@@ -68,6 +68,126 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
 
     return df
 
+def get_binance_volatility_ranking(minutes_list=[15, 30, 60]):
+    """
+    获取币安 U本位永续合约多个时间段的平均分钟波动率，并计算综合平均波动率，从高到低排序。
+    :param minutes_list: 包含需要计算的过去分钟数的列表，例如 [15, 30, 60]
+    """
+    # 兼容处理：如果用户不小心传入了单个整数，转成列表
+    if isinstance(minutes_list, int):
+        minutes_list = [minutes_list]
+
+    max_minutes = max(minutes_list)
+
+    print(f"\n==========================================")
+    print(f"开始获取币安合约波动率排行")
+    print(f"时间维度: {minutes_list} 分钟")
+    print(f"==========================================")
+
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'swap',
+        },
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    print("正在加载币安合约市场数据...")
+    markets = exchange.load_markets()
+
+    # 过滤出所有活跃的 U本位永续合约
+    symbols = [
+        symbol for symbol, market in markets.items()
+        if market.get('active')
+           and market.get('linear')
+           and market.get('quote') == 'USDT'
+           and market.get('type') == 'swap'
+    ]
+
+    print(f"共发现 {len(symbols)} 个交易中的 U本位永续合约。")
+
+    # 限制单次拉取的最大上限 (币安 fetch_ohlcv 单次最多一般是 1000 条)
+    if max_minutes > 1000:
+        print("⚠️ 警告: 请求的分钟数超过了 1000 分钟。已将拉取条数截断为 1000 条 (约 16.6 小时)。")
+        limit = 1000
+    else:
+        limit = max_minutes
+
+    now = exchange.milliseconds()
+    since = now - int(limit * 60 * 1000)
+
+    results = []
+    print(f"正在逐个拉取最大所需的 {limit} 根 K线数据 (约需要几十秒，请稍候)...")
+
+    for i, symbol in enumerate(symbols):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, '1m', since=since, limit=limit)
+
+            # 如果获取的数据极少，直接跳过
+            if not ohlcv or len(ohlcv) < (limit * 0.8):
+                continue
+
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = df[df['low'] > 0]
+
+            # 基础波动率计算: (High - Low) / Low * 100
+            df['volatility'] = (df['high'] - df['low']) / df['low'] * 100
+
+            latest_price = df['close'].iloc[-1]
+
+            # 初始化当前币种的数据字典
+            symbol_data = {
+                'Symbol': symbol,
+                'Latest Price': latest_price
+            }
+
+            # 用于存储当前币种不同时间维度的波动率，以便后续求总平均
+            temp_vols = []
+
+            # 循环截取不同的时间段，计算各自的平均波动率
+            for m in minutes_list:
+                df_m = df.tail(m)
+                avg_vol = df_m['volatility'].mean()
+                symbol_data[f'Avg Vol ({m}m) %'] = avg_vol
+                temp_vols.append(avg_vol)
+
+            # 计算所有要求时间段的【综合平均波动率】
+            overall_avg_vol = sum(temp_vols) / len(temp_vols)
+            symbol_data['Overall Avg Vol %'] = overall_avg_vol
+
+            results.append(symbol_data)
+
+            if (i + 1) % 50 == 0 or (i + 1) == len(symbols):
+                print(f"进度: 已处理 {i + 1}/{len(symbols)} 个合约...")
+
+        except Exception as e:
+            continue
+
+    df_res = pd.DataFrame(results)
+
+    if not df_res.empty:
+        # ==========================================
+        # 核心：重排列顺序并排序
+        # ==========================================
+        # 1. 明确列的顺序：将 'Overall Avg Vol %' 强制放在第三列（索引为2）
+        col_order = ['Symbol', 'Latest Price', 'Overall Avg Vol %'] + [f'Avg Vol ({m}m) %' for m in minutes_list]
+        df_res = df_res[col_order]
+
+        # 2. 按照综合平均波动率进行降序排序
+        df_res = df_res.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
+
+        # 3. 将所有的波动率列保留 4 位小数，使界面更清爽
+        df_res['Overall Avg Vol %'] = df_res['Overall Avg Vol %'].round(4)
+        for m in minutes_list:
+            df_res[f'Avg Vol ({m}m) %'] = df_res[f'Avg Vol ({m}m) %'].round(4)
+
+    return df_res
+
+
+
 def get_binance_futures_change(hours=48):
     """
     获取币安所有U本位合约过去 N 小时的涨跌幅，并从高到低排序
@@ -189,53 +309,64 @@ def gen_csv_file():
 
 
 if __name__ == "__main__":
-    # ==========================================
-    # 1. 核心参数配置区
-    # ==========================================
-    exchange = 'okx'  # 交易平台
-    target_symbol = 'ETH/USDT:USDT'  # 交易对
-    timeframe = "1s"  # 时间粒度
-    days_to_fetch = 30  # 时间范围（天数）
-
-    # ==========================================
-    # 2. 路径与文件名处理
-    # ==========================================
-    # 使用 pathlib 处理路径，自动适配不同操作系统的路径分隔符
-    data_dir = Path(r"W:\project\python_project\crypto_trade\data")
-
-    # 确保保存目录存在，如果不存在则自动创建
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    # 替换交易对中的特殊字符（/ 和 : 在 Windows/Linux 文件名中会导致报错或解析问题）
-    safe_symbol = target_symbol.replace('/', '_').replace(':', '_')
-
-
-    # 动态生成带有明确信息的文件名
-    # 最终格式示例: okx_ETH_USDT_USDT_1m_1days_20260406.csv
-    filename = f"{exchange}_{safe_symbol}_{timeframe}_{days_to_fetch}days.csv"
-    csv_file_path = gen_csv_file()
-
-    # ==========================================
-    # 3. 数据获取与保存
-    # ==========================================
-    print(f"正在从 {exchange} 获取 {target_symbol} ({timeframe}, 最近 {days_to_fetch} 天) 的历史数据...")
-
-    # 统一使用配置好的变量传入函数，避免硬编码
-    history_data = fetch_long_history(
-        exchange,
-        target_symbol,
-        timeframe=timeframe,
-        days=days_to_fetch
-    )
-
-    # 保存文件
-    history_data.to_csv(csv_file_path, index=False)
-    print(f"✅ 数据已成功保存至:\n{csv_file_path}")
-
-
-    # # 获取合约指定时间的涨跌幅
-    # change_hours = 2
-    # df_ranking = get_binance_futures_change(hours=change_hours)
+    # # ==========================================
+    # # 1. 核心参数配置区
+    # # ==========================================
+    # exchange = 'okx'  # 交易平台
+    # target_symbol = 'ETH/USDT:USDT'  # 交易对
+    # timeframe = "1s"  # 时间粒度
+    # days_to_fetch = 30  # 时间范围（天数）
     #
-    # print(f"\n✅ 币安合约过去 {change_hours} 小时涨跌幅排行 (前 10 名):")
-    # print(df_ranking.head(10).to_string())
+    # # ==========================================
+    # # 2. 路径与文件名处理
+    # # ==========================================
+    # # 使用 pathlib 处理路径，自动适配不同操作系统的路径分隔符
+    # data_dir = Path(r"W:\project\python_project\crypto_trade\data")
+    #
+    # # 确保保存目录存在，如果不存在则自动创建
+    # data_dir.mkdir(parents=True, exist_ok=True)
+    #
+    # # 替换交易对中的特殊字符（/ 和 : 在 Windows/Linux 文件名中会导致报错或解析问题）
+    # safe_symbol = target_symbol.replace('/', '_').replace(':', '_')
+    #
+    #
+    # # 动态生成带有明确信息的文件名
+    # # 最终格式示例: okx_ETH_USDT_USDT_1m_1days_20260406.csv
+    # filename = f"{exchange}_{safe_symbol}_{timeframe}_{days_to_fetch}days.csv"
+    # csv_file_path = gen_csv_file()
+    #
+    # # ==========================================
+    # # 3. 数据获取与保存
+    # # ==========================================
+    # print(f"正在从 {exchange} 获取 {target_symbol} ({timeframe}, 最近 {days_to_fetch} 天) 的历史数据...")
+    #
+    # # 统一使用配置好的变量传入函数，避免硬编码
+    # history_data = fetch_long_history(
+    #     exchange,
+    #     target_symbol,
+    #     timeframe=timeframe,
+    #     days=days_to_fetch
+    # )
+    #
+    # # 保存文件
+    # history_data.to_csv(csv_file_path, index=False)
+    # print(f"✅ 数据已成功保存至:\n{csv_file_path}")
+
+
+    # 获取合约指定时间的涨跌幅
+    change_hours = 2
+    df_ranking = get_binance_futures_change(hours=change_hours)
+
+    print(f"\n✅ 币安合约过去 {change_hours} 小时涨跌幅排行 (前 10 名):")
+    print(df_ranking.head(10).to_string())
+
+
+    # # 获取合约指定时间的波动率
+
+    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600]
+
+    df_volatility = get_binance_volatility_ranking(minutes_list=calc_minutes_list)
+
+    print(f"\n✅ 币安合约多维度波动率排行 (默认按 {calc_minutes_list[0]}m 排序，前 15 名):")
+    # 为了防止控制台打印时列被折叠，稍微调整一下 Pandas 显示设置
+    pd.set_option('display.max_columns', None)
