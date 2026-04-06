@@ -224,6 +224,7 @@ def _submit_comment(page: Page, comment: str, image_path: Optional[str] = None):
             else:
                 print(f"[*] 检测到图片，准备上传: {image_path}")
                 try:
+                    # 优先采用拦截系统弹窗方案
                     try:
                         with page.expect_file_chooser(timeout=5000) as fc_info:
                             upload_btn = page.locator(
@@ -240,10 +241,13 @@ def _submit_comment(page: Page, comment: str, image_path: Optional[str] = None):
                             print("[+] 已通过底层 input 成功加载图片。")
                         else:
                             raise Exception("找不到任何可用的图片上传入口。")
+
+                    # 给图片一定的预处理时间
+                    time.sleep(3)
                 except Exception as img_e:
                     print(f"[!] 图片上传过程中出现异常，可能只会发送纯文本: {img_e}")
 
-        # --- 第 3 步：点击提交按钮 (替换为智能校验循环) ---
+        # --- 第 3 步：点击提交按钮 (智能校验循环 + JS 强制点击) ---
         send_button = page.locator("button").filter(
             has_text=re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
         ).last
@@ -251,10 +255,14 @@ def _submit_comment(page: Page, comment: str, image_path: Optional[str] = None):
         print("[*] 开始尝试发送评论 (智能重试中)...")
         send_success = False
 
-        # 最多尝试 15 次，每次间隔 2 秒 (总计可等待 30 秒，足以应对大图片上传)
+        # 最多尝试 15 次，每次间隔 2 秒
         for i in range(15):
-            # force=True 强制点击，绕过 Playwright 对可视性和遮挡的严格校验
-            send_button.click(force=True)
+            try:
+                # 【终极杀招】：使用 JavaScript 原生点击，完全无视视口外、遮挡等报错
+                send_button.evaluate("node => node.click()")
+            except Exception as click_err:
+                print(f"[-] 点击操作遇到小障碍(将继续重试): {click_err}")
+
             time.sleep(2.5)  # 给网络请求和前端状态更新留出时间
 
             # 检查1：如果编辑器直接从 DOM 里消失了（被收起），说明发送成功
@@ -266,13 +274,11 @@ def _submit_comment(page: Page, comment: str, image_path: Optional[str] = None):
             current_text = real_editor.inner_text().strip()
 
             # 如果当前输入框里的字数不到你填入评论的 1/3，说明内容被清空了，发送成功
-            # (处理富文本编辑器清空后可能残留空格或零宽字符的情况)
-            print(f"[*] 当前输入框内容长度: {len(current_text)}, 评论内容长度: {len(comment.strip())}")
             if len(current_text) < (len(comment.strip()) / 3):
                 send_success = True
                 break
 
-            print(f"[*] 按钮可能仍在处理中(仍被前端拦截)，正在重试 ({i + 1}/15)...")
+            print(f"[*] 按钮可能仍在处理中(仍被前端拦截或图片在传)，正在重试 ({i + 1}/15)...")
 
         if not send_success:
             raise Exception("尝试了多次点击发送，但评论内容始终未清空，疑似发送失败或图片过大。")
