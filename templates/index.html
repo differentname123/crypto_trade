@@ -1,0 +1,823 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>网格策略保证金 & 参数推演系统</title>
+    <style>
+        :root {
+            --primary-blue: #2563eb;
+            --primary-hover: #1d4ed8;
+            --bg-color: #f0f2f5;
+            --card-bg: #ffffff;
+            --text-main: #1f2937;
+            --text-sub: #4b5563;
+            --border-color: #e5e7eb;
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            --transition: all 0.2s ease;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            line-height: 1.6;
+            padding: 20px;
+            margin: 0;
+            display: flex;
+            justify-content: center;
+        }
+
+        .main-container {
+            width: 100%;
+            max-width: 900px;
+            background: var(--card-bg);
+            padding: 40px;
+            border-radius: 16px;
+            box-shadow: var(--shadow);
+            position: relative;
+        }
+
+        h1 {
+            text-align: center;
+            color: var(--text-main);
+            font-size: 1.8rem;
+            margin-bottom: 30px;
+            margin-top: 0;
+        }
+
+        /* 语言切换器样式 */
+        .lang-switch-container {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+        }
+
+        .lang-switch-container select {
+            padding: 6px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border-color);
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-size: 0.9rem;
+            cursor: pointer;
+            outline: none;
+            transition: var(--transition);
+        }
+
+        .lang-switch-container select:hover {
+            border-color: var(--primary-blue);
+        }
+
+        /* 功能卡片区域 */
+        .function-selector {
+            margin-bottom: 30px;
+        }
+
+        .function-selector label {
+            display: block;
+            margin-bottom: 15px;
+            font-weight: 600;
+            font-size: 1.1rem;
+            color: var(--text-sub);
+        }
+
+        .cards-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+        }
+
+        @media (max-width: 600px) {
+            .cards-grid { grid-template-columns: 1fr; }
+            .lang-switch-container { position: static; text-align: right; margin-bottom: 15px; }
+        }
+
+        .func-card {
+            border: 2px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            cursor: pointer;
+            transition: var(--transition);
+            position: relative;
+        }
+
+        .func-card:hover {
+            border-color: var(--primary-blue);
+            box-shadow: 0 4px 6px rgba(37, 99, 235, 0.1);
+        }
+
+        .func-card input[type="radio"] {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            margin: 0;
+            transform: scale(1.3);
+            accent-color: var(--primary-blue);
+        }
+
+        .func-card h3 {
+            margin: 0 0 8px 0;
+            font-size: 1.2rem;
+            color: var(--text-main);
+        }
+
+        .func-card p {
+            margin: 0;
+            font-size: 0.95rem;
+            color: var(--text-sub);
+        }
+
+        .func-card.active {
+            border-color: var(--primary-blue);
+            background-color: #eff6ff;
+        }
+
+        /* 参数输入区域 */
+        .form-section {
+            margin-bottom: 30px;
+        }
+
+        .section-title {
+            margin-top: 30px;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid var(--border-color);
+            font-size: 1rem;
+            color: var(--text-sub);
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 600px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+
+        .form-group {
+            position: relative;
+        }
+
+        .form-label {
+            display: flex;
+            align-items: center;
+            margin-bottom: 6px;
+            font-weight: 500;
+            font-size: 0.95rem;
+            color: var(--text-sub);
+        }
+
+        .input-field {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            box-sizing: border-box;
+            font-size: 1rem;
+            transition: var(--transition);
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--primary-blue);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        /* 全新优化的 SVG Tooltip 系统 */
+        .tooltip-wrapper {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            margin-left: 6px;
+            cursor: help;
+        }
+
+        .help-icon-svg {
+            width: 18px;
+            height: 18px;
+            color: #9ca3af;
+            transition: color 0.2s;
+        }
+
+        .tooltip-wrapper:hover .help-icon-svg {
+            color: var(--primary-blue);
+        }
+
+        .tooltip-text {
+            position: absolute;
+            bottom: 130%;
+            left: 50%;
+            transform: translateX(-50%) translateY(5px);
+            background-color: rgba(31, 41, 55, 0.95);
+            color: #f9fafb;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: normal;
+            white-space: normal;
+            width: max-content;
+            max-width: 260px;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.2s ease, transform 0.2s ease;
+            z-index: 1000;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            pointer-events: none;
+            line-height: 1.6;
+        }
+
+        .tooltip-text::after {
+            content: '';
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            border-width: 6px;
+            border-style: solid;
+            border-color: rgba(31, 41, 55, 0.95) transparent transparent transparent;
+        }
+
+        .tooltip-wrapper:hover .tooltip-text {
+            opacity: 1;
+            visibility: visible;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        /* 隐藏和显示动画 */
+        .dynamic-field {
+            transition: opacity 0.3s ease, transform 0.3s ease;
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .dynamic-field.hidden {
+            display: none;
+            opacity: 0;
+            transform: translateY(10px);
+        }
+
+        /* 按钮和结果区域 */
+        .action-button {
+            width: 100%;
+            padding: 14px;
+            background-color: var(--primary-blue);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: var(--transition);
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        .action-button:hover {
+            background-color: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(37, 99, 235, 0.2);
+        }
+
+        .action-button:active {
+            transform: translateY(0);
+        }
+
+        #result-panel {
+            margin-top: 30px;
+            padding: 25px;
+            border-radius: 12px;
+            background-color: #f8fafc;
+            border: 1px solid var(--border-color);
+            display: none;
+            transition: var(--transition);
+        }
+
+        #result-panel.show {
+            display: block;
+        }
+
+        .success { color: #166534; font-weight: bold;}
+        .error { color: #991b1b; font-weight: bold;}
+    </style>
+</head>
+<body>
+
+<div class="main-container">
+    <div class="lang-switch-container">
+        <select onchange="switchLanguage(this.value)">
+            <option value="zh">🇨🇳 简体中文</option>
+            <option value="en">🇺🇸 English</option>
+        </select>
+    </div>
+
+    <h1 data-i18n="title">网格策略保证金 & 参数推演系统</h1>
+
+    <div class="function-selector">
+        <label data-i18n="select_op">🏆 请点击选择你要进行的操作：</label>
+        <div class="cards-grid">
+            <div class="func-card active" data-function="0">
+                <input type="radio" name="calcMode" value="0" checked>
+                <h3 data-i18n="op0_title">1. 资金计算器</h3>
+                <p data-i18n="op0_desc">输入所有策略参数，点击计算即可得出所需的总资金。</p>
+            </div>
+            <div class="func-card" data-function="1">
+                <input type="radio" name="calcMode" value="1">
+                <h3 data-i18n="op1_title">2. 生存极限测试</h3>
+                <p data-i18n="op1_desc">给定资金和策略，反推你的最大抗风险（抗跌/涨）幅度。</p>
+            </div>
+            <div class="func-card" data-function="2">
+                <input type="radio" name="calcMode" value="2">
+                <h3 data-i18n="op2_title">3. 加仓间距规划</h3>
+                <p data-i18n="op2_desc">在有限资金和风险要求下，反推可以设置的最密加仓步长。</p>
+            </div>
+            <div class="func-card" data-function="3">
+                <input type="radio" name="calcMode" value="3">
+                <h3 data-i18n="op3_title">4. 最大单量推演</h3>
+                <p data-i18n="op3_desc">确定资金、步长和幅差后，反推可以使用的最大单次开仓量。</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="form-section">
+        <div class="section-title" data-i18n="sec_basic">基础策略设置</div>
+        <div class="grid-2">
+            <div class="form-group">
+                <div class="form-label">
+                    <span data-i18n="lbl_dir">方向 (Direction)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_dir">做多赚涨跌输，做空赚跌涨输。<br>选择策略初始建仓的方向。</div>
+                    </div>
+                </div>
+                <select id="direction" class="input-field">
+                    <option value="long" selected data-i18n="dir_long">做多 (Long)</option>
+                    <option value="short" data-i18n="dir_short">做空 (Short)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <div class="form-label">
+                    <span data-i18n="lbl_lev">杠杆倍数 (Leverage)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_lev">放大收益也会放大风险。<br>建议网格策略使用低杠杆 (<20x) 运行以保证安全。</div>
+                    </div>
+                </div>
+                <input type="number" id="leverage" class="input-field" value="10" step="1">
+            </div>
+            <div class="form-group">
+                <div class="form-label">
+                    <span data-i18n="lbl_ip">初始价格 (Initial Price)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_ip">策略开始运行时的市场标杆价格。</div>
+                    </div>
+                </div>
+                <input type="number" id="initial_price" class="input-field" value="2000" step="0.0001">
+            </div>
+        </div>
+
+        <div class="section-title" data-i18n="sec_core">核心推演参数</div>
+        <div class="grid-2">
+            <div class="form-group dynamic-field" id="wrap_target_loss">
+                <div class="form-label">
+                    <span data-i18n="lbl_loss">预设抗跌/跌幅 (%)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_loss">策略预期的总抗风险空间。<br>例如：做空时，期望价格最高上涨多少而不爆仓。<br>用于限制最大回撤幅度。</div>
+                    </div>
+                </div>
+                <input type="number" id="target_loss_percent" class="input-field" value="20" step="0.1">
+            </div>
+
+            <div class="form-group dynamic-field" id="wrap_add_step">
+                <div class="form-label">
+                    <span data-i18n="lbl_step">步长 % (加仓间距)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_step">相邻网格（加仓点）之间的价格百分比差距。<br>较小的步长表示加仓更密集。<br>二分查找满足条件的步长。</div>
+                    </div>
+                </div>
+                <input type="number" id="add_step_percent" class="input-field" value="1" step="0.001">
+            </div>
+
+            <div class="form-group dynamic-field" id="wrap_fixed_qty">
+                <div class="form-label">
+                    <span data-i18n="lbl_qty">单次下单量 (币数)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_qty">每个网格节点单次买入/卖出的资产数量。<br>该数值直接影响总保证金占用。</div>
+                    </div>
+                </div>
+                <input type="number" id="fixed_qty" class="input-field" value="1" step="1">
+            </div>
+
+            <div class="form-group dynamic-field hidden" id="wrap_available_margin">
+                <div class="form-label">
+                    <span data-i18n="lbl_margin">可用资金 (U)</span>
+                    <div class="tooltip-wrapper">
+                        <svg class="help-icon-svg" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                          <path stroke-linecap="round" stroke-linejoin="round" d="M9.879 7.519c1.171-1.025 3.071-1.025 4.242 0 1.172 1.025 1.172 2.687 0 3.712-.203.179-.43.326-.67.442-.745.361-1.45.999-1.45 1.827v.75M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9 5.25h.008v.008H12v-.008z" />
+                        </svg>
+                        <div class="tooltip-text" data-i18n="tt_margin">你计划投入此策略的总体 USDT 资金。<br>作为反推计算的核心边界条件。</div>
+                    </div>
+                </div>
+                <input type="number" id="available_margin" class="input-field" value="1000" step="1">
+            </div>
+        </div>
+    </div>
+
+    <button onclick="executeCalculation()" class="action-button" data-i18n="btn_calc">开始推演计算</button>
+
+    <div id="result-panel">
+        <h3 id="result-status"></h3>
+        <div id="result-content"></div>
+    </div>
+</div>
+
+<script>
+// ==========================================
+// 0. 多语言配置及切换逻辑
+// ==========================================
+let currentLang = 'zh';
+
+const i18n = {
+    zh: {
+        title: "网格策略保证金 & 参数推演系统",
+        select_op: "🏆 请点击选择你要进行的操作：",
+        op0_title: "1. 资金计算器",
+        op0_desc: "输入所有策略参数，点击计算即可得出所需的总资金。",
+        op1_title: "2. 生存极限测试",
+        op1_desc: "给定资金和策略，反推你的最大抗风险（抗跌/涨）幅度。",
+        op2_title: "3. 加仓间距规划",
+        op2_desc: "在有限资金和风险要求下，反推可以设置的最密加仓步长。",
+        op3_title: "4. 最大单量推演",
+        op3_desc: "确定资金、步长和幅差后，反推可以使用的最大单次开仓量。",
+        sec_basic: "基础策略设置",
+        lbl_dir: "方向 (Direction)",
+        tt_dir: "做多赚涨跌输，做空赚跌涨输。<br>选择策略初始建仓的方向。",
+        dir_long: "做多 (Long)",
+        dir_short: "做空 (Short)",
+        lbl_lev: "杠杆倍数 (Leverage)",
+        tt_lev: "放大收益也会放大风险。<br>建议网格策略使用低杠杆 (<20x) 运行以保证安全。",
+        lbl_ip: "初始价格 (Initial Price)",
+        tt_ip: "策略开始运行时的市场标杆价格。",
+        sec_core: "核心推演参数",
+        lbl_loss: "预设抗跌/跌幅 (%)",
+        tt_loss: "策略预期的总抗风险空间。<br>例如：做空时，期望价格最高上涨多少而不爆仓。<br>用于限制最大回撤幅度。",
+        lbl_step: "步长 % (加仓间距)",
+        tt_step: "相邻网格（加仓点）之间的价格百分比差距。<br>较小的步长表示加仓更密集。<br>二分查找满足条件的步长。",
+        lbl_qty: "单次下单量 (币数)",
+        tt_qty: "每个网格节点单次买入/卖出的资产数量。<br>该数值直接影响总保证金占用。",
+        lbl_margin: "可用资金 (U)",
+        tt_margin: "你计划投入此策略的总体 USDT 资金。<br>作为反推计算的核心边界条件。",
+        btn_calc: "开始推演计算",
+
+        // JS 动态文本
+        calcing: "计算中...",
+        success_calc: "✅ 计算成功",
+        success_sim: "✅ 推演完成",
+        err_calc: "❌ 计算出错",
+        res_req_margin: "所需资金总计 (U)",
+        res_margin_desc: "依据上述策略设置，您的策略实际所需的极限保证金为: ", // 修复了繁体字
+        res_max_loss: "最大可扛幅差 (跌/涨)",
+        res_min_step: "最小加仓步长",
+        res_max_qty: "最大单次下单量",
+        res_util: "资金利用率",
+        res_actual: "实际消耗保证金",
+
+        // 错误提示
+        err_params: "所有数值参数必须 > 0",
+        err_dir: "direction 参数必须是 'long' 或 'short'",
+        err_long_100: "做多时，价格最大跌幅不能 >= 100.0% (价格不能跌破 0)。",
+        err_loop: "计算超出安全限制，请检查步长设置是否过小。",
+        err_avail: "可用保证金必须 > 0",
+        err_not_found: "在范围内无法找到满足资金条件的解。可能是资金严重不足或参数设置不合理。"
+    },
+    en: {
+        title: "Grid Strategy Margin & Parameter Simulator",
+        select_op: "🏆 Please select an operation:",
+        op0_title: "1. Margin Calculator",
+        op0_desc: "Input all parameters to calculate the total required margin.",
+        op1_title: "2. Survival Limit Test",
+        op1_desc: "Calculate the max price drop/surge you can withstand given your margin.",
+        op2_title: "3. Grid Spacing Planner",
+        op2_desc: "Calculate the minimum (densest) step percentage for your margin.",
+        op3_title: "4. Max Order Qty Simulator",
+        op3_desc: "Calculate the max fixed quantity per grid given your margin.",
+        sec_basic: "Basic Strategy Settings",
+        lbl_dir: "Direction",
+        tt_dir: "Long profits from rising, Short from falling prices.<br>Select the initial grid direction.",
+        dir_long: "Long",
+        dir_short: "Short",
+        lbl_lev: "Leverage",
+        tt_lev: "Amplifies both profit and risk.<br>Low leverage (<20x) is recommended for grid safety.",
+        lbl_ip: "Initial Price",
+        tt_ip: "The market benchmark price when the strategy starts.",
+        sec_core: "Core Simulation Parameters",
+        lbl_loss: "Target Loss/Surge (%)",
+        tt_loss: "Expected total risk tolerance.<br>e.g., Max allowed price surge before liquidation when shorting.",
+        lbl_step: "Step % (Grid Spacing)",
+        tt_step: "Percentage difference between adjacent grid nodes.<br>Smaller step means denser grids.",
+        lbl_qty: "Fixed Qty (Coins)",
+        tt_qty: "Amount of asset bought/sold at each grid node.<br>Directly impacts total margin usage.",
+        lbl_margin: "Available Margin (U)",
+        tt_margin: "Total USDT planned for this strategy.<br>Core boundary condition for reverse calculations.",
+        btn_calc: "Start Simulation",
+
+        // JS 动态文本
+        calcing: "Calculating...",
+        success_calc: "✅ Calculation Successful",
+        success_sim: "✅ Simulation Complete",
+        err_calc: "❌ Calculation Error",
+        res_req_margin: "Total Required Margin (U)",
+        res_margin_desc: "Based on the above settings, the absolute maximum required margin is: ",
+        res_max_loss: "Max Tolerable Drop/Surge",
+        res_min_step: "Min Grid Spacing (Step %)",
+        res_max_qty: "Max Fixed Qty per Grid",
+        res_util: "Margin Utilization",
+        res_actual: "Actual Margin Consumed",
+
+        // 错误提示
+        err_params: "All numeric parameters must be > 0",
+        err_dir: "Direction parameter must be 'long' or 'short'",
+        err_long_100: "When going Long, price drop cannot be >= 100.0% (price cannot drop below 0).",
+        err_loop: "Calculation exceeded safety limits. Please check if the step is too small.",
+        err_avail: "Available margin must be > 0",
+        err_not_found: "Could not find a valid solution. Margin may be too low or parameters are unreasonable."
+    }
+};
+
+function switchLanguage(lang) {
+    currentLang = lang;
+
+    // 翻译带有 data-i18n 属性的所有静态节点
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        if (i18n[lang][key]) {
+            el.innerHTML = i18n[lang][key];
+        }
+    });
+
+    // 如果结果面板正在显示，则重新执行计算以刷新动态结果的语言
+    if (document.getElementById('result-panel').classList.contains('show')) {
+        executeCalculation();
+    }
+}
+
+// ==========================================
+// 1. 核心计算逻辑
+// ==========================================
+function calculate_multi_group_margin(params) {
+    let { leverage, target_loss_percent, max_grids_per_group, fixed_qty, add_step_percent, initial_price, direction } = params;
+
+    // 修复：使用 !(x > 0) 这种反向校验方式，能够一并拦截用户清空输入框时产生的 NaN 报错绕过问题
+    if (!(leverage > 0) || !(target_loss_percent > 0) || !(add_step_percent > 0) || !(fixed_qty > 0) || !(max_grids_per_group > 0)) {
+        throw new Error(i18n[currentLang].err_params);
+    }
+    if (direction !== 'long' && direction !== 'short') {
+        throw new Error(i18n[currentLang].err_dir);
+    }
+    if (direction === 'long' && target_loss_percent >= 100.0) {
+        throw new Error(i18n[currentLang].err_long_100);
+    }
+
+    let r = add_step_percent / 100.0;
+    let sign = direction === 'long' ? 1 : -1;
+    let target_price = direction === 'long'
+        ? initial_price * (1.0 - target_loss_percent / 100.0)
+        : initial_price * (1.0 + target_loss_percent / 100.0);
+
+    let current_price = initial_price;
+    let total_margin_all_groups = 0.0;
+
+    const is_active = (cp, tp) => direction === 'long' ? cp >= tp : cp <= tp;
+
+    // 防止 JS 浮点数无限循环的安全计数器
+    let infiniteLoopGuard = 0;
+
+    while (is_active(current_price, target_price)) {
+        let group_qty = 0.0;
+        let group_cost = 0.0;
+        let group_max_margin = 0.0;
+        let grids_in_group = 0;
+
+        while (grids_in_group < max_grids_per_group && is_active(current_price, target_price)) {
+            // 修复：将防死循环逻辑移入最内层循环，防止因内层运行次数过多导致浏览器直接卡死崩溃
+            if (infiniteLoopGuard++ > 100000) {
+                throw new Error(i18n[currentLang].err_loop);
+            }
+
+            group_qty += fixed_qty;
+            group_cost += fixed_qty * current_price;
+            grids_in_group += 1;
+
+            let upnl_at_open = sign * (group_qty * current_price - group_cost);
+            let required_for_margin = (group_cost / leverage) - upnl_at_open;
+            if (required_for_margin > group_max_margin) group_max_margin = required_for_margin;
+
+            let next_price = direction === 'long' ? current_price * (1 - r) : current_price * (1 + r);
+            let check_price = direction === 'long' ? Math.max(next_price, target_price) : Math.min(next_price, target_price);
+
+            let upnl_at_bottom = sign * (group_qty * check_price - group_cost);
+            let required_for_survival = -upnl_at_bottom;
+            if (required_for_survival > group_max_margin) group_max_margin = required_for_survival;
+
+            current_price = next_price;
+        }
+
+        let upnl_at_global_target = sign * (group_qty * target_price - group_cost);
+        let required_at_global_target = (group_cost / leverage) - upnl_at_global_target;
+        if (required_at_global_target > group_max_margin) group_max_margin = required_at_global_target;
+
+        total_margin_all_groups += group_max_margin;
+    }
+
+    return { total_margin: total_margin_all_groups };
+}
+
+// ==========================================
+// 2. 通用二分查找求解器
+// ==========================================
+function _universal_margin_solver(target_param_name, available_margin, base_params, low_bound, high_bound, positive_correlation, tolerance = 0.0001) {
+    // 修复：同样的拦截 NaN 的逻辑优化
+    if (!(available_margin > 0)) return { status: "failed", message: i18n[currentLang].err_avail };
+
+    let best_val = null;
+    let best_result = null;
+    let low = low_bound, high = high_bound;
+    let guard = 0;
+
+    while ((high - low) > tolerance && guard++ < 200) {
+        let mid = (low + high) / 2.0;
+        let test_params = { ...base_params };
+        test_params[target_param_name] = mid;
+
+        try {
+            let current_result = calculate_multi_group_margin(test_params);
+            let current_margin = current_result.total_margin;
+
+            if (current_margin > available_margin) {
+                if (positive_correlation) high = mid; else low = mid;
+            } else {
+                best_val = mid;
+                best_result = current_result;
+                if (positive_correlation) low = mid; else high = mid;
+            }
+        } catch (e) {
+            if (positive_correlation) high = mid; else low = mid;
+        }
+    }
+
+    if (best_val === null) {
+        return { status: "failed", message: i18n[currentLang].err_not_found };
+    }
+
+    return {
+        status: "success",
+        optimal_value: Number(best_val.toFixed(5)),
+        actual_margin_used: Number(best_result.total_margin.toFixed(2)),
+        utilization_rate: ((best_result.total_margin / available_margin) * 100).toFixed(2) + "%"
+    };
+}
+
+// ==========================================
+// 3. UI 交互逻辑
+// ==========================================
+
+function initFunctions() {
+    const cards = document.querySelectorAll('.func-card');
+    cards.forEach(card => {
+        card.addEventListener('click', function() {
+            cards.forEach(c => c.classList.remove('active'));
+            this.classList.add('active');
+            this.querySelector('input[type="radio"]').checked = true;
+            updateFieldVisibility(this.dataset.function);
+        });
+    });
+}
+
+function updateFieldVisibility(selectedFunction) {
+    const wrapMargin = document.getElementById('wrap_available_margin');
+    const wrapLoss = document.getElementById('wrap_target_loss');
+    const wrapStep = document.getElementById('wrap_add_step');
+    const wrapQty = document.getElementById('wrap_fixed_qty');
+
+    [wrapMargin, wrapLoss, wrapStep, wrapQty].forEach(wrap => wrap.classList.remove('hidden'));
+
+    switch(selectedFunction) {
+        case "0": wrapMargin.classList.add('hidden'); break;
+        case "1": wrapLoss.classList.add('hidden'); break;
+        case "2": wrapStep.classList.add('hidden'); break;
+        case "3": wrapQty.classList.add('hidden'); break;
+    }
+}
+
+function getUIParams() {
+    return {
+        direction: document.getElementById('direction').value,
+        leverage: parseFloat(document.getElementById('leverage').value),
+        initial_price: parseFloat(document.getElementById('initial_price').value),
+        max_grids_per_group: 100000,
+        target_loss_percent: parseFloat(document.getElementById('target_loss_percent').value),
+        add_step_percent: parseFloat(document.getElementById('add_step_percent').value),
+        fixed_qty: parseFloat(document.getElementById('fixed_qty').value)
+    };
+}
+
+function executeCalculation() {
+    const mode = document.querySelector('input[name="calcMode"]:checked').value;
+    const params = getUIParams();
+    const available_margin = parseFloat(document.getElementById('available_margin').value);
+    const resultPanel = document.getElementById('result-panel');
+    const resultStatus = document.getElementById('result-status');
+    const resultContent = document.getElementById('result-content');
+    const t = i18n[currentLang]; // 提取当前语言配置
+
+    resultPanel.classList.add('show');
+    resultStatus.innerHTML = t.calcing;
+    resultContent.innerHTML = '';
+
+    try {
+        let resultHtml = '';
+        if (mode === "0") {
+            let res = calculate_multi_group_margin(params);
+            resultStatus.innerHTML = `<span class="success">${t.success_calc}</span>`;
+            resultHtml = `
+                <div class="func-card active" style="border:none; cursor:default;">
+                    <h3>${t.res_req_margin}</h3>
+                    <p style="font-size: 2.2rem; font-weight: bold; color: var(--primary-blue); margin-top: 10px;">
+                        ${res.total_margin.toFixed(2)} U
+                    </p>
+                    <p style="margin-top:10px; color: var(--text-sub);">${t.res_margin_desc}${res.total_margin.toFixed(2)} U。</p>
+                </div>`;
+        } else if (mode === "1") {
+            let max_loss_bound = params.direction === 'long' ? 99.9 : 500.0;
+            let res = _universal_margin_solver("target_loss_percent", available_margin, params, 0.1, max_loss_bound, true, 0.001);
+            if (res.status === 'success') {
+                resultStatus.innerHTML = `<span class="success">${t.success_sim}</span>`;
+                resultHtml = renderResultCard(t.res_max_loss, `${res.optimal_value}%`, res, t);
+            } else { throw new Error(res.message); }
+        } else if (mode === "2") {
+            let res = _universal_margin_solver("add_step_percent", available_margin, params, 0.01, 100.0, false, 0.001);
+            if (res.status === 'success') {
+                resultStatus.innerHTML = `<span class="success">${t.success_sim}</span>`;
+                resultHtml = renderResultCard(t.res_min_step, `${res.optimal_value}%`, res, t);
+            } else { throw new Error(res.message); }
+        } else if (mode === "3") {
+            let res = _universal_margin_solver("fixed_qty", available_margin, params, 0.0001, 1000000.0, true, 0.0001);
+            if (res.status === 'success') {
+                resultStatus.innerHTML = `<span class="success">${t.success_sim}</span>`;
+                // 英文环境下，" 个" 显得多余，所以做一点简单的格式化
+                let unit = currentLang === 'zh' ? ' 个' : '';
+                resultHtml = renderResultCard(t.res_max_qty, `${res.optimal_value}${unit}`, res, t);
+            } else { throw new Error(res.message); }
+        }
+        resultContent.innerHTML = resultHtml;
+    } catch (error) {
+        resultStatus.innerHTML = `<span class="error">${t.err_calc}</span>`;
+        resultContent.innerHTML = `<p>${error.message}</p>`;
+    }
+}
+
+function renderResultCard(title, value, data, t) {
+    return `
+        <div class="func-card active" style="border:none; cursor:default; margin-bottom: 20px;">
+            <h3>${title}</h3>
+            <p style="font-size: 2.2rem; font-weight: bold; color: var(--primary-blue); margin-top: 10px;">${value}</p>
+        </div>
+        <div class="grid-2" style="margin-top:20px;">
+            <div class="form-group">
+                <div class="form-label">${t.res_util}</div>
+                <input type="text" class="input-field" value="${data.utilization_rate}" readonly>
+            </div>
+            <div class="form-group">
+                <div class="form-label">${t.res_actual}</div>
+                <input type="text" class="input-field" value="${data.actual_margin_used} U" readonly>
+            </div>
+        </div>`;
+}
+
+// 初始化运行
+initFunctions();
+// 修复：读取初始下拉框状态进行同步，防止页面刷新时的中英文文本交错
+switchLanguage(document.querySelector('.lang-switch-container select').value);
+</script>
+<script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "a437f167dd3b436ab0f1d505af4b77db"}'></script>
+</body>
+</html>
