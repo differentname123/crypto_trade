@@ -3,7 +3,7 @@ from pathlib import Path
 import ccxt
 import pandas as pd
 import time
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
     """
@@ -68,24 +68,28 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
 
     return df
 
-def get_binance_volatility_ranking(minutes_list=[15, 30, 60]):
+
+def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
     """
-    获取币安 U本位永续合约多个时间段的平均分钟波动率，并计算综合平均波动率，从高到低排序。
-    :param minutes_list: 包含需要计算的过去分钟数的列表，例如 [15, 30, 60]
+    获取币安 U本位永续合约的多维度平均分钟波动率及资金费率。
+    使用多线程并发拉取，从高到低排序。
+
+    :param minutes_list: 需要计算的过去分钟数的列表，例如 [15, 30, 60]
+    :param max_workers: 线程池并发数，建议 10-20，过高容易触发币安 IP 频率限制
     """
-    # 兼容处理：如果用户不小心传入了单个整数，转成列表
     if isinstance(minutes_list, int):
         minutes_list = [minutes_list]
 
     max_minutes = max(minutes_list)
 
     print(f"\n==========================================")
-    print(f"开始获取币安合约波动率排行")
-    print(f"时间维度: {minutes_list} 分钟")
+    print(f"🚀 开始并发获取币安合约波动率 & 资金费率")
+    print(f"时间维度: {minutes_list} 分钟 | 并发线程数: {max_workers}")
     print(f"==========================================")
 
+    # 实例化交易所
     exchange = ccxt.binance({
-        'enableRateLimit': True,
+        'enableRateLimit': True,  # 开启内置速率限制保护
         'options': {
             'defaultType': 'swap',
         },
@@ -106,12 +110,20 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60]):
            and market.get('quote') == 'USDT'
            and market.get('type') == 'swap'
     ]
-
     print(f"共发现 {len(symbols)} 个交易中的 U本位永续合约。")
 
-    # 限制单次拉取的最大上限 (币安 fetch_ohlcv 单次最多一般是 1000 条)
+    # ==========================================
+    # 批量获取资金费率 (只需 1 次 API 请求)
+    # ==========================================
+    print("正在批量拉取全市场最新资金费率...")
+    try:
+        funding_rates_data = exchange.fetch_funding_rates(symbols)
+    except Exception as e:
+        print(f"⚠️ 获取资金费率失败: {e}")
+        funding_rates_data = {}
+
     if max_minutes > 1000:
-        print("⚠️ 警告: 请求的分钟数超过了 1000 分钟。已将拉取条数截断为 1000 条 (约 16.6 小时)。")
+        print("⚠️ 警告: 请求的分钟数超过了 1000 分钟。已截断为 1000 条。")
         limit = 1000
     else:
         limit = max_minutes
@@ -120,72 +132,92 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60]):
     since = now - int(limit * 60 * 1000)
 
     results = []
-    print(f"正在逐个拉取最大所需的 {limit} 根 K线数据 (约需要几十秒，请稍候)...")
 
-    for i, symbol in enumerate(symbols):
+    # ==========================================
+    # 定义单线程处理函数
+    # ==========================================
+    def fetch_and_calc(symbol):
         try:
+            # 拉取 K 线数据 (公开接口，无需签名)
             ohlcv = exchange.fetch_ohlcv(symbol, '1m', since=since, limit=limit)
 
-            # 如果获取的数据极少，直接跳过
             if not ohlcv or len(ohlcv) < (limit * 0.8):
-                continue
+                return None  # 数据不足，丢弃
 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df = df[df['low'] > 0]
 
-            # 基础波动率计算: (High - Low) / Low * 100
+            # 计算波动率
             df['volatility'] = (df['high'] - df['low']) / df['low'] * 100
-
             latest_price = df['close'].iloc[-1]
 
-            # 初始化当前币种的数据字典
+            # 获取该币种的资金费率（转化为百分比，通常资金费率为 0.0001 表示 0.01%）
+            fr_info = funding_rates_data.get(symbol, {})
+            funding_rate = fr_info.get('fundingRate', 0)
+            funding_rate_pct = funding_rate * 100 if funding_rate else 0.0
+
             symbol_data = {
                 'Symbol': symbol,
-                'Latest Price': latest_price
+                'Latest Price': latest_price,
+                'Funding Rate %': funding_rate_pct
             }
 
-            # 用于存储当前币种不同时间维度的波动率，以便后续求总平均
             temp_vols = []
-
-            # 循环截取不同的时间段，计算各自的平均波动率
             for m in minutes_list:
                 df_m = df.tail(m)
                 avg_vol = df_m['volatility'].mean()
                 symbol_data[f'Avg Vol ({m}m) %'] = avg_vol
                 temp_vols.append(avg_vol)
 
-            # 计算所有要求时间段的【综合平均波动率】
-            overall_avg_vol = sum(temp_vols) / len(temp_vols)
-            symbol_data['Overall Avg Vol %'] = overall_avg_vol
-
-            results.append(symbol_data)
-
-            if (i + 1) % 50 == 0 or (i + 1) == len(symbols):
-                print(f"进度: 已处理 {i + 1}/{len(symbols)} 个合约...")
+            # 计算综合平均波动率
+            symbol_data['Overall Avg Vol %'] = sum(temp_vols) / len(temp_vols)
+            return symbol_data
 
         except Exception as e:
-            continue
+            return None
+
+    # ==========================================
+    # 启动多线程并发执行
+    # ==========================================
+    print(f"正在启动 {max_workers} 个线程拉取 {limit} 根 K线数据...")
+
+    completed_count = 0
+    total_symbols = len(symbols)
+
+    # 使用 ThreadPoolExecutor 管理并发
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务到线程池
+        future_to_symbol = {executor.submit(fetch_and_calc, sym): sym for sym in symbols}
+
+        # as_completed 会在某个线程完成时立刻 yield
+        for future in as_completed(future_to_symbol):
+            completed_count += 1
+            res = future.result()
+            if res is not None:
+                results.append(res)
+
+            # 打印进度条
+            if completed_count % 50 == 0 or completed_count == total_symbols:
+                print(f"进度: 已处理 {completed_count}/{total_symbols} 个合约...")
 
     df_res = pd.DataFrame(results)
 
     if not df_res.empty:
-        # ==========================================
-        # 核心：重排列顺序并排序
-        # ==========================================
-        # 1. 明确列的顺序：将 'Overall Avg Vol %' 强制放在第三列（索引为2）
-        col_order = ['Symbol', 'Latest Price', 'Overall Avg Vol %'] + [f'Avg Vol ({m}m) %' for m in minutes_list]
+        # 强制排列列的顺序：基础信息 -> 综合波动率 -> 各维度波动率
+        col_order = ['Symbol', 'Latest Price', 'Funding Rate %', 'Overall Avg Vol %'] + [f'Avg Vol ({m}m) %' for m in
+                                                                                         minutes_list]
         df_res = df_res[col_order]
 
-        # 2. 按照综合平均波动率进行降序排序
+        # 按照“综合平均波动率”降序排序
         df_res = df_res.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
 
-        # 3. 将所有的波动率列保留 4 位小数，使界面更清爽
+        # 格式化小数位数
+        df_res['Funding Rate %'] = df_res['Funding Rate %'].round(4)
         df_res['Overall Avg Vol %'] = df_res['Overall Avg Vol %'].round(4)
         for m in minutes_list:
             df_res[f'Avg Vol ({m}m) %'] = df_res[f'Avg Vol ({m}m) %'].round(4)
 
     return df_res
-
 
 
 def get_binance_futures_change(hours=48):
@@ -353,12 +385,12 @@ if __name__ == "__main__":
     # print(f"✅ 数据已成功保存至:\n{csv_file_path}")
 
 
-    # 获取合约指定时间的涨跌幅
-    change_hours = 2
-    df_ranking = get_binance_futures_change(hours=change_hours)
-
-    print(f"\n✅ 币安合约过去 {change_hours} 小时涨跌幅排行 (前 10 名):")
-    print(df_ranking.head(10).to_string())
+    # # 获取合约指定时间的涨跌幅
+    # change_hours = 2
+    # df_ranking = get_binance_futures_change(hours=change_hours)
+    #
+    # print(f"\n✅ 币安合约过去 {change_hours} 小时涨跌幅排行 (前 10 名):")
+    # print(df_ranking.head(10).to_string())
 
 
     # # 获取合约指定时间的波动率
