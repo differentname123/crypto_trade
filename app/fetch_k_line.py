@@ -77,6 +77,8 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
     :param minutes_list: 需要计算的过去分钟数的列表，例如 [15, 30, 60]
     :param max_workers: 线程池并发数，建议 10-20，过高容易触发币安 IP 频率限制
     """
+    import time  # 确保内部可用
+
     if isinstance(minutes_list, int):
         minutes_list = [minutes_list]
 
@@ -113,14 +115,19 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
     print(f"共发现 {len(symbols)} 个交易中的 U本位永续合约。")
 
     # ==========================================
-    # 批量获取资金费率 (只需 1 次 API 请求)
+    # 批量获取资金费率 (增加 5 次重试机制)
     # ==========================================
     print("正在批量拉取全市场最新资金费率...")
-    try:
-        funding_rates_data = exchange.fetch_funding_rates(symbols)
-    except Exception as e:
-        print(f"⚠️ 获取资金费率失败: {e}")
-        funding_rates_data = {}
+    funding_rates_data = {}
+    for attempt in range(5):
+        try:
+            funding_rates_data = exchange.fetch_funding_rates(symbols)
+            break
+        except Exception as e:
+            if attempt == 4:
+                print(f"⚠️ 获取资金费率失败(已重试5次): {e}")
+            else:
+                time.sleep(1)
 
     if max_minutes > 1000:
         print("⚠️ 警告: 请求的分钟数超过了 1000 分钟。已截断为 1000 条。")
@@ -128,33 +135,63 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
     else:
         limit = max_minutes
 
-    now = exchange.milliseconds()
-    since = now - int(limit * 60 * 1000)
-
     results = []
 
     # ==========================================
-    # 定义单线程处理函数
+    # 定义单线程处理函数 (加入循环拉取与重试防错)
     # ==========================================
     def fetch_and_calc(symbol):
         try:
-            # 拉取 K 线数据 (公开接口，无需签名)
-            ohlcv = exchange.fetch_ohlcv(symbol, '1m', since=since, limit=limit)
+            all_ohlcv = []
+            now = exchange.milliseconds()
+            current_since = now - int(limit * 60 * 1000)
 
-            if not ohlcv or len(ohlcv) < (limit * 0.8):
-                return None  # 数据不足，丢弃
+            # 循环分批拉取，防止超过币安限制
+            while len(all_ohlcv) < limit:
+                fetch_limit = min(limit - len(all_ohlcv), 1000)
+                ohlcv = None
 
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                # 拉取 K 线数据 (增加 5 次重试机制)
+                for attempt in range(5):
+                    try:
+                        ohlcv = exchange.fetch_ohlcv(symbol, '1m', since=current_since, limit=fetch_limit)
+                        break
+                    except Exception as e:
+                        if attempt == 4:
+                            raise Exception(f"K线拉取失败(已重试5次): {e}")
+                        time.sleep(1)
+
+                if not ohlcv:
+                    break  # 如果没有数据返回，说明到底了
+
+                all_ohlcv.extend(ohlcv)
+                current_since = ohlcv[-1][0] + 60000
+
+                if len(ohlcv) < fetch_limit:
+                    break
+
+            if len(all_ohlcv) < (limit * 0.8):
+                print(f"⚠️ [{symbol}] K线数量不足: 期望 {limit} 根, 实际拼接到 {len(all_ohlcv)} 根, 已丢弃。")
+                return None
+
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+            # 强制转换为 float，防止数据污染报错
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(
+                float)
             df = df[df['low'] > 0]
+
+            if df.empty:
+                return None
 
             # 计算波动率
             df['volatility'] = (df['high'] - df['low']) / df['low'] * 100
             latest_price = df['close'].iloc[-1]
 
-            # 获取该币种的资金费率（转化为百分比，通常资金费率为 0.0001 表示 0.01%）
+            # 获取该币种的资金费率（防字符串异常处理）
             fr_info = funding_rates_data.get(symbol, {})
-            funding_rate = fr_info.get('fundingRate', 0)
-            funding_rate_pct = funding_rate * 100 if funding_rate else 0.0
+            funding_rate = fr_info.get('fundingRate') or fr_info.get('info', {}).get('fundingRate') or 0
+            funding_rate_pct = float(funding_rate) * 100 if funding_rate else 0.0
 
             symbol_data = {
                 'Symbol': symbol,
@@ -165,15 +202,16 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
             temp_vols = []
             for m in minutes_list:
                 df_m = df.tail(m)
-                avg_vol = df_m['volatility'].mean()
+                avg_vol = df_m['volatility'].mean() if not df_m.empty else 0
                 symbol_data[f'Avg Vol ({m}m) %'] = avg_vol
                 temp_vols.append(avg_vol)
 
             # 计算综合平均波动率
-            symbol_data['Overall Avg Vol %'] = sum(temp_vols) / len(temp_vols)
+            symbol_data['Overall Avg Vol %'] = sum(temp_vols) / len(temp_vols) if temp_vols else 0
             return symbol_data
 
         except Exception as e:
+            print(f"❌ [{symbol}] 处理时发生异常: {e}")
             return None
 
     # ==========================================
@@ -219,6 +257,178 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
 
     return df_res
 
+
+def get_okx_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
+    """
+    获取欧易 (OKX) U本位永续合约的多维度平均分钟波动率及资金费率。
+    """
+    import time  # 确保内部可用
+
+    if isinstance(minutes_list, int):
+        minutes_list = [minutes_list]
+
+    max_minutes = max(minutes_list)
+
+    print(f"\n==========================================")
+    print(f"🚀 开始并发获取欧易(OKX)合约波动率 & 资金费率")
+    print(f"时间维度: {minutes_list} 分钟 | 并发线程数: {max_workers}")
+    print(f"==========================================")
+
+    # 实例化交易所 (OKX)
+    exchange = ccxt.okx({
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'swap',
+        },
+        # 如果在海外服务器运行，请注释掉 proxies
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    print("正在加载欧易合约市场数据...")
+    markets = exchange.load_markets()
+
+    # 过滤出欧易的 U本位永续合约
+    symbols = [
+        symbol for symbol, market in markets.items()
+        if market.get('active')
+           and market.get('linear')
+           and market.get('settle') == 'USDT'  # 核心变动：OKX 使用 settle 判断结算货币
+           and market.get('type') == 'swap'
+    ]
+    print(f"共发现 {len(symbols)} 个交易中的 U本位永续合约。")
+
+    # ==========================================
+    # 批量获取资金费率 (增加 5 次重试机制)
+    # ==========================================
+    print("正在拉取全市场最新资金费率 (OKX)...")
+    funding_rates_data = {}
+    for attempt in range(5):
+        try:
+            funding_rates_data = exchange.fetch_funding_rates(symbols)
+            break
+        except Exception as e:
+            if attempt == 4:
+                print(f"⚠️ 获取资金费率失败(已重试5次): {e}")
+            else:
+                time.sleep(1)
+
+    if max_minutes > 1000:
+        print("⚠️ 警告: 请求的分钟数超过限制，已截断为 1000 条。")
+        limit = 1000
+    else:
+        limit = max_minutes
+
+    results = []
+
+    def fetch_and_calc(symbol):
+        try:
+            all_ohlcv = []
+            now = exchange.milliseconds()
+            current_since = now - int(limit * 60 * 1000)
+
+            # 💡 核心修复：循环分批拉取，突破 OKX 单次最多 300 根的限制
+            while len(all_ohlcv) < limit:
+                fetch_limit = min(limit - len(all_ohlcv), 300)
+                ohlcv = None
+
+                # 拉取 K 线数据 (增加 5 次重试机制)
+                for attempt in range(5):
+                    try:
+                        ohlcv = exchange.fetch_ohlcv(symbol, '1m', since=current_since, limit=fetch_limit)
+                        break
+                    except Exception as e:
+                        if attempt == 4:
+                            raise Exception(f"K线拉取失败(已重试5次): {e}")
+                        time.sleep(1)
+
+                if not ohlcv:
+                    break  # 如果没有数据返回，说明到底了
+
+                all_ohlcv.extend(ohlcv)
+                current_since = ohlcv[-1][0] + 60000
+
+                if len(ohlcv) < fetch_limit:
+                    break
+
+            if len(all_ohlcv) < (limit * 0.8):
+                print(f"⚠️ [{symbol}] K线数量不足: 期望 {limit} 根, 实际拼接到 {len(all_ohlcv)} 根, 已丢弃。")
+                return None
+
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+            # 强制转换为 float，防止数据污染
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(
+                float)
+
+            df = df[df['low'] > 0]
+
+            if df.empty:
+                return None
+
+            # 计算波动率 (振幅)
+            df['volatility'] = (df['high'] - df['low']) / df['low'] * 100
+            latest_price = df['close'].iloc[-1]
+
+            # 获取资金费率
+            fr_info = funding_rates_data.get(symbol, {})
+            funding_rate = fr_info.get('fundingRate') or fr_info.get('info', {}).get('fundingRate') or 0
+            funding_rate_pct = float(funding_rate) * 100 if funding_rate else 0.0
+
+            symbol_data = {
+                'Symbol': symbol,
+                'Latest Price': latest_price,
+                'Funding Rate %': funding_rate_pct
+            }
+
+            temp_vols = []
+            for m in minutes_list:
+                df_m = df.tail(m)
+                avg_vol = df_m['volatility'].mean() if not df_m.empty else 0
+                symbol_data[f'Avg Vol ({m}m) %'] = avg_vol
+                temp_vols.append(avg_vol)
+
+            symbol_data['Overall Avg Vol %'] = sum(temp_vols) / len(temp_vols) if temp_vols else 0
+            return symbol_data
+
+        except Exception as e:
+            print(f"❌ [{symbol}] 处理时发生异常: {e}")
+            return None
+
+    print(f"正在启动 {max_workers} 个线程拉取 {limit} 根 K线数据...")
+
+    completed_count = 0
+    total_symbols = len(symbols)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_symbol = {executor.submit(fetch_and_calc, sym): sym for sym in symbols}
+
+        for future in as_completed(future_to_symbol):
+            completed_count += 1
+            res = future.result()
+            if res is not None:
+                results.append(res)
+
+            if completed_count % 50 == 0 or completed_count == total_symbols:
+                print(f"进度: 已处理 {completed_count}/{total_symbols} 个合约...")
+
+    df_res = pd.DataFrame(results)
+
+    if not df_res.empty:
+        col_order = ['Symbol', 'Latest Price', 'Funding Rate %', 'Overall Avg Vol %'] + [f'Avg Vol ({m}m) %' for m in
+                                                                                         minutes_list]
+        df_res = df_res[col_order]
+
+        df_res = df_res.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
+
+        df_res['Funding Rate %'] = df_res['Funding Rate %'].round(4)
+        df_res['Overall Avg Vol %'] = df_res['Overall Avg Vol %'].round(4)
+        for m in minutes_list:
+            df_res[f'Avg Vol ({m}m) %'] = df_res[f'Avg Vol ({m}m) %'].round(4)
+
+    return df_res
 
 def get_binance_futures_change(hours=48):
     """
@@ -397,8 +607,18 @@ if __name__ == "__main__":
 
     calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600]
 
-    df_volatility = get_binance_volatility_ranking(minutes_list=calc_minutes_list)
+    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    okx_df = get_okx_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
 
-    print(f"\n✅ 币安合约多维度波动率排行 (默认按 {calc_minutes_list[0]}m 排序，前 15 名):")
-    # 为了防止控制台打印时列被折叠，稍微调整一下 Pandas 显示设置
-    pd.set_option('display.max_columns', None)
+    # 2. 添加来源列 (直接插入到最前面的第0列)
+    if not okx_df.empty: okx_df.insert(0, 'Source', 'OKX')
+    if not bin_df.empty: bin_df.insert(0, 'Source', 'Binance')
+
+    # 3. 纵向合并 (直接叠加：50行 + 50行 = 100行)
+    df_combined = pd.concat([okx_df, bin_df], ignore_index=True)
+
+    # 4. 合并后全局重新降序排序
+    if not df_combined.empty:
+        df_combined = df_combined.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
+
+    print(f"合并成功！总行数: {len(df_combined)}")
