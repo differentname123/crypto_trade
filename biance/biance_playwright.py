@@ -346,8 +346,11 @@ def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[st
             print("[*] 正在加载目标帖子...")
             page.goto(post_url)
             # time.sleep(1000)
-            # 等待网络空闲，确保 React 组件加载完毕
-            page.wait_for_load_state("networkidle")
+
+            # 【修复点】：放弃 networkidle，改用更松散的加载判定，避免被 WebSocket 长连接卡死
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(2)  # 给 React 组件额外一点渲染时间
+
             check_for_crash_and_abort(page)
 
             # 稍微滚动页面，让评论框出现在视野范围内（懒加载触发）
@@ -414,10 +417,10 @@ if __name__ == '__main__':
     # 步骤 2：登录成功后，使用自动化评论功能
     # ==================================
     test_post_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
-    test_comment_text = "一起发大财！"
+    test_comment_text = "携手共进！"
 
     # 【新增测试用例】：填写本地图片的绝对路径，如果不需要发图片，保持为 None 即可
-    test_image_path = r"C:\Users\zxh\Desktop\temp\crypt.png"
+    test_image_path = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-2366355a6874.png"
 
     err, success = comment_on_binance_post(
         post_url=test_post_url,
