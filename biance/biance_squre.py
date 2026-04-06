@@ -160,14 +160,7 @@ if __name__ == "__main__":
     print("3. 测试: 广场自动化发帖")
     print("=" * 40)
     YOUR_SQUARE_API_KEY = get_config("myself_square_api_key")
-    test_text = """$MET 做多！！
-    刚突破0.139，24h爆拉近10个点！
-    MET项目成交量放大到1万刀，主力明显在动。
-    趋势走出来了，抓紧上车别掉队！
-    🔥🔥🔥
-
-    #比特币 #合约交易 #BinanceSquare #DOGE
-    {future}(METUSDT)"""
+    test_text = """$ETH $BTC 祝愿大家发大财 天天开心"""
 
     if YOUR_SQUARE_API_KEY != "替换成你的_API_KEY":
         publish_to_binance_square(api_key=YOUR_SQUARE_API_KEY, text_content=test_text)

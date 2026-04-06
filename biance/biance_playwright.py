@@ -6,7 +6,7 @@
 :last_date:
     2026/4/7 1:12
 :description:
-    
+
 """
 import json
 import os
@@ -185,17 +185,15 @@ def _scroll_page_to_bottom(page: Page, steps: int = 10, step_px: int = 800, dela
         time.sleep(delay)
 
 
-def _submit_comment(page: Page, comment: str):
-    """(内部调用) 在币安广场帖子中定位并发送评论"""
+def _submit_comment(page: Page, comment: str, image_path: Optional[str] = None):
+    """(内部调用) 在币安广场帖子中定位并发送评论，支持附件图片和智能重试"""
     print("[*] 正在定位评论输入框...")
 
     try:
         # --- 第 1 步：点击伪装的占位输入框 ---
-        # 兼容中英文占位符，且兼容 <input> 元素
         trigger_input = page.locator(
             'input[placeholder*="回复"], input[placeholder*="Reply"], input[placeholder*="发布"]').first
 
-        # 如果正则表达式找不到，尝试用类名特征做备用方案
         if not trigger_input.is_visible(timeout=5000):
             trigger_input = page.locator("input.bg-transparent").first
 
@@ -204,11 +202,9 @@ def _submit_comment(page: Page, comment: str):
         print("[*] 找到初始占位输入框，正在点击以唤醒真实编辑器...")
         trigger_input.click()
 
-        # 给予前端 React 动态渲染 DOM 的时间
         time.sleep(1)
 
         # --- 第 2 步：操作真实的富文本编辑器 ---
-        # 根据你提供的结构: <div class="ProseMirror" contenteditable="true">
         real_editor = page.locator('div.ProseMirror[contenteditable="true"], div[contenteditable="true"]').last
         expect(real_editor).to_be_editable(timeout=10000)
 
@@ -216,31 +212,79 @@ def _submit_comment(page: Page, comment: str):
         real_editor.click()
         time.sleep(0.5)
 
-        # 重点：对于复杂的富文本编辑器，避免用 .fill() 覆盖节点结构
-        # 改用 keyboard.type 逐字模拟敲击，能最大概率触发前端的字数统计和状态校验
         page.keyboard.type(comment, delay=30)
         print("[+] 评论内容已填入。")
 
-        # 再次等待，确保前端状态机捕获到文字变化并解禁“发送”按钮
         time.sleep(1.5)
 
-        # --- 第 3 步：点击提交按钮 ---
-        # 严格匹配按钮上的文字，同时兼容中英文
+        # --- 第 2.5 步：处理图片上传逻辑 ---
+        if image_path:
+            if not os.path.exists(image_path):
+                print(f"[!] 警告: 图片文件不存在 ({image_path})，将仅发送文字。")
+            else:
+                print(f"[*] 检测到图片，准备上传: {image_path}")
+                try:
+                    try:
+                        with page.expect_file_chooser(timeout=5000) as fc_info:
+                            upload_btn = page.locator(
+                                'button.css-1ctgi7o, button:has-text("Upload file"), button[aria-label="图片"], button[aria-label="Image"]').first
+                            upload_btn.click()
+
+                        fc_info.value.set_files(image_path)
+                        print("[+] 拦截系统弹窗成功，已加载图片。")
+                    except Exception as btn_e:
+                        print(f"[*] 模拟点击图片按钮失败，尝试底层注入: {btn_e}")
+                        file_input = page.locator('input[type="file"]')
+                        if file_input.count() > 0:
+                            file_input.last.set_input_files(image_path)
+                            print("[+] 已通过底层 input 成功加载图片。")
+                        else:
+                            raise Exception("找不到任何可用的图片上传入口。")
+                except Exception as img_e:
+                    print(f"[!] 图片上传过程中出现异常，可能只会发送纯文本: {img_e}")
+
+        # --- 第 3 步：点击提交按钮 (替换为智能校验循环) ---
         send_button = page.locator("button").filter(
             has_text=re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
         ).last
 
-        expect(send_button).to_be_enabled(timeout=10000)
-        print("[*] 发送按钮已就绪，正在点击...")
-        send_button.click()
+        print("[*] 开始尝试发送评论 (智能重试中)...")
+        send_success = False
 
-        # 等待接口响应完成
-        time.sleep(3)
+        # 最多尝试 15 次，每次间隔 2 秒 (总计可等待 30 秒，足以应对大图片上传)
+        for i in range(15):
+            # force=True 强制点击，绕过 Playwright 对可视性和遮挡的严格校验
+            send_button.click(force=True)
+            time.sleep(2.5)  # 给网络请求和前端状态更新留出时间
+
+            # 检查1：如果编辑器直接从 DOM 里消失了（被收起），说明发送成功
+            if not real_editor.is_visible():
+                send_success = True
+                break
+
+            # 检查2：如果编辑器还在，提取里面的文字
+            current_text = real_editor.inner_text().strip()
+
+            # 如果当前输入框里的字数不到你填入评论的 1/3，说明内容被清空了，发送成功
+            # (处理富文本编辑器清空后可能残留空格或零宽字符的情况)
+            print(f"[*] 当前输入框内容长度: {len(current_text)}, 评论内容长度: {len(comment.strip())}")
+            if len(current_text) < (len(comment.strip()) / 3):
+                send_success = True
+                break
+
+            print(f"[*] 按钮可能仍在处理中(仍被前端拦截)，正在重试 ({i + 1}/15)...")
+
+        if not send_success:
+            raise Exception("尝试了多次点击发送，但评论内容始终未清空，疑似发送失败或图片过大。")
+
+        print("[+] 评论流执行确认完毕，已清空输入框！")
 
     except Exception as e:
         raise Exception(f"提交评论时遇到障碍: {e}")
 
-def comment_on_binance_post(post_url: str, comment: str, user_data_dir=USER_DATA_DIR) -> Tuple[Optional[str], bool]:
+
+def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[str] = None,
+                            user_data_dir=USER_DATA_DIR) -> Tuple[Optional[str], bool]:
     """
     使用已保存的登录会话启动浏览器，访问币安广场帖子并自动发送评论。
 
@@ -295,7 +339,7 @@ def comment_on_binance_post(post_url: str, comment: str, user_data_dir=USER_DATA
 
             print("[*] 正在加载目标帖子...")
             page.goto(post_url)
-
+            # time.sleep(1000)
             # 等待网络空闲，确保 React 组件加载完毕
             page.wait_for_load_state("networkidle")
             check_for_crash_and_abort(page)
@@ -304,8 +348,8 @@ def comment_on_binance_post(post_url: str, comment: str, user_data_dir=USER_DATA
             _scroll_page_to_bottom(page, steps=5)
             check_for_crash_and_abort(page)
 
-            # 执行填写和提交
-            _submit_comment(page, comment)
+            # 执行填写和提交 (带入图片参数)
+            _submit_comment(page, comment, image_path)
 
             check_for_crash_and_abort(page)
             print("[+] 评论流执行完毕！")
@@ -350,6 +394,7 @@ def comment_on_binance_post(post_url: str, comment: str, user_data_dir=USER_DATA
 
     return error_info, is_success
 
+
 # ==============================================================================
 # 程序主入口和使用示例
 # ==============================================================================
@@ -357,15 +402,22 @@ if __name__ == '__main__':
     # ==================================
     # 步骤 1：首次使用请取消下面这行的注释进行登录
     # ==================================
-    login_and_save_session()
+    # login_and_save_session()
 
     # ==================================
     # 步骤 2：登录成功后，使用自动化评论功能
     # ==================================
-    test_post_url = "https://www.binance.com/zh-CN/square/post/309671050623009"
-    test_comment_text = "支持！非常深度的分析，感谢博主分享！"
+    test_post_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
+    test_comment_text = "一起发大财！"
 
-    err, success = comment_on_binance_post(post_url=test_post_url, comment=test_comment_text)
+    # 【新增测试用例】：填写本地图片的绝对路径，如果不需要发图片，保持为 None 即可
+    test_image_path = r"C:\Users\zxh\Desktop\temp\crypt.png"
+
+    err, success = comment_on_binance_post(
+        post_url=test_post_url,
+        comment=test_comment_text,
+        image_path=test_image_path
+    )
 
     if err:
         print("\n======== ❌ 失败 ========")
