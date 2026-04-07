@@ -494,8 +494,9 @@ const i18n = {
         success_sim: "✅ 推演完成",
         err_calc: "❌ 计算出错",
         res_req_margin: "所需资金总计 (U)",
-        res_margin_desc: "依据上述策略设置，您的策略实际所需的极限保证金为: ", // 修复了繁体字
+        res_margin_desc: "依据上述策略设置，您的策略实际所需的极限保证金为: ",
         res_max_loss: "最大可扛幅差 (跌/涨)",
+        res_limit_price: "对应极限价格", // 新增中文翻译
         res_min_step: "最小加仓步长",
         res_max_qty: "最大单次下单量",
         res_util: "资金利用率",
@@ -548,6 +549,7 @@ const i18n = {
         res_req_margin: "Total Required Margin (U)",
         res_margin_desc: "Based on the above settings, the absolute maximum required margin is: ",
         res_max_loss: "Max Tolerable Drop/Surge",
+        res_limit_price: "Corresponding Limit Price", // 新增英文翻译
         res_min_step: "Min Grid Spacing (Step %)",
         res_max_qty: "Max Fixed Qty per Grid",
         res_util: "Margin Utilization",
@@ -771,7 +773,16 @@ function executeCalculation() {
             let res = _universal_margin_solver("target_loss_percent", available_margin, params, 0.1, max_loss_bound, true, 0.001);
             if (res.status === 'success') {
                 resultStatus.innerHTML = `<span class="success">${t.success_sim}</span>`;
-                resultHtml = renderResultCard(t.res_max_loss, `${res.optimal_value}%`, res, t);
+
+                // 【新增逻辑】计算极限价格
+                let limit_price = params.direction === 'long'
+                    ? params.initial_price * (1.0 - res.optimal_value / 100.0)
+                    : params.initial_price * (1.0 + res.optimal_value / 100.0);
+
+                // 【渲染逻辑】将百分比和极限价格组合成富文本传递给通用渲染函数，不破坏原有结构
+                let valueHtml = `${res.optimal_value}% <br><span style="font-size: 1.1rem; color: #6b7280; font-weight: normal;">≈ ${t.res_limit_price}: ${limit_price.toFixed(4)}</span>`;
+
+                resultHtml = renderResultCard(t.res_max_loss, valueHtml, res, t);
             } else { throw new Error(res.message); }
         } else if (mode === "2") {
             let res = _universal_margin_solver("add_step_percent", available_margin, params, 0.01, 100.0, false, 0.001);
