@@ -27,7 +27,7 @@ const HTML_CONTENT = `
             
             <div class="flex flex-col items-start md:items-end gap-2 w-full md:w-auto">
                 <p id="currentTime" class="text-gray-400 text-xs md:text-sm font-mono"></p>
-                <button id="refreshBtn" onclick="fetchData()" class="w-full md:w-auto justify-center bg-yellow-600 hover:bg-yellow-500 transition-colors px-6 py-2 rounded font-bold shadow-lg flex items-center gap-2 mt-2 md:mt-0">
+                <button id="refreshBtn" onclick="fetchData(false)" class="w-full md:w-auto justify-center bg-yellow-600 hover:bg-yellow-500 transition-colors px-6 py-2 rounded font-bold shadow-lg flex items-center gap-2 mt-2 md:mt-0">
                     ⚡ 实时拉取最新数据
                 </button>
             </div>
@@ -42,7 +42,7 @@ const HTML_CONTENT = `
                         </tr>
                 </thead>
                 <tbody id="tableBody" class="bg-gray-900 divide-y divide-gray-800">
-                    <tr><td colspan="10" class="p-8 text-center text-gray-500 text-sm md:text-base">点击右上角按钮开始实时拉取市场数据...</td></tr>
+                    <tr><td colspan="10" class="p-8 text-center text-gray-500 text-sm md:text-base">页面初始化中...</td></tr>
                 </tbody>
             </table>
         </div>
@@ -123,7 +123,7 @@ const HTML_CONTENT = `
             }
 
             if (displayData.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="' + (4 + currentMinutes.length) + '" class="p-8 text-center text-gray-500 text-sm md:text-base">当前没有满足条件的波动率数据。</td></tr>';
+                tableBody.innerHTML = '<tr><td colspan="' + (4 + currentMinutes.length) + '" class="p-8 text-center text-gray-500 text-sm md:text-base">暂无数据。</td></tr>';
                 return;
             }
 
@@ -158,20 +158,53 @@ const HTML_CONTENT = `
             errorBox.classList.remove('hidden');
         }
 
-        async function fetchData() {
+        // 核心修改：支持静默更新逻辑
+        async function fetchData(isInitialLoad = false) {
             const btn = document.getElementById('refreshBtn');
             const errorBox = document.getElementById('errorBox');
             const updateTimeEl = document.getElementById('updateTime');
             const minutesInput = document.getElementById('minutesInput').value;
+            const tableBody = document.getElementById('tableBody');
+            const tempColspan = 4 + currentMinutes.length;
             
-            btn.innerHTML = "⏳ <span class='hidden md:inline'>正在连接币安</span>拉取中...";
+            // 全局设置按钮不可点击状态
+            btn.innerHTML = "⏳ <span class='hidden md:inline'>后台</span>同步中...";
             btn.disabled = true;
             btn.classList.add('opacity-50', 'cursor-not-allowed');
             errorBox.classList.add('hidden');
-            
-            const tempColspan = 4 + currentMinutes.length;
-            document.getElementById('tableBody').innerHTML = '<tr><td colspan="' + tempColspan + '" class="p-8 text-center text-yellow-500 text-sm md:text-base animate-pulse">正在并发拉取主力合约 K 线数据，请稍候...</td></tr>';
 
+            let hasRenderedCache = false;
+
+            // 1. 初次访问：急速请求纯缓存接口，瞬间渲染页面
+            if (isInitialLoad) {
+                try {
+                    const cacheRes = await fetch('/api/cache');
+                    if (cacheRes.ok) {
+                        const cacheJson = await cacheRes.json();
+                        if (cacheJson && cacheJson.data) {
+                            currentData = cacheJson.data;
+                            defaultData = [...cacheJson.data];
+                            if (cacheJson.minutesList) currentMinutes = cacheJson.minutesList;
+                            sortConfig = { key: 'overall', direction: 'desc' };
+                            renderTable();
+                            updateTimeEl.innerHTML = \`⚠️ 已展示云端历史数据，后台正在同步最新市场数据...\`;
+                            updateTimeEl.className = "text-yellow-500 mt-2 text-xs md:text-sm animate-pulse";
+                            hasRenderedCache = true;
+                        }
+                    }
+                } catch (e) {
+                    console.log("极速缓存读取失败", e);
+                }
+            }
+
+            // 如果没有缓存，或者用户是手动点击刷新的，才显示全屏 loading
+            if (!hasRenderedCache && currentData.length === 0) {
+                tableBody.innerHTML = \`<tr><td colspan="\${tempColspan}" class="p-8 text-center text-yellow-500 text-sm md:text-base animate-pulse">正在并发拉取主力合约 K 线数据，请稍候...</td></tr>\`;
+                updateTimeEl.innerHTML = \`🔄 正在初始化市场数据...\`;
+                updateTimeEl.className = "text-yellow-500 mt-2 text-xs md:text-sm animate-pulse";
+            }
+
+            // 2. 深度请求：向后台发起带参数的真实数据拉取任务
             try {
                 const response = await fetch('/api/data?minutes=' + encodeURIComponent(minutesInput));
                 const json = await response.json();
@@ -187,15 +220,14 @@ const HTML_CONTENT = `
                 // 更新全局数据并重置排序
                 currentData = json.data;
                 defaultData = [...json.data]; 
-                // 如果后端返回了使用的 minutesList，则同步前端的列
                 if (json.minutesList) {
                     currentMinutes = json.minutesList; 
                 }
                 sortConfig = { key: 'overall', direction: 'desc' }; 
                 
+                // 深度拉取成功，无缝替换表格数据
                 renderTable();
 
-                // 【核心修改】：根据后端返回的 isCached 标识，展示不同状态
                 if (json.isCached) {
                     showErrorBox(\`<strong>⚠️ 本次云端刷新失败:</strong> 后端拉取异常 (\${json.errorMsg || '未知原因'}) <br> <span class="block mt-2 font-semibold text-yellow-400">已为您加载 Cloudflare 云端历史数据 (数据最后更新于: \${formatDateTime(json.updateTime)})</span>\`, true);
                     updateTimeEl.innerHTML = \`⚠️ 正在展示云端历史缓存数据\`;
@@ -208,10 +240,18 @@ const HTML_CONTENT = `
             } catch (error) {
                 console.error("请求失败详情:", error);
                 showErrorBox(\`<strong>⚠️ 拉取失败:</strong> \${error.message} <br> <span class="text-xs text-red-300 mt-1 block">可能是由于触发了币安风控拦截，且云端无历史缓存可用。</span>\`);
-                document.getElementById('tableBody').innerHTML = \`<tr><td colspan="\${tempColspan}" class="p-8 text-center text-red-500 text-sm md:text-base">获取数据失败，请稍后重试。</td></tr>\`;
-                updateTimeEl.innerHTML = \`❌ 数据拉取失败\`;
-                updateTimeEl.className = "text-red-400 mt-2 text-xs md:text-sm";
+                
+                // 如果之前没渲染出任何缓存，才把表格替换为报错信息
+                if (currentData.length === 0) {
+                    document.getElementById('tableBody').innerHTML = \`<tr><td colspan="\${tempColspan}" class="p-8 text-center text-red-500 text-sm md:text-base">获取数据失败，请稍后重试。</td></tr>\`;
+                    updateTimeEl.innerHTML = \`❌ 数据拉取失败\`;
+                    updateTimeEl.className = "text-red-400 mt-2 text-xs md:text-sm";
+                } else {
+                    updateTimeEl.innerHTML = \`❌ 后台更新失败，当前展示为历史缓存数据\`;
+                    updateTimeEl.className = "text-red-400 mt-2 text-xs md:text-sm";
+                }
             } finally {
+                // 释放按钮状态
                 btn.innerHTML = "⚡ <span class='hidden md:inline'>实时</span>拉取最新数据";
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -219,7 +259,8 @@ const HTML_CONTENT = `
         }
 
         renderTable();
-        fetchData();
+        // 初始化时传入 true，触发先缓存后刷新的静默加载机制
+        fetchData(true);
     </script>
 </body>
 </html>
@@ -233,12 +274,31 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 路由 A：页面
     if (url.pathname === "/") {
       return new Response(HTML_CONTENT, {
         headers: { "Content-Type": "text/html;charset=UTF-8" },
       });
     }
 
+    // 路由 B：新增的【极速缓存读取接口】
+    if (url.pathname === "/api/cache") {
+      try {
+        if (env && env.VOLATILITY_KV) {
+            const cachedDataStr = await env.VOLATILITY_KV.get("RANKING_DATA");
+            if (cachedDataStr) {
+                return new Response(cachedDataStr, {
+                    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" }
+                });
+            }
+        }
+        return new Response(JSON.stringify({ error: "No cache found" }), { status: 404 });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), { status: 500 });
+      }
+    }
+
+    // 路由 C：真实数据拉取接口
     if (url.pathname === "/api/data") {
       try {
         let minutesList = [15, 30, 60];
@@ -248,7 +308,6 @@ export default {
             if (parsed.length > 0) minutesList = parsed;
         }
 
-        // 【核心修改】：传入 env 以便后端能够操作 KV 数据库
         const data = await updateVolatilityData(minutesList, env);
         data.minutesList = minutesList;
 
@@ -385,23 +444,20 @@ async function updateVolatilityData(minutesList, env) {
       data: results
     };
 
-    // 【核心新增】：如果成功，将数据存入 Cloudflare KV 数据库
     if (env && env.VOLATILITY_KV) {
-        // 使用 waitUntil 让存库操作在后台执行，不阻塞返回前端的速度
         env.VOLATILITY_KV.put("RANKING_DATA", JSON.stringify(finalData)).catch(e => console.error("KV 写入失败", e));
     }
 
     return finalData;
 
   } catch (err) {
-    // 【核心新增】：如果拉取失败，尝试从 Cloudflare KV 读取历史数据作为降级展示
     if (env && env.VOLATILITY_KV) {
         try {
             const cachedDataStr = await env.VOLATILITY_KV.get("RANKING_DATA");
             if (cachedDataStr) {
                 const cachedData = JSON.parse(cachedDataStr);
-                cachedData.isCached = true; // 告诉前端这是旧数据
-                cachedData.errorMsg = err.message; // 附带原始报错原因
+                cachedData.isCached = true;
+                cachedData.errorMsg = err.message;
                 return cachedData;
             }
         } catch (kvErr) {
@@ -409,7 +465,6 @@ async function updateVolatilityData(minutesList, env) {
         }
     }
 
-    // 如果没有配置 KV 或者 KV 里完全没有历史数据，则直接抛出报错
     throw err; 
   }
 }
