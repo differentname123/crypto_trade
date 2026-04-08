@@ -69,6 +69,33 @@
             border-color: var(--primary-blue);
         }
 
+        /* 波动率按钮样式 */
+        .volatility-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 8px 24px;
+            background-color: #fff7ed;
+            color: #c2410c;
+            border: 1px solid #fed7aa;
+            border-radius: 20px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            text-decoration: none;
+        }
+
+        .volatility-btn:hover {
+            background-color: #ffedd5;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(194, 65, 12, 0.1);
+        }
+
+        .volatility-btn:active {
+            transform: translateY(0);
+        }
+
         /* 功能卡片区域 */
         .function-selector {
             margin-bottom: 30px;
@@ -314,7 +341,13 @@
         </select>
     </div>
 
-    <h1 data-i18n="title">网格策略保证金 & 参数推演系统</h1>
+    <h1 data-i18n="title" style="margin-bottom: 15px;">网格策略保证金 & 参数推演系统</h1>
+
+    <div style="text-align: center; margin-bottom: 30px;">
+        <button onclick="window.open('https://bodong-cka.pages.dev/', '_blank')" class="volatility-btn" data-i18n="btn_volatility">
+            🚀 波动率排行榜
+        </button>
+    </div>
 
     <div class="function-selector">
         <label data-i18n="select_op">🏆 请点击选择你要进行的操作：</label>
@@ -459,6 +492,7 @@ let currentLang = 'zh';
 const i18n = {
     zh: {
         title: "网格策略保证金 & 参数推演系统",
+        btn_volatility: "🚀 波动率排行榜", // 新增中文翻译
         select_op: "🏆 请点击选择你要进行的操作：",
         op0_title: "1. 资金计算器",
         op0_desc: "输入所有策略参数，点击计算即可得出所需的总资金。",
@@ -496,7 +530,7 @@ const i18n = {
         res_req_margin: "所需资金总计 (U)",
         res_margin_desc: "依据上述策略设置，您的策略实际所需的极限保证金为: ",
         res_max_loss: "最大可扛幅差 (跌/涨)",
-        res_limit_price: "对应极限价格", // 新增中文翻译
+        res_limit_price: "对应极限价格",
         res_min_step: "最小加仓步长",
         res_max_qty: "最大单次下单量",
         res_util: "资金利用率",
@@ -512,6 +546,7 @@ const i18n = {
     },
     en: {
         title: "Grid Strategy Margin & Parameter Simulator",
+        btn_volatility: "🚀 Volatility Leaderboard", // 新增英文翻译
         select_op: "🏆 Please select an operation:",
         op0_title: "1. Margin Calculator",
         op0_desc: "Input all parameters to calculate the total required margin.",
@@ -549,7 +584,7 @@ const i18n = {
         res_req_margin: "Total Required Margin (U)",
         res_margin_desc: "Based on the above settings, the absolute maximum required margin is: ",
         res_max_loss: "Max Tolerable Drop/Surge",
-        res_limit_price: "Corresponding Limit Price", // 新增英文翻译
+        res_limit_price: "Corresponding Limit Price",
         res_min_step: "Min Grid Spacing (Step %)",
         res_max_qty: "Max Fixed Qty per Grid",
         res_util: "Margin Utilization",
