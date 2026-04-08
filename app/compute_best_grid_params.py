@@ -37,6 +37,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     last_close = df['close'].iloc[-1]  # 记录最终收盘价
 
     realized_pnl = 0.0  # 已实现盈亏
+    paired_profit = 0.0  # 新增：已配对的利润（仅记录完成一开一平的闭环利润）
     positions = {}  # 当前持仓记录字典: { 网格层级 k : 开仓价格 }
     max_capital_needed = 0.0  # 历史记录中【所需的最大初始资金】(即最小不爆仓保证金)
     raw_equity_curve = []  # 记录纯净的资金变化曲线(不含初始资金)
@@ -122,6 +123,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
                             total_trades += 1
+
+                            # 新增：计算配对利润（扣除开平双边手续费）
+                            open_fee = entry_p * lot_size * fee_rate
+                            paired_profit += (gross_profit - fee - open_fee)
+
                             update_margin(pk, current_time)
                     else:  # direction == "short"
                         if k not in positions:  # 价格上涨，触发卖出开空
@@ -151,6 +157,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
                             total_trades += 1
+
+                            # 新增：计算配对利润（扣除开平双边手续费）
+                            open_fee = entry_p * lot_size * fee_rate
+                            paired_profit += (gross_profit - fee - open_fee)
+
                             update_margin(pk, current_time)
 
             p_prev = p
@@ -210,6 +221,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "grid_ratio": grid_ratio,
         "price_change_rate": price_change_rate,  # 标的物期间涨跌幅
         "total_profit": total_profit,  # 纯收益 (已扣除手续费)
+        "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
         "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
         "profit_to_margin_ratio": profit_rate,  # 收益 / 保证金 (核心参考价值)
         "max_drawdown": max_dd,  # 最大回撤率
@@ -240,8 +252,8 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     print(f"开始批量回测 (方向: {direction}) ...")
 
     # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
-    for i in range(1, 2):
-        grid_ratio = round(i * 0.001, 3)
+    for i in range(200, 1000):
+        grid_ratio = round(i * 0.0001, 5)
         res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
                             direction=direction)
         if res:
@@ -259,12 +271,13 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 
 
 if __name__ == "__main__":
-    csv_file_path = gen_csv_file()
-    data_dir = r"W:\project\python_project\crypto_trade\data"
+    csv_file_path = r"W:\project\python_project\crypto_trade\data\binance_JOE_USDT_USDT_1m.csv"
 
-    output_csv_path = f'{data_dir}/grid_backtest_results.csv'
+    output_csv_path = csv_file_path.replace(".csv", "_grid_backtest_results.csv")
     df = pd.read_csv(output_csv_path)
     df['score'] = df['profit_to_margin_ratio'] * df['total_trades']  # 简单的综合评分指标，越高越好
+    # df['score1'] = 1000000 * df['grid_ratio'] * df['total_profit']  # 简单的综合评分指标，越高越好
+    df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
     print()
     # data_df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
     # print()
@@ -283,8 +296,8 @@ if __name__ == "__main__":
 
         # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
         print("\n启动批量参数回测...")
-        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0001, lot_size=0.02,
-                                   direction="long")
+        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0004, lot_size=0.02,
+                                   direction="short")
 
     except FileNotFoundError:
         traceback.print_exc()

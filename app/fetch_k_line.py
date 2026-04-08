@@ -69,15 +69,19 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
     return df
 
 
-def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
+def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100, increase_hours=36,
+                                   min_increase_pct=50.0):
     """
     获取币安 U本位永续合约的多维度平均分钟波动率及资金费率。
     使用多线程并发拉取，从高到低排序。
 
     :param minutes_list: 需要计算的过去分钟数的列表，例如 [15, 30, 60]
     :param max_workers: 线程池并发数，建议 10-20，过高容易触发币安 IP 频率限制
+    :param increase_hours: 筛选涨幅所需的过去小时数
+    :param min_increase_pct: 过去 x 小时内的最小涨幅阈值 (例如 50 表示 50%)
     """
     import time  # 确保内部可用
+    from pathlib import Path
 
     if isinstance(minutes_list, int):
         minutes_list = [minutes_list]
@@ -113,6 +117,64 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
            and market.get('type') == 'swap'
     ]
     print(f"共发现 {len(symbols)} 个交易中的 U本位永续合约。")
+
+    # ==========================================
+    # 新增逻辑：提前筛选出满足涨幅要求的标的
+    # ==========================================
+    print(f"正在预筛选过去 {increase_hours} 小时内涨幅 >= {min_increase_pct}% 的合约 (防封 IP)...")
+    now_ts = exchange.milliseconds()
+    since_increase = now_ts - int(increase_hours * 60 * 60 * 1000)
+
+    try:
+        tickers = exchange.fetch_tickers(symbols)
+    except Exception as e:
+        print(f"⚠️ 批量获取现价失败: {e}")
+        tickers = {}
+
+    filtered_symbols = []
+
+    def check_increase(symbol):
+        try:
+            # 仅拉取一根指定时刻的历史K线进行比对
+            ohlcv_hist = exchange.fetch_ohlcv(symbol, '1h', since=since_increase, limit=1)
+            if not ohlcv_hist:
+                return None
+
+            historical_timestamp = ohlcv_hist[0][0]
+            historical_price = ohlcv_hist[0][1]
+
+            # 获取现价（容错处理：若批量获取失败则单独获取）
+            current_price = tickers.get(symbol, {}).get('last')
+            if not current_price:
+                current_price = exchange.fetch_ticker(symbol).get('last')
+
+            # 剔除现价异常或历史记录不符合时间要求（如新币）的情况
+            if not current_price or (historical_timestamp - since_increase > 2 * 60 * 60 * 1000):
+                return None
+
+            change_pct = (current_price - historical_price) / historical_price * 100
+            if change_pct >= min_increase_pct:
+                return symbol, change_pct
+        except Exception:
+            pass
+        return None
+
+    # 复用多线程加速筛选流程
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(check_increase, sym) for sym in symbols]
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                filtered_symbols.append(res[0])
+                print(f"✅ 符合要求: {res[0]} (涨幅: {res[1]:.2f}%)")
+
+    symbols = filtered_symbols
+    print(f"筛选完成，共保留 {len(symbols)} 个强势合约。将仅为它们深度拉取 1m K线数据。")
+
+    if not symbols:
+        print("⚠️ 未发现满足涨幅条件的合约，退出波动率计算。")
+        return pd.DataFrame()
+    # ==========================================
 
     # ==========================================
     # 批量获取资金费率 (增加 5 次重试机制)
@@ -183,6 +245,26 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
 
             if df.empty:
                 return None
+
+            # ==========================================
+            # 核心调整：单独保存该交易对的 1分钟 K线数据
+            # ==========================================
+            try:
+                save_dir = Path(r"W:\project\python_project\crypto_trade\data")
+                save_dir.mkdir(parents=True, exist_ok=True)
+
+                # 替换非法字符作为文件名
+                safe_symbol = symbol.replace('/', '_').replace(':', '_')
+                csv_path = save_dir / f"binance_{safe_symbol}_1m.csv"
+
+                # 拷贝一份专用于保存的数据，并将时间戳转为北京时间，方便在 Excel 中查看
+                df_save = df.copy()
+                df_save['timestamp'] = pd.to_datetime(df_save['timestamp'], unit='ms').dt.tz_localize(
+                    'UTC').dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
+                df_save.to_csv(csv_path, index=False, encoding='utf-8-sig')
+            except Exception as e:
+                print(f"⚠️ [{symbol}] 分钟线数据保存为CSV失败: {e}")
+            # ==========================================
 
             # 计算波动率
             df['volatility'] = (df['high'] - df['low']) / df['low'] * 100
@@ -256,7 +338,6 @@ def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
             df_res[f'Avg Vol ({m}m) %'] = df_res[f'Avg Vol ({m}m) %'].round(4)
 
     return df_res
-
 
 def get_okx_volatility_ranking(minutes_list=[15, 30, 60], max_workers=100):
     """
