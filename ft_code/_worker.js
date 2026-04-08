@@ -187,7 +187,8 @@ const HTML_CONTENT = `
                             if (cacheJson.minutesList) currentMinutes = cacheJson.minutesList;
                             sortConfig = { key: 'overall', direction: 'desc' };
                             renderTable();
-                            updateTimeEl.innerHTML = \`⚠️ 已展示云端历史数据，后台正在同步最新市场数据...\`;
+                            // 【修正点】：增加了具体数据更新时间的展示
+                            updateTimeEl.innerHTML = \`⚠️ 已展示云端历史数据 (更新于: <span class="text-white font-mono">\${formatDateTime(cacheJson.updateTime)}</span>)，后台正在同步最新数据...\`;
                             updateTimeEl.className = "text-yellow-500 mt-2 text-xs md:text-sm animate-pulse";
                             hasRenderedCache = true;
                         }
@@ -271,7 +272,7 @@ const HTML_CONTENT = `
 // 2. Worker 路由分发器
 // ==========================================
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     // 路由 A：页面
@@ -281,7 +282,7 @@ export default {
       });
     }
 
-    // 路由 B：新增的【极速缓存读取接口】
+    // 路由 B：【极速缓存读取接口】
     if (url.pathname === "/api/cache") {
       try {
         if (env && env.VOLATILITY_KV) {
@@ -308,7 +309,7 @@ export default {
             if (parsed.length > 0) minutesList = parsed;
         }
 
-        const data = await updateVolatilityData(minutesList, env);
+        const data = await updateVolatilityData(minutesList, env, ctx);
         data.minutesList = minutesList;
 
         return new Response(JSON.stringify(data), {
@@ -369,7 +370,7 @@ async function smartFetch(targetUrl) {
   return res;
 }
 
-async function updateVolatilityData(minutesList, env) {
+async function updateVolatilityData(minutesList, env, ctx) {
   const BASE_URL = "https://fapi.binance.com";
 
   try {
@@ -444,8 +445,10 @@ async function updateVolatilityData(minutesList, env) {
       data: results
     };
 
-    if (env && env.VOLATILITY_KV) {
-        env.VOLATILITY_KV.put("RANKING_DATA", JSON.stringify(finalData)).catch(e => console.error("KV 写入失败", e));
+    if (env && env.VOLATILITY_KV && ctx) {
+        ctx.waitUntil(
+            env.VOLATILITY_KV.put("RANKING_DATA", JSON.stringify(finalData)).catch(e => console.error("KV 写入失败", e))
+        );
     }
 
     return finalData;
