@@ -247,6 +247,7 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     if df.empty:
         print("数据为空，无法进行批量回测。")
         return
+    print(f"数据加载成功，包含 {len(df)} 行记录。开始批量回测网格参数...")
 
     results = []
     print(f"开始批量回测 (方向: {direction}) ...")
@@ -274,13 +275,20 @@ if __name__ == "__main__":
     csv_file_path = r"W:\project\python_project\crypto_trade\data\binance_JOE_USDT_USDT_1m.csv"
 
     output_csv_path = csv_file_path.replace(".csv", "_grid_backtest_results.csv")
-    df = pd.read_csv(output_csv_path)
-    df['score'] = df['profit_to_margin_ratio'] * df['total_trades']  # 简单的综合评分指标，越高越好
-    # df['score1'] = 1000000 * df['grid_ratio'] * df['total_profit']  # 简单的综合评分指标，越高越好
-    df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
-    print()
-    # data_df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
-    # print()
+
+    try:
+        df = pd.read_csv(output_csv_path)
+        df['score'] = df['profit_to_margin_ratio'] * df['total_trades']  # 简单的综合评分指标，越高越好
+        # df['score1'] = 1000000 * df['grid_ratio'] * df['total_profit']  # 简单的综合评分指标，越高越好
+        df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
+        # 把score1放在第一列
+        df = df[['score1'] + [col for col in df.columns if col != 'score1']]
+
+        print()
+        # data_df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
+        # print()
+    except FileNotFoundError:
+        pass
     try:
 
         df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
@@ -296,7 +304,7 @@ if __name__ == "__main__":
 
         # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
         print("\n启动批量参数回测...")
-        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0004, lot_size=0.02,
+        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0004, lot_size=0.1,
                                    direction="short")
 
     except FileNotFoundError:

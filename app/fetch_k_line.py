@@ -685,10 +685,10 @@ if __name__ == "__main__":
 
 
     # # 获取合约指定时间的波动率
+    increase_hours = 36
+    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 60 * increase_hours // 2]
 
-    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600]
-
-    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20, increase_hours=increase_hours)
     okx_df = get_okx_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
 
     # 2. 添加来源列 (直接插入到最前面的第0列)
