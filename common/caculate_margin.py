@@ -205,16 +205,16 @@ if __name__ == "__main__":
     # ---------------------------------------------
     # 统一的基础参数配置中心
     # ---------------------------------------------
-    TARGET_LOSS = 200.0  # 基准抗涨幅 (做空时扛住价格上涨200%)
-    ADD_STEP = 3.83  # 基准加仓步长 (%)
-    FIXED_QTY = 849.0  # 基准单次下单量
+    TARGET_LOSS = 30.0  # 基准抗涨幅 (做空时扛住价格上涨200%)
+    ADD_STEP = 0.4  # 基准加仓步长 (%)
+    FIXED_QTY = 0.01  # 基准单次下单量
 
     # 抽取所有场景都共享的公共参数，确保底层状态完全一致
     common_params = {
-        "leverage": 10.0,
-        "max_grids_per_group": 10000,
-        "initial_price": 0.007,
-        "direction": 'short'  # 做空
+        "leverage": 125.0,
+        "max_grids_per_group": 169,
+        "initial_price": 2300,
+        # "direction": 'short'  # 做空
     }
 
     print("==================================================")
@@ -237,6 +237,14 @@ if __name__ == "__main__":
 
     print("\n[功能0] 标准正向计算测试:")
     print(f"👉 严格按照上述参数，您的策略实际需要的极限保证金为: {ACTUAL_MARGIN_NEEDED} U")
+
+    for g in baseline_result['groups_info']:
+        print(f"组别 {g['group_id']}:")
+        print(f"  - 价格区间: {g['start_price']} -> {g['end_price']}")
+        print(f"  - 网格数量: {g['grid_count']} 单")
+        print(f"  - 该组累计币量: {g['group_qty']}")
+        print(f"  - 该组需分配保证金: {g['required_margin']}")
+        print("-" * 30)
     print("-" * 50)
 
     # 为了实现完美的交叉验证，我们将“钱包资金”设定为刚才算出的真实所需保证金
