@@ -573,6 +573,225 @@ def gen_csv_file():
     return csv_file_path
 
 
+def get_open_interest(symbol, exchange_name='binance'):
+    """
+    获取指定合约的实时持仓量 (Open Interest)
+
+    :param exchange_name: 交易所名称，例如 'binance' 或 'okx'
+    :param symbol: 统一格式的合约符号，例如 'BTC/USDT:USDT'
+    :return: 包含持仓量信息的字典，如果获取失败或不支持则返回 None
+    """
+    # 实例化对应的交易所类
+    exchange_class = getattr(ccxt, exchange_name)
+    exchange = exchange_class({
+        'enableRateLimit': True,
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    print(f"正在拉取 {exchange_name.upper()} 交易所 {symbol} 的实时持仓量 (OI)...")
+
+    try:
+        # CCXT 提供了统一的 API 来检查和获取 OI
+        if exchange.has.get('fetchOpenInterest'):
+            oi_data = exchange.fetch_open_interest(symbol)
+
+            # 提取核心数据
+            base_volume = oi_data.get('openInterestAmount')  # 持仓量 (按币的个数计算)
+            quote_value = oi_data.get('openInterestValue')  # 持仓价值 (按计价货币计算，通常是 U本位价值)
+
+            print(f"✅ 成功获取 [{symbol}] 持仓量: {base_volume} 币 | 价值: {quote_value} USDT")
+
+            return {
+                'Symbol': symbol,
+                'Exchange': exchange_name.upper(),
+                'OI (Base Coin)': base_volume,
+                'OI Value (USDT)': quote_value,
+                'Timestamp': oi_data.get('timestamp'),
+                'Datetime': oi_data.get('datetime')
+            }
+        else:
+            print(f"⚠️ 交易所 {exchange_name} 不支持通过统一 API 获取 {symbol} 的持仓量。")
+            return None
+
+    except Exception as e:
+        print(f"❌ 获取 [{symbol}] 持仓量失败: {e}")
+        return None
+
+
+def fetch_long_funding_history(exchange_name, symbol, days=30):
+    """
+    分页拉取指定合约最近N天的资金费率历史并转换为北京时间
+    :param days: 获取过去多少天的数据
+    """
+    exchange_class = getattr(ccxt, exchange_name)
+    exchange = exchange_class({
+        'enableRateLimit': True,
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    # 计算起始时间戳 (毫秒)
+    since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
+
+    all_funding = []
+
+    print(f"开始拉取 {exchange_name} 的 {symbol} 资金费率历史...")
+
+    while True:
+        try:
+            # 资金费率历史分页：币安最大1000，欧易安全值100（与fetch_long_history完全一致的逻辑）
+            limit = 1000 if exchange_name == 'binance' else 100
+            curr_funding = exchange.fetch_funding_rate_history(symbol, since=since, limit=limit)
+
+            if not curr_funding:
+                break
+
+            all_funding.extend(curr_funding)
+
+            # 更新 since 为最后一条数据的时间戳 + 1毫秒，避免重复
+            last_timestamp = curr_funding[-1]['timestamp']
+            since = last_timestamp + 1
+
+            print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_funding)} 条")
+
+            # 如果最后一条数据的时间已经接近当前时间，则停止
+            if last_timestamp >= exchange.milliseconds() - 60000:  # 1分钟内
+                break
+
+            # 尊重频率限制
+            # time.sleep(exchange.rateLimit / 1000)
+
+        except Exception as e:
+            print(f"拉取出错: {e}")
+            break
+
+    # 转换为 DataFrame（仅保留时间戳和资金费率，格式与原代码风格一致）
+    if not all_funding:
+        return pd.DataFrame(columns=['timestamp', 'funding_rate'])
+
+    df = pd.DataFrame([{
+        'timestamp': item['timestamp'],
+        'funding_rate': item.get('fundingRate', 0.0) * 100
+    } for item in all_funding])
+
+    # --- 时间处理核心步骤 ---（完全复制 fetch_long_history 中的代码，一字不改）
+    # 1. 转换为 UTC 时间
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
+    # 2. 转换为北京时间
+    df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Shanghai')
+    # 3. (可选) 如果不需要显示时区后缀，可以转为无时区格式
+    df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+    df['funding_rate_pct'] = df['funding_rate'].pct_change() * 100
+
+    # 按时间正序排列（确保数据完整性）
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    return df
+
+
+def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
+    """
+    分页拉取长历史持仓量 (OI) 数据，转换为北京时间，并计算相对上一时刻的涨跌幅
+    :param days: 获取过去多少天的数据，默认 30 天
+    """
+    import time
+    import pandas as pd
+
+    exchange_class = getattr(ccxt, exchange_name)
+    exchange = exchange_class({
+        'enableRateLimit': True,
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    if not exchange.has.get('fetchOpenInterestHistory'):
+        print(f"❌ 警告: 交易所 {exchange_name} 的 CCXT 模块暂不支持通过统一 API 获取历史持仓量。")
+        return pd.DataFrame()
+
+    since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
+    all_oi = []
+
+    print(f"开始拉取 {exchange_name} 的 {symbol} 历史持仓量 (OI) 数据...")
+
+    while True:
+        try:
+            limit = 500 if exchange_name == 'binance' else 100
+            curr_oi = exchange.fetch_open_interest_history(symbol, timeframe, since=since, limit=limit)
+
+            if not curr_oi:
+                break
+
+            all_oi.extend(curr_oi)
+
+            last_timestamp = curr_oi[-1]['timestamp']
+            since = last_timestamp + 1
+
+            print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_oi)} 条历史 OI 数据")
+
+            if last_timestamp >= exchange.milliseconds() - 60000:
+                break
+
+            time.sleep(exchange.rateLimit / 1000 * 1.5)
+
+        except Exception as e:
+            print(f"拉取历史 OI 出错: {e}")
+            break
+
+    if not all_oi:
+        print(f"⚠️ 未能获取到 {symbol} 的历史持仓数据。")
+        return pd.DataFrame()
+
+    parsed_data = []
+    for item in all_oi:
+        parsed_data.append({
+            'timestamp': item['timestamp'],
+            'oi_amount': item.get('openInterestAmount', 0),
+            'oi_value': item.get('openInterestValue', 0)
+        })
+
+    df = pd.DataFrame(parsed_data)
+
+    # --- 时间处理 ---
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
+    df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Shanghai')
+    df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+
+    # 去重处理，以防翻页时间戳重叠
+    df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
+
+    # ==========================================
+    # 🌟 新增核心逻辑：计算持仓量涨跌幅
+    # ==========================================
+    # 1. 确保数据严格按照时间升序排列，这是计算涨跌幅的前提
+    df.sort_values(by='timestamp', ascending=True, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    # 2. 计算数量的涨跌幅 (%)：当前值相对上一值的变化百分比
+    df['oi_amount_change_pct'] = df['oi_amount'].pct_change() * 100
+
+    # 3. 计算价值的涨跌幅 (%)
+    # 防御性编程：如果某些交易所不支持返回 oi_value (全为0)，则直接将其涨跌幅置为0，防止产生 NaN 或无穷大
+    if df['oi_value'].sum() > 0:
+        df['oi_value_change_pct'] = df['oi_value'].pct_change() * 100
+    else:
+        df['oi_value_change_pct'] = 0.0
+
+    # 4. 数据清理：第一行没有“上一时刻”，会产生 NaN，将其填充为 0
+    df.fillna({'oi_amount_change_pct': 0, 'oi_value_change_pct': 0}, inplace=True)
+
+    # 5. 格式化：保留四位小数，使其与资金费率等数据的精度对齐，便于观看
+    df['oi_amount_change_pct'] = df['oi_amount_change_pct'].round(4)
+    df['oi_value_change_pct'] = df['oi_value_change_pct'].round(4)
+
+    return df
+
 if __name__ == "__main__":
     # # ==========================================
     # # 1. 核心参数配置区
@@ -626,22 +845,34 @@ if __name__ == "__main__":
     # print(df_ranking.head(10).to_string())
 
 
-    # # 获取合约指定时间的波动率
+    # # # 获取合约指定时间的波动率
+    #
+    # calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
+    #
+    # bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    # okx_df = get_okx_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    #
+    # # 2. 添加来源列 (直接插入到最前面的第0列)
+    # if not okx_df.empty: okx_df.insert(0, 'Source', 'OKX')
+    # if not bin_df.empty: bin_df.insert(0, 'Source', 'Binance')
+    #
+    # # 3. 纵向合并 (直接叠加：50行 + 50行 = 100行)
+    # df_combined = pd.concat([okx_df, bin_df], ignore_index=True)
+    #
+    # # 4. 合并后全局重新降序排序
+    # if not df_combined.empty:
+    #     df_combined = df_combined.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
+    #
+    # print(f"合并成功！总行数: {len(df_combined)}")
 
-    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
 
-    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
-    okx_df = get_okx_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    # 获取指定合约的实时持仓量 (OI)
+    symbol = 'ARIA/USDT:USDT'
+    days = 2
+    # oi_info = get_open_interest('ETH/USDT:USDT')
 
-    # 2. 添加来源列 (直接插入到最前面的第0列)
-    if not okx_df.empty: okx_df.insert(0, 'Source', 'OKX')
-    if not bin_df.empty: bin_df.insert(0, 'Source', 'Binance')
+    # funding_df = fetch_long_funding_history(exchange_name='binance', symbol=symbol, days=days)
 
-    # 3. 纵向合并 (直接叠加：50行 + 50行 = 100行)
-    df_combined = pd.concat([okx_df, bin_df], ignore_index=True)
+    oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe='1h', days=days)
 
-    # 4. 合并后全局重新降序排序
-    if not df_combined.empty:
-        df_combined = df_combined.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
-
-    print(f"合并成功！总行数: {len(df_combined)}")
+    print()
