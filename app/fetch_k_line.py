@@ -895,6 +895,238 @@ def detect_oi_signals_with_confidence(df):
     return df
 
 
+def get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=15, max_workers=10):
+    """
+    综合自动化工作流：
+    1. 获取币安高波动率合约排行。
+    2. 使用多线程并发拉取这些高波动合约的 7 天 1h 历史持仓量 (OI) 数据 (带错误重试机制)。
+    3. 进行 OI 信号与置信度分析。
+    4. 将所有合约的分析结果合并为一个完整的 DataFrame。
+
+    :param days: 拉取历史 OI 数据天数，默认 7 天
+    :param timeframe: K线周期，默认 '1h'
+    :param top_k: 选取波动率排名前 K 的合约进行精准分析
+    :param max_workers: 并发线程数，默认 10
+    """
+    import pandas as pd
+    import time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("\n" + "=" * 50)
+    print("🚀 第一阶段：开始筛选高波动率合约...")
+    print("=" * 50)
+
+    # 1. 运行高波动率获取逻辑
+    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
+    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+
+    if bin_df is None or bin_df.empty:
+        print("❌ 未能获取到波动率数据，流程终止。")
+        return pd.DataFrame()
+
+    # 提取高波动率排名前 top_k 的合约
+    target_symbols = bin_df['Symbol'].head(top_k).tolist()
+
+    print("\n" + "=" * 50)
+    print(f"🚀 第二阶段：开始多线程批量拉取并分析 OI 信号")
+    print(f"目标标的 (前 {top_k} 名): {target_symbols}")
+    print(f"并发线程数: {max_workers} | 失败重试次数: 5次")
+    print("=" * 50)
+
+    all_analyzed_dfs = []
+
+    # ==========================================
+    # 定义单线程处理函数：包含拉取、重试机制和分析
+    # ==========================================
+    def process_symbol(symbol):
+        oi_df = None
+
+        # 增加 5 次重试机制，失败等待 1 秒
+        for attempt in range(5):
+            try:
+                oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
+
+                # 如果成功拿到数据且不为空，跳出重试循环
+                if oi_df is not None and not oi_df.empty:
+                    break
+
+                # 如果拿到的是空数据（可能网络延迟没抛错），也视作失败进行重试
+                if attempt < 4:
+                    time.sleep(1)
+
+            except Exception as e:
+                if attempt == 4:
+                    print(f"⚠️ [{symbol}] 拉取 OI 数据发生异常(已重试5次): {e}")
+                    return None
+                time.sleep(1)
+
+        # 校验最终拿到的数据
+        if oi_df is None or oi_df.empty:
+            print(f"⚠️ [{symbol}] 最终未能获取到历史 OI 数据，跳过该标的。")
+            return None
+
+        try:
+            # 调用信号识别函数
+            anlyse_df = detect_oi_signals_with_confidence(oi_df)
+
+            # ⚠️ 核心步骤：在 DataFrame 第 0 列插入当前币种的 Symbol，防合并后数据混乱
+            anlyse_df.insert(0, 'Symbol', symbol)
+            return anlyse_df
+
+        except Exception as e:
+            print(f"❌ [{symbol}] 信号分析时发生异常: {e}")
+            return None
+
+    # ==========================================
+    # 启动多线程并发执行
+    # ==========================================
+    completed_count = 0
+    total_symbols = len(target_symbols)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务到线程池
+        future_to_symbol = {executor.submit(process_symbol, sym): sym for sym in target_symbols}
+
+        # as_completed 保证任何一个线程完成时立即收集结果
+        for future in as_completed(future_to_symbol):
+            completed_count += 1
+            sym = future_to_symbol[future]
+
+            try:
+                res_df = future.result()
+                if res_df is not None and not res_df.empty:
+                    all_analyzed_dfs.append(res_df)
+            except Exception as e:
+                print(f"❌ [{sym}] 线程内部执行发生致命错误: {e}")
+
+            # 打印进度条
+            if completed_count % 5 == 0 or completed_count == total_symbols:
+                print(f"进度: 已处理并分析 {completed_count}/{total_symbols} 个合约...")
+
+    print("\n" + "=" * 50)
+    print("🚀 第三阶段：合并全部数据")
+    print("=" * 50)
+
+    # 3. 将所有分析完成的 df 纵向合并为一个完整的 df
+    if not all_analyzed_dfs:
+        print("❌ 所有标的均未产生有效分析数据。")
+        return pd.DataFrame()
+
+    final_combined_df = pd.concat(all_analyzed_dfs, ignore_index=True)
+
+    # 为了便于阅读，按照 合约名称 (升序) 和 时间 (降序) 进行排序
+    final_combined_df = final_combined_df.sort_values(by=['Symbol', 'timestamp'], ascending=[True, False]).reset_index(
+        drop=True)
+
+    print(f"✅ 综合分析工作流执行完毕！共生成 {len(final_combined_df)} 条分析记录。")
+
+    return final_combined_df
+
+
+def detect_long_grid_signals_strict(df):
+    """
+    V2 铁血严格版：专为【做多网格】设计的 OI 信号识别函数。
+    彻底修复“空头平仓死猫跳”陷阱，严格过滤连环瀑布。
+    """
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    signals = []
+    reasons = []
+    confidences = []
+
+    in_long_grid_zone = False
+    recent_capitulation = False
+    hours_since_danger = 0
+
+    for i in range(len(df)):
+        current_row = df.iloc[i]
+
+        amt_pct = current_row['oi_amount_change_pct']
+        val_pct = current_row['oi_value_change_pct']
+
+        signal = "Neutral"
+        reason = ""
+        conf_score = 0.0
+
+        hours_since_danger += 1
+
+        # -------------------------------------------------------------
+        # 1. 🛑 DANGER: 主动追空瀑布 (绝对禁区) - [你的截图 00:00 和 04:00]
+        # 价格暴跌，同时持仓量暴增，说明新空军进场屠杀。
+        # -------------------------------------------------------------
+        if val_pct < -5 and amt_pct > 6:
+            signal = "🛑 DANGER"
+            reason = "主动追空瀑布！空军携巨资入场，做多网格立刻停机！"
+            in_long_grid_zone = False
+            recent_capitulation = False
+            hours_since_danger = 0
+            conf_score = 60 + abs(val_pct + 5) * 1.5 + (amt_pct - 6) * 2
+
+        # -------------------------------------------------------------
+        # 2. ⚠️ WARNING: 多头大血洗 (连环爆仓预警) - [你的截图 18:00]
+        # -------------------------------------------------------------
+        elif val_pct < -15 and amt_pct < -10:
+            signal = "⚠️ WARNING"
+            reason = "多头连环爆仓。抛压释放中，不接飞刀，密切观察。"
+            recent_capitulation = True
+            in_long_grid_zone = False  # 确保网格关闭
+            conf_score = 65 + abs(val_pct + 15) * 1.5 + abs(amt_pct + 10) * 2.5
+
+        # -------------------------------------------------------------
+        # 3. ☠️ BEAR_TRAP: 死猫跳陷阱 (剔除你截图 19:00 的罪魁祸首)
+        # 价格暴涨，但 OI 暴跌。这是空头止盈的假象，绝对不能做多！
+        # -------------------------------------------------------------
+        elif recent_capitulation and val_pct > 8 and amt_pct < -5:
+            signal = "☠️ BEAR_TRAP"
+            reason = "空头平仓死猫跳！价格虚高但资金流出，即将二次探底，绝对观望！"
+            # 保持 recent_capitulation = True，因为我们还在等真正的底
+            conf_score = 80 + (val_pct - 8) * 1.5 + abs(amt_pct + 5) * 2
+
+        # -------------------------------------------------------------
+        # 4. ✅ GRID_START: 真实止跌企稳 (严格的网格启动确认)
+        # 必须是：价格不再剧烈波动 (±4%)，且资金不再大幅流出 (±2.5%)。
+        # -------------------------------------------------------------
+        elif recent_capitulation and abs(val_pct) <= 4 and abs(amt_pct) <= 2.5:
+            signal = "✅ GRID_START"
+            reason = "真实底部企稳。波动率极度收缩，多空双方熄火，安全开启网格！"
+            in_long_grid_zone = True
+            recent_capitulation = False
+            conf_score = 70 + (4 - abs(val_pct)) * 5
+
+        # -------------------------------------------------------------
+        # 5. 🎯 LONG_ENTRY: 严苛版空心砸盘 (震荡期最佳低吸点)
+        # 必须确保跌的时候没有人在爆仓 (amt_pct >= -1)。
+        # -------------------------------------------------------------
+        elif in_long_grid_zone and hours_since_danger > 3:
+            # 价格大跌，但资金既没有恐慌流出，也没有空头加仓
+            if val_pct <= -6 and -1 <= amt_pct <= 2:
+                signal = "🎯 LONG_ENTRY"
+                reason = "完美空心砸盘！无爆仓无追空，纯属流动性缺失假摔，低吸买点！"
+                conf_score = 70 + abs(val_pct + 6) * 2.5 + (2 - amt_pct) * 2
+
+            elif val_pct > 5 and amt_pct > 3:
+                signal = "📈 UP_TREND"
+                reason = "底部企稳回升，真实买盘介入。"
+                conf_score = 50 + val_pct * 1.5
+
+        # --- 分数限制与清理 ---
+        if signal != "Neutral":
+            conf_score = min(100.0, max(0.0, conf_score))
+            conf_score = round(conf_score, 2)
+        else:
+            conf_score = 0.0
+
+        signals.append(signal)
+        reasons.append(reason)
+        confidences.append(conf_score)
+
+    df['Signal'] = signals
+    df['Confidence_%'] = confidences
+    df['Reason'] = reasons
+
+    return df
+
+
 if __name__ == "__main__":
     # # ==========================================
     # # 1. 核心参数配置区
@@ -947,7 +1179,7 @@ if __name__ == "__main__":
     # print(f"\n✅ 币安合约过去 {change_hours} 小时涨跌幅排行 (前 10 名):")
     # print(df_ranking.head(10).to_string())
 
-
+    #
     # # # 获取合约指定时间的波动率
     #
     # calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
@@ -967,17 +1199,24 @@ if __name__ == "__main__":
     #     df_combined = df_combined.sort_values(by='Overall Avg Vol %', ascending=False).reset_index(drop=True)
     #
     # print(f"合并成功！总行数: {len(df_combined)}")
-
-
+    #
+    #
     # 获取指定合约的实时持仓量 (OI)
-    symbol = 'STO/USDT:USDT'
+
+
+    symbol = 'SIREN/USDT:USDT'
     days = 30
     # oi_info = get_open_interest('ETH/USDT:USDT')
-
+    #
     # funding_df = fetch_long_funding_history(exchange_name='binance', symbol=symbol, days=days)
 
     oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe='1h', days=days)
 
     anlyse_df = detect_oi_signals_with_confidence(oi_df)
+    # long_anlyse_df = detect_long_grid_signals_strict(oi_df)
+    print()
 
+
+    # 直接拉取高波动数据并且计算信号
+    final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=80)
     print()
