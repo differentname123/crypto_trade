@@ -792,6 +792,109 @@ def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
 
     return df
 
+
+def detect_oi_signals_with_confidence(df):
+    """
+    带有置信度 (Confidence Score) 的 OI 信号识别函数。
+    分数范围 0 - 100，越高代表信号越极其明显。
+    """
+    df = df.sort_values('timestamp').reset_index(drop=True)
+
+    signals = []
+    reasons = []
+    confidences = []  # 新增：记录置信度
+
+    # 状态机变量
+    in_grid_zone = False
+    recent_blow_off = False
+    hours_since_danger = 0
+
+    for i in range(len(df)):
+        current_row = df.iloc[i]
+
+        amt_pct = current_row['oi_amount_change_pct']
+        val_pct = current_row['oi_value_change_pct']
+
+        signal = "Neutral"
+        reason = ""
+        conf_score = 0.0  # 默认置信度为 0
+
+        hours_since_danger += 1
+
+        # -------------------------------------------------------------
+        # 🛑 DANGER: 燃料暴增
+        # -------------------------------------------------------------
+        if amt_pct > 15:
+            signal = "🛑 DANGER"
+            reason = "巨量燃料注入！"
+            in_grid_zone = False
+            recent_blow_off = False
+            hours_since_danger = 0
+
+            # 置信度计算：基数 50，超过 15% 的部分，每多 1% 加 2 分。
+            # 例如：增量 30%，分数 = 50 + (30-15)*2 = 80
+            conf_score = 50 + (amt_pct - 15) * 2
+
+        # -------------------------------------------------------------
+        # ⚠️ WARNING: 无量干拔 (见顶预警)
+        # -------------------------------------------------------------
+        elif amt_pct < 3 and val_pct > 18:
+            signal = "⚠️ WARNING"
+            reason = "无量干拔 (燃料停滞+价值飙升)"
+            recent_blow_off = True
+
+            # 置信度计算：价格拉得越高、持仓掉得越猛，置信度越高。
+            # 基数 60。价格每超 18% 加 1.5 分；持仓每比 3% 低 1%，加 3 分。
+            conf_score = 60 + (val_pct - 18) * 1.5 + (3 - amt_pct) * 3
+
+        # -------------------------------------------------------------
+        # ✅ GRID_START: 大资金撤退 (网格确认)
+        # -------------------------------------------------------------
+        elif recent_blow_off and amt_pct < -5 and val_pct < -8:
+            signal = "✅ GRID_START"
+            reason = "单边结束，大资金撤离"
+            in_grid_zone = True
+            recent_blow_off = False
+
+            # 置信度计算：双杀跌得越深，确认度越高。
+            # 基数 60。持仓跌幅超 5% 的部分乘以 2；价格跌幅超 8% 的部分乘以 1。
+            conf_score = 60 + abs(amt_pct + 5) * 2 + abs(val_pct + 8) * 1
+
+        # -------------------------------------------------------------
+        # 🎯 SHORT_ENTRY: 震荡期空心针 (最佳做空点)
+        # -------------------------------------------------------------
+        elif in_grid_zone and hours_since_danger > 3:
+            if amt_pct <= 1.5 and val_pct >= 10:
+                signal = "🎯 SHORT_ENTRY"
+                reason = "空心假拉升，网格高抛点"
+
+                # 置信度计算：纯粹的背离度。持仓越少（甚至为负），价格拉得越高，越准！
+                # 基数 65。价格超 10% 的部分乘 2；持仓少于 1.5% 的部分乘 4 (权重极大)。
+                conf_score = 65 + (val_pct - 10) * 2 + (1.5 - amt_pct) * 4
+
+            elif amt_pct < -5 and val_pct < -10:
+                signal = "📉 DOWN_TREND"
+                reason = "震荡向下破位"
+                conf_score = 50 + abs(amt_pct + 5) * 1.5
+
+        # --- 限制置信度范围在 0 到 100 之间，并保留两位小数 ---
+        if signal != "Neutral":
+            conf_score = min(100.0, max(0.0, conf_score))
+            conf_score = round(conf_score, 2)
+        else:
+            conf_score = 0.0
+
+        signals.append(signal)
+        reasons.append(reason)
+        confidences.append(conf_score)
+
+    df['Signal'] = signals
+    df['Confidence_%'] = confidences
+    df['Reason'] = reasons
+
+    return df
+
+
 if __name__ == "__main__":
     # # ==========================================
     # # 1. 核心参数配置区
@@ -867,12 +970,14 @@ if __name__ == "__main__":
 
 
     # 获取指定合约的实时持仓量 (OI)
-    symbol = 'ARIA/USDT:USDT'
-    days = 2
+    symbol = 'STO/USDT:USDT'
+    days = 30
     # oi_info = get_open_interest('ETH/USDT:USDT')
 
     # funding_df = fetch_long_funding_history(exchange_name='binance', symbol=symbol, days=days)
 
     oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe='1h', days=days)
+
+    anlyse_df = detect_oi_signals_with_confidence(oi_df)
 
     print()
