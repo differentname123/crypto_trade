@@ -2191,8 +2191,58 @@ def generate_microstructure_signals(df, oi_drop_threshold=-1.5, price_move_thres
 import pandas as pd
 import numpy as np
 
+import pandas as pd
+import numpy as np
+
 
 def calculate_oi_extremes(df, window=20):
+    """
+    计算基于持仓量 (OI) 极值的量价异常信号，用于捕捉市场拐点与主力异动。
+
+    本函数生成 3 大类核心交易信号，每类均包含“基础版 (simple)”与“严格版 (strict)”：
+
+    -------------------------------------------------------------------------
+    1. 做空信号 (Short Signal): 【寻找深坑反弹】
+    -------------------------------------------------------------------------
+        - 基础逻辑：上一根 K 线的 OI 相对高点回撤幅度 (oi_pct_from_max) 创近期最大，且当前 OI 开始绝对上涨。
+        - 严格过滤：当前价格表现必须比上一次做空信号点更高 (保障入场盈亏比)。
+        - 为啥能做空 (背后的市场逻辑)：
+          当 OI 出现历史级别的深度回撤时，说明前期积累的杠杆（通常是多头）已经被彻底爆仓或割肉清洗，市场处于“大病初愈”的虚弱期。
+          此时 OI 突然重新抬头（说明有新资金急不可耐地进场），但价格却处于低位且反弹乏力。这通常意味着“做多动能已经枯竭，
+          此时新进场建仓的资金大概率是聪明的空头主力”，因此我们要跟随新空头顺势砸盘。
+
+    -------------------------------------------------------------------------
+    2. 镜像做多信号 (Long Signal): 【寻找高位挤泡沫】
+    -------------------------------------------------------------------------
+        - 基础逻辑：上一根 K 线的 OI 相对低点涨幅 (oi_pct_from_min) 创近期最大，且当前 OI 开始绝对下降。
+        - 严格过滤：当前价格表现必须比上一次做多信号点更低 (保障抄底的安全边际)。
+        - 为啥能做多 (背后的市场逻辑)：
+          当 OI 攀升至历史极高点时，说明市场堆积了极度拥挤的杠杆筹码（通常是狂热的散户在追高）。
+          随后 OI 突然掉头大幅下降，伴随价格回落，说明主力在“杀多”——高位的散户正在踩踏平仓或连环爆仓。
+          当这种高位杠杆的“泡沫”被清洗并释放掉风险后，盘面抛压瞬间衰竭，往往会砸出一个无风险的“黄金坑”。
+          此时入场做多，吃的是洗盘结束后的报复性反弹或趋势延续。
+
+    -------------------------------------------------------------------------
+    3. 吸筹做多信号 (Long Accumulation Signal): 【捕捉庄家压价吸筹】
+    -------------------------------------------------------------------------
+        - 基础逻辑：
+            a. 资金暴增：OI 相对坑底增幅 > 10% 且仍在持续加仓。
+            b. 同级别突破：计算【OI增幅/价格增幅】的吸筹比率(Ratio)。在历史上同样满足暴增(>10%)的同级别时刻中，
+               当前的吸筹比率创下新高；或遭遇价格不涨反跌的极端压制。
+        - 严格过滤：不仅吸筹比率创同级别新高，其 OI 的绝对涨幅也必须创同级别新高。
+        - 为啥能做多 (背后的市场逻辑)：
+          这是极其经典的“量价背离”庄家建仓模型。持仓量（OI）暴增，说明有极其庞大的真金白银正在猛烈开仓；
+          但在如此庞大的买盘下，价格不仅没起飞，反而被死死压制甚至微跌。这揭示了一个真相：主力资金正在利用
+          庞大的被动限价单（Maker）悄悄承接散户的恐慌抛盘。他们在刻意压着价格吸血。
+          一旦主力吃饱喝足、撤掉上方的压盘，被积压的买盘瞬间就会化作主升浪。此时跟随做多，是极具爆发力的买点。
+
+    Args:
+        df (pd.DataFrame): 包含基础 K 线数据及 oi_amount 的 DataFrame。
+        window (int): 极值计算的滑动窗口大小。若为 None 则使用全局历史。
+
+    Returns:
+        pd.DataFrame: 附带各类信号列及计算中间值的新 DataFrame。
+    """
     df = df.copy()
 
     # 1. 定义核心排序列
@@ -2202,6 +2252,9 @@ def calculate_oi_extremes(df, window=20):
         'short_signal',
         'long_simple_signal',  # 新增：做多基础信号
         'long_signal',  # 新增：做多高级过滤信号
+        'long_acc_simple_signal',  # 新增：吸筹做多基础信号
+        'long_acc_signal',  # 新增：吸筹做多高级过滤信号
+        'oi_price_ratio',  # 修改：排查用，记录 OI增幅/价格增幅 的真实比值
         'oi_pct_from_max',
         'price_pct_from_max_oi',
         'max_oi_net_vol_pct',
@@ -2213,7 +2266,9 @@ def calculate_oi_extremes(df, window=20):
 
     # 初始化新列
     for col in key_cols + ref_cols:
-        if col in ['short_signal', 'short_simple_signal', 'long_signal', 'long_simple_signal']:
+        # 将 oi_price_ratio 移出布尔值初始化列表，让它自动进入下方的 np.nan 初始化
+        if col in ['short_signal', 'short_simple_signal', 'long_signal', 'long_simple_signal', 'long_acc_simple_signal',
+                   'long_acc_signal']:
             df[col] = False
         elif col != 'timestamp':
             df[col] = np.nan if 'time' not in col else None
@@ -2271,78 +2326,115 @@ def calculate_oi_extremes(df, window=20):
         df.at[i, 'min_oi_net_vol_pct'] = get_net_vol_pct(idx_min, i)
 
         # --- 4. 做空信号逻辑 ---
-        # 1. 上一根的 oi_pct_from_max 是所在窗口内最小的 (相对历史最高回撤最深)
-        # 2. 当前 oi_amount 相比上一根上涨了 (真实反弹)
-        # 3. 当前价格表现 (price_pct_from_max_oi) 优于上一次信号发生时的表现
-
         prev_oi_pct = df.at[i - 1, 'oi_pct_from_max']
 
         if not pd.isna(prev_oi_pct):
-            # 获取用于比较的历史区间起点的索引
             if window is None:
                 lookback_start = 1
             else:
-                # 确保不越界
                 lookback_start = max(1, i - window)
 
-            # 截取上一根所在的滑动窗口的历史 oi_pct_from_max 序列 (截至到 i-1)
             prev_window_pcts = df['oi_pct_from_max'].iloc[lookback_start: i]
-
-            # 条件A: 上一根的百分比跌幅，必须是该窗口序列中的最小值
             is_prev_pct_min = (prev_oi_pct <= prev_window_pcts.min())
-
-            # 条件B: 当前 oi 绝对值发生上涨 (使用绝对值最稳妥，避免分母滑动带来的漂移误判)
             is_oi_turning_up = (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount'])
-
-            # 条件C: 跌幅需要超过一定阈值过滤震荡噪点
             is_deep_enough = (prev_oi_pct < -0.1)
 
             if is_prev_pct_min and is_oi_turning_up and is_deep_enough:
-                # 核心过滤：价格表现必须优于上一个信号点
                 if curr_price_pct > last_signal_price_pct:
                     df.at[i, 'short_signal'] = True
-                    # 更新记录值，供下一个信号对比
                     last_signal_price_pct = curr_price_pct
                 df.at[i, 'short_simple_signal'] = True
 
-                pass
-
         # --- 5. 做多信号逻辑 (绝对对称镜像) ---
-        # 1. 上一根的 oi_pct_from_min 是所在窗口内最大的 (积累了大量多头杠杆)
-        # 2. 当前 oi_amount 相比上一根下降了 (高位松动平仓/爆仓)
-        # 3. 当前价格表现 (price_pct_from_min_oi) 小于上一次信号发生时的表现
-
         prev_oi_pct_from_min = df.at[i - 1, 'oi_pct_from_min']
 
         if not pd.isna(prev_oi_pct_from_min):
-            # 复用上面的 lookback_start 截取历史窗口
             if window is None:
                 lookback_start = 1
             else:
                 lookback_start = max(1, i - window)
 
             prev_window_long_pcts = df['oi_pct_from_min'].iloc[lookback_start: i]
-
-            # 条件A: 上一根的涨幅，必须是该窗口序列中的最大值
             is_prev_long_pct_max = (prev_oi_pct_from_min >= prev_window_long_pcts.max())
-
-            # 条件B: 当前 oi 绝对值发生下降 (真实回落)
             is_oi_turning_down = (df.at[i, 'oi_amount'] < df.at[i - 1, 'oi_amount'])
-
-            # 条件C: 涨幅需要超过一定阈值过滤震荡噪点 (此处做空的 -0.1 镜像为 > 0.1)
             is_high_enough = (prev_oi_pct_from_min > 0.1)
 
             if is_prev_long_pct_max and is_oi_turning_down and is_high_enough:
                 df.at[i, 'long_simple_signal'] = True
-
-                # 核心过滤：验证 price_pct_from_min_oi 比上次做多信号更小
                 curr_long_price_pct = df.at[i, 'price_pct_from_min_oi']
                 if curr_long_price_pct < last_long_signal_price_pct:
                     df.at[i, 'long_signal'] = True
-                    # 更新记录值
                     last_long_signal_price_pct = curr_long_price_pct
 
-    # 6. 整理排序
+        # --- 6. 建仓吸筹做多信号逻辑 (动能突破创新高法则 - 噪音剔除 + 同级别过滤版) ---
+        curr_oi_pct_from_min = df.at[i, 'oi_pct_from_min']
+        curr_price_pct_from_min = df.at[i, 'price_pct_from_min_oi']
+
+        if not pd.isna(curr_oi_pct_from_min) and not pd.isna(curr_price_pct_from_min):
+            min_oi_surge = 10.0  # 基础门槛：增量超过 10%
+            noise_price_threshold = 0.1  # 噪音过滤阈值：价格波动小于 0.1%
+
+            # 1. 计算当前的 oi_price_ratio 并剔除噪音
+            if curr_price_pct_from_min <= noise_price_threshold:
+                current_ratio = np.nan
+            else:
+                current_ratio = curr_oi_pct_from_min / curr_price_pct_from_min
+
+            df.at[i, 'oi_price_ratio'] = current_ratio
+
+            # 2. 截取历史窗口数据，并进行“同级别”过滤
+            if window is None:
+                lookback_start = 1
+            else:
+                lookback_start = max(1, i - window)
+
+            # 获取当前窗口内的历史 K 线切片 (不包含当前行 i)
+            window_slice = df.iloc[lookback_start: i]
+
+            # 【核心修改】：过滤历史记录，只保留那些同样满足 OI 涨幅 > 10% 的“同级别”高价值时刻
+            valid_history = window_slice[window_slice['oi_pct_from_min'] > min_oi_surge]
+
+            # 判断吸筹比例 (Ratio) 是否创同级别新高
+            if pd.isna(current_ratio):
+                is_ratio_new_high = False
+            elif valid_history.empty:
+                # 历史窗口里没有达到过 10% 增量的记录，那当前这根只要达标了就是“创世纪”的新高
+                is_ratio_new_high = True
+            else:
+                # 只在那些同级别(>10%)的时刻中，去比对最大 Ratio
+                valid_historical_ratios = valid_history['oi_price_ratio'].dropna()
+                if valid_historical_ratios.empty:
+                    is_ratio_new_high = True
+                else:
+                    is_ratio_new_high = current_ratio > valid_historical_ratios.max()
+
+            # 判断 OI 绝对增幅 是否创同级别新高
+            if valid_history.empty:
+                is_oi_pct_new_high = True
+            else:
+                is_oi_pct_new_high = curr_oi_pct_from_min > valid_history['oi_pct_from_min'].max()
+
+            # 3. 信号触发逻辑
+            is_oi_surged = curr_oi_pct_from_min > min_oi_surge
+
+            # 必须满足基础的涨幅过滤，并且确保正在加仓(OI向上)
+            if is_oi_surged and (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount']):
+
+                # 触发条件 A：极致的绝对压价吸筹 (资金暴增>10%，但价格连0.1%都没涨上去)
+                is_absolute_suppression = (curr_price_pct_from_min <= noise_price_threshold)
+
+                # 触发条件 B：比例在“同级别”中创下新高
+                is_ratio_breakout = is_ratio_new_high
+
+                # 简单信号：满足绝对压制，或者比例创下新高
+                if is_absolute_suppression or is_ratio_breakout:
+                    df.at[i, 'long_acc_simple_signal'] = True
+
+                    # 严格信号：不仅吸筹烈度达标，且 OI 的绝对涨幅也必须是同级别近期新高
+                    if is_oi_pct_new_high:
+                        df.at[i, 'long_acc_signal'] = True
+
+    # 7. 整理排序
     remaining_cols = [c for c in df.columns if c not in key_cols and c not in ref_cols]
     return df[key_cols + ref_cols + remaining_cols]
 
@@ -2425,7 +2517,7 @@ if __name__ == "__main__":
     # 获取指定合约的实时持仓量 (OI)
 
 
-    symbol = 'RAVE/USDT:USDT'
+    symbol = 'SIREN/USDT:USDT'
     days = 30
     timeframe = '5m'
 
@@ -2439,12 +2531,12 @@ if __name__ == "__main__":
 
 
 
-    # oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
-    # cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
-    # result = detect_signal_a(cvd_df)
-    # merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
-    # # 将merge_cvd_oi_df保存为csv文件
-    # merge_cvd_oi_df.to_csv(file_path, index=False)
+    oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
+    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+    result = detect_signal_a(cvd_df)
+    merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
+    # 将merge_cvd_oi_df保存为csv文件
+    merge_cvd_oi_df.to_csv(file_path, index=False)
 
 
 
