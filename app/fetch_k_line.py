@@ -1957,6 +1957,361 @@ def calculate_short_signal(df: pd.DataFrame) -> pd.DataFrame:
     ])
     return df
 
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+def plot_interactive_trend_plotly(df):
+    """
+    使用 Plotly 绘制带底部滑动窗口的趋势对比图。
+    - Close 和 OI Amount 使用归一化在同一基准面看趋势。
+    - Delta Ratio 独占右侧 Y 轴，保持原始数据，并标注 0 轴基准线。
+    - 鼠标悬停显示所有指标的原始时间与原始数据。
+    """
+    df_plot = df.copy()
+    df_plot['timestamp'] = pd.to_datetime(df_plot['timestamp'])
+    df_plot = df_plot.sort_values('timestamp')
+
+    # 1. 仅对 Close 和 OI Amount 进行归一化处理（Delta 保留原始数据）
+    cols_to_plot = ['close', 'oi_amount']
+    for col in cols_to_plot:
+        min_val, max_val = df_plot[col].min(), df_plot[col].max()
+        if max_val != min_val:
+            df_plot[f'{col}_norm'] = (df_plot[col] - min_val) / (max_val - min_val)
+        else:
+            df_plot[f'{col}_norm'] = 0.5
+
+    # 2. 创建带 双 Y 轴 (secondary_y) 的交互式图表
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # 添加 Close (绑定主 Y 轴，左侧，不显示刻度)
+    fig.add_trace(go.Scatter(
+        x=df_plot['timestamp'],
+        y=df_plot['close_norm'],
+        customdata=df_plot['close'],  # 传入原始数据供悬停显示
+        mode='lines',
+        name='Close',
+        line=dict(color='#1f77b4', width=2),
+        hovertemplate='Close : %{customdata}'
+    ), secondary_y=False)
+
+    # 添加 OI Amount (绑定主 Y 轴，左侧)
+    fig.add_trace(go.Scatter(
+        x=df_plot['timestamp'],
+        y=df_plot['oi_amount_norm'],
+        customdata=df_plot['oi_amount'],
+        mode='lines',
+        name='OI Amount',
+        line=dict(color='#ff7f0e', width=2),
+        hovertemplate='OI Amount : %{customdata}'
+    ), secondary_y=False)
+
+    # 添加 Delta Ratio (绑定副 Y 轴，右侧，直接使用原始数据！)
+    fig.add_trace(go.Scatter(
+        x=df_plot['timestamp'],
+        y=df_plot['delta_ratio'],  # 直接使用原始数据，不再是 norm
+        mode='lines',
+        name='Delta Ratio',
+        line=dict(color='#2ca02c', width=2),
+        hovertemplate='Delta Ratio : %{y}'  # y 轴本身就是原始数据了
+    ), secondary_y=True)
+
+    # 3. 核心：在副 Y 轴 (Delta 所在轴) 的 y=0 处添加一条明显的基准线
+    fig.add_hline(
+        y=0,
+        line_dash="dash",
+        line_color="red",
+        line_width=1.5,
+        opacity=0.6,
+        annotation_text="Delta = 0",
+        annotation_position="top left",
+        annotation_font_color="red",
+        secondary_y=True  # 确保这条线画在 Delta 的坐标系里
+    )
+
+    # 4. 配置底部滑动窗口、时间选择器及双 Y 轴样式
+    fig.update_layout(
+        title="Interactive Trend: Close vs OI vs Delta Ratio",
+        xaxis=dict(
+            rangeselector=dict(
+                buttons=list([
+                    dict(count=7, label="7天", step="day", stepmode="backward"),
+                    dict(count=1, label="1个月", step="month", stepmode="backward"),
+                    dict(step="all", label="全部")
+                ])
+            ),
+            rangeslider=dict(visible=True),  # 开启底部滑动窗口
+            type="date",
+            hoverformat="%Y-%m-%d %H:%M:%S"  # 悬停显示完整原始时间
+        ),
+        # 左侧 Y 轴：隐藏（因为归一化数值对看盘意义不大，只看线条走势即可）
+        yaxis=dict(visible=False, showgrid=False),
+        # 右侧 Y 轴：显示 Delta 的真实刻度
+        yaxis2=dict(
+            title="Delta Ratio (Raw)",
+            visible=True,
+            showgrid=True,
+            gridcolor='rgba(0,0,0,0.05)',  # 加一点淡淡的网格辅助看 Delta 0 轴
+            zeroline=False  # 禁用默认自带的 0 轴线，用我们自定义的红色虚线替代
+        ),
+        template="plotly_white",
+        hovermode="x unified"
+    )
+
+    # 自动在默认浏览器中打开图表
+    fig.show()
+
+
+def generate_microstructure_signals(df, oi_drop_threshold=-1.5, price_move_threshold=1.0):
+    """
+    基于订单流和持仓量微观结构的交易信号生成器
+
+    参数:
+    df (pd.DataFrame): 包含你指定的列的数据集
+    oi_drop_threshold (float): 判定为“大规模爆仓/清算”的OI下降百分比阈值 (默认 -1.5%)
+    price_move_threshold (float): 判定为“单边级联”的价格变动百分比阈值 (默认 1.0%)
+    """
+    # 为了安全操作，创建一个副本
+    res_df = df.copy()
+
+    # 将需要的列转为数值型，防止由于原始dtype为'str'导致报错
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol',
+                    'taker_sell_base_vol', 'volume_delta', 'cvd', 'oi_amount_change_pct',
+                    'price_change_pct', 'delta_ratio']
+    for col in numeric_cols:
+        if col in res_df.columns:
+            res_df[col] = pd.to_numeric(res_df[col], errors='coerce')
+
+    # 计算K线结构辅助列 (用于判断吸收/长下影线/长上影线)
+    res_df['body_size'] = abs(res_df['close'] - res_df['open'])
+    res_df['lower_shadow'] = res_df[['open', 'close']].min(axis=1) - res_df['low']
+    res_df['upper_shadow'] = res_df['high'] - res_df[['open', 'close']].max(axis=1)
+
+    # 初始化输出列表
+    signals = []
+    strengths = []
+    explanations = []
+
+    # 逐行扫描判定 (虽然iterrows较慢，但对于生成复杂的文本逻辑解释最直观)
+    for index, row in res_df.iterrows():
+        signal = 0
+        strength = 0.0
+        logic_texts = []
+
+        oi_change = row['oi_amount_change_pct']
+        px_change = row['price_change_pct']
+        vol_delta = row['volume_delta']
+
+        # ----------------------------------------------------
+        # 场景 1: 寻找多头爆仓枯竭后的做多机会 (寻找长信号 1)
+        # ----------------------------------------------------
+        if px_change < -price_move_threshold and oi_change < oi_drop_threshold:
+            # 基础条件满足：价格大跌且OI大降 (多头被爆或踩踏止损)
+            score = 40
+            logic_texts.append(f"【多头爆仓确认】价格下跌{px_change:.2f}%, OI骤降{oi_change:.2f}%，提供{score}分基础动能。")
+
+            # 维度A：K线吸收判断 (下影线大于实体的1.5倍)
+            if row['lower_shadow'] > row['body_size'] * 1.5:
+                score += 30
+                logic_texts.append("【底部吸收】存在长下影线，暴跌被被动买盘接住 (+30分)。")
+            elif row['lower_shadow'] > row['body_size'] * 0.5:
+                score += 15
+                logic_texts.append("【微弱吸收】有一定的下影线支撑 (+15分)。")
+
+            # 维度B：微观订单流反转判断 (CVD/Delta转正)
+            if vol_delta > 0:
+                score += 30
+                logic_texts.append("【主动买盘回归】Volume Delta转为正数，多头Taker重新主导 (+30分)。")
+            elif row['taker_sell_base_vol'] > 0 and (row['taker_buy_base_vol'] / row['taker_sell_base_vol']) > 0.8:
+                # 即使没转正，但主动买卖力量开始均衡
+                score += 15
+                logic_texts.append("【卖压衰竭】Delta虽为负，但买卖比已回升，卖压减轻 (+15分)。")
+
+            strength = score
+            if strength >= 70:
+                signal = 1
+
+        # ----------------------------------------------------
+        # 场景 2: 寻找空头爆仓枯竭后的做空机会 (寻找短信号 -1)
+        # ----------------------------------------------------
+        elif px_change > price_move_threshold and oi_change < oi_drop_threshold:
+            # 基础条件满足：价格大涨且OI大降 (空头被挤兑/轧空爆仓)
+            score = 40
+            logic_texts.append(f"【空头轧空确认】价格上涨{px_change:.2f}%, OI骤降{oi_change:.2f}%，提供{score}分基础动能。")
+
+            # 维度A：K线吸收判断 (上影线大于实体的1.5倍)
+            if row['upper_shadow'] > row['body_size'] * 1.5:
+                score += 30
+                logic_texts.append("【顶部吸收】存在长上影线，追高买盘撞上冰山卖单 (+30分)。")
+            elif row['upper_shadow'] > row['body_size'] * 0.5:
+                score += 15
+                logic_texts.append("【微弱吸收】有一定的上影线压制 (+15分)。")
+
+            # 维度B：微观订单流反转判断 (CVD/Delta转负)
+            if vol_delta < 0:
+                score += 30
+                logic_texts.append("【主动卖盘砸盘】Volume Delta转为负数，空头Taker重新主导 (+30分)。")
+            elif row['taker_buy_base_vol'] > 0 and (row['taker_sell_base_vol'] / row['taker_buy_base_vol']) > 0.8:
+                score += 15
+                logic_texts.append("【买力衰竭】Delta虽为正，但空头反击比例提高，买盘枯竭 (+15分)。")
+
+            strength = -score  # 做空强度用负数表示
+            if strength <= -70:
+                signal = -1
+
+        # 无信号或信号不达标
+        if signal == 0:
+            logic_explanation = "持仓观望。当前行情属于正常波动，未检测到引擎级联或流动性异常。"
+        else:
+            logic_explanation = "综合判定触发：\n" + "\n".join(logic_texts)
+
+        signals.append(signal)
+        strengths.append(strength)
+        explanations.append(logic_explanation)
+
+    # 找到 timestamp 的位置，并将新列精确插入其后
+    try:
+        ts_idx = res_df.columns.get_loc('timestamp')
+    except KeyError:
+        # 如果没有 timestamp 列，插在最前面
+        ts_idx = -1
+
+    res_df.insert(ts_idx + 1, 'signal', signals)
+    res_df.insert(ts_idx + 2, 'signal_strength', strengths)
+    res_df.insert(ts_idx + 3, 'logic_explanation', explanations)
+
+    # 清理辅助列
+    res_df = res_df.drop(columns=['body_size', 'lower_shadow', 'upper_shadow'])
+
+    return res_df
+
+
+import pandas as pd
+import numpy as np
+
+
+def calculate_oi_extremes(df, window=20):
+    df = df.copy()
+
+    # 1. 定义核心排序列
+    key_cols = [
+        'timestamp',
+        'short_simple_signal',
+
+        'short_signal',
+        'oi_pct_from_max',
+        'price_pct_from_max_oi',
+        'max_oi_net_vol_pct',
+        'oi_pct_from_min',
+        'price_pct_from_min_oi',
+        'min_oi_net_vol_pct'
+    ]
+    ref_cols = ['max_oi_time', 'max_oi_val', 'min_oi_time', 'min_oi_val']
+
+    # 初始化新列
+    # 初始化新列
+    for col in key_cols + ref_cols:
+        if col in ['short_signal', 'short_simple_signal']:
+            df[col] = False
+        elif col != 'timestamp':
+            df[col] = np.nan if 'time' not in col else None
+
+    # 2. 预计算极值索引
+    if window is None:
+        # 全局模式：使用整个历史
+        max_idx_series = df['oi_amount'].expanding().apply(lambda x: x.idxmax(), raw=False)
+        min_idx_series = df['oi_amount'].expanding().apply(lambda x: x.idxmin(), raw=False)
+        start_idx = 1
+    else:
+        # 窗口模式
+        max_idx_series = df['oi_amount'].rolling(window=window).apply(lambda x: x.idxmax(), raw=False)
+        min_idx_series = df['oi_amount'].rolling(window=window).apply(lambda x: x.idxmin(), raw=False)
+        start_idx = window
+
+    # 3. 遍历计算详细指标并生成信号
+    last_signal_price_pct = -np.inf  # 用于记录上一个信号的价格表现百分比
+
+    for i in range(start_idx, len(df)):
+        idx_max = max_idx_series.iloc[i]
+        idx_min = min_idx_series.iloc[i]
+
+        if pd.isna(idx_max) or pd.isna(idx_min):
+            continue
+
+        idx_max = int(idx_max)
+        idx_min = int(idx_min)
+
+        # --- 基础参考数据 ---
+        df.at[i, 'max_oi_time'] = df.at[idx_max, 'timestamp']
+        df.at[i, 'max_oi_val'] = df.at[idx_max, 'oi_amount']
+        df.at[i, 'min_oi_time'] = df.at[idx_min, 'timestamp']
+        df.at[i, 'min_oi_val'] = df.at[idx_min, 'oi_amount']
+
+        # --- 关键百分比计算 (%) ---
+        curr_oi_pct = (df.at[i, 'oi_amount'] / df.at[idx_max, 'oi_amount'] - 1) * 100
+        curr_price_pct = (df.at[i, 'close'] / df.at[idx_max, 'close'] - 1) * 100
+
+        df.at[i, 'oi_pct_from_max'] = curr_oi_pct
+        df.at[i, 'price_pct_from_max_oi'] = curr_price_pct
+
+        df.at[i, 'oi_pct_from_min'] = (df.at[i, 'oi_amount'] / df.at[idx_min, 'oi_amount'] - 1) * 100
+        df.at[i, 'price_pct_from_min_oi'] = (df.at[i, 'close'] / df.at[idx_min, 'close'] - 1) * 100
+
+        # --- Net Vol Pct 计算 ---
+        def get_net_vol_pct(start_idx, current_idx):
+            seg = df.iloc[start_idx: current_idx + 1]
+            buy = seg['taker_buy_base_vol'].sum()
+            sell = seg['taker_sell_base_vol'].sum()
+            return ((buy - sell) / (buy + sell) * 100) if (buy + sell) != 0 else 0
+
+        df.at[i, 'max_oi_net_vol_pct'] = get_net_vol_pct(idx_max, i)
+        df.at[i, 'min_oi_net_vol_pct'] = get_net_vol_pct(idx_min, i)
+
+        # --- 4. 做空信号逻辑 ---
+        # 1. 上一根的 oi_pct_from_max 是所在窗口内最小的 (相对历史最高回撤最深)
+        # 2. 当前 oi_amount 相比上一根上涨了 (真实反弹)
+        # 3. 当前价格表现 (price_pct_from_max_oi) 优于上一次信号发生时的表现
+
+        prev_oi_pct = df.at[i - 1, 'oi_pct_from_max']
+
+        if not pd.isna(prev_oi_pct):
+            # 获取用于比较的历史区间起点的索引
+            if window is None:
+                lookback_start = 1
+            else:
+                # 确保不越界
+                lookback_start = max(1, i - window)
+
+            # 截取上一根所在的滑动窗口的历史 oi_pct_from_max 序列 (截至到 i-1)
+            prev_window_pcts = df['oi_pct_from_max'].iloc[lookback_start: i]
+
+            # 条件A: 上一根的百分比跌幅，必须是该窗口序列中的最小值
+            is_prev_pct_min = (prev_oi_pct <= prev_window_pcts.min())
+
+            # 条件B: 当前 oi 绝对值发生上涨 (使用绝对值最稳妥，避免分母滑动带来的漂移误判)
+            is_oi_turning_up = (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount'])
+
+            # 条件C: 跌幅需要超过一定阈值过滤震荡噪点
+            is_deep_enough = (prev_oi_pct < -0.1)
+
+            if is_prev_pct_min and is_oi_turning_up and is_deep_enough:
+                # 核心过滤：价格表现必须优于上一个信号点
+                if curr_price_pct > last_signal_price_pct:
+                    df.at[i, 'short_signal'] = True
+                    # 更新记录值，供下一个信号对比
+                    last_signal_price_pct = curr_price_pct
+                df.at[i, 'short_simple_signal'] = True
+
+                pass
+
+    # 5. 整理排序
+    remaining_cols = [c for c in df.columns if c not in key_cols and c not in ref_cols]
+    return df[key_cols + ref_cols + remaining_cols]
+
+# 示例调用
+# result_df = calculate_oi_extremes(your_df, window=20)
 if __name__ == "__main__":
     # # ==========================================
     # # 1. 核心参数配置区
@@ -2036,27 +2391,35 @@ if __name__ == "__main__":
 
     symbol = 'ARIA/USDT:USDT'
     days = 30
-    timeframe = '1d'
+    timeframe = '5m'
+
+    clean_symbol = symbol.replace('/', '_').replace(':', '_')
+
+    # 使用 f-string 动态构建路径
+    file_path = fr'W:\project\python_project\crypto_trade\data\grid_results_{clean_symbol}_{days}d_{timeframe}.csv'
 
 
 
-    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
-    result = detect_signal_a(cvd_df)
+
+
 
     oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
-
+    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+    result = detect_signal_a(cvd_df)
     merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
-
     # 将merge_cvd_oi_df保存为csv文件
-    merge_cvd_oi_df.to_csv(r'W:\project\python_project\crypto_trade\data\grid_backtest_results.csv', index=False)
+    merge_cvd_oi_df.to_csv(file_path, index=False)
 
 
 
 
-    file_path = r'W:\project\python_project\crypto_trade\data\grid_backtest_results.csv'
+
     merge_cvd_oi_df = pd.read_csv(file_path)
-    calc_signal_df1 = calculate_short_signal(merge_cvd_oi_df)
-    calc_signal_df = detect_short_signal(merge_cvd_oi_df)
+    # plot_interactive_trend_plotly(merge_cvd_oi_df.head(80))
+    # result_df = generate_microstructure_signals(merge_cvd_oi_df)
+    add_df = calculate_oi_extremes(merge_cvd_oi_df, window=None)
+    # calc_signal_df1 = calculate_short_signal(merge_cvd_oi_df)
+    # calc_signal_df = detect_short_signal(merge_cvd_oi_df)
 
 
 
