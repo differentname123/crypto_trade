@@ -2194,6 +2194,9 @@ import numpy as np
 import pandas as pd
 import numpy as np
 
+import pandas as pd
+import numpy as np
+
 
 def calculate_oi_extremes(df, window=20):
     """
@@ -2366,19 +2369,24 @@ def calculate_oi_extremes(df, window=20):
                     df.at[i, 'long_signal'] = True
                     last_long_signal_price_pct = curr_long_price_pct
 
-        # --- 6. 建仓吸筹做多信号逻辑 (动能突破创新高法则 - 噪音剔除 + 同级别过滤版) ---
+        # --- 6. 建仓吸筹做多信号逻辑 (动能突破创新高法则 - 价格乘数平滑法 + 同级别过滤) ---
         curr_oi_pct_from_min = df.at[i, 'oi_pct_from_min']
         curr_price_pct_from_min = df.at[i, 'price_pct_from_min_oi']
 
         if not pd.isna(curr_oi_pct_from_min) and not pd.isna(curr_price_pct_from_min):
             min_oi_surge = 10.0  # 基础门槛：增量超过 10%
-            noise_price_threshold = 0.1  # 噪音过滤阈值：价格波动小于 0.1%
 
-            # 1. 计算当前的 oi_price_ratio 并剔除噪音
-            if curr_price_pct_from_min <= noise_price_threshold:
-                current_ratio = np.nan
-            else:
-                current_ratio = curr_oi_pct_from_min / curr_price_pct_from_min
+            # 1. 核心数学重构：价格乘数法
+            # 将价格百分比转换为乘数 (例：涨10% -> 1.1，跌10% -> 0.9)
+            price_multiplier = (curr_price_pct_from_min + 100) / 100.0
+
+            # 极小值保护，防止某些归零币导致分母为0
+            price_multiplier = max(price_multiplier, 0.0001)
+
+            # 重新定义比例：OI涨幅 / 价格乘数
+            # 优势1：完美处理负数。价格下跌(乘数<1)，反而会放大比例，体现绝对压制。
+            # 优势2：解决绝对量级问题。OI涨100%/价格涨10%(100/1.1=90.9) 远大于 OI涨2%/价格涨0.1%(2/1.001=1.99)
+            current_ratio = curr_oi_pct_from_min / price_multiplier
 
             df.at[i, 'oi_price_ratio'] = current_ratio
 
@@ -2391,7 +2399,7 @@ def calculate_oi_extremes(df, window=20):
             # 获取当前窗口内的历史 K 线切片 (不包含当前行 i)
             window_slice = df.iloc[lookback_start: i]
 
-            # 【核心修改】：过滤历史记录，只保留那些同样满足 OI 涨幅 > 10% 的“同级别”高价值时刻
+            # 过滤历史记录，只保留那些同样满足 OI 涨幅 > 10% 的“同级别”高价值时刻
             valid_history = window_slice[window_slice['oi_pct_from_min'] > min_oi_surge]
 
             # 判断吸筹比例 (Ratio) 是否创同级别新高
@@ -2420,14 +2428,8 @@ def calculate_oi_extremes(df, window=20):
             # 必须满足基础的涨幅过滤，并且确保正在加仓(OI向上)
             if is_oi_surged and (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount']):
 
-                # 触发条件 A：极致的绝对压价吸筹 (资金暴增>10%，但价格连0.1%都没涨上去)
-                is_absolute_suppression = (curr_price_pct_from_min <= noise_price_threshold)
-
-                # 触发条件 B：比例在“同级别”中创下新高
-                is_ratio_breakout = is_ratio_new_high
-
-                # 简单信号：满足绝对压制，或者比例创下新高
-                if is_absolute_suppression or is_ratio_breakout:
+                # 简单信号：比例在“同级别”中创下新高
+                if is_ratio_new_high:
                     df.at[i, 'long_acc_simple_signal'] = True
 
                     # 严格信号：不仅吸筹烈度达标，且 OI 的绝对涨幅也必须是同级别近期新高
@@ -2517,7 +2519,7 @@ if __name__ == "__main__":
     # 获取指定合约的实时持仓量 (OI)
 
 
-    symbol = 'SIREN/USDT:USDT'
+    symbol = 'STO/USDT:USDT'
     days = 30
     timeframe = '5m'
 
