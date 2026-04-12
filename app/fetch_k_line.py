@@ -2199,8 +2199,9 @@ def calculate_oi_extremes(df, window=20):
     key_cols = [
         'timestamp',
         'short_simple_signal',
-
         'short_signal',
+        'long_simple_signal',  # 新增：做多基础信号
+        'long_signal',  # 新增：做多高级过滤信号
         'oi_pct_from_max',
         'price_pct_from_max_oi',
         'max_oi_net_vol_pct',
@@ -2211,9 +2212,8 @@ def calculate_oi_extremes(df, window=20):
     ref_cols = ['max_oi_time', 'max_oi_val', 'min_oi_time', 'min_oi_val']
 
     # 初始化新列
-    # 初始化新列
     for col in key_cols + ref_cols:
-        if col in ['short_signal', 'short_simple_signal']:
+        if col in ['short_signal', 'short_simple_signal', 'long_signal', 'long_simple_signal']:
             df[col] = False
         elif col != 'timestamp':
             df[col] = np.nan if 'time' not in col else None
@@ -2231,7 +2231,8 @@ def calculate_oi_extremes(df, window=20):
         start_idx = window
 
     # 3. 遍历计算详细指标并生成信号
-    last_signal_price_pct = -np.inf  # 用于记录上一个信号的价格表现百分比
+    last_signal_price_pct = -np.inf  # 用于记录上一个做空信号的价格表现百分比
+    last_long_signal_price_pct = np.inf  # 用于记录上一个做多信号的价格表现百分比 (初始无穷大，保证第一次必触发)
 
     for i in range(start_idx, len(df)):
         idx_max = max_idx_series.iloc[i]
@@ -2306,7 +2307,42 @@ def calculate_oi_extremes(df, window=20):
 
                 pass
 
-    # 5. 整理排序
+        # --- 5. 做多信号逻辑 (绝对对称镜像) ---
+        # 1. 上一根的 oi_pct_from_min 是所在窗口内最大的 (积累了大量多头杠杆)
+        # 2. 当前 oi_amount 相比上一根下降了 (高位松动平仓/爆仓)
+        # 3. 当前价格表现 (price_pct_from_min_oi) 小于上一次信号发生时的表现
+
+        prev_oi_pct_from_min = df.at[i - 1, 'oi_pct_from_min']
+
+        if not pd.isna(prev_oi_pct_from_min):
+            # 复用上面的 lookback_start 截取历史窗口
+            if window is None:
+                lookback_start = 1
+            else:
+                lookback_start = max(1, i - window)
+
+            prev_window_long_pcts = df['oi_pct_from_min'].iloc[lookback_start: i]
+
+            # 条件A: 上一根的涨幅，必须是该窗口序列中的最大值
+            is_prev_long_pct_max = (prev_oi_pct_from_min >= prev_window_long_pcts.max())
+
+            # 条件B: 当前 oi 绝对值发生下降 (真实回落)
+            is_oi_turning_down = (df.at[i, 'oi_amount'] < df.at[i - 1, 'oi_amount'])
+
+            # 条件C: 涨幅需要超过一定阈值过滤震荡噪点 (此处做空的 -0.1 镜像为 > 0.1)
+            is_high_enough = (prev_oi_pct_from_min > 0.1)
+
+            if is_prev_long_pct_max and is_oi_turning_down and is_high_enough:
+                df.at[i, 'long_simple_signal'] = True
+
+                # 核心过滤：验证 price_pct_from_min_oi 比上次做多信号更小
+                curr_long_price_pct = df.at[i, 'price_pct_from_min_oi']
+                if curr_long_price_pct < last_long_signal_price_pct:
+                    df.at[i, 'long_signal'] = True
+                    # 更新记录值
+                    last_long_signal_price_pct = curr_long_price_pct
+
+    # 6. 整理排序
     remaining_cols = [c for c in df.columns if c not in key_cols and c not in ref_cols]
     return df[key_cols + ref_cols + remaining_cols]
 
@@ -2389,7 +2425,7 @@ if __name__ == "__main__":
     # 获取指定合约的实时持仓量 (OI)
 
 
-    symbol = 'ARIA/USDT:USDT'
+    symbol = 'RAVE/USDT:USDT'
     days = 30
     timeframe = '5m'
 
@@ -2403,12 +2439,12 @@ if __name__ == "__main__":
 
 
 
-    oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
-    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
-    result = detect_signal_a(cvd_df)
-    merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
-    # 将merge_cvd_oi_df保存为csv文件
-    merge_cvd_oi_df.to_csv(file_path, index=False)
+    # oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
+    # cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+    # result = detect_signal_a(cvd_df)
+    # merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
+    # # 将merge_cvd_oi_df保存为csv文件
+    # merge_cvd_oi_df.to_csv(file_path, index=False)
 
 
 
