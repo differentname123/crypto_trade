@@ -2195,8 +2195,7 @@ def generate_microstructure_signals(df, oi_drop_threshold=-1.5, price_move_thres
 import pandas as pd
 import numpy as np
 
-
-def calculate_oi_extremes(df, window=20):
+def calculate_oi_extremes(df, window=20, future_window=24):
     """
     计算基于持仓量 (OI) 极值的量价异常信号，用于捕捉市场拐点与主力异动。
 
@@ -2254,6 +2253,7 @@ def calculate_oi_extremes(df, window=20):
     Args:
         df (pd.DataFrame): 包含基础 K 线数据及 oi_amount (最好包含 funding_rate) 的 DataFrame。
         window (int): 极值计算的滑动窗口大小。若为 None 则使用全局历史。
+        future_window (int): 评估后续行情的未来滑动窗口大小（默认24）。
 
     Returns:
         pd.DataFrame: 附带各类信号列及计算中间值的新 DataFrame。
@@ -2262,9 +2262,39 @@ def calculate_oi_extremes(df, window=20):
 
     df = df.copy()
 
+    # ==========================================
+    # 新增：计算当前价格在历史窗口的水平 (百分比)
+    # ==========================================
+    if window is None:
+        hist_high_max = df['high'].expanding(min_periods=1).max()
+        hist_low_min = df['low'].expanding(min_periods=1).min()
+    else:
+        hist_high_max = df['high'].rolling(window=window, min_periods=1).max()
+        hist_low_min = df['low'].rolling(window=window, min_periods=1).min()
+
+    hist_diff = hist_high_max - hist_low_min
+    df['price_window_percentile'] = np.round(np.where(
+        hist_diff == 0,
+        0.0,
+        ((df['close'] - hist_low_min) / hist_diff * 100)
+    ), 2)
+
+    # ==========================================
+    # 计算后续窗口内的最高价、最低价及其涨跌幅
+    # 采用 shift(-1) 向前偏移结合反转滚动窗口实现 O(N) 高效运算
+    # ==========================================
+    future_high_max = df['high'].shift(-1).iloc[::-1].rolling(window=future_window, min_periods=1).max().iloc[::-1]
+    future_low_min = df['low'].shift(-1).iloc[::-1].rolling(window=future_window, min_periods=1).min().iloc[::-1]
+
+    df['future_max_high_pct'] = (future_high_max / df['close'] - 1) * 100
+    df['future_min_low_pct'] = (future_low_min / df['close'] - 1) * 100
+
     # 1. 定义核心排序列
     key_cols = [
         'timestamp',
+        'price_window_percentile',  # 新增的指标字段直接放在timestamp后面
+        'future_max_high_pct',
+        'future_min_low_pct',
         'short_simple_signal',
         'short_signal',
         'long_simple_signal',
@@ -2525,7 +2555,6 @@ def calculate_oi_extremes(df, window=20):
     return df[key_cols + ref_cols + remaining_cols]
 
 
-
 def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, retries=5, save_csv=False, file_path=None):
     """
     带重试机制的全量市场数据拉取中心
@@ -2572,7 +2601,7 @@ def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_wor
 
     # 1. 运行高波动率获取逻辑 (保持原逻辑获取最新排名)
     calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
-    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20, top_n=top_k)
 
     if bin_df is None or bin_df.empty:
         print("❌ 未能获取到波动率数据，流程终止。")
@@ -2906,11 +2935,14 @@ if __name__ == "__main__":
 
 
     # 直接拉取高波动数据并且计算信号
-    final_df = pd.read_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv")
+    origin_final_df = pd.read_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv")
     # 过滤掉 funding_rate 列中存在 NaN 的行
-    final_df = final_df[~final_df['funding_rate'].isna()]
+    final_df = origin_final_df[~origin_final_df['funding_rate'].isna()]
+    # 过滤掉时间小于2026-03-20 00:00:00的行
+    final_df['timestamp'] = pd.to_datetime(final_df['timestamp'])
+    final_df = final_df[final_df['timestamp'] >= pd.Timestamp('2026-03-20 00:00:00')]
 
     # final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
-    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2000, max_workers=2, window=None, use_local=False)
+    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2000, max_workers=2, window=None, use_local=True)
     final_df.to_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv", index=False)
-    print()
+    # print()
