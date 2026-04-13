@@ -680,9 +680,14 @@ def fetch_long_funding_history(exchange_name, symbol, days=30):
         'funding_rate': item.get('fundingRate', 0.0) * 100
     } for item in all_funding])
 
-    # --- 时间处理核心步骤 ---（完全复制 fetch_long_history 中的代码，一字不改）
+    # --- 时间处理核心步骤 ---
     # 1. 转换为 UTC 时间
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
+
+    # 🌟 核心修复：抹平交易所引擎延迟产生的毫秒级误差 (如 .003000)
+    # 使用四舍五入精确到秒，确保后续 merge 能与标准 K线 完美对齐
+    df['timestamp'] = df['timestamp'].dt.round('s')
+
     # 2. 转换为北京时间
     df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Shanghai')
     # 3. (可选) 如果不需要显示时区后缀，可以转为无时区格式
@@ -693,7 +698,6 @@ def fetch_long_funding_history(exchange_name, symbol, days=30):
     df = df.sort_values('timestamp').reset_index(drop=True)
 
     return df
-
 
 def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
     """
@@ -2198,11 +2202,14 @@ import pandas as pd
 import numpy as np
 
 
+import pandas as pd
+import numpy as np
+
 def calculate_oi_extremes(df, window=20):
     """
     计算基于持仓量 (OI) 极值的量价异常信号，用于捕捉市场拐点与主力异动。
 
-    本函数生成 3 大类核心交易信号，每类均包含“基础版 (simple)”与“严格版 (strict)”：
+    本函数生成 5 大类核心交易信号，包含原有三大类持仓信号，及新增的两大类资金费率背离信号：
 
     -------------------------------------------------------------------------
     1. 做空信号 (Short Signal): 【寻找深坑反弹】
@@ -2239,8 +2246,22 @@ def calculate_oi_extremes(df, window=20):
           庞大的被动限价单（Maker）悄悄承接散户的恐慌抛盘。他们在刻意压着价格吸血。
           一旦主力吃饱喝足、撤掉上方的压盘，被积压的买盘瞬间就会化作主升浪。此时跟随做多，是极具爆发力的买点。
 
+    -------------------------------------------------------------------------
+    4. 资金费率背离做空信号 (Funding Short Signal): 【捕捉空头衰竭/多头陷阱】
+    -------------------------------------------------------------------------
+        - 基础逻辑：资金费率创下近期新低（空军极度拥挤，支付天价费率），但是当前价格却比上一次资金费率最低时的价格更高。
+        - 背后的市场逻辑：空头付出了极大的代价疯狂做空，但价格却跌不下去反而更高了，说明空头抛压已被完全吸收或成为后续的燃料，
+          极易发生轧空；或者相反，多头利用假突破拉高出货。配合用户自定义策略作为做空参考。
+
+    -------------------------------------------------------------------------
+    5. 资金费率背离做多信号 (Funding Long Signal): 【捕捉多头衰竭/空头陷阱】
+    -------------------------------------------------------------------------
+        - 基础逻辑：资金费率创下近期新高（多军极度拥挤，支付天价费率），但是当前价格却比上一次资金费率最高时的价格更低。
+        - 背后的市场逻辑：多头支付天价费率疯狂做多，但价格却越买越低，说明买盘被冰山卖单彻底压制，此时多头随时面临连环爆仓的风险；
+          洗盘结束后往往是做多的黄金坑。配合用户自定义策略作为做多参考。
+
     Args:
-        df (pd.DataFrame): 包含基础 K 线数据及 oi_amount 的 DataFrame。
+        df (pd.DataFrame): 包含基础 K 线数据及 oi_amount (最好包含 funding_rate) 的 DataFrame。
         window (int): 极值计算的滑动窗口大小。若为 None 则使用全局历史。
 
     Returns:
@@ -2257,6 +2278,8 @@ def calculate_oi_extremes(df, window=20):
         'long_signal',  # 新增：做多高级过滤信号
         'long_acc_simple_signal',  # 新增：吸筹做多基础信号
         'long_acc_signal',  # 新增：吸筹做多高级过滤信号
+        'funding_short_signal', # 新增：资金费率背离做空信号
+        'funding_long_signal',  # 新增：资金费率背离做多信号
         'oi_price_ratio',  # 修改：排查用，记录 OI增幅/价格增幅 的真实比值
         'oi_pct_from_max',
         'price_pct_from_max_oi',
@@ -2271,7 +2294,7 @@ def calculate_oi_extremes(df, window=20):
     for col in key_cols + ref_cols:
         # 将 oi_price_ratio 移出布尔值初始化列表，让它自动进入下方的 np.nan 初始化
         if col in ['short_signal', 'short_simple_signal', 'long_signal', 'long_simple_signal', 'long_acc_simple_signal',
-                   'long_acc_signal']:
+                   'long_acc_signal', 'funding_short_signal', 'funding_long_signal']:
             df[col] = False
         elif col != 'timestamp':
             df[col] = np.nan if 'time' not in col else None
@@ -2436,9 +2459,350 @@ def calculate_oi_extremes(df, window=20):
                     if is_oi_pct_new_high:
                         df.at[i, 'long_acc_signal'] = True
 
-    # 7. 整理排序
+        # --- 7. 资金费率背离信号逻辑 (新增) ---
+        if 'funding_rate' in df.columns and not pd.isna(df.at[i, 'funding_rate']):
+            curr_fr = df.at[i, 'funding_rate']
+            curr_close = df.at[i, 'close']
+
+            fr_lookback_start = 0 if window is None else max(0, i - window)
+            # 获取当前窗口内的历史切片（不包含当前行）
+            history_slice = df.iloc[fr_lookback_start: i]
+            # 提取其中存在资金费率记录的数据
+            valid_fr_history = history_slice.dropna(subset=['funding_rate'])
+
+            if not valid_fr_history.empty:
+                # 7.1 做空信号：资金费率创新低，但是价格比上次最低时更高
+                prev_min_fr = valid_fr_history['funding_rate'].min()
+                if curr_fr < prev_min_fr:
+                    # 找到上一次费率最低的索引位置（如果有多个相同低点，取离当前最近的一次）
+                    idx_prev_min = valid_fr_history[valid_fr_history['funding_rate'] == prev_min_fr].index[-1]
+                    if curr_close > df.at[idx_prev_min, 'close']:
+                        df.at[i, 'funding_short_signal'] = True
+
+                # 7.2 做多信号：资金费率创新高，但是价格比上次最高时更低
+                prev_max_fr = valid_fr_history['funding_rate'].max()
+                if curr_fr > prev_max_fr:
+                    # 找到上一次费率最高的索引位置
+                    idx_prev_max = valid_fr_history[valid_fr_history['funding_rate'] == prev_max_fr].index[-1]
+                    if curr_close < df.at[idx_prev_max, 'close']:
+                        df.at[i, 'funding_long_signal'] = True
+
+    # 8. 整理排序
     remaining_cols = [c for c in df.columns if c not in key_cols and c not in ref_cols]
     return df[key_cols + ref_cols + remaining_cols]
+
+def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, retries=5, save_csv=False, file_path=None):
+    """
+    带重试机制的全量市场数据拉取中心 (OI + CVD + Funding)
+    """
+    import time
+    import pandas as pd
+
+    # 1. 拉取 OI 数据 (带重试机制)
+    oi_df = None
+    for attempt in range(retries):
+        try:
+            oi_df = fetch_historical_oi(exchange_name=exchange_name, symbol=symbol, timeframe=timeframe, days=days)
+            if oi_df is not None and not oi_df.empty:
+                break
+            if attempt < retries - 1:
+                time.sleep(1)
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"⚠️ [{symbol}] 拉取 OI 数据发生异常(已重试{retries}次): {e}")
+                return None
+            time.sleep(1)
+
+    if oi_df is None or oi_df.empty:
+        print(f"⚠️ [{symbol}] 最终未能获取到历史 OI 数据。")
+        return None
+
+    # 2. 拉取 CVD 数据 (带重试机制)
+    cvd_df = None
+    for attempt in range(retries):
+        try:
+            cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+            if cvd_df is not None and not cvd_df.empty:
+                break
+            if attempt < retries - 1:
+                time.sleep(1)
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"⚠️ [{symbol}] 拉取 CVD 数据发生异常(已重试{retries}次): {e}")
+                return None
+            time.sleep(1)
+
+    if cvd_df is None or cvd_df.empty:
+        print(f"⚠️ [{symbol}] 最终未能获取到历史 CVD 数据。")
+        return None
+
+    # 3. 拉取 资金费率 数据 (带重试机制)
+    funding_df = None
+    for attempt in range(retries):
+        try:
+            funding_df = fetch_long_funding_history(exchange_name=exchange_name, symbol=symbol, days=days)
+            if funding_df is not None:
+                break
+            if attempt < retries - 1:
+                time.sleep(1)
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"⚠️ [{symbol}] 拉取资金费率发生异常(已重试{retries}次): {e}")
+                funding_df = pd.DataFrame(columns=['timestamp', 'funding_rate', 'funding_rate_pct'])
+            time.sleep(1)
+
+    # 4. 执行深度合并
+    try:
+        merge_df = merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe=timeframe)
+    except Exception as e:
+        print(f"❌ [{symbol}] 数据合并时发生异常: {e}")
+        return None
+
+    # 5. 校验并保存至文件 (可选)
+    if save_csv and merge_df is not None and not merge_df.empty and file_path:
+        try:
+            merge_df.to_csv(file_path, index=False)
+            print(f"✅ [{symbol}] 数据合并成功！已保存至: {file_path}")
+        except Exception as e:
+            print(f"❌ [{symbol}] 保存 CSV 文件失败: {e}")
+
+    return merge_df
+
+
+def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_workers=10, window=None):
+    """
+    综合自动化工作流 (CVD + OI 极值 + 资金费率合并版)：
+    1. 获取币安高波动率合约排行。
+    2. 使用多线程并发拉取这些高波动合约的 CVD、历史持仓量 (OI) 以及资金费率数据。
+    3. 深度合并 CVD、OI 和 资金费率 数据 (merge_cvd_oi_funding_complete)。
+    4. 进行 OI 极值与资金费率量价异常信号分析 (calculate_oi_extremes)。
+    5. 将所有合约的分析结果合并为一个完整的 DataFrame。
+
+    :param days: 拉取历史数据天数，默认 7 天
+    :param timeframe: K线周期，默认 '1h'
+    :param top_k: 选取波动率排名前 K 的合约进行精准分析
+    :param max_workers: 并发线程数，默认 10
+    :param window: 计算极值的滑动窗口大小，默认 None (使用全局历史)
+    """
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    print("\n" + "=" * 50)
+    print("🚀 第一阶段：开始筛选高波动率合约...")
+    print("=" * 50)
+
+    # 1. 运行高波动率获取逻辑
+    calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
+    bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
+
+    if bin_df is None or bin_df.empty:
+        print("❌ 未能获取到波动率数据，流程终止。")
+        return pd.DataFrame()
+
+    # 提取高波动率排名前 top_k 的合约
+    target_symbols = bin_df['Symbol'].head(top_k).tolist()
+
+    print("\n" + "=" * 50)
+    print(f"🚀 第二阶段：开始多线程批量拉取并分析 CVD & OI & 资金费率 合并信号")
+    print(f"目标标的 (前 {top_k} 名): {target_symbols}")
+    print(f"并发线程数: {max_workers} | 失败重试次数: 5次")
+    print("=" * 50)
+
+    all_analyzed_dfs = []
+
+    # ==========================================
+    # 定义单线程处理函数：极致精简版
+    # ==========================================
+    def process_symbol(symbol):
+        try:
+            # 1. 一键拉取并合并底层数据 (不写盘，纯内存操作)
+            merge_cvd_oi_df = fetch_full_market_data_with_retry(
+                exchange_name='binance',
+                symbol=symbol,
+                timeframe=timeframe,
+                days=days,
+                retries=5,
+                save_csv=False
+            )
+
+            if merge_cvd_oi_df is None or merge_cvd_oi_df.empty:
+                print(f"⚠️ [{symbol}] 底层数据获取或合并失败，跳过该标的。")
+                return None
+
+            # 2. 计算极值与信号 (包含资金费率背离信号)
+            anlyse_df = calculate_oi_extremes(merge_cvd_oi_df, window=window)
+
+            # 3. 在 DataFrame 第 0 列插入当前币种的 Symbol，防合并后数据混乱
+            anlyse_df.insert(0, 'Symbol', symbol)
+            return anlyse_df
+
+        except Exception as e:
+            print(f"❌ [{symbol}] 线程处理或信号分析时发生异常: {e}")
+            return None
+
+    # ==========================================
+    # 启动多线程并发执行
+    # ==========================================
+    completed_count = 0
+    total_symbols = len(target_symbols)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务到线程池
+        future_to_symbol = {executor.submit(process_symbol, sym): sym for sym in target_symbols}
+
+        # as_completed 保证任何一个线程完成时立即收集结果
+        for future in as_completed(future_to_symbol):
+            completed_count += 1
+            sym = future_to_symbol[future]
+
+            try:
+                res_df = future.result()
+                if res_df is not None and not res_df.empty:
+                    all_analyzed_dfs.append(res_df)
+            except Exception as e:
+                print(f"❌ [{sym}] 线程内部执行发生致命错误: {e}")
+
+            # 打印进度条
+            if completed_count % 5 == 0 or completed_count == total_symbols:
+                print(f"进度: 已处理并分析 {completed_count}/{total_symbols} 个合约...")
+
+    print("\n" + "=" * 50)
+    print("🚀 第三阶段：合并全部数据")
+    print("=" * 50)
+
+    # 3. 将所有分析完成的 df 纵向合并为一个完整的 df
+    if not all_analyzed_dfs:
+        print("❌ 所有标的均未产生有效分析数据。")
+        return pd.DataFrame()
+
+    final_combined_df = pd.concat(all_analyzed_dfs, ignore_index=True)
+
+    # 为了便于阅读，按照 合约名称 (升序) 和 时间 (降序) 进行排序
+    try:
+        final_combined_df = final_combined_df.sort_values(by=['Symbol', 'timestamp'],
+                                                          ascending=[True, False]).reset_index(drop=True)
+    except KeyError:
+        print("⚠️ 警告：未找到 'timestamp' 列，将仅按 'Symbol' 排序。")
+        final_combined_df = final_combined_df.sort_values(by=['Symbol'], ascending=[True]).reset_index(drop=True)
+
+    print(f"✅ 综合分析工作流执行完毕！共生成 {len(final_combined_df)} 条极值信号分析记录。")
+
+    return final_combined_df
+
+
+import pandas as pd
+import numpy as np
+
+
+def merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe='1h'):
+    """
+    深度合并 CVD、OI 和 资金费率 数据，保留所有原始字段并新增分析指标。
+    （在原 merge_cvd_oi_complete 基础上新增对 funding_df 的左连接）
+    """
+    if cvd_df.empty or oi_df.empty:
+        print("❌ 错误: 输入的 CVD 或 OI DataFrame 为空，无法合并")
+        return pd.DataFrame()
+
+    # 1. 拷贝数据，确保时间戳格式
+    cvd = cvd_df.copy()
+    oi = oi_df.copy()
+    funding = funding_df.copy() if not funding_df.empty else pd.DataFrame(
+        columns=['timestamp', 'funding_rate', 'funding_rate_pct'])
+
+    cvd['timestamp'] = pd.to_datetime(cvd['timestamp'])
+    oi['timestamp'] = pd.to_datetime(oi['timestamp'])
+    if not funding.empty:
+        funding['timestamp'] = pd.to_datetime(funding['timestamp'])
+
+    # 2. 【核心对齐逻辑】
+    # 将 OI 的时间戳向前偏移一个周期。
+    delta = pd.to_timedelta(timeframe)
+    oi['match_timestamp'] = oi['timestamp'] - delta
+
+    # 3. 执行合并 (保留 cvd 的所有行)
+    df = pd.merge(
+        cvd,
+        oi,
+        left_on='timestamp',
+        right_on='match_timestamp',
+        how='left',
+        suffixes=('', '_oi_raw')
+    )
+
+    # 4. 清理多余的对齐辅助列
+    if 'match_timestamp' in df.columns:
+        df.drop(columns=['match_timestamp'], inplace=True)
+    df.rename(columns={'timestamp_oi_raw': 'oi_snapshot_time'}, inplace=True)
+
+    # 5. 【核心新增：合并资金费率】
+    # 资金费率在特定时刻产生(通常是8小时一次)，直接按 K线的 timestamp 进行左连接
+    if not funding.empty:
+        df = pd.merge(
+            df,
+            funding[['timestamp', 'funding_rate', 'funding_rate_pct']],
+            on='timestamp',
+            how='left'
+        )
+    else:
+        df['funding_rate'] = np.nan
+        df['funding_rate_pct'] = np.nan
+
+    # 6. 【新增指标计算】
+    df['price_change_pct'] = df['close'].pct_change() * 100
+    df['volume_change'] = df['volume'].diff()
+    df['delta_ratio'] = np.where(
+        df['volume'] != 0,
+        (df['volume_delta'] / df['volume']) * 100,
+        0
+    )
+
+    if 'oi_value_change_pct' not in df.columns:
+        df['oi_value_change_pct'] = df['oi_value'].pct_change() * 100
+
+    # 7. 数据最后清理
+    fill_cols = ['price_change_pct', 'volume_change', 'delta_ratio', 'oi_value_change_pct']
+    for col in fill_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # 保留小数位数，增强可读性
+    round_cols = ['price_change_pct', 'oi_amount_change_pct', 'oi_value_change_pct', 'delta_ratio']
+    for col in round_cols:
+        if col in df.columns:
+            df[col] = df[col].round(4)
+
+    return df
+
+
+def fetch_and_save_full_market_data(exchange_name, symbol, timeframe, days, file_path):
+    """
+    一键拉取持仓量(OI)、订单流(CVD)以及资金费率，合并并保存为CSV的新流水线函数。
+    """
+    print(f"\n==========================================")
+    print(f"🚀 开始执行完整数据拉取流水线")
+    print(f"标的: {symbol} | 周期: {timeframe} | 天数: {days}天")
+    print(f"==========================================")
+
+    # 1. 拉取历史持仓量 (OI)
+    oi_df = fetch_historical_oi(exchange_name=exchange_name, symbol=symbol, timeframe=timeframe, days=days)
+
+    # 2. 拉取 CVD 数据 (币安专有)
+    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+
+    # 3. 拉取 资金费率 历史数据
+    funding_df = fetch_long_funding_history(exchange_name=exchange_name, symbol=symbol, days=days)
+
+    # 4. 执行深度合并 (结合 CVD + OI + Funding)
+    merge_df = merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe=timeframe)
+
+    # 5. 校验并保存至文件
+    if merge_df is not None and not merge_df.empty:
+        merge_df.to_csv(file_path, index=False)
+        print(f"✅ 数据合并成功 (共 {len(merge_df)} 条)！已保存至:\n   {file_path}\n")
+    else:
+        print(f"❌ 数据合并失败或为空，未生成 CSV 文件。\n")
+
+    return merge_df
 
 # 示例调用
 # result_df = calculate_oi_extremes(your_df, window=20)
@@ -2519,45 +2883,56 @@ if __name__ == "__main__":
     # 获取指定合约的实时持仓量 (OI)
 
 
-    symbol = 'STO/USDT:USDT'
-    days = 30
-    timeframe = '5m'
-
-    clean_symbol = symbol.replace('/', '_').replace(':', '_')
-
-    # 使用 f-string 动态构建路径
-    file_path = fr'W:\project\python_project\crypto_trade\data\grid_results_{clean_symbol}_{days}d_{timeframe}.csv'
-
-
-
-
-
-
-    oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
-    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
-    result = detect_signal_a(cvd_df)
-    merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
-    # 将merge_cvd_oi_df保存为csv文件
-    merge_cvd_oi_df.to_csv(file_path, index=False)
-
-
-
-
-
-    merge_cvd_oi_df = pd.read_csv(file_path)
-    # plot_interactive_trend_plotly(merge_cvd_oi_df.head(80))
-    # result_df = generate_microstructure_signals(merge_cvd_oi_df)
-    add_df = calculate_oi_extremes(merge_cvd_oi_df, window=None)
-    # calc_signal_df1 = calculate_short_signal(merge_cvd_oi_df)
-    # calc_signal_df = detect_short_signal(merge_cvd_oi_df)
-
-
-
-    anlyse_df = detect_oi_signals_with_confidence(oi_df)
-    # long_anlyse_df = detect_long_grid_signals_strict(oi_df)
-    print()
+    # symbol = 'SIREN/USDT:USDT'
+    # days = 30
+    # timeframe = '5m'
+    #
+    # clean_symbol = symbol.replace('/', '_').replace(':', '_')
+    #
+    # # 使用 f-string 动态构建路径
+    # file_path = fr'W:\project\python_project\crypto_trade\data\grid_results_{clean_symbol}_{days}d_{timeframe}.csv'
+    #
+    # funding_df = fetch_long_funding_history(exchange_name="binance", symbol=symbol, days=days)
+    #
+    #
+    #
+    #
+    #
+    # # oi_df = fetch_historical_oi(exchange_name='binance', symbol=symbol, timeframe=timeframe, days=days)
+    # # cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+    # # merge_cvd_oi_df = merge_cvd_oi_complete(cvd_df, oi_df, timeframe=timeframe)
+    # # merge_cvd_oi_df.to_csv(file_path, index=False)
+    #
+    #
+    #
+    # merge_cvd_oi_df = fetch_and_save_full_market_data(
+    #     exchange_name='binance',
+    #     symbol=symbol,
+    #     timeframe=timeframe,
+    #     days=days,
+    #     file_path=file_path
+    # )
+    # merge_cvd_oi_df.to_csv(file_path, index=False)
+    #
+    #
+    #
+    #
+    #
+    # merge_cvd_oi_df = pd.read_csv(file_path)
+    # # plot_interactive_trend_plotly(merge_cvd_oi_df.head(80))
+    # # result_df = generate_microstructure_signals(merge_cvd_oi_df)
+    # add_df = calculate_oi_extremes(merge_cvd_oi_df, window=None)
+    # # calc_signal_df1 = calculate_short_signal(merge_cvd_oi_df)
+    # # calc_signal_df = detect_short_signal(merge_cvd_oi_df)
+    #
+    #
+    #
+    # anlyse_df = detect_oi_signals_with_confidence(oi_df)
+    # # long_anlyse_df = detect_long_grid_signals_strict(oi_df)
+    # print()
 
 
     # 直接拉取高波动数据并且计算信号
-    final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
+    # final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
+    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2, max_workers=10, window=None)
     print()
