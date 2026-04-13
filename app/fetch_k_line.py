@@ -2883,7 +2883,7 @@ if __name__ == "__main__":
     # 获取指定合约的实时持仓量 (OI)
 
 
-    # symbol = 'SIREN/USDT:USDT'
+    # symbol = 'AIOT/USDT:USDT'
     # days = 30
     # timeframe = '5m'
     #
