@@ -43,7 +43,7 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
             last_timestamp = curr_ohlcv[-1][0]
             since = last_timestamp + 1
 
-            print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_ohlcv)} 条")
+            # print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_ohlcv)} 条")
 
             # 如果最后一条数据的时间已经接近当前时间，则停止
             if last_timestamp >= exchange.milliseconds() - 60000:  # 1分钟内
@@ -70,7 +70,7 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
     return df
 
 
-def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=20, top_n=80):
+def get_binance_volatility_ranking(minutes_list=[15, 30, 60], max_workers=20, top_n=800):
     """
     获取币安 U本位永续合约的多维度平均分钟波动率及资金费率。
     使用多线程并发拉取，从高到低排序。
@@ -738,7 +738,7 @@ def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
             last_timestamp = curr_oi[-1]['timestamp']
             since = last_timestamp + 1
 
-            print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_oi)} 条历史 OI 数据")
+            # print(f"已获取到: {pd.to_datetime(last_timestamp, unit='ms')}，累计 {len(all_oi)} 条历史 OI 数据")
 
             if last_timestamp >= exchange.milliseconds() - 60000:
                 break
@@ -1185,7 +1185,7 @@ def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
 
             # 打印时也加入容错处理，避免 print 时报错
             readable_time = pd.to_datetime(last_timestamp, unit='ms', errors='coerce')
-            print(f"已获取到: {readable_time}，累计 {len(all_klines)} 条")
+            # print(f"已获取到: {readable_time}，累计 {len(all_klines)} 条")
 
             if last_timestamp >= exchange.milliseconds() - 60000:
                 break
@@ -2195,15 +2195,6 @@ def generate_microstructure_signals(df, oi_drop_threshold=-1.5, price_move_thres
 import pandas as pd
 import numpy as np
 
-import pandas as pd
-import numpy as np
-
-import pandas as pd
-import numpy as np
-
-
-import pandas as pd
-import numpy as np
 
 def calculate_oi_extremes(df, window=20):
     """
@@ -2267,6 +2258,8 @@ def calculate_oi_extremes(df, window=20):
     Returns:
         pd.DataFrame: 附带各类信号列及计算中间值的新 DataFrame。
     """
+    start_time = pd.Timestamp.now()
+
     df = df.copy()
 
     # 1. 定义核心排序列
@@ -2274,13 +2267,13 @@ def calculate_oi_extremes(df, window=20):
         'timestamp',
         'short_simple_signal',
         'short_signal',
-        'long_simple_signal',  # 新增：做多基础信号
-        'long_signal',  # 新增：做多高级过滤信号
-        'long_acc_simple_signal',  # 新增：吸筹做多基础信号
-        'long_acc_signal',  # 新增：吸筹做多高级过滤信号
-        'funding_short_signal', # 新增：资金费率背离做空信号
-        'funding_long_signal',  # 新增：资金费率背离做多信号
-        'oi_price_ratio',  # 修改：排查用，记录 OI增幅/价格增幅 的真实比值
+        'long_simple_signal',
+        'long_signal',
+        'long_acc_simple_signal',
+        'long_acc_signal',
+        'funding_short_signal',
+        'funding_long_signal',
+        'oi_price_ratio',
         'oi_pct_from_max',
         'price_pct_from_max_oi',
         'max_oi_net_vol_pct',
@@ -2290,308 +2283,294 @@ def calculate_oi_extremes(df, window=20):
     ]
     ref_cols = ['max_oi_time', 'max_oi_val', 'min_oi_time', 'min_oi_val']
 
-    # 初始化新列
-    for col in key_cols + ref_cols:
-        # 将 oi_price_ratio 移出布尔值初始化列表，让它自动进入下方的 np.nan 初始化
-        if col in ['short_signal', 'short_simple_signal', 'long_signal', 'long_simple_signal', 'long_acc_simple_signal',
-                   'long_acc_signal', 'funding_short_signal', 'funding_long_signal']:
-            df[col] = False
-        elif col != 'timestamp':
-            df[col] = np.nan if 'time' not in col else None
+    # ==========================================
+    # 🌟 核心提速区：提取到底层 NumPy 数组，避免内部高频 Pandas 对象开销
+    # ==========================================
+    n = len(df)
+    oi_amounts = df['oi_amount'].values
+    closes = df['close'].values
+    timestamps = df['timestamp'].values
 
-    # 2. 预计算极值索引
-    if window is None:
-        # 全局模式：使用整个历史
-        max_idx_series = df['oi_amount'].expanding().apply(lambda x: x.idxmax(), raw=False)
-        min_idx_series = df['oi_amount'].expanding().apply(lambda x: x.idxmin(), raw=False)
-        start_idx = 1
+    # 获取买卖单数据，兼容可能不存在的情况
+    taker_buys = df.get('taker_buy_base_vol', pd.Series(np.zeros(n))).values
+    taker_sells = df.get('taker_sell_base_vol', pd.Series(np.zeros(n))).values
+
+    has_fr = 'funding_rate' in df.columns
+    if has_fr:
+        funding_rates = df['funding_rate'].values
     else:
-        # 窗口模式
-        max_idx_series = df['oi_amount'].rolling(window=window).apply(lambda x: x.idxmax(), raw=False)
-        min_idx_series = df['oi_amount'].rolling(window=window).apply(lambda x: x.idxmin(), raw=False)
-        start_idx = window
+        funding_rates = np.full(n, np.nan)
 
-    # 3. 遍历计算详细指标并生成信号
-    last_signal_price_pct = -np.inf  # 用于记录上一个做空信号的价格表现百分比
-    last_long_signal_price_pct = np.inf  # 用于记录上一个做多信号的价格表现百分比 (初始无穷大，保证第一次必触发)
+    # 初始化存储容器 (原生 List 和 Numpy 数组比在 df 里插列快 100 倍)
+    max_oi_time = [None] * n
+    max_oi_val = np.full(n, np.nan)
+    min_oi_time = [None] * n
+    min_oi_val = np.full(n, np.nan)
 
-    for i in range(start_idx, len(df)):
-        idx_max = max_idx_series.iloc[i]
-        idx_min = min_idx_series.iloc[i]
+    oi_pct_from_max = np.full(n, np.nan)
+    price_pct_from_max_oi = np.full(n, np.nan)
+    max_oi_net_vol_pct = np.full(n, np.nan)
 
-        if pd.isna(idx_max) or pd.isna(idx_min):
-            continue
+    oi_pct_from_min = np.full(n, np.nan)
+    price_pct_from_min_oi = np.full(n, np.nan)
+    min_oi_net_vol_pct = np.full(n, np.nan)
 
-        idx_max = int(idx_max)
-        idx_min = int(idx_min)
+    oi_price_ratio = np.full(n, np.nan)
 
-        # --- 基础参考数据 ---
-        df.at[i, 'max_oi_time'] = df.at[idx_max, 'timestamp']
-        df.at[i, 'max_oi_val'] = df.at[idx_max, 'oi_amount']
-        df.at[i, 'min_oi_time'] = df.at[idx_min, 'timestamp']
-        df.at[i, 'min_oi_val'] = df.at[idx_min, 'oi_amount']
+    short_simple_signal = np.zeros(n, dtype=bool)
+    short_signal = np.zeros(n, dtype=bool)
+    long_simple_signal = np.zeros(n, dtype=bool)
+    long_signal = np.zeros(n, dtype=bool)
+    long_acc_simple_signal = np.zeros(n, dtype=bool)
+    long_acc_signal = np.zeros(n, dtype=bool)
+    funding_short_signal = np.zeros(n, dtype=bool)
+    funding_long_signal = np.zeros(n, dtype=bool)
+
+    # 预计算 O(1) 累计和，替代原本极慢的 df.iloc[...].sum()
+    cum_buys = np.zeros(n + 1)
+    cum_sells = np.zeros(n + 1)
+    cum_buys[1:] = np.cumsum(np.nan_to_num(taker_buys))
+    cum_sells[1:] = np.cumsum(np.nan_to_num(taker_sells))
+
+    start_idx = 1 if window is None else window
+
+    last_signal_price_pct = -np.inf
+    last_long_signal_price_pct = np.inf
+
+    # 供全局模式使用的 O(1) 极值游标
+    curr_global_max_idx = 0
+    curr_global_min_idx = 0
+
+    # 3. 遍历计算详细指标并生成信号 (纯 NumPy 逻辑，无缝衔接原有的数学公式)
+    for i in range(start_idx, n):
+        # --- 获取 Max / Min Index ---
+        if window is None:
+            if oi_amounts[i] > oi_amounts[curr_global_max_idx]:
+                curr_global_max_idx = i
+            if oi_amounts[i] < oi_amounts[curr_global_min_idx]:
+                curr_global_min_idx = i
+            idx_max = curr_global_max_idx
+            idx_min = curr_global_min_idx
+        else:
+            start_w = max(0, i - window + 1)
+            window_slice = oi_amounts[start_w: i + 1]
+            idx_max = start_w + np.argmax(window_slice)
+            idx_min = start_w + np.argmin(window_slice)
+
+        max_oi_time[i] = timestamps[idx_max]
+        max_oi_val[i] = oi_amounts[idx_max]
+        min_oi_time[i] = timestamps[idx_min]
+        min_oi_val[i] = oi_amounts[idx_min]
 
         # --- 关键百分比计算 (%) ---
-        curr_oi_pct = (df.at[i, 'oi_amount'] / df.at[idx_max, 'oi_amount'] - 1) * 100
-        curr_price_pct = (df.at[i, 'close'] / df.at[idx_max, 'close'] - 1) * 100
+        curr_oi_pct = (oi_amounts[i] / oi_amounts[idx_max] - 1) * 100
+        curr_price_pct = (closes[i] / closes[idx_max] - 1) * 100
 
-        df.at[i, 'oi_pct_from_max'] = curr_oi_pct
-        df.at[i, 'price_pct_from_max_oi'] = curr_price_pct
+        oi_pct_from_max[i] = curr_oi_pct
+        price_pct_from_max_oi[i] = curr_price_pct
 
-        df.at[i, 'oi_pct_from_min'] = (df.at[i, 'oi_amount'] / df.at[idx_min, 'oi_amount'] - 1) * 100
-        df.at[i, 'price_pct_from_min_oi'] = (df.at[i, 'close'] / df.at[idx_min, 'close'] - 1) * 100
+        curr_oi_pct_min = (oi_amounts[i] / oi_amounts[idx_min] - 1) * 100
+        curr_price_pct_min = (closes[i] / closes[idx_min] - 1) * 100
 
-        # --- Net Vol Pct 计算 ---
-        def get_net_vol_pct(start_idx, current_idx):
-            seg = df.iloc[start_idx: current_idx + 1]
-            buy = seg['taker_buy_base_vol'].sum()
-            sell = seg['taker_sell_base_vol'].sum()
-            return ((buy - sell) / (buy + sell) * 100) if (buy + sell) != 0 else 0
+        oi_pct_from_min[i] = curr_oi_pct_min
+        price_pct_from_min_oi[i] = curr_price_pct_min
 
-        df.at[i, 'max_oi_net_vol_pct'] = get_net_vol_pct(idx_max, i)
-        df.at[i, 'min_oi_net_vol_pct'] = get_net_vol_pct(idx_min, i)
+        # --- Net Vol Pct 计算 (借用 Cumsum 化 O(N) 为 O(1)) ---
+        buy_max = cum_buys[i + 1] - cum_buys[idx_max]
+        sell_max = cum_sells[i + 1] - cum_sells[idx_max]
+        max_oi_net_vol_pct[i] = ((buy_max - sell_max) / (buy_max + sell_max) * 100) if (buy_max + sell_max) != 0 else 0
+
+        buy_min = cum_buys[i + 1] - cum_buys[idx_min]
+        sell_min = cum_sells[i + 1] - cum_sells[idx_min]
+        min_oi_net_vol_pct[i] = ((buy_min - sell_min) / (buy_min + sell_min) * 100) if (buy_min + sell_min) != 0 else 0
 
         # --- 4. 做空信号逻辑 ---
-        prev_oi_pct = df.at[i - 1, 'oi_pct_from_max']
+        prev_oi_pct = oi_pct_from_max[i - 1]
 
-        if not pd.isna(prev_oi_pct):
-            if window is None:
-                lookback_start = 1
+        if not np.isnan(prev_oi_pct):
+            lookback_start = 1 if window is None else max(1, i - window)
+            slice_vals = oi_pct_from_max[lookback_start: i]
+            valid_mask = ~np.isnan(slice_vals)
+
+            if np.any(valid_mask):
+                is_prev_pct_min = bool(prev_oi_pct <= np.min(slice_vals[valid_mask]))
             else:
-                lookback_start = max(1, i - window)
+                is_prev_pct_min = False
 
-            prev_window_pcts = df['oi_pct_from_max'].iloc[lookback_start: i]
-            is_prev_pct_min = (prev_oi_pct <= prev_window_pcts.min())
-            is_oi_turning_up = (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount'])
-            is_deep_enough = (prev_oi_pct < -0.1)
+            is_oi_turning_up = bool(oi_amounts[i] > oi_amounts[i - 1])
+            is_deep_enough = bool(prev_oi_pct < -0.1)
 
             if is_prev_pct_min and is_oi_turning_up and is_deep_enough:
                 if curr_price_pct > last_signal_price_pct:
-                    df.at[i, 'short_signal'] = True
+                    short_signal[i] = True
                     last_signal_price_pct = curr_price_pct
-                df.at[i, 'short_simple_signal'] = True
+                short_simple_signal[i] = True
 
         # --- 5. 做多信号逻辑 (绝对对称镜像) ---
-        prev_oi_pct_from_min = df.at[i - 1, 'oi_pct_from_min']
+        prev_oi_pct_from_min = oi_pct_from_min[i - 1]
 
-        if not pd.isna(prev_oi_pct_from_min):
-            if window is None:
-                lookback_start = 1
+        if not np.isnan(prev_oi_pct_from_min):
+            lookback_start = 1 if window is None else max(1, i - window)
+            slice_vals_long = oi_pct_from_min[lookback_start: i]
+            valid_mask_long = ~np.isnan(slice_vals_long)
+
+            if np.any(valid_mask_long):
+                is_prev_long_pct_max = bool(prev_oi_pct_from_min >= np.max(slice_vals_long[valid_mask_long]))
             else:
-                lookback_start = max(1, i - window)
+                is_prev_long_pct_max = False
 
-            prev_window_long_pcts = df['oi_pct_from_min'].iloc[lookback_start: i]
-            is_prev_long_pct_max = (prev_oi_pct_from_min >= prev_window_long_pcts.max())
-            is_oi_turning_down = (df.at[i, 'oi_amount'] < df.at[i - 1, 'oi_amount'])
-            is_high_enough = (prev_oi_pct_from_min > 0.1)
+            is_oi_turning_down = bool(oi_amounts[i] < oi_amounts[i - 1])
+            is_high_enough = bool(prev_oi_pct_from_min > 0.1)
 
             if is_prev_long_pct_max and is_oi_turning_down and is_high_enough:
-                df.at[i, 'long_simple_signal'] = True
-                curr_long_price_pct = df.at[i, 'price_pct_from_min_oi']
-                if curr_long_price_pct < last_long_signal_price_pct:
-                    df.at[i, 'long_signal'] = True
-                    last_long_signal_price_pct = curr_long_price_pct
+                long_simple_signal[i] = True
+                if curr_price_pct_min < last_long_signal_price_pct:
+                    long_signal[i] = True
+                    last_long_signal_price_pct = curr_price_pct_min
 
-        # --- 6. 建仓吸筹做多信号逻辑 (动能突破创新高法则 - 价格乘数平滑法 + 同级别过滤) ---
-        curr_oi_pct_from_min = df.at[i, 'oi_pct_from_min']
-        curr_price_pct_from_min = df.at[i, 'price_pct_from_min_oi']
+        # --- 6. 建仓吸筹做多信号逻辑 ---
+        if not np.isnan(curr_oi_pct_min) and not np.isnan(curr_price_pct_min):
+            min_oi_surge = 10.0
+            price_multiplier = max((curr_price_pct_min + 100) / 100.0, 0.0001)
+            current_ratio = curr_oi_pct_min / price_multiplier
+            oi_price_ratio[i] = current_ratio
 
-        if not pd.isna(curr_oi_pct_from_min) and not pd.isna(curr_price_pct_from_min):
-            min_oi_surge = 10.0  # 基础门槛：增量超过 10%
+            lookback_start = 1 if window is None else max(1, i - window)
 
-            # 1. 核心数学重构：价格乘数法
-            # 将价格百分比转换为乘数 (例：涨10% -> 1.1，跌10% -> 0.9)
-            price_multiplier = (curr_price_pct_from_min + 100) / 100.0
+            # 同级别过滤
+            valid_history_mask = (oi_pct_from_min[lookback_start: i] > min_oi_surge)
+            valid_ratios = oi_price_ratio[lookback_start: i][valid_history_mask]
+            valid_oi_pcts = oi_pct_from_min[lookback_start: i][valid_history_mask]
 
-            # 极小值保护，防止某些归零币导致分母为0
-            price_multiplier = max(price_multiplier, 0.0001)
-
-            # 重新定义比例：OI涨幅 / 价格乘数
-            # 优势1：完美处理负数。价格下跌(乘数<1)，反而会放大比例，体现绝对压制。
-            # 优势2：解决绝对量级问题。OI涨100%/价格涨10%(100/1.1=90.9) 远大于 OI涨2%/价格涨0.1%(2/1.001=1.99)
-            current_ratio = curr_oi_pct_from_min / price_multiplier
-
-            df.at[i, 'oi_price_ratio'] = current_ratio
-
-            # 2. 截取历史窗口数据，并进行“同级别”过滤
-            if window is None:
-                lookback_start = 1
-            else:
-                lookback_start = max(1, i - window)
-
-            # 获取当前窗口内的历史 K 线切片 (不包含当前行 i)
-            window_slice = df.iloc[lookback_start: i]
-
-            # 过滤历史记录，只保留那些同样满足 OI 涨幅 > 10% 的“同级别”高价值时刻
-            valid_history = window_slice[window_slice['oi_pct_from_min'] > min_oi_surge]
-
-            # 判断吸筹比例 (Ratio) 是否创同级别新高
-            if pd.isna(current_ratio):
-                is_ratio_new_high = False
-            elif valid_history.empty:
-                # 历史窗口里没有达到过 10% 增量的记录，那当前这根只要达标了就是“创世纪”的新高
+            valid_ratios = valid_ratios[~np.isnan(valid_ratios)]
+            if len(valid_ratios) == 0:
                 is_ratio_new_high = True
             else:
-                # 只在那些同级别(>10%)的时刻中，去比对最大 Ratio
-                valid_historical_ratios = valid_history['oi_price_ratio'].dropna()
-                if valid_historical_ratios.empty:
-                    is_ratio_new_high = True
-                else:
-                    is_ratio_new_high = current_ratio > valid_historical_ratios.max()
+                is_ratio_new_high = bool(current_ratio > np.max(valid_ratios))
 
-            # 判断 OI 绝对增幅 是否创同级别新高
-            if valid_history.empty:
+            valid_oi_pcts = valid_oi_pcts[~np.isnan(valid_oi_pcts)]
+            if len(valid_oi_pcts) == 0:
                 is_oi_pct_new_high = True
             else:
-                is_oi_pct_new_high = curr_oi_pct_from_min > valid_history['oi_pct_from_min'].max()
+                is_oi_pct_new_high = bool(curr_oi_pct_min > np.max(valid_oi_pcts))
 
-            # 3. 信号触发逻辑
-            is_oi_surged = curr_oi_pct_from_min > min_oi_surge
+            is_oi_surged = bool(curr_oi_pct_min > min_oi_surge)
 
-            # 必须满足基础的涨幅过滤，并且确保正在加仓(OI向上)
-            if is_oi_surged and (df.at[i, 'oi_amount'] > df.at[i - 1, 'oi_amount']):
-
-                # 简单信号：比例在“同级别”中创下新高
+            if is_oi_surged and (oi_amounts[i] > oi_amounts[i - 1]):
                 if is_ratio_new_high:
-                    df.at[i, 'long_acc_simple_signal'] = True
-
-                    # 严格信号：不仅吸筹烈度达标，且 OI 的绝对涨幅也必须是同级别近期新高
+                    long_acc_simple_signal[i] = True
                     if is_oi_pct_new_high:
-                        df.at[i, 'long_acc_signal'] = True
+                        long_acc_signal[i] = True
 
-        # --- 7. 资金费率背离信号逻辑 (新增) ---
-        if 'funding_rate' in df.columns and not pd.isna(df.at[i, 'funding_rate']):
-            curr_fr = df.at[i, 'funding_rate']
-            curr_close = df.at[i, 'close']
+        # --- 7. 资金费率背离信号逻辑 ---
+        if has_fr and not np.isnan(funding_rates[i]):
+            curr_fr = funding_rates[i]
+            curr_close = closes[i]
 
             fr_lookback_start = 0 if window is None else max(0, i - window)
-            # 获取当前窗口内的历史切片（不包含当前行）
-            history_slice = df.iloc[fr_lookback_start: i]
-            # 提取其中存在资金费率记录的数据
-            valid_fr_history = history_slice.dropna(subset=['funding_rate'])
 
-            if not valid_fr_history.empty:
-                # 7.1 做空信号：资金费率创新低，但是价格比上次最低时更高
-                prev_min_fr = valid_fr_history['funding_rate'].min()
+            fr_window = funding_rates[fr_lookback_start: i]
+            valid_fr_mask = ~np.isnan(fr_window)
+
+            if np.any(valid_fr_mask):
+                valid_fr_history = fr_window[valid_fr_mask]
+
+                # 7.1 做空背离
+                prev_min_fr = np.min(valid_fr_history)
                 if curr_fr < prev_min_fr:
-                    # 找到上一次费率最低的索引位置（如果有多个相同低点，取离当前最近的一次）
-                    idx_prev_min = valid_fr_history[valid_fr_history['funding_rate'] == prev_min_fr].index[-1]
-                    if curr_close > df.at[idx_prev_min, 'close']:
-                        df.at[i, 'funding_short_signal'] = True
+                    indices = np.where(fr_window == prev_min_fr)[0]
+                    idx_prev_min = fr_lookback_start + indices[-1]
+                    if curr_close > closes[idx_prev_min]:
+                        funding_short_signal[i] = True
 
-                # 7.2 做多信号：资金费率创新高，但是价格比上次最高时更低
-                prev_max_fr = valid_fr_history['funding_rate'].max()
+                # 7.2 做多背离
+                prev_max_fr = np.max(valid_fr_history)
                 if curr_fr > prev_max_fr:
-                    # 找到上一次费率最高的索引位置
-                    idx_prev_max = valid_fr_history[valid_fr_history['funding_rate'] == prev_max_fr].index[-1]
-                    if curr_close < df.at[idx_prev_max, 'close']:
-                        df.at[i, 'funding_long_signal'] = True
+                    indices = np.where(fr_window == prev_max_fr)[0]
+                    idx_prev_max = fr_lookback_start + indices[-1]
+                    if curr_close < closes[idx_prev_max]:
+                        funding_long_signal[i] = True
+
+    # ==========================================
+    # 🏁 结算并写回原 DataFrame
+    # ==========================================
+    df['max_oi_time'] = max_oi_time
+    df['max_oi_val'] = max_oi_val
+    df['min_oi_time'] = min_oi_time
+    df['min_oi_val'] = min_oi_val
+
+    df['oi_pct_from_max'] = oi_pct_from_max
+    df['price_pct_from_max_oi'] = price_pct_from_max_oi
+    df['max_oi_net_vol_pct'] = max_oi_net_vol_pct
+
+    df['oi_pct_from_min'] = oi_pct_from_min
+    df['price_pct_from_min_oi'] = price_pct_from_min_oi
+    df['min_oi_net_vol_pct'] = min_oi_net_vol_pct
+
+    df['oi_price_ratio'] = oi_price_ratio
+
+    df['short_simple_signal'] = short_simple_signal
+    df['short_signal'] = short_signal
+    df['long_simple_signal'] = long_simple_signal
+    df['long_signal'] = long_signal
+    df['long_acc_simple_signal'] = long_acc_simple_signal
+    df['long_acc_signal'] = long_acc_signal
+    df['funding_short_signal'] = funding_short_signal
+    df['funding_long_signal'] = funding_long_signal
 
     # 8. 整理排序
     remaining_cols = [c for c in df.columns if c not in key_cols and c not in ref_cols]
+
+    print(f"✅ 计算完成！总耗时: {(pd.Timestamp.now() - start_time).total_seconds():.3f} 秒")
     return df[key_cols + ref_cols + remaining_cols]
+
+
 
 def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, retries=5, save_csv=False, file_path=None):
     """
-    带重试机制的全量市场数据拉取中心 (OI + CVD + Funding)
+    带重试机制的全量市场数据拉取中心
     """
     import time
     import pandas as pd
 
-    # 1. 拉取 OI 数据 (带重试机制)
-    oi_df = None
-    for attempt in range(retries):
-        try:
-            oi_df = fetch_historical_oi(exchange_name=exchange_name, symbol=symbol, timeframe=timeframe, days=days)
-            if oi_df is not None and not oi_df.empty:
-                break
-            if attempt < retries - 1:
-                time.sleep(1)
-        except Exception as e:
-            if attempt == retries - 1:
-                print(f"⚠️ [{symbol}] 拉取 OI 数据发生异常(已重试{retries}次): {e}")
-                return None
-            time.sleep(1)
+    # 1. 拉取 OI 数据
+    oi_df = fetch_historical_oi(exchange_name=exchange_name, symbol=symbol, timeframe=timeframe, days=days)
+    if oi_df is None or oi_df.empty: return None
 
-    if oi_df is None or oi_df.empty:
-        print(f"⚠️ [{symbol}] 最终未能获取到历史 OI 数据。")
-        return None
+    # 2. 拉取 CVD 数据
+    cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
+    if cvd_df is None or cvd_df.empty: return None
 
-    # 2. 拉取 CVD 数据 (带重试机制)
-    cvd_df = None
-    for attempt in range(retries):
-        try:
-            cvd_df = fetch_binance_cvd_history(symbol=symbol, timeframe=timeframe, days=days)
-            if cvd_df is not None and not cvd_df.empty:
-                break
-            if attempt < retries - 1:
-                time.sleep(1)
-        except Exception as e:
-            if attempt == retries - 1:
-                print(f"⚠️ [{symbol}] 拉取 CVD 数据发生异常(已重试{retries}次): {e}")
-                return None
-            time.sleep(1)
+    # 3. 拉取 资金费率
+    funding_df = fetch_long_funding_history(exchange_name=exchange_name, symbol=symbol, days=days)
 
-    if cvd_df is None or cvd_df.empty:
-        print(f"⚠️ [{symbol}] 最终未能获取到历史 CVD 数据。")
-        return None
+    # 4. 执行合并
+    merge_df = merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe=timeframe)
 
-    # 3. 拉取 资金费率 数据 (带重试机制)
-    funding_df = None
-    for attempt in range(retries):
-        try:
-            funding_df = fetch_long_funding_history(exchange_name=exchange_name, symbol=symbol, days=days)
-            if funding_df is not None:
-                break
-            if attempt < retries - 1:
-                time.sleep(1)
-        except Exception as e:
-            if attempt == retries - 1:
-                print(f"⚠️ [{symbol}] 拉取资金费率发生异常(已重试{retries}次): {e}")
-                funding_df = pd.DataFrame(columns=['timestamp', 'funding_rate', 'funding_rate_pct'])
-            time.sleep(1)
-
-    # 4. 执行深度合并
-    try:
-        merge_df = merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe=timeframe)
-    except Exception as e:
-        print(f"❌ [{symbol}] 数据合并时发生异常: {e}")
-        return None
-
-    # 5. 校验并保存至文件 (可选)
+    # 5. 自动写盘 (由 get_high_volatility_merged_signals 触发)
     if save_csv and merge_df is not None and not merge_df.empty and file_path:
-        try:
-            merge_df.to_csv(file_path, index=False)
-            print(f"✅ [{symbol}] 数据合并成功！已保存至: {file_path}")
-        except Exception as e:
-            print(f"❌ [{symbol}] 保存 CSV 文件失败: {e}")
+        merge_df.to_csv(file_path, index=False)
+        print(f"💾 [{symbol}] 数据已存档至本地。")
 
     return merge_df
 
+import os
+import pandas as pd
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_workers=10, window=None):
+def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_workers=10, window=None, use_local=True):
     """
-    综合自动化工作流 (CVD + OI 极值 + 资金费率合并版)：
-    1. 获取币安高波动率合约排行。
-    2. 使用多线程并发拉取这些高波动合约的 CVD、历史持仓量 (OI) 以及资金费率数据。
-    3. 深度合并 CVD、OI 和 资金费率 数据 (merge_cvd_oi_funding_complete)。
-    4. 进行 OI 极值与资金费率量价异常信号分析 (calculate_oi_extremes)。
-    5. 将所有合约的分析结果合并为一个完整的 DataFrame。
-
-    :param days: 拉取历史数据天数，默认 7 天
-    :param timeframe: K线周期，默认 '1h'
-    :param top_k: 选取波动率排名前 K 的合约进行精准分析
-    :param max_workers: 并发线程数，默认 10
-    :param window: 计算极值的滑动窗口大小，默认 None (使用全局历史)
+    综合自动化工作流优化版：
+    1. 自动筛选币安高波动率合约。
+    2. 增加缓存机制：如果 use_local=True 且本地存在数据，则直接读取，否则拉取并保存。
+    3. 多线程并行处理各标的信号分析。
     """
-    import pandas as pd
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
     print("\n" + "=" * 50)
     print("🚀 第一阶段：开始筛选高波动率合约...")
     print("=" * 50)
 
-    # 1. 运行高波动率获取逻辑
+    # 1. 运行高波动率获取逻辑 (保持原逻辑获取最新排名)
     calc_minutes_list = [15, 30, 60, 90, 120, 180, 240, 300, 360, 420, 480, 540, 600, 1000]
     bin_df = get_binance_volatility_ranking(minutes_list=calc_minutes_list, max_workers=20)
 
@@ -2599,45 +2578,59 @@ def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_wor
         print("❌ 未能获取到波动率数据，流程终止。")
         return pd.DataFrame()
 
-    # 提取高波动率排名前 top_k 的合约
     target_symbols = bin_df['Symbol'].head(top_k).tolist()
+    data_dir = Path(r"W:\project\python_project\crypto_trade\data")
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 50)
-    print(f"🚀 第二阶段：开始多线程批量拉取并分析 CVD & OI & 资金费率 合并信号")
+    print(f"🚀 第二阶段：开始并行分析信号 (本地缓存: {'开启' if use_local else '关闭'})")
     print(f"目标标的 (前 {top_k} 名): {target_symbols}")
-    print(f"并发线程数: {max_workers} | 失败重试次数: 5次")
     print("=" * 50)
 
     all_analyzed_dfs = []
 
-    # ==========================================
-    # 定义单线程处理函数：极致精简版
-    # ==========================================
     def process_symbol(symbol):
         try:
-            # 1. 一键拉取并合并底层数据 (不写盘，纯内存操作)
-            merge_cvd_oi_df = fetch_full_market_data_with_retry(
-                exchange_name='binance',
-                symbol=symbol,
-                timeframe=timeframe,
-                days=days,
-                retries=5,
-                save_csv=False
-            )
+            # 构造安全的文件名
+            safe_symbol = symbol.replace('/', '_').replace(':', '_')
+            filename = f"merge_cvd_oi_funding_{safe_symbol}_{timeframe}_{days}d.csv"
+            file_path = data_dir / filename
+
+            merge_cvd_oi_df = None
+
+            # --- 优化点：本地缓存检查 ---
+            if use_local and file_path.exists():
+                print(f"📦 [{symbol}] 发现本地缓存，正在读取...")
+                merge_cvd_oi_df = pd.read_csv(file_path)
+                # 转换时间戳确保计算正确
+                if 'timestamp' in merge_cvd_oi_df.columns:
+                    merge_cvd_oi_df['timestamp'] = pd.to_datetime(merge_cvd_oi_df['timestamp'])
+            else:
+                # --- 若无缓存或强制刷新，则拉取数据 ---
+                print(f"🌐 [{symbol}] 正在从交易所拉取最新数据...")
+                merge_cvd_oi_df = fetch_full_market_data_with_retry(
+                    exchange_name='binance',
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    days=days,
+                    retries=5,
+                    save_csv=True, # 内部逻辑会自动保存
+                    file_path=str(file_path)
+                )
 
             if merge_cvd_oi_df is None or merge_cvd_oi_df.empty:
-                print(f"⚠️ [{symbol}] 底层数据获取或合并失败，跳过该标的。")
+                print(f"⚠️ [{symbol}] 数据为空，跳过。")
                 return None
 
-            # 2. 计算极值与信号 (包含资金费率背离信号)
+            # 2. 执行核心信号算法计算
             anlyse_df = calculate_oi_extremes(merge_cvd_oi_df, window=window)
 
-            # 3. 在 DataFrame 第 0 列插入当前币种的 Symbol，防合并后数据混乱
+            # 3. 标记 Symbol
             anlyse_df.insert(0, 'Symbol', symbol)
             return anlyse_df
 
         except Exception as e:
-            print(f"❌ [{symbol}] 线程处理或信号分析时发生异常: {e}")
+            print(f"❌ [{symbol}] 处理发生异常: {e}")
             return None
 
     # ==========================================
@@ -2647,48 +2640,28 @@ def get_high_volatility_merged_signals(days=7, timeframe='1h', top_k=15, max_wor
     total_symbols = len(target_symbols)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # 提交所有任务到线程池
         future_to_symbol = {executor.submit(process_symbol, sym): sym for sym in target_symbols}
 
-        # as_completed 保证任何一个线程完成时立即收集结果
         for future in as_completed(future_to_symbol):
             completed_count += 1
-            sym = future_to_symbol[future]
+            res_df = future.result()
+            if res_df is not None and not res_df.empty:
+                all_analyzed_dfs.append(res_df)
 
-            try:
-                res_df = future.result()
-                if res_df is not None and not res_df.empty:
-                    all_analyzed_dfs.append(res_df)
-            except Exception as e:
-                print(f"❌ [{sym}] 线程内部执行发生致命错误: {e}")
-
-            # 打印进度条
             if completed_count % 5 == 0 or completed_count == total_symbols:
-                print(f"进度: 已处理并分析 {completed_count}/{total_symbols} 个合约...")
+                print(f"进度: 已完成 {completed_count}/{total_symbols}...")
 
-    print("\n" + "=" * 50)
-    print("🚀 第三阶段：合并全部数据")
-    print("=" * 50)
-
-    # 3. 将所有分析完成的 df 纵向合并为一个完整的 df
     if not all_analyzed_dfs:
-        print("❌ 所有标的均未产生有效分析数据。")
+        print("❌ 未生成任何分析结果。")
         return pd.DataFrame()
 
+    # 合并并排序
     final_combined_df = pd.concat(all_analyzed_dfs, ignore_index=True)
+    sort_cols = ['Symbol', 'timestamp'] if 'timestamp' in final_combined_df.columns else ['Symbol']
+    final_combined_df = final_combined_df.sort_values(by=sort_cols, ascending=[True, False]).reset_index(drop=True)
 
-    # 为了便于阅读，按照 合约名称 (升序) 和 时间 (降序) 进行排序
-    try:
-        final_combined_df = final_combined_df.sort_values(by=['Symbol', 'timestamp'],
-                                                          ascending=[True, False]).reset_index(drop=True)
-    except KeyError:
-        print("⚠️ 警告：未找到 'timestamp' 列，将仅按 'Symbol' 排序。")
-        final_combined_df = final_combined_df.sort_values(by=['Symbol'], ascending=[True]).reset_index(drop=True)
-
-    print(f"✅ 综合分析工作流执行完毕！共生成 {len(final_combined_df)} 条极值信号分析记录。")
-
+    print(f"\n✅ 全部工作流执行完毕！结果集总计: {len(final_combined_df)} 行数据。")
     return final_combined_df
-
 
 import pandas as pd
 import numpy as np
@@ -2892,7 +2865,7 @@ if __name__ == "__main__":
     # # 使用 f-string 动态构建路径
     # file_path = fr'W:\project\python_project\crypto_trade\data\grid_results_{clean_symbol}_{days}d_{timeframe}.csv'
     #
-    # funding_df = fetch_long_funding_history(exchange_name="binance", symbol=symbol, days=days)
+    # # funding_df = fetch_long_funding_history(exchange_name="binance", symbol=symbol, days=days)
     #
     #
     #
@@ -2905,14 +2878,14 @@ if __name__ == "__main__":
     #
     #
     #
-    # merge_cvd_oi_df = fetch_and_save_full_market_data(
-    #     exchange_name='binance',
-    #     symbol=symbol,
-    #     timeframe=timeframe,
-    #     days=days,
-    #     file_path=file_path
-    # )
-    # merge_cvd_oi_df.to_csv(file_path, index=False)
+    # # merge_cvd_oi_df = fetch_and_save_full_market_data(
+    # #     exchange_name='binance',
+    # #     symbol=symbol,
+    # #     timeframe=timeframe,
+    # #     days=days,
+    # #     file_path=file_path
+    # # )
+    # # merge_cvd_oi_df.to_csv(file_path, index=False)
     #
     #
     #
@@ -2933,6 +2906,11 @@ if __name__ == "__main__":
 
 
     # 直接拉取高波动数据并且计算信号
+    final_df = pd.read_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv")
+    # 过滤掉 funding_rate 列中存在 NaN 的行
+    final_df = final_df[~final_df['funding_rate'].isna()]
+
     # final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
-    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2, max_workers=10, window=None)
+    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2000, max_workers=2, window=None, use_local=False)
+    final_df.to_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv", index=False)
     print()
