@@ -2555,13 +2555,17 @@ def calculate_oi_extremes(df, window=20, future_window=24):
     return df[key_cols + ref_cols + remaining_cols]
 
 
-def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, retries=5, save_csv=False, file_path=None):
+import os
+import time
+import pandas as pd
+import numpy as np
+
+
+def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, retries=5, save_csv=False,
+                                      file_path=None):
     """
     带重试机制的全量市场数据拉取中心
     """
-    import time
-    import pandas as pd
-
     # 1. 拉取 OI 数据
     oi_df = fetch_historical_oi(exchange_name=exchange_name, symbol=symbol, timeframe=timeframe, days=days)
     if oi_df is None or oi_df.empty: return None
@@ -2576,12 +2580,62 @@ def fetch_full_market_data_with_retry(exchange_name, symbol, timeframe, days, re
     # 4. 执行合并
     merge_df = merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe=timeframe)
 
-    # 5. 自动写盘 (由 get_high_volatility_merged_signals 触发)
+    # 5. 自动写盘 (增量保存与日志打印逻辑)
     if save_csv and merge_df is not None and not merge_df.empty and file_path:
-        merge_df.to_csv(file_path, index=False)
-        print(f"💾 [{symbol}] 数据已存档至本地。")
+        # 确保时间戳为 datetime 类型以便比较
+        merge_df['timestamp'] = pd.to_datetime(merge_df['timestamp'])
+
+        if os.path.exists(file_path):
+            try:
+                # 读取本地原有数据，仅读取 timestamp 列以节省内存和提升速度
+                existing_df = pd.read_csv(file_path, usecols=['timestamp'])
+
+                if not existing_df.empty:
+                    existing_df['timestamp'] = pd.to_datetime(existing_df['timestamp'])
+
+                    # 提取本地数据的统计信息
+                    orig_len = len(existing_df)
+                    orig_start = existing_df['timestamp'].min()
+                    orig_end = existing_df['timestamp'].max()
+
+                    # 过滤出新数据 (时间戳大于本地最新记录)
+                    new_data = merge_df[merge_df['timestamp'] > orig_end]
+
+                    if not new_data.empty:
+                        # 提取新数据的统计信息
+                        new_len = len(new_data)
+                        new_start = new_data['timestamp'].min()
+                        new_end = new_data['timestamp'].max()
+
+                        # 增量写入 (mode='a' 追加，header=False 不写入表头)
+                        # 注意：需要确保新数据的列顺序与本地一致，这里使用 DataFrame 原有列顺序
+                        new_data.to_csv(file_path, mode='a', header=False, index=False)
+
+                        print(f"💾 [{symbol}] 增量保存成功！")
+                        print(f"   📊 [本地原始数据] 长度: {orig_len} 条 | 时间范围: {orig_start} -> {orig_end}")
+                        print(f"   📈 [本次新增数据] 长度: {new_len} 条 | 时间范围: {new_start} -> {new_end}")
+                    else:
+                        print(f"💾 [{symbol}] 数据已是最新，无增量数据需要存档。")
+                        print(f"   📊 [本地当前数据] 长度: {orig_len} 条 | 最新时间: {orig_end}")
+                else:
+                    # 文件存在但为空，直接覆盖
+                    raise ValueError("本地文件为空")
+
+            except Exception as e:
+                # 如果读取本地文件失败(如格式被破坏)，回退到全量覆盖模式
+                print(f"⚠️ 读取本地文件出错 ({e})，将执行全量覆盖保存。")
+                merge_df.to_csv(file_path, index=False)
+                print(f"💾 [{symbol}] 全量数据已存档至本地，共 {len(merge_df)} 条。")
+        else:
+            # 文件不存在，首次全量保存
+            merge_df.to_csv(file_path, index=False)
+            init_start = merge_df['timestamp'].min()
+            init_end = merge_df['timestamp'].max()
+            print(f"💾 [{symbol}] 首次创建数据文件。")
+            print(f"   🌱 [初始化数据] 长度: {len(merge_df)} 条 | 时间范围: {init_start} -> {init_end}")
 
     return merge_df
+
 
 import os
 import pandas as pd
@@ -2696,6 +2750,7 @@ import pandas as pd
 import numpy as np
 
 
+
 def merge_cvd_oi_funding_complete(cvd_df, oi_df, funding_df, timeframe='1h'):
     """
     深度合并 CVD、OI 和 资金费率 数据，保留所有原始字段并新增分析指标。
@@ -2805,6 +2860,74 @@ def fetch_and_save_full_market_data(exchange_name, symbol, timeframe, days, file
         print(f"❌ 数据合并失败或为空，未生成 CSV 文件。\n")
 
     return merge_df
+
+
+def continuous_incremental_update(exchange_name='binance', timeframe='5m', fetch_days=2, sleep_interval=1.5):
+    """
+    不断循环拉取所有全市场合约的 CVD、OI、Funding 合并数据，并增量更新到本地。
+
+    :param exchange_name: 交易所名称
+    :param timeframe: K线周期
+    :param fetch_days: 每次拉取的天数 (建议设为1-2天，只要覆盖了本地最新时间即可触发增量逻辑，极大节省请求)
+    :param sleep_interval: 每个币种处理完后的休眠时间(秒)，防止触发频率限制
+    """
+    # 1. 确保目录存在
+    data_dir = Path(r"W:\project\python_project\crypto_trade\data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. 实例化交易所 (仅用于拉取市场列表)
+    exchange = getattr(ccxt, exchange_name)({
+        'enableRateLimit': True,
+        'proxies': {
+            'http': 'http://127.0.0.1:7890',
+            'https': 'http://127.0.0.1:7890',
+        },
+    })
+
+    print("初始化：正在获取全市场 U本位永续合约列表...")
+    markets = exchange.load_markets()
+    symbols = [
+        sym for sym, market in markets.items()
+        if market.get('active')
+           and market.get('linear')
+           and market.get('quote') == 'USDT'
+           and market.get('type') == 'swap'
+    ]
+    print(f"✅ 共锁定 {len(symbols)} 个活跃合约，开始进入 7x24h 持续增量更新循环。")
+
+    # 3. 开启无限循环
+    while True:
+        for i, symbol in enumerate(symbols):
+            try:
+                safe_symbol = symbol.replace('/', '_').replace(':', '_')
+                # 统一本地文件命名规则，确保与你的历史文件能够匹配
+                file_path = data_dir / f"merge_cvd_oi_funding_{safe_symbol}_{timeframe}_history.csv"
+
+                print(f"\n[{i + 1}/{len(symbols)}] 正在巡检更新 {symbol} ...")
+
+                # 调用你原代码中已经写好的强力合并与增量保存函数
+                fetch_full_market_data_with_retry(
+                    exchange_name=exchange_name,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    days=fetch_days,  # 核心优化：只拉取最近1-2天，利用原有函数的增量比对直接入库
+                    retries=3,
+                    save_csv=True,
+                    file_path=str(file_path)
+                )
+
+                # 核心防封逻辑：请求完一个标的（内部包含了OI/CVD/Funding三次请求），强制休眠
+                time.sleep(sleep_interval)
+
+            except Exception as e:
+                print(f"❌ 更新 {symbol} 时发生不可预见异常: {e}")
+                time.sleep(sleep_interval)
+
+        # 当一轮 300 多个币全部拉取完毕后，整体休眠一段时间再开始下一轮
+        print("\n===================================================")
+        print("✅ 一轮全市场巡检增量更新完成，休眠 3 分钟后开启下一轮...")
+        print("===================================================")
+        time.sleep(180)
 
 # 示例调用
 # result_df = calculate_oi_extremes(your_df, window=20)
@@ -2934,15 +3057,25 @@ if __name__ == "__main__":
     # print()
 
 
-    # 直接拉取高波动数据并且计算信号
-    origin_final_df = pd.read_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv")
-    # 过滤掉 funding_rate 列中存在 NaN 的行
-    final_df = origin_final_df[~origin_final_df['funding_rate'].isna()]
-    # 过滤掉时间小于2026-03-20 00:00:00的行
-    final_df['timestamp'] = pd.to_datetime(final_df['timestamp'])
-    final_df = final_df[final_df['timestamp'] >= pd.Timestamp('2026-03-20 00:00:00')]
+    # # 直接拉取高波动数据并且计算信号
+    # origin_final_df = pd.read_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals_full.csv")
+    # # 过滤掉 funding_rate 列中存在 NaN 的行
+    # final_df = origin_final_df[~origin_final_df['funding_rate'].isna()]
+    # # 过滤掉时间小于2026-03-20 00:00:00的行
+    # final_df['timestamp'] = pd.to_datetime(final_df['timestamp'])
+    # final_df = final_df[final_df['timestamp'] >= pd.Timestamp('2026-03-20 00:00:00')]
 
-    # final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
-    final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2000, max_workers=2, window=None, use_local=True)
-    final_df.to_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals.csv", index=False)
-    # print()
+    # while True:
+    #     try:
+    #         # final_df = get_high_volatility_oi_signals(days=7, timeframe='1h', top_k=20)
+    #         final_df = get_high_volatility_merged_signals(days=30, timeframe='5m', top_k=2000, max_workers=2, window=None, use_local=True)
+    #         final_df.to_csv(r"W:\project\python_project\crypto_trade\data\high_volatility_signals_full.csv", index=False)
+    #         # print()
+    #     except Exception as e:
+    #         print(f"发生异常: {e}，正在重试...")
+    #     time.sleep(60)  # 等待5秒后重试
+
+
+
+
+    continuous_incremental_update(exchange_name='binance', timeframe='5m', fetch_days=30, sleep_interval=1.5)
