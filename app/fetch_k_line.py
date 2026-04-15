@@ -2904,6 +2904,8 @@ def continuous_incremental_update(exchange_name='binance', timeframe='5m', fetch
                 file_path = data_dir / f"merge_cvd_oi_funding_{safe_symbol}_{timeframe}_history.csv"
 
                 print(f"\n[{i + 1}/{len(symbols)}] 正在巡检更新 {symbol} ...")
+                # 判断file_path是否存在，如果存在则降低时间
+                fetch_days = 2 if file_path.exists() else 30  # 核心优化：如果文件存在，说明之前已经拉取过历史数据，这次只需要覆盖最近2天即可触发增量逻辑
 
                 # 调用你原代码中已经写好的强力合并与增量保存函数
                 fetch_full_market_data_with_retry(
