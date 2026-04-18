@@ -26,7 +26,7 @@ import traceback
 # 用于保存浏览器登录状态的目录，请确保该目录可写
 USER_DATA_DIR = r"W:\temp\coin"
 # 登录目标地址
-LOGIN_URL = 'https://www.coinglass.com/zh/currencies/RAVE/futures'
+LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
 
 # ==============================================================================
@@ -411,7 +411,7 @@ if __name__ == '__main__':
     # ==================================
     # 步骤 1：首次使用请取消下面这行的注释进行登录
     # ==================================
-    login_and_save_session()
+    # login_and_save_session()
 
     # ==================================
     # 步骤 2：登录成功后，使用自动化评论功能
