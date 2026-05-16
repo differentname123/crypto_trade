@@ -4,19 +4,19 @@
 :create_date:
     2026/5/16
 :description:
-    ETH 网格与期权动态对冲寻优引擎 (生产版)
+    网格与期权动态对冲寻优引擎 (生产版) - 支持多币种动态配置
 """
 import os
 import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-pd.set_option('display.unicode.east_asian_width', True)
+
 # ==========================================
 # 1. 数据获取模块
 # ==========================================
-def get_binance_eth_options():
-    """从币安拉取最新的 ETH 期权行情数据"""
+def get_binance_options(symbol="ETH"):
+    """从币安拉取最新的指定币种期权行情数据"""
     url = "https://eapi.binance.com/eapi/v1/ticker"
     print(f"[INFO] 正在请求币安期权接口: {url}")
     try:
@@ -24,34 +24,36 @@ def get_binance_eth_options():
         response.raise_for_status()
         data = response.json()
 
-        eth_options = [item for item in data if item['symbol'].startswith('ETH-')]
-        if not eth_options:
-            print("[WARNING] 接口请求成功，但未找到 ETH 相关期权数据。")
+        target_prefix = f"{symbol.upper()}-"
+        target_options = [item for item in data if item['symbol'].startswith(target_prefix)]
+        if not target_options:
+            print(f"[WARNING] 接口请求成功，但未找到 {symbol.upper()} 相关期权数据。")
             return None
 
-        df = pd.DataFrame(eth_options)
+        df = pd.DataFrame(target_options)
         columns_to_show = ['symbol', 'lastPrice', 'bidPrice', 'askPrice', 'volume']
         df = df[[col for col in columns_to_show if col in df.columns]]
 
         for col in ['lastPrice', 'bidPrice', 'askPrice', 'volume']:
             df[col] = df[col].astype(float)
 
-        print(f"[INFO] 成功拉取并清洗 {len(df)} 条 ETH 期权数据。")
+        print(f"[INFO] 成功拉取并清洗 {len(df)} 条 {symbol.upper()} 期权数据。")
         return df
     except requests.exceptions.RequestException as e:
         print(f"[ERROR] 请求币安 API 失败: {e}")
         return None
 
 
-def get_current_eth_price():
-    """获取当前 ETH 现货价格"""
+def get_current_spot_price(symbol="ETH"):
+    """获取当前指定币种现货价格"""
     try:
-        resp = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=5)
+        target_pair = f"{symbol.upper()}USDT"
+        resp = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={target_pair}", timeout=5)
         resp.raise_for_status()
         return float(resp.json()['price'])
     except Exception as e:
-        print(f"[WARNING] 获取 ETH 现货价格失败: {e}。默认返回 3000.0 U")
-        return 3000.0
+        print(f"[WARNING] 获取 {symbol.upper()} 现货价格失败: {e}。")
+        return 0.0
 
 
 # ==========================================
@@ -77,7 +79,7 @@ def calculate_multi_group_margin(
     r = add_step_percent / 100.0
     sign = 1 if direction == 'long' else -1
     target_price = initial_price * (1.0 - target_loss_percent / 100.0) if direction == 'long' else initial_price * (
-                1.0 + target_loss_percent / 100.0)
+            1.0 + target_loss_percent / 100.0)
 
     current_price = initial_price
     total_margin_all_groups = 0.0
@@ -146,16 +148,17 @@ def calculate_multi_group_margin(
 # ==========================================
 # 3. 期权策略寻优引擎
 # ==========================================
-def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48, max_margin=1000):
+def find_optimal_options_strategy(df, target_price, target_profit, symbol="ETH", min_hours=48, max_margin=1000):
     """全局遍历寻找给定目标价与利润要求下的最优期权价差组合"""
     results = []
     now_utc = datetime.now(timezone.utc)
+    target_prefix = f"{symbol.upper()}-"
 
     # 预处理查找表 (加速卖出腿的匹配)
     put_bids = {}
     for _, r in df.iterrows():
         sym = r['symbol']
-        if isinstance(sym, str) and sym.startswith('ETH-') and sym.endswith('-P'):
+        if isinstance(sym, str) and sym.startswith(target_prefix) and sym.endswith('-P'):
             p = sym.split('-')
             if len(p) == 4:
                 bid_p = r.get('bidPrice', 0)
@@ -163,13 +166,13 @@ def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48,
                     put_bids[(p[1], float(p[2]))] = (sym, float(bid_p))
 
     for index, row in df.iterrows():
-        symbol = row['symbol']
+        opt_symbol = row['symbol']
         ask_price = row.get('askPrice', 0)
 
         if pd.isna(ask_price) or ask_price <= 0:
             continue
 
-        parts = symbol.split('-')
+        parts = opt_symbol.split('-')
         if len(parts) != 4:
             continue
 
@@ -257,7 +260,7 @@ def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48,
             continue
 
         results.append({
-            '期权名称 (买入腿)': symbol,
+            '期权名称 (买入腿)': opt_symbol,
             '期权名称 (卖出腿)': best_sell_symbol,
             '类型': opt_type_name,
             '距离结束的时间': time_left_str,
@@ -281,36 +284,32 @@ def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48,
 
 
 # ==========================================
-# 4. 主流程逻辑
+# 4. 业务流程拆解 (提高可读性)
 # ==========================================
-if __name__ == "__main__":
-    pd.set_option('display.unicode.east_asian_width', True)  # 解决中文对齐问题
-    pd.set_option('display.max_columns', None)  # 强制显示所有列，防止省略号
-    pd.set_option('display.width', 1000)  # 加宽显示区，防止自动换行
-    pd.set_option('display.colheader_justify', 'center')  # 表头居中对齐
+def load_options_data(symbol: str) -> pd.DataFrame:
+    """加载并缓存期权数据"""
+    cache_file = f'binance_{symbol.lower()}_options.csv'
+    # if os.path.exists(cache_file):
+    #     print(f"[INFO] 找到本地缓存文件 {cache_file}，直接加载。")
+    #     return pd.read_csv(cache_file)
+    # else:
+    df = get_binance_options(symbol)
+    if df is not None and not df.empty:
+        df.to_csv(cache_file, index=False)
+        print(f"[INFO] 数据已成功缓存至 {cache_file}。")
+    return df
 
-    eth_df_file = 'binance_eth_options.csv'
-    if os.path.exists(eth_df_file):
-        print(f"[INFO] 找到本地缓存文件 {eth_df_file}，直接加载。")
-        eth_df = pd.read_csv(eth_df_file)
-    else:
-        eth_df = get_binance_eth_options()
-        if eth_df is not None:
-            eth_df.to_csv(eth_df_file, index=False)
-            print(f"[INFO] 数据已成功缓存至 {eth_df_file}。")
 
-    current_eth_price = get_current_eth_price()
-    print(f"\n[INFO] 当前 ETH 现货基准价格: {current_eth_price} U\n")
-
-    # 核心业务假设参数
-    grid_principal_to_protect = 1000.0  # 我们始终投入并保护的网格标准化本金
-    option_max_margin = float('inf')  # 解除占用上限，交由全局 ROI 来做公平裁决
+def run_optimization_engine(symbol: str, current_price: float, options_df: pd.DataFrame) -> pd.DataFrame:
+    """执行核心测算寻优逻辑"""
+    grid_principal_to_protect = 1000.0  # 始终投入并保护的网格标准化本金
+    option_max_margin = float('inf')  # 解除占用上限，交由全局 ROI 裁决
 
     summary_results = []
-    print("[INFO] 启动寻优引擎: 正在全局测算 TARGET_LOSS (3% -> 30%) 的理论极限解...\n")
+    print(f"[INFO] 启动 {symbol.upper()} 寻优引擎: 正在全局测算 TARGET_LOSS (3% -> 30%) 的理论极限解...\n")
 
-    for target_loss_pct in range(3, 31):
-        target_price = current_eth_price * (1 - target_loss_pct / 100.0)
+    for target_loss_pct in range(1, 31):
+        target_price = current_price * (1 - target_loss_pct / 100.0)
 
         try:
             margin_result = calculate_multi_group_margin(
@@ -319,7 +318,7 @@ if __name__ == "__main__":
                 max_grids_per_group=169,
                 fixed_qty=0.051,
                 add_step_percent=0.15,
-                initial_price=current_eth_price,
+                initial_price=current_price,
                 direction='long'
             )
             actual_grid_margin_needed = margin_result['total_margin']
@@ -334,9 +333,10 @@ if __name__ == "__main__":
 
         # 寻找保护千 U 本金的最优期权方案
         best_strategy_df = find_optimal_options_strategy(
-            eth_df,
+            df=options_df,
             target_price=target_price,
             target_profit=grid_principal_to_protect,
+            symbol=symbol,
             min_hours=24,  # 强制过滤小于 24H 的垃圾末日轮
             max_margin=option_max_margin
         )
@@ -351,13 +351,9 @@ if __name__ == "__main__":
             option_time_left = best_option['距离结束的时间']
             num_contracts = best_option['需买组合张数']
 
-            # 【新增修正与深度指标】
             net_daily_profit = standardized_daily_profit - option_daily_cost
-            total_capital_employed = grid_principal_to_protect + option_total_cost  # 修复总投入资金错位 Bug
+            total_capital_employed = grid_principal_to_protect + option_total_cost
             theoretical_roi_percent = (net_daily_profit / total_capital_employed) * 100
-
-            # 粗略估算做市商滑点/点差抽水
-            friction_cost = (best_option['买入单价(ask)'] - best_option['卖出抵扣(bid)']) * num_contracts
 
             summary_results.append({
                 '跌幅': f"{target_loss_pct}%",
@@ -368,15 +364,18 @@ if __name__ == "__main__":
                 '【总投入资金】': round(total_capital_employed, 2),
                 '期权组合': f"{buy_leg} / {sell_leg}",
                 '【需买张数】': round(num_contracts, 2),
-                '【点差摩擦】': round(friction_cost, 2),
                 '网格日利': round(standardized_daily_profit, 2),
                 '期权日耗': round(option_daily_cost, 2),
                 '【千U日净利】': round(net_daily_profit, 2),
                 '【日化ROI】': round(theoretical_roi_percent, 2)
             })
 
-    if summary_results:
-        summary_df = pd.DataFrame(summary_results)
+    return pd.DataFrame(summary_results)
+
+
+def display_results(summary_df: pd.DataFrame):
+    """格式化打印输出结论"""
+    if not summary_df.empty:
         # 用最公平的“全口径资金日化ROI”进行排序
         summary_df = summary_df.sort_values(by='【日化ROI】', ascending=False)
 
@@ -389,7 +388,40 @@ if __name__ == "__main__":
         best_overall = summary_df.iloc[0]
         print(f"\n[CONCLUSION] 理论寻优结束。")
         print(f"基于全口径资金利用率，最高性价比跌幅设置为: TARGET_LOSS = {best_overall['跌幅']}")
-        print(
-            f"该方案日化 ROI 达 {best_overall['【日化ROI】']}% (注: 需结合【点差摩擦】与【期权到期时间】判断实盘落地可行性)")
+        print(f"该方案日化 ROI 达 {best_overall['【日化ROI】']}% (注: 需结合【期权到期时间】判断实盘落地可行性)")
     else:
         print("\n[WARNING] 在当前约束条件下，未能找到任何有效的正收益期权套保策略。")
+
+
+# ==========================================
+# 5. 主程序入口
+# ==========================================
+if __name__ == "__main__":
+    # Pandas 显示配置
+    pd.set_option('display.unicode.east_asian_width', True)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 1000)
+    pd.set_option('display.colheader_justify', 'center')
+
+    # --- 核心控制参数 ---
+    TARGET_SYMBOL = "ETH"  # 修改此处可一键切换为 BTC、SOL 等其他期权币种
+    # --------------------
+
+    # 1. 准备数据
+    df_options = load_options_data(TARGET_SYMBOL)
+    if df_options is None or df_options.empty:
+        print(f"[ERROR] 无法获取或加载 {TARGET_SYMBOL} 期权数据，程序退出。")
+        exit()
+
+    current_spot_price = get_current_spot_price(TARGET_SYMBOL)
+    if current_spot_price <= 0:
+        print(f"[ERROR] 无法获取 {TARGET_SYMBOL} 现货价格，程序退出。")
+        exit()
+
+    print(f"\n[INFO] 当前 {TARGET_SYMBOL.upper()} 现货基准价格: {current_spot_price} U\n")
+
+    # 2. 运行寻优引擎
+    final_results = run_optimization_engine(TARGET_SYMBOL, current_spot_price, df_options)
+
+    # 3. 打印报表
+    display_results(final_results)
