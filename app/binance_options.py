@@ -11,7 +11,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-
+pd.set_option('display.unicode.east_asian_width', True)
 # ==========================================
 # 1. 数据获取模块
 # ==========================================
@@ -284,8 +284,12 @@ def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48,
 # 4. 主流程逻辑
 # ==========================================
 if __name__ == "__main__":
-    eth_df_file = 'binance_eth_options.csv'
+    pd.set_option('display.unicode.east_asian_width', True)  # 解决中文对齐问题
+    pd.set_option('display.max_columns', None)  # 强制显示所有列，防止省略号
+    pd.set_option('display.width', 1000)  # 加宽显示区，防止自动换行
+    pd.set_option('display.colheader_justify', 'center')  # 表头居中对齐
 
+    eth_df_file = 'binance_eth_options.csv'
     if os.path.exists(eth_df_file):
         print(f"[INFO] 找到本地缓存文件 {eth_df_file}，直接加载。")
         eth_df = pd.read_csv(eth_df_file)
