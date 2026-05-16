@@ -68,7 +68,7 @@ import pandas as pd
 from datetime import datetime, timezone
 
 
-def find_optimal_options_strategy(df, target_price, target_profit, min_hours=0, max_margin=100):
+def find_optimal_options_strategy(df, target_price, target_profit, min_hours=48, max_margin=1000):
     results = []
     # 获取当前的绝对时间 (UTC 时区)
     now_utc = datetime.now(timezone.utc)
@@ -270,7 +270,7 @@ if __name__ == "__main__":
 
     # ================= 使用示例 =================
     # 假设 eth_df 是你之前代码跑出来的包含了最新行情的 DataFrame
-    target_price = 2100   # 预期跌到的目标价
+    target_price = 1900   # 预期跌到的目标价
     target_profit = 1000  # 预期赚到的净利润
 
     print(f"\n寻找目标价 {target_price} 时净赚 {target_profit} 的最优策略...")
