@@ -206,14 +206,14 @@ if __name__ == "__main__":
     # 统一的基础参数配置中心
     # ---------------------------------------------
     TARGET_LOSS = 20  # 基准抗涨幅 (做空时扛住价格上涨200%)
-    ADD_STEP = 0.04  # 基准加仓步长 (%)
-    FIXED_QTY = 0.016  # 基准单次下单量
+    ADD_STEP = 0.15  # 基准加仓步长 (%)
+    FIXED_QTY = 0.008  # 基准单次下单量
 
     # 抽取所有场景都共享的公共参数，确保底层状态完全一致
     common_params = {
-        "leverage": 100.0,
+        "leverage": 125.0,
         "max_grids_per_group": 169,
-        "initial_price": 2500,
+        "initial_price": 85000,
         # "direction": 'short'  # 做空
     }
 
