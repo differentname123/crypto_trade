@@ -43,11 +43,8 @@ def preprocess_minute_data(df_list, time_offset='0h'):
         # 新增一列叫做time
         df_copy['time'] = df_copy['open_time']
 
-
-
         df_copy.set_index('open_time', inplace=True)
         df_copy.sort_index(inplace=True)
-
 
         # 3. 核心对齐：使用与回测一致的重采样逻辑生成高低价
         df_4h_coin = df_copy['close'].resample('4h', offset=time_offset).agg(
@@ -79,10 +76,12 @@ def preprocess_minute_data(df_list, time_offset='0h'):
 
     return df_processed
 
+
 # ==========================================
 # 2. 核心流式推演引擎 (账本级对齐，包含 Reason)
 # ==========================================
-def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: str, initial_capital=10000.0, start_trade_date='2026-01-01 00:00:00'):
+def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: str, initial_capital=10000.0,
+                                   start_trade_date='2026-01-01 00:00:00'):
     """
     流式模拟引擎：生成与回测 100% 一致的 trade_logs DataFrame。
     """
@@ -190,13 +189,18 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                 cash += (actual_sell_val - fee)
 
                 cost = coin_states[c]['cost']
-                pnl = sell_amount * (prices_row[idx_c] - cost) - fee
+                net_pnl = sell_amount * (prices_row[idx_c] - cost) - fee
+                pnl_pct = (net_pnl / (cost * sell_amount)) * 100 if cost > 0 else 0.0
+
+                # 区分平仓原因：大盘关闭 or 掉出排名
+                close_reason = "大盘开关关闭" if not is_btc_trend_on else "掉出排名"
 
                 trade_logs.append({
                     "time": current_time, "action": "SELL", "coin": c, "direction": "LONG", "event": "CLOSE",
                     "price": prices_row[idx_c], "amount": sell_amount, "value": actual_sell_val, "fee": fee,
-                    "reason": "Signal Exit Long",
-                    "target_weight": 0.0, "pnl": pnl
+                    "reason": close_reason,
+                    "target_weight": 0.0, "pnl": pnl_pct,
+                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
                 })
                 coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
 
@@ -209,13 +213,18 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                 cash -= (actual_buy_val + fee)
 
                 cost = coin_states[c]['cost']
-                pnl = buy_amount * (cost - prices_row[idx_c]) - fee
+                net_pnl = buy_amount * (cost - prices_row[idx_c]) - fee
+                pnl_pct = (net_pnl / (cost * buy_amount)) * 100 if cost > 0 else 0.0
+
+                # 区分平仓原因：做空时大盘开关为相反逻辑
+                close_reason = "大盘开关关闭" if is_btc_trend_on else "掉出排名"
 
                 trade_logs.append({
                     "time": current_time, "action": "BUY", "coin": c, "direction": "SHORT", "event": "CLOSE",
                     "price": prices_row[idx_c], "amount": buy_amount, "value": actual_buy_val, "fee": fee,
-                    "reason": "Signal Exit Short",
-                    "target_weight": 0.0, "pnl": pnl
+                    "reason": close_reason,
+                    "target_weight": 0.0, "pnl": pnl_pct,
+                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
                 })
                 coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
 
@@ -230,7 +239,7 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                     target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
                     target_val = current_equity * target_weight
                     buy_val = target_val / (1 + FEE_RATE) if cash >= target_val / (1 + FEE_RATE) else cash / (
-                                1 + FEE_RATE)
+                            1 + FEE_RATE)
 
                     if buy_val > 1.0:
                         fee = buy_val * FEE_RATE
@@ -248,7 +257,8 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                             "time": current_time, "action": "BUY", "coin": c, "direction": "LONG", "event": "OPEN",
                             "price": prices_row[idx_c], "amount": buy_amount, "value": buy_val, "fee": fee,
                             "reason": "Signal Entry Long",
-                            "target_weight": target_weight, "pnl": np.nan
+                            "target_weight": target_weight, "pnl": np.nan,
+                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
                         })
 
         # --- C. 开仓逻辑 (空) ---
@@ -278,10 +288,12 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                             "time": current_time, "action": "SELL", "coin": c, "direction": "SHORT", "event": "OPEN",
                             "price": prices_row[idx_c], "amount": sell_amount, "value": sell_val, "fee": fee,
                             "reason": "Signal Entry Short",
-                            "target_weight": target_weight, "pnl": np.nan
+                            "target_weight": target_weight, "pnl": np.nan,
+                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
                         })
 
     return pd.DataFrame(trade_logs)
+
 
 # ==========================================
 # 3. 实盘自动化主流水线
@@ -340,6 +352,7 @@ def run_live_pipeline(raw_minute_df_list):
                 print(
                     f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
 
+
 def fetch_new_df():
     """
     拉取最新的数据
@@ -348,7 +361,8 @@ def fetch_new_df():
     raw_list = []
 
     days = 30
-    symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"]
+    symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
+                   "DOGE/USDT:USDT"]
     for symbol in symbol_list:
         timeframe = "1m"
         df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=days)
