@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>加密货币交易信号</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white font-sans min-h-screen">
+
+    {% raw %}
+    <div id="app" class="max-w-3xl mx-auto p-4 flex flex-col h-screen">
+
+        <!-- 头部 -->
+        <header class="flex flex-col sm:flex-row justify-between items-start sm:items-center py-4 border-b border-gray-700 gap-2 sm:gap-0">
+            <h1 class="text-xl font-bold text-blue-400">⚡ 交易信号雷达</h1>
+            <div class="text-xs sm:text-sm text-gray-400 font-mono">
+                当前系统时间: <span class="text-gray-200">{{ currentTime }}</span>
+            </div>
+        </header>
+
+        <!-- 控制栏 -->
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mt-4 mb-4 gap-4 sm:gap-0">
+            <div class="text-xs sm:text-sm text-gray-400">
+                数据最后更新: <span class="font-mono text-gray-200">{{ lastUpdateTime }}</span>
+            </div>
+
+            <!-- 动态状态按钮 -->
+            <button @click="triggerUpdate" :disabled="isUpdating"
+                    class="w-full sm:w-auto px-4 py-2 rounded-lg text-sm transition-all duration-300 flex items-center justify-center gap-2"
+                    :class="isUpdating ? 'bg-gray-700 text-gray-400 cursor-not-allowed border border-gray-600' : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg'">
+
+                <!-- 旋转的加载图标 -->
+                <svg v-if="isUpdating" class="animate-spin h-4 w-4 text-gray-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <!-- 静态图标 -->
+                <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+
+                <span>{{ isUpdating ? '后台拉取数据中...' : '拉取最新数据' }}</span>
+            </button>
+        </div>
+
+        <!-- 数据加载成功时的展示区 -->
+        <div v-if="!isLoading" class="flex-1 flex flex-col gap-4 overflow-hidden">
+
+            <!-- ====== 版块 1：当前持仓 ====== -->
+            <div class="shrink-0 flex flex-col gap-3">
+                <h2 class="text-base sm:text-lg font-semibold text-gray-300">当前持仓</h2>
+
+                <!-- 空仓状态 -->
+                <div v-if="currentPositions.length === 0" class="bg-gray-800/50 border border-gray-700 border-dashed rounded-xl p-8 flex flex-col items-center justify-center text-gray-500">
+                    <svg class="w-8 h-8 mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"></path></svg>
+                    <span class="text-sm">当前无任何持仓，耐心等待信号</span>
+                </div>
+
+                <!-- 持仓列表 -->
+                <div v-else class="flex flex-col gap-3">
+                    <div v-for="(pos, index) in currentPositions" :key="'pos-'+index"
+                         class="bg-gray-800 rounded-2xl p-4 sm:p-6 border-l-4 shadow-lg"
+                         :class="pos.action === 'BUY' ? 'border-green-500' : 'border-red-500'">
+                        <div class="flex justify-between items-start mb-2 sm:mb-4">
+                            <div>
+                                <div class="text-xs sm:text-sm text-gray-400 mb-1">开仓时间 · {{ pos.open_time }}</div>
+                                <div class="text-3xl sm:text-4xl font-extrabold flex items-center gap-2 sm:gap-3">
+                                    {{ pos.coin }}
+                                    <span class="text-base sm:text-xl px-2 sm:px-3 py-1 rounded text-white"
+                                          :class="pos.action === 'BUY' ? 'bg-green-600' : 'bg-red-600'">
+                                        {{ formatDirection(pos.action, 'OPEN') }}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3 sm:gap-4 mt-4 bg-gray-900 rounded-xl p-3 sm:p-4">
+                            <div>
+                                <div class="text-gray-400 text-[10px] sm:text-xs mb-1">开仓价格 (USDT)</div>
+                                <div class="text-lg sm:text-xl font-mono">{{ pos.open_price }}</div>
+                            </div>
+                            <div>
+                                <div class="text-gray-400 text-[10px] sm:text-xs mb-1">当前仓位占比</div>
+                                <div class="text-lg sm:text-xl font-mono text-blue-400">{{ formatWeight(pos.weight) }}</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ====== 版块 2：历史记录 ====== -->
+            <div class="flex-1 overflow-y-auto no-scrollbar pb-10 mt-2">
+                <h2 class="text-base sm:text-lg font-semibold text-gray-300 mb-2 sm:mb-3">历史记录 (已平仓)</h2>
+
+                <div v-if="historyRecords.length === 0" class="text-center text-gray-500 text-sm mt-4">
+                    暂无平仓历史记录
+                </div>
+
+                <div v-else class="space-y-3">
+                    <div v-for="(record, index) in historyRecords" :key="'hist-'+index"
+                         class="bg-gray-800/80 rounded-lg p-3 sm:p-4 flex flex-col hover:bg-gray-700 transition gap-3">
+
+                        <!-- 顶部：币种与盈亏 -->
+                        <div class="flex justify-between items-center border-b border-gray-700 pb-2">
+                            <div class="flex items-center gap-2">
+                                <span class="text-base sm:text-lg font-bold text-gray-200">{{ record.coin }}</span>
+                                <span class="text-[10px] sm:text-xs border rounded px-1"
+                                      :class="record.action === 'BUY' ? 'border-green-500/50 text-green-400' : 'border-red-500/50 text-red-400'">
+                                    {{ formatDirection(record.action, 'OPEN') }} -> 平仓
+                                </span>
+                            </div>
+                            <div class="text-right">
+                                <div class="font-mono text-sm sm:text-base font-bold" :class="getPnlColor(record.pnl)">
+                                    {{ formatPnl(record.pnl) }}
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 底部：开平仓详情对比 -->
+                        <div class="flex flex-row justify-between w-full">
+                            <div class="w-1/2 pr-2">
+                                <div class="text-gray-500 text-[10px] sm:text-xs mb-0.5">开仓 · {{ record.open_time }}</div>
+                                <div class="font-mono text-sm text-gray-300">{{ record.open_price }}</div>
+                            </div>
+                            <div class="w-1/2 pl-3 border-l border-gray-700 text-right">
+                                <div class="text-gray-500 text-[10px] sm:text-xs mb-0.5">平仓 · {{ record.close_time }}</div>
+                                <div class="font-mono text-sm text-gray-300">{{ record.close_price }}</div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <div v-else class="flex-1 flex items-center justify-center text-gray-500 text-sm sm:text-base">
+            正在读取本地数据...
+        </div>
+
+    </div>
+    {% endraw %}
+    <script>
+        const { createApp, ref, onMounted, onUnmounted } = Vue;
+
+        createApp({
+            setup() {
+                const currentTime = ref('');
+                const lastUpdateTime = ref('--');
+
+                // 拆分为当前持仓和历史记录
+                const currentPositions = ref([]);
+                const historyRecords = ref([]);
+
+                const isLoading = ref(true);
+                const isUpdating = ref(false);
+
+                let timer = null;
+
+                const updateCurrentTime = () => {
+                    const now = new Date();
+                    currentTime.value = now.toLocaleString('zh-CN', { hour12: false });
+                };
+
+                const fetchLocalData = async () => {
+                    try {
+                        const response = await fetch('/api/signals');
+                        const result = await response.json();
+
+                        // 接收后端分拆好的数据
+                        currentPositions.value = result.current_positions || [];
+                        historyRecords.value = result.history || [];
+                        lastUpdateTime.value = result.update_time;
+
+                    } catch (error) {
+                        console.error('获取 CSV 数据失败:', error);
+                    } finally {
+                        isLoading.value = false;
+                    }
+                };
+
+                const triggerUpdate = async () => {
+                    if (isUpdating.value) return;
+                    isUpdating.value = true;
+                    try {
+                        const res = await fetch('/api/update', { method: 'POST' });
+                        if (res.ok) {
+                            await fetchLocalData();
+                        } else {
+                            console.error("后台更新拉取失败");
+                        }
+                    } catch (error) {
+                        console.error('触发更新失败:', error);
+                    } finally {
+                        isUpdating.value = false;
+                    }
+                };
+
+                const formatDirection = (action, event) => {
+                    if (action === 'BUY' && event === 'OPEN') return '买入开多';
+                    if (action === 'SELL' && event === 'OPEN') return '卖出开空';
+                    // 历史记录中不再需要单独渲染 "卖出平仓"，已经在UI中体现为 "-> 平仓"
+                    return action;
+                };
+
+                const formatWeight = (weight) => {
+                    if (weight === null || weight === undefined || weight === '--') return '--';
+                    return (weight * 100).toFixed(0) + '%';
+                };
+
+                const formatPnl = (pnl) => {
+                    if (pnl === null || pnl === undefined || isNaN(pnl)) return '--';
+                    return (pnl > 0 ? '+' : '') + pnl.toFixed(2) + '%';
+                };
+
+                const getPnlColor = (pnl) => {
+                    if (pnl === null || pnl === undefined || isNaN(pnl)) return 'text-gray-400';
+                    return pnl > 0 ? 'text-green-400' : 'text-red-400';
+                };
+
+                onMounted(() => {
+                    updateCurrentTime();
+                    timer = setInterval(updateCurrentTime, 1000);
+
+                    fetchLocalData().then(() => {
+                        triggerUpdate();
+                    });
+                });
+
+                onUnmounted(() => {
+                    if (timer) clearInterval(timer);
+                });
+
+                return {
+                    currentTime,
+                    lastUpdateTime,
+                    currentPositions,
+                    historyRecords,
+                    isLoading,
+                    isUpdating,
+                    triggerUpdate,
+                    formatDirection,
+                    formatWeight,
+                    formatPnl,
+                    getPnlColor
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>
