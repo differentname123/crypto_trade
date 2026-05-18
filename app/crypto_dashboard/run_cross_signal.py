@@ -331,13 +331,17 @@ def run_live_pipeline(raw_minute_df_list):
         print("► 历史流转中尚未产生任何交易信号。")
         return
 
+    # 🟢 【新增修改】：为 logs_df 中的 time 统一增加 4h
+    logs_df['time'] = pd.to_datetime(logs_df['time']) + pd.Timedelta(hours=4)
+
     # 3. 导出完整的流水日志 (这与你回测生成的 logs DataFrame 完全一致，可用于 Diff)
     output_path = "live_simulation_logs.csv"
     logs_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     print(f"✅ 全量交易流水(Ledger)已生成: {output_path}(共 {len(logs_df)} 条记录)")
 
     # 4. 提取当下的实盘发单指令
-    latest_kline_time = df_4h_ready.index[-1]
+    # 🟢 【同步修改】：由于 logs_df 的 time 统一增加了 4h，匹配截面发单时也需同步增加 4h
+    latest_kline_time = df_4h_ready.index[-1] + pd.Timedelta(hours=4)
     current_actions = logs_df[logs_df['time'] == latest_kline_time]
 
     print(f"\n🎯 [当前截面时刻: {latest_kline_time} 实盘发单指令]")
