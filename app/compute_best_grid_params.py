@@ -277,8 +277,8 @@ if __name__ == "__main__":
     try:
         df = pd.read_csv(output_csv_path)
         df['score'] = df['profit_to_margin_ratio'] * df['total_trades']  # 简单的综合评分指标，越高越好
-        # df['score1'] = 1000000 * df['grid_ratio'] * df['total_profit']  # 简单的综合评分指标，越高越好
-        df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
+        df['score1'] = 100 * df['paired_profit'] / df['min_margin_needed']  # 简单的综合评分指标，越高越好
+        # df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
         # 把score1放在第一列
         df = df[['score1'] + [col for col in df.columns if col != 'score1']]
 
