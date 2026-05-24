@@ -13,8 +13,6 @@ import traceback
 
 import pandas as pd
 
-from app.fetch_k_line import gen_csv_file
-
 
 def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short"):
     """
@@ -253,8 +251,8 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     print(f"开始批量回测 (方向: {direction}) ...")
 
     # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
-    for i in range(200, 1000):
-        grid_ratio = round(i * 0.0001, 5)
+    for i in range(10, 100):
+        grid_ratio = round(i * 0.001, 5)
         res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
                             direction=direction)
         if res:
@@ -272,7 +270,7 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 
 
 if __name__ == "__main__":
-    csv_file_path = r"W:\project\python_project\crypto_trade\data\binance_JOE_USDT_USDT_1m.csv"
+    csv_file_path = r"W:\project\python_project\crypto_trade\data\ETH_USDT_USDT_1m.csv"
 
     output_csv_path = csv_file_path.replace(".csv", "_grid_backtest_results.csv")
 
@@ -293,19 +291,10 @@ if __name__ == "__main__":
 
         df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
 
-        # 如果您的数据中包含时间列，例如 'timestamp'，建议在传入前将其设为索引，这样 worst_time 就能记录下真实时间：
-        # if 'timestamp' in df.columns:
-        #     df.set_index('timestamp', inplace=True)
-
-        # 1. 单次测试示例
-        # print("单次测试结果：")
-        # single_result = backtest_grid(df, grid_ratio=0.001, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short")
-        # print(single_result)
-
         # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
         print("\n启动批量参数回测...")
-        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0004, lot_size=0.1,
-                                   direction="short")
+        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0000, lot_size=0.1,
+                                   direction="long")
 
     except FileNotFoundError:
         traceback.print_exc()

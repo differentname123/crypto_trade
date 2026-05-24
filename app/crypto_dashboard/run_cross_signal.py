@@ -364,7 +364,7 @@ def fetch_new_df():
     """
     raw_list = []
 
-    days = 30
+    days = 60
     symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
                    "DOGE/USDT:USDT"]
     for symbol in symbol_list:
