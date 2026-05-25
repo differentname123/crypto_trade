@@ -1,390 +1,348 @@
-import os
+# -*- coding: utf-8 -*-
+""":authors:
+    zhuxiaohu
+:create_date:
+    2026/4/5 20:32
+:last_date:
+    2026/4/5 20:32
+:description:
+
+"""
+import math
+import traceback
+from pathlib import Path
+
 import pandas as pd
-import numpy as np
-
-from app.fetch_biance_kline import fetch_binance_futures_klines
 
 
-# ==========================================
-# 1. 数据预处理适配器
-# ==========================================
-def preprocess_minute_data(df_list, time_offset='0h'):
+def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
-    将交易所拉取的【分钟级 K线列表】无损转换为信号引擎所需的【4H 截面 DataFrame】
+    简易网格交易回测函数
+    参数:
+      df: 包含 'open', 'high', 'low', 'close' 的 DataFrame
+      grid_ratio: 网格间距比例 (例如 0.001 代表 0.1%)
+      leverage: 杠杆倍数 (默认 100)
+      fee_rate: 单边手续费率 (默认 0.05% = 0.0005)
+      lot_size: 每格交易的数量 (默认 1 个单位)
+      direction: 网格策略整体方向，可选 "long" (做多) 或 "short" (做空)，默认为 "short"
+      initial_price: 网格初始价格 (作为做多的最高价限制)
+    返回:
+      包含各项回测指标的字典
     """
-    dfs = []
+    if df.empty:
+        return None
 
-    for df in df_list:
-        if df is None or df.empty:
-            continue
+    # 基准价格：修改为传入的初始价格作为网格的零点
+    p0 = initial_price
+    first_open = df['open'].iloc[0]  # 获取实际第一根K线开盘价用于初始化价格轨迹
+    last_close = df['close'].iloc[-1]  # 记录最终收盘价
 
-        df_copy = df.copy()
+    realized_pnl = 0.0  # 已实现盈亏
+    paired_profit = 0.0  # 新增：已配对的利润（仅记录完成一开一平的闭环利润）
+    positions = {}  # 当前持仓记录字典: { 网格层级 k : 开仓价格 }
+    max_capital_needed = 0.0  # 历史记录中【所需的最大初始资金】(即最小不爆仓保证金)
+    raw_equity_curve = []  # 记录纯净的资金变化曲线(不含初始资金)
+    total_trades = 0  # 新增：记录总的开平仓总次数
 
-        # --- 新增兼容逻辑：处理 timestamp 字段开始 ---
-        # 如果数据中不存在 open_time 列，则尝试将 timestamp 转换为 open_time
-        if 'open_time' not in df_copy.columns:
-            if 'timestamp' in df_copy.columns:
-                # 兼容 timestamp 作为普通列的情况
-                df_copy.rename(columns={'timestamp': 'open_time'}, inplace=True)
-            elif df_copy.index.name == 'timestamp':
-                # 兼容 timestamp 作为索引 (Index) 的情况
-                df_copy.reset_index(inplace=True)
-                df_copy.rename(columns={'timestamp': 'open_time'}, inplace=True)
-        # --- 新增兼容逻辑：处理 timestamp 字段结束 ---
-
-        # 1. 提取当前 df 对应的币种名称
-        coin_name = df_copy['coin_name'].iloc[0]
-
-        # 2. 统一时间索引处理
-        if pd.api.types.is_numeric_dtype(df_copy['open_time']) and df_copy['open_time'].max() > 1e11:
-            df_copy['open_time'] = pd.to_datetime(df_copy['open_time'], unit='ms')
-        elif not pd.api.types.is_datetime64_any_dtype(df_copy['open_time']):
-            df_copy['open_time'] = pd.to_datetime(df_copy['open_time'])
-        # 新增一列叫做time
-        df_copy['time'] = df_copy['open_time']
-
-        df_copy.set_index('open_time', inplace=True)
-        df_copy.sort_index(inplace=True)
-
-        # 3. 核心对齐：使用与回测一致的重采样逻辑生成高低价
-        df_4h_coin = df_copy['close'].resample('4h', offset=time_offset).agg(
-            open='first',
-            high='max',
-            low='min',
-            close='last'
-        )
-
-        # 4. 清理因时间错位产生的碎片空 K 线
-        df_4h_coin.dropna(how='all', inplace=True)
-
-        # 5. 统一重命名规范
-        df_4h_coin.rename(columns={
-            'open': f"{coin_name}_open",
-            'high': f"{coin_name}_high",
-            'low': f"{coin_name}_low",
-            'close': coin_name
-        }, inplace=True)
-
-        dfs.append(df_4h_coin)
-
-    if not dfs:
-        raise ValueError("传入的 df_list 全为空或无法解析！")
-
-    # 6. 横向合并与前向填充兜底
-    df_raw = pd.concat(dfs, axis=1).sort_index()
-    df_processed = df_raw.ffill()
-
-    return df_processed
-
-
-# ==========================================
-# 2. 核心流式推演引擎 (账本级对齐，包含 Reason)
-# ==========================================
-def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: str, initial_capital=10000.0,
-                                   start_trade_date='2026-01-01 00:00:00'):
-    """
-    流式模拟引擎：生成与回测 100% 一致的 trade_logs DataFrame。
-    """
-    MOM_WINDOW = params['MOM_WINDOW']
-    VOL_WINDOW = params['VOL_WINDOW']
-    BTC_TREND_WINDOW = params['BTC_TREND_WINDOW']
-    TOP_K = int(params.get('TOP_K', 2))
-    MAX_WEIGHT = params['MAX_WEIGHT']
-    FEE_RATE = 0.0005  # 费率保持一致
-
-    coins = [c for c in df.columns if not any(suffix in c for suffix in ['_open', '_high', '_low'])]
-    n_coins = len(coins)
-    coin_to_idx = {c: idx for idx, c in enumerate(coins)}
-
-    if 'BTC' not in coins:
-        raise ValueError("数据中必须包含 BTC 作为宏观开关！")
-
-    # 批量计算指标矩阵
-    df_close = df[coins]
-    returns = df_close.pct_change(MOM_WINDOW)
-
-    high_df = df[[f"{c}_high" for c in coins]].copy()
-    high_df.columns = coins
-    low_df = df[[f"{c}_low" for c in coins]].copy()
-    low_df.columns = coins
-    prev_close = df_close.shift(1)
-
-    tr_arr = np.fmax.reduce([
-        (high_df - low_df).values,
-        (high_df - prev_close).abs().values,
-        (low_df - prev_close).abs().values
-    ])
-
-    atr = pd.DataFrame(tr_arr, index=df.index, columns=coins).rolling(window=VOL_WINDOW).mean()
-    atr_pct = atr / df_close
-
-    adj_mom = returns / (atr_pct + 1e-8)
-    volatility = atr_pct
-
-    btc_ma = df['BTC'].rolling(window=BTC_TREND_WINDOW).mean()
-    btc_trend_on = df['BTC'] > btc_ma
-
-    mom_arr = adj_mom[coins].values
-    vol_arr = volatility[coins].values
-    btc_trend_arr = btc_trend_on.values
-    close_arr = df_close.values
-    time_index = df.index
-
-    # 状态机初始化
-    cash = float(initial_capital)
-    positions_arr = np.zeros(n_coins, dtype=float)
-    coin_states = {c: {'qty': 0.0, 'cost': 0.0, 'side': None} for c in coins}
-    trade_logs = []
-
-    min_warmup = max(MOM_WINDOW, VOL_WINDOW, BTC_TREND_WINDOW)
-
-    # 🟢 【新增】：解析指定的发车时间戳
-    start_trade_timestamp = pd.to_datetime(start_trade_date) if start_trade_date else None
-
-    # 逐根 K 线流转推演
-    for i in range(min_warmup, len(df)):
-        current_time = time_index[i]
-        prices_row = close_arr[i]
-
-        current_equity = cash + np.dot(positions_arr, prices_row)
-
-        current_mom = mom_arr[i]
-        current_vol = vol_arr[i]
-        is_btc_trend_on = btc_trend_arr[i]
-
-        top_long_coins = []
-        top_short_coins = []
-
-        if is_btc_trend_on:
-            if trade_mode in ['BOTH', 'LONG_ONLY']:
-                mask = ~np.isnan(current_mom) & (current_mom > 0)
-                if mask.any():
-                    valid_idx = np.where(mask)[0]
-                    valid_vals = current_mom[valid_idx]
-                    order = np.argsort(-valid_vals, kind='stable')
-                    top_long_coins = [coins[idx] for idx in valid_idx[order[:TOP_K]]]
-        else:
-            if trade_mode in ['BOTH', 'SHORT_ONLY']:
-                mask = ~np.isnan(current_mom) & (current_mom < 0)
-                if mask.any():
-                    valid_idx = np.where(mask)[0]
-                    valid_vals = current_mom[valid_idx]
-                    order = np.argsort(valid_vals, kind='stable')
-                    top_short_coins = [coins[idx] for idx in valid_idx[order[:TOP_K]]]
-
-        # 🔴 【核心修改】：时间拦截器。未到发车时间，强制掐断交易候选名单
-        if start_trade_timestamp is not None and current_time < start_trade_timestamp:
-            top_long_coins = []
-            top_short_coins = []
-
-        # --- A. 平仓逻辑 ---
-        for idx_c in range(n_coins):
-            c = coins[idx_c]
-            # 平多
-            if positions_arr[idx_c] > 0 and c not in top_long_coins:
-                sell_amount = positions_arr[idx_c]
-                actual_sell_val = sell_amount * prices_row[idx_c]
-                fee = actual_sell_val * FEE_RATE
-                positions_arr[idx_c] = 0
-                cash += (actual_sell_val - fee)
-
-                cost = coin_states[c]['cost']
-                net_pnl = sell_amount * (prices_row[idx_c] - cost) - fee
-                pnl_pct = (net_pnl / (cost * sell_amount)) * 100 if cost > 0 else 0.0
-
-                # 区分平仓原因：大盘关闭 or 掉出排名
-                close_reason = "大盘开关关闭" if not is_btc_trend_on else "掉出排名"
-
-                trade_logs.append({
-                    "time": current_time, "action": "SELL", "coin": c, "direction": "LONG", "event": "CLOSE",
-                    "price": prices_row[idx_c], "amount": sell_amount, "value": actual_sell_val, "fee": fee,
-                    "reason": close_reason,
-                    "target_weight": 0.0, "pnl": pnl_pct,
-                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                })
-                coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
-
-            # 平空
-            elif positions_arr[idx_c] < 0 and c not in top_short_coins:
-                buy_amount = abs(positions_arr[idx_c])
-                actual_buy_val = buy_amount * prices_row[idx_c]
-                fee = actual_buy_val * FEE_RATE
-                positions_arr[idx_c] = 0
-                cash -= (actual_buy_val + fee)
-
-                cost = coin_states[c]['cost']
-                net_pnl = buy_amount * (cost - prices_row[idx_c]) - fee
-                pnl_pct = (net_pnl / (cost * buy_amount)) * 100 if cost > 0 else 0.0
-
-                # 区分平仓原因：做空时大盘开关为相反逻辑
-                close_reason = "大盘开关关闭" if is_btc_trend_on else "掉出排名"
-
-                trade_logs.append({
-                    "time": current_time, "action": "BUY", "coin": c, "direction": "SHORT", "event": "CLOSE",
-                    "price": prices_row[idx_c], "amount": buy_amount, "value": actual_buy_val, "fee": fee,
-                    "reason": close_reason,
-                    "target_weight": 0.0, "pnl": pnl_pct,
-                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                })
-                coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
-
-        # --- B. 开仓逻辑 (多) ---
-        if top_long_coins:
-            inv_vols = [1.0 / current_vol[coin_to_idx[c]] if current_vol[coin_to_idx[c]] > 0 else 0 for c in
-                        top_long_coins]
-            total_inv_vol = sum(inv_vols)
-            for k_, c in enumerate(top_long_coins):
-                idx_c = coin_to_idx[c]
-                if positions_arr[idx_c] == 0 and total_inv_vol > 0:
-                    target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
-                    target_val = current_equity * target_weight
-                    buy_val = target_val / (1 + FEE_RATE) if cash >= target_val / (1 + FEE_RATE) else cash / (
-                            1 + FEE_RATE)
-
-                    if buy_val > 1.0:
-                        fee = buy_val * FEE_RATE
-                        buy_amount = buy_val / prices_row[idx_c]
-                        positions_arr[idx_c] += buy_amount
-                        cash -= (buy_val + fee)
-
-                        coin_states[c] = {
-                            'qty': buy_amount,
-                            'cost': prices_row[idx_c] + (fee / buy_amount),
-                            'side': 'LONG'
-                        }
-
-                        trade_logs.append({
-                            "time": current_time, "action": "BUY", "coin": c, "direction": "LONG", "event": "OPEN",
-                            "price": prices_row[idx_c], "amount": buy_amount, "value": buy_val, "fee": fee,
-                            "reason": "Signal Entry Long",
-                            "target_weight": target_weight, "pnl": np.nan,
-                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                        })
-
-        # --- C. 开仓逻辑 (空) ---
-        if top_short_coins:
-            inv_vols = [1.0 / current_vol[coin_to_idx[c]] if current_vol[coin_to_idx[c]] > 0 else 0 for c in
-                        top_short_coins]
-            total_inv_vol = sum(inv_vols)
-            for k_, c in enumerate(top_short_coins):
-                idx_c = coin_to_idx[c]
-                if positions_arr[idx_c] == 0 and total_inv_vol > 0:
-                    target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
-                    sell_val = current_equity * target_weight / (1 + FEE_RATE)
-
-                    if sell_val > 1.0:
-                        fee = sell_val * FEE_RATE
-                        sell_amount = sell_val / prices_row[idx_c]
-                        positions_arr[idx_c] -= sell_amount
-                        cash += (sell_val - fee)
-
-                        coin_states[c] = {
-                            'qty': -sell_amount,
-                            'cost': prices_row[idx_c] - (fee / sell_amount),
-                            'side': 'SHORT'
-                        }
-
-                        trade_logs.append({
-                            "time": current_time, "action": "SELL", "coin": c, "direction": "SHORT", "event": "OPEN",
-                            "price": prices_row[idx_c], "amount": sell_amount, "value": sell_val, "fee": fee,
-                            "reason": "Signal Entry Short",
-                            "target_weight": target_weight, "pnl": np.nan,
-                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                        })
-
-    return pd.DataFrame(trade_logs)
-
-
-# ==========================================
-# 3. 实盘自动化主流水线
-# ==========================================
-def run_live_pipeline(raw_minute_df_list):
-    BEST_PARAMS = {
-        'MOM_WINDOW': 36,
-        'VOL_WINDOW': 90,
-        'BTC_TREND_WINDOW': 120,
-        'MAX_WEIGHT': 0.4,
-        'TOP_K': 1
+    # 新增：记录发生 max_capital_needed 时的“案发现场”信息
+    worst_case_info = {
+        "time": None,  # 修改：名称改为 time
+        "worst_price": first_open,
+        "worst_position_count": 0,
+        "worst_price_change_rate": 0.0,
+        "worst_realized_pnl": 0.0,  # 新增：当时的已实现利润
+        "worst_floating_pnl": 0.0,  # 新增：当时的持仓总浮亏(或浮盈)
+        "worst_total_trades": 0,  # 新增：当时的已成交单数
+        "worst_required_margin": 0.0  # 新增：当时的仓位所需保证金 (用于完美核对公式)
     }
-    TIME_OFFSET = '0h'
-    TRADE_MODE = 'LONG_ONLY'
 
-    print("⏳ 1. 正在将分钟级数据组装为 4H 矩阵...")
-    df_4h_ready = preprocess_minute_data(raw_minute_df_list, time_offset=TIME_OFFSET)
+    # 内部函数：每次价格变动或成交后，校验并更新最高所需保证金
+    def update_margin(current_price, current_time):
+        nonlocal max_capital_needed, worst_case_info
+        if not positions:
+            return
 
-    if df_4h_ready is None or df_4h_ready.empty:
-        return
+        # 浮动盈亏 = Σ (盈亏价差) * 数量 （依据多空方向区分）
+        if direction == "long":
+            floating_pnl = sum((current_price - p) * lot_size for p in positions.values())
+        else:
+            floating_pnl = sum((p - current_price) * lot_size for p in positions.values())
 
-    # 🔴 核心对齐：打印处理后的数据起始与截止时间日志
-    start_time_str = df_4h_ready.index[0].strftime('%Y-%m-%d %H:%M:%S')
-    end_time_str = df_4h_ready.index[-1].strftime('%Y-%m-%d %H:%M:%S')
-    print(f"   起始: {start_time_str} | 截止: {end_time_str}")
+        # 当前所需保证金 = Σ (开仓价 * 数量 / 杠杆)
+        required_margin = sum(p * lot_size / leverage for p in positions.values())
 
-    print("🧠 2. 正在运行状态推演机，生成全量理论 trade_logs...")
-    logs_df = generate_historical_trade_logs(
-        df=df_4h_ready,
-        params=BEST_PARAMS,
-        trade_mode=TRADE_MODE
-    )
+        # 资金缺口 = 所需保证金 - 已实现盈亏 - 浮动盈亏
+        capital_needed = required_margin - realized_pnl - floating_pnl
 
-    if logs_df.empty:
-        print("► 历史流转中尚未产生任何交易信号。")
-        return
+        if capital_needed > max_capital_needed:
+            max_capital_needed = capital_needed
+            # 记录刷新极值时的现场数据
+            worst_case_info["time"] = current_time  # 修改：记录真实 time
+            worst_case_info["worst_price"] = current_price
+            worst_case_info["worst_position_count"] = len(positions)
+            worst_case_info["worst_price_change_rate"] = (current_price - p0) / p0 if p0 > 0 else 0.0
+            worst_case_info["worst_realized_pnl"] = realized_pnl  # 记录当时已实现利润
+            worst_case_info["worst_floating_pnl"] = floating_pnl  # 记录当时浮动盈亏
+            worst_case_info["worst_total_trades"] = total_trades  # 记录当时成交单数
+            worst_case_info["worst_required_margin"] = required_margin  # 记录当时所需保证金
 
-    # 🟢 【新增修改】：为 logs_df 中的 time 统一增加 4h
-    logs_df['time'] = pd.to_datetime(logs_df['time']) + pd.Timedelta(hours=4)
+    p_prev = first_open
+    k_prev = math.floor((p_prev - p0) / (p0 * grid_ratio))
 
-    # 3. 导出完整的流水日志 (这与你回测生成的 logs DataFrame 完全一致，可用于 Diff)
-    output_path = "live_simulation_logs.csv"
-    logs_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    print(f"✅ 全量交易流水(Ledger)已生成: {output_path}(共 {len(logs_df)} 条记录)")
-
-    # 4. 提取当下的实盘发单指令
-    # 🟢 【同步修改】：由于 logs_df 的 time 统一增加了 4h，匹配截面发单时也需同步增加 4h
-    latest_kline_time = df_4h_ready.index[-1] + pd.Timedelta(hours=4)
-    current_actions = logs_df[logs_df['time'] == latest_kline_time]
-
-    print(f"\n🎯 [当前截面时刻: {latest_kline_time} 实盘发单指令]")
-    if current_actions.empty:
-        print("   ► 当前无平仓或开仓信号，继续保持现有仓位。")
+    # 修改：获取实际的时间序列 (优先取 'time' 或 'timestamp' 列，否则用 index)
+    if 'time' in df.columns:
+        time_seq = df['time']
+    elif 'timestamp' in df.columns:
+        time_seq = df['timestamp']
     else:
-        for _, row in current_actions.iterrows():
-            if row['event'] == 'CLOSE':
-                print(
-                    f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
-            elif row['event'] == 'OPEN':
-                print(
-                    f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
+        time_seq = df.index
 
+    # 遍历每一分钟 (优化点: 放弃 iterrows，使用 zip 原生迭代加速几十倍，并引入真实时间标识)
+    for current_time, open_p, high_p, low_p, close_p in zip(time_seq, df['open'], df['high'], df['low'], df['close']):
 
-def fetch_new_df():
-    """
-    拉取最新的数据
-    :return:
-    """
-    raw_list = []
+        # 根据K线阴阳，模拟分钟内部的价格轨迹，使回测更加贴近真实
+        if close_p > open_p:
+            points = [open_p, low_p, high_p, close_p]
+        else:
+            points = [open_p, high_p, low_p, close_p]
 
-    days = 60
-    symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
-                   "DOGE/USDT:USDT"]
-    for symbol in symbol_list:
-        timeframe = "1m"
-        df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=days)
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
+        # 沿着价格轨迹模拟穿越网格线
+        for p in points:
+            # 当前价格所处的网格层级
+            k_curr = math.floor((p - p0) / (p0 * grid_ratio))
 
-        raw_list.append(df_klines)
+            if k_curr > k_prev:
+                # 价格上涨
+                for k in range(k_prev + 1, k_curr + 1):
+                    pk = p0 * (1 + k * grid_ratio)
+                    update_margin(pk, current_time)  # 碰线前结算一次极值
 
-    if not raw_list:
-        print("❌ 错误：没有任何数据被成功加载，程序退出。请检查 kline_data 文件夹及其路径。")
+                    if direction == "long":
+                        if (k - 1) in positions:  # 如果持有多单，则平仓
+                            entry_p = positions.pop(k - 1)
+                            gross_profit = (pk - entry_p) * lot_size
+                            fee = pk * lot_size * fee_rate
+                            realized_pnl += (gross_profit - fee)
+                            total_trades += 1
+
+                            # 新增：计算配对利润（扣除开平双边手续费）
+                            open_fee = entry_p * lot_size * fee_rate
+                            paired_profit += (gross_profit - fee - open_fee)
+
+                            update_margin(pk, current_time)
+                    else:  # direction == "short"
+                        if k not in positions:  # 价格上涨，触发卖出开空
+                            positions[k] = pk
+                            fee = pk * lot_size * fee_rate
+                            realized_pnl -= fee
+                            total_trades += 1
+                            update_margin(pk, current_time)
+
+            elif k_curr < k_prev:
+                # 价格下跌
+                for k in range(k_prev, k_curr, -1):
+                    pk = p0 * (1 + k * grid_ratio)
+                    update_margin(pk, current_time)  # 碰线前结算一次极值
+
+                    if direction == "long":
+                        # 修改：使用 k <= 0 确保新开仓的价格严格小于等于 p0(最高价限制)
+                        if k not in positions and k <= 0:
+                            positions[k] = pk
+                            fee = pk * lot_size * fee_rate
+                            realized_pnl -= fee
+                            total_trades += 1
+                            update_margin(pk, current_time)
+                    else:  # direction == "short"
+                        if (k + 1) in positions:  # 价格下跌，触发买入平空(检查之前是否在上层开空过)
+                            entry_p = positions.pop(k + 1)
+                            gross_profit = (entry_p - pk) * lot_size
+                            fee = pk * lot_size * fee_rate
+                            realized_pnl += (gross_profit - fee)
+                            total_trades += 1
+
+                            # 新增：计算配对利润（扣除开平双边手续费）
+                            open_fee = entry_p * lot_size * fee_rate
+                            paired_profit += (gross_profit - fee - open_fee)
+
+                            update_margin(pk, current_time)
+
+            p_prev = p
+            k_prev = k_curr
+            update_margin(p, current_time)  # 轨迹点结算
+
+        # 分钟结束，记录当期总权益 (用于后续画图或算回撤)
+        if direction == "long":
+            minute_floating_pnl = sum((close_p - p) * lot_size for p in positions.values())
+        else:
+            minute_floating_pnl = sum((p - close_p) * lot_size for p in positions.values())
+
+        raw_equity_curve.append(realized_pnl + minute_floating_pnl)
+
+    # =============== 统计结果 ===============
+
+    # 如果极值小于0说明光靠利润就够扛了，但理论上首次开仓必定需要保证金，给个基础兜底
+    min_margin = max_capital_needed if max_capital_needed > 0 else (p0 * lot_size / leverage)
+
+    # 生成真实的资产曲线用于计算回撤 (初始资金 + 过程盈亏)
+    equity_curve = [min_margin + eq for eq in raw_equity_curve]
+
+    # 计算最大回撤率 (Max Drawdown)
+    max_dd = 0.0
+    if equity_curve:
+        peak = equity_curve[0]
+        for eq in equity_curve:
+            if eq > peak:
+                peak = eq
+            dd = (peak - eq) / peak if peak > 0 else 0
+            if dd > max_dd:
+                max_dd = dd
+
+    # ================== 修改部分开始 ==================
+    # 最终收益指标：直观地取最后一刻的总净盈亏，不再使用减去 min_margin 的绕弯子逻辑
+    total_profit = raw_equity_curve[-1] if raw_equity_curve else 0.0
+    profit_rate = total_profit / min_margin if min_margin > 0 else 0.0
+
+    # 新增：计算最后一刻的持仓数量和持仓浮动盈亏
+    final_position_count = len(positions)
+    if direction == "long":
+        final_floating_pnl = sum((last_close - p) * lot_size for p in positions.values())
     else:
-        print(f"\n🚀 数据加载完毕，共 {len(raw_list)} 个标的。准备进入信号生成流水线...\n")
-        print("═" * 70)
-        run_live_pipeline(raw_list)
+        final_floating_pnl = sum((p - last_close) * lot_size for p in positions.values())
+    # ================== 修改部分结束 ==================
+
+    # 新增：计算每小时平均交易次数 (基于每行数据代表 1 分钟的前提)
+    total_minutes = len(df)
+    total_hours = total_minutes / 60.0 if total_minutes > 0 else 1.0
+    trades_per_hour = total_trades / total_hours if total_hours > 0 else 0.0
+
+    # 新增：开始价格到最终价格的涨跌幅
+    price_change_rate = (last_close - p0) / p0 if p0 > 0 else 0.0
+
+    return {
+        "direction": direction,
+        "grid_ratio": grid_ratio,
+        "price_change_rate": price_change_rate,  # 标的物期间涨跌幅
+        "total_profit": total_profit,  # 纯收益 (已扣除手续费)
+        "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
+        "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
+        "profit_to_margin_ratio": profit_rate,  # 收益 / 保证金 (核心参考价值)
+        "max_drawdown": max_dd,  # 最大回撤率
+        "total_trades": total_trades,  # 交易总次数(开平仓均计算在内)
+        "trades_per_hour": trades_per_hour,  # 每小时平均交易次数
+        "final_position_count": final_position_count,  # 新增：最后一刻的持仓单数
+        "final_floating_pnl": final_floating_pnl,  # 新增：最后一刻的持仓浮动盈亏
+        "time": worst_case_info["time"],  # 修改：极值发生时间(获取自真实的 time/timestamp 列或行号)
+        "worst_price": worst_case_info["worst_price"],  # 极值发生时的价格
+        "worst_position_count": worst_case_info["worst_position_count"],  # 极值发生时的持仓单数
+        "worst_price_change_rate": worst_case_info["worst_price_change_rate"],  # 极值发生时相对于初始价格的涨跌幅
+        "worst_realized_pnl": worst_case_info["worst_realized_pnl"],  # 极值发生时的已实现利润
+        "worst_floating_pnl": worst_case_info["worst_floating_pnl"],  # 极值发生时的持仓浮动盈亏
+        "worst_total_trades": worst_case_info["worst_total_trades"],  # 极值发生时的已成交单数
+        "worst_required_margin": worst_case_info["worst_required_margin"]  # 极值发生时的持仓所需本金
+    }
 
 
-# ==========================================
-# 4. 程序入口 (加载 CSV 并启动)
-# ==========================================
+def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
+    """
+    批量回测不同网格间距(0.001 到 0.1，步长 0.001)并保存为 CSV
+    """
+    if df.empty:
+        print("数据为空，无法进行批量回测。")
+        return
+    print(f"数据加载成功，包含 {len(df)} 行记录。开始批量回测网格参数...")
+
+    results = []
+    print(f"开始批量回测 (方向: {direction}) ...")
+
+    # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
+    for i in range(1, 100):
+        grid_ratio = round(i * 0.001, 5)
+        res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
+                            direction=direction, initial_price=initial_price)
+        if res:
+            results.append(res)
+            # 简单打印进度
+            if i % 10 == 0:
+                print(f"已完成网格步长: {grid_ratio}")
+
+    if results:
+        res_df = pd.DataFrame(results)
+        res_df.to_csv(output_csv, index=False, encoding='utf-8-sig')
+        print(f"批量回测全部完成！共 {len(results)} 条结果，已保存至: {output_csv}")
+
+    return results
+
+
+import pandas as pd
+from pathlib import Path
+
 if __name__ == "__main__":
-    fetch_new_df()
+    # 1. 定义文件夹路径和匹配模式
+    folder_path = Path(r"W:\project\python_project\oke_auto_trade\kline_data")
+    file_pattern = "*DOGEUSDT_1m_2025-01-01_merged_grid_backtest_results_*.csv"
+
+    # 获取所有匹配的文件列表
+    matched_files = list(folder_path.glob(file_pattern))
+
+    if not matched_files:
+        print("未找到任何匹配的文件，请检查路径和文件名规则。")
+    else:
+        df_list = []
+
+        # 2. 遍历读取每个文件并计算 score1
+        for file in matched_files:
+            try:
+                temp_df = pd.read_csv(file)
+                temp_df['file_name'] = file.name.split('grid_backtest_results_')[1].split('.csv')[0]  # 提取参数信息作为新列
+
+                # 检查必要的列是否存在，防止报错中断 (新增了 total_trades)
+                required_cols = ['paired_profit', 'min_margin_needed', 'grid_ratio', 'total_trades']
+                if all(col in temp_df.columns for col in required_cols):
+                    # 计算 score1
+                    temp_df['score1'] = 100 * temp_df['paired_profit'] / temp_df['min_margin_needed']
+
+                    # 保留所有的列
+                    df_list.append(temp_df)
+                else:
+                    print(f"跳过 {file.name}：缺少必要的字段 (需包含 {required_cols})")
+
+            except pd.errors.EmptyDataError:
+                print(f"跳过 {file.name}：文件为空")
+            except Exception as e:
+                print(f"读取 {file.name} 时出错: {e}")
+
+        # 3. 将所有有效数据合并并进行聚合
+        if df_list:
+            # 合并所有提取出来的数据
+            all_data = pd.concat(df_list, ignore_index=True)
+
+            # 以 grid_ratio 进行分组，采用多列命名聚合语法，同时计算 score1 和 total_trades 的统计信息
+            final_df = all_data.groupby('grid_ratio').agg(
+                score1_mean=('score1', 'mean'),
+                score1_std=('score1', 'std'),
+                score1_max=('score1', 'max'),
+                score1_min=('score1', 'min'),
+                sample_count=('score1', 'count'),  # 统计一下每个 grid_ratio 下有多少条数据
+                total_trades_mean=('total_trades', 'mean'), # 新增：平均交易次数
+                total_trades_max=('total_trades', 'max'),   # 新增：最大交易次数
+                total_trades_min=('total_trades', 'min')    # 新增：最小交易次数
+            ).reset_index()
+
+            # --- 修改点：新增统计相邻 score1_mean 平均值的字段 ---
+            # 此时 final_df 已经是按 grid_ratio 从小到大排序的，可以直接计算相邻均值
+            # 使用 window=3, center=True 表示取它本身和前后各一个（共3个）进行平均计算，min_periods=1 保证首尾也能算出均值
+            final_df['score1_mean_adj_avg'] = final_df['score1_mean'].rolling(window=3, center=True, min_periods=1).mean()
+            # ---------------------------------------------------
+
+            # 按照平均分降序排列，方便直接看到表现最好的参数
+            final_df = final_df.sort_values(by='score1_mean', ascending=False)
+            final_df['score'] = final_df['score1_mean']*final_df['score1_min']  # 计算最终的 score（均值除以标准差）
+            final_df['score2'] = final_df['score1_mean']*final_df['score1_min']/(final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
+
+            print("聚合计算完成！结果如下：")
+            print(final_df)
+
+            # 如果需要保存结果，可以取消下面这行的注释
+            # final_df.to_csv(folder_path / "aggregated_grid_scores.csv", index=False)
+        else:
+            print("没有提取到任何有效数据。")

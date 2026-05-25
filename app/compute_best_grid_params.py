@@ -9,12 +9,13 @@
 
 """
 import math
+import os
 import traceback
 
 import pandas as pd
 
 
-def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short"):
+def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
     简易网格交易回测函数
     参数:
@@ -24,14 +25,16 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
       fee_rate: 单边手续费率 (默认 0.05% = 0.0005)
       lot_size: 每格交易的数量 (默认 1 个单位)
       direction: 网格策略整体方向，可选 "long" (做多) 或 "short" (做空)，默认为 "short"
+      initial_price: 网格初始价格 (作为做多的最高价限制)
     返回:
       包含各项回测指标的字典
     """
     if df.empty:
         return None
 
-    # 基准价格：以第一根K线的开盘价作为网格的零点
-    p0 = df['open'].iloc[0]
+    # 基准价格：修改为传入的初始价格作为网格的零点
+    p0 = initial_price
+    first_open = df['open'].iloc[0]  # 获取实际第一根K线开盘价用于初始化价格轨迹
     last_close = df['close'].iloc[-1]  # 记录最终收盘价
 
     realized_pnl = 0.0  # 已实现盈亏
@@ -44,7 +47,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # 新增：记录发生 max_capital_needed 时的“案发现场”信息
     worst_case_info = {
         "time": None,  # 修改：名称改为 time
-        "worst_price": p0,
+        "worst_price": first_open,
         "worst_position_count": 0,
         "worst_price_change_rate": 0.0,
         "worst_realized_pnl": 0.0,  # 新增：当时的已实现利润
@@ -83,7 +86,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
             worst_case_info["worst_total_trades"] = total_trades  # 记录当时成交单数
             worst_case_info["worst_required_margin"] = required_margin  # 记录当时所需保证金
 
-    p_prev = p0
+    p_prev = first_open
     k_prev = math.floor((p_prev - p0) / (p0 * grid_ratio))
 
     # 修改：获取实际的时间序列 (优先取 'time' 或 'timestamp' 列，否则用 index)
@@ -142,7 +145,8 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                     update_margin(pk, current_time)  # 碰线前结算一次极值
 
                     if direction == "long":
-                        if k not in positions:  # 价格下跌，触发买入开多
+                        # 修改：使用 k <= 0 确保新开仓的价格严格小于等于 p0(最高价限制)
+                        if k not in positions and k <= 0:
                             positions[k] = pk
                             fee = pk * lot_size * fee_rate
                             realized_pnl -= fee
@@ -238,7 +242,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     }
 
 
-def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short"):
+def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
     批量回测不同网格间距(0.001 到 0.1，步长 0.001)并保存为 CSV
     """
@@ -251,10 +255,10 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     print(f"开始批量回测 (方向: {direction}) ...")
 
     # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
-    for i in range(10, 100):
+    for i in range(1, 100):
         grid_ratio = round(i * 0.001, 5)
         res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
-                            direction=direction)
+                            direction=direction, initial_price=initial_price)
         if res:
             results.append(res)
             # 简单打印进度
@@ -270,32 +274,66 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 
 
 if __name__ == "__main__":
-    csv_file_path = r"W:\project\python_project\crypto_trade\data\ETH_USDT_USDT_1m.csv"
+    param_list = [
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 100000,
+            "offset": 1500
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 3500,
+            "offset": 52.5
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 150,
+            "offset": 2.25
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\XRPUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 2.42,
+            "offset": 0.0363
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 960,
+            "offset": 14.4
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv",
+            "base_initial_price": 0.15656,
+            "offset": 0.0023484
+        }
 
-    output_csv_path = csv_file_path.replace(".csv", "_grid_backtest_results.csv")
+    ]
 
-    try:
-        df = pd.read_csv(output_csv_path)
-        df['score'] = df['profit_to_margin_ratio'] * df['total_trades']  # 简单的综合评分指标，越高越好
-        df['score1'] = 100 * df['paired_profit'] / df['min_margin_needed']  # 简单的综合评分指标，越高越好
-        # df['score1'] = 1000000 * df['paired_profit'] * (df['grid_ratio'] ** 0.5)
-        # 把score1放在第一列
-        df = df[['score1'] + [col for col in df.columns if col != 'score1']]
+    for param in param_list:
+        csv_file_path = param["csv_file_path"]
+        base_initial_price = param["base_initial_price"]
+        offset = param["offset"]
 
-        print()
-        # data_df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
-        # print()
-    except FileNotFoundError:
-        pass
-    try:
+        for i in range(25):
+            initial_price = base_initial_price - offset*i
+            print(f"\n=== 回测初始价格: {initial_price} ===")
 
-        df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
+            output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
+            if os.path.exists(output_csv_path):
+                print(f"结果文件已存在，跳过回测: {output_csv_path}")
+                continue
+            try:
 
-        # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
-        print("\n启动批量参数回测...")
-        batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0000, lot_size=0.1,
-                                   direction="long")
+                df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
 
-    except FileNotFoundError:
-        traceback.print_exc()
-        print(f"找不到文件: {csv_file_path}，请检查路径。")
+                if 'open_time' in df.columns:
+                    df['time'] = pd.to_datetime(df['open_time'], unit='ms')
+
+
+                # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
+                print("\n启动批量参数回测...")
+                batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0000, lot_size=0.1,
+                                           direction="long", initial_price=initial_price)
+
+            except FileNotFoundError:
+                traceback.print_exc()
+                print(f"找不到文件: {csv_file_path}，请检查路径。")
