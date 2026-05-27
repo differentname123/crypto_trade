@@ -12,6 +12,7 @@ import math
 import traceback
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -279,70 +280,84 @@ from pathlib import Path
 if __name__ == "__main__":
     # 1. 定义文件夹路径和匹配模式
     folder_path = Path(r"W:\project\python_project\oke_auto_trade\kline_data")
-    file_pattern = "*DOGEUSDT_1m_2025-01-01_merged_grid_backtest_results_*.csv"
+    coin_name_list = ["BTC", "ETH", "SOL","BNB", "XRP", "DOGE"]  # 可根据需要调整币种列表
+    for coin in coin_name_list:
+        file_pattern = f"*{coin}USDT_1m_2025-01-01_merged_grid_backtest_results_*.csv"
 
-    # 获取所有匹配的文件列表
-    matched_files = list(folder_path.glob(file_pattern))
+        # 获取所有匹配的文件列表
+        matched_files = list(folder_path.glob(file_pattern))
 
-    if not matched_files:
-        print("未找到任何匹配的文件，请检查路径和文件名规则。")
-    else:
-        df_list = []
-
-        # 2. 遍历读取每个文件并计算 score1
-        for file in matched_files:
-            try:
-                temp_df = pd.read_csv(file)
-                temp_df['file_name'] = file.name.split('grid_backtest_results_')[1].split('.csv')[0]  # 提取参数信息作为新列
-
-                # 检查必要的列是否存在，防止报错中断 (新增了 total_trades)
-                required_cols = ['paired_profit', 'min_margin_needed', 'grid_ratio', 'total_trades']
-                if all(col in temp_df.columns for col in required_cols):
-                    # 计算 score1
-                    temp_df['score1'] = 100 * temp_df['paired_profit'] / temp_df['min_margin_needed']
-
-                    # 保留所有的列
-                    df_list.append(temp_df)
-                else:
-                    print(f"跳过 {file.name}：缺少必要的字段 (需包含 {required_cols})")
-
-            except pd.errors.EmptyDataError:
-                print(f"跳过 {file.name}：文件为空")
-            except Exception as e:
-                print(f"读取 {file.name} 时出错: {e}")
-
-        # 3. 将所有有效数据合并并进行聚合
-        if df_list:
-            # 合并所有提取出来的数据
-            all_data = pd.concat(df_list, ignore_index=True)
-
-            # 以 grid_ratio 进行分组，采用多列命名聚合语法，同时计算 score1 和 total_trades 的统计信息
-            final_df = all_data.groupby('grid_ratio').agg(
-                score1_mean=('score1', 'mean'),
-                score1_std=('score1', 'std'),
-                score1_max=('score1', 'max'),
-                score1_min=('score1', 'min'),
-                sample_count=('score1', 'count'),  # 统计一下每个 grid_ratio 下有多少条数据
-                total_trades_mean=('total_trades', 'mean'), # 新增：平均交易次数
-                total_trades_max=('total_trades', 'max'),   # 新增：最大交易次数
-                total_trades_min=('total_trades', 'min')    # 新增：最小交易次数
-            ).reset_index()
-
-            # --- 修改点：新增统计相邻 score1_mean 平均值的字段 ---
-            # 此时 final_df 已经是按 grid_ratio 从小到大排序的，可以直接计算相邻均值
-            # 使用 window=3, center=True 表示取它本身和前后各一个（共3个）进行平均计算，min_periods=1 保证首尾也能算出均值
-            final_df['score1_mean_adj_avg'] = final_df['score1_mean'].rolling(window=3, center=True, min_periods=1).mean()
-            # ---------------------------------------------------
-
-            # 按照平均分降序排列，方便直接看到表现最好的参数
-            final_df = final_df.sort_values(by='score1_mean', ascending=False)
-            final_df['score'] = final_df['score1_mean']*final_df['score1_min']  # 计算最终的 score（均值除以标准差）
-            final_df['score2'] = final_df['score1_mean']*final_df['score1_min']/(final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
-
-            print("聚合计算完成！结果如下：")
-            print(final_df)
-
-            # 如果需要保存结果，可以取消下面这行的注释
-            # final_df.to_csv(folder_path / "aggregated_grid_scores.csv", index=False)
+        if not matched_files:
+            print("未找到任何匹配的文件，请检查路径和文件名规则。")
         else:
-            print("没有提取到任何有效数据。")
+            df_list = []
+
+            # 2. 遍历读取每个文件并计算 score1
+            for file in matched_files:
+                try:
+                    temp_df = pd.read_csv(file)
+                    temp_df['file_name'] = file.name.split('grid_backtest_results_')[1].split('.csv')[0]  # 提取参数信息作为新列
+
+                    # 检查必要的列是否存在，防止报错中断 (新增了 total_trades)
+                    required_cols = ['paired_profit', 'min_margin_needed', 'grid_ratio', 'total_trades']
+                    if all(col in temp_df.columns for col in required_cols):
+                        # 计算 score1
+                        temp_df['score1'] = 100 * temp_df['paired_profit'] / temp_df['min_margin_needed']
+
+                        # 保留所有的列
+                        df_list.append(temp_df)
+                    else:
+                        print(f"跳过 {file.name}：缺少必要的字段 (需包含 {required_cols})")
+
+                except pd.errors.EmptyDataError:
+                    print(f"跳过 {file.name}：文件为空")
+                except Exception as e:
+                    print(f"读取 {file.name} 时出错: {e}")
+
+            # 3. 将所有有效数据合并并进行聚合
+            if df_list:
+                # 合并所有提取出来的数据
+                all_data = pd.concat(df_list, ignore_index=True)
+
+                # 以 grid_ratio 进行分组，采用多列命名聚合语法，同时计算 score1 和 total_trades 的统计信息
+                final_df = all_data.groupby('grid_ratio').agg(
+                    score1_mean=('score1', 'mean'),
+                    score1_std=('score1', 'std'),
+                    score1_max=('score1', 'max'),
+                    score1_min=('score1', 'min'),
+                    sample_count=('score1', 'count'),  # 统计一下每个 grid_ratio 下有多少条数据
+                    total_trades_mean=('total_trades', 'mean'), # 新增：平均交易次数
+                    total_trades_max=('total_trades', 'max'),   # 新增：最大交易次数
+                    total_trades_min=('total_trades', 'min')    # 新增：最小交易次数
+                ).reset_index()
+
+                # --- 修改点：新增统计相邻 score1_mean 平均值的字段 ---
+                # 此时 final_df 已经是按 grid_ratio 从小到大排序的，可以直接计算相邻均值
+                # 使用 window=3, center=True 表示取它本身和前后各一个（共3个）进行平均计算，min_periods=1 保证首尾也能算出均值
+                final_df['score1_mean_adj_avg'] = final_df['score1_mean'].rolling(window=3, center=True, min_periods=1).mean()
+                # ---------------------------------------------------
+
+                # 按照平均分降序排列，方便直接看到表现最好的参数
+                final_df = final_df.sort_values(by='score1_mean', ascending=False)
+                final_df['score'] = final_df['score1_mean']*final_df['score1_min']  # 计算最终的 score（均值除以标准差）
+                final_df['score2'] = final_df['score1_mean']*final_df['score1_min']/(final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
+
+                # 保留total_trades_max大于365的参数组合，确保每年平均至少交易一次
+                final_df = final_df[final_df['total_trades_max'] > 365]
+
+
+                # 对final_df['total_trades_mean']取一个log
+                final_df['total_trades_mean_log'] = np.log1p(
+                    final_df['total_trades_mean']
+                )
+
+                final_df['score3'] = final_df['score'] * final_df['score'] * final_df['score'] * final_df['total_trades_mean_log']
+
+
+                print("聚合计算完成！结果如下：")
+                print(final_df)
+
+                # 如果需要保存结果，可以取消下面这行的注释
+                # final_df.to_csv(folder_path / "aggregated_grid_scores.csv", index=False)
+            else:
+                print("没有提取到任何有效数据。")
