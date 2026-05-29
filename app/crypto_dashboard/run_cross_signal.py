@@ -281,18 +281,30 @@ if __name__ == "__main__":
     # 1. 定义文件夹路径和匹配模式
     folder_path = Path(r"W:\project\python_project\oke_auto_trade\kline_data")
     coin_name_list = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]  # 可根据需要调整币种列表
+
+    coin_target_price_map = {
+        "BTC": 75000,
+        "ETH": 2170,
+        "SOL": 75000,
+        "BNB": 75000,
+        "XRP": 75000,
+        "DOGE": 75000,
+
+    }
+    target_count = 2
     for coin in coin_name_list:
+        target_price = coin_target_price_map.get(coin, 75000)  # 获取目标价格，默认为75000
         file_pattern = f"*{coin}USDT_1m_2025-01-01_merged_grid_backtest_results_*.csv"
 
         # 获取所有匹配的文件列表
-        matched_files = list(folder_path.glob(file_pattern))
+        origin_matched_files = list(folder_path.glob(file_pattern))
 
-        if not matched_files:
+        if not origin_matched_files:
             print("未找到任何匹配的文件，请检查路径和文件名规则。")
         else:
             # ================= 新增逻辑开始 =================
             file_price_list = []
-            for f in matched_files:
+            for f in origin_matched_files:
                 try:
                     # 1. 从文件名中解析出最后的价格
                     price_str = f.name.split('grid_backtest_results_')[1].split('.csv')[0]
@@ -301,32 +313,29 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"解析文件 {f.name} 的价格时出错: {e}，跳过此文件。")
 
-            # 2. 按照价格从小到大排序，准备剔除价格最大的一半以保证稳健性
-            file_price_list.sort(key=lambda x: x[1])
+            # 2. 找到 price 离 target_price 最近的 target_count 个文件
+            # 按价格与 target_price 差值的绝对值进行从小到大排序
+            file_price_list.sort(key=lambda x: abs(x[1] - target_price))
 
-            total_count = len(file_price_list)
-            if total_count > 0:
-                drop_count = total_count // 2  # 剔除最大的一半数量
-                keep_count = total_count - drop_count  # 最终保留的数量
+            # 取出最接近的 target_count 个元素
+            closest_items = file_price_list[:target_count]
 
-                max_price = file_price_list[-1][1]
-                min_price = file_price_list[0][1]
-                # 剔除的阈值价格（被剔除的文件中的最低价格）
-                threshold_price = file_price_list[keep_count][1] if drop_count > 0 else None
+            # 3. 将符合条件的文件对象存入 matched_files 列表
+            matched_files = [item[0] for item in closest_items]
 
-                # 3. 输出重要日志
-                print(f"\n--- {coin} 文件过滤日志 ---")
-                print(f"最大价格: {max_price}")
-                print(f"最低价格: {min_price}")
-                print(
-                    f"剔除的阈值价格 (从该价格及以上开始剔除): {threshold_price if threshold_price is not None else '无 (文件过少未剔除)'}")
-                print(f"剔除数量: {drop_count}")
-                print(f"最终数量: {keep_count}")
-                print("-" * 30)
+            # 4. 打印日志及相应的 price 和 百分比涨跌幅
+            if closest_items:
+                print(f"\n[匹配成功] {coin} 距离目标价格 {target_price} 最近的 {len(closest_items)} 个文件：")
+                for file_obj, price in closest_items:
+                    # 计算相较于 target_price 的百分比涨跌幅
+                    pct_diff = ((price - target_price) / target_price) * 100
 
-                # 4. 更新 matched_files 为剔除后的列表（仅保留较小的部分）
-                matched_files = [item[0] for item in file_price_list[:keep_count]]
-            # ================= 新增逻辑结束 =================
+                    # 格式化输出：:+.2f 会强制显示正负号，并保留两位小数
+                    print(f"  -> 文件名: {file_obj.name}")
+                    print(f"     实际价格: {price} | 涨跌幅: {pct_diff:+.2f}%")
+            else:
+                print(f"\n[提示] {coin} 提取价格失败，无满足条件的文件。")
+
 
             df_list = []
 
@@ -383,7 +392,7 @@ if __name__ == "__main__":
                             final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
 
                 # 保留total_trades_max大于365的参数组合，确保每年平均至少交易一次
-                final_df = final_df[final_df['total_trades_min'] > 365]
+                # final_df = final_df[final_df['total_trades_min'] > 365]
 
                 # 对final_df['total_trades_mean']取一个log
                 final_df['total_trades_mean_log'] = np.log1p(
@@ -395,7 +404,7 @@ if __name__ == "__main__":
                 final_df = final_df.sort_values(by='score3', ascending=False)
 
                 print("聚合计算完成！结果如下：")
-                print(final_df)
+                print()
 
                 # 如果需要保存结果，可以取消下面这行的注释
                 # final_df.to_csv(folder_path / "aggregated_grid_scores.csv", index=False)
