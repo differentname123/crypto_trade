@@ -280,7 +280,7 @@ from pathlib import Path
 if __name__ == "__main__":
     # 1. 定义文件夹路径和匹配模式
     folder_path = Path(r"W:\project\python_project\oke_auto_trade\kline_data")
-    coin_name_list = ["BTC", "ETH", "SOL","BNB", "XRP", "DOGE"]  # 可根据需要调整币种列表
+    coin_name_list = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]  # 可根据需要调整币种列表
     for coin in coin_name_list:
         file_pattern = f"*{coin}USDT_1m_2025-01-01_merged_grid_backtest_results_*.csv"
 
@@ -290,6 +290,44 @@ if __name__ == "__main__":
         if not matched_files:
             print("未找到任何匹配的文件，请检查路径和文件名规则。")
         else:
+            # ================= 新增逻辑开始 =================
+            file_price_list = []
+            for f in matched_files:
+                try:
+                    # 1. 从文件名中解析出最后的价格
+                    price_str = f.name.split('grid_backtest_results_')[1].split('.csv')[0]
+                    price = float(price_str)
+                    file_price_list.append((f, price))
+                except Exception as e:
+                    print(f"解析文件 {f.name} 的价格时出错: {e}，跳过此文件。")
+
+            # 2. 按照价格从小到大排序，准备剔除价格最大的一半以保证稳健性
+            file_price_list.sort(key=lambda x: x[1])
+
+            total_count = len(file_price_list)
+            if total_count > 0:
+                drop_count = total_count // 2  # 剔除最大的一半数量
+                keep_count = total_count - drop_count  # 最终保留的数量
+
+                max_price = file_price_list[-1][1]
+                min_price = file_price_list[0][1]
+                # 剔除的阈值价格（被剔除的文件中的最低价格）
+                threshold_price = file_price_list[keep_count][1] if drop_count > 0 else None
+
+                # 3. 输出重要日志
+                print(f"\n--- {coin} 文件过滤日志 ---")
+                print(f"最大价格: {max_price}")
+                print(f"最低价格: {min_price}")
+                print(
+                    f"剔除的阈值价格 (从该价格及以上开始剔除): {threshold_price if threshold_price is not None else '无 (文件过少未剔除)'}")
+                print(f"剔除数量: {drop_count}")
+                print(f"最终数量: {keep_count}")
+                print("-" * 30)
+
+                # 4. 更新 matched_files 为剔除后的列表（仅保留较小的部分）
+                matched_files = [item[0] for item in file_price_list[:keep_count]]
+            # ================= 新增逻辑结束 =================
+
             df_list = []
 
             # 2. 遍历读取每个文件并计算 score1
@@ -326,33 +364,35 @@ if __name__ == "__main__":
                     score1_max=('score1', 'max'),
                     score1_min=('score1', 'min'),
                     sample_count=('score1', 'count'),  # 统计一下每个 grid_ratio 下有多少条数据
-                    total_trades_mean=('total_trades', 'mean'), # 新增：平均交易次数
-                    total_trades_max=('total_trades', 'max'),   # 新增：最大交易次数
-                    total_trades_min=('total_trades', 'min')    # 新增：最小交易次数
+                    total_trades_mean=('total_trades', 'mean'),  # 新增：平均交易次数
+                    total_trades_max=('total_trades', 'max'),  # 新增：最大交易次数
+                    total_trades_min=('total_trades', 'min')  # 新增：最小交易次数
                 ).reset_index()
 
                 # --- 修改点：新增统计相邻 score1_mean 平均值的字段 ---
                 # 此时 final_df 已经是按 grid_ratio 从小到大排序的，可以直接计算相邻均值
                 # 使用 window=3, center=True 表示取它本身和前后各一个（共3个）进行平均计算，min_periods=1 保证首尾也能算出均值
-                final_df['score1_mean_adj_avg'] = final_df['score1_mean'].rolling(window=3, center=True, min_periods=1).mean()
+                final_df['score1_mean_adj_avg'] = final_df['score1_mean'].rolling(window=3, center=True,
+                                                                                  min_periods=1).mean()
                 # ---------------------------------------------------
 
                 # 按照平均分降序排列，方便直接看到表现最好的参数
                 final_df = final_df.sort_values(by='score1_mean', ascending=False)
-                final_df['score'] = final_df['score1_mean']*final_df['score1_min']  # 计算最终的 score（均值除以标准差）
-                final_df['score2'] = final_df['score1_mean']*final_df['score1_min']/(final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
+                final_df['score'] = final_df['score1_mean'] * final_df['score1_min']  # 计算最终的 score（均值除以标准差）
+                final_df['score2'] = final_df['score1_mean'] * final_df['score1_min'] / (
+                            final_df['grid_ratio'] + 0.1)  # 计算最终的 score（均值除以标准差）
 
                 # 保留total_trades_max大于365的参数组合，确保每年平均至少交易一次
-                final_df = final_df[final_df['total_trades_max'] > 365]
-
+                final_df = final_df[final_df['total_trades_min'] > 365]
 
                 # 对final_df['total_trades_mean']取一个log
                 final_df['total_trades_mean_log'] = np.log1p(
                     final_df['total_trades_mean']
                 )
 
-                final_df['score3'] = final_df['score'] * final_df['score'] * final_df['score'] * final_df['total_trades_mean_log']
-
+                final_df['score3'] = final_df['score'] * final_df[
+                    'total_trades_mean_log']
+                final_df = final_df.sort_values(by='score3', ascending=False)
 
                 print("聚合计算完成！结果如下：")
                 print(final_df)

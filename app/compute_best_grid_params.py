@@ -255,8 +255,8 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     print(f"开始批量回测 (方向: {direction}) ...")
 
     # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
-    for i in range(1, 100):
-        grid_ratio = round(i * 0.001, 5)
+    for i in range(10, 200):
+        grid_ratio = round(i * 0.0001, 5)
         res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
                             direction=direction, initial_price=initial_price)
         if res:
@@ -314,13 +314,15 @@ if __name__ == "__main__":
         offset = param["offset"]
 
         for i in range(25):
+            if i < 12:
+                continue
             initial_price = base_initial_price - offset*i
             print(f"\n=== 回测初始价格: {initial_price} ===")
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
-            if os.path.exists(output_csv_path):
-                print(f"结果文件已存在，跳过回测: {output_csv_path}")
-                continue
+            # if os.path.exists(output_csv_path):
+            #     print(f"结果文件已存在，跳过回测: {output_csv_path}")
+            #     continue
             try:
 
                 df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
