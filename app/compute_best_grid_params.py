@@ -436,6 +436,9 @@ if __name__ == "__main__":
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
             if os.path.exists(output_csv_path):
+                temp_df = pd.read_csv(output_csv_path)
+                temp_df['min_price'] = min_price  # 添加一列记录当前的最小价格
+                temp_df.to_csv(output_csv_path, index=False, encoding='utf-8-sig')  # 重新保存覆盖原文件
                 print(f"结果文件已存在，跳过回测: {output_csv_path}")
                 initial_price = initial_price * 0.99
                 continue
