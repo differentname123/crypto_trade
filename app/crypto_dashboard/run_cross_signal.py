@@ -283,7 +283,7 @@ if __name__ == "__main__":
     coin_name_list = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE"]  # 可根据需要调整币种列表
 
     coin_target_price_map = {
-        "BTC": 75000,
+        "BTC": 100000,
         "ETH": 2170,
         "SOL": 84,
         "BNB": 670,
@@ -346,10 +346,11 @@ if __name__ == "__main__":
                     temp_df['file_name'] = file.name.split('grid_backtest_results_')[1].split('.csv')[0]  # 提取参数信息作为新列
 
                     # 检查必要的列是否存在，防止报错中断 (新增了 total_trades)
-                    required_cols = ['paired_profit', 'min_margin_needed', 'grid_ratio', 'total_trades']
+                    required_cols = ['paired_profit', 'min_margin_needed', 'grid_ratio', 'total_trades', 'valid_bar_count']
                     if all(col in temp_df.columns for col in required_cols):
                         # 计算 score1
                         temp_df['score1'] = 100 * temp_df['paired_profit'] / temp_df['min_margin_needed']
+                        temp_df['score_time'] = 100000 * temp_df['paired_profit'] / temp_df['min_margin_needed'] / temp_df['valid_bar_count']  # 新增：考虑时间因素的评分
 
                         # 保留所有的列
                         df_list.append(temp_df)
@@ -372,6 +373,11 @@ if __name__ == "__main__":
                     score1_std=('score1', 'std'),
                     score1_max=('score1', 'max'),
                     score1_min=('score1', 'min'),
+                    score_time_mean=('score_time', 'mean'),
+                    score_time_std=('score_time', 'std'),
+                    score_time_max=('score_time', 'max'),
+                    score_time_min=('score_time', 'min'),
+
                     sample_count=('score1', 'count'),  # 统计一下每个 grid_ratio 下有多少条数据
                     total_trades_mean=('total_trades', 'mean'),  # 新增：平均交易次数
                     total_trades_max=('total_trades', 'max'),  # 新增：最大交易次数
