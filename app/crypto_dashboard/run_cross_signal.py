@@ -285,10 +285,10 @@ if __name__ == "__main__":
     coin_target_price_map = {
         "BTC": 75000,
         "ETH": 2170,
-        "SOL": 75000,
-        "BNB": 75000,
-        "XRP": 75000,
-        "DOGE": 75000,
+        "SOL": 84,
+        "BNB": 670,
+        "XRP": 1.4,
+        "DOGE": 0.11,
 
     }
     target_count = 2
@@ -404,7 +404,8 @@ if __name__ == "__main__":
                 final_df = final_df.sort_values(by='score3', ascending=False)
 
                 print("聚合计算完成！结果如下：")
-                print()
+                # 只打印第一行，每个字段都要打印
+                print(final_df.iloc[0].to_dict())
 
                 # 如果需要保存结果，可以取消下面这行的注释
                 # final_df.to_csv(folder_path / "aggregated_grid_scores.csv", index=False)

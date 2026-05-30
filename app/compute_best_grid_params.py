@@ -15,6 +15,8 @@ import traceback
 import pandas as pd
 
 
+import math
+
 def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
     简易网格交易回测函数
@@ -218,10 +220,16 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # 新增：开始价格到最终价格的涨跌幅
     price_change_rate = (last_close - p0) / p0 if p0 > 0 else 0.0
 
+    # 新增：统计有效 bar 数量（针对 long 方向）
+    valid_bar_count = 0
+    if direction == "long":
+        valid_bar_count = int((df['close'] < initial_price).sum())
+
     return {
         "direction": direction,
         "grid_ratio": grid_ratio,
         "price_change_rate": price_change_rate,  # 标的物期间涨跌幅
+        "valid_bar_count": valid_bar_count,  # 新增：多头有效运作区间的K线数量
         "total_profit": total_profit,  # 纯收益 (已扣除手续费)
         "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
         "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
@@ -240,7 +248,6 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "worst_total_trades": worst_case_info["worst_total_trades"],  # 极值发生时的已成交单数
         "worst_required_margin": worst_case_info["worst_required_margin"]  # 极值发生时的持仓所需本金
     }
-
 
 def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
@@ -278,58 +285,56 @@ if __name__ == "__main__":
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 100000,
-            "offset": 1500
+            "min_price": 60000
         },
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 3500,
-            "offset": 52.5
+            "min_price": 1740
         },
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 150,
-            "offset": 2.25
+            "min_price": 67.5
         },
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\XRPUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 2.42,
-            "offset": 0.0363
+            "min_price": 1.12
         },
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 960,
-            "offset": 14.4
+            "min_price": 570
         },
         {
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv",
             "base_initial_price": 0.15656,
-            "offset": 0.0023484
+            "min_price": 0.08
         }
-
     ]
 
     for param in param_list:
         csv_file_path = param["csv_file_path"]
         base_initial_price = param["base_initial_price"]
-        offset = param["offset"]
+        min_price = param["min_price"]
 
-        for i in range(25):
-            if i < 12:
-                continue
-            initial_price = base_initial_price - offset*i
+        initial_price = base_initial_price
+
+        # 只要当前价格大于等于下限价格，就继续循环
+        while initial_price >= min_price:
             print(f"\n=== 回测初始价格: {initial_price} ===")
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
-            # if os.path.exists(output_csv_path):
-            #     print(f"结果文件已存在，跳过回测: {output_csv_path}")
-            #     continue
+            if os.path.exists(output_csv_path):
+                print(f"结果文件已存在，跳过回测: {output_csv_path}")
+                continue
             try:
 
                 df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
 
                 if 'open_time' in df.columns:
                     df['time'] = pd.to_datetime(df['open_time'], unit='ms')
-
 
                 # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
                 print("\n启动批量参数回测...")
@@ -339,3 +344,6 @@ if __name__ == "__main__":
             except FileNotFoundError:
                 traceback.print_exc()
                 print(f"找不到文件: {csv_file_path}，请检查路径。")
+
+            # 每次回测后，价格降低当前值的 1%
+            initial_price = initial_price * 0.99
