@@ -11,12 +11,11 @@
 import math
 import os
 import traceback
+from multiprocessing import Pool
 
 import numpy as np
 import pandas as pd
 
-
-import math
 
 def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
@@ -287,9 +286,17 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     }
 
 
+# ================== 新增的包裹函数 ==================
+# 用于多进程参数解包（Python 多进程要求传入的函数在顶层作用域）
+def _run_single_backtest(kwargs):
+    return backtest_grid(**kwargs)
+# ====================================================
+
+
 def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
     批量回测不同网格间距(0.001 到 0.1，步长 0.001)并保存为 CSV
+    修改为 20 并发的多进程运行。
     """
     if df.empty:
         print("数据为空，无法进行批量回测。")
@@ -297,20 +304,36 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     print(f"数据加载成功，包含 {len(df)} 行记录。开始批量回测网格参数...")
 
     results = []
-    print(f"开始批量回测 (方向: {direction}) ...")
+    print(f"开始批量并行回测 (方向: {direction}) ...")
 
-    # 从 1 遍历到 100，对应 0.001 到 0.100 (避免直接浮点数相加产生的精度丢失)
+    # --- 构造多进程任务参数池 ---
+    tasks = []
+    # 从 10 遍历到 200，对应 0.001 到 0.0199...
     for i in range(10, 200):
         grid_ratio = round(i * 0.0001, 5)
-        res = backtest_grid(df, grid_ratio=grid_ratio, leverage=leverage, fee_rate=fee_rate, lot_size=lot_size,
-                            direction=direction, initial_price=initial_price)
-        if res:
-            results.append(res)
+        tasks.append({
+            'df': df,
+            'grid_ratio': grid_ratio,
+            'leverage': leverage,
+            'fee_rate': fee_rate,
+            'lot_size': lot_size,
+            'direction': direction,
+            'initial_price': initial_price
+        })
+
+    # --- 启动 20 进程的进程池 ---
+    with Pool(processes=30) as pool:
+        # imap_unordered 可以最高效地调度任务，并且能够在进行中立刻获得返回以更新进度
+        for i, res in enumerate(pool.imap_unordered(_run_single_backtest, tasks)):
+            if res:
+                results.append(res)
             # 简单打印进度
-            if i % 10 == 0:
-                print(f"已完成网格步长: {grid_ratio}")
+            if (i + 1) % 10 == 0:
+                print(f"已完成并行任务进度: {i + 1} / {len(tasks)}")
 
     if results:
+        # 由于 imap_unordered 会打乱返回顺序，我们在保存前按照 grid_ratio 重新排个序
+        results = sorted(results, key=lambda x: x['grid_ratio'])
         res_df = pd.DataFrame(results)
         res_df.to_csv(output_csv, index=False, encoding='utf-8-sig')
         print(f"批量回测全部完成！共 {len(results)} 条结果，已保存至: {output_csv}")
@@ -321,42 +344,90 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 if __name__ == "__main__":
     param_list = [
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 100000,
-            "min_price": 60000
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 3500,
-            "min_price": 1740
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 150,
-            "min_price": 67.5
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\XRPUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 2.42,
-            "min_price": 1.12
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 960,
-            "min_price": 570
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv",
-            "base_initial_price": 0.15656,
-            "min_price": 0.08
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2025-01-01_merged.csv"
+        },
+        {
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2025-01-01_merged.csv"
         }
     ]
 
     for param in param_list:
         csv_file_path = param["csv_file_path"]
-        base_initial_price = param["base_initial_price"]
-        min_price = param["min_price"]
 
+        # ---------------- 新增：根据CSV自动计算价格参数开始 ----------------
+        try:
+            # 预先读取文件一次用于计算 base_initial_price 和 min_price
+            temp_df = pd.read_csv(csv_file_path)
+
+            # 时间列转换
+            if 'open_time' in temp_df.columns:
+                temp_df['time'] = pd.to_datetime(temp_df['open_time'], unit='ms')
+            elif 'time' in temp_df.columns:
+                temp_df['time'] = pd.to_datetime(temp_df['time'])
+
+            # 筛选2026年后(含2026-01-01)的数据
+            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2026-01-01')]
+            if df_2026.empty:
+                df_2026 = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
+
+            # 获取最高价作为最大值，最低价求50%作为最小值 (优先判断k线标准列high/low，无则用close)
+            if 'high' in df_2026.columns and 'low' in df_2026.columns:
+                base_initial_price = float(df_2026['high'].max())
+                min_price = float(df_2026['low'].min())
+            elif 'close' in df_2026.columns:
+                base_initial_price = float(df_2026['close'].max())
+                min_price = float(df_2026['close'].min())
+            else:
+                print(f"跳过 {csv_file_path}：数据列中未找到 high/low 或 close")
+                continue
+
+        except Exception as e:
+            print(f"读取文件以计算自动价格失败: {csv_file_path}, 错误: {e}")
+            continue
+        # ---------------- 新增：根据CSV自动计算价格参数结束 ----------------
+        print(f"根据CSV数据计算得到的初始价格: {base_initial_price}, 最小价格: {min_price} {csv_file_path}")
         initial_price = base_initial_price
 
         # 只要当前价格大于等于下限价格，就继续循环
