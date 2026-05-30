@@ -92,6 +92,8 @@
             font-size: 22px;
             font-weight: 700;
             color: var(--text-primary);
+            display: flex;
+            align-items: center;
         }
 
         /* 数据行样式：弱化标签，突出数值 */
@@ -201,6 +203,52 @@
             to { opacity: 1; transform: translateY(0); }
         }
 
+        /* 卡片内部的自动输入框专用样式 (强制高优覆盖原有全局input样式) */
+        .card-price-input {
+            flex: none !important;
+            min-width: unset !important;
+            padding: 4px 8px !important;
+            font-size: 22px !important;
+            font-weight: 700 !important;
+            color: var(--accent-color) !important;
+            letter-spacing: -0.5px !important;
+            background: rgba(255, 255, 255, 0.5) !important;
+            border: 1px dashed rgba(0, 113, 227, 0.4) !important;
+            border-radius: 6px !important;
+            text-align: right !important;
+            outline: none !important;
+            width: 120px !important;
+            transition: all 0.2s ease !important;
+            box-sizing: border-box !important;
+            -moz-appearance: textfield !important;
+        }
+
+        .card-price-input::placeholder {
+            color: rgba(0, 113, 227, 0.3);
+            font-weight: 400;
+            font-size: 16px;
+        }
+
+        .card-price-input::-webkit-outer-spin-button,
+        .card-price-input::-webkit-inner-spin-button {
+            -webkit-appearance: none;
+            margin: 0;
+        }
+
+        .card-price-input:focus {
+            border: 1px solid var(--accent-color) !important;
+            background: #ffffff !important;
+            box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.1) !important;
+        }
+
+        /* 成功/拉取按钮颜色样式 */
+        button.btn-success {
+            background-color: var(--success-color);
+        }
+        button.btn-success:hover {
+            background-color: #2eb350;
+        }
+
         /* 手机端深度适配 */
         @media (max-width: 600px) {
             .page-title { font-size: 24px; margin: 10px 0 30px; }
@@ -231,22 +279,22 @@
 
     <!-- 自动刷新展示区 (移至下方) -->
     <div class="section-title">实时市场分析</div>
-    <div id="auto-results" class="grid-container">
+    <div id="auto-results" class="grid-container" style="margin-bottom: 20px;">
         <div class="status-msg">正在与实时市场数据同步...</div>
+    </div>
+
+    <!-- 动态修改卡片计算与拉取数据的控制面板 -->
+    <div class="control-panel" style="margin-bottom: 40px;">
+        <div class="form-group">
+            <button onclick="recalculateAuto()">使用输入价格重新计算并排序</button>
+            <button onclick="autoLoad()" class="btn-success">拉取实时数据并计算</button>
+        </div>
     </div>
 </div>
 
 <script>
     // 1. 固定的数据字典 (保持不变)
-    const cryptoData = {
-        'BTCUSDT': [
-            { 'price': 100000.0, '平均每天赚钱速度(单位 %)': 0.7501, '平均每天交易次数': 64.5036, '网格间距(单位 %)': 0.27 },
-            { 'price': 62352.539489119954, '平均每天赚钱速度(单位 %)': 6083.5317, '平均每天交易次数': 436.3636, '网格间距(单位 %)': 1.88 }
-        ],
-        'ETHUSDT': [
-            { 'price': 3000.0, '平均每天赚钱速度(单位 %)': 0.87, '平均每天交易次数': 70.321, '网格间距(单位 %)': 0.27 }
-        ]
-    };
+    const cryptoData = {'BTCUSDT': [{'price': 100000.0, '平均每天赚钱速度(单位 %)': 0.7501, '平均每天交易次数': 64.5036, '网格间距(单位 %)': 0.27}, {'price': 60500.6067137536, '平均每天赚钱速度(单位 %)': 61959.5987, '平均每天交易次数': 2160.0, '网格间距(单位 %)': 1.15}, {'price': 61111.72395328647, '平均每天赚钱速度(单位 %)': 13681.0538, '平均每天交易次数': 576.0, '网格间距(单位 %)': 1.81}, {'price': 61729.014094228754, '平均每天赚钱速度(单位 %)': 3198.5614, '平均每天交易次数': 2764.8, '网格间距(单位 %)': 0.4}, {'price': 62352.539489119954, '平均每天赚钱速度(单位 %)': 6083.5317, '平均每天交易次数': 436.3636, '网格间距(单位 %)': 1.88}, {'price': 62982.363120323185, '平均每天赚钱速度(单位 %)': 1928.6902, '平均每天交易次数': 119.3782, '网格间距(单位 %)': 1.99}, {'price': 63618.548606387056, '平均每天赚钱速度(单位 %)': 316.6459, '平均每天交易次数': 47.8505, '网格间距(单位 %)': 1.42}, {'price': 64261.160208471774, '平均每天赚钱速度(单位 %)': 106.9736, '平均每天交易次数': 89.5558, '网格间距(单位 %)': 0.72}, {'price': 64910.26283684018, '平均每天赚钱速度(单位 %)': 71.7753, '平均每天交易次数': 32.7273, '网格间距(单位 %)': 1.15}, {'price': 65565.92205741433, '平均每天赚钱速度(单位 %)': 43.0988, '平均每天交易次数': 77.3506, '网格间距(单位 %)': 0.63}, {'price': 66228.2040983983, '平均每天赚钱速度(单位 %)': 24.0596, '平均每天交易次数': 74.749, '网格间距(单位 %)': 0.54}, {'price': 66897.17585696798, '平均每天赚钱速度(单位 %)': 11.8428, '平均每天交易次数': 105.065, '网格间距(单位 %)': 0.35}, {'price': 67572.90490602827, '平均每天赚钱速度(单位 %)': 7.8023, '平均每天交易次数': 172.6367, '网格间距(单位 %)': 0.24}, {'price': 68255.45950103865, '平均每天赚钱速度(单位 %)': 6.2888, '平均每天交易次数': 111.322, '网格间距(单位 %)': 0.29}, {'price': 68944.90858690774, '平均每天赚钱速度(单位 %)': 4.8811, '平均每天交易次数': 175.5003, '网格间距(单位 %)': 0.22}, {'price': 69641.32180495732, '平均每天赚钱速度(单位 %)': 4.2541, '平均每天交易次数': 158.2538, '网格间距(单位 %)': 0.23}, {'price': 70344.76949995689, '平均每天赚钱速度(单位 %)': 3.7957, '平均每天交易次数': 158.7371, '网格间距(单位 %)': 0.23}, {'price': 71055.32272722918, '平均每天赚钱速度(单位 %)': 3.109, '平均每天交易次数': 213.2341, '网格间距(单位 %)': 0.19}, {'price': 71773.05325982746, '平均每天赚钱速度(单位 %)': 2.6665, '平均每天交易次数': 202.342, '网格间距(单位 %)': 0.19}, {'price': 72498.03359578531, '平均每天赚钱速度(单位 %)': 2.3387, '平均每天交易次数': 277.046, '网格间距(单位 %)': 0.16}, {'price': 73230.33696543971, '平均每天赚钱速度(单位 %)': 2.1112, '平均每天交易次数': 272.1737, '网格间距(单位 %)': 0.16}, {'price': 73970.03733882798, '平均每天赚钱速度(单位 %)': 1.9994, '平均每天交易次数': 219.3394, '网格间距(单位 %)': 0.18}, {'price': 74717.20943315959, '平均每天赚钱速度(单位 %)': 1.7601, '平均每天交易次数': 235.0808, '网格间距(单位 %)': 0.17}, {'price': 75471.92872036323, '平均每天赚钱速度(单位 %)': 1.6847, '平均每天交易次数': 172.1247, '网格间距(单位 %)': 0.2}, {'price': 76234.27143471033, '平均每天赚钱速度(单位 %)': 1.5204, '平均每天交易次数': 228.5714, '网格间距(单位 %)': 0.17}, {'price': 77004.31458051549, '平均每天赚钱速度(单位 %)': 1.4721, '平均每天交易次数': 203.7119, '网格间距(单位 %)': 0.18}, {'price': 77782.13593991465, '平均每天赚钱速度(单位 %)': 1.402, '平均每天交易次数': 224.2166, '网格间距(单位 %)': 0.17}, {'price': 78567.81408072186, '平均每天赚钱速度(单位 %)': 1.4001, '平均每天交易次数': 163.1411, '网格间距(单位 %)': 0.2}, {'price': 79361.42836436552, '平均每天赚钱速度(单位 %)': 1.4031, '平均每天交易次数': 137.2453, '网格间距(单位 %)': 0.22}, {'price': 80163.05895390456, '平均每天赚钱速度(单位 %)': 1.37, '平均每天交易次数': 116.1145, '网格间距(单位 %)': 0.24}, {'price': 80972.78682212582, '平均每天赚钱速度(单位 %)': 1.3245, '平均每天交易次数': 84.4215, '网格间距(单位 %)': 0.28}, {'price': 81790.69375972306, '平均每天赚钱速度(单位 %)': 1.3485, '平均每天交易次数': 61.7296, '网格间距(单位 %)': 0.33}, {'price': 82616.86238355865, '平均每天赚钱速度(单位 %)': 1.8542, '平均每天交易次数': 7.8149, '网格间距(单位 %)': 1.01}, {'price': 83451.37614500873, '平均每天赚钱速度(单位 %)': 1.9739, '平均每天交易次数': 7.9376, '网格间距(单位 %)': 1.0}, {'price': 84294.31933839266, '平均每天赚钱速度(单位 %)': 1.5486, '平均每天交易次数': 49.4098, '网格间距(单位 %)': 0.37}, {'price': 85145.77710948754, '平均每天赚钱速度(单位 %)': 1.3952, '平均每天交易次数': 86.5489, '网格间距(单位 %)': 0.27}, {'price': 86005.83546412883, '平均每天赚钱速度(单位 %)': 1.4057, '平均每天交易次数': 70.0834, '网格间距(单位 %)': 0.3}, {'price': 86874.5812768978, '平均每天赚钱速度(单位 %)': 1.4588, '平均每天交易次数': 66.2471, '网格间距(单位 %)': 0.31}, {'price': 87752.10229989678, '平均每天赚钱速度(单位 %)': 1.5585, '平均每天交易次数': 43.7464, '网格间距(单位 %)': 0.38}, {'price': 88638.48717161291, '平均每天赚钱速度(单位 %)': 1.5184, '平均每天交易次数': 49.7013, '网格间距(单位 %)': 0.35}, {'price': 89533.82542587163, '平均每天赚钱速度(单位 %)': 1.9485, '平均每天交易次数': 4.9738, '网格间距(单位 %)': 1.16}, {'price': 90438.20750088044, '平均每天赚钱速度(单位 %)': 1.6247, '平均每天交易次数': 18.7834, '网格间距(单位 %)': 0.57}, {'price': 91351.72474836408, '平均每天赚钱速度(单位 %)': 1.5662, '平均每天交易次数': 19.7017, '网格间距(单位 %)': 0.55}, {'price': 92274.469442792, '平均每天赚钱速度(单位 %)': 1.3499, '平均每天交易次数': 37.4049, '网格间距(单位 %)': 0.39}, {'price': 93206.53479069899, '平均每天赚钱速度(单位 %)': 1.1979, '平均每天交易次数': 74.8314, '网格间距(单位 %)': 0.27}, {'price': 94148.0149401, '平均每天赚钱速度(单位 %)': 1.3479, '平均每天交易次数': 20.2784, '网格间距(单位 %)': 0.53}, {'price': 95099.00499, '平均每天赚钱速度(单位 %)': 1.1092, '平均每天交易次数': 62.7566, '网格间距(单位 %)': 0.29}, {'price': 96059.601, '平均每天赚钱速度(单位 %)': 1.0701, '平均每天交易次数': 44.8575, '网格间距(单位 %)': 0.34}, {'price': 97029.9, '平均每天赚钱速度(单位 %)': 0.9891, '平均每天交易次数': 48.7231, '网格间距(单位 %)': 0.32}, {'price': 98010.0, '平均每天赚钱速度(单位 %)': 0.8682, '平均每天交易次数': 70.9713, '网格间距(单位 %)': 0.26}, {'price': 99000.0, '平均每天赚钱速度(单位 %)': 0.8312, '平均每天交易次数': 61.1723, '网格间距(单位 %)': 0.28}], 'ETHUSDT': [{'price': 2950.3011768437436, '平均每天赚钱速度(单位 %)': 0.429, '平均每天交易次数': 100.4826, '网格间距(单位 %)': 0.3}, {'price': 2980.1021988320645, '平均每天赚钱速度(单位 %)': 0.4045, '平均每天交易次数': 112.2421, '网格间距(单位 %)': 0.28}, {'price': 3010.2042412445094, '平均每天赚钱速度(单位 %)': 0.3789, '平均每天交易次数': 135.9584, '网格间距(单位 %)': 0.25}, {'price': 3040.6103446914235, '平均每天赚钱速度(单位 %)': 0.3583, '平均每天交易次数': 156.9624, '网格间距(单位 %)': 0.23}, {'price': 3071.3235804963874, '平均每天赚钱速度(单位 %)': 0.3625, '平均每天交易次数': 108.3593, '网格间距(单位 %)': 0.28}, {'price': 3102.347051006452, '平均每天赚钱速度(单位 %)': 0.3365, '平均每天交易次数': 167.9816, '网格间距(单位 %)': 0.22}, {'price': 3133.6838899055074, '平均每天赚钱速度(单位 %)': 0.329, '平均每天交易次数': 152.5582, '网格间距(单位 %)': 0.23}, {'price': 3165.3372625308157, '平均每天赚钱速度(单位 %)': 0.3221, '平均每天交易次数': 128.6875, '网格间距(单位 %)': 0.25}, {'price': 3197.310366192743, '平均每天赚钱速度(单位 %)': 0.3222, '平均每天交易次数': 103.7875, '网格间距(单位 %)': 0.28}, {'price': 3229.6064304977203, '平均每天赚钱速度(单位 %)': 0.3014, '平均每天交易次数': 176.1862, '网格间距(单位 %)': 0.21}, {'price': 3262.228717674465, '平均每天赚钱速度(单位 %)': 0.3112, '平均每天交易次数': 109.2223, '网格间距(单位 %)': 0.27}, {'price': 3295.1805229035, '平均每天赚钱速度(单位 %)': 0.2988, '平均每天交易次数': 146.5519, '网格间距(单位 %)': 0.23}, {'price': 3328.46517465, '平均每天赚钱速度(单位 %)': 0.2965, '平均每天交易次数': 133.9589, '网格间距(单位 %)': 0.24}, {'price': 3362.086035, '平均每天赚钱速度(单位 %)': 0.2879, '平均每天交易次数': 143.4935, '网格间距(单位 %)': 0.23}, {'price': 3396.0465, '平均每天赚钱速度(单位 %)': 0.2822, '平均每天交易次数': 131.2671, '网格间距(单位 %)': 0.24}, {'price': 3430.35, '平均每天赚钱速度(单位 %)': 0.2698, '平均每天交易次数': 152.8253, '网格间距(单位 %)': 0.22}, {'price': 3465.0, '平均每天赚钱速度(单位 %)': 0.2561, '平均每天交易次数': 179.5203, '网格间距(单位 %)': 0.2}, {'price': 3500.0, '平均每天赚钱速度(单位 %)': 0.2526, '平均每天交易次数': 136.2616, '网格间距(单位 %)': 0.23}]};
 
     // 免费 CORS 代理池 (解决 IP 阻断与跨域限流)
     const PROXY_POOL = [
@@ -254,6 +302,9 @@
         "https://api.codetabs.com/v1/proxy?quest=",
         "https://corsproxy.io/?"
     ];
+
+    // 维持在页面中的自动市场状态全局数组，供动态更新计算
+    let globalMarketData = [];
 
     // 健壮的代理降级抓取引擎
     async function smartFetch(targetUrl, signal) {
@@ -342,93 +393,132 @@
         }
     }
 
-    // 渲染卡片HTML (保持不变)
-    function renderCard(symbol, currentPrice, matchedData, isAuto = true) {
-        const priceLabel = isAuto ? '当前实时价格' : '预测基准价格';
+    // 渲染卡片HTML (增加对空数据/超时数据的健壮性处理)
+    function renderCard(symbol, currentPrice, matchedData, isAuto = true, isSuccess = true) {
+        // 如果价格为空（拉取失败且尚未填写），则替换为安全空白符
+        const safePrice = (currentPrice !== null && currentPrice !== undefined) ? currentPrice : '';
+        const displayPriceStr = safePrice ? `$${safePrice.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}` : '-';
+
+        // 如果是实时市场(isAuto)，允许用户直接在卡片输入；反之则锁定显示普通文字
+        const priceDisplay = isAuto
+            ? `<div style="display: flex; align-items: center; justify-content: flex-end;">
+                 <span style="font-size: 20px; font-weight: 700; color: var(--accent-color); margin-right: 4px;">$</span>
+                 <input type="number" class="card-price-input" data-symbol="${symbol}" value="${safePrice}" placeholder="--" step="any">
+               </div>`
+            : `<div class="price-highlight">${displayPriceStr}</div>`;
+
+        // 如果拉取失败，在标题旁边友好地挂载一个红色的状态徽章
+        const errorBadge = (isAuto && !isSuccess) ? `<span style="font-size:12px; color:var(--danger-color); margin-left:8px; font-weight:normal;">(获取超时)</span>` : '';
+
+        // 匹配不到数据时的默认横杠显示 (-)
+        const matchedPrice = matchedData ? `$${matchedData.price.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}` : '-';
+        const profit = matchedData ? matchedData['平均每天赚钱速度(单位 %)'] : '-';
+        const trades = matchedData ? matchedData['平均每天交易次数'] : '-';
+        const gridGap = matchedData ? matchedData['网格间距(单位 %)'] : '-';
 
         return `
             <div class="card">
                 <div class="card-header">
-                    <div class="coin-name">${symbol}</div>
-                    <div class="price-highlight">$${currentPrice.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</div>
+                    <div class="coin-name">${symbol}${errorBadge}</div>
+                    ${priceDisplay}
                 </div>
 
                 <div class="data-row">
                     <div class="data-label">最匹配策略价格</div>
-                    <div class="data-value">$${matchedData.price.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</div>
+                    <div class="data-value">${matchedPrice}</div>
                 </div>
 
                 <div class="data-row">
                     <div class="data-label">日均盈利率 (%)</div>
-                    <div class="data-value">${matchedData['平均每天赚钱速度(单位 %)']}</div>
+                    <div class="data-value">${profit}</div>
                 </div>
 
                 <div class="data-row">
                     <div class="data-label">日均交易次数</div>
-                    <div class="data-value">${matchedData['平均每天交易次数']}</div>
+                    <div class="data-value">${trades}</div>
                 </div>
 
                 <div class="data-row">
                     <div class="data-label">网格间距 (%)</div>
-                    <div class="data-value">${matchedData['网格间距(单位 %)']}</div>
+                    <div class="data-value">${gridGap}</div>
                 </div>
             </div>
         `;
     }
 
-    // 页面加载时的自动逻辑 (加入盈利率排序功能)
+    // 页面加载或拉取实时数据的逻辑 (已使用全局变量供排序重算)
     async function autoLoad() {
         const autoResultsDiv = document.getElementById('auto-results');
+        autoResultsDiv.innerHTML = '<div class="status-msg">正在与实时市场数据同步...</div>';
 
         // 并发拉取所有币种，返回对象而非直接生成字符串，以便后续排序
         const fetchPromises = Object.keys(cryptoData).map(async (symbol) => {
             const currentPrice = await fetchCurrentPrice(symbol);
-            if (currentPrice !== null) {
-                const closestData = findClosestData(symbol, currentPrice);
-                return {
-                    symbol: symbol,
-                    currentPrice: currentPrice,
-                    closestData: closestData,
-                    success: true
-                };
-            } else {
-                return {
-                    symbol: symbol,
-                    success: false
-                };
-            }
+            // 即使失败，也强行返回对象，提供后续手动修改入口
+            const closestData = currentPrice !== null ? findClosestData(symbol, currentPrice) : null;
+            return {
+                symbol: symbol,
+                currentPrice: currentPrice,
+                closestData: closestData,
+                success: currentPrice !== null
+            };
         });
 
-        const results = await Promise.all(fetchPromises);
+        // 保存状态至全局用于重绘
+        globalMarketData = await Promise.all(fetchPromises);
+        renderAutoResults();
+    }
 
-        // 排序：按照 盈利率从高到底排序。如果拉取失败则垫底。
-        results.sort((a, b) => {
-            if (!a.success && !b.success) return 0;
-            if (!a.success) return 1;
-            if (!b.success) return -1;
+    // 提取通用卡片排序和渲染的方法
+    function renderAutoResults() {
+        const autoResultsDiv = document.getElementById('auto-results');
+
+        // 排序：按照 盈利率从高到底排序。如果都没有数据，保留原位。没有数据的项永远垫底。
+        globalMarketData.sort((a, b) => {
+            if (!a.closestData && !b.closestData) return 0;
+            if (!a.closestData) return 1;
+            if (!b.closestData) return -1;
 
             const profitA = a.closestData['平均每天赚钱速度(单位 %)'];
             const profitB = b.closestData['平均每天赚钱速度(单位 %)'];
             return profitB - profitA; // 降序
         });
 
-        // 按照排序后的结果生成 HTML 数组
-        const cardsHtmlArray = results.map(item => {
-            if (item.success) {
-                return renderCard(item.symbol, item.currentPrice, item.closestData, true);
-            } else {
-                return `
-                    <div class="card">
-                        <div class="card-header">
-                            <div class="coin-name">${item.symbol}</div>
-                            <div class="error-text">网络连接超时</div>
-                        </div>
-                        <div class="data-label">无法拉取实时数据，但这不影响您的自定义推演功能。</div>
-                    </div>`;
-            }
+        // 无论成功与否，全部走统一的渲染函数生成含有Input的卡片
+        const cardsHtmlArray = globalMarketData.map(item => {
+            return renderCard(item.symbol, item.currentPrice, item.closestData, true, item.success);
         });
 
         autoResultsDiv.innerHTML = cardsHtmlArray.join('');
+    }
+
+    // 获取用户填写的Input值并重新匹配参数和排序功能
+    function recalculateAuto() {
+        // 读取所有实时市场卡片内的输入框
+        const inputs = document.querySelectorAll('.card-price-input');
+
+        inputs.forEach(input => {
+            const symbol = input.getAttribute('data-symbol');
+            const newPrice = parseFloat(input.value);
+
+            const item = globalMarketData.find(d => d.symbol === symbol);
+            if (item) {
+                // 如果用户输入了有效数字，则强制清除“超时状态”并匹配本地数据
+                if (!isNaN(newPrice)) {
+                    item.currentPrice = newPrice;
+                    item.closestData = findClosestData(symbol, newPrice);
+                    item.success = true;
+                } else {
+                    // 如果被用户清空，则回退为空白占位状态
+                    item.currentPrice = null;
+                    item.closestData = null;
+                    item.success = false;
+                }
+            }
+        });
+
+        // 计算完毕后按最新的盈利率触发重新排序和渲染
+        renderAutoResults();
     }
 
     // 手动查询逻辑 (保持不变)
@@ -452,7 +542,7 @@
         // 为了布局美观，手动查询的结果套一个单列的Grid容器
         contentDiv.innerHTML = `
             <div class="grid-container" style="grid-template-columns: 1fr; margin-bottom: 0;">
-                ${renderCard(symbol, inputPrice, closestData, false)}
+                ${renderCard(symbol, inputPrice, closestData, false, true)}
             </div>
         `;
     }
