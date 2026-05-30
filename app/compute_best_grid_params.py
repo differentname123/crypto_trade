@@ -12,6 +12,7 @@ import math
 import os
 import traceback
 
+import numpy as np
 import pandas as pd
 
 
@@ -42,6 +43,12 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     realized_pnl = 0.0  # 已实现盈亏
     paired_profit = 0.0  # 新增：已配对的利润（仅记录完成一开一平的闭环利润）
     positions = {}  # 当前持仓记录字典: { 网格层级 k : 开仓价格 }
+
+    # ================== 🚀 核心优化一：引入全局状态追踪变量 ==================
+    current_pos_count = 0  # 当前持仓总单数，替代 len(positions)
+    sum_entry_prices = 0.0  # 当前持仓的开仓价总和，替代 sum(positions.values())
+    # ======================================================================
+
     max_capital_needed = 0.0  # 历史记录中【所需的最大初始资金】(即最小不爆仓保证金)
     raw_equity_curve = []  # 记录纯净的资金变化曲线(不含初始资金)
     total_trades = 0  # 新增：记录总的开平仓总次数
@@ -61,17 +68,20 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # 内部函数：每次价格变动或成交后，校验并更新最高所需保证金
     def update_margin(current_price, current_time):
         nonlocal max_capital_needed, worst_case_info
-        if not positions:
+        # 优化：通过数值判断代替遍历字典判空，速度更快
+        if current_pos_count == 0:
             return
 
-        # 浮动盈亏 = Σ (盈亏价差) * 数量 （依据多空方向区分）
+        # ================== 🚀 核心优化二：O(1) 代数降维计算 ==================
+        # 浮动盈亏计算：提取公因式，彻底消除原先的 sum(...) O(N) 循环
         if direction == "long":
-            floating_pnl = sum((current_price - p) * lot_size for p in positions.values())
+            floating_pnl = (current_price * current_pos_count - sum_entry_prices) * lot_size
         else:
-            floating_pnl = sum((p - current_price) * lot_size for p in positions.values())
+            floating_pnl = (sum_entry_prices - current_price * current_pos_count) * lot_size
 
-        # 当前所需保证金 = Σ (开仓价 * 数量 / 杠杆)
-        required_margin = sum(p * lot_size / leverage for p in positions.values())
+        # 当前所需保证金计算：消除 sum(...) 循环
+        required_margin = (sum_entry_prices * lot_size) / leverage
+        # ======================================================================
 
         # 资金缺口 = 所需保证金 - 已实现盈亏 - 浮动盈亏
         capital_needed = required_margin - realized_pnl - floating_pnl
@@ -81,7 +91,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
             # 记录刷新极值时的现场数据
             worst_case_info["time"] = current_time  # 修改：记录真实 time
             worst_case_info["worst_price"] = current_price
-            worst_case_info["worst_position_count"] = len(positions)
+            worst_case_info["worst_position_count"] = current_pos_count  # 优化：直接读取状态变量
             worst_case_info["worst_price_change_rate"] = (current_price - p0) / p0 if p0 > 0 else 0.0
             worst_case_info["worst_realized_pnl"] = realized_pnl  # 记录当时已实现利润
             worst_case_info["worst_floating_pnl"] = floating_pnl  # 记录当时浮动盈亏
@@ -122,6 +132,13 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                     if direction == "long":
                         if (k - 1) in positions:  # 如果持有多单，则平仓
                             entry_p = positions.pop(k - 1)
+                            # === 同步维护 O(1) 状态 ===
+                            current_pos_count -= 1
+                            sum_entry_prices -= entry_p
+                            if current_pos_count == 0:
+                                sum_entry_prices = 0.0
+                            # ==========================
+
                             gross_profit = (pk - entry_p) * lot_size
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
@@ -135,6 +152,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                     else:  # direction == "short"
                         if k not in positions:  # 价格上涨，触发卖出开空
                             positions[k] = pk
+                            # === 同步维护 O(1) 状态 ===
+                            current_pos_count += 1
+                            sum_entry_prices += pk
+                            # ==========================
+
                             fee = pk * lot_size * fee_rate
                             realized_pnl -= fee
                             total_trades += 1
@@ -150,6 +172,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                         # 修改：使用 k <= 0 确保新开仓的价格严格小于等于 p0(最高价限制)
                         if k not in positions and k <= 0:
                             positions[k] = pk
+                            # === 同步维护 O(1) 状态 ===
+                            current_pos_count += 1
+                            sum_entry_prices += pk
+                            # ==========================
+
                             fee = pk * lot_size * fee_rate
                             realized_pnl -= fee
                             total_trades += 1
@@ -157,6 +184,13 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                     else:  # direction == "short"
                         if (k + 1) in positions:  # 价格下跌，触发买入平空(检查之前是否在上层开空过)
                             entry_p = positions.pop(k + 1)
+                            # === 同步维护 O(1) 状态 ===
+                            current_pos_count -= 1
+                            sum_entry_prices -= entry_p
+                            if current_pos_count == 0:
+                                sum_entry_prices = 0.0
+                            # ==========================
+
                             gross_profit = (entry_p - pk) * lot_size
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
@@ -173,10 +207,12 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
             update_margin(p, current_time)  # 轨迹点结算
 
         # 分钟结束，记录当期总权益 (用于后续画图或算回撤)
+        # ================== 🚀 核心优化三：K线末尾 O(1) 计算 ==================
         if direction == "long":
-            minute_floating_pnl = sum((close_p - p) * lot_size for p in positions.values())
+            minute_floating_pnl = (close_p * current_pos_count - sum_entry_prices) * lot_size
         else:
-            minute_floating_pnl = sum((p - close_p) * lot_size for p in positions.values())
+            minute_floating_pnl = (sum_entry_prices - close_p * current_pos_count) * lot_size
+        # ======================================================================
 
         raw_equity_curve.append(realized_pnl + minute_floating_pnl)
 
@@ -185,19 +221,20 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # 如果极值小于0说明光靠利润就够扛了，但理论上首次开仓必定需要保证金，给个基础兜底
     min_margin = max_capital_needed if max_capital_needed > 0 else (p0 * lot_size / leverage)
 
-    # 生成真实的资产曲线用于计算回撤 (初始资金 + 过程盈亏)
-    equity_curve = [min_margin + eq for eq in raw_equity_curve]
-
-    # 计算最大回撤率 (Max Drawdown)
-    max_dd = 0.0
-    if equity_curve:
-        peak = equity_curve[0]
-        for eq in equity_curve:
-            if eq > peak:
-                peak = eq
-            dd = (peak - eq) / peak if peak > 0 else 0
-            if dd > max_dd:
-                max_dd = dd
+    # ================== 🚀 核心优化四：NumPy 向量化计算最大回撤 ==================
+    # 彻底消除原生 for 循环计算回撤的缓慢过程
+    if raw_equity_curve:
+        # 生成真实的资产曲线 Numpy 数组
+        equity_array = min_margin + np.array(raw_equity_curve)
+        # 计算历史峰值数组
+        peak_array = np.maximum.accumulate(equity_array)
+        # 使用 np.where 完美避开除以 0 的情况，计算所有时点的回撤
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdowns = np.where(peak_array > 0, (peak_array - equity_array) / peak_array, 0.0)
+        max_dd = float(np.max(drawdowns))
+    else:
+        max_dd = 0.0
+    # ==========================================================================
 
     # ================== 修改部分开始 ==================
     # 最终收益指标：直观地取最后一刻的总净盈亏，不再使用减去 min_margin 的绕弯子逻辑
@@ -205,11 +242,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     profit_rate = total_profit / min_margin if min_margin > 0 else 0.0
 
     # 新增：计算最后一刻的持仓数量和持仓浮动盈亏
-    final_position_count = len(positions)
+    final_position_count = current_pos_count  # 优化：直接读取状态变量
     if direction == "long":
-        final_floating_pnl = sum((last_close - p) * lot_size for p in positions.values())
+        final_floating_pnl = (last_close * current_pos_count - sum_entry_prices) * lot_size
     else:
-        final_floating_pnl = sum((p - last_close) * lot_size for p in positions.values())
+        final_floating_pnl = (sum_entry_prices - last_close * current_pos_count) * lot_size
     # ================== 修改部分结束 ==================
 
     # 新增：计算每小时平均交易次数 (基于每行数据代表 1 分钟的前提)
@@ -248,6 +285,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "worst_total_trades": worst_case_info["worst_total_trades"],  # 极值发生时的已成交单数
         "worst_required_margin": worst_case_info["worst_required_margin"]  # 极值发生时的持仓所需本金
     }
+
 
 def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
     """
