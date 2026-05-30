@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <!-- 优化移动端视口，禁止手动缩放以获得类似原生App的体验 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>网格策略参数评价系统</title>
+    <style>
+        /* 苹果风格 CSS 变量 */
+        :root {
+            --bg-color: #f5f5f7; /* 苹果经典的淡灰背景色 */
+            --card-bg: rgba(255, 255, 255, 0.8);
+            --text-primary: #1d1d1f; /* 柔和的深黑色 */
+            --text-secondary: #86868b; /* 高级灰色，用于标签 */
+            --accent-color: #0071e3; /* 苹果蓝 */
+            --danger-color: #ff3b30;
+            --success-color: #34c759;
+            --border-radius-lg: 20px;
+            --border-radius-sm: 12px;
+            --shadow-sm: 0 4px 14px rgba(0,0,0,0.04);
+            --shadow-lg: 0 10px 30px rgba(0,0,0,0.06);
+        }
+
+        body {
+            /* 苹方/旧金山字体栈 */
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 20px 16px;
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        /* 标题样式 */
+        .page-title {
+            text-align: center;
+            font-size: 28px;
+            font-weight: 700;
+            margin: 20px 0 40px;
+            letter-spacing: -0.5px;
+        }
+
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            padding-left: 8px;
+        }
+
+        /* 布局容器 */
+        .grid-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+
+        /* 卡片高级质感 */
+        .card {
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: var(--border-radius-lg);
+            padding: 24px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid rgba(255,255,255,0.5);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            animation: fadeIn 0.6s ease-out;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(0,0,0,0.05);
+        }
+
+        .coin-name {
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        /* 数据行样式：弱化标签，突出数值 */
+        .data-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .data-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .data-label {
+            color: var(--text-secondary);
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .data-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .price-highlight {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--accent-color);
+            letter-spacing: -0.5px;
+        }
+
+        /* 表单控件高级质感 */
+        .control-panel {
+            background: #ffffff;
+            border-radius: var(--border-radius-lg);
+            padding: 20px;
+            box-shadow: var(--shadow-sm);
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        select, input {
+            flex: 1;
+            min-width: 150px;
+            padding: 14px 16px;
+            font-size: 16px;
+            border: 1px solid rgba(0,0,0,0.1);
+            border-radius: var(--border-radius-sm);
+            background-color: #fafafa;
+            color: var(--text-primary);
+            outline: none;
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+
+        select:focus, input:focus {
+            background-color: #ffffff;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.1);
+        }
+
+        button {
+            padding: 14px 28px;
+            font-size: 16px;
+            font-weight: 600;
+            color: white;
+            background-color: var(--accent-color);
+            border: none;
+            border-radius: var(--border-radius-sm);
+            cursor: pointer;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+            font-family: inherit;
+            white-space: nowrap;
+        }
+
+        button:hover {
+            background-color: #005bb5;
+        }
+
+        button:active {
+            transform: scale(0.97);
+        }
+
+        /* 状态提示 */
+        .status-msg {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 15px;
+            padding: 20px;
+        }
+
+        .error-text {
+            color: var(--danger-color);
+            font-size: 14px;
+        }
+
+        /* 动画 */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* 手机端深度适配 */
+        @media (max-width: 600px) {
+            .page-title { font-size: 24px; margin: 10px 0 30px; }
+            .form-group { flex-direction: column; }
+            button { width: 100%; }
+            select, input { width: 100%; box-sizing: border-box; }
+            .card { padding: 20px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="page-title">策略参数评价系统</div>
+
+    <!-- 用户手动查询区 (移至上方) -->
+    <div class="section-title">自定义推演</div>
+    <div class="control-panel">
+        <div class="form-group">
+            <select id="coin-select"></select>
+            <input type="number" id="price-input" placeholder="请输入预测价格 (如: 65000)" step="any">
+            <button onclick="manualQuery()">查询</button>
+        </div>
+    </div>
+    <div id="manual-content" style="margin-bottom: 40px;">
+        <!-- 手动查询结果将在这里生成 -->
+    </div>
+
+    <!-- 自动刷新展示区 (移至下方) -->
+    <div class="section-title">实时市场分析</div>
+    <div id="auto-results" class="grid-container">
+        <div class="status-msg">正在与实时市场数据同步...</div>
+    </div>
+</div>
+
+<script>
+    // 1. 固定的数据字典 (保持不变)
+    const cryptoData = {
+        'BTCUSDT': [
+            { 'price': 100000.0, '平均每天赚钱速度(单位 %)': 0.7501, '平均每天交易次数': 64.5036, '网格间距(单位 %)': 0.27 },
+            { 'price': 62352.539489119954, '平均每天赚钱速度(单位 %)': 6083.5317, '平均每天交易次数': 436.3636, '网格间距(单位 %)': 1.88 }
+        ],
+        'ETHUSDT': [
+            { 'price': 3000.0, '平均每天赚钱速度(单位 %)': 0.87, '平均每天交易次数': 70.321, '网格间距(单位 %)': 0.27 }
+        ]
+    };
+
+    // 初始化下拉菜单
+    function initSelect() {
+        const select = document.getElementById('coin-select');
+        for (const coin in cryptoData) {
+            const option = document.createElement('option');
+            option.value = coin;
+            option.textContent = coin;
+            select.appendChild(option);
+        }
+    }
+
+    // 寻找最接近的价格数据
+    function findClosestData(symbol, targetPrice) {
+        const strategies = cryptoData[symbol];
+        if (!strategies || strategies.length === 0) return null;
+        return strategies.reduce((prev, curr) => {
+            return (Math.abs(curr.price - targetPrice) < Math.abs(prev.price - targetPrice) ? curr : prev);
+        });
+    }
+
+    // 从币安公开API获取最新价格 (带超时和错误隔离机制)
+    async function fetchCurrentPrice(symbol) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5秒超时限制
+
+        try {
+            const response = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, {
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (!response.ok) throw new Error('网络响应异常');
+            const data = await response.json();
+            return parseFloat(data.price);
+        } catch (error) {
+            clearTimeout(timeoutId);
+            console.warn(`获取 ${symbol} 价格失败, 但不影响本地查询功能:`, error);
+            return null; // 静默失败，返回null
+        }
+    }
+
+    // 渲染卡片HTML (保持不变)
+    function renderCard(symbol, currentPrice, matchedData, isAuto = true) {
+        const priceLabel = isAuto ? '当前实时价格' : '预测基准价格';
+
+        return `
+            <div class="card">
+                <div class="card-header">
+                    <div class="coin-name">${symbol}</div>
+                    <div class="price-highlight">$${currentPrice.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</div>
+                </div>
+
+                <div class="data-row">
+                    <div class="data-label">最匹配策略价格</div>
+                    <div class="data-value">$${matchedData.price.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}</div>
+                </div>
+
+                <div class="data-row">
+                    <div class="data-label">日均盈利率 (%)</div>
+                    <div class="data-value">${matchedData['平均每天赚钱速度(单位 %)']}</div>
+                </div>
+
+                <div class="data-row">
+                    <div class="data-label">日均交易次数</div>
+                    <div class="data-value">${matchedData['平均每天交易次数']}</div>
+                </div>
+
+                <div class="data-row">
+                    <div class="data-label">网格间距 (%)</div>
+                    <div class="data-value">${matchedData['网格间距(单位 %)']}</div>
+                </div>
+            </div>
+        `;
+    }
+
+    // 页面加载时的自动逻辑 (加入盈利率排序功能)
+    async function autoLoad() {
+        const autoResultsDiv = document.getElementById('auto-results');
+
+        // 并发拉取所有币种，返回对象而非直接生成字符串，以便后续排序
+        const fetchPromises = Object.keys(cryptoData).map(async (symbol) => {
+            const currentPrice = await fetchCurrentPrice(symbol);
+            if (currentPrice !== null) {
+                const closestData = findClosestData(symbol, currentPrice);
+                return {
+                    symbol: symbol,
+                    currentPrice: currentPrice,
+                    closestData: closestData,
+                    success: true
+                };
+            } else {
+                return {
+                    symbol: symbol,
+                    success: false
+                };
+            }
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // 排序：按照 盈利率从高到底排序。如果拉取失败则垫底。
+        results.sort((a, b) => {
+            if (!a.success && !b.success) return 0;
+            if (!a.success) return 1;
+            if (!b.success) return -1;
+
+            const profitA = a.closestData['平均每天赚钱速度(单位 %)'];
+            const profitB = b.closestData['平均每天赚钱速度(单位 %)'];
+            return profitB - profitA; // 降序
+        });
+
+        // 按照排序后的结果生成 HTML 数组
+        const cardsHtmlArray = results.map(item => {
+            if (item.success) {
+                return renderCard(item.symbol, item.currentPrice, item.closestData, true);
+            } else {
+                return `
+                    <div class="card">
+                        <div class="card-header">
+                            <div class="coin-name">${item.symbol}</div>
+                            <div class="error-text">网络连接超时</div>
+                        </div>
+                        <div class="data-label">无法拉取实时数据，但这不影响您的自定义推演功能。</div>
+                    </div>`;
+            }
+        });
+
+        autoResultsDiv.innerHTML = cardsHtmlArray.join('');
+    }
+
+    // 手动查询逻辑 (保持不变)
+    function manualQuery() {
+        const symbol = document.getElementById('coin-select').value;
+        const priceInput = document.getElementById('price-input').value;
+        const contentDiv = document.getElementById('manual-content');
+
+        if (!priceInput) {
+            // 原生体验：让输入框微微闪烁或聚焦，而不是弹丑陋的alert
+            const inputElement = document.getElementById('price-input');
+            inputElement.focus();
+            inputElement.style.borderColor = 'var(--danger-color)';
+            setTimeout(() => inputElement.style.borderColor = '', 1000);
+            return;
+        }
+
+        const inputPrice = parseFloat(priceInput);
+        const closestData = findClosestData(symbol, inputPrice);
+
+        // 为了布局美观，手动查询的结果套一个单列的Grid容器
+        contentDiv.innerHTML = `
+            <div class="grid-container" style="grid-template-columns: 1fr; margin-bottom: 0;">
+                ${renderCard(symbol, inputPrice, closestData, false)}
+            </div>
+        `;
+    }
+
+    // 启动
+    window.onload = () => {
+        initSelect();
+        // 自动拉取在后台执行，不会卡主页面和JS主线程
+        autoLoad();
+    };
+</script>
+</body>
+</html>

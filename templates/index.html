@@ -70,7 +70,7 @@
             border-color: var(--primary-blue);
         }
 
-        /* 波动率按钮样式 */
+        /* 波动率/参数 按钮样式 */
         .volatility-btn {
             display: inline-flex;
             align-items: center;
@@ -85,6 +85,7 @@
             cursor: pointer;
             transition: var(--transition);
             text-decoration: none;
+            margin: 5px 10px; /* 增加边距适配多个按钮并排与换行 */
         }
 
         .volatility-btn:hover {
@@ -396,6 +397,9 @@
         <button onclick="window.open('https://bodong-cka.pages.dev/', '_blank')" class="volatility-btn" data-i18n="btn_volatility">
             🚀 波动率排行榜
         </button>
+        <button onclick="window.open('https://crypto-grid-eval.pages.dev/', '_blank')" class="volatility-btn" data-i18n="btn_best_params">
+            💡 最优参数查询
+        </button>
     </div>
 
     <div class="function-selector">
@@ -542,6 +546,7 @@ const i18n = {
     zh: {
         title: "网格策略参数与资金计算器",
         btn_volatility: "🚀 波动率排行榜",
+        btn_best_params: "💡 最优参数查询",
         select_op: "🏆 请选择你需要计算的类型：",
         op0_title: "1. 计算所需总资金",
         op0_desc: "输入所有参数，计算运行该策略一共需要占用多少资金。",
@@ -596,6 +601,7 @@ const i18n = {
     en: {
         title: "Grid Strategy Parameter & Margin Calculator",
         btn_volatility: "🚀 Volatility Leaderboard",
+        btn_best_params: "💡 Best Params Query",
         select_op: "🏆 Please select a calculation type:",
         op0_title: "1. Calc Total Margin",
         op0_desc: "Input all parameters to calculate the total margin required to run the strategy.",

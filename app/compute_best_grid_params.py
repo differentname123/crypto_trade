@@ -366,6 +366,7 @@ if __name__ == "__main__":
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
             if os.path.exists(output_csv_path):
                 print(f"结果文件已存在，跳过回测: {output_csv_path}")
+                initial_price = initial_price * 0.99
                 continue
             try:
 
