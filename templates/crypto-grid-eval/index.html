@@ -99,7 +99,7 @@
             align-items: center;
         }
 
-        /* 新增：卡片右上角暂时取消按钮 X */
+        /* 卡片右上角暂时取消按钮 X */
         .card-close-btn {
             position: absolute;
             top: 14px;
@@ -117,8 +117,7 @@
             transform: scale(1.15);
         }
 
-        /* ================= 新增：卡片内部重新排版样式 ================= */
-        /* 核心数据高亮区 */
+        /* 卡片内部重新排版样式 */
         .card-hero {
             display: flex;
             justify-content: space-between;
@@ -207,9 +206,7 @@
             font-weight: 700;
             color: var(--danger-color);
         }
-        /* ========================================================= */
 
-        /* 兼容保留原来的价高亮样式 (如果没有被替换的话) */
         .price-highlight {
             font-size: 24px;
             font-weight: 700;
@@ -232,7 +229,27 @@
             flex-wrap: wrap;
         }
 
-        select, input {
+        /* 输入框容器样式，用于显示固定标签 */
+        .input-wrapper {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            min-width: 150px;
+        }
+
+        .input-wrapper label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+            font-weight: 500;
+        }
+
+        .input-wrapper input {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        select, input[type="number"], input[type="text"] {
             flex: 1;
             min-width: 150px;
             padding: 14px 16px;
@@ -246,7 +263,7 @@
             font-family: inherit;
         }
 
-        select:focus, input:focus {
+        select:focus, input[type="number"]:focus, input[type="text"]:focus {
             background-color: #ffffff;
             border-color: var(--accent-color);
             box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.1);
@@ -274,6 +291,67 @@
             transform: scale(0.97);
         }
 
+        /* 滑动开关 Toggle 样式 */
+        .switch-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            padding: 10px 12px;
+            background: #fafafa;
+            border-radius: var(--border-radius-sm);
+            border: 1px solid rgba(0,0,0,0.05);
+        }
+
+        .switch-label {
+            font-size: 15px;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 48px;
+            height: 26px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #d1d1d6;
+            transition: .3s ease;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 22px;
+            width: 22px;
+            left: 2px;
+            bottom: 2px;
+            background-color: white;
+            transition: .3s ease;
+            border-radius: 50%;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        input:checked + .slider {
+            background-color: var(--success-color);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(22px);
+        }
+
         /* 状态提示 */
         .status-msg {
             text-align: center;
@@ -293,7 +371,7 @@
             to { opacity: 1; transform: translateY(0); }
         }
 
-        /* 卡片内部的自动输入框专用样式 (强制高优覆盖原有全局input样式) */
+        /* 卡片内部的自动输入框专用样式 */
         .card-price-input {
             flex: none !important;
             min-width: unset !important;
@@ -344,8 +422,9 @@
             .page-title { font-size: 24px; margin: 10px 0 30px; }
             .form-group { flex-direction: column; }
             button { width: 100%; }
-            select, input { width: 100%; box-sizing: border-box; }
+            select, input[type="number"], input[type="text"] { width: 100%; box-sizing: border-box; }
             .card { padding: 20px; }
+            .switch-container { justify-content: space-between; }
         }
     </style>
 </head>
@@ -371,12 +450,45 @@
     </div>
 
     <div class="control-panel" style="margin-bottom: 40px;">
-        <div class="form-group" style="margin-bottom: 15px;">
-            <input type="number" id="threshold-input" placeholder="日均盈利率过滤阈值 (默认: 0.5)" value="0.5" step="any">
-            <input type="number" id="min-trades-input" placeholder="最小日均交易次数 (默认: 0)" value="0" step="any">
-            <input type="number" id="offset-input" placeholder="价格偏移百分比 (默认: 5%)" value="5" step="any">
-            <input type="number" id="total-fund-input" placeholder="资金数量 (默认: 100)" value="100" step="any">
+        <div class="form-group" style="margin-bottom: 20px;">
+            <div class="input-wrapper">
+                <label>日均盈利率阈值 (%)</label>
+                <input type="number" id="threshold-input" value="0.5" step="any">
+            </div>
+            <div class="input-wrapper">
+                <label>最小日均交易次数</label>
+                <input type="number" id="min-trades-input" value="0" step="any">
+            </div>
+            <div class="input-wrapper">
+                <label>价格偏移百分比 (%)</label>
+                <input type="number" id="offset-input" value="5" step="any">
+            </div>
+            <div class="input-wrapper">
+                <label>距最低价涨幅最小值 (%)</label>
+                <input type="number" id="min-rise-input" value="15" step="any">
+            </div>
+            <div class="input-wrapper">
+                <label>资金数量 (总额)</label>
+                <input type="number" id="total-fund-input" value="100" step="any">
+            </div>
         </div>
+
+        <div class="switch-container" style="margin-bottom: 10px;">
+            <label class="switch">
+                <input type="checkbox" id="confidence-square-toggle" onchange="renderAutoResults()">
+                <span class="slider"></span>
+            </label>
+            <span class="switch-label">使用置信度的平方计算资金分配</span>
+        </div>
+
+        <div class="switch-container">
+            <label class="switch">
+                <input type="checkbox" id="profit-multiply-toggle" onchange="renderAutoResults()">
+                <span class="slider"></span>
+            </label>
+            <span class="switch-label">资金分配乘日均盈利率 (向高收益倾斜)</span>
+        </div>
+
         <div class="form-group">
             <button onclick="recalculateAuto()">使用输入参数重新计算并排序</button>
             <button onclick="autoLoad()" class="btn-success">拉取实时数据并计算</button>
@@ -385,7 +497,7 @@
 </div>
 
 <script>
-    // 1. 根据新层级深度修改的固定的数据字典
+    // 固定的数据字典
 const cryptoData =
 {
   'AAVEUSDT': {
@@ -23748,19 +23860,21 @@ const cryptoData =
     ]
   }
 }
-    ;
 
-    // 免费 CORS 代理池 (解决 IP 阻断与跨域限流)
+
+;
+
+    // 免费 CORS 代理池
     const PROXY_POOL = [
         "https://api.allorigins.win/raw?url=",
         "https://api.codetabs.com/v1/proxy?quest=",
         "https://corsproxy.io/?"
     ];
 
-    // 维持在页面中的自动市场状态全局数组，供动态更新计算
+    // 维持在页面中的自动市场状态全局数组
     let globalMarketData = [];
 
-    // 维护在自定义手动查询模式下的状态，供下拉切换刷新时使用
+    // 维护在自定义手动查询模式下的状态
     let currentManualState = null;
 
     // 获取界面输入参数辅助函数
@@ -23774,13 +23888,16 @@ const cryptoData =
         return val === '' ? 2 : parseFloat(val);
     }
 
-    // 获取最小日均交易次数输入框的数据
     function getMinTrades() {
         const val = document.getElementById('min-trades-input').value;
         return val === '' ? 0 : parseFloat(val);
     }
 
-    // 获取总资金输入框的数据
+    function getMinRise() {
+        const val = document.getElementById('min-rise-input').value;
+        return val === '' ? 15 : parseFloat(val);
+    }
+
     function getTotalFund() {
         const val = document.getElementById('total-fund-input').value;
         return val === '' ? 100 : parseFloat(val);
@@ -23791,36 +23908,27 @@ const cryptoData =
         const headers = { "Accept": "application/json" };
 
         try {
-            // 1. 优先尝试直连 (速度最快)
             let res = await fetch(targetUrl, { headers, signal });
 
-            // 2. 拦截被风控的状态码: 451(地域屏蔽), 403(WAF拦截), 429(限流), 418(IP拉黑)
             if (res.status === 451 || res.status === 403 || res.status === 429 || res.status === 418) {
-                // 增加时间戳防止公共代理节点缓存老旧的金融数据
                 const cacheBuster = targetUrl.includes('?') ? `&_t=${Date.now() + Math.random()}` : `?_t=${Date.now() + Math.random()}`;
                 const finalUrl = targetUrl + cacheBuster;
-
-                // 乱序代理池，避免请求尖峰始终打在同一个免费节点上
                 const shuffledProxies = [...PROXY_POOL].sort(() => 0.5 - Math.random());
 
                 for (let proxyBase of shuffledProxies) {
                     try {
                         let proxyRes = await fetch(proxyBase + encodeURIComponent(finalUrl), { headers, signal });
-
-                        // 校验代理返回的是否真为 JSON 数据，防止代理自身报错吐出 HTML 页面
                         const contentType = proxyRes.headers.get("content-type");
                         if (proxyRes.ok && contentType && contentType.includes("application/json")) {
                             return proxyRes;
                         }
                     } catch(e) {
-                        // 当前代理失效，静默跳过，尝试下一个代理
                         continue;
                     }
                 }
                 throw new Error(`直连受限(状态码:${res.status})，且所有代理节点尝试失败`);
             }
 
-            // 3. 校验直连是否异常返回了非 JSON 格式 (例如机场IP遇到 Cloudflare 盾)
             const contentType = res.headers.get("content-type");
             if (res.ok && contentType && !contentType.includes("application/json")) {
                 throw new Error("直连返回了非 JSON 格式数据");
@@ -23828,7 +23936,6 @@ const cryptoData =
 
             return res;
         } catch (error) {
-            // 将包含超时 (AbortError) 在内的网络底层异常抛出给外层
             throw error;
         }
     }
@@ -23844,16 +23951,22 @@ const cryptoData =
         }
     }
 
-    // 【修改核心逻辑】：下沉过滤逻辑，先过滤同价格档位下所有的策略
-    function findClosestData(symbol, targetPrice, offset = 5, threshold = -Infinity, minTrades = -Infinity) {
+    function findClosestData(symbol, targetPrice, offset = 5, threshold = -Infinity, minTrades = -Infinity, minRise = 15) {
         const priceGroups = cryptoData[symbol];
         if (!priceGroups || Object.keys(priceGroups).length === 0) return null;
 
-        // 基于价格偏移百分比计算新的目标匹配价格
-        const adjustedTargetPrice = targetPrice * (1 + offset / 100);
         const availablePrices = Object.keys(priceGroups).map(Number);
 
-        // 寻找最接近的价格点
+        let lowestPrice = 0;
+        if (availablePrices.length > 0 && priceGroups[availablePrices[0]].length > 0) {
+            lowestPrice = priceGroups[availablePrices[0]][0]['最低价格'] || 0;
+        }
+
+        const targetPriceOffset = targetPrice / (1 - offset / 100);
+        const targetPriceMinRise = lowestPrice / (1 - minRise / 100);
+
+        const adjustedTargetPrice = Math.max(targetPriceOffset, targetPriceMinRise);
+
         const closestPrice = availablePrices.reduce((prev, curr) => {
             return (Math.abs(curr - adjustedTargetPrice) < Math.abs(prev - adjustedTargetPrice) ? curr : prev);
         });
@@ -23861,17 +23974,14 @@ const cryptoData =
         const allStrategies = priceGroups[closestPrice];
         if (!allStrategies || allStrategies.length === 0) return null;
 
-        // 【重构重点】先提取当前价格点下的所有策略，经过双重阈值彻底清洗
         const validStrategies = allStrategies.filter(strat => {
             const profit = strat['平均每天赚钱速度(单位 %)'] || 0;
             const trades = strat['平均每天交易次数'] || 0;
             return profit >= threshold && trades >= minTrades;
         });
 
-        // 严格遵循：“真的没有数据了才不显示”。如果所有备选策略全军覆没，才返回 null 代表该币无可用策略
         if (validStrategies.length === 0) return null;
 
-        // 在幸存的策略中，默认寻找 "平均每天赚钱速度" 最大的作为卡片首选项展示
         let maxProfitIndex = 0;
         let maxProfit = -Infinity;
         validStrategies.forEach((strat, index) => {
@@ -23882,7 +23992,6 @@ const cryptoData =
             }
         });
 
-        // 返回包含清洗干净策略列表的新结构
         return {
             price: closestPrice,
             strategies: validStrategies,
@@ -23890,48 +23999,33 @@ const cryptoData =
         };
     }
 
-    // 从币安公开API获取最新价格 (彻底解决跨域拦截导致的降级失效)
     async function fetchCurrentPrice(symbol) {
         const controller = new AbortController();
-        // 超时稍微延长至 8 秒，因为如果触发代理池遍历需要更多回源时间
         const timeoutId = setTimeout(() => controller.abort(), 8000);
 
         try {
             let response;
-
             try {
-                // 1. 优先尝试币安 现货(Spot) API
                 response = await smartFetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`, controller.signal);
-
-                // 如果后端明确返回了非 200 错误，主动抛出异常以触发下面的 catch 降级
                 if (!response.ok) {
                     throw new Error('现货接口返回非200状态码');
                 }
             } catch (spotError) {
-                // 2. 核心修复：无论是 400 错误引发的 CORS 跨域报错，还是真断网了，都会被这里的 catch 拦截
                 console.warn(`${symbol} 现货接口未找到或被跨域拦截，正在尝试请求 U本位合约接口...`);
-
-                // 3. 强制回退到 币安 U本位合约(Futures) API
                 response = await smartFetch(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`, controller.signal);
-
-                // 如果合约也没有这个币，抛出最终异常
                 if (!response.ok) {
                     throw new Error('现货和合约API均未找到该交易对');
                 }
             }
-
             clearTimeout(timeoutId);
             const data = await response.json();
             return parseFloat(data.price);
-
         } catch (error) {
             clearTimeout(timeoutId);
-            console.warn(`获取 ${symbol} 价格失败, 但不影响本地查询功能:`, error.message || error);
-            return null; // 静默失败，返回null
+            return null;
         }
     }
 
-    // 手动暂时取消这个币的排序和资金计算
     function excludeCoin(symbol) {
         const item = globalMarketData.find(d => d.symbol === symbol);
         if (item) {
@@ -23940,21 +24034,16 @@ const cryptoData =
         }
     }
 
-    // 核心新增功能：切换策略列表的下拉框动作监听器
     function changeStrategyIndex(symbol, newIndex, isAuto) {
         if (isAuto) {
-            // 如果是在实时市场中切换
             const item = globalMarketData.find(d => d.symbol === symbol);
             if (item && item.closestData) {
                 item.closestData.selectedIndex = parseInt(newIndex);
-                // 触发重新排序过滤以及资金重算
                 renderAutoResults();
             }
         } else {
-            // 如果是在自定义推演单卡片中切换
             if (currentManualState && currentManualState.symbol === symbol) {
                 currentManualState.closestData.selectedIndex = parseInt(newIndex);
-                // 局部刷新单张卡片
                 const contentDiv = document.getElementById('manual-content');
                 contentDiv.innerHTML = `
                     <div class="grid-container" style="grid-template-columns: 1fr; margin-bottom: 0;">
@@ -23965,13 +24054,10 @@ const cryptoData =
         }
     }
 
-    // ================= 修改点：完全重写卡片渲染逻辑，强化信息优先级 =================
     function renderCard(symbol, currentPrice, matchedData, isAuto = true, isSuccess = true, fundRatio = null) {
-        // 如果价格为空（拉取失败且尚未填写），则替换为安全空白符
         const safePrice = (currentPrice !== null && currentPrice !== undefined) ? currentPrice : '';
         const displayPriceStr = safePrice ? `$${safePrice.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 4})}` : '-';
 
-        // 如果是实时市场(isAuto)，允许用户直接在卡片输入；反之则锁定显示普通文字
         const priceDisplay = isAuto
             ? `<div style="display: flex; align-items: center; justify-content: flex-end;">
                  <span style="font-size: 20px; font-weight: 700; color: var(--accent-color); margin-right: 4px;">$</span>
@@ -23979,10 +24065,8 @@ const cryptoData =
                </div>`
             : `<div class="price-highlight">${displayPriceStr}</div>`;
 
-        // 如果拉取失败，在标题旁边友好地挂载一个红色的状态徽章
         const errorBadge = (isAuto && !isSuccess) ? `<span style="font-size:12px; color:var(--danger-color); margin-left:8px; font-weight:normal;">(获取超时)</span>` : '';
 
-        // 数据解析层级更新：从 selectedIndex 取出当前策略
         let currentStrat = null;
         let matchedPrice = '-';
         let dropdownHtml = '';
@@ -23993,7 +24077,6 @@ const cryptoData =
             if (matchedData.strategies && matchedData.strategies.length > 0) {
                 currentStrat = matchedData.strategies[matchedData.selectedIndex];
 
-                // 生成策略切换下拉框 (注意：此时传入此处的strategies已经是绝对满足双重条件的干净列表了)
                 if (matchedData.strategies.length > 1) {
                     dropdownHtml = `
                     <div class="strategy-selector" style="margin-bottom: 16px;">
@@ -24017,7 +24100,6 @@ const cryptoData =
         const gridGap = currentStrat ? currentStrat['网格间距(单位 %)'] : '-';
         const confidence = currentStrat && currentStrat['置信度'] !== undefined ? currentStrat['置信度'] : '-';
 
-        // 增加 最匹配策略价 和 实时价格的偏差百分比
         let diffDisplay = '-';
         if (matchedData && currentPrice !== null && currentPrice !== undefined && matchedData.price > 0) {
             const diffPercent = ((matchedData.price - currentPrice) / matchedData.price * 100).toFixed(2);
@@ -24026,20 +24108,16 @@ const cryptoData =
             diffDisplay = `<span style="color: ${diffColor}; font-weight:600;">${diffSign}${diffPercent}%</span>`;
         }
 
-        // 计算距离今年最低价格的跌幅 %
         let dropToLowest = '-';
         if (currentStrat && currentStrat['最低价格'] !== undefined && matchedData.price > 0) {
             dropToLowest = (((matchedData.price - currentStrat['最低价格']) / matchedData.price) * 100).toFixed(2);
         }
 
-        // 跌幅显示格式化
         const dropDisplay = dropToLowest !== '-' ? `${dropToLowest}%` : '-';
         const fundRatioDisplay = fundRatio !== null ? fundRatio : '-';
 
-        // 每个卡片增加 X 关闭按钮按钮 (仅限实时分析列表展示)
         const closeBtnHtml = isAuto ? `<div class="card-close-btn" onclick="excludeCoin('${symbol}')" title="暂时取消此币排序与分配">×</div>` : '';
 
-        // 返回重新排版后的 HTML 结构
         return `
             <div class="card">
                 ${closeBtnHtml}
@@ -24091,22 +24169,19 @@ const cryptoData =
             </div>
         `;
     }
-    // ==============================================================================
 
-    // 页面加载或拉取实时数据的逻辑
     async function autoLoad() {
         const autoResultsDiv = document.getElementById('auto-results');
         autoResultsDiv.innerHTML = '<div class="status-msg">正在与实时市场数据同步...</div>';
 
-        // 同步获取全量拦截参数
         const offset = getOffset();
         const threshold = getThreshold();
         const minTrades = getMinTrades();
+        const minRise = getMinRise();
 
         const fetchPromises = Object.keys(cryptoData).map(async (symbol) => {
             const currentPrice = await fetchCurrentPrice(symbol);
-            // 将双重拦截阈值深入传到底层引擎去清洗策略池
-            const closestData = currentPrice !== null ? findClosestData(symbol, currentPrice, offset, threshold, minTrades) : null;
+            const closestData = currentPrice !== null ? findClosestData(symbol, currentPrice, offset, threshold, minTrades, minRise) : null;
             return {
                 symbol: symbol,
                 currentPrice: currentPrice,
@@ -24116,43 +24191,46 @@ const cryptoData =
             };
         });
 
-        // 保存状态至全局用于重绘
         globalMarketData = await Promise.all(fetchPromises);
         renderAutoResults();
     }
 
-    // 【修改过滤逻辑】 因为底层已经做完了数据清洗，渲染层只需要根据有无残留数据做减法即可
+    // 【核心修改点：加入复合权重分配模型】
     function renderAutoResults() {
         const autoResultsDiv = document.getElementById('auto-results');
         const totalFund = getTotalFund();
 
+        // 获取两个开关的状态
+        const useConfidenceSquare = document.getElementById('confidence-square-toggle').checked;
+        const useProfitMultiply = document.getElementById('profit-multiply-toggle').checked;
+
         let filteredData = globalMarketData.filter(item => {
-            // 被手动叉掉的强制不可见
             if (item.excluded) return false;
-
-            // 获取价格异常的，保留空壳卡片以便用户手动补全价格推演
             if (!item.success) return true;
-
-            // 深度清洗后如果 closestData 为空（该价位下的所有备选策略都覆灭了），严格触发“不显示”逻辑
             if (item.closestData === null || item.closestData.strategies.length === 0) {
                 return false;
             }
-
             return true;
         });
 
-        // 2. 计算过滤后所有的置信度总和，用于算资金占比
-        let totalConfidence = 0;
+        // 1. 根据开关组合状态，累加全网总权重（分母）
+        let totalConfidenceWeight = 0;
         filteredData.forEach(item => {
             if (item.closestData && item.closestData.strategies.length > 0) {
                 const currentStrat = item.closestData.strategies[item.closestData.selectedIndex];
                 if (currentStrat['置信度']) {
-                    totalConfidence += parseFloat(currentStrat['置信度']);
+                    const conf = parseFloat(currentStrat['置信度']);
+                    const profit = Math.max(0, parseFloat(currentStrat['平均每天赚钱速度(单位 %)']) || 0);
+
+                    let weight = useConfidenceSquare ? Math.pow(conf, 2) : conf;
+                    if (useProfitMultiply) {
+                        weight *= profit; // 如果开启，则叠加盈利率的权重放大效应
+                    }
+                    totalConfidenceWeight += weight;
                 }
             }
         });
 
-        // 3. 排序：按照 盈利率从高到底排序。如果都没有数据，保留原位。没有数据的项永远垫底。
         filteredData.sort((a, b) => {
             const hasA = a.closestData && a.closestData.strategies.length > 0;
             const hasB = b.closestData && b.closestData.strategies.length > 0;
@@ -24163,17 +24241,24 @@ const cryptoData =
 
             const profitA = a.closestData.strategies[a.closestData.selectedIndex]['平均每天赚钱速度(单位 %)'];
             const profitB = b.closestData.strategies[b.closestData.selectedIndex]['平均每天赚钱速度(单位 %)'];
-            return profitB - profitA; // 降序
+            return profitB - profitA;
         });
 
-        // 4. 计算占比并渲染
+        // 2. 根据复合总权重，计算每张卡片的资金分配额度
         const cardsHtmlArray = filteredData.map(item => {
             let fundRatio = '-';
-            if (item.closestData && item.closestData.strategies.length > 0 && totalConfidence > 0) {
+            if (item.closestData && item.closestData.strategies.length > 0 && totalConfidenceWeight > 0) {
                 const currentStrat = item.closestData.strategies[item.closestData.selectedIndex];
                 if (currentStrat['置信度']) {
                     const conf = parseFloat(currentStrat['置信度']);
-                    fundRatio = ((conf / totalConfidence) * totalFund).toFixed(2);
+                    const profit = Math.max(0, parseFloat(currentStrat['平均每天赚钱速度(单位 %)']) || 0);
+
+                    let finalWeight = useConfidenceSquare ? Math.pow(conf, 2) : conf;
+                    if (useProfitMultiply) {
+                        finalWeight *= profit;
+                    }
+
+                    fundRatio = ((finalWeight / totalConfidenceWeight) * totalFund).toFixed(2);
                 }
             }
             return renderCard(item.symbol, item.currentPrice, item.closestData, true, item.success, fundRatio);
@@ -24186,9 +24271,7 @@ const cryptoData =
         }
     }
 
-    // 【修改重算逻辑】保证被隐藏掉的卡片可以在条件放宽后“复活”
     function recalculateAuto() {
-        // 第一步：先收集此时还在页面上的卡片，同步用户手填覆盖过的币种价格
         const inputs = document.querySelectorAll('.card-price-input');
         inputs.forEach(input => {
             const symbol = input.getAttribute('data-symbol');
@@ -24200,32 +24283,28 @@ const cryptoData =
                     item.currentPrice = newPrice;
                     item.success = true;
                 } else {
-                    // 清空输入代表舍弃本地价格
                     item.currentPrice = null;
                     item.success = false;
                 }
             }
         });
 
-        // 第二步：获取最新的全部门槛条件
         const offset = getOffset();
         const threshold = getThreshold();
         const minTrades = getMinTrades();
+        const minRise = getMinRise();
 
-        // 第三步：对【全部缓存数据】重新执行清洗引擎，保证曾经因为门槛过高隐藏掉的币也能复活
         globalMarketData.forEach(item => {
             if (item.currentPrice !== null) {
-                item.closestData = findClosestData(item.symbol, item.currentPrice, offset, threshold, minTrades);
+                item.closestData = findClosestData(item.symbol, item.currentPrice, offset, threshold, minTrades, minRise);
             } else {
                 item.closestData = null;
             }
         });
 
-        // 计算完毕后触发渲染重新刷出来
         renderAutoResults();
     }
 
-    // 手动查询逻辑
     function manualQuery() {
         const symbol = document.getElementById('coin-select').value;
         const priceInput = document.getElementById('price-input').value;
@@ -24234,10 +24313,10 @@ const cryptoData =
         const offset = getOffset();
         const threshold = getThreshold();
         const minTrades = getMinTrades();
+        const minRise = getMinRise();
         const totalFund = getTotalFund();
 
         if (!priceInput) {
-            // 原生体验：让输入框微微闪烁或聚焦，而不是弹丑陋的alert
             const inputElement = document.getElementById('price-input');
             inputElement.focus();
             inputElement.style.borderColor = 'var(--danger-color)';
@@ -24247,10 +24326,8 @@ const cryptoData =
 
         const inputPrice = parseFloat(priceInput);
 
-        // 带着全量清洗条件单点抓取匹配
-        const closestData = findClosestData(symbol, inputPrice, offset, threshold, minTrades);
+        const closestData = findClosestData(symbol, inputPrice, offset, threshold, minTrades, minRise);
 
-        // 保存当前状态供下单切换选择重置使用
         currentManualState = { symbol, inputPrice, closestData, totalFund };
 
         contentDiv.innerHTML = `
@@ -24260,10 +24337,8 @@ const cryptoData =
         `;
     }
 
-    // 启动
     window.onload = () => {
         initSelect();
-        // 自动拉取在后台执行，不会卡主页面和JS主线程
         autoLoad();
     };
 </script>
