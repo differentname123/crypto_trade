@@ -16,8 +16,10 @@ from multiprocessing import Pool
 import numpy as np
 import pandas as pd
 
+from common.caculate_margin import calculate_multi_group_margin
 
-def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
+
+def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500, min_price=100):
     """
     简易网格交易回测函数
     参数:
@@ -51,6 +53,8 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     max_capital_needed = 0.0  # 历史记录中【所需的最大初始资金】(即最小不爆仓保证金)
     raw_equity_curve = []  # 记录纯净的资金变化曲线(不含初始资金)
     total_trades = 0  # 新增：记录总的开平仓总次数
+
+    first_open_time = None  # 新增：记录第一次开仓的时间
 
     # 新增：记录发生 max_capital_needed 时的“案发现场”信息
     worst_case_info = {
@@ -108,8 +112,14 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     else:
         time_seq = df.index
 
-    # 遍历每一分钟 (优化点: 放弃 iterrows，使用 zip 原生迭代加速几十倍，并引入真实时间标识)
-    for current_time, open_p, high_p, low_p, close_p in zip(time_seq, df['open'], df['high'], df['low'], df['close']):
+    # 新增：为了高效按天统计平仓次数，通过向量化直接生成纯日期序列，用于字典初始化与迭代
+    time_series_for_dates = pd.Series(time_seq) if not isinstance(time_seq, pd.Series) else time_seq
+    date_seq = pd.to_datetime(time_series_for_dates).dt.date
+    daily_close_counts = {d: 0 for d in date_seq.unique()}
+
+    # 遍历每一分钟 (优化点: 放弃 iterrows，使用 zip 原生迭代加速几十倍，并引入真实时间标识和日期标识)
+    for current_time, current_date, open_p, high_p, low_p, close_p in zip(time_seq, date_seq, df['open'], df['high'],
+                                                                          df['low'], df['close']):
 
         # 根据K线阴阳，模拟分钟内部的价格轨迹，使回测更加贴近真实
         if close_p > open_p:
@@ -142,6 +152,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
                             total_trades += 1
+                            daily_close_counts[current_date] += 1  # 新增：按天记录平仓次数
 
                             # 新增：计算配对利润（扣除开平双边手续费）
                             open_fee = entry_p * lot_size * fee_rate
@@ -150,6 +161,8 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             update_margin(pk, current_time)
                     else:  # direction == "short"
                         if k not in positions:  # 价格上涨，触发卖出开空
+                            if first_open_time is None:  # 新增：记录第一次开仓时间
+                                first_open_time = current_time
                             positions[k] = pk
                             # === 同步维护 O(1) 状态 ===
                             current_pos_count += 1
@@ -170,6 +183,8 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                     if direction == "long":
                         # 修改：使用 k <= 0 确保新开仓的价格严格小于等于 p0(最高价限制)
                         if k not in positions and k <= 0:
+                            if first_open_time is None:  # 新增：记录第一次开仓时间
+                                first_open_time = current_time
                             positions[k] = pk
                             # === 同步维护 O(1) 状态 ===
                             current_pos_count += 1
@@ -194,6 +209,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             fee = pk * lot_size * fee_rate
                             realized_pnl += (gross_profit - fee)
                             total_trades += 1
+                            daily_close_counts[current_date] += 1  # 新增：按天记录平仓次数
 
                             # 新增：计算配对利润（扣除开平双边手续费）
                             open_fee = entry_p * lot_size * fee_rate
@@ -248,10 +264,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         final_floating_pnl = (sum_entry_prices - last_close * current_pos_count) * lot_size
     # ================== 修改部分结束 ==================
 
-    # 新增：计算每小时平均交易次数 (基于每行数据代表 1 分钟的前提)
-    total_minutes = len(df)
-    total_hours = total_minutes / 60.0 if total_minutes > 0 else 1.0
-    trades_per_hour = total_trades / total_hours if total_hours > 0 else 0.0
+    # 新增：计算每天平均平仓次数和每天平仓次数中位数
+    total_days = len(daily_close_counts)
+    total_closes = sum(daily_close_counts.values())
+    avg_closes_per_day = total_closes / total_days if total_days > 0 else 0.0
+    median_closes_per_day = float(np.median(list(daily_close_counts.values()))) if total_days > 0 else 0.0
 
     # 新增：开始价格到最终价格的涨跌幅
     price_change_rate = (last_close - p0) / p0 if p0 > 0 else 0.0
@@ -261,6 +278,16 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     if direction == "long":
         valid_bar_count = int((df['close'] < initial_price).sum())
 
+    base_params = {'add_step_percent': 0.15, 'fixed_qty': 0.1, 'initial_price': 2230, 'leverage': 100.0,
+                   'max_grids_per_group': 1000000, 'target_loss_percent': 15}
+    base_params['initial_price'] = initial_price
+    base_params['add_step_percent'] = grid_ratio * 100
+    base_params['target_loss_percent'] = 100 - worst_case_info["worst_price"] / initial_price * 100
+    baseline_result = calculate_multi_group_margin(**base_params)
+    total_margin = baseline_result['total_margin']
+
+
+
     return {
         "direction": direction,
         "grid_ratio": grid_ratio,
@@ -269,13 +296,18 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "total_profit": total_profit,  # 纯收益 (已扣除手续费)
         "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
         "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
+        "total_margin": total_margin,
+        "target_loss_percent":base_params['target_loss_percent'],
         "profit_to_margin_ratio": profit_rate,  # 收益 / 保证金 (核心参考价值)
         "max_drawdown": max_dd,  # 最大回撤率
         "total_trades": total_trades,  # 交易总次数(开平仓均计算在内)
-        "trades_per_hour": trades_per_hour,  # 每小时平均交易次数
+        "avg_closes_per_day": avg_closes_per_day,  # 新增：每天平均平仓次数
+        "median_closes_per_day": median_closes_per_day,  # 新增：每天平仓次数中位数
+        "first_open_time": first_open_time,  # 新增：第一次开仓的时间
         "final_position_count": final_position_count,  # 新增：最后一刻的持仓单数
         "final_floating_pnl": final_floating_pnl,  # 新增：最后一刻的持仓浮动盈亏
         "time": worst_case_info["time"],  # 修改：极值发生时间(获取自真实的 time/timestamp 列或行号)
+        "min_price": min_price,
         "worst_price": worst_case_info["worst_price"],  # 极值发生时的价格
         "worst_position_count": worst_case_info["worst_position_count"],  # 极值发生时的持仓单数
         "worst_price_change_rate": worst_case_info["worst_price_change_rate"],  # 极值发生时相对于初始价格的涨跌幅
@@ -290,10 +322,13 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 # 用于多进程参数解包（Python 多进程要求传入的函数在顶层作用域）
 def _run_single_backtest(kwargs):
     return backtest_grid(**kwargs)
+
+
 # ====================================================
 
 
-def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500):
+def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short",
+                               initial_price=2500, min_price=100):
     """
     批量回测不同网格间距(0.001 到 0.1，步长 0.001)并保存为 CSV
     修改为 20 并发的多进程运行。
@@ -318,7 +353,8 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
             'fee_rate': fee_rate,
             'lot_size': lot_size,
             'direction': direction,
-            'initial_price': initial_price
+            'initial_price': initial_price,
+            'min_price':min_price
         })
 
     # --- 启动 20 进程的进程池 ---
@@ -393,6 +429,7 @@ if __name__ == "__main__":
         }
     ]
 
+
     for param in param_list:
         csv_file_path = param["csv_file_path"]
 
@@ -408,7 +445,7 @@ if __name__ == "__main__":
                 temp_df['time'] = pd.to_datetime(temp_df['time'])
 
             # 筛选2026年后(含2026-01-01)的数据
-            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2026-01-01')]
+            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2025-01-01')]
             if df_2026.empty:
                 df_2026 = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
 
@@ -429,6 +466,7 @@ if __name__ == "__main__":
         # ---------------- 新增：根据CSV自动计算价格参数结束 ----------------
         print(f"根据CSV数据计算得到的初始价格: {base_initial_price}, 最小价格: {min_price} {csv_file_path}")
         initial_price = base_initial_price
+
 
         # 只要当前价格大于等于下限价格，就继续循环
         while initial_price >= min_price:
@@ -452,7 +490,7 @@ if __name__ == "__main__":
                 # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
                 print("\n启动批量参数回测...")
                 batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0000, lot_size=0.1,
-                                           direction="long", initial_price=initial_price)
+                                           direction="long", initial_price=initial_price, min_price=min_price)
 
             except FileNotFoundError:
                 traceback.print_exc()
