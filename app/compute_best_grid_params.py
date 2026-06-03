@@ -19,7 +19,8 @@ import pandas as pd
 from common.caculate_margin import calculate_multi_group_margin
 
 
-def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500, min_price=100):
+def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500,
+                  min_price=100):
     """
     简易网格交易回测函数
     参数:
@@ -154,7 +155,7 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
                             total_trades += 1
                             daily_close_counts[current_date] += 1  # 新增：按天记录平仓次数
 
-                            # 新增：计算配对利润（扣除开平双边手续费）
+                            # 新增：计算配钉利润（扣除开平双边手续费）
                             open_fee = entry_p * lot_size * fee_rate
                             paired_profit += (gross_profit - fee - open_fee)
 
@@ -264,11 +265,35 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         final_floating_pnl = (sum_entry_prices - last_close * current_pos_count) * lot_size
     # ================== 修改部分结束 ==================
 
-    # 新增：计算每天平均平仓次数和每天平仓次数中位数
-    total_days = len(daily_close_counts)
-    total_closes = sum(daily_close_counts.values())
-    avg_closes_per_day = total_closes / total_days if total_days > 0 else 0.0
-    median_closes_per_day = float(np.median(list(daily_close_counts.values()))) if total_days > 0 else 0.0
+    # ---------------- 🚀 本次精准修复部分开始 ----------------
+    # 重新计算有效时间内的每天平均平仓次数和中位数（只统计价格小于 initial_price 的日子）
+    valid_dates_mask = df['close'] < initial_price
+    # 提取所有有效的独立日期集合（使用 set 加速查询）
+    valid_dates = set(date_seq[valid_dates_mask].unique())
+
+    # 过滤掉那些由于价格高于 initial_price 导致无效/不工作的日子
+    valid_daily_close_counts = [count for date, count in daily_close_counts.items() if date in valid_dates]
+
+    total_valid_days = len(valid_daily_close_counts)
+    total_closes = sum(valid_daily_close_counts)
+
+    avg_closes_per_day = total_closes / total_valid_days if total_valid_days > 0 else 0.0
+
+    # ---------------- 🚀 升级：计算更精确的“中位水平”(截尾平均数) ----------------
+    if total_valid_days > 0:
+        # 去掉排名前 20% 的极端刷单日，和排名垫底 20% 的死水日 (比例可自己调)
+        lower_bound = np.percentile(valid_daily_close_counts, 20)
+        upper_bound = np.percentile(valid_daily_close_counts, 80)
+
+        # 提取出最能代表日常策略表现的“中间 60% 核心数据”
+        core_data = [x for x in valid_daily_close_counts if lower_bound <= x <= upper_bound]
+
+        # 对核心数据求平均，得到一个兼具中位数稳定性和平均数精度(带小数)的指标
+        median_closes_per_day = float(np.mean(core_data)) if core_data else 0.0
+    else:
+        median_closes_per_day = 0.0
+    # --------------------------------------------------------------------------
+    # ---------------- 🚀 本次精准修复部分结束 ----------------
 
     # 新增：开始价格到最终价格的涨跌幅
     price_change_rate = (last_close - p0) / p0 if p0 > 0 else 0.0
@@ -286,8 +311,6 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     baseline_result = calculate_multi_group_margin(**base_params)
     total_margin = baseline_result['total_margin']
 
-
-
     return {
         "direction": direction,
         "grid_ratio": grid_ratio,
@@ -297,12 +320,12 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
         "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
         "total_margin": total_margin,
-        "target_loss_percent":base_params['target_loss_percent'],
+        "target_loss_percent": base_params['target_loss_percent'],
         "profit_to_margin_ratio": profit_rate,  # 收益 / 保证金 (核心参考价值)
         "max_drawdown": max_dd,  # 最大回撤率
         "total_trades": total_trades,  # 交易总次数(开平仓均计算在内)
-        "avg_closes_per_day": avg_closes_per_day,  # 新增：每天平均平仓次数
-        "median_closes_per_day": median_closes_per_day,  # 新增：每天平仓次数中位数
+        "avg_closes_per_day": avg_closes_per_day,  # 修改：有效运行期每天平均平仓次数
+        "median_closes_per_day": median_closes_per_day,  # 修改：有效运行期每天平仓次数中位数
         "first_open_time": first_open_time,  # 新增：第一次开仓的时间
         "final_position_count": final_position_count,  # 新增：最后一刻的持仓单数
         "final_floating_pnl": final_floating_pnl,  # 新增：最后一刻的持仓浮动盈亏
@@ -354,7 +377,7 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
             'lot_size': lot_size,
             'direction': direction,
             'initial_price': initial_price,
-            'min_price':min_price
+            'min_price': min_price
         })
 
     # --- 启动 20 进程的进程池 ---
@@ -429,7 +452,6 @@ if __name__ == "__main__":
         }
     ]
 
-
     for param in param_list:
         csv_file_path = param["csv_file_path"]
 
@@ -467,10 +489,12 @@ if __name__ == "__main__":
         print(f"根据CSV数据计算得到的初始价格: {base_initial_price}, 最小价格: {min_price} {csv_file_path}")
         initial_price = base_initial_price
 
-
         # 只要当前价格大于等于下限价格，就继续循环
         while initial_price >= min_price:
             print(f"\n=== 回测初始价格: {initial_price} ===")
+            # if initial_price > 87015:
+            #     initial_price = initial_price * 0.99
+            #     continue
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
             if os.path.exists(output_csv_path):
