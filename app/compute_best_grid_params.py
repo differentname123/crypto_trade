@@ -423,6 +423,18 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     baseline_result = calculate_multi_group_margin(**base_params)
     max_total_margin = baseline_result['total_margin']
 
+
+
+    base_params = {'add_step_percent': 0.15, 'fixed_qty': 0.1, 'initial_price': 2230, 'leverage': 100.0,
+                   'max_grids_per_group': 1000000, 'target_loss_percent': 15}
+    base_params['initial_price'] = initial_price
+    base_params['add_step_percent'] = grid_ratio * 100
+    abs_low_price = highest_seen * 0.23
+    abs_low_dd = 100 - abs_low_price / base_params['initial_price'] * 100
+    base_params['target_loss_percent'] = abs_low_dd
+    baseline_result = calculate_multi_group_margin(**base_params)
+    abs_low_dd_margin = baseline_result['total_margin']
+
     return {
         "direction": direction,
         "grid_ratio": grid_ratio,
@@ -447,6 +459,14 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "first_open_time": first_open_time,  # 新增：第一次开仓的时间
         "final_position_count": final_position_count,  # 新增：最后一刻的持仓单数
         "final_floating_pnl": final_floating_pnl,  # 新增：最后一刻的持仓浮动盈亏
+
+        # --- 🚀 新增/修改：极限情况时间与价格基准追踪 ---
+        "highest_seen": highest_seen,  # 基准价格发生的起始时间
+        "abs_low_price": abs_low_price,  # 基准具体价格(min/max约束后)
+        "abs_low_dd": abs_low_dd,  # 极值(最低/高点)发生时间
+        "abs_low_dd_margin": abs_low_dd_margin,  # 极值发生时的价格
+        # -----------------------------------------------
+
 
         # --- 🚀 新增/修改：极限情况时间与价格基准追踪 ---
         "base_time": worst_case_info["base_time"],  # 基准价格发生的起始时间
