@@ -18,6 +18,65 @@ import pandas as pd
 
 from common.caculate_margin import calculate_multi_group_margin
 
+# ================== 🚀 新增：数据预处理函数 ==================
+def preprocess_max_drawdown_period(df, direction="long"):
+    """
+    预处理函数：分析并找出全局最大回撤的起始和结束时间，只截取该区间用于回测
+    """
+    if df is None or df.empty:
+        return df
+
+    prices = df['close'].values
+    if len(prices) < 2:
+        return df
+
+    if direction == "long":
+        # 针对做多：寻找价格最大回撤 (从历史高点跌到最低点)
+        peaks = np.maximum.accumulate(prices)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdowns = np.where(peaks > 0, (peaks - prices) / peaks, 0.0)
+        end_idx = int(np.argmax(drawdowns))
+        if end_idx == 0 or drawdowns[end_idx] == 0:
+            return df
+        start_idx = int(np.argmax(prices[:end_idx + 1]))
+    else:
+        # 针对做空：寻找反向最大回撤 (从历史低点涨到最高点)
+        troughs = np.minimum.accumulate(prices)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            drawdowns = np.where(troughs > 0, (prices - troughs) / troughs, 0.0)
+        end_idx = int(np.argmax(drawdowns))
+        if end_idx == 0 or drawdowns[end_idx] == 0:
+            return df
+        start_idx = int(np.argmin(prices[:end_idx + 1]))
+
+    # 获取时间以便于控制台输出提示
+    start_time = df['time'].iloc[start_idx] if 'time' in df.columns else start_idx
+    end_time = df['time'].iloc[end_idx] if 'time' in df.columns else end_idx
+    # 🚀 新增：计算起始和结束的时间差（天数）
+    try:
+        start_dt = pd.to_datetime(start_time)
+        end_dt = pd.to_datetime(end_time)
+        # 计算精确天数差（总秒数除以一天的秒数，保留两位小数）
+        duration_days = (end_dt - start_dt).total_seconds() / (24 * 3600)
+        duration_str = f"{duration_days:.2f} 天"
+    except Exception:
+        # 兜底：如果 start_time 只是整数索引（无时间列），则显示未知
+        duration_str = "未知 (无时间戳)"
+
+    # 🚀 优化后的控制台输出
+    print(f"--> [预处理拦截] 截取最大回撤区间 (方向: {direction})")
+    print(f"--> [预处理拦截] 起始时间: {start_time} (价格: {prices[start_idx]:.4f})")
+    print(f"--> [预处理拦截] 截止时间: {end_time} (价格: {prices[end_idx]:.4f})")
+    print(f"--> [预处理拦截] 持续时间: {duration_str}")
+    print(f"--> [预处理拦截] 区间回撤幅度: {drawdowns[end_idx] * 100:.2f}% | 截取 K 线数量: {end_idx - start_idx + 1}")
+
+    # 仅截取该回撤区间的数据片段，并重置索引防止后续报错
+    sliced_df = df.iloc[start_idx:end_idx + 1].copy()
+    sliced_df.reset_index(drop=True, inplace=True)
+    return sliced_df, prices[start_idx], prices[end_idx], drawdowns[end_idx] * 100
+# ==========================================================
+
+
 def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500,
                   min_price=100):
     """
@@ -553,52 +612,52 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 if __name__ == "__main__":
     param_list = [
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2020-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2020-01-01_merged.csv"
         }
     ]
 
@@ -609,26 +668,30 @@ if __name__ == "__main__":
         try:
             # 预先读取文件一次用于计算 base_initial_price 和 min_price
             temp_df = pd.read_csv(csv_file_path)
+            # ================== 🚀 新增：调用预处理函数 ==================
+            # 这里根据下方的回测参数 direction="long" 来截取做多承受的最大回撤区间
+            # ==========================================================
 
             # 时间列转换
             if 'open_time' in temp_df.columns:
                 temp_df['time'] = pd.to_datetime(temp_df['open_time'], unit='ms')
             elif 'time' in temp_df.columns:
                 temp_df['time'] = pd.to_datetime(temp_df['time'])
+            temp_df, start_price, end_price, max_dd = preprocess_max_drawdown_period(temp_df, direction="long")
 
-            # 筛选2026年后(含2026-01-01)的数据
-            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2025-01-01')]
-
-            if temp_df.empty:
-                temp_df = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
+            # # 筛选2026年后(含2026-01-01)的数据
+            # df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2025-01-01')]
+            #
+            # if temp_df.empty:
+            #     temp_df = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
 
             # 获取最高价作为最大值，最低价求50%作为最小值 (优先判断k线标准列high/low，无则用close)
             if 'high' in temp_df.columns and 'low' in temp_df.columns:
                 base_initial_price = float(temp_df['high'].max())
-                min_price = float(df_2026['low'].min())
+                min_price = float(temp_df['low'].min())
             elif 'close' in temp_df.columns:
                 base_initial_price = float(temp_df['close'].max())
-                min_price = float(df_2026['close'].min())
+                min_price = float(temp_df['close'].min())
             else:
                 print(f"跳过 {csv_file_path}：数据列中未找到 high/low 或 close")
                 continue
@@ -649,24 +712,25 @@ if __name__ == "__main__":
             #     continue
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
-            if os.path.exists(output_csv_path):
-                temp_df = pd.read_csv(output_csv_path)
-                temp_df['min_price'] = min_price  # 添加一列记录当前的最小价格
-                temp_df.to_csv(output_csv_path, index=False, encoding='utf-8-sig')  # 重新保存覆盖原文件
-                print(f"结果文件已存在，跳过回测: {output_csv_path}")
-                initial_price = initial_price * 0.99
-                continue
+
             try:
 
-                df = pd.read_csv(csv_file_path)  # 先尝试读取，确保文件存在且格式正确
-
-                if 'open_time' in df.columns:
-                    df['time'] = pd.to_datetime(df['open_time'], unit='ms')
+                df = temp_df
 
                 # 2. 批量跑网格参数并导出 CSV (以 0.001 步长一直算到 0.1)
                 print("\n启动批量参数回测...")
                 batch_backtest_grid_ratios(df, output_csv=output_csv_path, leverage=100, fee_rate=0.0000, lot_size=0.1,
                                            direction="long", initial_price=initial_price, min_price=min_price)
+
+                if os.path.exists(output_csv_path):
+                    temp_df1 = pd.read_csv(output_csv_path)
+                    temp_df1['start_price'] = start_price  # 添加一列记录当前的最小价格
+                    temp_df1['end_price'] = end_price  # 添加一列记录当前的最小价格
+                    temp_df1['max_dd'] = max_dd  # 添加一列记录当前的最小价格
+
+                    temp_df1.to_csv(output_csv_path, index=False, encoding='utf-8-sig')  # 重新保存覆盖原文件
+                    initial_price = initial_price * 0.99
+                    continue
 
             except FileNotFoundError:
                 traceback.print_exc()
