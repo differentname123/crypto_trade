@@ -403,52 +403,52 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
 if __name__ == "__main__":
     param_list = [
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2023-01-01_merged.csv"
         },
         {
-            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2025-01-01_merged.csv"
+            "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2023-01-01_merged.csv"
         }
     ]
 
@@ -467,7 +467,7 @@ if __name__ == "__main__":
                 temp_df['time'] = pd.to_datetime(temp_df['time'])
 
             # 筛选2026年后(含2026-01-01)的数据
-            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2025-01-01')]
+            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2023-01-01')]
             if df_2026.empty:
                 df_2026 = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
 
@@ -485,6 +485,8 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"读取文件以计算自动价格失败: {csv_file_path}, 错误: {e}")
             continue
+
+        min_price = 1.05 * min_price
         # ---------------- 新增：根据CSV自动计算价格参数结束 ----------------
         print(f"根据CSV数据计算得到的初始价格: {base_initial_price}, 最小价格: {min_price} {csv_file_path}")
         initial_price = base_initial_price
