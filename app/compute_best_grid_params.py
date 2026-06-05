@@ -73,8 +73,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # ================== 🚀 核心优化五：纯价格极限回撤与全局极值追踪 ==================
     highest_seen = -float('inf')
     highest_seen_time = None
+    highest_seen_realized_pnl = 0.0  # 🚀新增：记录刷新最高点时的累计已实现利润
+
     lowest_seen = float('inf')
     lowest_seen_time = None
+    lowest_seen_realized_pnl = 0.0   # 🚀新增：记录刷新最低点时的累计已实现利润
 
     running_peak = -float('inf')
     running_peak_time = None
@@ -118,15 +121,19 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         # 浮动盈亏计算：提取公因式，彻底消除原先的 sum(...) O(N) 循环
         if direction == "long":
             floating_pnl = (current_price * current_pos_count - sum_entry_prices) * lot_size
+            # 🚀严格版本修改：仅计算从极值点(最高点)开始回撤期间产生的已实现利润，剔除历史利润缓冲
+            period_realized_pnl = realized_pnl - highest_seen_realized_pnl
         else:
             floating_pnl = (sum_entry_prices - current_price * current_pos_count) * lot_size
+            # 🚀严格版本修改：仅计算从极值点(最低点)开始回撤期间产生的已实现利润，剔除历史利润缓冲
+            period_realized_pnl = realized_pnl - lowest_seen_realized_pnl
 
         # 当前所需保证金计算：消除 sum(...) 循环
         required_margin = (sum_entry_prices * lot_size) / leverage
         # ======================================================================
 
-        # 资金缺口 = 所需保证金 - 已实现盈亏 - 浮动盈亏
-        capital_needed = required_margin - realized_pnl - floating_pnl
+        # 资金缺口 = 所需保证金 - 期间已实现盈亏 - 浮动盈亏 (修改：使用 period_realized_pnl)
+        capital_needed = required_margin - period_realized_pnl - floating_pnl
 
         if capital_needed > max_capital_needed:
             max_capital_needed = capital_needed
@@ -144,14 +151,14 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 
             worst_case_info["base_price"] = base_p
             worst_case_info["required_margin"] = required_margin
-            worst_case_info["realized_pnl"] = realized_pnl
+            worst_case_info["realized_pnl"] = period_realized_pnl  # 记录严格版本的期间利润
             worst_case_info["floating_pnl"] = floating_pnl
 
             worst_case_info["worst_time"] = current_time
             worst_case_info["worst_price"] = current_price
             worst_case_info["worst_position_count"] = current_pos_count
             worst_case_info["worst_price_change_rate"] = (current_price - base_p) / base_p if base_p > 0 else 0.0
-            worst_case_info["worst_realized_pnl"] = realized_pnl
+            worst_case_info["worst_realized_pnl"] = period_realized_pnl  # 记录严格版本的期间利润
             worst_case_info["worst_floating_pnl"] = floating_pnl
             worst_case_info["worst_total_trades"] = total_trades
             worst_case_info["worst_required_margin"] = required_margin
@@ -189,9 +196,11 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
             if p > highest_seen:
                 highest_seen = p
                 highest_seen_time = current_time
+                highest_seen_realized_pnl = realized_pnl  # 🚀新增：锁定创下新高时的已实现利润
             if p < lowest_seen:
                 lowest_seen = p
                 lowest_seen_time = current_time
+                lowest_seen_realized_pnl = realized_pnl   # 🚀新增：锁定创下新低时的已实现利润
 
             # === 2. 实时计算纯价格最大回撤 (在 initial_price 限制下) ===
             if direction == "long":
@@ -588,16 +597,17 @@ if __name__ == "__main__":
                 temp_df['time'] = pd.to_datetime(temp_df['time'])
 
             # 筛选2026年后(含2026-01-01)的数据
-            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2023-01-01')]
-            if df_2026.empty:
-                df_2026 = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
+            df_2026 = temp_df[temp_df['time'] >= pd.to_datetime('2026-01-01')]
+
+            if temp_df.empty:
+                temp_df = temp_df  # 如果没有2026年后的数据，默认使用全部数据作为保底
 
             # 获取最高价作为最大值，最低价求50%作为最小值 (优先判断k线标准列high/low，无则用close)
-            if 'high' in df_2026.columns and 'low' in df_2026.columns:
-                base_initial_price = float(df_2026['high'].max())
+            if 'high' in temp_df.columns and 'low' in temp_df.columns:
+                base_initial_price = float(temp_df['high'].max())
                 min_price = float(df_2026['low'].min())
-            elif 'close' in df_2026.columns:
-                base_initial_price = float(df_2026['close'].max())
+            elif 'close' in temp_df.columns:
+                base_initial_price = float(temp_df['close'].max())
                 min_price = float(df_2026['close'].min())
             else:
                 print(f"跳过 {csv_file_path}：数据列中未找到 high/low 或 close")
@@ -607,7 +617,6 @@ if __name__ == "__main__":
             print(f"读取文件以计算自动价格失败: {csv_file_path}, 错误: {e}")
             continue
 
-        min_price = 1.05 * min_price
         # ---------------- 新增：根据CSV自动计算价格参数结束 ----------------
         print(f"根据CSV数据计算得到的初始价格: {base_initial_price}, 最小价格: {min_price} {csv_file_path}")
         initial_price = base_initial_price
@@ -619,7 +628,7 @@ if __name__ == "__main__":
             #     initial_price = initial_price * 0.99
             #     continue
 
-            output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}_debug1.csv")
+            output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
             if os.path.exists(output_csv_path):
                 temp_df = pd.read_csv(output_csv_path)
                 temp_df['min_price'] = min_price  # 添加一列记录当前的最小价格
