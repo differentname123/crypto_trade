@@ -18,7 +18,6 @@ import pandas as pd
 
 from common.caculate_margin import calculate_multi_group_margin
 
-
 def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, direction="short", initial_price=2500,
                   min_price=100):
     """
@@ -42,6 +41,26 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     first_open = df['open'].iloc[0]  # 获取实际第一根K线开盘价用于初始化价格轨迹
     last_close = df['close'].iloc[-1]  # 记录最终收盘价
 
+    # ================== 🚀 新增：等比网格核心数学函数 ==================
+    eps = 1e-9  # 防止浮点数精度导致的错位
+
+    def get_k(p):
+        """根据当前价格，反推所处的等比网格层级 k"""
+        if p >= p0:
+            ratio = math.log(p / p0) / math.log(1 + grid_ratio)
+            return math.floor(ratio + eps)
+        else:
+            ratio = math.log(p / p0) / math.log(1 - grid_ratio)
+            return -math.ceil(ratio - eps)
+
+    def get_p(k):
+        """根据网格层级 k，计算对应的等比开仓/平仓价格"""
+        if k >= 0:
+            return p0 * ((1 + grid_ratio) ** k)
+        else:
+            return p0 * ((1 - grid_ratio) ** (-k))
+    # ======================================================================
+
     realized_pnl = 0.0  # 已实现盈亏
     paired_profit = 0.0  # 新增：已配对的利润（仅记录完成一开一平的闭环利润）
     positions = {}  # 当前持仓记录字典: { 网格层级 k : 开仓价格 }
@@ -49,6 +68,23 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
     # ================== 🚀 核心优化一：引入全局状态追踪变量 ==================
     current_pos_count = 0  # 当前持仓总单数，替代 len(positions)
     sum_entry_prices = 0.0  # 当前持仓的开仓价总和，替代 sum(positions.values())
+    # ======================================================================
+
+    # ================== 🚀 核心优化五：纯价格极限回撤与全局极值追踪 ==================
+    highest_seen = -float('inf')
+    highest_seen_time = None
+    lowest_seen = float('inf')
+    lowest_seen_time = None
+
+    running_peak = -float('inf')
+    running_peak_time = None
+    running_trough = float('inf')
+    running_trough_time = None
+    price_max_dd = 0.0
+    dd_start_time = None
+    dd_start_price = None
+    dd_end_time = None
+    dd_end_price = None
     # ======================================================================
 
     max_capital_needed = 0.0  # 历史记录中【所需的最大初始资金】(即最小不爆仓保证金)
@@ -59,7 +95,9 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 
     # 新增：记录发生 max_capital_needed 时的“案发现场”信息
     worst_case_info = {
-        "time": None,  # 修改：名称改为 time
+        "base_time": None,  # 新增：base价格开始的时间 (即极值发生的时间)
+        "base_price": p0,  # 新增：真实感受的起跌/起涨基准价
+        "worst_time": None,  # 修改：名称改为 worst_time，即达到 worst_price 的时间
         "worst_price": first_open,
         "worst_position_count": 0,
         "worst_price_change_rate": 0.0,
@@ -92,18 +130,35 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 
         if capital_needed > max_capital_needed:
             max_capital_needed = capital_needed
+
+            # === 根据历史极值动态核算基准价格，完美还原网格感受到的跌幅 ===
+            if direction == "long":
+                base_p = min(highest_seen, p0)
+                base_t = highest_seen_time
+            else:
+                base_p = max(lowest_seen, p0)
+                base_t = lowest_seen_time
+
             # 记录刷新极值时的现场数据
-            worst_case_info["time"] = current_time  # 修改：记录真实 time
+            worst_case_info["base_time"] = base_t
+
+            worst_case_info["base_price"] = base_p
+            worst_case_info["required_margin"] = required_margin
+            worst_case_info["realized_pnl"] = realized_pnl
+            worst_case_info["floating_pnl"] = floating_pnl
+
+            worst_case_info["worst_time"] = current_time
             worst_case_info["worst_price"] = current_price
-            worst_case_info["worst_position_count"] = current_pos_count  # 优化：直接读取状态变量
-            worst_case_info["worst_price_change_rate"] = (current_price - p0) / p0 if p0 > 0 else 0.0
-            worst_case_info["worst_realized_pnl"] = realized_pnl  # 记录当时已实现利润
-            worst_case_info["worst_floating_pnl"] = floating_pnl  # 记录当时浮动盈亏
-            worst_case_info["worst_total_trades"] = total_trades  # 记录当时成交单数
-            worst_case_info["worst_required_margin"] = required_margin  # 记录当时所需保证金
+            worst_case_info["worst_position_count"] = current_pos_count
+            worst_case_info["worst_price_change_rate"] = (current_price - base_p) / base_p if base_p > 0 else 0.0
+            worst_case_info["worst_realized_pnl"] = realized_pnl
+            worst_case_info["worst_floating_pnl"] = floating_pnl
+            worst_case_info["worst_total_trades"] = total_trades
+            worst_case_info["worst_required_margin"] = required_margin
 
     p_prev = first_open
-    k_prev = math.floor((p_prev - p0) / (p0 * grid_ratio))
+    # 替换为等比定位函数
+    k_prev = get_k(p_prev)
 
     # 修改：获取实际的时间序列 (优先取 'time' 或 'timestamp' 列，否则用 index)
     if 'time' in df.columns:
@@ -130,13 +185,51 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 
         # 沿着价格轨迹模拟穿越网格线
         for p in points:
-            # 当前价格所处的网格层级
-            k_curr = math.floor((p - p0) / (p0 * grid_ratio))
+            # === 1. 实时追踪全局极值 (用于 worst_case_info 的基准核定) ===
+            if p > highest_seen:
+                highest_seen = p
+                highest_seen_time = current_time
+            if p < lowest_seen:
+                lowest_seen = p
+                lowest_seen_time = current_time
+
+            # === 2. 实时计算纯价格最大回撤 (在 initial_price 限制下) ===
+            if direction == "long":
+                effective_p = min(p, p0)
+                if effective_p > running_peak:
+                    running_peak = effective_p
+                    running_peak_time = current_time
+                if running_peak > 0:
+                    current_dd = (running_peak - effective_p) / running_peak
+                    if current_dd > price_max_dd:
+                        price_max_dd = current_dd
+                        dd_start_time = running_peak_time
+                        dd_start_price = running_peak
+                        dd_end_time = current_time
+                        dd_end_price = effective_p
+            else:
+                effective_p = max(p, p0)
+                if effective_p < running_trough:
+                    running_trough = effective_p
+                    running_trough_time = current_time
+                if running_trough > 0:
+                    current_dd = (effective_p - running_trough) / running_trough
+                    if current_dd > price_max_dd:
+                        price_max_dd = current_dd
+                        dd_start_time = running_trough_time
+                        dd_start_price = running_trough
+                        dd_end_time = current_time
+                        dd_end_price = effective_p
+            # =======================================================
+
+            # 当前价格所处的网格层级：替换为等比定位函数
+            k_curr = get_k(p)
 
             if k_curr > k_prev:
                 # 价格上涨
                 for k in range(k_prev + 1, k_curr + 1):
-                    pk = p0 * (1 + k * grid_ratio)
+                    # 替换为等比价格计算函数
+                    pk = get_p(k)
                     update_margin(pk, current_time)  # 碰线前结算一次极值
 
                     if direction == "long":
@@ -178,7 +271,8 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
             elif k_curr < k_prev:
                 # 价格下跌
                 for k in range(k_prev, k_curr, -1):
-                    pk = p0 * (1 + k * grid_ratio)
+                    # 替换为等比价格计算函数
+                    pk = get_p(k)
                     update_margin(pk, current_time)  # 碰线前结算一次极值
 
                     if direction == "long":
@@ -305,11 +399,20 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
 
     base_params = {'add_step_percent': 0.15, 'fixed_qty': 0.1, 'initial_price': 2230, 'leverage': 100.0,
                    'max_grids_per_group': 1000000, 'target_loss_percent': 15}
-    base_params['initial_price'] = initial_price
+    base_params['initial_price'] = worst_case_info["base_price"]
     base_params['add_step_percent'] = grid_ratio * 100
-    base_params['target_loss_percent'] = 100 - worst_case_info["worst_price"] / initial_price * 100
+    base_params['target_loss_percent'] = 100 - worst_case_info["worst_price"] / base_params['initial_price'] * 100
     baseline_result = calculate_multi_group_margin(**base_params)
     total_margin = baseline_result['total_margin']
+
+
+    base_params = {'add_step_percent': 0.15, 'fixed_qty': 0.1, 'initial_price': 2230, 'leverage': 100.0,
+                   'max_grids_per_group': 1000000, 'target_loss_percent': 15}
+    base_params['initial_price'] = dd_start_price
+    base_params['add_step_percent'] = grid_ratio * 100
+    base_params['target_loss_percent'] = price_max_dd * 100
+    baseline_result = calculate_multi_group_margin(**base_params)
+    max_total_margin = baseline_result['total_margin']
 
     return {
         "direction": direction,
@@ -320,6 +423,12 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "paired_profit": paired_profit,  # 新增：已配对的闭环净利润
         "min_margin_needed": min_margin,  # 最小不爆仓所需初始保证金
         "total_margin": total_margin,
+        "worst_price_change_rate": worst_case_info["worst_price_change_rate"],  # 极值发生时相对于base的真实涨跌幅
+
+        "max_total_margin": max_total_margin,
+        "price_max_drawdown_ratio": price_max_dd,  # 最大纯价格回撤比例
+
+
         "target_loss_percent": base_params['target_loss_percent'],
         "profit_to_margin_ratio": profit_rate,  # 收益 / 保证金 (核心参考价值)
         "max_drawdown": max_dd,  # 最大回撤率
@@ -329,15 +438,27 @@ def backtest_grid(df, grid_ratio, leverage=100, fee_rate=0.0005, lot_size=1.0, d
         "first_open_time": first_open_time,  # 新增：第一次开仓的时间
         "final_position_count": final_position_count,  # 新增：最后一刻的持仓单数
         "final_floating_pnl": final_floating_pnl,  # 新增：最后一刻的持仓浮动盈亏
-        "time": worst_case_info["time"],  # 修改：极值发生时间(获取自真实的 time/timestamp 列或行号)
-        "min_price": min_price,
+
+        # --- 🚀 新增/修改：极限情况时间与价格基准追踪 ---
+        "base_time": worst_case_info["base_time"],  # 基准价格发生的起始时间
+        "base_price": worst_case_info["base_price"],  # 基准具体价格(min/max约束后)
+        "worst_time": worst_case_info["worst_time"],  # 极值(最低/高点)发生时间
         "worst_price": worst_case_info["worst_price"],  # 极值发生时的价格
+        # -----------------------------------------------
+
+        "min_price": min_price,
         "worst_position_count": worst_case_info["worst_position_count"],  # 极值发生时的持仓单数
-        "worst_price_change_rate": worst_case_info["worst_price_change_rate"],  # 极值发生时相对于初始价格的涨跌幅
         "worst_realized_pnl": worst_case_info["worst_realized_pnl"],  # 极值发生时的已实现利润
         "worst_floating_pnl": worst_case_info["worst_floating_pnl"],  # 极值发生时的持仓浮动盈亏
         "worst_total_trades": worst_case_info["worst_total_trades"],  # 极值发生时的已成交单数
-        "worst_required_margin": worst_case_info["worst_required_margin"]  # 极值发生时的持仓所需本金
+        "worst_required_margin": worst_case_info["worst_required_margin"],  # 极值发生时的持仓所需本金
+
+        # --- 🚀 新增：纯价格维度的最大回撤统计 ---
+        "price_max_dd_start_time": dd_start_time,  # 回撤开始时间
+        "price_max_dd_start_price": dd_start_price,  # 回撤开始价格
+        "price_max_dd_end_time": dd_end_time,  # 回撤结束(见底/见顶)时间
+        "price_max_dd_end_price": dd_end_price  # 回撤结束时的极端价格
+        # ---------------------------------------
     }
 
 
@@ -498,7 +619,7 @@ if __name__ == "__main__":
             #     initial_price = initial_price * 0.99
             #     continue
 
-            output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
+            output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}_debug1.csv")
             if os.path.exists(output_csv_path):
                 temp_df = pd.read_csv(output_csv_path)
                 temp_df['min_price'] = min_price  # 添加一列记录当前的最小价格
