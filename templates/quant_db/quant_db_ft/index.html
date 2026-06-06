@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serverless Quant System</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background-color: #f3f4f6; color: #1f2937; padding: 20px; max-width: 1000px; margin: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        button { background-color: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
+        button:disabled { background-color: #9ca3af; cursor: not-allowed; }
+        table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+        th { background-color: #f9fafb; font-weight: 600; }
+        .action-BUY { color: #10b981; font-weight: bold; }
+        .action-SELL { color: #ef4444; font-weight: bold; }
+        #error-box { display: none; background-color: #fee2e2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-bottom: 20px; border: 1px solid #f87171; white-space: pre-wrap; font-family: monospace; }
+        .warning { color: #d97706; font-size: 0.9em; margin-top: 5px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #e5e7eb; display: flex; flex-direction: column; }
+        .stat-title { font-size: 0.85em; color: #6b7280; margin-bottom: 8px; font-weight: 600; }
+        .stat-value { font-size: 1.4em; font-weight: bold; color: #111827; }
+        .stat-value-small { font-size: 1em; color: #374151; font-weight: 600; margin-top: auto; }
+    </style>
+</head>
+<body>
+    <div id="error-box"></div>
+    <div class="header">
+        <div>
+            <h2>信号推演流水 (Live Logs)</h2>
+            <div class="warning">⚠️ 注意：每次点击请间隔 3-5 秒，避免触发币安接口风控</div>
+        </div>
+        <button id="calcBtn" onclick="triggerCalculation()">逐步拉取增量数据并回测</button>
+    </div>
+
+    <div class="stats-grid" id="statsGrid"></div>
+
+    <table>
+        <thead>
+            <tr>
+                <th>时间 (Time)</th>
+                <th>动作 (Action)</th>
+                <th>资产 (Coin)</th>
+                <th>方向 (Direction)</th>
+                <th>价格 (Price)</th>
+                <th>触发原因 (Reason)</th>
+            </tr>
+        </thead>
+        <tbody id="logTableBody"></tbody>
+    </table>
+
+    <script>
+        // ==========================================
+        // 配置：如果 Worker 和 Pages 域名不同，请填入 Worker 的完整域名
+        // 例如：const API_BASE = 'https://my-quant-worker.xxxx.workers.dev';
+        // ==========================================
+        const API_BASE = 'https://serverless-quant-bot.zhuxiaohu98.workers.dev';
+
+        window.onload = () => fetchLogs();
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch(API_BASE + '/api/logs');
+                if (!res.ok) {
+                    const errorText = await res.text();
+                    try {
+                        const errJson = JSON.parse(errorText);
+                        throw new Error(errJson.error || '未知后端错误');
+                    } catch(e) {
+                        throw new Error('服务器崩溃，返回了非 JSON 内容: ' + errorText.substring(0, 100));
+                    }
+                }
+                const responseData = await res.json();
+
+                let logs = [];
+                let dataStart = null;
+                let dataEnd = null;
+
+                if (Array.isArray(responseData)) {
+                    logs = responseData;
+                } else {
+                    logs = responseData.logs || [];
+                    dataStart = responseData.dataStart;
+                    dataEnd = responseData.dataEnd;
+                }
+
+                const tbody = document.getElementById('logTableBody');
+
+                if (logs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无交易流水，请继续点击按钮预热数据（需满 20 天）</td></tr>';
+                    renderStats(logs, dataStart, dataEnd);
+                    return;
+                }
+
+                renderStats(logs, dataStart, dataEnd);
+
+                tbody.innerHTML = logs.map(log =>
+                    '<tr>' +
+                        '<td>' + log.time + '</td>' +
+                        '<td class="action-' + log.action + '">' + log.action + '</td>' +
+                        '<td>' + log.coin + '</td>' +
+                        '<td>' + log.direction + '</td>' +
+                        '<td>' + log.price.toFixed(4) + '</td>' +
+                        '<td>' + log.reason + '</td>' +
+                    '</tr>'
+                ).join('');
+            } catch (err) {
+                showError('获取历史流水失败：\n' + err.message);
+            }
+        }
+
+        function renderStats(logs, dataStart, dataEnd) {
+            let buys = 0;
+            let sells = 0;
+            let currentHoldings = new Set();
+            let processedCoins = new Set();
+
+            for (let log of logs) {
+                if (log.action === 'BUY') buys++;
+                if (log.action === 'SELL') sells++;
+
+                if (!processedCoins.has(log.coin)) {
+                    processedCoins.add(log.coin);
+                    if (log.action === 'BUY') {
+                        currentHoldings.add(log.coin);
+                    }
+                }
+            }
+
+            const holdingsText = currentHoldings.size > 0
+                ? Array.from(currentHoldings).map(c => '<span class="action-BUY">' + c + '</span>').join(', ')
+                : '无 (全量空仓)';
+
+            const latestTradeTime = logs.length > 0 ? logs[0].time : '无记录';
+
+            const formatTime = (ts) => {
+                if (!ts || isNaN(ts)) return '未知';
+                try {
+                    let d = new Date(ts + 8 * 3600 * 1000);
+                    return d.toISOString().replace('T', ' ').substring(0, 19);
+                } catch(e) {
+                    return '时间解析错误';
+                }
+            };
+
+            const dataRangeText = (dataStart && dataEnd)
+                ? formatTime(dataStart) + '<br><span style="font-size:0.8em;color:#6b7280;">至</span><br>' + formatTime(dataEnd)
+                : '暂无回测数据';
+
+            const statsHtml = `
+                <div class="stat-card">
+                    <div class="stat-title">📊 原始数据时间范围</div>
+                    <div class="stat-value-small" style="line-height:1.4;">${dataRangeText}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">📈 记录内信号总数</div>
+                    <div class="stat-value">${logs.length} <span style="font-size: 0.5em; color: #9ca3af; font-weight: normal;">(上限100条)</span></div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">⚖️ 动作统计 (买 / 卖)</div>
+                    <div class="stat-value">
+                        <span class="action-BUY">${buys}</span> / <span class="action-SELL">${sells}</span>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">💼 当前系统持仓推测</div>
+                    <div class="stat-value-small">${holdingsText}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">⏱️ 最后一次触发时间</div>
+                    <div class="stat-value-small">${latestTradeTime}</div>
+                </div>
+            `;
+            document.getElementById('statsGrid').innerHTML = statsHtml;
+        }
+
+        async function triggerCalculation() {
+            const btn = document.getElementById('calcBtn');
+            const errorBox = document.getElementById('error-box');
+
+            btn.disabled = true;
+            btn.innerText = '⏳ 正在限速拉取并推演中...';
+            btn.style.backgroundColor = '#f59e0b';
+            errorBox.style.display = 'none';
+
+            try {
+                const res = await fetch(API_BASE + '/api/calculate', { method: 'POST' });
+
+                if (!res.ok) {
+                    const errorText = await res.text();
+                    try {
+                        const errJson = JSON.parse(errorText);
+                        throw new Error(errJson.error || '计算接口执行异常');
+                    } catch(e) {
+                        throw new Error('触发计算失败，状态码: ' + res.status + ' \n服务器可能被币安风控拦截或触发防撞锁。');
+                    }
+                }
+
+                const result = await res.json();
+                if (result.partial_success) {
+                    showError('⚠️ 部分请求被币安拦截 (状态码 503/429)。已保存成功拉取的部分数据。建议稍作休息再点。');
+                }
+
+                await fetchLogs();
+            } catch (err) {
+                showError('推演执行报错：\n' + err.message);
+            } finally {
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.innerText = '逐步拉取增量数据并回测';
+                    btn.style.backgroundColor = '#3b82f6';
+                }, 3000);
+            }
+        }
+
+        function showError(msg) {
+            const box = document.getElementById('error-box');
+            box.innerText = msg;
+            box.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
