@@ -576,8 +576,8 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     # --- 构造多进程任务参数池 ---
     tasks = []
     # 从 10 遍历到 200，对应 0.001 到 0.0199...
-    for i in range(1, 50):
-        grid_ratio = round(i * 0.001, 5)
+    for i in range(1, 500):
+        grid_ratio = round(i * 0.0001, 5)
         tasks.append({
             'df': df,
             'grid_ratio': grid_ratio,
@@ -660,9 +660,12 @@ if __name__ == "__main__":
             "csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2020-01-01_merged.csv"
         }
     ]
-
+    coin_info = {}
     for param in param_list:
         csv_file_path = param["csv_file_path"]
+
+
+
 
         # ---------------- 新增：根据CSV自动计算价格参数开始 ----------------
         try:
@@ -671,6 +674,16 @@ if __name__ == "__main__":
             # ================== 🚀 新增：调用预处理函数 ==================
             # 这里根据下方的回测参数 direction="long" 来截取做多承受的最大回撤区间
             # ==========================================================
+
+            coin_name = os.path.basename(csv_file_path).split('_')[0]
+            # 获取temp_df high 最大的值
+            abs_high_price = float(temp_df['high'].max())
+            # 获取temp_df low 最小的值
+            abs_low_price = float(temp_df['low'].min())
+            coin_info[coin_name] = {
+                "abs_high_price": abs_high_price,
+                "abs_low_price": abs_low_price
+            }
 
             # 时间列转换
             if 'open_time' in temp_df.columns:
@@ -707,7 +720,7 @@ if __name__ == "__main__":
         # 只要当前价格大于等于下限价格，就继续循环
         while initial_price >= min_price:
             print(f"\n=== 回测初始价格: {initial_price} ===")
-            if initial_price > base_initial_price * 0.5 or initial_price < min_price * 1.1:
+            if initial_price < base_initial_price * 0.99 or initial_price < min_price * 1.1:
                 initial_price = initial_price * 0.99
                 continue
 

@@ -14,7 +14,8 @@ def calculate_multi_group_margin(
         direction: str = 'long'
 ) -> dict:
     if leverage <= 0 or target_loss_percent <= 0 or add_step_percent <= 0 or fixed_qty <= 0 or max_grids_per_group <= 0:
-        raise ValueError("所有数值参数必须 > 0")
+        # print(f"参数错误: leverage={leverage}, target_loss_percent={target_loss_percent}, add_step_percent={add_step_percent}, fixed_qty={fixed_qty}, max_grids_per_group={max_grids_per_group}")
+        return {"total_margin": float('inf'), "groups_info": []}
     if direction not in ['long', 'short']:
         raise ValueError("direction 参数必须是 'long' 或 'short'")
 
