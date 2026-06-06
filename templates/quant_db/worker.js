@@ -2,7 +2,7 @@
 // 1. 核心数学与矩阵推演引擎 (严禁修改，保留原样)
 // ==========================================
 
-function alignAndResampleTo4H(all_klines_map, symbols) {
+function alignAndResampleTo4H(all_klines_map, symbols, offset_ms = 0) {
     let chunkMap = new Map();
     const FOUR_HOURS_MS = 4 * 3600 * 1000;
     let minTime = Infinity;
@@ -11,7 +11,9 @@ function alignAndResampleTo4H(all_klines_map, symbols) {
     for (const sym of symbols) {
         if (!all_klines_map[sym]) continue;
         for (const k of all_klines_map[sym]) {
-            let ts_4h = Math.floor(k[0] / FOUR_HOURS_MS) * FOUR_HOURS_MS;
+            // 严格对齐 Pandas resample 的 offset 逻辑
+            let ts_4h = Math.floor((k[0] - offset_ms) / FOUR_HOURS_MS) * FOUR_HOURS_MS + offset_ms;
+
             if (ts_4h < minTime) minTime = ts_4h;
             if (ts_4h > maxTime) maxTime = ts_4h;
 
@@ -54,9 +56,10 @@ function alignAndResampleTo4H(all_klines_map, symbols) {
 function generateHistoricalTradeLogs(df_4h, params, symbols) {
     let trade_logs = [];
     let positions = {};
-    for (let sym of symbols) positions[sym] = { qty: 0 };
+    for (let sym of symbols) positions[sym] = { qty: 0 }; // qty: 1 表示多, -1 表示空, 0 表示空仓
 
     let min_warmup = Math.max(params.MOM_WINDOW, params.VOL_WINDOW, params.BTC_TREND_WINDOW);
+    let trade_mode = params.TRADE_MODE || 'LONG_ONLY';
 
     for (let i = 0; i < df_4h.length; i++) {
         let row = df_4h[i];
@@ -118,27 +121,62 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
             let current_time_obj = new Date(row.time + 4 * 3600 * 1000 + 8 * 3600 * 1000);
             let current_time = current_time_obj.toISOString().replace('T', ' ').substring(0, 19);
 
-            let top_long_coins = [];
+            // 真实信号时刻 (对应 Python 中加上 4h 后的时间拦截器比对)
+            let current_time_ms = row.time + 4 * 3600 * 1000;
 
+            let top_long_coins = [];
+            let top_short_coins = [];
+
+            // 多空发单候选矩阵生成 (严格对齐 TRADE_MODE)
             if (row.BTC_TREND_ON) {
-                let eligible = [];
-                for (const sym of symbols) {
-                    if (row.ADJ_MOM[sym] > 0) eligible.push({ sym: sym, val: row.ADJ_MOM[sym] });
+                if (['BOTH', 'LONG_ONLY'].includes(trade_mode)) {
+                    let eligible = [];
+                    for (const sym of symbols) {
+                        if (row.ADJ_MOM[sym] > 0) eligible.push({ sym: sym, val: row.ADJ_MOM[sym] });
+                    }
+                    eligible.sort((a, b) => b.val - a.val); // 降序：最强多头
+                    top_long_coins = eligible.slice(0, params.TOP_K).map(x => x.sym);
                 }
-                eligible.sort((a, b) => b.val - a.val);
-                top_long_coins = eligible.slice(0, params.TOP_K).map(x => x.sym);
+            } else {
+                if (['BOTH', 'SHORT_ONLY'].includes(trade_mode)) {
+                    let eligible = [];
+                    for (const sym of symbols) {
+                        if (row.ADJ_MOM[sym] < 0) eligible.push({ sym: sym, val: row.ADJ_MOM[sym] });
+                    }
+                    eligible.sort((a, b) => a.val - b.val); // 升序：最强空头 (负值越小越强)
+                    top_short_coins = eligible.slice(0, params.TOP_K).map(x => x.sym);
+                }
             }
 
+            // 【拦截器】：未到发车时间，强制掐断交易候选名单
+            if (params.START_TRADE_TIMESTAMP && current_time_ms < params.START_TRADE_TIMESTAMP) {
+                top_long_coins = [];
+                top_short_coins = [];
+            }
+
+            // --- A. 平仓逻辑 ---
             for (const sym of symbols) {
-                if (positions[sym].qty > 0 && !top_long_coins.includes(sym)) {
+                let current_qty = positions[sym].qty;
+
+                // 平多
+                if (current_qty > 0 && !top_long_coins.includes(sym)) {
                     let reason = !row.BTC_TREND_ON ? "大盘开关关闭" : "掉出排名";
                     trade_logs.push({
                         time: current_time, action: "SELL", coin: sym.replace('USDT', ''), direction: "LONG", price: row[sym].c, reason: reason
                     });
                     positions[sym].qty = 0;
                 }
+                // 平空
+                else if (current_qty < 0 && !top_short_coins.includes(sym)) {
+                    let reason = row.BTC_TREND_ON ? "大盘开关关闭" : "掉出排名";
+                    trade_logs.push({
+                        time: current_time, action: "BUY", coin: sym.replace('USDT', ''), direction: "SHORT", price: row[sym].c, reason: reason
+                    });
+                    positions[sym].qty = 0;
+                }
             }
 
+            // --- B. 开仓逻辑 (多) ---
             if (top_long_coins.length > 0) {
                 for (const sym of top_long_coins) {
                     if (positions[sym].qty === 0) {
@@ -146,6 +184,18 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
                             time: current_time, action: "BUY", coin: sym.replace('USDT', ''), direction: "LONG", price: row[sym].c, reason: "Signal Entry Long"
                         });
                         positions[sym].qty = 1;
+                    }
+                }
+            }
+
+            // --- C. 开仓逻辑 (空) ---
+            if (top_short_coins.length > 0) {
+                for (const sym of top_short_coins) {
+                    if (positions[sym].qty === 0) {
+                        trade_logs.push({
+                            time: current_time, action: "SELL", coin: sym.replace('USDT', ''), direction: "SHORT", price: row[sym].c, reason: "Signal Entry Short"
+                        });
+                        positions[sym].qty = -1;
                     }
                 }
             }
@@ -327,14 +377,27 @@ async function runUnifiedPipeline(env, ctx) {
         }
 
         console.log(`[Math] 🧠 开始核心量化引擎计算 (对齐与重采样)...`);
-        const BEST_PARAMS = { MOM_WINDOW: 36, VOL_WINDOW: 90, BTC_TREND_WINDOW: 120, MAX_WEIGHT: 0.4, TOP_K: 1 };
-        let df_4h_ready = alignAndResampleTo4H(all_klines_map, targetSymbols);
+
+        // 🔴 将核心配置参数拉取到表层，补齐参数设定！
+        const BEST_PARAMS = {
+            MOM_WINDOW: 36,
+            VOL_WINDOW: 90,
+            BTC_TREND_WINDOW: 120,
+            MAX_WEIGHT: 0.4,
+            TOP_K: 1,
+            TRADE_MODE: 'LONG_ONLY',  // 与 Python 保持绝对一致
+            TIME_OFFSET_MS: 0,        // '0h' 默认不偏移
+            START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00Z').getTime() // 发车拦截器
+        };
+
+        // 注入 time offset
+        let df_4h_ready = alignAndResampleTo4H(all_klines_map, targetSymbols, BEST_PARAMS.TIME_OFFSET_MS);
         console.log(`[Math] 重采样完成，时间切块数: ${df_4h_ready.length}。进入信号推演环节...`);
 
         let fullSimulatedLogs = generateHistoricalTradeLogs(df_4h_ready, BEST_PARAMS, targetSymbols);
         console.log(`[Math] 矩阵推演结束，共产生 ${fullSimulatedLogs.length} 条原始交易日志。`);
 
-        console.log(`[DB] 🔍 从 D1 拉取历史信号库进行指纹比对...`);
+        console.log(`[DB] 🔍 从 D1 拉取历史信号库进行指纹比简...`);
         const { results: existingLogs } = await env.DB.prepare("SELECT time, action, coin FROM live_simulation_logs").all();
         const existingSet = new Set((existingLogs || []).map(l => `${l.time}_${l.action}_${l.coin}`));
         console.log(`[DB] 历史信号库基数: ${existingSet.size} 条记录。开始去重过滤...`);

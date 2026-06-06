@@ -81,7 +81,7 @@ def preprocess_minute_data(df_list, time_offset='0h'):
 # 2. 核心流式推演引擎 (账本级对齐，包含 Reason)
 # ==========================================
 def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: str, initial_capital=10000.0,
-                                   start_trade_date='2026-01-01 00:00:00'):
+                                   start_trade_date='2026-04-27 00:00:00'):
     """
     流式模拟引擎：生成与回测 100% 一致的 trade_logs DataFrame。
     """
@@ -364,7 +364,7 @@ def fetch_new_df():
     """
     raw_list = []
 
-    days = 60
+    days = 80
     symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
                    "DOGE/USDT:USDT"]
     for symbol in symbol_list:
