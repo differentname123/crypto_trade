@@ -300,13 +300,13 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
 # ==========================================
 def run_live_pipeline(raw_minute_df_list):
     BEST_PARAMS = {
-        'MOM_WINDOW': 36,
-        'VOL_WINDOW': 90,
+        'MOM_WINDOW': 48,
+        'VOL_WINDOW': 42,
         'BTC_TREND_WINDOW': 120,
-        'MAX_WEIGHT': 0.4,
+        'MAX_WEIGHT': 0.5,
         'TOP_K': 1
     }
-    TIME_OFFSET = '0h'
+    TIME_OFFSET = '2h'
     TRADE_MODE = 'LONG_ONLY'
 
     print("⏳ 1. 正在将分钟级数据组装为 4H 矩阵...")

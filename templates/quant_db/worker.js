@@ -263,7 +263,7 @@ async function releaseGlobalLock(env) {
 
 
 // ==========================================
-// 3. 构建统一推演流水线 (Unified Pipeline)
+// 3. 构建统一推演流水线 (Unified Pipeline) - 多策略重构版
 // ==========================================
 async function runUnifiedPipeline(env, ctx) {
     console.log(`[Pipeline] 🚀 ================= 开始执行统一推演流水线 =================`);
@@ -376,46 +376,81 @@ async function runUnifiedPipeline(env, ctx) {
             console.log(`[DB] ℹ️ 没有增量数据需要落盘`);
         }
 
-        console.log(`[Math] 🧠 开始核心量化引擎计算 (对齐与重采样)...`);
+        console.log(`[Math] 🧠 开始核心量化引擎计算 (多策略并行循环推演)...`);
 
-        // 🔴 将核心配置参数拉取到表层，补齐参数设定！
-        const BEST_PARAMS = {
-            MOM_WINDOW: 36,
-            VOL_WINDOW: 90,
-            BTC_TREND_WINDOW: 120,
-            MAX_WEIGHT: 0.4,
-            TOP_K: 1,
-            TRADE_MODE: 'LONG_ONLY',  // 与 Python 保持绝对一致
-            TIME_OFFSET_MS: 0,        // '0h' 默认不偏移
-            START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00Z').getTime() // 发车拦截器
-        };
+        // 🔴 灵活的多策略配置数组 (未来可以自由在此数组中增删对象，互不干扰)
+        const STRATEGIES = [
+            {
+                STRATEGY_ID: 'Grid_No.43629',
+                TRADE_MODE: 'LONG_ONLY',
+                MOM_WINDOW: 48,
+                VOL_WINDOW: 42,
+                BTC_TREND_WINDOW: 120,
+                MAX_WEIGHT: 0.5,
+                TOP_K: 1,
+                TIME_OFFSET_MS: 2 * 3600 * 1000, // 2h偏移
+                START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00+08:00').getTime()
 
-        // 注入 time offset
-        let df_4h_ready = alignAndResampleTo4H(all_klines_map, targetSymbols, BEST_PARAMS.TIME_OFFSET_MS);
-        console.log(`[Math] 重采样完成，时间切块数: ${df_4h_ready.length}。进入信号推演环节...`);
+            },
+            {
+                STRATEGY_ID: 'Grid_No.69393',
+                TRADE_MODE: 'SHORT_ONLY',
+                MOM_WINDOW: 90,
+                VOL_WINDOW: 120,
+                BTC_TREND_WINDOW: 720,
+                MAX_WEIGHT: 0.05,
+                TOP_K: 3,
+                TIME_OFFSET_MS: 0, // 0h偏移
+                START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00+08:00').getTime()
 
-        let fullSimulatedLogs = generateHistoricalTradeLogs(df_4h_ready, BEST_PARAMS, targetSymbols);
-        console.log(`[Math] 矩阵推演结束，共产生 ${fullSimulatedLogs.length} 条原始交易日志。`);
 
-        console.log(`[DB] 🔍 从 D1 拉取历史信号库进行指纹比简...`);
-        const { results: existingLogs } = await env.DB.prepare("SELECT time, action, coin FROM live_simulation_logs").all();
-        const existingSet = new Set((existingLogs || []).map(l => `${l.time}_${l.action}_${l.coin}`));
+            }
+        ];
+
+        let fullSimulatedLogs = [];
+
+        for (const strategy of STRATEGIES) {
+            console.log(`[Math] ⚙️ 正在推演策略: ${strategy.STRATEGY_ID} (${strategy.TRADE_MODE})`);
+
+            // 为当前策略单独进行时间切块与重采样 (因为 offset 不同，不能共享重采样结果)
+            let df_4h_ready = alignAndResampleTo4H(all_klines_map, targetSymbols, strategy.TIME_OFFSET_MS);
+
+            // 独立产生交易日志
+            let logs = generateHistoricalTradeLogs(df_4h_ready, strategy, targetSymbols);
+
+            // 注入标识符以作数据库存储区分
+            logs.forEach(log => {
+                log.strategy_id = strategy.STRATEGY_ID;
+            });
+
+            fullSimulatedLogs.push(...logs);
+            console.log(`[Math] 策略 ${strategy.STRATEGY_ID} 推演完毕，产生 ${logs.length} 条记录。`);
+        }
+
+        console.log(`[Math] 矩阵推演结束，所有策略共产生 ${fullSimulatedLogs.length} 条原始交易日志。`);
+
+        console.log(`[DB] 🔍 从 D1 拉取历史信号库进行指纹比对...`);
+        // 拉取所有历史日志用于去重。因为可能存在无 strategy_id 的老数据，在此兼容处理
+        const { results: existingLogs } = await env.DB.prepare("SELECT * FROM live_simulation_logs").all();
+        // 去重指纹升级：加入 strategy_id 作为联合主键概念
+        const existingSet = new Set((existingLogs || []).map(l => `${l.strategy_id || 'UNKNOWN'}_${l.time}_${l.action}_${l.coin}`));
         console.log(`[DB] 历史信号库基数: ${existingSet.size} 条记录。开始去重过滤...`);
 
         const now_ms = Date.now();
         const newLogsToInsert = fullSimulatedLogs.filter(log => {
             const logTimeMs = new Date(log.time.replace(' ', 'T') + '+08:00').getTime();
             const isClosed = now_ms >= logTimeMs;
-            const logKey = `${log.time}_${log.action}_${log.coin}`;
+            const logKey = `${log.strategy_id}_${log.time}_${log.action}_${log.coin}`;
             return isClosed && !existingSet.has(logKey);
         });
 
         if (newLogsToInsert.length > 0) {
             console.log(`[DB] 💾 去重完成，准备写入 ${newLogsToInsert.length} 条全新信号记录！`);
+            // 🔴 注意：SQL 语句已加入 strategy_id 的插入
             const stmts = newLogsToInsert.map(log => {
                 return env.DB.prepare(
-                    "INSERT INTO live_simulation_logs (time, action, coin, direction, price, reason) VALUES (?, ?, ?, ?, ?, ?)"
-                ).bind(log.time, log.action, log.coin, log.direction, log.price, log.reason);
+                    "INSERT INTO live_simulation_logs (strategy_id, time, action, coin, direction, price, reason) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ).bind(log.strategy_id, log.time, log.action, log.coin, log.direction, log.price, log.reason);
             });
             await env.DB.batch(stmts);
             console.log(`[DB] ✅ ${newLogsToInsert.length} 条新信号已成功入库！`);
@@ -460,6 +495,7 @@ export default {
                 if (!env.DB) throw new Error("D1 数据库未绑定！");
 
                 console.log(`[Router] 执行读链路 (CQRS Read)`);
+                // SELECT * 会自动抓取新加的 strategy_id 字段
                 const { results } = await env.DB.prepare("SELECT * FROM live_simulation_logs ORDER BY time DESC LIMIT 100").all();
 
                 let dataStart = null;

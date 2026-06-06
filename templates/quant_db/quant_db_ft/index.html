@@ -21,6 +21,9 @@
         .stat-title { font-size: 0.85em; color: #6b7280; margin-bottom: 8px; font-weight: 600; }
         .stat-value { font-size: 1.4em; font-weight: bold; color: #111827; }
         .stat-value-small { font-size: 1em; color: #374151; font-weight: 600; margin-top: auto; }
+        /* 新增下拉框样式 */
+        .filter-container { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
+        select { padding: 6px 10px; border-radius: 6px; border: 1px solid #d1d5db; font-family: inherit; font-size: 0.9em; outline: none; background: white; }
     </style>
 </head>
 <body>
@@ -29,6 +32,12 @@
         <div>
             <h2>信号推演流水 (Live Logs)</h2>
             <div class="warning">⚠️ 注意：每次点击请间隔 3-5 秒，避免触发币安接口风控</div>
+            <div class="filter-container">
+                <label for="strategyFilter" style="font-weight: 600; font-size: 0.9em; color: #4b5563;">当前展示参数 (策略): </label>
+                <select id="strategyFilter" onchange="renderFilteredData()">
+                    <option value="ALL">全部策略混合 (All)</option>
+                </select>
+            </div>
         </div>
         <button id="calcBtn" onclick="triggerCalculation()">逐步拉取增量数据并回测</button>
     </div>
@@ -56,6 +65,11 @@
         // ==========================================
         const API_BASE = 'https://serverless-quant-bot.zhuxiaohu98.workers.dev';
 
+        // 全局状态管理：用于在下拉切换时不用重复请求后端
+        let globalAllLogs = [];
+        let globalDataStart = null;
+        let globalDataEnd = null;
+
         window.onload = () => fetchLogs();
 
         async function fetchLogs() {
@@ -63,50 +77,87 @@
                 const res = await fetch(API_BASE + '/api/logs');
                 if (!res.ok) {
                     const errorText = await res.text();
+                    let errMsg = '未知后端错误';
                     try {
                         const errJson = JSON.parse(errorText);
-                        throw new Error(errJson.error || '未知后端错误');
+                        errMsg = errJson.error || errMsg;
                     } catch(e) {
-                        throw new Error('服务器崩溃，返回了非 JSON 内容: ' + errorText.substring(0, 100));
+                        errMsg = '服务器返回了非 JSON 内容: ' + errorText.substring(0, 100);
                     }
+                    throw new Error(errMsg);
                 }
                 const responseData = await res.json();
 
-                let logs = [];
-                let dataStart = null;
-                let dataEnd = null;
-
                 if (Array.isArray(responseData)) {
-                    logs = responseData;
+                    globalAllLogs = responseData;
                 } else {
-                    logs = responseData.logs || [];
-                    dataStart = responseData.dataStart;
-                    dataEnd = responseData.dataEnd;
+                    globalAllLogs = responseData.logs || [];
+                    globalDataStart = responseData.dataStart;
+                    globalDataEnd = responseData.dataEnd;
                 }
 
-                const tbody = document.getElementById('logTableBody');
+                updateStrategyDropdown();
+                renderFilteredData();
 
-                if (logs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无交易流水，请继续点击按钮预热数据（需满 20 天）</td></tr>';
-                    renderStats(logs, dataStart, dataEnd);
-                    return;
-                }
-
-                renderStats(logs, dataStart, dataEnd);
-
-                tbody.innerHTML = logs.map(log =>
-                    '<tr>' +
-                        '<td>' + log.time + '</td>' +
-                        '<td class="action-' + log.action + '">' + log.action + '</td>' +
-                        '<td>' + log.coin + '</td>' +
-                        '<td>' + log.direction + '</td>' +
-                        '<td>' + log.price.toFixed(4) + '</td>' +
-                        '<td>' + log.reason + '</td>' +
-                    '</tr>'
-                ).join('');
             } catch (err) {
                 showError('获取历史流水失败：\n' + err.message);
             }
+        }
+
+        // 动态提取存在的策略并更新下拉框
+        function updateStrategyDropdown() {
+            const filter = document.getElementById('strategyFilter');
+            const currentSelection = filter.value;
+
+            const strategies = new Set();
+            globalAllLogs.forEach(log => {
+                if (log.strategy_id) strategies.add(log.strategy_id);
+            });
+
+            // 重构下拉选项
+            filter.innerHTML = '<option value="ALL">全部策略混合 (All)</option>';
+            strategies.forEach(strategy => {
+                const option = document.createElement('option');
+                option.value = strategy;
+                option.textContent = strategy;
+                filter.appendChild(option);
+            });
+
+            // 尽可能保留用户之前的选择
+            if (currentSelection !== 'ALL' && strategies.has(currentSelection)) {
+                filter.value = currentSelection;
+            }
+        }
+
+        // 根据下拉框的值过滤并渲染数据
+        function renderFilteredData() {
+            const selectedStrategy = document.getElementById('strategyFilter').value;
+
+            let filteredLogs = globalAllLogs;
+            if (selectedStrategy !== 'ALL') {
+                filteredLogs = globalAllLogs.filter(log => log.strategy_id === selectedStrategy);
+            }
+
+            const tbody = document.getElementById('logTableBody');
+
+            if (filteredLogs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无该策略的交易流水（或者需继续点击预热）</td></tr>';
+                renderStats(filteredLogs, globalDataStart, globalDataEnd);
+                return;
+            }
+
+            renderStats(filteredLogs, globalDataStart, globalDataEnd);
+
+            tbody.innerHTML = filteredLogs.map(log =>
+                '<tr>' +
+                    '<td>' + log.time + '</td>' +
+                    '<td class="action-' + log.action + '">' + log.action + '</td>' +
+                    '<td>' + log.coin + '</td>' +
+                    '<td>' + log.direction + '</td>' +
+                    '<td>' + log.price.toFixed(4) + '</td>' +
+                    '<td>' + log.reason + '</td>' +
+                '</tr>'
+            ).join('');
         }
 
         function renderStats(logs, dataStart, dataEnd) {
@@ -188,11 +239,20 @@
 
                 if (!res.ok) {
                     const errorText = await res.text();
+                    let specificErrorMsg = '';
+
+                    // 剥离 try-catch，防止抛出的自定义异常被强行覆盖
                     try {
                         const errJson = JSON.parse(errorText);
-                        throw new Error(errJson.error || '计算接口执行异常');
+                        specificErrorMsg = errJson.error;
                     } catch(e) {
-                        throw new Error('触发计算失败，状态码: ' + res.status + ' \n服务器可能被币安风控拦截或触发防撞锁。');
+                        // 解析 JSON 失败，静默处理，走后面的保底逻辑
+                    }
+
+                    if (specificErrorMsg) {
+                        throw new Error(`触发计算失败 (HTTP ${res.status}):\n具体原因: ${specificErrorMsg}`);
+                    } else {
+                        throw new Error(`触发计算失败，状态码: ${res.status} \n服务器返回: ${errorText.substring(0, 100)}`);
                     }
                 }
 
