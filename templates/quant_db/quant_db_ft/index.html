@@ -2,28 +2,81 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Serverless Quant System</title>
     <style>
-        body { font-family: system-ui, -apple-system, sans-serif; background-color: #f3f4f6; color: #1f2937; padding: 20px; max-width: 1000px; margin: auto; }
+        body { font-family: system-ui, -apple-system, sans-serif; background-color: #161a25; color: #e5e7eb; padding: 20px; max-width: 1000px; margin: auto; }
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        h2 { color: #f3f4f6; margin-bottom: 5px; }
         button { background-color: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: bold; transition: background-color 0.2s; }
-        button:disabled { background-color: #9ca3af; cursor: not-allowed; }
-        table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #e5e7eb; }
-        th { background-color: #f9fafb; font-weight: 600; }
+        button:disabled { background-color: #4b5563; cursor: not-allowed; }
+
         .action-BUY { color: #10b981; font-weight: bold; }
         .action-SELL { color: #ef4444; font-weight: bold; }
-        #error-box { display: none; background-color: #fee2e2; color: #b91c1c; padding: 12px; border-radius: 6px; margin-bottom: 20px; border: 1px solid #f87171; white-space: pre-wrap; font-family: monospace; }
-        .warning { color: #d97706; font-size: 0.9em; margin-top: 5px; }
+        #error-box { display: none; background-color: rgba(239, 68, 68, 0.1); color: #ef4444; padding: 12px; border-radius: 6px; margin-bottom: 20px; border: 1px solid #ef4444; white-space: pre-wrap; font-family: monospace; }
+
+        /* Stats Grid */
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); border: 1px solid #e5e7eb; display: flex; flex-direction: column; }
-        .stat-title { font-size: 0.85em; color: #6b7280; margin-bottom: 8px; font-weight: 600; }
-        .stat-value { font-size: 1.4em; font-weight: bold; color: #111827; }
-        .stat-value-small { font-size: 1em; color: #374151; font-weight: 600; margin-top: auto; }
-        /* 新增下拉框样式 */
+        .stat-card { background: #1f2532; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); border: 1px solid #2d3342; display: flex; flex-direction: column; }
+        .stat-title { font-size: 0.85em; color: #9ca3af; margin-bottom: 8px; font-weight: 600; }
+        .stat-value { font-size: 1.4em; font-weight: bold; color: #f3f4f6; }
+        .stat-value-small { font-size: 1em; color: #d1d5db; font-weight: 600; margin-top: auto; }
+
+        /* Filter Dropdown */
         .filter-container { margin-top: 10px; display: flex; align-items: center; gap: 10px; }
-        select { padding: 6px 10px; border-radius: 6px; border: 1px solid #d1d5db; font-family: inherit; font-size: 0.9em; outline: none; background: white; }
+        select { padding: 6px 10px; border-radius: 6px; border: 1px solid #374151; font-family: inherit; font-size: 0.9em; outline: none; background: #1e2330; color: #e5e7eb; transition: border-color 0.2s; }
+        select:focus { border-color: #3b82f6; }
+
+        /* Signal UI */
+        .section-title { font-size: 1.2em; font-weight: bold; margin: 30px 0 15px 0; color: #f3f4f6; }
+        .trade-card { background: #1f2532; border-radius: 8px; padding: 18px 20px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); border: 1px solid #2d3342; transition: transform 0.2s, box-shadow 0.2s; }
+        .trade-card:hover { transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.25); border-color: #374151; }
+        .trade-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; border-bottom: 1px solid #2d3342; padding-bottom: 12px; }
+        .trade-coin { font-size: 1.3em; font-weight: bold; color: #ffffff; margin-right: 10px; }
+        .trade-tag { font-size: 0.75em; padding: 3px 8px; border-radius: 4px; border: 1px solid #10b981; color: #10b981; background: rgba(16, 185, 129, 0.1); font-weight: 500; }
+        .trade-tag.open { border-color: #3b82f6; color: #3b82f6; background: rgba(59, 130, 246, 0.1); }
+        .trade-pnl { font-size: 1.2em; font-weight: bold; }
+        .text-green { color: #10b981; }
+        .text-red { color: #ef4444; }
+
+        .trade-body { display: flex; align-items: center; justify-content: space-between; }
+        .trade-half { display: flex; flex-direction: column; gap: 8px; width: 38%; }
+        .trade-half.right { text-align: right; align-items: flex-end; }
+
+        .trade-middle { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 24%; }
+        .trade-arrow { color: #4b5563; font-size: 1.2em; line-height: 1; margin-bottom: 4px; }
+        .trade-duration { font-size: 0.75em; color: #9ca3af; background: rgba(55, 65, 81, 0.4); padding: 2px 8px; border-radius: 12px; white-space: nowrap; }
+
+        .trade-time { font-size: 0.85em; color: #9ca3af; }
+        .trade-price { font-size: 1.1em; font-weight: bold; color: #f3f4f6; }
+
+        .empty-state { text-align: center; color: #9ca3af; padding: 25px; background: #1a1e29; border-radius: 8px; border: 1px dashed #374151; font-size: 0.9em; display: flex; justify-content: center; align-items: center; gap: 8px; }
+
+        /* Mobile Optimization */
+        @media (max-width: 600px) {
+            body { padding: 12px; }
+            .header { flex-direction: column; align-items: stretch; gap: 15px; }
+            .header h2 { font-size: 1.3em; margin: 0; }
+            .filter-container { flex-direction: column; align-items: stretch; gap: 8px; margin-top: 5px; }
+            select { width: 100%; padding: 12px 10px; font-size: 1em; }
+            button { width: 100%; padding: 14px; font-size: 1.05em; }
+
+            .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+            .stat-card { padding: 12px; }
+            .stat-card:nth-child(3) { grid-column: span 2; } /* 让时间范围卡片独占一行横排 */
+            .stat-value { font-size: 1.2em; }
+
+            .trade-card { padding: 15px 12px; }
+            .trade-coin { font-size: 1.1em; }
+            .trade-pnl { font-size: 1.1em; }
+            .trade-body { gap: 2px; }
+            .trade-half { width: 38%; }
+            .trade-middle { width: 24%; }
+            .trade-time { font-size: 0.7em; }
+            .trade-price { font-size: 0.95em; }
+            .trade-duration { font-size: 0.65em; padding: 2px 4px; white-space: normal; text-align: center; line-height: 1.2; }
+            .section-title { font-size: 1.1em; margin: 20px 0 10px 0; }
+        }
     </style>
 </head>
 <body>
@@ -31,9 +84,8 @@
     <div class="header">
         <div>
             <h2>信号推演流水 (Live Logs)</h2>
-            <div class="warning">⚠️ 注意：每次点击请间隔 3-5 秒，避免触发币安接口风控</div>
             <div class="filter-container">
-                <label for="strategyFilter" style="font-weight: 600; font-size: 0.9em; color: #4b5563;">当前展示参数 (策略): </label>
+                <label for="strategyFilter" style="font-weight: 600; font-size: 0.9em; color: #9ca3af;">当前展示参数 (策略): </label>
                 <select id="strategyFilter" onchange="renderFilteredData()">
                     <option value="ALL">全部策略混合 (All)</option>
                 </select>
@@ -44,19 +96,11 @@
 
     <div class="stats-grid" id="statsGrid"></div>
 
-    <table>
-        <thead>
-            <tr>
-                <th>时间 (Time)</th>
-                <th>动作 (Action)</th>
-                <th>资产 (Coin)</th>
-                <th>方向 (Direction)</th>
-                <th>价格 (Price)</th>
-                <th>触发原因 (Reason)</th>
-            </tr>
-        </thead>
-        <tbody id="logTableBody"></tbody>
-    </table>
+    <div class="section-title">当前持仓</div>
+    <div id="currentHoldingsContainer"></div>
+
+    <div class="section-title">历史记录 (已平仓)</div>
+    <div id="historyContainer"></div>
 
     <script>
         // ==========================================
@@ -104,7 +148,6 @@
             }
         }
 
-        // 动态提取存在的策略并更新下拉框
         function updateStrategyDropdown() {
             const filter = document.getElementById('strategyFilter');
             const currentSelection = filter.value;
@@ -114,7 +157,6 @@
                 if (log.strategy_id) strategies.add(log.strategy_id);
             });
 
-            // 重构下拉选项
             filter.innerHTML = '<option value="ALL">全部策略混合 (All)</option>';
             strategies.forEach(strategy => {
                 const option = document.createElement('option');
@@ -123,13 +165,54 @@
                 filter.appendChild(option);
             });
 
-            // 尽可能保留用户之前的选择
             if (currentSelection !== 'ALL' && strategies.has(currentSelection)) {
                 filter.value = currentSelection;
             }
         }
 
-        // 根据下拉框的值过滤并渲染数据
+        // 格式化时间为截屏样式 (05-16 02:00)
+        function formatShortTime(tsStr) {
+            if (!tsStr) return '--';
+            try {
+                let cleanStr = tsStr.replace('T', ' ');
+                const parts = cleanStr.split(' ');
+                if (parts.length < 2) return cleanStr;
+                const dateParts = parts[0].split('-');
+                const timeParts = parts[1].split(':');
+                if (dateParts.length >= 3 && timeParts.length >= 2) {
+                    return `${dateParts[1]}-${dateParts[2]} ${timeParts[0]}:${timeParts[1]}`;
+                }
+                return cleanStr;
+            } catch(e) {
+                return tsStr;
+            }
+        }
+
+        // 格式化价格，移除多余的零
+        function formatPrice(p) {
+            if (!p || isNaN(p)) return '0';
+            return Number(Number(p).toFixed(4)).toString();
+        }
+
+        // 新增：计算两点时间之间的历时
+        function formatDuration(startStr, endStr) {
+            try {
+                const ms = new Date(endStr) - new Date(startStr);
+                if (ms < 0 || isNaN(ms)) return '--';
+
+                const minutes = Math.floor(ms / 60000);
+                const hours = Math.floor(minutes / 60);
+                const days = Math.floor(hours / 24);
+
+                if (days > 0) return `${days}天 ${hours % 24}小时`;
+                if (hours > 0) return `${hours}小时 ${minutes % 60}分钟`;
+                return `${minutes}分钟`;
+            } catch(e) {
+                return '--';
+            }
+        }
+
+        // 核心渲染与交易卡片重组逻辑
         function renderFilteredData() {
             const selectedStrategy = document.getElementById('strategyFilter').value;
 
@@ -138,51 +221,136 @@
                 filteredLogs = globalAllLogs.filter(log => log.strategy_id === selectedStrategy);
             }
 
-            const tbody = document.getElementById('logTableBody');
+            // 1. 将流水按时间正序排列（从旧到新），以便模拟开仓和平仓推演
+            const sortedLogs = [...filteredLogs].sort((a, b) => new Date(a.time) - new Date(b.time));
+
+            const positions = {}; // 记录持仓字典 coin -> open log
+            const closedTrades = []; // 记录已平仓的配对流水
+
+            sortedLogs.forEach(log => {
+                if (log.action === 'BUY') {
+                    // 买入开仓
+                    positions[log.coin] = log;
+                } else if (log.action === 'SELL') {
+                    // 卖出平仓
+                    if (positions[log.coin]) {
+                        const openLog = positions[log.coin];
+                        // 计算收益百分比
+                        const pnlPct = ((log.price - openLog.price) / openLog.price) * 100;
+                        closedTrades.push({
+                            coin: log.coin,
+                            openTime: openLog.time,
+                            openPrice: openLog.price,
+                            closeTime: log.time,
+                            closePrice: log.price,
+                            pnlPct: pnlPct,
+                            direction: openLog.direction || '买多',
+                            duration: formatDuration(openLog.time, log.time)
+                        });
+                        delete positions[log.coin]; // 平仓后移除持仓
+                    }
+                }
+            });
+
+            const currentHoldings = Object.values(positions); // 未平仓部分为当前持仓
+            const historyContainer = document.getElementById('historyContainer');
+            const holdingsContainer = document.getElementById('currentHoldingsContainer');
 
             if (filteredLogs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#6b7280;">暂无该策略的交易流水（或者需继续点击预热）</td></tr>';
-                renderStats(filteredLogs, globalDataStart, globalDataEnd);
+                holdingsContainer.innerHTML = '<div class="empty-state"><span>📦</span> 当前无任何持仓，耐心等待信号</div>';
+                historyContainer.innerHTML = '<div class="empty-state">暂无该策略的交易流水（或者需继续点击预热）</div>';
+                renderStats(filteredLogs, globalDataStart, globalDataEnd, [], []);
                 return;
             }
 
-            renderStats(filteredLogs, globalDataStart, globalDataEnd);
-
-            tbody.innerHTML = filteredLogs.map(log =>
-                '<tr>' +
-                    '<td>' + log.time + '</td>' +
-                    '<td class="action-' + log.action + '">' + log.action + '</td>' +
-                    '<td>' + log.coin + '</td>' +
-                    '<td>' + log.direction + '</td>' +
-                    '<td>' + log.price.toFixed(4) + '</td>' +
-                    '<td>' + log.reason + '</td>' +
-                '</tr>'
-            ).join('');
-        }
-
-        function renderStats(logs, dataStart, dataEnd) {
-            let buys = 0;
-            let sells = 0;
-            let currentHoldings = new Set();
-            let processedCoins = new Set();
-
-            for (let log of logs) {
-                if (log.action === 'BUY') buys++;
-                if (log.action === 'SELL') sells++;
-
-                if (!processedCoins.has(log.coin)) {
-                    processedCoins.add(log.coin);
-                    if (log.action === 'BUY') {
-                        currentHoldings.add(log.coin);
-                    }
-                }
+            // 渲染当前持仓
+            if (currentHoldings.length === 0) {
+                holdingsContainer.innerHTML = '<div class="empty-state"><span>📦</span> 当前无任何持仓，耐心等待信号</div>';
+            } else {
+                holdingsContainer.innerHTML = currentHoldings.map(trade => {
+                    const liveDuration = formatDuration(trade.time, new Date().toISOString());
+                    return `
+                    <div class="trade-card">
+                        <div class="trade-header">
+                            <div>
+                                <span class="trade-coin">${trade.coin}</span>
+                                <span class="trade-tag open">买多 -> 持仓中</span>
+                            </div>
+                            <div class="trade-pnl text-green">--</div>
+                        </div>
+                        <div class="trade-body">
+                            <div class="trade-half">
+                                <div class="trade-time">开仓 · ${formatShortTime(trade.time)}</div>
+                                <div class="trade-price">${formatPrice(trade.price)}</div>
+                            </div>
+                            <div class="trade-middle">
+                                <div class="trade-arrow">→</div>
+                                <div class="trade-duration">已持仓 ${liveDuration}</div>
+                            </div>
+                            <div class="trade-half right">
+                                <div class="trade-time">等待平仓信号</div>
+                                <div class="trade-price">--</div>
+                            </div>
+                        </div>
+                    </div>
+                `}).join('');
             }
 
-            const holdingsText = currentHoldings.size > 0
-                ? Array.from(currentHoldings).map(c => '<span class="action-BUY">' + c + '</span>').join(', ')
-                : '无 (全量空仓)';
+            // 渲染历史记录（逆序，最新的放前面）
+            const displayHistory = [...closedTrades].reverse();
+            if (displayHistory.length === 0) {
+                historyContainer.innerHTML = '<div class="empty-state">暂无已平仓记录</div>';
+            } else {
+                historyContainer.innerHTML = displayHistory.map(trade => {
+                    const isWin = trade.pnlPct > 0;
+                    const isLoss = trade.pnlPct < 0;
+                    const pnlClass = isWin ? 'text-green' : (isLoss ? 'text-red' : '');
+                    const pnlSign = isWin ? '+' : '';
+                    return `
+                        <div class="trade-card">
+                            <div class="trade-header">
+                                <div>
+                                    <span class="trade-coin">${trade.coin}</span>
+                                    <span class="trade-tag">买多 -> 平仓</span>
+                                </div>
+                                <div class="trade-pnl ${pnlClass}">${pnlSign}${trade.pnlPct.toFixed(2)}%</div>
+                            </div>
+                            <div class="trade-body">
+                                <div class="trade-half">
+                                    <div class="trade-time">开仓 · ${formatShortTime(trade.openTime)}</div>
+                                    <div class="trade-price">${formatPrice(trade.openPrice)}</div>
+                                </div>
+                                <div class="trade-middle">
+                                    <div class="trade-arrow">→</div>
+                                    <div class="trade-duration">历时 ${trade.duration}</div>
+                                </div>
+                                <div class="trade-half right">
+                                    <div class="trade-time">平仓 · ${formatShortTime(trade.closeTime)}</div>
+                                    <div class="trade-price">${formatPrice(trade.closePrice)}</div>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+            }
 
-            const latestTradeTime = logs.length > 0 ? logs[0].time : '无记录';
+            renderStats(filteredLogs, globalDataStart, globalDataEnd, closedTrades, currentHoldings);
+        }
+
+        // 修改计算 Stats 的逻辑，剔除了不要的字段，保留核心业务指标
+        function renderStats(logs, dataStart, dataEnd, closedTrades = [], currentHoldings = []) {
+            // 计算胜率和总收益
+            let totalWin = 0;
+            let totalPnL = 0;
+            if (closedTrades && closedTrades.length > 0) {
+                closedTrades.forEach(t => {
+                    totalPnL += t.pnlPct;
+                    if (t.pnlPct > 0) totalWin++;
+                });
+            }
+            const winRateText = (closedTrades && closedTrades.length > 0) ? ((totalWin / closedTrades.length) * 100).toFixed(2) + '%' : '0.00%';
+            const totalPnlText = totalPnL > 0 ? '+' + totalPnL.toFixed(2) + '%' : totalPnL.toFixed(2) + '%';
+            const pnlColor = totalPnL > 0 ? '#10b981' : (totalPnL < 0 ? '#ef4444' : '#f3f4f6');
 
             const formatTime = (ts) => {
                 if (!ts || isNaN(ts)) return '未知';
@@ -200,26 +368,16 @@
 
             const statsHtml = `
                 <div class="stat-card">
+                    <div class="stat-title">💰 累计收益 (已平仓)</div>
+                    <div class="stat-value" style="color: ${pnlColor};">${totalPnlText}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">🏆 策略胜率</div>
+                    <div class="stat-value">${winRateText} <span style="font-size: 0.5em; color: #9ca3af; font-weight: normal;">(${totalWin}/${closedTrades.length})</span></div>
+                </div>
+                <div class="stat-card">
                     <div class="stat-title">📊 原始数据时间范围</div>
                     <div class="stat-value-small" style="line-height:1.4;">${dataRangeText}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-title">📈 记录内信号总数</div>
-                    <div class="stat-value">${logs.length} <span style="font-size: 0.5em; color: #9ca3af; font-weight: normal;">(上限100条)</span></div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-title">⚖️ 动作统计 (买 / 卖)</div>
-                    <div class="stat-value">
-                        <span class="action-BUY">${buys}</span> / <span class="action-SELL">${sells}</span>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-title">💼 当前系统持仓推测</div>
-                    <div class="stat-value-small">${holdingsText}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-title">⏱️ 最后一次触发时间</div>
-                    <div class="stat-value-small">${latestTradeTime}</div>
                 </div>
             `;
             document.getElementById('statsGrid').innerHTML = statsHtml;
@@ -241,12 +399,11 @@
                     const errorText = await res.text();
                     let specificErrorMsg = '';
 
-                    // 剥离 try-catch，防止抛出的自定义异常被强行覆盖
                     try {
                         const errJson = JSON.parse(errorText);
                         specificErrorMsg = errJson.error;
                     } catch(e) {
-                        // 解析 JSON 失败，静默处理，走后面的保底逻辑
+                        // 解析 JSON 失败，静默处理
                     }
 
                     if (specificErrorMsg) {
