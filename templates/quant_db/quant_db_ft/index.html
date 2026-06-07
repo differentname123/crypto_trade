@@ -61,9 +61,9 @@
             select { width: 100%; padding: 12px 10px; font-size: 1em; }
             button { width: 100%; padding: 14px; font-size: 1.05em; }
 
+            /* 去除了原来的 .stat-card:nth-child(3) 占满整行，让四个卡片形成 2x2 网格 */
             .stats-grid { grid-template-columns: repeat(2, 1fr); gap: 10px; }
             .stat-card { padding: 12px; }
-            .stat-card:nth-child(3) { grid-column: span 2; } /* 让时间范围卡片独占一行横排 */
             .stat-value { font-size: 1.2em; }
 
             .trade-card { padding: 15px 12px; }
@@ -109,10 +109,11 @@
         // ==========================================
         const API_BASE = 'https://serverless-quant-bot.zhuxiaohu98.workers.dev';
 
-        // 全局状态管理：用于在下拉切换时不用重复请求后端
+        // 全局状态管理
         let globalAllLogs = [];
         let globalDataStart = null;
         let globalDataEnd = null;
+        let globalLastCalcTime = null; // 新增：最后计算时间
 
         window.onload = () => fetchLogs();
 
@@ -138,6 +139,7 @@
                     globalAllLogs = responseData.logs || [];
                     globalDataStart = responseData.dataStart;
                     globalDataEnd = responseData.dataEnd;
+                    globalLastCalcTime = responseData.lastCalcTime; // 读取最新计算时间
                 }
 
                 updateStrategyDropdown();
@@ -170,7 +172,6 @@
             }
         }
 
-        // 格式化时间为截屏样式 (05-16 02:00)
         function formatShortTime(tsStr) {
             if (!tsStr) return '--';
             try {
@@ -188,13 +189,11 @@
             }
         }
 
-        // 格式化价格，移除多余的零
         function formatPrice(p) {
             if (!p || isNaN(p)) return '0';
             return Number(Number(p).toFixed(4)).toString();
         }
 
-        // 新增：计算两点时间之间的历时
         function formatDuration(startStr, endStr) {
             try {
                 const ms = new Date(endStr) - new Date(startStr);
@@ -212,7 +211,6 @@
             }
         }
 
-        // 核心渲染与交易卡片重组逻辑
         function renderFilteredData() {
             const selectedStrategy = document.getElementById('strategyFilter').value;
 
@@ -221,21 +219,17 @@
                 filteredLogs = globalAllLogs.filter(log => log.strategy_id === selectedStrategy);
             }
 
-            // 1. 将流水按时间正序排列（从旧到新），以便模拟开仓和平仓推演
             const sortedLogs = [...filteredLogs].sort((a, b) => new Date(a.time) - new Date(b.time));
 
-            const positions = {}; // 记录持仓字典 coin -> open log
-            const closedTrades = []; // 记录已平仓的配对流水
+            const positions = {};
+            const closedTrades = [];
 
             sortedLogs.forEach(log => {
                 if (log.action === 'BUY') {
-                    // 买入开仓
                     positions[log.coin] = log;
                 } else if (log.action === 'SELL') {
-                    // 卖出平仓
                     if (positions[log.coin]) {
                         const openLog = positions[log.coin];
-                        // 计算收益百分比
                         const pnlPct = ((log.price - openLog.price) / openLog.price) * 100;
                         closedTrades.push({
                             coin: log.coin,
@@ -247,23 +241,22 @@
                             direction: openLog.direction || '买多',
                             duration: formatDuration(openLog.time, log.time)
                         });
-                        delete positions[log.coin]; // 平仓后移除持仓
+                        delete positions[log.coin];
                     }
                 }
             });
 
-            const currentHoldings = Object.values(positions); // 未平仓部分为当前持仓
+            const currentHoldings = Object.values(positions);
             const historyContainer = document.getElementById('historyContainer');
             const holdingsContainer = document.getElementById('currentHoldingsContainer');
 
             if (filteredLogs.length === 0) {
                 holdingsContainer.innerHTML = '<div class="empty-state"><span>📦</span> 当前无任何持仓，耐心等待信号</div>';
                 historyContainer.innerHTML = '<div class="empty-state">暂无该策略的交易流水（或者需继续点击预热）</div>';
-                renderStats(filteredLogs, globalDataStart, globalDataEnd, [], []);
+                renderStats(filteredLogs, globalDataStart, globalDataEnd, globalLastCalcTime, [], []);
                 return;
             }
 
-            // 渲染当前持仓
             if (currentHoldings.length === 0) {
                 holdingsContainer.innerHTML = '<div class="empty-state"><span>📦</span> 当前无任何持仓，耐心等待信号</div>';
             } else {
@@ -296,7 +289,6 @@
                 `}).join('');
             }
 
-            // 渲染历史记录（逆序，最新的放前面）
             const displayHistory = [...closedTrades].reverse();
             if (displayHistory.length === 0) {
                 historyContainer.innerHTML = '<div class="empty-state">暂无已平仓记录</div>';
@@ -334,12 +326,11 @@
                 }).join('');
             }
 
-            renderStats(filteredLogs, globalDataStart, globalDataEnd, closedTrades, currentHoldings);
+            renderStats(filteredLogs, globalDataStart, globalDataEnd, globalLastCalcTime, closedTrades, currentHoldings);
         }
 
-        // 修改计算 Stats 的逻辑，剔除了不要的字段，保留核心业务指标
-        function renderStats(logs, dataStart, dataEnd, closedTrades = [], currentHoldings = []) {
-            // 计算胜率和总收益
+        // 修改计算 Stats 的逻辑，新增最近计算时间的展示
+        function renderStats(logs, dataStart, dataEnd, lastCalcTime, closedTrades = [], currentHoldings = []) {
             let totalWin = 0;
             let totalPnL = 0;
             if (closedTrades && closedTrades.length > 0) {
@@ -366,6 +357,8 @@
                 ? formatTime(dataStart) + '<br><span style="font-size:0.8em;color:#6b7280;">至</span><br>' + formatTime(dataEnd)
                 : '暂无回测数据';
 
+            const lastCalcText = lastCalcTime ? formatTime(lastCalcTime) : '暂未计算';
+
             const statsHtml = `
                 <div class="stat-card">
                     <div class="stat-title">💰 累计收益 (已平仓)</div>
@@ -376,8 +369,12 @@
                     <div class="stat-value">${winRateText} <span style="font-size: 0.5em; color: #9ca3af; font-weight: normal;">(${totalWin}/${closedTrades.length})</span></div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-title">📊 原始数据时间范围</div>
+                    <div class="stat-title">📊 共有数据时间范围</div>
                     <div class="stat-value-small" style="line-height:1.4;">${dataRangeText}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-title">⏱️ 最新推演计算时间</div>
+                    <div class="stat-value-small" style="line-height:1.4; display: flex; align-items: center; height: 100%;">${lastCalcText}</div>
                 </div>
             `;
             document.getElementById('statsGrid').innerHTML = statsHtml;
@@ -402,9 +399,7 @@
                     try {
                         const errJson = JSON.parse(errorText);
                         specificErrorMsg = errJson.error;
-                    } catch(e) {
-                        // 解析 JSON 失败，静默处理
-                    }
+                    } catch(e) {}
 
                     if (specificErrorMsg) {
                         throw new Error(`触发计算失败 (HTTP ${res.status}):\n具体原因: ${specificErrorMsg}`);

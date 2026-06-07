@@ -11,7 +11,6 @@ function alignAndResampleTo4H(all_klines_map, symbols, offset_ms = 0) {
     for (const sym of symbols) {
         if (!all_klines_map[sym]) continue;
         for (const k of all_klines_map[sym]) {
-            // 严格对齐 Pandas resample 的 offset 逻辑
             let ts_4h = Math.floor((k[0] - offset_ms) / FOUR_HOURS_MS) * FOUR_HOURS_MS + offset_ms;
 
             if (ts_4h < minTime) minTime = ts_4h;
@@ -56,7 +55,7 @@ function alignAndResampleTo4H(all_klines_map, symbols, offset_ms = 0) {
 function generateHistoricalTradeLogs(df_4h, params, symbols) {
     let trade_logs = [];
     let positions = {};
-    for (let sym of symbols) positions[sym] = { qty: 0 }; // qty: 1 表示多, -1 表示空, 0 表示空仓
+    for (let sym of symbols) positions[sym] = { qty: 0 };
 
     let min_warmup = Math.max(params.MOM_WINDOW, params.VOL_WINDOW, params.BTC_TREND_WINDOW);
     let trade_mode = params.TRADE_MODE || 'LONG_ONLY';
@@ -120,21 +119,18 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
         if (i >= min_warmup) {
             let current_time_obj = new Date(row.time + 4 * 3600 * 1000 + 8 * 3600 * 1000);
             let current_time = current_time_obj.toISOString().replace('T', ' ').substring(0, 19);
-
-            // 真实信号时刻 (对应 Python 中加上 4h 后的时间拦截器比对)
             let current_time_ms = row.time + 4 * 3600 * 1000;
 
             let top_long_coins = [];
             let top_short_coins = [];
 
-            // 多空发单候选矩阵生成 (严格对齐 TRADE_MODE)
             if (row.BTC_TREND_ON) {
                 if (['BOTH', 'LONG_ONLY'].includes(trade_mode)) {
                     let eligible = [];
                     for (const sym of symbols) {
                         if (row.ADJ_MOM[sym] > 0) eligible.push({ sym: sym, val: row.ADJ_MOM[sym] });
                     }
-                    eligible.sort((a, b) => b.val - a.val); // 降序：最强多头
+                    eligible.sort((a, b) => b.val - a.val);
                     top_long_coins = eligible.slice(0, params.TOP_K).map(x => x.sym);
                 }
             } else {
@@ -143,12 +139,11 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
                     for (const sym of symbols) {
                         if (row.ADJ_MOM[sym] < 0) eligible.push({ sym: sym, val: row.ADJ_MOM[sym] });
                     }
-                    eligible.sort((a, b) => a.val - b.val); // 升序：最强空头 (负值越小越强)
+                    eligible.sort((a, b) => a.val - b.val);
                     top_short_coins = eligible.slice(0, params.TOP_K).map(x => x.sym);
                 }
             }
 
-            // 【拦截器】：未到发车时间，强制掐断交易候选名单
             if (params.START_TRADE_TIMESTAMP && current_time_ms < params.START_TRADE_TIMESTAMP) {
                 top_long_coins = [];
                 top_short_coins = [];
@@ -157,8 +152,6 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
             // --- A. 平仓逻辑 ---
             for (const sym of symbols) {
                 let current_qty = positions[sym].qty;
-
-                // 平多
                 if (current_qty > 0 && !top_long_coins.includes(sym)) {
                     let reason = !row.BTC_TREND_ON ? "大盘开关关闭" : "掉出排名";
                     trade_logs.push({
@@ -166,7 +159,6 @@ function generateHistoricalTradeLogs(df_4h, params, symbols) {
                     });
                     positions[sym].qty = 0;
                 }
-                // 平空
                 else if (current_qty < 0 && !top_short_coins.includes(sym)) {
                     let reason = row.BTC_TREND_ON ? "大盘开关关闭" : "掉出排名";
                     trade_logs.push({
@@ -378,7 +370,6 @@ async function runUnifiedPipeline(env, ctx) {
 
         console.log(`[Math] 🧠 开始核心量化引擎计算 (多策略并行循环推演)...`);
 
-        // 🔴 灵活的多策略配置数组 (未来可以自由在此数组中增删对象，互不干扰)
         const STRATEGIES = [
             {
                 STRATEGY_ID: 'Grid_No.43629',
@@ -388,9 +379,8 @@ async function runUnifiedPipeline(env, ctx) {
                 BTC_TREND_WINDOW: 120,
                 MAX_WEIGHT: 0.5,
                 TOP_K: 1,
-                TIME_OFFSET_MS: 2 * 3600 * 1000, // 2h偏移
+                TIME_OFFSET_MS: 2 * 3600 * 1000,
                 START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00+08:00').getTime()
-
             },
             {
                 STRATEGY_ID: 'Grid_No.69393',
@@ -400,10 +390,8 @@ async function runUnifiedPipeline(env, ctx) {
                 BTC_TREND_WINDOW: 720,
                 MAX_WEIGHT: 0.05,
                 TOP_K: 3,
-                TIME_OFFSET_MS: 0, // 0h偏移
+                TIME_OFFSET_MS: 0,
                 START_TRADE_TIMESTAMP: new Date('2026-04-27T00:00:00+08:00').getTime()
-
-
             }
         ];
 
@@ -412,13 +400,10 @@ async function runUnifiedPipeline(env, ctx) {
         for (const strategy of STRATEGIES) {
             console.log(`[Math] ⚙️ 正在推演策略: ${strategy.STRATEGY_ID} (${strategy.TRADE_MODE})`);
 
-            // 为当前策略单独进行时间切块与重采样 (因为 offset 不同，不能共享重采样结果)
             let df_4h_ready = alignAndResampleTo4H(all_klines_map, targetSymbols, strategy.TIME_OFFSET_MS);
 
-            // 独立产生交易日志
             let logs = generateHistoricalTradeLogs(df_4h_ready, strategy, targetSymbols);
 
-            // 注入标识符以作数据库存储区分
             logs.forEach(log => {
                 log.strategy_id = strategy.STRATEGY_ID;
             });
@@ -429,10 +414,28 @@ async function runUnifiedPipeline(env, ctx) {
 
         console.log(`[Math] 矩阵推演结束，所有策略共产生 ${fullSimulatedLogs.length} 条原始交易日志。`);
 
+        // 🔴 新增：计算真正的“共有时间交集”并写入最近推演时间
+        console.log(`[DB] 💾 更新系统状态 (共有数据时间范围与最后计算时间)...`);
+        let symbolMinTimes = [];
+        let symbolMaxTimes = [];
+        for (const sym of targetSymbols) {
+            let klines = all_klines_map[sym];
+            if (klines && klines.length > 0) {
+                symbolMinTimes.push(klines[0][0]);
+                symbolMaxTimes.push(klines[klines.length - 1][0]);
+            }
+        }
+        // 共有时间开始 = 各币种开始时间的最大值；共有时间结束 = 各币种结束时间的最小值
+        let commonDataStart = symbolMinTimes.length > 0 ? Math.max(...symbolMinTimes) : null;
+        let commonDataEnd = symbolMaxTimes.length > 0 ? Math.min(...symbolMaxTimes) : null;
+        let lastCalcTime = Date.now();
+
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS sys_status (id INTEGER PRIMARY KEY, common_data_start INTEGER, common_data_end INTEGER, last_calc_time INTEGER)").run();
+        await env.DB.prepare("INSERT OR REPLACE INTO sys_status (id, common_data_start, common_data_end, last_calc_time) VALUES (1, ?, ?, ?)").bind(commonDataStart, commonDataEnd, lastCalcTime).run();
+        // -------------------------------------------------------------
+
         console.log(`[DB] 🔍 从 D1 拉取历史信号库进行指纹比对...`);
-        // 拉取所有历史日志用于去重。因为可能存在无 strategy_id 的老数据，在此兼容处理
         const { results: existingLogs } = await env.DB.prepare("SELECT * FROM live_simulation_logs").all();
-        // 去重指纹升级：加入 strategy_id 作为联合主键概念
         const existingSet = new Set((existingLogs || []).map(l => `${l.strategy_id || 'UNKNOWN'}_${l.time}_${l.action}_${l.coin}`));
         console.log(`[DB] 历史信号库基数: ${existingSet.size} 条记录。开始去重过滤...`);
 
@@ -446,7 +449,6 @@ async function runUnifiedPipeline(env, ctx) {
 
         if (newLogsToInsert.length > 0) {
             console.log(`[DB] 💾 去重完成，准备写入 ${newLogsToInsert.length} 条全新信号记录！`);
-            // 🔴 注意：SQL 语句已加入 strategy_id 的插入
             const stmts = newLogsToInsert.map(log => {
                 return env.DB.prepare(
                     "INSERT INTO live_simulation_logs (strategy_id, time, action, coin, direction, price, reason) VALUES (?, ?, ?, ?, ?, ?, ?)"
@@ -495,24 +497,29 @@ export default {
                 if (!env.DB) throw new Error("D1 数据库未绑定！");
 
                 console.log(`[Router] 执行读链路 (CQRS Read)`);
-                // SELECT * 会自动抓取新加的 strategy_id 字段
                 const { results } = await env.DB.prepare("SELECT * FROM live_simulation_logs ORDER BY time DESC LIMIT 100").all();
 
+                // 🔴 修改：不再解析 JSON，直接从 sys_status 中获取最新计算的共享时间与推演时间
                 let dataStart = null;
                 let dataEnd = null;
+                let lastCalcTime = null;
                 try {
-                    const maxRes = await env.DB.prepare("SELECT MAX(last_updated) as maxT FROM kline_cache").first();
-                    if (maxRes && maxRes.maxT) dataEnd = maxRes.maxT;
-
-                    const minChunk = await env.DB.prepare("SELECT data FROM kline_cache WHERE symbol = 'BTCUSDT'").first();
-                    if (minChunk && minChunk.data) {
-                        const parsed = JSON.parse(minChunk.data);
-                        if (parsed.length > 0) dataStart = parsed[0][0];
+                    await env.DB.prepare("CREATE TABLE IF NOT EXISTS sys_status (id INTEGER PRIMARY KEY, common_data_start INTEGER, common_data_end INTEGER, last_calc_time INTEGER)").run();
+                    const statusRes = await env.DB.prepare("SELECT * FROM sys_status WHERE id = 1").first();
+                    if (statusRes) {
+                        dataStart = statusRes.common_data_start;
+                        dataEnd = statusRes.common_data_end;
+                        lastCalcTime = statusRes.last_calc_time;
                     }
-                } catch(e) { console.error(`[Router] ❌ 获取数据范围失败:`, e); }
+                } catch(e) { console.error(`[Router] ❌ 获取数据范围与系统状态失败:`, e); }
 
                 console.log(`[Router] 响应 /api/logs: 成功返回 ${results?.length || 0} 条历史记录`);
-                return new Response(JSON.stringify({ logs: results, dataStart: dataStart, dataEnd: dataEnd }), {
+                return new Response(JSON.stringify({
+                    logs: results,
+                    dataStart: dataStart,
+                    dataEnd: dataEnd,
+                    lastCalcTime: lastCalcTime // 返回新增的最近推演时间
+                }), {
                     headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
                 });
             }
