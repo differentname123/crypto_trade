@@ -720,7 +720,7 @@ if __name__ == "__main__":
         # 只要当前价格大于等于下限价格，就继续循环
         while initial_price >= min_price:
             print(f"\n=== 回测初始价格: {initial_price} ===")
-            if initial_price < base_initial_price * 0.3 or initial_price < min_price * 1.1:
+            if initial_price < base_initial_price * 0.1 or initial_price < min_price * 1.1:
                 initial_price = initial_price * 0.99
                 continue
 
