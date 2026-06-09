@@ -138,6 +138,9 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
 
     min_warmup = max(MOM_WINDOW, VOL_WINDOW, BTC_TREND_WINDOW)
 
+    # 🟢 【新增】：初始化信号诊断列表，默认填充为预热期
+    signal_reasons = ["无信号: 指标预热期"] * len(df)
+
     # 🟢 【新增】：解析指定的发车时间戳
     start_trade_timestamp = pd.to_datetime(start_trade_date) if start_trade_date else None
 
@@ -176,6 +179,26 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
         if start_trade_timestamp is not None and current_time < start_trade_timestamp:
             top_long_coins = []
             top_short_coins = []
+            # 🟢 【新增】：记录因为时间未到而无信号
+            signal_reasons[i] = "无信号: 未到设定的发车时间"
+        else:
+            # 🟢 【新增】：精细化记录当根 K 线的具体信号状态及原因
+            if is_btc_trend_on:
+                if trade_mode in ['BOTH', 'LONG_ONLY']:
+                    if top_long_coins:
+                        signal_reasons[i] = f"有信号 (做多): {', '.join(top_long_coins)}"
+                    else:
+                        signal_reasons[i] = "无信号: 大盘看多，但所有标的动量均不满足做多阈值"
+                else:
+                    signal_reasons[i] = "无信号: 大盘看多，但策略模式禁止做多"
+            else:
+                if trade_mode in ['BOTH', 'SHORT_ONLY']:
+                    if top_short_coins:
+                        signal_reasons[i] = f"有信号 (做空): {', '.join(top_short_coins)}"
+                    else:
+                        signal_reasons[i] = "无信号: 大盘看空，但所有标的动量均不满足做空阈值"
+                else:
+                    signal_reasons[i] = "无信号: 大盘看空，但策略模式禁止做空"
 
         # --- A. 平仓逻辑 ---
         for idx_c in range(n_coins):
@@ -292,6 +315,16 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
                             "top_k": TOP_K, "max_weight": MAX_WEIGHT
                         })
 
+    # 🟢 【新增】：循环结束后，将完整记录一键附加到原 df，完成状态溯源追踪
+    df['signal_status'] = signal_reasons
+
+    # # 1. 定义你的目标截止时间
+    # cutoff_time = pd.Timestamp('2026-04-27 02:00:00')
+    #
+    # # 2. 使用列表推导式保留时间在该节点之前的数据
+    # # (如果你想包含等于该时间点的数据，可以将 < 改为 <=)
+    # trade_logs = [log for log in trade_logs if log['time'] < cutoff_time]
+
     return pd.DataFrame(trade_logs)
 
 
@@ -364,7 +397,7 @@ def fetch_new_df():
     """
     raw_list = []
 
-    days = 80
+    days = 180
     symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
                    "DOGE/USDT:USDT"]
     for symbol in symbol_list:

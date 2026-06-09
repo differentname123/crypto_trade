@@ -23,6 +23,7 @@ def get_signals():
     current_positions = []
     history_records = []
     update_time = "--"
+    stats = None  # 新增：初始化统计数据对象
 
     if os.path.exists(CSV_FILE_PATH):
         try:
@@ -91,6 +92,24 @@ def get_signals():
             current_positions = list(active_positions.values())
             current_positions.sort(key=lambda x: x['open_time'], reverse=True)
 
+            # --- 新增：计算仪表盘所需的统计数据 ---
+            total_count = len(history_records)
+            # 过滤出 pnl 不为 None 且大于 0 的盈利次数
+            win_count = sum(1 for r in history_records if r.get('pnl') is not None and r['pnl'] > 0)
+            # 累加所有有效平仓的 pnl
+            total_pnl = sum(r['pnl'] for r in history_records if r.get('pnl') is not None)
+
+            stats = {
+                "total_pnl": round(total_pnl, 2),
+                "win_rate": (win_count / total_count * 100) if total_count > 0 else 0.0,
+                "win_count": win_count,
+                "total_count": total_count,
+                # 因为 raw_data 是按时间正序的，直接取第一条和最后一条的时间即可
+                "start_time": raw_data[0]['time'] if raw_data else "--",
+                "end_time": raw_data[-1]['time'] if raw_data else "--"
+            }
+            # --- 新增结束 ---
+
             # 历史记录也按平仓时间倒序（最新平仓的在最前）
             history_records.reverse()
 
@@ -100,7 +119,8 @@ def get_signals():
     return jsonify({
         "update_time": update_time,
         "current_positions": current_positions,
-        "history": history_records
+        "history": history_records,
+        "stats": stats  # 新增：将统计数据推给前端
     })
 
 

@@ -44,6 +44,47 @@
 
         <div v-if="!isLoading" class="flex-1 flex flex-col gap-4 overflow-hidden">
 
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 shrink-0">
+                <div class="bg-gray-800/80 rounded-xl p-3 border border-gray-700/50 shadow-sm flex flex-col justify-center gap-1.5">
+                    <div class="text-[11px] text-gray-400 flex items-center gap-1.5">
+                        💰 累计收益 (已平仓)
+                    </div>
+                    <div class="text-xl font-bold font-mono" :class="dashboardStats.pnlColor">
+                        {{ dashboardStats.pnlStr }}
+                    </div>
+                </div>
+
+                <div class="bg-gray-800/80 rounded-xl p-3 border border-gray-700/50 shadow-sm flex flex-col justify-center gap-1.5">
+                    <div class="text-[11px] text-gray-400 flex items-center gap-1.5">
+                        🏆 策略胜率
+                    </div>
+                    <div class="flex items-baseline gap-1.5 font-mono">
+                        <span class="text-xl font-bold text-white">{{ dashboardStats.winRateStr }}</span>
+                        <span class="text-[11px] text-gray-500">{{ dashboardStats.winRatioStr }}</span>
+                    </div>
+                </div>
+
+                <div class="bg-gray-800/80 rounded-xl p-3 border border-gray-700/50 shadow-sm flex flex-col justify-center gap-1">
+                    <div class="text-[11px] text-gray-400 flex items-center gap-1.5 mb-0.5">
+                        📊 共有数据时间范围
+                    </div>
+                    <div class="text-[11px] font-mono text-gray-200 flex flex-col">
+                        <div>{{ dashboardStats.timeStart }}</div>
+                        <div class="text-gray-500 text-[10px] my-0.5">至</div>
+                        <div>{{ dashboardStats.timeEnd }}</div>
+                    </div>
+                </div>
+
+                <div class="bg-gray-800/80 rounded-xl p-3 border border-gray-700/50 shadow-sm flex flex-col gap-1.5">
+                    <div class="text-[11px] text-gray-400 flex items-center gap-1.5">
+                        ⏱️ 最新推演计算时间
+                    </div>
+                    <div class="text-[11px] sm:text-xs font-mono text-gray-200 mt-auto mb-0.5">
+                        {{ dashboardStats.calcTime }}
+                    </div>
+                </div>
+            </div>
+
             <div class="shrink-0 flex flex-col gap-2">
                 <h2 class="text-sm sm:text-base font-semibold text-gray-400">当前持仓</h2>
 
@@ -133,13 +174,14 @@
     </div>
     {% endraw %}
     <script>
-        const { createApp, ref, onMounted } = Vue;
+        const { createApp, ref, onMounted, computed } = Vue;
 
         createApp({
             setup() {
                 const lastUpdateTime = ref('--');
                 const currentPositions = ref([]);
                 const historyRecords = ref([]);
+                const statsData = ref(null);
                 const isLoading = ref(true);
                 const isUpdating = ref(false);
 
@@ -150,6 +192,7 @@
                         currentPositions.value = result.current_positions || [];
                         historyRecords.value = result.history || [];
                         lastUpdateTime.value = result.update_time;
+                        statsData.value = result.stats || null;
                     } catch (error) {
                         console.error('获取数据失败:', error);
                     } finally {
@@ -195,6 +238,68 @@
                     return pnl > 0 ? 'text-green-400' : 'text-red-400';
                 };
 
+                // 自动计算面板所需的统计数据
+                const dashboardStats = computed(() => {
+                    let pnlStr = '--';
+                    let pnlColor = 'text-gray-400';
+                    let winRateStr = '--';
+                    let winRatioStr = '';
+                    let timeStart = '--';
+                    let timeEnd = '--';
+                    let calcTime = lastUpdateTime.value;
+
+                    const history = historyRecords.value;
+
+                    // --- 新增逻辑：每次拿总资金一半开仓，通过复利推演最终收益率 ---
+                    let calculatedTotalPnl = 0;
+                    if (history && history.length > 0) {
+                        let capitalFactor = 1.0;
+                        history.forEach(r => {
+                            const tradePnl = parseFloat(r.pnl) || 0;
+                            // 每次只使用一半本金，另一半本金不动
+                            // 本次交易后的本金比例 = 1 + 0.5 * (交易收益率 / 100)
+                            capitalFactor *= (1 + 0.5 * (tradePnl / 100));
+                        });
+                        calculatedTotalPnl = (capitalFactor - 1) * 100;
+                    }
+                    // -------------------------------------------------------------
+
+                    if (statsData.value) {
+                        // 如果后端接口返回了 stats 对象，覆盖胜率等数据
+                        // 【强制干预】：使用前端复利推演出的累计收益，忽略后端原有的绝对加法 total_pnl
+                        const pnl = (history && history.length > 0) ? calculatedTotalPnl : (statsData.value.total_pnl || 0);
+                        pnlStr = (pnl > 0 ? '+' : '') + parseFloat(pnl).toFixed(2) + '%';
+                        pnlColor = pnl > 0 ? 'text-green-400' : (pnl < 0 ? 'text-red-400' : 'text-gray-400');
+
+                        const rate = statsData.value.win_rate || 0;
+                        const displayRate = rate <= 1 ? (rate * 100) : rate;
+                        winRateStr = parseFloat(displayRate).toFixed(2) + '%';
+                        winRatioStr = `(${statsData.value.win_count || 0}/${statsData.value.total_count || 0})`;
+
+                        timeStart = statsData.value.start_time || '--';
+                        timeEnd = statsData.value.end_time || '--';
+                    } else {
+                        // 降级方案
+                        if (history && history.length > 0) {
+                            const total = history.length;
+                            const wins = history.filter(r => (parseFloat(r.pnl) || 0) > 0).length;
+
+                            const totalPnl = calculatedTotalPnl; // 替换原本的累加逻辑
+
+                            pnlStr = (totalPnl > 0 ? '+' : '') + totalPnl.toFixed(2) + '%';
+                            pnlColor = totalPnl > 0 ? 'text-green-400' : (totalPnl < 0 ? 'text-red-400' : 'text-gray-400');
+
+                            winRateStr = ((wins / total) * 100).toFixed(2) + '%';
+                            winRatioStr = `(${wins}/${total})`;
+
+                            timeStart = history[history.length - 1].open_time || '--';
+                            timeEnd = history[0].close_time || history[0].open_time || '--';
+                        }
+                    }
+
+                    return { pnlStr, pnlColor, winRateStr, winRatioStr, timeStart, timeEnd, calcTime };
+                });
+
                 onMounted(() => {
                     fetchLocalData().then(() => {
                         triggerUpdate();
@@ -211,7 +316,8 @@
                     formatDirection,
                     formatWeight,
                     formatPnl,
-                    getPnlColor
+                    getPnlColor,
+                    dashboardStats
                 };
             }
         }).mount('#app');
