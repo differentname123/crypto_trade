@@ -576,7 +576,7 @@ def batch_backtest_grid_ratios(df, output_csv, leverage=100, fee_rate=0.0005, lo
     # --- 构造多进程任务参数池 ---
     tasks = []
     # 从 10 遍历到 200，对应 0.001 到 0.0199...
-    for i in range(1, 500):
+    for i in range(30, 300):
         grid_ratio = round(i * 0.0001, 5)
         tasks.append({
             'df': df,
@@ -684,7 +684,7 @@ if __name__ == "__main__":
                 "abs_high_price": abs_high_price,
                 "abs_low_price": abs_low_price
             }
-
+            print(f"{coin_name} 的绝对最高价: {abs_high_price}, 绝对最低价: {abs_low_price}")
             # 时间列转换
             if 'open_time' in temp_df.columns:
                 temp_df['time'] = pd.to_datetime(temp_df['open_time'], unit='ms')
@@ -719,14 +719,14 @@ if __name__ == "__main__":
 
         # 只要当前价格大于等于下限价格，就继续循环
         while initial_price >= min_price:
-            print(f"\n=== 回测初始价格: {initial_price} ===")
-            if initial_price < base_initial_price * 0.1 or initial_price < min_price * 1.1:
-                initial_price = initial_price * 0.99
+            print(f"\n=== 回测初始价格: {initial_price} {min_price * 1.1}===")
+            if initial_price < min_price * 1.3:
+                initial_price = initial_price * 0.98
                 continue
 
             output_csv_path = csv_file_path.replace(".csv", f"_grid_backtest_results_{initial_price}.csv")
             if os.path.exists(output_csv_path):
-                initial_price = initial_price * 0.99
+                initial_price = initial_price * 0.98
                 continue
 
             try:
@@ -745,7 +745,7 @@ if __name__ == "__main__":
                     # temp_df1['max_dd'] = max_dd  # 添加一列记录当前的最小价格
 
                     temp_df1.to_csv(output_csv_path, index=False, encoding='utf-8-sig')  # 重新保存覆盖原文件
-                    initial_price = initial_price * 0.99
+                    initial_price = initial_price * 0.98
                     continue
 
             except FileNotFoundError:
@@ -753,4 +753,4 @@ if __name__ == "__main__":
                 print(f"找不到文件: {csv_file_path}，请检查路径。")
 
             # 每次回测后，价格降低当前值的 1%
-            initial_price = initial_price * 0.99
+            initial_price = initial_price * 0.98
