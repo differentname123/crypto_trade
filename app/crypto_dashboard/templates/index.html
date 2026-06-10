@@ -14,7 +14,7 @@
 <body class="bg-gray-900 text-white font-sans min-h-screen">
 
     {% raw %}
-    <div id="app" class="max-w-3xl mx-auto p-4 flex flex-col h-screen">
+    <div id="app" class="max-w-3xl mx-auto p-4 flex flex-col">
 
         <header class="flex justify-between items-center pb-3 border-b border-gray-700 mb-3 shrink-0">
             <h1 class="text-lg font-bold text-blue-400 flex items-center gap-1">
@@ -42,12 +42,18 @@
             </div>
         </header>
 
-        <div v-if="!isLoading" class="flex-1 flex flex-col gap-4 overflow-hidden">
+        <div v-if="!isLoading" class="flex-1 flex flex-col gap-4">
 
             <div class="grid grid-cols-2 md:grid-cols-4 gap-3 shrink-0">
                 <div class="bg-gray-800/80 rounded-xl p-3 border border-gray-700/50 shadow-sm flex flex-col justify-center gap-1.5">
-                    <div class="text-[11px] text-gray-400 flex items-center gap-1.5">
-                        💰 累计收益 (已平仓)
+                    <div class="text-[11px] text-gray-400 flex items-center justify-between w-full">
+                        <span>💰 累计收益</span>
+                        <!-- 使用 v-for 循环生成 1 到 100 的选项 -->
+                        <select v-model.number="positionRatio" class="bg-gray-900 border border-gray-700 text-gray-300 rounded text-[10px] px-1 py-0.5 outline-none cursor-pointer">
+                            <option v-for="n in 100" :key="n" :value="n / 100">
+                                {{ n === 100 ? '满仓' : n + '%仓' }}
+                            </option>
+                        </select>
                     </div>
                     <div class="text-xl font-bold font-mono" :class="dashboardStats.pnlColor">
                         {{ dashboardStats.pnlStr }}
@@ -124,7 +130,7 @@
                 </div>
             </div>
 
-            <div class="flex-1 overflow-y-auto no-scrollbar pb-6 mt-1">
+            <div class="no-scrollbar pb-6 mt-1">
                 <h2 class="text-sm sm:text-base font-semibold text-gray-400 mb-2">历史记录 (已平仓)</h2>
 
                 <div v-if="historyRecords.length === 0" class="text-center text-gray-500 text-xs mt-4">
@@ -173,6 +179,7 @@
 
     </div>
     {% endraw %}
+
     <script>
         const { createApp, ref, onMounted, computed } = Vue;
 
@@ -184,6 +191,9 @@
                 const statsData = ref(null);
                 const isLoading = ref(true);
                 const isUpdating = ref(false);
+
+                // 前端绑定的仓位占比变量，默认 0.5 (50%)
+                const positionRatio = ref(0.5);
 
                 const fetchLocalData = async () => {
                     try {
@@ -250,15 +260,16 @@
 
                     const history = historyRecords.value;
 
-                    // --- 新增逻辑：每次拿总资金一半开仓，通过复利推演最终收益率 ---
+                    // --- 根据前端选择的仓位比例，通过复利推演最终收益率 ---
                     let calculatedTotalPnl = 0;
                     if (history && history.length > 0) {
                         let capitalFactor = 1.0;
+                        const ratio = positionRatio.value; // 读取用户选择的比例
                         history.forEach(r => {
                             const tradePnl = parseFloat(r.pnl) || 0;
-                            // 每次只使用一半本金，另一半本金不动
-                            // 本次交易后的本金比例 = 1 + 0.5 * (交易收益率 / 100)
-                            capitalFactor *= (1 + 0.5 * (tradePnl / 100));
+                            // 每次使用选择的本金比例
+                            // 本次交易后的本金比例 = 1 + 用户选择比例 * (交易收益率 / 100)
+                            capitalFactor *= (1 + ratio * (tradePnl / 100));
                         });
                         calculatedTotalPnl = (capitalFactor - 1) * 100;
                     }
@@ -312,6 +323,7 @@
                     historyRecords,
                     isLoading,
                     isUpdating,
+                    positionRatio,
                     triggerUpdate,
                     formatDirection,
                     formatWeight,

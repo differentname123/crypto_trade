@@ -333,14 +333,14 @@ def generate_historical_trade_logs(df: pd.DataFrame, params: dict, trade_mode: s
 # ==========================================
 def run_live_pipeline(raw_minute_df_list):
     BEST_PARAMS = {
-        'MOM_WINDOW': 48,
-        'VOL_WINDOW': 42,
-        'BTC_TREND_WINDOW': 120,
-        'MAX_WEIGHT': 0.5,
-        'TOP_K': 1
+        'MOM_WINDOW': 90,
+        'VOL_WINDOW': 120,
+        'BTC_TREND_WINDOW': 720,
+        'MAX_WEIGHT': 0.05,
+        'TOP_K': 3
     }
-    TIME_OFFSET = '2h'
-    TRADE_MODE = 'LONG_ONLY'
+    TIME_OFFSET = '0h'
+    TRADE_MODE = 'SHORT_ONLY'
 
     print("⏳ 1. 正在将分钟级数据组装为 4H 矩阵...")
     df_4h_ready = preprocess_minute_data(raw_minute_df_list, time_offset=TIME_OFFSET)
@@ -397,7 +397,7 @@ def fetch_new_df():
     """
     raw_list = []
 
-    days = 180
+    days = 300
     symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "XRP/USDT:USDT", "BNB/USDT:USDT",
                    "DOGE/USDT:USDT"]
     for symbol in symbol_list:
