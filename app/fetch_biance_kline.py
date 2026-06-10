@@ -26,8 +26,8 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5):
             'defaultType': 'swap',  # ⚠️ 核心修正：强制指定为永续合约市场
         },
         'proxies': {
-            'http': 'http://127.0.0.1:7892',  # 请根据实际运行环境决定是否注释
-            'https': 'http://127.0.0.1:7892',
+            'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
+            'https': 'http://127.0.0.1:7890',
         },
     })
 
