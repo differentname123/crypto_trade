@@ -146,7 +146,8 @@ def get_symbol_status(exchange, symbol):
 # ==========================================
 # 3. 核心交易模块：极致纯粹的执行器
 # ==========================================
-def execute_order(exchange, symbol, side, amount, client_oid, order_type='market', price=None, reduce_only=False):
+def execute_order(exchange, symbol, side, amount, client_oid, order_type='market', price=None, reduce_only=False,
+                  position_side="LONG"):
     """
     执行单次下单意图，内置网络断联(UNKNOWN)与业务拒单(REJECT)的隔离处理。
 
@@ -158,6 +159,7 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
     :param order_type: 订单类型，支持 "market" (市价), "limit" (限价), "maker" (只做 Maker 限价单) (默认: 'market')
     :param price: 触发价格，当 order_type 为 "limit" 或 "maker" 时必填 (默认: None)
     :param reduce_only: 是否只减仓。平仓时务必设为 True，防止因为超额平仓变成反向开仓 (默认: False)
+    :param position_side: 持仓方向，支持 "LONG" (多仓) 或 "SHORT" (空仓)。双向持仓模式下必填！(默认: None)
     :return: ExecResult 实例。
              若返回 ExecStatus.UNKNOWN，切勿盲目重试下单，必须通过后台服务用 client_oid 轮询核对真实状态！
     """
@@ -167,6 +169,10 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
     if reduce_only:
         params['reduceOnly'] = True
 
+    # 【核心修改点】：适配双向持仓模式，向交易所透传 positionSide
+    if position_side:
+        params['positionSide'] = position_side.upper()
+
     ccxt_type = 'limit' if order_type in ['limit', 'maker'] else 'market'
     if ccxt_type == 'limit' and price is None:
         return ExecResult(ExecStatus.REJECT, client_oid, error_msg="限价单必须提供 price 参数")
@@ -174,8 +180,10 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
         params['postOnly'] = True
 
     try:
+        # 日志加上 position_side 的打印，保持排查链路的完整性
+        pos_side_str = f" | 持仓方向:{position_side.upper()}" if position_side else ""
         logger.info(
-            f"[ACTION] 下单意图 | CID:{client_oid} | {symbol} {side.upper()} | 量:{amount} | 类:{order_type} | 价:{price} | 仅减仓:{reduce_only}")
+            f"[ACTION] 下单意图 | CID:{client_oid} | {symbol} {side.upper()}{pos_side_str} | 量:{amount} | 类:{order_type} | 价:{price} | 仅减仓:{reduce_only}")
 
         order = exchange.create_order(
             symbol=symbol, type=ccxt_type, side=side, amount=amount, price=price, params=params
@@ -195,7 +203,6 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
         latency = int((time.perf_counter() - t0) * 1000)
         logger.error(f"[REJECT] 业务拒单 | CID:{client_oid} | {e} | 耗时:{latency}ms")
         return ExecResult(ExecStatus.REJECT, client_oid, latency_ms=latency, error_msg=str(e))
-
 
 def cancel_single_order(exchange, symbol, order_id, is_client_id=False):
     """
@@ -263,7 +270,7 @@ if __name__ == "__main__":
     # 1. 填入你的测试 API 密钥（建议使用币安测试网）
     API_KEY = get_config('nana_biance_api_key')
     SECRET_KEY = get_config('nana_biance_api_secret')
-    SYMBOL = "BTC/USDT"
+    SYMBOL = "BTC/USDT:USDT"
 
     try:
         # 注意：如果在境内测试，可能需要传 proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
@@ -283,35 +290,35 @@ if __name__ == "__main__":
     print("\n--- 场景 2: 上层策略发出防呆拦截指令 ---")
     # 模拟上层传了错误参数（限价单忘记传价格）
     bad_intent_id = f"open_bad_{uuid.uuid4().hex[:8]}"
-    res_bad = execute_order(bot_exchange, SYMBOL, "buy", 0.001, bad_intent_id, order_type="limit")
+    res_bad = execute_order(bot_exchange, SYMBOL, "buy", 0.001, bad_intent_id, order_type="limit",price=60000)
 
     if res_bad.status == ExecStatus.REJECT:
         print(f"被基座直接挡回: {res_bad.error_msg}")
         print("策略引擎: 幸好没发出去，调整参数重新计算。")
-
-    print("\n--- 场景 3: 正常的平仓意图 (使用 reduceOnly 防翻转) ---")
-    # 主策略决定平仓，主动生成绝对唯一的意图 ID
-    close_intent_id = f"close_pos_{uuid.uuid4().hex[:8]}"
-
-    res_close = execute_order(
-        exchange=bot_exchange,
-        symbol=SYMBOL,
-        side="sell",  # 平多仓
-        amount=100.0,  # 直接给个极大值
-        client_oid=close_intent_id,
-        reduce_only=True  # 核心保护
-    )
-
-    # ！！！上层主策略的终极处理范式 ！！！
-    if res_close.status == ExecStatus.OK:
-        print(f"策略引擎: 平仓成功！交易所单号是 {res_close.exchange_oid}，耗时 {res_close.latency_ms} ms。")
-        # 此时可以去更新本地的记账数据库或持仓状态
-
-    elif res_close.status == ExecStatus.REJECT:
-        print(f"策略引擎: 平仓被拒 ({res_close.error_msg})。")
-        # 往往是因为刚才根本没仓位，或者余额不足，这种明确被拒的单子，主策略直接忽略即可，不要重试。
-
-    elif res_close.status == ExecStatus.UNKNOWN:
-        print(f"策略引擎: 🚨 警报！发生薛定谔状态！单号 {close_intent_id} 失联！")
-        # 将该单号推入后台的 Redis 队列或死信队列。
-        # 后台会有一个独立的 Reconciler（对账协程），每隔 5 秒去调用 get_single_order_status 查这个 CID，直到确认它是成交还是被废弃。
+    #
+    # print("\n--- 场景 3: 正常的平仓意图 (使用 reduceOnly 防翻转) ---")
+    # # 主策略决定平仓，主动生成绝对唯一的意图 ID
+    # close_intent_id = f"close_pos_{uuid.uuid4().hex[:8]}"
+    #
+    # res_close = execute_order(
+    #     exchange=bot_exchange,
+    #     symbol=SYMBOL,
+    #     side="sell",  # 平多仓
+    #     amount=100.0,  # 直接给个极大值
+    #     client_oid=close_intent_id,
+    #     reduce_only=True  # 核心保护
+    # )
+    #
+    # # ！！！上层主策略的终极处理范式 ！！！
+    # if res_close.status == ExecStatus.OK:
+    #     print(f"策略引擎: 平仓成功！交易所单号是 {res_close.exchange_oid}，耗时 {res_close.latency_ms} ms。")
+    #     # 此时可以去更新本地的记账数据库或持仓状态
+    #
+    # elif res_close.status == ExecStatus.REJECT:
+    #     print(f"策略引擎: 平仓被拒 ({res_close.error_msg})。")
+    #     # 往往是因为刚才根本没仓位，或者余额不足，这种明确被拒的单子，主策略直接忽略即可，不要重试。
+    #
+    # elif res_close.status == ExecStatus.UNKNOWN:
+    #     print(f"策略引擎: 🚨 警报！发生薛定谔状态！单号 {close_intent_id} 失联！")
+    #     # 将该单号推入后台的 Redis 队列或死信队列。
+    #     # 后台会有一个独立的 Reconciler（对账协程），每隔 5 秒去调用 get_single_order_status 查这个 CID，直到确认它是成交还是被废弃。
