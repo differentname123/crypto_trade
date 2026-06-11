@@ -258,6 +258,24 @@ def cancel_all_orders(exchange, symbol):
         logger.error(f"[REJECT] {symbol} 全撤失败: {e}")
         return False
 
+# 将此函数添加到你的 base_trader.py 中
+def get_total_equity(exchange):
+    """
+    获取 U本位合约账户的整体总权益 (包含所有币种折算成USD的价值)
+    """
+    t0 = time.perf_counter()
+    try:
+        balance = exchange.fetch_balance()
+        # totalWalletBalance 代表所有资产折算的总钱包余额
+        total_equity = float(balance['info']['totalWalletBalance'])
+        latency = int((time.perf_counter() - t0) * 1000)
+        logger.info(f"[EQUITY_OK] 耗时:{latency}ms | 账户总权益: {total_equity:.2f} USD")
+        return ExecStatus.OK, total_equity
+    except Exception as e:
+        latency = int((time.perf_counter() - t0) * 1000)
+        logger.error(f"[EQUITY_REJECT] 获取账户总权益失败 耗时:{latency}ms | {e}")
+        return ExecStatus.REJECT, 0.0
+
 
 # ==========================================
 # 5. 上层应用模拟 (Main 演示)
@@ -279,7 +297,7 @@ if __name__ == "__main__":
     except Exception:
         print(">>> 交易所初始化失败，程序退出。")
         exit(1)
-
+    get_total_equity(bot_exchange)
     print("\n--- 场景 1: 开机状态检查 ---")
     status, usdt, pos = get_symbol_status(bot_exchange, SYMBOL)
     if status == ExecStatus.OK:
