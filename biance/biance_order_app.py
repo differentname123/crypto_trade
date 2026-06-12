@@ -18,7 +18,7 @@ from common.common_utils import get_config
 # ==========================================
 SIGNAL_FILE = r'W:\project\python_project\crypto_trade\app\crypto_dashboard\live_simulation_logs.csv'
 TRADE_RECORD_FILE = "trade_records.csv"
-POSITION_RISK_RATIO = 0.10  # 每次开仓占总资产的 10%
+POSITION_RISK_RATIO = 0.90  # 每次开仓占总资产的 10%
 
 
 # ==========================================
@@ -106,10 +106,10 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache):
     except Exception as e:
         logger.error(f"读取信号文件失败: {e}")
         return
-
+    timedelta_minutes = 60 * 24 * 10
     # 2. 严格筛选当前整点的信号 (容差放宽至前后 1 分钟以防文件生成有微小偏差)
-    time_lower = target_time - timedelta(minutes=1)
-    time_upper = target_time + timedelta(minutes=1)
+    time_lower = target_time - timedelta(minutes=timedelta_minutes)
+    time_upper = target_time + timedelta(minutes=timedelta_minutes)
     current_signals = df[(df['time'] >= time_lower) & (df['time'] <= time_upper)]
 
     if current_signals.empty:
@@ -229,7 +229,7 @@ def run_scheduler():
     except Exception:
         logger.critical("交易所初始化失败，程序退出。")
         return
-    total_equity, position_cache = preload_account_state(exchange)
+    # total_equity, position_cache = preload_account_state(exchange)
 
     logger.info(">>> 应用层启动完成！进入调度循环...")
 
@@ -241,22 +241,22 @@ def run_scheduler():
         # 预加载时间设为整点前 1 分钟 (如 13:59:00)
         preload_time = next_hour - timedelta(minutes=1)
 
-        # 阶段一：等待到达预加载时间
-        if now < preload_time:
-            sleep_sec = (preload_time - now).total_seconds()
-            logger.info(f"睡眠 {sleep_sec:.0f}s，等待数据预加载时间: {preload_time.strftime('%H:%M:%S')}")
-            time.sleep(sleep_sec)
+        # # 阶段一：等待到达预加载时间
+        # if now < preload_time:
+        #     sleep_sec = (preload_time - now).total_seconds()
+        #     logger.info(f"睡眠 {sleep_sec:.0f}s，等待数据预加载时间: {preload_time.strftime('%H:%M:%S')}")
+        #     time.sleep(sleep_sec)
 
         # ----------- 触发预加载 -----------
         total_equity, position_cache = preload_account_state(exchange)
 
-        # 阶段二：精细等待到达整点 (XX:00:00)
-        now = datetime.now()
-        if now < next_hour:
-            # 增加 0.5 秒的微小冗余，确保上游的 CSV 文件在整点准时生成并完全刷入磁盘
-            sleep_sec_final = (next_hour - now).total_seconds() + 0.5
-            logger.info(f"缓存完毕！屏息倒计时 {sleep_sec_final:.1f}s 准备拔枪...")
-            time.sleep(sleep_sec_final)
+        # # 阶段二：精细等待到达整点 (XX:00:00)
+        # now = datetime.now()
+        # if now < next_hour:
+        # 增加 0.5 秒的微小冗余，确保上游的 CSV 文件在整点准时生成并完全刷入磁盘
+        sleep_sec_final = (next_hour - now).total_seconds() + 0.5
+        # logger.info(f"缓存完毕！屏息倒计时 {sleep_sec_final:.1f}s 准备拔枪...")
+        # time.sleep(sleep_sec_final)
 
         # ----------- 极速拔枪 -----------
         execute_signals_fast(exchange, next_hour, total_equity, position_cache)

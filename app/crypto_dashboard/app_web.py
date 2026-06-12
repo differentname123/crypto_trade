@@ -4,8 +4,8 @@ import os
 import math
 from datetime import datetime
 
-# 假设你的 fetch_new_df 已经导入
-from app.crypto_dashboard.run_cross_signal import fetch_new_df
+# 假设你的 execute_trading_bot_workflow 已经导入
+from app.crypto_dashboard.run_cross_signal import execute_trading_bot_workflow
 
 app = Flask(__name__)
 
@@ -128,7 +128,7 @@ def get_signals():
 @app.route('/api/update', methods=['POST'])
 def update_signals():
     try:
-        fetch_new_df()  # 耗时操作
+        execute_trading_bot_workflow()  # 耗时操作
         return jsonify({"status": "success", "message": "数据更新完成"})
     except Exception as e:
         print(f"拉取新数据报错: {e}")
