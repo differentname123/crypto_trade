@@ -5,6 +5,7 @@ import pandas as pd
 import csv
 from datetime import datetime, timedelta
 
+from app.crypto_dashboard.run_cross_signal import execute_trading_bot_workflow
 # 从基础文件中导入核心组件 (假设基础文件名为 base_trader.py)
 # 确保 base_trader.py 中已经添加了上一轮我给你的 get_total_equity 函数
 from biance_order import (
@@ -369,14 +370,12 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
         logger.error(f"[FAIL] {client_oid} 失败/拒绝: {result.error_msg}")
 
 
-# ==========================================
-# 4. 高效调度器
-# ==========================================
 def run_scheduler():
     """
-    智能双阶段调度器：
-    1. 休眠到 XX:59:00 -> 唤醒获取并缓存资产和持仓
-    2. 休眠到 XX:00:00 -> 精确执行本地文件信号
+    智能三阶段调度器：
+    1. 休眠到 XX:50:00 -> 唤醒执行 execute_trading_bot_workflow 生成最新信号
+    2. 休眠到 XX:59:00 -> 唤醒获取并缓存资产和持仓
+    3. 休眠到 XX:00:00 -> 精确执行本地文件信号
     """
     API_KEY = get_config('nana_biance_api_key')
     SECRET_KEY = get_config('nana_biance_api_secret')
@@ -389,7 +388,6 @@ def run_scheduler():
     except Exception:
         logger.critical("交易所初始化失败，程序退出。")
         return
-    # total_equity, position_cache = preload_account_state(exchange)
 
     logger.info(">>> 应用层启动完成！进入调度循环...")
 
@@ -398,29 +396,69 @@ def run_scheduler():
 
         # 计算下一个整点时间 (如 14:00:00)
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        # 工作流执行时间设为整点前 10 分钟 (如 13:50:00)
+        workflow_time = next_hour - timedelta(minutes=10)
         # 预加载时间设为整点前 1 分钟 (如 13:59:00)
         preload_time = next_hour - timedelta(minutes=1)
+        # [优化点] 统一计算包含 0.5 秒冗余的目标拔枪时间 (如 14:00:00.500)
+        target_exec_time = next_hour + timedelta(seconds=0.5)
 
-        # # 阶段一：等待到达预加载时间
-        # if now < preload_time:
-        #     sleep_sec = (preload_time - now).total_seconds()
-        #     logger.info(f"睡眠 {sleep_sec:.0f}s，等待数据预加载时间: {preload_time.strftime('%H:%M:%S')}")
-        #     time.sleep(sleep_sec)
+        # 阶段一：等待到达信号生成工作流时间 (XX:50:00)
+        if now < workflow_time:
+            sleep_sec = (workflow_time - now).total_seconds()
+            logger.info(f"睡眠 {sleep_sec:.0f}s，等待信号生成任务时间: {workflow_time.strftime('%H:%M:%S')}")
+            # [深度优化] 放弃单次大段 sleep，改用每秒检查的细粒度轮询。
+            # 防止服务器系统时间 NTP 同步跳跃导致的长眠不醒。
+            while datetime.now() < workflow_time:
+                time.sleep(1)
+
+        # ----------- 触发信号生成工作流 -----------
+        # 再次获取当前时间，为了兼容刚好在 50~59分之间启动程序的补跑逻辑
+        now = datetime.now()
+        if now < preload_time:
+            logger.info(">>> [WORKFLOW] 开始执行交易机器人工作流 (生成最新信号)...")
+            try:
+                execute_trading_bot_workflow()
+                logger.info(">>> [WORKFLOW] 信号生成完成！")
+            except Exception as e:
+                logger.error(f">>> [WORKFLOW] 信号生成工作流执行异常: {e}")
+
+        # 阶段二：等待到达预加载时间 (XX:59:00)
+        now = datetime.now()
+        if now < preload_time:
+            sleep_sec = (preload_time - now).total_seconds()
+            logger.info(f"睡眠 {sleep_sec:.0f}s，等待数据预加载时间: {preload_time.strftime('%H:%M:%S')}")
+            # [深度优化] 同样使用细粒度休眠，确保精准衔接到 59 分 00 秒
+            while datetime.now() < preload_time:
+                time.sleep(1)
 
         # ----------- 触发预加载 -----------
         total_equity, position_cache, open_order_cache = preload_account_state(exchange)
 
-        # # 阶段二：精细等待到达整点 (XX:00:00)
-        # now = datetime.now()
-        # if now < next_hour:
-        # 增加 0.5 秒的微小冗余，确保上游的 CSV 文件在整点准时生成并完全刷入磁盘
-        sleep_sec_final = (next_hour - now).total_seconds() + 0.5
-        # logger.info(f"缓存完毕！屏息倒计时 {sleep_sec_final:.1f}s 准备拔枪...")
-        # time.sleep(sleep_sec_final)
+        # 阶段三：精细等待到达目标拔枪时间 (XX:00:00.500)
+        now = datetime.now()
+        if now < target_exec_time:
+            sleep_sec_final = (target_exec_time - now).total_seconds()
+            logger.info(f"缓存完毕！屏息倒计时 {sleep_sec_final:.1f}s 准备拔枪...")
+
+            # [深度优化] 量化级混合精度等待 (普通休眠 + 极速自旋锁)
+            while True:
+                current_now = datetime.now()
+                remaining_time = (target_exec_time - current_now).total_seconds()
+
+                if remaining_time <= 0:
+                    break  # 时间到，立即出锁
+                elif remaining_time > 0.05:
+                    # 距离目标时间大于 50 毫秒，使用短暂 sleep 让出 CPU 给其他系统进程
+                    time.sleep(0.01)
+                else:
+                    # 剩余最后不到 50 毫秒！
+                    # 此时严禁使用 time.sleep()。直接执行 pass 进入死循环自旋（Spin-wait）。
+                    # 虽然会在这 50 毫秒内霸占单核 100% CPU，但能彻底消除操作系统线程调度造成的延迟，实现真正的微秒级同步。
+                    pass
 
         # ----------- 极速拔枪 -----------
         execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache)
-        time.sleep(100)
 
 
 if __name__ == "__main__":
