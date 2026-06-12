@@ -34,23 +34,131 @@ def record_trade(row, actual_time, total_equity, risk_ratio, target_value, amoun
     with open(TRADE_RECORD_FILE, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
-            # 表头：包含原始信号信息 + 实际执行信息 + 资产与风控信息
+            # 表头：包含原始信号信息 + 实际执行信息 + 资产与风控信息 (新增 update_time)
             writer.writerow([
                 "signal_time", "action", "coin", "direction", "event", "signal_price",
-                "actual_trade_time", "total_equity", "risk_ratio", "target_value", "exec_amount",
+                "actual_trade_time", "update_time", "total_equity", "risk_ratio", "target_value", "exec_amount",
                 "exec_status", "client_oid", "exchange_oid", "error_msg"
             ])
 
+        # 初始发单时，更新时间 (update_time) 等于实际发单时间 (actual_time)
         writer.writerow([
             row['time'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(row['time'], pd.Timestamp) else row['time'],
             row['action'], row['coin'], row['direction'], row['event'], row['price'],
-            actual_time, total_equity, risk_ratio, target_value, amount, status.value, client_oid, exchange_oid, msg
+            actual_time, actual_time, total_equity, risk_ratio, target_value, amount, status.value, client_oid,
+            exchange_oid, msg
         ])
 
 
 # ==========================================
-# 2. 状态缓存 (解决延迟问题)
+# 2. 状态缓存 (解决延迟问题) & 挂单管理
 # ==========================================
+def sync_and_clean_orders(exchange, open_order_cache):
+    """
+    1. 同步 trade_records.csv 中的订单状态 (从挂单转为成交或取消)，并刷新 update_time。
+    2. 发现 signal_time 超过 1 天的挂单执行撤销，维护撤销状态及更新时间。
+    """
+    logger.info(">>> [SYNC] 开始同步订单状态与清理超时挂单...")
+    if not os.path.isfile(TRADE_RECORD_FILE):
+        return open_order_cache
+
+    try:
+        df = pd.read_csv(TRADE_RECORD_FILE)
+    except Exception as e:
+        logger.error(f"[SYNC] 读取记录文件失败: {e}")
+        return open_order_cache
+
+    if df.empty:
+        return open_order_cache
+
+    # 兼容历史没有 update_time 字段的文件
+    if 'update_time' not in df.columns:
+        df['update_time'] = df['actual_trade_time']
+
+    # 【核心修复】：强制将可能写入文本的列转换为 object (字符串) 类型。
+    # 解决因列全为空值被 Pandas 推断为 float64，导致写入字符串时抛出 TypeError/LossySetitemError 的问题。
+    cols_to_cast = ['exec_status', 'error_msg', 'update_time', 'exchange_oid']
+    for col in cols_to_cast:
+        if col in df.columns:
+            df[col] = df[col].astype(object)
+
+    now = datetime.now()
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
+    has_changes = False
+
+    # 构建快速检索字典: exchange_oid -> order
+    open_order_dict = {}
+    for sym, orders in open_order_cache.items():
+        for o in orders:
+            open_order_dict[str(o.get('id'))] = o
+
+    # 遍历更新订单记录
+    for index, row in df.iterrows():
+        status = str(row.get('exec_status', ''))
+        exch_oid = str(row.get('exchange_oid', ''))
+        client_oid = str(row.get('client_oid', ''))
+
+        # 定义终态 (无需再向交易所查询的最终状态)
+        terminal_states = ['FAIL', 'closed', 'canceled', 'CANCELED_SUCCESS', 'CANCELED_FAIL']
+        if status in terminal_states or not exch_oid or exch_oid == 'nan':
+            continue
+
+        sym = f"{row['coin']}/USDT:USDT"
+        try:
+            sig_time = pd.to_datetime(row['signal_time'])
+        except Exception:
+            continue  # 日期解析异常直接跳过
+
+        # 情况 A: 订单仍在活动挂单缓存中
+        if exch_oid in open_order_dict:
+            # 校验超时 (大于 1 天)
+            if (now - sig_time) > timedelta(days=1):
+                logger.info(f"[CLEANUP] 发现超时1天的挂单: {client_oid}，开始执行撤单...")
+                try:
+                    exchange.cancel_order(exch_oid, sym)
+                    df.at[index, 'exec_status'] = 'CANCELED_SUCCESS'
+                    df.at[index, 'error_msg'] = '系统自动清理超时(>1天)挂单: 成功'
+                    df.at[index, 'update_time'] = now_str
+                    logger.info(f"[CLEANUP] 撤销成功: {client_oid}")
+
+                    # 撤单成功后，将其从内存 cache 剔除，防止本轮后续判断受阻
+                    open_order_cache[sym] = [o for o in open_order_cache[sym] if str(o.get('id')) != exch_oid]
+                    has_changes = True
+                except Exception as e:
+                    df.at[index, 'exec_status'] = 'CANCELED_FAIL'
+                    df.at[index, 'error_msg'] = f'自动清理超时撤单失败: {e}'
+                    df.at[index, 'update_time'] = now_str
+                    logger.error(f"[CLEANUP] 撤销超时挂单失败: {client_oid}, 原因: {e}")
+                    has_changes = True
+            else:
+                # 尚未超时，同步状态标记为明确的 open (刚下发时可能是 OK)
+                if status != 'open':
+                    df.at[index, 'exec_status'] = 'open'
+                    df.at[index, 'update_time'] = now_str
+                    has_changes = True
+
+        # 情况 B: 订单已不在挂单池中，说明其已成交或被外部取消
+        else:
+            try:
+                # 追溯它的最终状态
+                fetched_order = exchange.fetch_order(exch_oid, sym)
+                new_status = fetched_order.get('status', status)  # ccxt 标准通常返回 'closed' 或 'canceled'
+                if new_status != status:
+                    df.at[index, 'exec_status'] = new_status
+                    df.at[index, 'update_time'] = now_str
+                    logger.info(f"[SYNC] 订单 {client_oid} 最终状态更新为: {new_status}")
+                    has_changes = True
+            except Exception as e:
+                logger.warning(f"[SYNC] 无法从交易所回溯订单 {client_oid} 状态: {e}")
+
+    # 如果发生变化，则回写 CSV (保持全链路一致性)
+    if has_changes:
+        df.to_csv(TRADE_RECORD_FILE, index=False)
+        logger.info("[SYNC] trade_records.csv 状态及最后更新时间同步完毕。")
+
+    return open_order_cache
+
+
 def preload_account_state(exchange):
     """
     在整点前 1 分钟提前获取并缓存账户权益、所有币种持仓以及当前活动挂单。
@@ -100,6 +208,10 @@ def preload_account_state(exchange):
     except Exception as e:
         logger.error(f"[PRELOAD] 预加载挂单失败: {e}，防重复挂单功能可能会受阻！")
         open_order_cache = None  # 标记为失败
+
+    # 4. 同步并清理历史挂单，过滤完后返回最新的挂单缓存
+    if open_order_cache is not None:
+        open_order_cache = sync_and_clean_orders(exchange, open_order_cache)
 
     return total_equity, position_cache, open_order_cache
 
