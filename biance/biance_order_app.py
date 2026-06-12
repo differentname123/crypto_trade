@@ -24,25 +24,27 @@ POSITION_RISK_RATIO = 0.90  # 每次开仓占总资产的 10%
 # ==========================================
 # 1. 记账系统：全链路追溯
 # ==========================================
-def record_trade(row, actual_time, amount, status, client_oid, exchange_oid, msg=""):
+def record_trade(row, actual_time, total_equity, risk_ratio, target_value, amount, status, client_oid, exchange_oid,
+                 msg=""):
     """
-    将原始信号参数与实际交易结果合并持久化，实现全链路对账。
+    将原始信号参数与实际交易结果、资产状况合并持久化，实现全链路对账。
     """
     file_exists = os.path.isfile(TRADE_RECORD_FILE)
 
     with open(TRADE_RECORD_FILE, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
-            # 表头：包含原始信号信息 + 实际执行信息
+            # 表头：包含原始信号信息 + 实际执行信息 + 资产与风控信息
             writer.writerow([
                 "signal_time", "action", "coin", "direction", "event", "signal_price",
-                "actual_trade_time", "exec_amount", "exec_status", "client_oid", "exchange_oid", "error_msg"
+                "actual_trade_time", "total_equity", "risk_ratio", "target_value", "exec_amount",
+                "exec_status", "client_oid", "exchange_oid", "error_msg"
             ])
 
         writer.writerow([
             row['time'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(row['time'], pd.Timestamp) else row['time'],
             row['action'], row['coin'], row['direction'], row['event'], row['price'],
-            actual_time, amount, status.value, client_oid, exchange_oid, msg
+            actual_time, total_equity, risk_ratio, target_value, amount, status.value, client_oid, exchange_oid, msg
         ])
 
 
@@ -51,12 +53,13 @@ def record_trade(row, actual_time, amount, status, client_oid, exchange_oid, msg
 # ==========================================
 def preload_account_state(exchange):
     """
-    在整点前 1 分钟提前获取并缓存账户权益和所有币种持仓。
+    在整点前 1 分钟提前获取并缓存账户权益、所有币种持仓以及当前活动挂单。
     防止整点时网络拥堵，确保整点只做发单动作。
     """
-    logger.info(">>> [PRELOAD] 开始提前预加载账户资产与持仓缓存...")
+    logger.info(">>> [PRELOAD] 开始提前预加载账户资产、持仓与挂单缓存...")
     total_equity = 0.0
     position_cache = {}
+    open_order_cache = {}
 
     # 1. 获取总资产 (带重试机制以防偶发网络抖动)
     for _ in range(3):
@@ -82,13 +85,29 @@ def preload_account_state(exchange):
         logger.error(f"[PRELOAD] 预加载持仓失败: {e}，平仓操作可能会受阻！")
         position_cache = None  # 标记为失败
 
-    return total_equity, position_cache
+    # 3. 获取全量活动挂单并构建缓存字典 (防止重复挂单)
+    try:
+        # 解决 fetchOpenOrders 无 symbol 拉取全量挂单时的警告拦截
+        exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+
+        open_orders = exchange.fetch_open_orders()
+        for order in open_orders:
+            sym = order['symbol']
+            if sym not in open_order_cache:
+                open_order_cache[sym] = []
+            open_order_cache[sym].append(order)
+        logger.info(f"[PRELOAD] 挂单缓存加载完成，当前存在挂单的币种数量: {len(open_order_cache)}")
+    except Exception as e:
+        logger.error(f"[PRELOAD] 预加载挂单失败: {e}，防重复挂单功能可能会受阻！")
+        open_order_cache = None  # 标记为失败
+
+    return total_equity, position_cache, open_order_cache
 
 
 # ==========================================
 # 3. 核心零延迟执行模块
 # ==========================================
-def execute_signals_fast(exchange, target_time, total_equity, position_cache):
+def execute_signals_fast(exchange, target_time, total_equity, position_cache, open_order_cache):
     """
     极速执行当前整点的信号（纯本地计算 + 直接发单）
     :param target_time: 目标整点时间 (datetime)
@@ -106,7 +125,7 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache):
     except Exception as e:
         logger.error(f"读取信号文件失败: {e}")
         return
-    timedelta_minutes = 60 * 24 * 10
+    timedelta_minutes = 60 * 24 * 11
     # 2. 严格筛选当前整点的信号 (容差放宽至前后 1 分钟以防文件生成有微小偏差)
     time_lower = target_time - timedelta(minutes=timedelta_minutes)
     time_upper = target_time + timedelta(minutes=timedelta_minutes)
@@ -123,12 +142,12 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache):
     # 3. 遍历并瞬发信号
     for _, row in current_signals.iterrows():
         try:
-            execute_single_signal(exchange, row, target_position_value, position_cache)
+            execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache)
         except Exception as e:
             logger.error(f"单次发单异常拦截: {e}")
 
 
-def execute_single_signal(exchange, row, target_position_value, position_cache):
+def execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache):
     coin = str(row['coin']).strip().upper()
     action = str(row['action']).strip().upper()  # BUY / SELL
     direction = str(row['direction']).strip().upper()  # SHORT / LONG
@@ -136,22 +155,47 @@ def execute_single_signal(exchange, row, target_position_value, position_cache):
     price = float(row['price'])
     symbol = f"{coin}/USDT:USDT"
 
-    # 生成高可读性、利于排查的 client_oid
-    # 格式: {币种}_{方向}_{动作}_{开平}_{UUID前4位} => 例: BTC_SHORT_SELL_OPEN_a1b2
+    # 提取信号时间 (日+时+分)，确保挂单与具体的信号行绝对绑定
+    sig_time = row['time'].strftime('%d%H%M') if isinstance(row['time'], pd.Timestamp) else pd.to_datetime(
+        row['time']).strftime('%d%H%M')
+
+    # 生成高可读性、防重且与信号时间绑定的 client_oid
+    # 格式: {币种}_{方向}_{动作}_{开平}_{时间}_{UUID前4位} => 例: BTC_SHORT_SELL_OPEN_122000_a1b2
+    # 此格式结合控制在币安系统限定的 36 字符最大长度之内
+    order_prefix = f"{coin}_{direction}_{action}_{event}_{sig_time}"
     uid = uuid.uuid4().hex[:4]
-    client_oid = f"{coin}_{direction}_{action}_{event}_{uid}"
+    client_oid = f"{order_prefix}_{uid}"
 
     # ---------------- 极速状态校验 (纯内存字典查询) ----------------
-    if position_cache is None:
-        logger.error(f"[{client_oid}] 致命错误: 预加载持仓失败，无法校验状态，放弃此单。")
+    if position_cache is None or open_order_cache is None:
+        logger.error(f"[{client_oid}] 致命错误: 预加载持仓或挂单信息失败，无法校验状态，放弃此单。")
         return
 
-    # 当前币种本地缓存的真实仓位
+    # 当前币种本地缓存的真实仓位与挂单信息
     current_pos_amt = position_cache.get(symbol, 0.0)
+    symbol_open_orders = open_order_cache.get(symbol, [])
+
     has_short = current_pos_amt < 0
     has_long = current_pos_amt > 0
 
-    # 防呆/防重发拦截 (0 耗时)
+    # 【防重复挂单拦截】基于 clientOrderId 精确前缀匹配
+    has_duplicate_order = False
+    for o in symbol_open_orders:
+        o_client_id = o.get('clientOrderId', '')
+        if not o_client_id:
+            o_client_id = o.get('info', {}).get('clientOrderId', '')
+
+        # 只要当前活动挂单包含相同的该笔信号前缀，说明这笔信号已经被执行过且在排队中
+        if o_client_id.startswith(order_prefix):
+            has_duplicate_order = True
+            break
+
+    if has_duplicate_order:
+        logger.warning(
+            f"[{client_oid}] 拦截重复下单: 发现已存在信号时段({sig_time})的未成交挂单，跳过本次发单以防重复建仓。")
+        return
+
+    # 防呆/仓位拦截 (0 耗时)
     if event == "OPEN":
         if target_position_value <= 0:
             logger.warning(f"[{client_oid}] 资金预加载为0，无法开仓。")
@@ -197,6 +241,9 @@ def execute_single_signal(exchange, row, target_position_value, position_cache):
     record_trade(
         row=row,
         actual_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        total_equity=total_equity,
+        risk_ratio=POSITION_RISK_RATIO,
+        target_value=target_position_value,
         amount=amount,
         status=result.status,
         client_oid=client_oid,
@@ -225,7 +272,8 @@ def run_scheduler():
     logger.info(">>> 初始化交易所实例...")
     try:
         # 代理按需配置
-        exchange = init_exchange(API_KEY, SECRET_KEY, proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
+        exchange = init_exchange(API_KEY, SECRET_KEY,
+                                 proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
     except Exception:
         logger.critical("交易所初始化失败，程序退出。")
         return
@@ -248,7 +296,7 @@ def run_scheduler():
         #     time.sleep(sleep_sec)
 
         # ----------- 触发预加载 -----------
-        total_equity, position_cache = preload_account_state(exchange)
+        total_equity, position_cache, open_order_cache = preload_account_state(exchange)
 
         # # 阶段二：精细等待到达整点 (XX:00:00)
         # now = datetime.now()
@@ -259,7 +307,8 @@ def run_scheduler():
         # time.sleep(sleep_sec_final)
 
         # ----------- 极速拔枪 -----------
-        execute_signals_fast(exchange, next_hour, total_equity, position_cache)
+        execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache)
+        time.sleep(100)
 
 
 if __name__ == "__main__":
