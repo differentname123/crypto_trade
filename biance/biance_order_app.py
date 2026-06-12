@@ -59,7 +59,6 @@ def sync_and_clean_orders(exchange, open_order_cache):
     1. 同步 trade_records.csv 中的订单状态 (从挂单转为成交或取消)，并刷新 update_time。
     2. 发现 signal_time 超过 1 天的挂单执行撤销，维护撤销状态及更新时间。
     """
-    logger.info(">>> [SYNC] 开始同步订单状态与清理超时挂单...")
     if not os.path.isfile(TRADE_RECORD_FILE):
         return open_order_cache
 
@@ -86,6 +85,10 @@ def sync_and_clean_orders(exchange, open_order_cache):
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     has_changes = False
+
+    # 增加聚合统计指标
+    sync_updates = 0
+    cleanups = 0
 
     # 构建快速检索字典: exchange_oid -> order
     open_order_dict = {}
@@ -114,22 +117,23 @@ def sync_and_clean_orders(exchange, open_order_cache):
         if exch_oid in open_order_dict:
             # 校验超时 (大于 1 天)
             if (now - sig_time) > timedelta(days=1):
-                logger.info(f"[CLEANUP] 发现超时1天的挂单: {client_oid}，开始执行撤单...")
+                logger.info(f"[CLEANUP] 触发超时自动撤单 | CID: {client_oid}")
                 try:
                     exchange.cancel_order(exch_oid, sym)
                     df.at[index, 'exec_status'] = 'CANCELED_SUCCESS'
                     df.at[index, 'error_msg'] = '系统自动清理超时(>1天)挂单: 成功'
                     df.at[index, 'update_time'] = now_str
-                    logger.info(f"[CLEANUP] 撤销成功: {client_oid}")
+                    logger.info(f"[CLEANUP] 撤销成功 | CID: {client_oid}")
 
                     # 撤单成功后，将其从内存 cache 剔除，防止本轮后续判断受阻
                     open_order_cache[sym] = [o for o in open_order_cache[sym] if str(o.get('id')) != exch_oid]
                     has_changes = True
+                    cleanups += 1
                 except Exception as e:
                     df.at[index, 'exec_status'] = 'CANCELED_FAIL'
                     df.at[index, 'error_msg'] = f'自动清理超时撤单失败: {e}'
                     df.at[index, 'update_time'] = now_str
-                    logger.error(f"[CLEANUP] 撤销超时挂单失败: {client_oid}, 原因: {e}")
+                    logger.error(f"[CLEANUP] 撤销超时挂单失败 | CID: {client_oid} | 原因: {e}")
                     has_changes = True
             else:
                 # 尚未超时，同步状态标记为明确的 open (刚下发时可能是 OK)
@@ -137,6 +141,7 @@ def sync_and_clean_orders(exchange, open_order_cache):
                     df.at[index, 'exec_status'] = 'open'
                     df.at[index, 'update_time'] = now_str
                     has_changes = True
+                    sync_updates += 1
 
         # 情况 B: 订单已不在挂单池中，说明其已成交或被外部取消
         else:
@@ -147,15 +152,16 @@ def sync_and_clean_orders(exchange, open_order_cache):
                 if new_status != status:
                     df.at[index, 'exec_status'] = new_status
                     df.at[index, 'update_time'] = now_str
-                    logger.info(f"[SYNC] 订单 {client_oid} 最终状态更新为: {new_status}")
+                    logger.info(f"[SYNC] 终态回溯 | CID: {client_oid} -> {new_status}")
                     has_changes = True
+                    sync_updates += 1
             except Exception as e:
-                logger.warning(f"[SYNC] 无法从交易所回溯订单 {client_oid} 状态: {e}")
+                logger.warning(f"[SYNC] 回溯订单状态失败 | CID: {client_oid} | 原因: {e}")
 
     # 如果发生变化，则回写 CSV (保持全链路一致性)
     if has_changes:
         df.to_csv(TRADE_RECORD_FILE, index=False)
-        logger.info("[SYNC] trade_records.csv 状态及最后更新时间同步完毕。")
+        logger.info(f"[SYNC] 状态表同步完毕 | 状态流转: {sync_updates}条 | 超时清理: {cleanups}条")
 
     return open_order_cache
 
@@ -165,7 +171,7 @@ def preload_account_state(exchange):
     在整点前 1 分钟提前获取并缓存账户权益、所有币种持仓以及当前活动挂单。
     防止整点时网络拥堵，确保整点只做发单动作。
     """
-    logger.info(">>> [PRELOAD] 开始提前预加载账户资产、持仓与挂单缓存...")
+    logger.info(">>> [PRELOAD] 启动资产与挂单预加载...")
     total_equity = 0.0
     position_cache = {}
     open_order_cache = {}
@@ -189,7 +195,6 @@ def preload_account_state(exchange):
             amt = float(pos['info']['positionAmt'])
             if amt != 0:
                 position_cache[sym] = amt
-        logger.info(f"[PRELOAD] 持仓缓存加载完成，当前有效持仓数量: {len(position_cache)}")
     except Exception as e:
         logger.error(f"[PRELOAD] 预加载持仓失败: {e}，平仓操作可能会受阻！")
         position_cache = None  # 标记为失败
@@ -205,7 +210,6 @@ def preload_account_state(exchange):
             if sym not in open_order_cache:
                 open_order_cache[sym] = []
             open_order_cache[sym].append(order)
-        logger.info(f"[PRELOAD] 挂单缓存加载完成，当前存在挂单的币种数量: {len(open_order_cache)}")
     except Exception as e:
         logger.error(f"[PRELOAD] 预加载挂单失败: {e}，防重复挂单功能可能会受阻！")
         open_order_cache = None  # 标记为失败
@@ -213,6 +217,11 @@ def preload_account_state(exchange):
     # 4. 同步并清理历史挂单，过滤完后返回最新的挂单缓存
     if open_order_cache is not None:
         open_order_cache = sync_and_clean_orders(exchange, open_order_cache)
+
+    # 日志聚合：将多条分散的就绪日志合并为一条高密度日志
+    pos_len = len(position_cache) if position_cache is not None else 'FAIL'
+    ord_len = len(open_order_cache) if open_order_cache is not None else 'FAIL'
+    logger.info(f"[PRELOAD] 缓存就绪 | 总权益: {total_equity:.2f} USD | 有效持仓: {pos_len}种 | 存在挂单: {ord_len}种")
 
     return total_equity, position_cache, open_order_cache
 
@@ -225,7 +234,10 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     极速执行当前整点的信号（纯本地计算 + 直接发单）
     :param target_time: 目标整点时间 (datetime)
     """
-    logger.info(f"========== 准点触发执行: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')} ==========")
+    target_position_value = total_equity * POSITION_RISK_RATIO
+    # 日志聚合：将触发时间和资金风控信息合并为一条极简表头日志，去除微秒中的多余尾数
+    logger.info(
+        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 风控限额: {target_position_value:.2f} ({POSITION_RISK_RATIO * 100:.0f}%) ==========")
 
     if not os.path.exists(SIGNAL_FILE):
         logger.warning(f"信号文件 {SIGNAL_FILE} 不存在。")
@@ -245,12 +257,8 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     current_signals = df[(df['time'] >= time_lower) & (df['time'] <= time_upper)]
 
     if current_signals.empty:
-        logger.info("当前时间点无交易信号。")
+        logger.info("[EXEC] 当前时间点无交易信号。")
         return
-
-    target_position_value = total_equity * POSITION_RISK_RATIO
-    logger.info(
-        f"本轮风控额度 (总资产 {total_equity:.2f}) * {POSITION_RISK_RATIO * 100}% = {target_position_value:.2f} USD")
 
     # 3. 遍历并瞬发信号
     for _, row in current_signals.iterrows():
@@ -281,7 +289,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
     # ---------------- 极速状态校验 (纯内存字典查询) ----------------
     if position_cache is None or open_order_cache is None:
-        logger.error(f"[{client_oid}] 致命错误: 预加载持仓或挂单信息失败，无法校验状态，放弃此单。")
+        logger.error(f"[EXEC] 致命拦截 | CID: {client_oid} | 原因: 预加载信息失败，放弃校验与下发。")
         return
 
     # 当前币种本地缓存的真实仓位与挂单信息
@@ -304,17 +312,17 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
             break
 
     if has_duplicate_order:
-        logger.warning(
-            f"[{client_oid}] 拦截重复下单: 发现已存在信号时段({sig_time})的未成交挂单，跳过本次发单以防重复建仓。")
+        logger.warning(f"[EXEC] 重复拦截 | CID: {client_oid} | 发现该信号时段({sig_time})已有排队挂单。")
         return
 
     # 防呆/仓位拦截 (0 耗时)
     if event == "OPEN":
         if target_position_value <= 0:
-            logger.warning(f"[{client_oid}] 资金预加载为0，无法开仓。")
+            logger.warning(f"[EXEC] 无效开仓 | CID: {client_oid} | 资金预加载为0。")
             return
         if (direction == "SHORT" and has_short) or (direction == "LONG" and has_long):
-            logger.warning(f"[{client_oid}] 拦截重复开仓: 已存在 {direction} 仓位 ({current_pos_amt})。")
+            logger.warning(
+                f"[EXEC] 重复开仓拦截 | CID: {client_oid} | 缓存显示已有 {direction} 仓位 ({current_pos_amt})。")
             return
 
         raw_amount = target_position_value / price
@@ -323,7 +331,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
     elif event == "CLOSE":
         if (direction == "SHORT" and not has_short) or (direction == "LONG" and not has_long):
-            logger.warning(f"[{client_oid}] 拦截无效平仓: 本地缓存显示不存在待平仓位。")
+            logger.warning(f"[EXEC] 无效平仓拦截 | CID: {client_oid} | 缓存显示无对应待平仓位。")
             return
 
         # 平仓：直接取真实持仓全平 (绝对值)
@@ -333,7 +341,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
         return
 
     if amount <= 0:
-        logger.warning(f"[{client_oid}] 计算所得下单量为 0，跳过。")
+        logger.warning(f"[EXEC] 丢单拦截 | CID: {client_oid} | 计算所得下单量为 0。")
         return
 
     # ---------------- 发起真实的 API 请求 ----------------
@@ -364,10 +372,10 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
         msg=result.error_msg
     )
 
-    if result.status == ExecStatus.OK:
-        logger.info(f"[SUCCESS] {client_oid} 发送成功! EID: {result.exchange_oid}")
-    else:
-        logger.error(f"[FAIL] {client_oid} 失败/拒绝: {result.error_msg}")
+    # 剔除了原先的 [SUCCESS] 重复打印。因为 execute_order 里面已经打出了含完整 CID / EID 的详细发单日志
+    # 这里仅在失败时补加一条归档状态的记录即可，避免高频日志刷屏。
+    if result.status != ExecStatus.OK:
+        logger.error(f"[RECORD] 发单失败/拒绝，状态已归档入库 | CID: {client_oid} | 记录状态: {result.status.value}")
 
 
 def run_scheduler():
@@ -406,7 +414,7 @@ def run_scheduler():
         # 阶段一：等待到达信号生成工作流时间 (XX:50:00)
         if now < workflow_time:
             sleep_sec = (workflow_time - now).total_seconds()
-            logger.info(f"睡眠 {sleep_sec:.0f}s，等待信号生成任务时间: {workflow_time.strftime('%H:%M:%S')}")
+            logger.info(f"[SCHEDULER] 休眠 {sleep_sec:.0f}s -> {workflow_time.strftime('%H:%M:%S')} (目标: 信号生成)")
             # [深度优化] 放弃单次大段 sleep，改用每秒检查的细粒度轮询。
             # 防止服务器系统时间 NTP 同步跳跃导致的长眠不醒。
             while datetime.now() < workflow_time:
@@ -416,18 +424,18 @@ def run_scheduler():
         # 再次获取当前时间，为了兼容刚好在 50~59分之间启动程序的补跑逻辑
         now = datetime.now()
         if now < preload_time:
-            logger.info(">>> [WORKFLOW] 开始执行交易机器人工作流 (生成最新信号)...")
+            logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
             try:
                 execute_trading_bot_workflow()
-                logger.info(">>> [WORKFLOW] 信号生成完成！")
+                logger.info(">>> [WORKFLOW] 信号流水线执行完毕！")
             except Exception as e:
-                logger.error(f">>> [WORKFLOW] 信号生成工作流执行异常: {e}")
+                logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e}")
 
         # 阶段二：等待到达预加载时间 (XX:59:00)
         now = datetime.now()
         if now < preload_time:
             sleep_sec = (preload_time - now).total_seconds()
-            logger.info(f"睡眠 {sleep_sec:.0f}s，等待数据预加载时间: {preload_time.strftime('%H:%M:%S')}")
+            logger.info(f"[SCHEDULER] 休眠 {sleep_sec:.0f}s -> {preload_time.strftime('%H:%M:%S')} (目标: 数据预加载)")
             # [深度优化] 同样使用细粒度休眠，确保精准衔接到 59 分 00 秒
             while datetime.now() < preload_time:
                 time.sleep(1)
@@ -439,7 +447,7 @@ def run_scheduler():
         now = datetime.now()
         if now < target_exec_time:
             sleep_sec_final = (target_exec_time - now).total_seconds()
-            logger.info(f"缓存完毕！屏息倒计时 {sleep_sec_final:.1f}s 准备拔枪...")
+            logger.info(f"[SCHEDULER] 资产数据就绪！屏息倒计时 {sleep_sec_final:.1f}s 准备极速拔枪...")
 
             # [深度优化] 量化级混合精度等待 (普通休眠 + 极速自旋锁)
             while True:
