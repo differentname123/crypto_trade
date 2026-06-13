@@ -8,6 +8,7 @@ from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from ccxt.base.errors import NetworkError, InvalidOrder
 
+from app.signal_trade_lite.common_utils_lite import setup_logger
 from common.common_utils import get_config
 
 
@@ -42,37 +43,6 @@ class ExecResult:
         self.error_msg = error_msg
         self.raw_data = raw_data
 
-
-# ==========================================
-# 1. 基础设施：按天切割的精简日志系统
-# ==========================================
-def setup_logger(log_dir="logs"):
-    """
-    初始化并返回按天切割的日志记录器。
-
-    :param log_dir: 日志文件存储的相对或绝对目录 (默认: "logs")
-    :return: logging.Logger 实例
-    """
-    os.makedirs(log_dir, exist_ok=True)
-    logger = logging.getLogger("QuantBot")
-    logger.setLevel(logging.INFO)
-
-    if not logger.handlers:
-        formatter = logging.Formatter('%(asctime)s,%(msecs)03d | %(levelname)s | [BOT] %(message)s',
-                                      datefmt='%Y-%m-%d %H:%M:%S')
-
-        log_file_path = os.path.join(log_dir, "trading_bot.log")
-        file_handler = TimedRotatingFileHandler(
-            filename=log_file_path, when="midnight", interval=1, backupCount=30, encoding='utf-8'
-        )
-        file_handler.setFormatter(formatter)
-
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-
-        logger.addHandler(file_handler)
-        logger.addHandler(console_handler)
-    return logger
 
 
 logger = setup_logger()

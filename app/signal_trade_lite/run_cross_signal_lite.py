@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from typing import List
 
+from app.signal_trade_lite.common_utils_lite import setup_logger
 from app.signal_trade_lite.fetch_data_lite import fetch_binance_futures_klines
 
 
@@ -410,9 +411,14 @@ def execute_trading_bot_workflow():
         "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
     ]
     timeframe = "1m"
+    proxy_config = {
+            'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
+            'https': 'http://127.0.0.1:7890',
+        }
+    run_logger = setup_logger()
 
     for symbol in symbol_list:
-        df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=lookback_days)
+        df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=lookback_days, proxies=proxy_config, logger=run_logger)
         # 提取纯币种名如 'BTC'
         coin_name = symbol.split('/')[0]
         df_klines['coin_name'] = coin_name

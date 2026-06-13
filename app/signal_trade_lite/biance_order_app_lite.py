@@ -5,7 +5,7 @@ import pandas as pd
 import csv
 from datetime import datetime, timedelta
 
-from app.crypto_dashboard.run_cross_signal import execute_trading_bot_workflow
+from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow
 # 从基础文件中导入核心组件 (假设基础文件名为 base_trader.py)
 # 确保 base_trader.py 中已经添加了上一轮我给你的 get_total_equity 函数
 from biance_order_lite import (
