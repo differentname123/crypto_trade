@@ -49,8 +49,7 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
     }
     if proxies:
         exchange_params['proxies'] = proxies
-        # 优化点 E：精简代理日志，防止大规模跑批时刷屏
-        logger.info(f"{log_prefix} 代理已接管请求")
+        log_prefix += "[ProxyEnabled]"
 
     exchange = ccxt.binance(exchange_params)
 
@@ -237,19 +236,20 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
         except Exception as e:
             logger.error(f"{log_prefix} 缓存文件原子写入失败: {e}", exc_info=True)
 
-    # 8. 截取请求的天数范围，并在内存展现层将其转换为带有北京时间的 Datetime 对象
+    # 8. 截取请求的天数范围，并在内存展现层新增带有北京时间的 Datetime 对象字段
     final_df = pd.DataFrame()
     if not df.empty:
         final_df = df[df['timestamp'] >= requested_since].reset_index(drop=True)
-        # ⚠️ 这里是最终展现层：将 UNIX ms 转为带 UTC 的时间，然后再转为东八区
-        final_df['timestamp'] = pd.to_datetime(final_df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(
+        # ⚠️ 这里是最终展现层：不覆盖原有的 timestamp 毫秒字段，新增 datetime_bj 字段存储东八区时间
+        final_df['datetime_bj'] = pd.to_datetime(final_df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(
             'Asia/Shanghai')
 
     cost_time = time.time() - start_time_proc
 
     if not final_df.empty:
-        final_start_str = final_df['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
-        final_end_str = final_df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+        # 修改日志提取逻辑，使用新生成的 datetime_bj 字段进行格式化输出
+        final_start_str = final_df['datetime_bj'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
+        final_end_str = final_df['datetime_bj'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
         # 优化点 F：在总结处补充数据来源构成比例，便于观测 Cache 健康度
         logger.info(
             f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 范围: {final_start_str} -> {final_end_str} | 最终输出: {len(final_df)} 条 (来源: 本地缓存 {len(cache_df)} 条, API增量 {len(all_ohlcv) + repair_ohlcv_total_len} 条)")
