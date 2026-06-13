@@ -1,16 +1,12 @@
 import os
 import pandas as pd
 import numpy as np
-from typing import List
 
 from app.signal_trade_lite.common_utils_lite import setup_logger
 from app.signal_trade_lite.fetch_data_lite import fetch_binance_futures_klines
 
 
-# ==========================================
-# 1. 数据预处理适配器
-# ==========================================
-def build_4h_cross_section(minute_klines_list: List[pd.DataFrame], time_offset: str = '0h') -> pd.DataFrame:
+def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') -> pd.DataFrame:
     """
     将交易所拉取的【分钟级 K线列表】无损转换为信号引擎所需的【4H 截面 DataFrame】
     返回的 DataFrame 列名包含各币种的 open, high, low 以及作为 close 的币种名。
@@ -26,7 +22,7 @@ def build_4h_cross_section(minute_klines_list: List[pd.DataFrame], time_offset: 
         # 1. 提取当前 df 对应的币种名称
         coin_name = df_coin['coin_name'].iloc[0]
 
-        # 2. 统一时间索引处理：以新的 ms 级 timestamp 字段为准，不再兼容 open_time
+        # 2. 统一时间索引处理：保持标准 UTC 时间，不直接进行暴力的数值加减
         df_coin['timestamp'] = pd.to_datetime(df_coin['timestamp'], unit='ms')
 
         # 冗余保留 time 列以防外部依赖
@@ -317,9 +313,10 @@ def run_strategy_simulation(
 # ==========================================
 # 3. 实盘自动化主流水线
 # ==========================================
-def run_live_pipeline(minute_klines_list: List[pd.DataFrame], strategy_params_list: List[dict]):
+def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logger):
     """
     接收最新行情数据，遍历运行多个参数策略流水线，并生成各参数当前最新截面的操作指令。
+    返回合并后的全量交易流水账本字符串内容。
     """
     all_strategy_ledgers = []
 
@@ -329,18 +326,19 @@ def run_live_pipeline(minute_klines_list: List[pd.DataFrame], strategy_params_li
         time_offset = params['TIME_OFFSET']
         trade_mode = params['TRADE_MODE']
 
-        print(f"⏳ [策略: {strategy_name}] 正在将分钟级数据组装为 4H 矩阵 (Offset: {time_offset})...")
+        logger.info(f"⏳ [策略: {strategy_name}] 正在将分钟级数据组装为 4H 矩阵 (Offset: {time_offset})...")
         df_4h_features = build_4h_cross_section(minute_klines_list, time_offset=time_offset)
 
         if df_4h_features is None or df_4h_features.empty:
             continue
 
-        # 日志：展示数据边界
-        start_time_str = df_4h_features.index[0].strftime('%Y-%m-%d %H:%M:%S')
-        end_time_str = df_4h_features.index[-1].strftime('%Y-%m-%d %H:%M:%S')
-        print(f"   [{strategy_name}] 起始: {start_time_str} | 截止: {end_time_str}")
+        # 日志：展示数据边界 (标准处理：声明当前为 UTC，并转换为北京时间展示)
+        start_time_bjt = df_4h_features.index[0].tz_localize('UTC').tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+        end_time_bjt = df_4h_features.index[-1].tz_localize('UTC').tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+        logger.info(f"   [{strategy_name}] 起始: {start_time_bjt} | 截止: {end_time_bjt} (北京时间)")
 
-        print(f"🧠 [{strategy_name}] 正在运行状态推演机，生成理论交易账本...")
         trade_ledger_df = run_strategy_simulation(
             df_cross_section=df_4h_features,
             strategy_params=params,
@@ -348,45 +346,69 @@ def run_live_pipeline(minute_klines_list: List[pd.DataFrame], strategy_params_li
         )
 
         if trade_ledger_df.empty:
-            print(f"► [{strategy_name}] 历史流转中尚未产生任何交易信号。")
+            logger.info(f"🧠 [{strategy_name}] 正在运行状态推演机，生成理论交易账本 | 生成数量: 0 | 最新信号时间: 无")
+            logger.info(f"► [{strategy_name}] 历史流转中尚未产生任何交易信号。")
         else:
-            # 重要：对齐实盘执行时间。4H K线的开盘时间需加上4小时，代表K线走完真正执行信号的时刻。
+            # 重要：对齐实盘执行时间。4H K线的开盘时间需加上4小时，代表K线走完真正执行信号的时刻。(此时依然是纯净的 UTC 时间)
             trade_ledger_df['time'] = pd.to_datetime(trade_ledger_df['time']) + pd.Timedelta(hours=4)
+
+            # 【核心健壮点 1】生成绝对准确的毫秒级 Unix 时间戳 (基于纯净 UTC 计算，无视任何时区漂移，保证下游 API 不会认错)
+            trade_ledger_df['signal_timestamp_ms'] = trade_ledger_df['time'].astype('int64') // 10 ** 6
+
+            # 【核心健壮点 2】将 dataframe 的 time 列安全转换为北京时间，最后剥离时区标签 (tz_localize(None))，保证输出给人类看的 CSV 格式清爽且时间正确
+            trade_ledger_df['time'] = trade_ledger_df['time'].dt.tz_localize('UTC').dt.tz_convert(
+                'Asia/Shanghai').dt.tz_localize(None)
 
             # 新增参数标识，方便区分产生的交易数据
             trade_ledger_df['STRATEGY_NAME'] = strategy_name
             all_strategy_ledgers.append(trade_ledger_df)
 
+            gen_count = len(trade_ledger_df)
+            latest_signal_time_bjt = trade_ledger_df['time'].max().strftime('%Y-%m-%d %H:%M:%S')
+
+            # 后置推演日志：此时已获知推演量及时间
+            logger.info(
+                f"🧠 [{strategy_name}] 正在运行状态推演机，生成理论交易账本 | 生成数量: {gen_count} | 最新信号时间: {latest_signal_time_bjt} (北京时间)")
+
         # 4. 提取当前策略在当下截面的实盘发单指令
-        latest_kline_end_time = df_4h_features.index[-1] + pd.Timedelta(hours=4)
+        # 计算最新截面执行时间的 UTC 值
+        latest_kline_end_time_utc = df_4h_features.index[-1] + pd.Timedelta(hours=4)
+        # 将其转化为无标签的北京时间，用于和账本（已转为北京时间）进行精准匹配
+        latest_kline_end_time_bjt = latest_kline_end_time_utc.tz_localize('UTC').tz_convert(
+            'Asia/Shanghai').tz_localize(None)
 
         if not trade_ledger_df.empty:
-            latest_trade_signals = trade_ledger_df[trade_ledger_df['time'] == latest_kline_end_time]
+            latest_trade_signals = trade_ledger_df[trade_ledger_df['time'] == latest_kline_end_time_bjt]
         else:
             latest_trade_signals = pd.DataFrame()
 
-        print(f"🎯 [当前截面时刻: {latest_kline_end_time} | 策略: {strategy_name} 实盘发单指令]")
+        logger.info(
+            f"🎯 [当前截面时刻: {latest_kline_end_time_bjt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间) | 策略: {strategy_name} 实盘发单指令]")
         if latest_trade_signals.empty:
-            print("   ► 当前无平仓或开仓信号，继续保持现有仓位。")
+            logger.info("   ► 当前无平仓或开仓信号，继续保持现有仓位。")
         else:
             for _, row in latest_trade_signals.iterrows():
                 if row['event'] == 'CLOSE':
-                    print(
+                    logger.info(
                         f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
                 elif row['event'] == 'OPEN':
-                    print(
+                    logger.info(
                         f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
-        print("-" * 70)
+        logger.info("-" * 70)
 
     # 3. 汇总并导出完整的流水日志
     output_path = "live_simulation_logs.csv"
     if all_strategy_ledgers:
         final_ledger_df = pd.concat(all_strategy_ledgers, ignore_index=True)
         final_ledger_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        print(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_ledger_df)} 条记录)")
-    else:
-        print("\n► 历史流转中所有策略均未产生任何交易信号。")
+        logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_ledger_df)} 条记录)")
 
+        # 读取并返回信号文件的内容
+        with open(output_path, 'r', encoding='utf-8-sig') as f:
+            return f.read()
+    else:
+        logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
+        return ""
 
 # ==========================================
 # 4. 程序入口点
@@ -394,6 +416,7 @@ def run_live_pipeline(minute_klines_list: List[pd.DataFrame], strategy_params_li
 def execute_trading_bot_workflow():
     """
     拉取数据并启动整套交易工作流
+    返回最终生成的信号文件内容
     """
     fetched_raw_data = []
 
@@ -430,7 +453,9 @@ def execute_trading_bot_workflow():
             max_window = current_max
 
     lookback_days = int(np.ceil(max_window / 6)) + 30
-    print(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    run_logger = setup_logger()
+    run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
 
     symbol_list = [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
@@ -441,7 +466,6 @@ def execute_trading_bot_workflow():
         'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
         'https': 'http://127.0.0.1:7890',
     }
-    run_logger = setup_logger()
 
     for symbol in symbol_list:
         df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=lookback_days,
@@ -453,11 +477,14 @@ def execute_trading_bot_workflow():
         fetched_raw_data.append(df_klines)
 
     if not fetched_raw_data:
-        print("❌ 错误：没有任何数据被成功加载，程序退出。请检查网络或 fetch_binance_futures_klines 模块。")
+        run_logger.error("❌ 错误：没有任何数据被成功加载，程序退出。请检查网络或 fetch_binance_futures_klines 模块。")
+        return ""
     else:
-        print(f"\n🚀 数据加载完毕，共 {len(fetched_raw_data)} 个标的。")
-        print("═" * 70)
-        run_live_pipeline(fetched_raw_data, strategy_params_list)
+        run_logger.info(f"\n🚀 数据加载完毕，共 {len(fetched_raw_data)} 个标的。")
+        run_logger.info("═" * 70)
+        # 【修改】执行实盘流传并捕获信号文件内容进行返回
+        signal_file_content = run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
+        return signal_file_content
 
 
 if __name__ == "__main__":
