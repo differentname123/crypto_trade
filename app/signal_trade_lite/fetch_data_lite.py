@@ -6,7 +6,7 @@
 :last_date:
     2026/6/13 7:13
 :description:
-    
+
 """
 import ccxt
 import pandas as pd
@@ -35,6 +35,9 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
     if logger is None:
         logger = logging.getLogger("QuantBot")  # Fallback
 
+    # 规范化日志前缀：增加周期上下文，彻底消灭孤儿日志
+    log_prefix = f"[{symbol}][{timeframe}]"
+
     start_time_proc = time.time()
 
     # 1. 动态实例化交易所配置
@@ -46,7 +49,8 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
     }
     if proxies:
         exchange_params['proxies'] = proxies
-        logger.info(f"[{symbol}] 已启用代理设置: {proxies}")
+        # 优化点 E：精简代理日志，防止大规模跑批时刷屏
+        logger.info(f"{log_prefix} 代理已接管请求")
 
     exchange = ccxt.binance(exchange_params)
 
@@ -71,59 +75,79 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
         try:
             cache_df = pd.read_csv(cache_file)
             if not cache_df.empty:
-                # 兼容性拦截：如果发现之前存的 CSV 时间戳是字符串(老代码遗留)，抛弃重建
+                # 优化点 C：对“旧版时间格式的遗留缓存”进行平稳的向下兼容，不作为错误抛出
                 if cache_df['timestamp'].dtype == 'O':
-                    raise ValueError("检测到旧版时间格式的遗留缓存，将重建底层为 UNIX 毫秒的缓存")
-
-                cache_df['timestamp'] = cache_df['timestamp'].astype('int64')
-                cache_oldest_ms = cache_df['timestamp'].iloc[0]
-                cache_latest_ms = cache_df['timestamp'].iloc[-1]
-
-                existing_latest_time_str = format_ts_to_bj(cache_latest_ms)
-
-                if cache_oldest_ms <= requested_since:
-                    # 缓存已覆盖请求起点，仅做增量拉取（回退 2 个周期容错，防止最后未收线）
-                    since = cache_latest_ms - timeframe_ms * 2
-                else:
-                    # 缓存不够指定天数，补充早期的缺失数据（拉取起点设为请求起点）
+                    logger.info(f"{log_prefix} 发现旧版时间格式缓存，主动丢弃并全量重建底层结构")
+                    cache_df = pd.DataFrame()
+                    existing_latest_time_str = "无"
                     since = requested_since
+                else:
+                    cache_df['timestamp'] = cache_df['timestamp'].astype('int64')
+                    cache_oldest_ms = cache_df['timestamp'].iloc[0]
+                    cache_latest_ms = cache_df['timestamp'].iloc[-1]
+
+                    existing_latest_time_str = format_ts_to_bj(cache_latest_ms)
+
+                    if cache_oldest_ms <= requested_since:
+                        # 缓存已覆盖请求起点，仅做增量拉取（回退 2 个周期容错，防止最后未收线）
+                        since = cache_latest_ms - timeframe_ms * 2
+                    else:
+                        # 缓存不够指定天数，补充早期的缺失数据（拉取起点设为请求起点）
+                        since = requested_since
         except Exception as e:
-            logger.warning(f"[{symbol}] 读取缓存异常: {e}，将执行全量重拉取。")
+            logger.warning(f"{log_prefix} 读取缓存异常: {e}，将执行全量重拉取。")
             cache_df = pd.DataFrame()
             existing_latest_time_str = "无"
     else:
         existing_latest_time_str = "无"
 
+    # 优化点 H：去除无意义的数字硬编码，统一任务阶段标签 [TaskStart]
     logger.info(
-        f"1. [拉取开始] {symbol} | 本地最新: {existing_latest_time_str} | API 寻址范围: {format_ts_to_bj(since)} -> 当前")
+        f"{log_prefix} [TaskStart] 本地最新: {existing_latest_time_str} | API 寻址范围: {format_ts_to_bj(since)} -> 当前")
 
     limit = 1000
     all_ohlcv = []
     curr_since = since
+    page_count = 0  # 用于触发心跳日志
 
     # 4. 主干数据拉取循环
     while True:
-        curr_ohlcv = None
+        curr_ohlcv = []
+        fetch_success = False
+
         for net_attempt in range(retries):
             try:
                 curr_ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=curr_since, limit=limit)
+                fetch_success = True
                 break
             except ccxt.RateLimitExceeded as e:
-                logger.error(f"[{symbol}] 触发币安限频 (HTTP 429): {e}，休眠 5 秒...")
+                # 优化点 A：限频是常态抵抗机制，降级为 WARNING，防止污染报警监控
+                logger.warning(f"{log_prefix} 触发币安限频 (HTTP 429)，休眠 5 秒...")
                 time.sleep(5)
             except ccxt.NetworkError as e:
-                logger.warning(f"[{symbol}] 网络抖动: {e}，休眠 2 秒...")
+                logger.warning(f"{log_prefix} 网络抖动: {e}，休眠 2 秒...")
                 time.sleep(2)
             except Exception as e:
-                logger.error(f"[{symbol}] 未知拉取异常: {e}，休眠 2 秒...")
+                logger.warning(f"{log_prefix} 未知拉取异常: {e}，休眠 2 秒...")
                 time.sleep(2)
 
+        # 优化点 B：精确拆分 "彻底失败" 与 "空数据触底" 的语义
+        if not fetch_success:
+            logger.error(f"{log_prefix} 耗尽重试次数 ({retries})，API 拉取异常中断。", exc_info=True)
+            break
+
         if not curr_ohlcv:
-            logger.warning(f"[{symbol}] API 返回空数据或耗尽重试，退出分页拉取。")
+            logger.info(f"{log_prefix} API 返回空数据，触底正常结束分页拉取。")
             break
 
         all_ohlcv.extend(curr_ohlcv)
         curr_since = curr_ohlcv[-1][0] + 1  # 推进到下一毫秒
+        page_count += 1
+
+        # 优化点 G：主干长耗时任务的进度心跳日志
+        if page_count % 10 == 0:
+            logger.info(
+                f"{log_prefix} 分页拉取中... 已获取 {page_count} 页 ({len(all_ohlcv)} 条), 当前推进至: {format_ts_to_bj(curr_since)}")
 
         # 核心修正：分页结束的安全标志（如果当前拉到的数量小于上限，绝对是拉到底了）
         if len(curr_ohlcv) < limit:
@@ -131,6 +155,8 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
 
     # 5. 合并并转正数据结构
     new_df = pd.DataFrame()
+    repair_ohlcv_total_len = 0  # 为后续来源统筹做准备
+
     if all_ohlcv:
         new_df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
@@ -149,14 +175,19 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
 
         if gap_mask.any():
             gap_indices = df.index[gap_mask]
-            logger.warning(f"[{symbol}] 检查到 {len(gap_indices)} 处历史时间跳变(缺口)，尝试向交易所发起修补拉取...")
+            # 优化点 D：前置汇总日志
+            logger.warning(f"{log_prefix} 发现 {len(gap_indices)} 处历史时间跳变(缺口)，开始智能修补...")
 
             repair_ohlcv = []
+            physical_missing_count = 0
+
             for idx in gap_indices:
                 gap_start_ms = df.loc[idx - 1, 'timestamp']
                 gap_end_ms = df.loc[idx, 'timestamp']
 
-                logger.info(f"修复区间: {format_ts_to_bj(gap_start_ms)} -> {format_ts_to_bj(gap_end_ms)}")
+                # 优化点 D：将循环内的明细降级为 DEBUG
+                logger.debug(
+                    f"{log_prefix} 尝试修补区间: {format_ts_to_bj(gap_start_ms)} -> {format_ts_to_bj(gap_end_ms)}")
 
                 # 尝试拉取缝隙中间的数据
                 repair_since = gap_start_ms + timeframe_ms
@@ -165,11 +196,12 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
                     try:
                         repair_fetch = exchange.fetch_ohlcv(symbol, timeframe, since=repair_since, limit=limit)
                     except Exception as e:
-                        logger.error(f"修补数据时发生异常: {e}")
+                        logger.warning(f"{log_prefix} 修补数据时发生异常: {e}")
 
                     if not repair_fetch:
-                        logger.warning(
-                            f"修补拉取无新数据，区间: {format_ts_to_bj(repair_since)} - 确认系交易所物理缺失，予以保留。")
+                        logger.debug(
+                            f"{log_prefix} 修补拉取无新数据，区间: {format_ts_to_bj(repair_since)} - 确认系交易所物理缺失，予以保留。")
+                        physical_missing_count += 1
                         break
 
                     # 过滤掉不属于缺口内的数据
@@ -185,13 +217,17 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
 
             # 如果修复补拉成功，再次合并清洗
             if repair_ohlcv:
+                repair_ohlcv_total_len = len(repair_ohlcv)
                 repair_df = pd.DataFrame(repair_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 repair_df[numeric_cols] = repair_df[numeric_cols].astype(float)
                 repair_df['timestamp'] = repair_df['timestamp'].astype('int64')
                 df = pd.concat([df, repair_df], ignore_index=True)
                 df = df.drop_duplicates(subset=['timestamp'], keep='last').sort_values('timestamp').reset_index(
                     drop=True)
-                logger.info(f"[{symbol}] 数据跳变尝试修复完成。")
+
+            # 优化点 D：完成后的总结性日志，彻底告别刷屏
+            logger.info(
+                f"{log_prefix} 数据修补完成: 共尝试 {len(gap_indices)} 处缺口, 成功补齐 {repair_ohlcv_total_len} 条数据, 确认物理缺失 {physical_missing_count} 处。")
 
         # 7. 原子写入 (安全落盘机制，防止断电写残 CSV)
         try:
@@ -199,7 +235,7 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
             df.to_csv(tmp_file, index=False)
             os.replace(tmp_file, cache_file)
         except Exception as e:
-            logger.error(f"[{symbol}] 缓存文件原子写入失败: {e}")
+            logger.error(f"{log_prefix} 缓存文件原子写入失败: {e}", exc_info=True)
 
     # 8. 截取请求的天数范围，并在内存展现层将其转换为带有北京时间的 Datetime 对象
     final_df = pd.DataFrame()
@@ -214,10 +250,11 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
     if not final_df.empty:
         final_start_str = final_df['timestamp'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
         final_end_str = final_df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+        # 优化点 F：在总结处补充数据来源构成比例，便于观测 Cache 健康度
         logger.info(
-            f"2. [拉取完成] {symbol} | 耗时: {cost_time:.2f}秒 | 内存产出范围: {final_start_str} -> {final_end_str} | 数量: {len(final_df)}")
+            f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 范围: {final_start_str} -> {final_end_str} | 最终输出: {len(final_df)} 条 (来源: 本地缓存 {len(cache_df)} 条, API增量 {len(all_ohlcv) + repair_ohlcv_total_len} 条)")
     else:
-        logger.warning(f"2. [拉取完成] {symbol} | 耗时: {cost_time:.2f}秒 | 内存产出范围: 无数据")
+        logger.warning(f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 内存产出范围: 无数据")
 
     return final_df
 
@@ -228,9 +265,9 @@ if __name__ == "__main__":
 
     # 模拟 Linux 云端环境 (默认关闭代理，如需本地测试可在下面传入 {'http': 'http://127.0.0.1:7890'})
     proxy_config = {
-            'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
-            'https': 'http://127.0.0.1:7890',
-        }
+        'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
+        'https': 'http://127.0.0.1:7890',
+    }
 
     df_klines = fetch_binance_futures_klines(
         symbol="BNB/USDT:USDT",
