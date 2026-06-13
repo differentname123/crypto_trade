@@ -17,7 +17,6 @@ from common.common_utils import get_config
 # ==========================================
 # 0. 配置与常量
 # ==========================================
-SIGNAL_FILE = r'W:\project\python_project\crypto_trade\app\crypto_dashboard\live_simulation_logs.csv'
 TRADE_RECORD_FILE = "trade_records.csv"
 POSITION_RISK_RATIO = 0.90  # 每次开仓占总资产的 10%
 
@@ -249,7 +248,7 @@ def preload_account_state(exchange):
 # ==========================================
 # 3. 核心零延迟执行模块
 # ==========================================
-def execute_signals_fast(exchange, target_time, total_equity, position_cache, open_order_cache):
+def execute_signals_fast(exchange, target_time, total_equity, position_cache, open_order_cache, signal_df):
     """
     极速执行当前整点的信号（纯本地计算 + 直接发单）
     :param target_time: 目标整点时间 (datetime)
@@ -260,17 +259,10 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     logger.info(
         f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 风控限额: {target_position_value:.2f} ({POSITION_RISK_RATIO * 100:.0f}%) ==========")
 
-    if not os.path.exists(SIGNAL_FILE):
-        logger.warning(f"信号文件 {SIGNAL_FILE} 不存在。")
+    if signal_df is None or signal_df.empty:
+        logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
         return
-
-    # 1. 读取信号
-    try:
-        df = pd.read_csv(SIGNAL_FILE)
-        df['time'] = pd.to_datetime(df['time'])
-    except Exception as e:
-        logger.error(f"读取信号文件失败: {e}")
-        return
+    df = signal_df
     timedelta_minutes = 60 * 24 * 11
     # 2. 严格筛选当前整点的信号 (容差放宽至前后 1 分钟以防文件生成有微小偏差)
     time_lower = target_time - timedelta(minutes=timedelta_minutes)
@@ -451,7 +443,7 @@ def run_scheduler():
             logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
             t_wf = time.perf_counter()
             try:
-                execute_trading_bot_workflow()
+                signal_df = execute_trading_bot_workflow()
                 logger.info(f">>> [WORKFLOW] 信号流水线执行完毕！| 耗时: {time.perf_counter() - t_wf:.2f}s")
             except Exception as e:
                 logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e} | 耗时: {time.perf_counter() - t_wf:.2f}s")
@@ -497,7 +489,7 @@ def run_scheduler():
             f"========== [SCHEDULER] 破壁出锁 | 实际跳出时间: {actual_exit.strftime('%H:%M:%S.%f')[:-3]} | 自旋误差(Jitter): {drift_ms:+.2f}ms ==========")
 
         # ----------- 极速拔枪 -----------
-        execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache)
+        execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache, signal_df)
 
 
 if __name__ == "__main__":

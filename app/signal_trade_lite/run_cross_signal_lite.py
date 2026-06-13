@@ -316,7 +316,7 @@ def run_strategy_simulation(
 def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logger):
     """
     接收最新行情数据，遍历运行多个参数策略流水线，并生成各参数当前最新截面的操作指令。
-    返回合并后的全量交易流水账本字符串内容。
+    返回合并后的全量交易流水账本 DataFrame。
     """
     all_strategy_ledgers = []
 
@@ -400,16 +400,16 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
     output_path = "live_simulation_logs.csv"
     if all_strategy_ledgers:
         final_ledger_df = pd.concat(all_strategy_ledgers, ignore_index=True)
+        # 依然保留导出 CSV 的动作，方便本地查阅
         final_ledger_df.to_csv(output_path, index=False, encoding='utf-8-sig')
         logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_ledger_df)} 条记录)")
 
-        # 读取并返回信号文件的内容
-        with open(output_path, 'r', encoding='utf-8-sig') as f:
-            return f.read()
+        # 修改点：直接返回 DataFrame 对象
+        return final_ledger_df
     else:
         logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
-        return ""
-
+        # 修改点：当没有交易信号时，返回空的 DataFrame 而不是空字符串
+        return pd.DataFrame()
 # ==========================================
 # 4. 程序入口点
 # ==========================================
