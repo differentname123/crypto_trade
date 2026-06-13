@@ -430,6 +430,7 @@ def execute_trading_bot_workflow():
             max_window = current_max
 
     lookback_days = int(np.ceil(max_window / 6)) + 30
+    print(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
 
     symbol_list = [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
@@ -455,7 +456,6 @@ def execute_trading_bot_workflow():
         print("❌ 错误：没有任何数据被成功加载，程序退出。请检查网络或 fetch_binance_futures_klines 模块。")
     else:
         print(f"\n🚀 数据加载完毕，共 {len(fetched_raw_data)} 个标的。")
-        print(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
         print("═" * 70)
         run_live_pipeline(fetched_raw_data, strategy_params_list)
 

@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """:authors:
     zhuxiaohu
 :create_date:
@@ -100,9 +100,11 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
     else:
         existing_latest_time_str = "无"
 
+    # 新增：计算寻址范围跨度（天）
+    api_span_days = (current_ms - since) / (1000 * 60 * 60 * 24)
     # 优化点 H：去除无意义的数字硬编码，统一任务阶段标签 [TaskStart]
     logger.info(
-        f"{log_prefix} [TaskStart] 本地最新: {existing_latest_time_str} | API 寻址范围: {format_ts_to_bj(since)} -> 当前")
+        f"{log_prefix} [TaskStart] 本地最新: {existing_latest_time_str} | API 寻址范围: {format_ts_to_bj(since)} -> 当前 (跨度: {api_span_days:.2f}天)")
 
     limit = 1000
     all_ohlcv = []
@@ -250,9 +252,15 @@ def fetch_binance_futures_klines(symbol, timeframe='1h', days=30, retries=5, pro
         # 修改日志提取逻辑，使用新生成的 datetime_bj 字段进行格式化输出
         final_start_str = final_df['datetime_bj'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
         final_end_str = final_df['datetime_bj'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+
+        # 新增：计算最终数据的实际跨度（天）
+        final_start_ms = final_df['timestamp'].iloc[0]
+        final_end_ms = final_df['timestamp'].iloc[-1]
+        final_span_days = (final_end_ms - final_start_ms) / (1000 * 60 * 60 * 24)
+
         # 优化点 F：在总结处补充数据来源构成比例，便于观测 Cache 健康度
         logger.info(
-            f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 范围: {final_start_str} -> {final_end_str} | 最终输出: {len(final_df)} 条 (来源: 本地缓存 {len(cache_df)} 条, API增量 {len(all_ohlcv) + repair_ohlcv_total_len} 条)")
+            f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 范围: {final_start_str} -> {final_end_str} (跨度: {final_span_days:.2f}天) | 最终输出: {len(final_df)} 条 (来源: 本地缓存 {len(cache_df)} 条, API增量 {len(all_ohlcv) + repair_ohlcv_total_len} 条)")
     else:
         logger.warning(f"{log_prefix} [TaskEnd] 耗时: {cost_time:.2f}秒 | 内存产出范围: 无数据")
 
