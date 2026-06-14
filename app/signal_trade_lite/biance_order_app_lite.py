@@ -352,7 +352,9 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
         # 平仓：直接取真实持仓全平 (绝对值)
         amount = abs(current_pos_amt)
-        reduce_only = True
+        # 【核心修复】：双向持仓模式（Hedge Mode）下，API 严格禁止传入 reduce_only = True。
+        # 只要带有 position_side 参数，买卖方向做反向操作即可自动平仓，强制设为 False 避免 -1106 拒单。
+        reduce_only = False
     else:
         return
 
@@ -392,7 +394,6 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
     # 这里仅在失败时补加一条归档状态的记录即可，避免高频日志刷屏。
     if result.status != ExecStatus.OK:
         logger.error(f"[RECORD] 发单失败/拒绝，状态已归档入库 | CID: {client_oid} | 记录状态: {result.status.value}")
-
 
 def run_scheduler():
     """

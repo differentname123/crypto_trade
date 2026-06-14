@@ -54,31 +54,33 @@ logger = setup_logger()
 def init_exchange(api_key, secret_key, proxies=None):
     """
     初始化币安 U本位合约 (Future) 交易所对象并加载市场数据。
-
-    :param api_key: 币安 API Key
-    :param secret_key: 币安 Secret Key
-    :param proxies: 代理配置字典，如 {'http': '...', 'https': '...'} (默认: None)
-    :return: 初始化成功的 ccxt.binance 实例
-    :raises: 初始化或网络错误时抛出异常，调用方需自行捕获或直接阻断启动
     """
     try:
         config = {
             'apiKey': api_key,
             'secret': secret_key,
             'enableRateLimit': True,
-            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+                'recvWindow': 10000  # [新增] 将默认的 5000ms 接收窗口放宽至 10000ms，增加网络抖动容错
+            }
         }
         if proxies:
             config['proxies'] = proxies
 
         exchange = ccxt.binance(config)
+
+        # [新增] 强制进行初始时间对齐，并记录到日志中
+        exchange.load_time_difference()
+        initial_diff = exchange.options.get('timeDifference', 0)
+
         exchange.load_markets()
-        logger.info("[INIT] 交易所初始化成功，市场精度数据已加载。")
+        logger.info(f"[INIT] 交易所初始化成功，市场精度已加载 | 初始系统时间漂移补偿: {initial_diff}ms")
         return exchange
     except Exception as e:
         logger.critical(f"[INIT_FATAL] 交易所初始化失败: {e}")
         raise
-
 
 def get_symbol_status(exchange, symbol):
     """
