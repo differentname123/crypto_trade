@@ -182,10 +182,23 @@ def preload_account_state(exchange):
     """
     logger.info(">>> [PRELOAD] 启动资产与挂单预加载...")
     t_start = time.perf_counter()
-    eq_cost, pos_cost, ord_cost = 0, 0, 0
+    sync_cost, eq_cost, pos_cost, ord_cost = 0, 0, 0, 0
     total_equity = 0.0
     position_cache = {}
     open_order_cache = {}
+
+    # 【修复1】：每次预加载前，强制重新对齐币安服务器时间，消除系统时钟长程漂移 (Error -1021)
+    try:
+        t_sync = time.perf_counter()
+        old_diff = exchange.options.get('timeDifference', 0)
+        exchange.load_time_difference()
+        new_diff = exchange.options.get('timeDifference', 0)
+        sync_cost = (time.perf_counter() - t_sync) * 1000
+        # 补全关键日志：直观展示漂移程度与校准耗时
+        logger.info(
+            f"[PRELOAD] 动态时间偏差重新校准完成 | 漂移补偿: {old_diff}ms -> {new_diff}ms | 耗时: {sync_cost:.0f}ms")
+    except Exception as e:
+        logger.warning(f"[PRELOAD] 时间偏差动态校准失败，将继续使用旧值: {e}")
 
     # 1. 获取总资产 (带重试机制以防偶发网络抖动)
     for attempt in range(3):
@@ -200,49 +213,66 @@ def preload_account_state(exchange):
     if total_equity <= 0:
         logger.error("[PRELOAD] 预加载总资产失败或为0，本轮开仓将受限！")
 
-    # 2. 获取全量持仓并构建缓存字典
-    try:
-        t_pos = time.perf_counter()
-        positions = exchange.fetch_positions()
-        pos_cost = (time.perf_counter() - t_pos) * 1000
-        for pos in positions:
-            sym = pos['symbol']  # 格式如 "BTC/USDT:USDT"
-            amt = float(pos['info']['positionAmt'])
-            if amt != 0:
-                position_cache[sym] = amt
-    except Exception as e:
-        logger.error(f"[PRELOAD] 预加载持仓失败: {e}，平仓操作可能会受阻！")
+    # 2. 获取全量持仓并构建缓存字典 (【修复2】：增加 3 次重试机制)
+    position_success = False
+    for attempt in range(3):
+        try:
+            t_pos = time.perf_counter()
+            positions = exchange.fetch_positions()
+            pos_cost = (time.perf_counter() - t_pos) * 1000
+            for pos in positions:
+                sym = pos['symbol']  # 格式如 "BTC/USDT:USDT"
+                amt = float(pos['info']['positionAmt'])
+                if amt != 0:
+                    position_cache[sym] = amt
+            position_success = True
+            break
+        except Exception as e:
+            logger.warning(f"[PRELOAD] 拉取持仓失败 (第{attempt + 1}/3次): {e}")
+            time.sleep(1)
+
+    if not position_success:
+        logger.error("[PRELOAD] 预加载持仓彻底失败，平仓操作可能会受阻！")
         position_cache = None  # 标记为失败
 
-    # 3. 获取全量活动挂单并构建缓存字典 (防止重复挂单)
-    try:
-        t_ord = time.perf_counter()
-        # 解决 fetchOpenOrders 无 symbol 拉取全量挂单时的警告拦截
-        exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+    # 3. 获取全量活动挂单并构建缓存字典 (防止重复挂单) (【修复2】：增加 3 次重试机制)
+    order_success = False
+    for attempt in range(3):
+        try:
+            t_ord = time.perf_counter()
+            # 解决 fetchOpenOrders 无 symbol 拉取全量挂单时的警告拦截
+            exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
 
-        open_orders = exchange.fetch_open_orders()
-        ord_cost = (time.perf_counter() - t_ord) * 1000
-        for order in open_orders:
-            sym = order['symbol']
-            if sym not in open_order_cache:
-                open_order_cache[sym] = []
-            open_order_cache[sym].append(order)
-    except Exception as e:
-        logger.error(f"[PRELOAD] 预加载挂单失败: {e}，防重复挂单功能可能会受阻！")
+            open_orders = exchange.fetch_open_orders()
+            ord_cost = (time.perf_counter() - t_ord) * 1000
+            for order in open_orders:
+                sym = order['symbol']
+                if sym not in open_order_cache:
+                    open_order_cache[sym] = []
+                open_order_cache[sym].append(order)
+            order_success = True
+            break
+        except Exception as e:
+            logger.warning(f"[PRELOAD] 拉取挂单失败 (第{attempt + 1}/3次): {e}")
+            time.sleep(1)
+
+    if not order_success:
+        logger.error("[PRELOAD] 预加载挂单彻底失败，防重复挂单功能可能会受阻！")
         open_order_cache = None  # 标记为失败
 
     # 4. 同步并清理历史挂单，过滤完后返回最新的挂单缓存
     if open_order_cache is not None:
         open_order_cache = sync_and_clean_orders(exchange, open_order_cache)
 
-    # 日志聚合探针：将多条分散的就绪日志合并为一条高密度日志，暴露出三大核心 IO 的网络延迟
+    # 日志聚合探针：补全了对时耗时，并将多条分散的就绪日志合并为一条高密度日志
     pos_len = len(position_cache) if position_cache is not None else 'FAIL'
     ord_len = len(open_order_cache) if open_order_cache is not None else 'FAIL'
     total_cost = (time.perf_counter() - t_start) * 1000
     logger.info(
-        f"[PRELOAD] 缓存就绪 | 总权益: {total_equity:.2f} USD | 有效持仓: {pos_len}种 | 存在挂单: {ord_len}种 | 耗时探针(权益/持仓/挂单/总计): {eq_cost:.0f}ms / {pos_cost:.0f}ms / {ord_cost:.0f}ms / {total_cost:.0f}ms")
+        f"[PRELOAD] 缓存就绪 | 总权益: {total_equity:.2f} USD | 有效持仓: {pos_len}种 | 存在挂单: {ord_len}种 | 耗时探针(对时/权益/持仓/挂单/总计): {sync_cost:.0f}ms / {eq_cost:.0f}ms / {pos_cost:.0f}ms / {ord_cost:.0f}ms / {total_cost:.0f}ms")
 
     return total_equity, position_cache, open_order_cache
+
 
 
 # ==========================================
@@ -263,8 +293,9 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
         logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
         return
     df = signal_df
-    timedelta_minutes = 60
-    # 2. 严格筛选当前整点的信号 (容差放宽至前后 1 分钟以防文件生成有微小偏差)
+
+    # 【修复3】：严格筛选当前整点的信号 (容差缩紧至前后 1 分钟)
+    timedelta_minutes = 1
     time_lower = target_time - timedelta(minutes=timedelta_minutes)
     time_upper = target_time + timedelta(minutes=timedelta_minutes)
     current_signals = df[(df['time'] >= time_lower) & (df['time'] <= time_upper)]
@@ -282,6 +313,7 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
 
     logger.info(
         f"[EXEC] 本轮({target_time.strftime('%H:%M')})所有信号处理完毕 | 共匹配 {len(current_signals)} 条 | 模块总耗时: {(time.perf_counter() - t_start) * 1000:.1f}ms")
+
 
 
 def execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache):
