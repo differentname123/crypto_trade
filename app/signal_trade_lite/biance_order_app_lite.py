@@ -63,7 +63,7 @@ def sync_and_clean_orders(exchange, open_order_cache):
 
     t_start = time.perf_counter()
     try:
-        df = pd.read_csv(TRADE_RECORD_FILE)
+        df = pd.read_csv(TRADE_RECORD_FILE, dtype={'exchange_oid': str})
     except Exception as e:
         logger.error(f"[SYNC] 读取记录文件失败: {e}")
         return open_order_cache
@@ -263,7 +263,7 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
         logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
         return
     df = signal_df
-    timedelta_minutes = 60 * 24 * 11
+    timedelta_minutes = 60
     # 2. 严格筛选当前整点的信号 (容差放宽至前后 1 分钟以防文件生成有微小偏差)
     time_lower = target_time - timedelta(minutes=timedelta_minutes)
     time_upper = target_time + timedelta(minutes=timedelta_minutes)
