@@ -420,10 +420,10 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
             for _, row in latest_trade_signals.iterrows():
                 if row['event'] == 'CLOSE':
                     logger.info(
-                        f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
+                        f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
                 elif row['event'] == 'OPEN':
                     logger.info(
-                        f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
+                        f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
         logger.info("-" * 70)
 
     # 3. 汇总并导出完整的流水日志
@@ -440,6 +440,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
         logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
         # 修改点：当没有交易信号时，返回空的 DataFrame 而不是空字符串
         return pd.DataFrame()
+
 # ==========================================
 # 4. 程序入口点
 # ==========================================
