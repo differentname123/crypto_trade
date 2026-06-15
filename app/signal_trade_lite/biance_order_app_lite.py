@@ -429,10 +429,9 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
 def run_scheduler():
     """
-    智能三阶段调度器：
-    1. 休眠到 XX:50:00 -> 唤醒执行 execute_trading_bot_workflow 生成最新信号
-    2. 休眠到 XX:59:00 -> 唤醒获取并缓存资产和持仓
-    3. 休眠到 XX:00:00 -> 精确执行本地文件信号
+    智能两阶段调度器：
+    1. 休眠到 XX:55:00 -> 唤醒获取并缓存资产和持仓
+    2. 休眠到 XX:00:00 -> 唤醒执行 execute_trading_bot_workflow 生成最新信号 然后 精确执行本地文件信号
     """
     API_KEY = get_config('nana_biance_api_key')
     SECRET_KEY = get_config('nana_biance_api_secret')
@@ -453,51 +452,33 @@ def run_scheduler():
 
         # 计算下一个整点时间 (如 14:00:00)
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        # 工作流执行时间设为整点前 10 分钟 (如 13:50:00)
-        workflow_time = next_hour - timedelta(minutes=1)
-        # 预加载时间设为整点前 1 分钟 (如 13:59:00)
-        preload_time = next_hour - timedelta(minutes=1)
-        # [优化点] 统一计算包含 0.5 秒冗余的目标拔枪时间 (如 14:00:00.500)
-        target_exec_time = next_hour + timedelta(seconds=0.5)
 
-        # 阶段一：等待到达信号生成工作流时间 (XX:50:00)
-        if now < workflow_time:
-            sleep_sec = (workflow_time - now).total_seconds()
-            logger.info(f"[SCHEDULER] 休眠 {sleep_sec:.0f}s -> {workflow_time.strftime('%H:%M:%S')} (目标: 信号生成)")
-            # [深度优化] 放弃单次大段 sleep，改用每秒检查的细粒度轮询。
-            # 防止服务器系统时间 NTP 同步跳跃导致的长眠不醒。
-            while datetime.now() < workflow_time:
-                time.sleep(1)
+        # 预加载时间设为整点前 5 分钟 (如 13:55:00)
+        preload_time = next_hour - timedelta(minutes=5)
 
-        # ----------- 触发信号生成工作流 -----------
-        # 再次获取当前时间，为了兼容刚好在 50~59分之间启动程序的补跑逻辑
-        now = datetime.now()
-        if now < preload_time:
-            logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
-            t_wf = time.perf_counter()
-            try:
-                signal_df = execute_trading_bot_workflow()
-                logger.info(f">>> [WORKFLOW] 信号流水线执行完毕！| 耗时: {time.perf_counter() - t_wf:.2f}s")
-            except Exception as e:
-                logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e} | 耗时: {time.perf_counter() - t_wf:.2f}s")
+        # 目标唤醒时间设为精准整点 (如 14:00:00.000)
+        target_exec_time = next_hour
 
-        # 阶段二：等待到达预加载时间 (XX:59:00)
-        now = datetime.now()
+        # 防御性初始化，防止后续因网络/执行异常导致变量未绑定
+        signal_df = None
+
+        # 阶段一：等待到达预加载时间 (XX:55:00)
         if now < preload_time:
             sleep_sec = (preload_time - now).total_seconds()
             logger.info(f"[SCHEDULER] 休眠 {sleep_sec:.0f}s -> {preload_time.strftime('%H:%M:%S')} (目标: 数据预加载)")
-            # [深度优化] 同样使用细粒度休眠，确保精准衔接到 59 分 00 秒
+            # [深度优化] 放弃单次大段 sleep，改用每秒检查的细粒度轮询。
+            # 防止服务器系统时间 NTP 同步跳跃导致的长眠不醒。
             while datetime.now() < preload_time:
                 time.sleep(1)
 
         # ----------- 触发预加载 -----------
         total_equity, position_cache, open_order_cache = preload_account_state(exchange)
 
-        # 阶段三：精细等待到达目标拔枪时间 (XX:00:00.500)
+        # 阶段二：精细等待到达目标拔枪时间 (XX:00:00.000)
         now = datetime.now()
         if now < target_exec_time:
             sleep_sec_final = (target_exec_time - now).total_seconds()
-            logger.info(f"[SCHEDULER] 资产数据就绪！屏息倒计时 {sleep_sec_final:.1f}s 准备极速拔枪...")
+            logger.info(f"[SCHEDULER] 资产数据就绪！屏息倒计时 {sleep_sec_final:.1f}s 准备极速唤醒...")
 
             # [深度优化] 量化级混合精度等待 (普通休眠 + 极速自旋锁)
             while True:
@@ -521,9 +502,17 @@ def run_scheduler():
         logger.info(
             f"========== [SCHEDULER] 破壁出锁 | 实际跳出时间: {actual_exit.strftime('%H:%M:%S.%f')[:-3]} | 自旋误差(Jitter): {drift_ms:+.2f}ms ==========")
 
+        # ----------- 触发信号生成工作流 (XX:00:00 之后立刻执行) -----------
+        logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
+        t_wf = time.perf_counter()
+        try:
+            signal_df = execute_trading_bot_workflow()
+            logger.info(f">>> [WORKFLOW] 信号流水线执行完毕！| 耗时: {time.perf_counter() - t_wf:.2f}s")
+        except Exception as e:
+            logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e} | 耗时: {time.perf_counter() - t_wf:.2f}s")
+
         # ----------- 极速拔枪 -----------
         execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache, signal_df)
-
 
 if __name__ == "__main__":
     run_scheduler()
