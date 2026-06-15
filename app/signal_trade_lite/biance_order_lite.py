@@ -238,8 +238,8 @@ def get_total_equity(exchange):
     t0 = time.perf_counter()
     try:
         balance = exchange.fetch_balance()
-        # totalWalletBalance 代表所有资产折算的总钱包余额
-        total_equity = float(balance['info']['totalWalletBalance'])
+        # 【修复】：改为获取 totalMarginBalance，这是包含了未实现盈亏的动态总权益
+        total_equity = float(balance['info']['totalMarginBalance'])
         latency = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[EQUITY_OK] 耗时:{latency}ms | 账户总权益: {total_equity:.2f} USD")
         return ExecStatus.OK, total_equity
