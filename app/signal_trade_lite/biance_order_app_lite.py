@@ -454,7 +454,7 @@ def run_scheduler():
         # 计算下一个整点时间 (如 14:00:00)
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         # 工作流执行时间设为整点前 10 分钟 (如 13:50:00)
-        workflow_time = next_hour - timedelta(minutes=10)
+        workflow_time = next_hour - timedelta(minutes=1)
         # 预加载时间设为整点前 1 分钟 (如 13:59:00)
         preload_time = next_hour - timedelta(minutes=1)
         # [优化点] 统一计算包含 0.5 秒冗余的目标拔枪时间 (如 14:00:00.500)
