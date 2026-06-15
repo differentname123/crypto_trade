@@ -68,11 +68,10 @@ def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
     common_1m_start = max(m1_starts)
     common_1m_end = min(m1_ends)
 
-    # 健壮的时区处理：先声明原数据为绝对 UTC，再利用标准库转换为亚洲/上海（北京时间）
-    # 这样生成的 datetime 对象自带时区信息，无论服务器在哪里运行都绝对可靠
-    beijing_1m_start = common_1m_start.tz_localize('UTC').tz_convert('Asia/Shanghai')
-    beijing_1m_end = common_1m_end.tz_localize('UTC').tz_convert('Asia/Shanghai')
-    logger.info(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {beijing_1m_start} 至 {beijing_1m_end} (北京时间)")
+    # 格式化时间为字符串，去除时区偏移信息，保持清爽
+    start_str = common_1m_start.tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+    end_str = common_1m_end.tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+    logger.info(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {start_str} 至 {end_str} (北京时间)")
 
     # 6. 横向合并与严格交集对齐 (对齐了 prepare_environment 中的公共区间截断逻辑)
     df_merged_raw = pd.concat(resampled_coin_dfs, axis=1).sort_index()
