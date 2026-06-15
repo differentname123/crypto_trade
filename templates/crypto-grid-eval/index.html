@@ -477,7 +477,7 @@
 
     <div class="section-title">实时市场分析 (BTC核心基准驱动)</div>
     <div id="auto-results" class="grid-container" style="margin-bottom: 20px;">
-        <div class="status-msg">正在与实时市场数据同步...</div>
+        <div class="status-msg">正在与实时 market 数据同步...</div>
     </div>
 </div>
 
@@ -684,8 +684,8 @@ const cryptoData =
             let actualDrawdown = 0;
             let enhancementFactor = 1;
 
-            if (highestPrice > 0 && currentPrice !== null) {
-                actualDrawdown = (currentPrice / highestPrice) - 1;
+            if (highestPrice > 0 && targetPrice !== null) {
+                actualDrawdown = (targetPrice / highestPrice) - 1;
                 if (theoreticalDrawdown !== 0) {
                     enhancementFactor = actualDrawdown / theoreticalDrawdown;
                 }
@@ -718,8 +718,8 @@ const cryptoData =
                     let sActualDrawdown = 0;
                     let sEnhancementFactor = 1;
 
-                    if (sHighestPrice > 0 && currentPrice !== null) {
-                        sActualDrawdown = (currentPrice / sHighestPrice) - 1;
+                    if (sHighestPrice > 0 && targetPrice !== null) {
+                        sActualDrawdown = (targetPrice / sHighestPrice) - 1;
                         if (sTheoreticalDrawdown !== 0) {
                             sEnhancementFactor = sActualDrawdown / sTheoreticalDrawdown;
                         }
@@ -876,7 +876,10 @@ const cryptoData =
                 btcHighestPrice = parseFloat(cryptoData['BTCUSDT'][keys[0]][0]['最高价格']) || 46000;
             }
         }
-        globalBtcActualDrawdown = (btcPrice / btcHighestPrice) - 1;
+
+        // 【关键修复点】：将全局理论大盘基准回撤也修改为使用“推演目标价格”来计算，统一逻辑维度
+        const btcTargetPrice = btcPrice / (1 - offset / 100);
+        globalBtcActualDrawdown = (btcTargetPrice / btcHighestPrice) - 1;
 
         // 计算带容差的BTC价格并推导基础的回撤比例
         const adjustedBtcPrice = btcPrice / (1 - offset / 100);
@@ -936,8 +939,10 @@ const cryptoData =
                 let actualDrawdown = 0;
                 let enhancementFactor = 1;
 
-                if (highestPrice > 0 && item.currentPrice !== null) {
-                    actualDrawdown = (item.currentPrice / highestPrice) - 1;
+                const targetPrice = (item.currentPrice !== null && !isNaN(item.currentPrice)) ? item.currentPrice / (1 - offset / 100) : null;
+
+                if (highestPrice > 0 && targetPrice !== null) {
+                    actualDrawdown = (targetPrice / highestPrice) - 1;
                     if (theoreticalDrawdown !== 0) {
                         enhancementFactor = actualDrawdown / theoreticalDrawdown;
                     }
