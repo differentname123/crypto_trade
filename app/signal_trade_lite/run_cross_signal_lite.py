@@ -13,6 +13,10 @@ def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') ->
     """
     resampled_coin_dfs = []
 
+    # [新增] 记录所有币种在底层 1m 级别的时间首尾边界
+    m1_starts = []
+    m1_ends = []
+
     for df in minute_klines_list:
         if df is None or df.empty:
             continue
@@ -30,6 +34,10 @@ def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') ->
 
         df_coin.set_index('timestamp', inplace=True)
         df_coin.sort_index(inplace=True)
+
+        # [新增] 提取当前币种 1m 数据的精确首尾时间
+        m1_starts.append(df_coin.index[0])
+        m1_ends.append(df_coin.index[-1])
 
         # 3. 核心对齐：使用与回测一致的重采样逻辑生成高低价
         df_coin_4h = df_coin['close'].resample('4h', offset=time_offset).agg(
@@ -55,9 +63,26 @@ def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') ->
     if not resampled_coin_dfs:
         raise ValueError("传入的 minute_klines_list 全为空或无法解析！")
 
-    # 6. 横向合并与前向填充兜底
+    # [新增] 严格取交集：找出最晚上市的起点和最早结束的终点，输出精确 1m 日志
+    common_1m_start = max(m1_starts)
+    common_1m_end = min(m1_ends)
+    print(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {common_1m_start} 至 {common_1m_end}")
+
+    # 6. 横向合并与严格交集对齐 (对齐了 prepare_environment 中的公共区间截断逻辑)
     df_merged_raw = pd.concat(resampled_coin_dfs, axis=1).sort_index()
-    df_merged_filled = df_merged_raw.ffill()
+
+    # 提取只包含收盘价(即币种名)的主列
+    main_coins = [c for c in df_merged_raw.columns if not any(x in c for x in ['_open', '_high', '_low'])]
+
+    # 锁定所有币种在 4h 级别都有数据的绝对公共区间
+    coin_starts_4h = [df_merged_raw[c].first_valid_index() for c in main_coins]
+    coin_ends_4h = [df_merged_raw[c].last_valid_index() for c in main_coins]
+
+    common_4h_start = max(coin_starts_4h)
+    common_4h_end = min(coin_ends_4h)
+
+    # 先用 loc 截断所有非公共期的参差不齐的数据，然后再执行 ffill 兜底
+    df_merged_filled = df_merged_raw.loc[common_4h_start:common_4h_end].ffill()
 
     return df_merged_filled
 
