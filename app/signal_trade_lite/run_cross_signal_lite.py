@@ -6,7 +6,8 @@ from app.signal_trade_lite.common_utils_lite import setup_logger
 from app.signal_trade_lite.fetch_data_lite import fetch_binance_futures_klines
 
 
-def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') -> pd.DataFrame:
+
+def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
     """
     将交易所拉取的【分钟级 K线列表】无损转换为信号引擎所需的【4H 截面 DataFrame】
     返回的 DataFrame 列名包含各币种的 open, high, low 以及作为 close 的币种名。
@@ -66,7 +67,12 @@ def build_4h_cross_section(minute_klines_list: list, time_offset: str = '0h') ->
     # [新增] 严格取交集：找出最晚上市的起点和最早结束的终点，输出精确 1m 日志
     common_1m_start = max(m1_starts)
     common_1m_end = min(m1_ends)
-    print(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {common_1m_start} 至 {common_1m_end}")
+
+    # 健壮的时区处理：先声明原数据为绝对 UTC，再利用标准库转换为亚洲/上海（北京时间）
+    # 这样生成的 datetime 对象自带时区信息，无论服务器在哪里运行都绝对可靠
+    beijing_1m_start = common_1m_start.tz_localize('UTC').tz_convert('Asia/Shanghai')
+    beijing_1m_end = common_1m_end.tz_localize('UTC').tz_convert('Asia/Shanghai')
+    logger.info(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {beijing_1m_start} 至 {beijing_1m_end} (北京时间)")
 
     # 6. 横向合并与严格交集对齐 (对齐了 prepare_environment 中的公共区间截断逻辑)
     df_merged_raw = pd.concat(resampled_coin_dfs, axis=1).sort_index()
@@ -352,7 +358,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
         trade_mode = params['TRADE_MODE']
 
         logger.info(f"⏳ [策略: {strategy_name}] 正在将分钟级数据组装为 4H 矩阵 (Offset: {time_offset})...")
-        df_4h_features = build_4h_cross_section(minute_klines_list, time_offset=time_offset)
+        df_4h_features = build_4h_cross_section(logger, minute_klines_list, time_offset=time_offset)
 
         if df_4h_features is None or df_4h_features.empty:
             continue
