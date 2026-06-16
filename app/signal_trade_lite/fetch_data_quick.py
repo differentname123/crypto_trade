@@ -39,7 +39,7 @@ def _format_bj_time(ts_ms):
 # =====================================================================
 # 🗄️ 模块一：缓存与存储引擎 (Cache & Storage Manager) [已修复]
 # =====================================================================
-def load_local_cache(symbol_list, start_time_ms, cache_dir="data", log_prefix=""):
+def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data", log_prefix=""):
     """
     智能加载本地缓存数据。
     如果本地缓存涵盖了所需历史的起点，则只需拉取缺失的增量数据；
@@ -71,14 +71,19 @@ def load_local_cache(symbol_list, start_time_ms, cache_dir="data", log_prefix=""
                     # row[0]是float，需强转为int作为字典key，后半部使用切片拼接
                     memory_pool[sym][ts] = [ts] + row[1:]
 
+                # 计算该缓存的理论期望行数与实际行数，用于甄别“瑞士奶酪”断层数据
+                expected_rows = (max_ts - min_ts) // timeframe_ms + 1
+                actual_rows = len(records)
+
                 # 智能判断需要追赶的起点
-                if min_ts <= start_time_ms:
-                    # 缓存已覆盖起点，将追赶起点设为 max_ts（重叠拉取最后一根，确保其已彻底闭合）
+                if min_ts <= start_time_ms and actual_rows >= expected_rows:
+                    # 缓存已覆盖起点，且中间绝对无断层，将追赶起点设为 max_ts（重叠拉取最后一根，确保其已彻底闭合）
                     fetch_since_map[sym] = max_ts
                     hits += 1
                     latest_times[sym.split('/')[0]] = _format_bj_time(max_ts)
                 else:
-                    # 缓存缺失早期数据，必须全量拉取
+                    # 缓存缺失早期数据，或中间存在缺失(空洞)，强制标记为从头拉取补齐
+                    fetch_since_map[sym] = start_time_ms
                     misses += 1
             except Exception as e:
                 logger.warning(f"{log_prefix} [CACHE] ⚠️ 读取 {sym} 缓存失败: {e}")
@@ -170,7 +175,7 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
                     close_sys_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
                     # 给强判脱困的币种打个 ⏱️ 标记，方便运维追踪复盘
                     mark = "⏱️强判" if condition_time_force and not (
-                                condition_ws_closed or condition_next_candle) else ""
+                            condition_ws_closed or condition_next_candle) else ""
                     processor_stats["details"][symbol.split(':')[0]] = f"{source}{mark}({close_sys_time})"
 
                     # [改造点] 取消单条频刷日志，保持静默，等待主协程汇报
@@ -199,23 +204,34 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
     latest_ts = 0
 
     while True:
-        try:
-            ohlcvs = await exchange.fetch_ohlcv(symbol, timeframe, since=curr_since, limit=limit)
-            if not ohlcvs: break
+        retry_count = 0
+        success = False
+        while retry_count <= 3:
+            try:
+                ohlcvs = await exchange.fetch_ohlcv(symbol, timeframe, since=curr_since, limit=limit)
+                success = True
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                retry_count += 1
+                prefix = tracker.get('log_prefix', '') if tracker else ''
+                logger.warning(f"{prefix} [HIST] {symbol} 拉取异常: {e}，重试 {retry_count}/3...")
+                if retry_count <= 3:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"{prefix} [HIST] {symbol} 达到最大重试次数，放弃当前片段。")
 
-            total_fetched += len(ohlcvs)
-            latest_ts = ohlcvs[-1][0]
+        if not success or not ohlcvs:
+            break
 
-            for k in ohlcvs: await queue.put((symbol, k, "HIST", False))
+        total_fetched += len(ohlcvs)
+        latest_ts = ohlcvs[-1][0]
 
-            curr_since = ohlcvs[-1][0] + 1
-            if len(ohlcvs) < limit: break
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            prefix = tracker.get('log_prefix', '') if tracker else ''
-            logger.warning(f"{prefix} [HIST] {symbol} 拉取异常: {e}，重试中...")
-            await asyncio.sleep(2)
+        for k in ohlcvs: await queue.put((symbol, k, "HIST", False))
+
+        curr_since = ohlcvs[-1][0] + 1
+        if len(ohlcvs) < limit: break
 
     cost_t = time.time() - start_t
     # [改造点] 利用 tracker 聚合日志，消灭 O(N) 冗余
@@ -239,27 +255,33 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix
     ws_symbols = [k.lower() for k in ws_mapping.keys()]
     stream_url = f"wss://fstream.binance.com/market/stream?streams={'/'.join([f'{s}@kline_{timeframe}' for s in ws_symbols])}"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(stream_url, proxy=proxy_url, heartbeat=10) as ws:
-                logger.info(f"{log_prefix} [WSS] ✅ 数据总线已建连 | streams={len(ws_symbols)}")
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        if 'data' in data and 'k' in data['data']:
-                            k_data = data['data']['k']
-                            raw_s = data['data']['s']
+    attempt = 0
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(stream_url, proxy=proxy_url, heartbeat=10) as ws:
+                    logger.info(f"{log_prefix} [WSS] ✅ 数据总线已建连 | streams={len(ws_symbols)}")
+                    attempt = 0  # 成功连接并准备接收数据，重置退避计数
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            if 'data' in data and 'k' in data['data']:
+                                k_data = data['data']['k']
+                                raw_s = data['data']['s']
 
-                            # 通过字典动态匹配，彻底告别硬编码！完美兼容 USDC/USDT 等所有计价方式
-                            if raw_s in ws_mapping:
-                                target_symbol = ws_mapping[raw_s]
-                                kline = [int(k_data['t']), float(k_data['o']), float(k_data['h']),
-                                         float(k_data['l']), float(k_data['c']), float(k_data['v'])]
-                                await queue.put((target_symbol, kline, "WS", bool(k_data['x'])))
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.error(f"{log_prefix} [WSS] ❌ 异常断开: {e}")
+                                # 通过字典动态匹配，彻底告别硬编码！完美兼容 USDC/USDT 等所有计价方式
+                                if raw_s in ws_mapping:
+                                    target_symbol = ws_mapping[raw_s]
+                                    kline = [int(k_data['t']), float(k_data['o']), float(k_data['h']),
+                                             float(k_data['l']), float(k_data['c']), float(k_data['v'])]
+                                    await queue.put((target_symbol, kline, "WS", bool(k_data['x'])))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            attempt += 1
+            sleep_time = min(2 ** attempt, 16)  # 指数退避重试：2, 4, 8, 16...
+            logger.error(f"{log_prefix} [WSS] ❌ 异常断开: {e} | {sleep_time}秒后自愈重连 (第{attempt}次)...")
+            await asyncio.sleep(sleep_time)
 
 
 async def fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue):
@@ -332,6 +354,7 @@ async def check_time_sync(exchange, log_prefix=""):
         logger.error(f"{log_prefix} [PING] ❌ 时钟同步检测失败: {e}")
         return None, None
 
+
 async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_time_str,
                                            use_ws, use_rest, proxy_url):
     orchestrator_start_t = time.time()
@@ -355,7 +378,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={len(symbol_list)} days={days}")
 
         # 2. 智能缓存装载 & 内存池初始化
-        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, log_prefix=log_prefix)
+        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, log_prefix=log_prefix)
 
         queue = asyncio.Queue()
         completion_event = asyncio.Event()
@@ -377,6 +400,9 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             for sym in symbol_list
         ]
 
+        # 阻塞等待历史数据拉取完成，保证不遗漏补充数据
+        await asyncio.gather(*history_tasks, return_exceptions=True)
+
         # 4. [改造点1] 战术休眠第一阶段：提前一分钟休眠至目标时间到来，随后立刻触发二次追赶释放压力
         sleep_to_target = target_time_ms - exchange.milliseconds()
         if sleep_to_target > 0:
@@ -393,6 +419,9 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             gap_tasks.append(asyncio.create_task(
                 fetch_historical_rest(exchange, sym, timeframe, gap_start_ms, queue, hist_tracker_2)
             ))
+
+        # 阻塞等待第二阶段缺口拉取完成
+        await asyncio.gather(*gap_tasks, return_exceptions=True)
         history_tasks.extend(gap_tasks)
 
         # 实时双擎机制分配：WS流可以即刻点火，监听收线全过程
@@ -414,14 +443,15 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
         # 5. [改造点] 超时检测预警：正常收线保持静默，超时滞后则 O(N) 穿透点名
         try:
-            # 预期收线界限后延 1 秒作为容忍阈值，超过则抛出 Warning
-            timeout = max(0.1, (target_close_time_ms + 1000 - exchange.milliseconds()) / 1000)
+            absolute_deadline_ms = target_close_time_ms + 60000
+            current_ms = exchange.milliseconds()
+            timeout = max(0.1, (absolute_deadline_ms - current_ms) / 1000)
             await asyncio.wait_for(completion_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             lag_symbols = set(symbol_list) - processor_stats["reached"]
-            # 仅截取前 3 个标的打印防止刷屏
-            logger.warning(f"{log_prefix} [RACE] ⚠️ 引擎收线滞后(>1s) | pending={list(lag_symbols)[:3]}... 持续兜底中")
-            await completion_event.wait()  # 打印完告警后，继续无限等待直至补齐
+            # 移除无限等待，发生超时直接向下执行发令枪强杀
+            logger.warning(
+                f"{log_prefix} [RACE] 🚨 触发绝对超时硬熔断(>1m) | pending={list(lag_symbols)[:3]}... 强制脱壳返回！")
 
         # [核心竞速指标计算]
         close_latency_ms = exchange.milliseconds() - target_close_time_ms
@@ -458,12 +488,20 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         # 7. 数据清洗封装 (给用户返回精确切片的数据)
         # [终极修复] 消灭 O(N) 冗余计算：直接利用上面排好序的完美全量 DataFrame 利用 Pandas C底层向量化特性切片
         final_dfs = {}
+        expected_rows = int((target_time_ms - start_time_ms) / timeframe_ms) + 1
+
         for sym, full_df in full_dfs_for_cache.items():
             sliced_df = full_df[
                 (full_df['timestamp'] >= start_time_ms) & (full_df['timestamp'] <= target_time_ms)].reset_index(
                 drop=True)
             sliced_df['datetime_bj'] = pd.to_datetime(sliced_df['timestamp'], unit='ms').dt.tz_localize(
                 'UTC').dt.tz_convert('Asia/Shanghai')
+
+            actual_rows = len(sliced_df)
+            if actual_rows < expected_rows:
+                logger.warning(
+                    f"{log_prefix} [CHECK] ⚠️ {sym} 数据存在断缺！预期 {expected_rows} 条，实际 {actual_rows} 条 (缺失 {expected_rows - actual_rows} 条)")
+
             final_dfs[sym] = sliced_df
 
         total_pts = sum(len(df) for df in final_dfs.values())
