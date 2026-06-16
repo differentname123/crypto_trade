@@ -285,7 +285,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         gap_tasks = []
         for sym in symbol_list:
             # 动态算出缺口起点，避免拉取重复数据
-            gap_start_ms = max(memory_pool[sym].keys()) + 1 if memory_pool[sym] else fetch_since_map[sym]
+            gap_start_ms = max(memory_pool[sym].keys()) if memory_pool[sym] else fetch_since_map[sym]
             gap_tasks.append(asyncio.create_task(
                 fetch_historical_rest(exchange, sym, timeframe, gap_start_ms, queue)
             ))
@@ -379,7 +379,7 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
 # =====================================================================
 if __name__ == "__main__":
     symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT"]
-    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+    target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
 
     print(">>> 准备调用数据引擎...")
 
