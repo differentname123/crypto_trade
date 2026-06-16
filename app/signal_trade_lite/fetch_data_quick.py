@@ -42,8 +42,8 @@ def _format_bj_time(ts_ms):
 def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data", log_prefix=""):
     """
     智能加载本地缓存数据。
-    如果本地缓存涵盖了所需历史的起点，则只需拉取缺失的增量数据；
-    否则，标记为全量回溯。
+    如果本地缓存涵盖了所需历史的起点，且目标区间无断层，则只需拉取缺失的增量数据；
+    否则，从起点强制回拉，弥补空洞。
     """
     t0 = time.time()
     memory_pool = {sym: {} for sym in symbol_list}
@@ -64,25 +64,37 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data",
                 min_ts = int(df['timestamp'].min())
                 max_ts = int(df['timestamp'].max())
 
-                # [修复点1] 极致性能优化：抛弃 iterrows，使用 values.tolist() 提速百倍
+                # 极致性能优化：抛弃 iterrows，使用 values.tolist() 提速百倍
                 records = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].values.tolist()
                 for row in records:
                     ts = int(row[0])
-                    # row[0]是float，需强转为int作为字典key，后半部使用切片拼接
                     memory_pool[sym][ts] = [ts] + row[1:]
 
-                # 计算该缓存的理论期望行数与实际行数，用于甄别“瑞士奶酪”断层数据
-                expected_rows = (max_ts - min_ts) // timeframe_ms + 1
-                actual_rows = len(records)
+                # [终极修复2] 局部连续性校验：只检查请求的 start_time_ms 到 max_ts 这一段是否存在空洞
+                if min_ts <= start_time_ms:
+                    sub_df = df[df['timestamp'] >= start_time_ms]
+                    if not sub_df.empty:
+                        sub_min_ts = int(sub_df['timestamp'].min())
+                        sub_max_ts = int(sub_df['timestamp'].max())
+                        expected_rows = (sub_max_ts - sub_min_ts) // timeframe_ms + 1
+                        actual_rows = len(sub_df)
 
-                # 智能判断需要追赶的起点
-                if min_ts <= start_time_ms and actual_rows >= expected_rows:
-                    # 缓存已覆盖起点，且中间绝对无断层，将追赶起点设为 max_ts（重叠拉取最后一根，确保其已彻底闭合）
-                    fetch_since_map[sym] = max_ts
-                    hits += 1
-                    latest_times[sym.split('/')[0]] = _format_bj_time(max_ts)
+                        # 核心判定：
+                        # 1. actual_rows >= expected_rows 说明这段区间内部无空洞
+                        # 2. sub_min_ts - start_time_ms <= timeframe_ms 说明这段数据刚好能无缝衔接请求起点，没发生脱节
+                        if actual_rows >= expected_rows and (sub_min_ts - start_time_ms) <= timeframe_ms:
+                            fetch_since_map[sym] = max_ts
+                            hits += 1
+                            latest_times[sym.split('/')[0]] = _format_bj_time(max_ts)
+                        else:
+                            # 存在空洞，从请求起点老老实实回拉弥补
+                            fetch_since_map[sym] = start_time_ms
+                            misses += 1
+                    else:
+                        fetch_since_map[sym] = start_time_ms
+                        misses += 1
                 else:
-                    # 缓存缺失早期数据，或中间存在缺失(空洞)，强制标记为从头拉取补齐
+                    # 连起点都没覆盖，必须全量重拉
                     fetch_since_map[sym] = start_time_ms
                     misses += 1
             except Exception as e:
@@ -91,7 +103,6 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data",
             misses += 1
 
     cost = time.time() - t0
-    # [改造点] O(N) 级别刷屏日志替换为单条高密度汇总聚合，并加入每个币最新的时间
     logger.info(
         f"{log_prefix} [CACHE] ♻️ 智能缓存装载 | hit={hits} miss={misses} load_cost={cost:.2f}s latest={latest_times}")
 
@@ -110,13 +121,12 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
         path = os.path.join(cache_dir, f"{safe_symbol}_latest.csv")
         temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
         try:
-            # [终极修复] 原子性写入保护：先写临时文件，完成后系统级瞬间覆盖，防止程序被强杀导致数月缓存归零损坏
+            # 原子性写入保护：先写临时文件，完成后系统级瞬间覆盖，防止程序被强杀导致数月缓存归零损坏
             df.to_csv(temp_path, index=False)
             total_io_size += os.path.getsize(temp_path)
             os.replace(temp_path, path)
         except Exception as e:
             logger.error(f"{log_prefix} [DISK] ❌ 异步保存 {symbol} 失败: {e}")
-            # 如果出错尝试清理临时文件
             if os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -124,7 +134,6 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
                     pass
 
     cost = time.time() - t0
-    # [改造点] 暴露落盘的核心 IO 指标，方便告警监控
     logger.info(
         f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
 
@@ -136,7 +145,6 @@ def dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=""
     save_thread = threading.Thread(
         target=_save_csv_sync_fast,
         args=(full_dfs_for_cache, cache_dir, log_prefix),
-        # 设置为非守护线程，确保主程序体面等待落盘完成才彻底退出，防止文件损坏
         daemon=False
     )
     save_thread.start()
@@ -164,21 +172,17 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
                 condition_ws_closed = (ts == target_time_ms and is_closed)
                 condition_next_candle = (ts >= target_time_ms + timeframe_ms)
 
-                # [防死锁防线] 物理时钟强判：针对流动性弱的冷门币种，如果收到了目标K线且现实时间已跨越寿命终点 10 秒，强制闭合！
                 condition_time_force = (ts == target_time_ms and current_sys_ms > target_time_ms + timeframe_ms + 10000)
 
                 if condition_ws_closed or condition_next_candle or condition_time_force:
                     reached_symbols.add(symbol)
                     processor_stats["winners"][source] += 1
 
-                    # 记录该币种闭合时的精确系统时间与方式
                     close_sys_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                    # 给强判脱困的币种打个 ⏱️ 标记，方便运维追踪复盘
                     mark = "⏱️强判" if condition_time_force and not (
                             condition_ws_closed or condition_next_candle) else ""
                     processor_stats["details"][symbol.split(':')[0]] = f"{source}{mark}({close_sys_time})"
 
-                    # [改造点] 取消单条频刷日志，保持静默，等待主协程汇报
                     if len(reached_symbols) == len(symbol_list):
                         processor_stats["throughput"] = stats
                         completion_event.set()
@@ -188,7 +192,6 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # [防静默崩溃] 捕获所有字典异常，强制释放事件锁，绝不让主线程无限死等卡住
         logger.error(f"[Processor] ❌ 数据大脑发生致命异常: {e}，正在强制解除全局阻塞锁...")
         completion_event.set()
 
@@ -234,7 +237,6 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
         if len(ohlcvs) < limit: break
 
     cost_t = time.time() - start_t
-    # [改造点] 利用 tracker 聚合日志，消灭 O(N) 冗余
     if tracker is not None:
         tracker['done'] += 1
         tracker['max_cost'] = max(tracker.get('max_cost', 0), cost_t)
@@ -250,7 +252,6 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
 
 
 async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=""):
-    # [核心修复] 动态构建 WS 的 raw_symbol (如 ETHUSDC) 到 target_symbol (如 ETH/USDC:USDC) 的映射字典
     ws_mapping = {s.replace("/", "").split(":")[0].upper(): s for s in symbol_list}
     ws_symbols = [k.lower() for k in ws_mapping.keys()]
     stream_url = f"wss://fstream.binance.com/market/stream?streams={'/'.join([f'{s}@kline_{timeframe}' for s in ws_symbols])}"
@@ -269,7 +270,6 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix
                                 k_data = data['data']['k']
                                 raw_s = data['data']['s']
 
-                                # 通过字典动态匹配，彻底告别硬编码！完美兼容 USDC/USDT 等所有计价方式
                                 if raw_s in ws_mapping:
                                     target_symbol = ws_mapping[raw_s]
                                     kline = [int(k_data['t']), float(k_data['o']), float(k_data['h']),
@@ -292,10 +292,8 @@ async def fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue):
             for sym, ohlcvs in zip(symbol_list, results):
                 if isinstance(ohlcvs, Exception) or not ohlcvs: continue
 
-                # [改造点2] 严格的数据完整性校验
                 latest_ts = ohlcvs[-1][0]
                 for k in ohlcvs:
-                    # 只有时间戳小于最新一条的数据，才被视为前一分钟完全走完的数据
                     is_closed = (k[0] < latest_ts)
                     await queue.put((sym, k, "REST_POLL", is_closed))
 
@@ -321,29 +319,17 @@ async def check_time_sync(exchange, log_prefix=""):
     采用标准 NTP 估计算法剔除网络传输误差。
     """
     try:
-        # 发起请求前的本地时间
         t0 = time.time() * 1000
-
-        # 异步获取币安服务器时间
         server_time = await exchange.fetch_time()
-
-        # 收到响应后的本地时间
         t1 = time.time() * 1000
-
-        # 1. RTT (Round Trip Time): 网络往返总延迟
         rtt = t1 - t0
-
-        # 2. 精准偏差 (Offset): 假设上下行网络是对称的，计算出请求到达币安的那一刻，我们本地是几点，然后与币安时间做差集
         local_time_at_server = t0 + (rtt / 2)
         offset = server_time - local_time_at_server
-
-        # 判断时钟快慢 (为了日志直观，我们将语义转换为：本地机器相对于服务器是快了还是慢了)
         status = "落后" if offset > 0 else "超前"
 
         logger.info(
             f"{log_prefix} [PING] ⏱️ 时钟与网络基准测试 | RTT延迟: {rtt:.2f}ms | 本地时钟{status}服务器: {abs(offset):.2f}ms")
 
-        # 强预警机制：如果偏差超过 500ms，API 极易拒绝签名
         if abs(offset) > 500:
             logger.warning(
                 f"{log_prefix} [PING] ⚠️ 极高危预警：本地时间偏差过大(>{abs(offset):.0f}ms)！极易导致 API 签名失败，请立即执行 NTP 时间同步！")
@@ -358,7 +344,6 @@ async def check_time_sync(exchange, log_prefix=""):
 async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_time_str,
                                            use_ws, use_rest, proxy_url):
     orchestrator_start_t = time.time()
-    # [改造点] 生成全局 TraceID，后续用于链路绑定
     run_id = f"T-{uuid.uuid4().hex[:4].upper()}"
     log_prefix = f"[{run_id}]"
 
@@ -382,7 +367,6 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
         queue = asyncio.Queue()
         completion_event = asyncio.Event()
-        # [改造点] 统计字典，用于提取监控面数据
         processor_stats = {"reached": set(), "winners": {"WS": 0, "REST_POLL": 0, "HIST": 0}, "throughput": {},
                            "details": {}}
 
@@ -400,10 +384,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             for sym in symbol_list
         ]
 
-        # 阻塞等待历史数据拉取完成，保证不遗漏补充数据
-        await asyncio.gather(*history_tasks, return_exceptions=True)
-
-        # 4. [改造点1] 战术休眠第一阶段：提前一分钟休眠至目标时间到来，随后立刻触发二次追赶释放压力
+        # 4. 战术休眠第一阶段：提前一分钟休眠至目标时间到来，随后立刻触发二次追赶释放压力
         sleep_to_target = target_time_ms - exchange.milliseconds()
         if sleep_to_target > 0:
             logger.info(
@@ -414,14 +395,11 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
                           'log_prefix': log_prefix, 'latest_ts': 0}
         gap_tasks = []
         for sym in symbol_list:
-            # 动态算出缺口起点，避免拉取重复数据
             gap_start_ms = max(memory_pool[sym].keys()) if memory_pool[sym] else fetch_since_map[sym]
             gap_tasks.append(asyncio.create_task(
                 fetch_historical_rest(exchange, sym, timeframe, gap_start_ms, queue, hist_tracker_2)
             ))
 
-        # 阻塞等待第二阶段缺口拉取完成
-        await asyncio.gather(*gap_tasks, return_exceptions=True)
         history_tasks.extend(gap_tasks)
 
         # 实时双擎机制分配：WS流可以即刻点火，监听收线全过程
@@ -430,7 +408,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             engine_tasks.append(
                 asyncio.create_task(fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=log_prefix)))
 
-        # [改造点3] 战术休眠第二阶段：死等最后 5 秒，再瞬间点爆无延迟脉冲 REST
+        # 战术休眠第二阶段：死等最后 5 秒，再瞬间点爆无延迟脉冲 REST
         sleep_to_rest = target_close_time_ms - 5000 - exchange.milliseconds()
         if sleep_to_rest > 0:
             logger.info(
@@ -441,7 +419,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             engine_tasks.append(
                 asyncio.create_task(fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue)))
 
-        # 5. [改造点] 超时检测预警：正常收线保持静默，超时滞后则 O(N) 穿透点名
+        # 5. 超时检测预警与收盘等待
         try:
             absolute_deadline_ms = target_close_time_ms + 60000
             current_ms = exchange.milliseconds()
@@ -449,9 +427,11 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             await asyncio.wait_for(completion_event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
             lag_symbols = set(symbol_list) - processor_stats["reached"]
-            # 移除无限等待，发生超时直接向下执行发令枪强杀
             logger.warning(
                 f"{log_prefix} [RACE] 🚨 触发绝对超时硬熔断(>1m) | pending={list(lag_symbols)[:3]}... 强制脱壳返回！")
+
+        # 【重点修改】：在这里确保所有尽力而为的历史拉取已交卷，保证最后交付的数据尽可能补全缺口
+        await asyncio.gather(*history_tasks, return_exceptions=True)
 
         # [核心竞速指标计算]
         close_latency_ms = exchange.milliseconds() - target_close_time_ms
@@ -462,15 +442,14 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             f"{log_prefix} [RACE] 🎯 目标全线闭合 | close_latency={close_latency_ms / 1000:.3f}s winner=(WS:{win['WS']}, REST:{win['REST_POLL']}) throughput=(ws:{tp.get('WS', 0)}, rest:{tp.get('REST_POLL', 0)}, hist:{tp.get('HIST', 0)}) details={det}")
 
         # 6. 发令枪响：瞬间强杀所有底层协程
-        all_tasks = history_tasks + engine_tasks + [processor_task]
+        all_tasks = engine_tasks + [processor_task]
         for task in all_tasks:
             if not task.done(): task.cancel()
 
-        # [终极修复] 静默回收所有被 Cancel 的任务，防止报 Task was destroyed but it is pending! 的内存/网络连接泄露警告
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # 构建用于后台落盘的全量数据 (Source of Truth)，确保缓存不会丢失切片外的边缘数据
-        MAX_CACHE_ROWS = 525600  # 最大保存1年的数据(基于1m周期: 365*24*60)，防止无限膨胀导致OOM
+        # 构建用于后台落盘的全量数据
+        MAX_CACHE_ROWS = 525600
         full_dfs_for_cache = {}
         for sym in symbol_list:
             all_klines = list(memory_pool[sym].values())
@@ -482,11 +461,10 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             full_dfs_for_cache[sym] = pd.DataFrame(all_klines,
                                                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-        # 无阻塞落盘：直接把全量数据甩给后台线程
+        # 无阻塞落盘
         dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=log_prefix)
 
-        # 7. 数据清洗封装 (给用户返回精确切片的数据)
-        # [终极修复] 消灭 O(N) 冗余计算：直接利用上面排好序的完美全量 DataFrame 利用 Pandas C底层向量化特性切片
+        # 7. 数据清洗封装
         final_dfs = {}
         expected_rows = int((target_time_ms - start_time_ms) / timeframe_ms) + 1
 
@@ -548,14 +526,14 @@ if __name__ == "__main__":
             "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
         ]
 
-        target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
 
         print(">>> 准备调用数据引擎...")
 
         result_map = snipe_kline_data(
             symbol_list=symbol_list,
             timeframe="1m",
-            days=1,  # 测试大天数，第二次运行将秒开
+            days=150,
             target_time_str=target_time,
             use_ws=True,
             use_rest=True,
@@ -563,20 +541,17 @@ if __name__ == "__main__":
         )
 
         symbol_list = [
-
             "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-
             "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
-
         ]
-        target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
 
         print(">>> 准备调用数据引擎...")
 
         result_map = snipe_kline_data(
             symbol_list=symbol_list,
             timeframe="1m",
-            days=1,  # 测试大天数，第二次运行将秒开
+            days=150,
             target_time_str=target_time,
             use_ws=True,
             use_rest=True,

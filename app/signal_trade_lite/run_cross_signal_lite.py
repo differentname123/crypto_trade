@@ -1,10 +1,10 @@
-import os
+from datetime import datetime, timedelta
+
 import pandas as pd
 import numpy as np
 
 from app.signal_trade_lite.common_utils_lite import setup_logger
-from app.signal_trade_lite.fetch_data_lite import fetch_binance_futures_klines
-
+from app.signal_trade_lite.fetch_data_quick import snipe_kline_data
 
 
 def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
@@ -444,7 +444,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
 # ==========================================
 # 4. 程序入口点
 # ==========================================
-def execute_trading_bot_workflow():
+def execute_trading_bot_workflow(target_time):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
@@ -498,9 +498,45 @@ def execute_trading_bot_workflow():
         'https': 'http://127.0.0.1:7890',
     }
 
+    # 提取 proxy_url 适配新版引擎
+    proxy_url = proxy_config.get('http', '')
+
+    # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
+    result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    # 1分钟周期的理论预期总行数：天数 * 24小时 * 60分钟 + 1根
+    expected_rows = lookback_days * 24 * 60 + 1
+
     for symbol in symbol_list:
-        df_klines = fetch_binance_futures_klines(symbol=symbol, timeframe=timeframe, days=lookback_days,
-                                                 proxies=proxy_config, logger=run_logger)
+        # 从极速引擎返回的字典中安全提取对应币种的数据
+        df_klines = result_map.get(symbol, pd.DataFrame())
+
+        # 【修改点 2】检查数据缺失并输出告警日志
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} 数据完全丢失！缺失 {expected_rows} 条数据。")
+            continue
+
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            # 提取已拿到数据的实际时间跨度
+            start_time_str = df_klines['datetime_bj'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = df_klines['datetime_bj'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ 数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
         # 提取纯币种名如 'BTC'
         coin_name = symbol.split('/')[0]
         df_klines['coin_name'] = coin_name
@@ -513,10 +549,11 @@ def execute_trading_bot_workflow():
     else:
         run_logger.info(f"\n🚀 数据加载完毕，共 {len(fetched_raw_data)} 个标的。")
         run_logger.info("═" * 70)
-        # 【修改】执行实盘流传并捕获信号文件内容进行返回
+        # 执行实盘流传并捕获信号文件内容进行返回
         signal_file_content = run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
         return signal_file_content
 
-
 if __name__ == "__main__":
-    execute_trading_bot_workflow()
+    target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+
+    execute_trading_bot_workflow(target_time)
