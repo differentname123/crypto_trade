@@ -6,11 +6,11 @@
 【性能修复版】彻底消除 iterrows 主线程阻塞，重构后台落盘规避冗余 IO 与数据丢失。
 【终极优化版】修复主线程切片双重计算冗余、引入临时文件原子性落盘防损坏、静默回收取消协程防止内存泄露。
 【极限竞速版】二次历史前置释放、REST 脏数据严格过滤、最后 5s 无延迟脉冲式狂暴轮询。
+【生产监控版】引入 TraceID 链路追踪、Logfmt 结构化高密度聚合、静默成功与 O(N) 滞后点名机制。
 """
 
 import asyncio
 import uuid
-
 import ccxt.async_support as ccxt
 import pandas as pd
 import time
@@ -30,17 +30,25 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("QuantSniper")
 
 
+def _format_bj_time(ts_ms):
+    """辅助函数：将时间戳统一格式化为北京时间字符串，消除时区歧义"""
+    return pd.to_datetime(ts_ms, unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+
+
 # =====================================================================
 # 🗄️ 模块一：缓存与存储引擎 (Cache & Storage Manager) [已修复]
 # =====================================================================
-def load_local_cache(symbol_list, start_time_ms, cache_dir="data"):
+def load_local_cache(symbol_list, start_time_ms, cache_dir="data", log_prefix=""):
     """
     智能加载本地缓存数据。
     如果本地缓存涵盖了所需历史的起点，则只需拉取缺失的增量数据；
     否则，标记为全量回溯。
     """
+    t0 = time.time()
     memory_pool = {sym: {} for sym in symbol_list}
     fetch_since_map = {sym: start_time_ms for sym in symbol_list}
+    hits, misses = 0, 0
+    latest_times = {}  # 记录每个币最新的缓存时间
 
     for sym in symbol_list:
         safe_symbol = sym.replace("/", "_").replace(":", "_")
@@ -66,25 +74,30 @@ def load_local_cache(symbol_list, start_time_ms, cache_dir="data"):
                 if min_ts <= start_time_ms:
                     # 缓存已覆盖起点，将追赶起点设为 max_ts（重叠拉取最后一根，确保其已彻底闭合）
                     fetch_since_map[sym] = max_ts
-                    # [修复点2] 时区修正：将 max_ts 转换为北京时间打印
-                    max_time_bj = pd.to_datetime(max_ts, unit='ms').tz_localize('UTC').tz_convert(
-                        'Asia/Shanghai').strftime('%Y-%m-%d %H:%M')
-                    logger.info(f"[Cache] ♻️ {sym} 命中缓存! 起点已覆盖，将从 {max_time_bj} 开始增量追赶。")
+                    hits += 1
+                    latest_times[sym.split('/')[0]] = _format_bj_time(max_ts)
                 else:
                     # 缓存缺失早期数据，必须全量拉取
-                    logger.info(f"[Cache] ⚠️ {sym} 缓存不完整 (最早的一根晚于目标起点)。将全量回溯。")
+                    misses += 1
             except Exception as e:
-                logger.warning(f"[Cache] 读取 {sym} 缓存失败: {e}")
+                logger.warning(f"{log_prefix} [CACHE] ⚠️ 读取 {sym} 缓存失败: {e}")
         else:
-            logger.info(f"[Cache] 🔍 {sym} 无本地缓存记录，准备全量初始化。")
+            misses += 1
+
+    cost = time.time() - t0
+    # [改造点] O(N) 级别刷屏日志替换为单条高密度汇总聚合，并加入每个币最新的时间
+    logger.info(
+        f"{log_prefix} [CACHE] ♻️ 智能缓存装载 | hit={hits} miss={misses} load_cost={cost:.2f}s latest={latest_times}")
 
     return memory_pool, fetch_since_map
 
 
-def _save_csv_sync_fast(full_dfs_for_cache, cache_dir):
+def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
     """
     （后台线程专用）直接将内存池中的全量最新数据覆写落盘，避免二次读取
     """
+    t0 = time.time()
+    total_io_size = 0
     os.makedirs(cache_dir, exist_ok=True)
     for symbol, df in full_dfs_for_cache.items():
         safe_symbol = symbol.replace("/", "_").replace(":", "_")
@@ -93,9 +106,10 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir):
         try:
             # [终极修复] 原子性写入保护：先写临时文件，完成后系统级瞬间覆盖，防止程序被强杀导致数月缓存归零损坏
             df.to_csv(temp_path, index=False)
+            total_io_size += os.path.getsize(temp_path)
             os.replace(temp_path, path)
         except Exception as e:
-            logger.error(f"[Storage] ❌ 异步保存 {symbol} 失败: {e}")
+            logger.error(f"{log_prefix} [DISK] ❌ 异步保存 {symbol} 失败: {e}")
             # 如果出错尝试清理临时文件
             if os.path.exists(temp_path):
                 try:
@@ -103,16 +117,19 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir):
                 except:
                     pass
 
-    logger.info(f"[Storage] 💾 独立线程落盘任务圆满完成! ({len(full_dfs_for_cache)} 个币种最新状态已归档)")
+    cost = time.time() - t0
+    # [改造点] 暴露落盘的核心 IO 指标，方便告警监控
+    logger.info(
+        f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
 
 
-def dispatch_background_save(full_dfs_for_cache, cache_dir="data"):
+def dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=""):
     """
     启动独立守护线程进行全量覆盖覆写，彻底解放主线程
     """
     save_thread = threading.Thread(
         target=_save_csv_sync_fast,
-        args=(full_dfs_for_cache, cache_dir),
+        args=(full_dfs_for_cache, cache_dir, log_prefix),
         # 设置为非守护线程，确保主程序体面等待落盘完成才彻底退出，防止文件损坏
         daemon=False
     )
@@ -123,9 +140,8 @@ def dispatch_background_save(full_dfs_for_cache, cache_dir="data"):
 # 📦 模块二：核心处理器 (Consumer) [严格未修改]
 # =====================================================================
 async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
-                         completion_event, memory_pool):
-    logger.info(f"[Processor] 🧠 数据大脑启动，监控 {len(symbol_list)} 个数据流...")
-    reached_symbols = set()
+                         completion_event, memory_pool, processor_stats):
+    reached_symbols = processor_stats["reached"]
     stats = {"HIST": 0, "WS": 0, "REST_POLL": 0}
 
     while True:
@@ -141,15 +157,15 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
 
             if condition_ws_closed or condition_next_candle:
                 reached_symbols.add(symbol)
-                pending = set(symbol_list) - reached_symbols
-                pending_str = f"等待滞后项: {pending}" if pending else "全员集结完毕"
-                trigger_reason = "WS精准收线" if condition_ws_closed else f"探测到下周期({ts})"
+                processor_stats["winners"][source] += 1
 
-                logger.info(f"[Processor] 🏁 {symbol} 目标闭合 [{trigger_reason}], 功臣:[{source}] | {pending_str}")
+                # 记录该币种闭合时的精确系统时间与方式
+                close_sys_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                processor_stats["details"][symbol.split(':')[0]] = f"{source}({close_sys_time})"
 
+                # [改造点] 取消单条频刷日志，保持静默，等待主协程汇报
                 if len(reached_symbols) == len(symbol_list):
-                    logger.info(
-                        f"[Processor] 🎯 收线达成！吞吐量: 历史={stats['HIST']}, WS={stats['WS']}, 轮询={stats['REST_POLL']}")
+                    processor_stats["throughput"] = stats
                     completion_event.set()
                     queue.task_done()
                     break
@@ -159,11 +175,12 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
 # =====================================================================
 # 🚜 模块三：数据搬运工 (Producers) [已引入 REST 核心保护]
 # =====================================================================
-async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue):
+async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tracker=None):
     start_t = time.time()
     limit = 1000
     curr_since = since_ms
     total_fetched = 0
+    latest_ts = 0
 
     while True:
         try:
@@ -171,6 +188,8 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue):
             if not ohlcvs: break
 
             total_fetched += len(ohlcvs)
+            latest_ts = ohlcvs[-1][0]
+
             for k in ohlcvs: await queue.put((symbol, k, "HIST", False))
 
             curr_since = ohlcvs[-1][0] + 1
@@ -178,22 +197,34 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning(f"[History] {symbol} 拉取异常: {e}，重试中...")
+            prefix = tracker.get('log_prefix', '') if tracker else ''
+            logger.warning(f"{prefix} [HIST] {symbol} 拉取异常: {e}，重试中...")
             await asyncio.sleep(2)
 
     cost_t = time.time() - start_t
-    if total_fetched > 0:
-        logger.info(f"[History] 📦 {symbol} 追赶完成 | 入库 {total_fetched} 根 | 耗时 {cost_t:.2f}s")
+    # [改造点] 利用 tracker 聚合日志，消灭 O(N) 冗余
+    if tracker is not None:
+        tracker['done'] += 1
+        tracker['max_cost'] = max(tracker.get('max_cost', 0), cost_t)
+        tracker['fetched_rows'] += total_fetched
+        tracker['latest_ts'] = max(tracker.get('latest_ts', 0), latest_ts)
+
+        if tracker['done'] == tracker['total']:
+            phase = tracker.get('phase', 'HIST')
+            prefix = tracker.get('log_prefix', '')
+            latest_time_str = _format_bj_time(tracker['latest_ts']) if tracker['latest_ts'] > 0 else 'N/A'
+            logger.info(
+                f"{prefix} [{phase}] 📦 缺口历史补齐就绪 | done={tracker['done']}/{tracker['total']} fetched_rows={tracker['fetched_rows']} max_cost={tracker['max_cost']:.2f}s latest_time={latest_time_str}")
 
 
-async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url):
+async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=""):
     ws_symbols = [s.replace("/", "").split(":")[0].lower() for s in symbol_list]
     stream_url = f"wss://fstream.binance.com/market/stream?streams={'/'.join([f'{s}@kline_{timeframe}' for s in ws_symbols])}"
 
     try:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(stream_url, proxy=proxy_url, heartbeat=10) as ws:
-                logger.info("[WS Engine] ✅ WebSocket 通道建立，蹲守数据中...")
+                logger.info(f"{log_prefix} [WSS] ✅ 数据总线已建连 | streams={len(ws_symbols)}")
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         data = json.loads(msg.data)
@@ -206,7 +237,7 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        logger.error(f"[WS Engine] ❌ 异常断开: {e}")
+        logger.error(f"{log_prefix} [WSS] ❌ 异常断开: {e}")
 
 
 async def fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue):
@@ -240,10 +271,13 @@ def parse_time_params(exchange, timeframe, days, target_time_str):
     return timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms
 
 
-# 注：已移除原有的 process_final_data 函数，因其会导致二次排序和 DataFrame 构建的巨大性能冗余
-
 async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_time_str,
                                            use_ws, use_rest, proxy_url):
+    orchestrator_start_t = time.time()
+    # [改造点] 生成全局 TraceID，后续用于链路绑定
+    run_id = f"T-{uuid.uuid4().hex[:4].upper()}"
+    log_prefix = f"[{run_id}]"
+
     exchange = ccxt.binance({
         'enableRateLimit': True, 'options': {'defaultType': 'swap'},
         'aiohttp_proxy': proxy_url, 'proxies': {'http': proxy_url, 'https': proxy_url}
@@ -257,61 +291,86 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             exchange, timeframe, days, target_time_str)
 
         logger.info(
-            f"[Orchestrator] 锁定目标: {target_time_str} | 将于 {exchange.iso8601(target_close_time_ms)} 圆满收线")
+            f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={len(symbol_list)} days={days}")
 
         # 2. 智能缓存装载 & 内存池初始化
-        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms)
+        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, log_prefix=log_prefix)
 
         queue = asyncio.Queue()
         completion_event = asyncio.Event()
+        # [改造点] 统计字典，用于提取监控面数据
+        processor_stats = {"reached": set(), "winners": {"WS": 0, "REST_POLL": 0, "HIST": 0}, "throughput": {},
+                           "details": {}}
 
         # 3. 启动后台协程任务 (首波历史追赶)
         processor_task = asyncio.create_task(
-            data_processor(queue, symbol_list, target_time_ms, timeframe_ms, completion_event, memory_pool)
+            data_processor(queue, symbol_list, target_time_ms, timeframe_ms, completion_event, memory_pool,
+                           processor_stats)
         )
 
+        hist_tracker_1 = {'done': 0, 'total': len(symbol_list), 'max_cost': 0, 'fetched_rows': 0, 'phase': 'HIST-1',
+                          'log_prefix': log_prefix, 'latest_ts': 0}
         history_tasks = [
-            asyncio.create_task(fetch_historical_rest(exchange, sym, timeframe, fetch_since_map[sym], queue))
+            asyncio.create_task(
+                fetch_historical_rest(exchange, sym, timeframe, fetch_since_map[sym], queue, hist_tracker_1))
             for sym in symbol_list
         ]
 
         # 4. [改造点1] 战术休眠第一阶段：提前一分钟休眠至目标时间到来，随后立刻触发二次追赶释放压力
         sleep_to_target = target_time_ms - exchange.milliseconds()
         if sleep_to_target > 0:
-            logger.info(f"[Orchestrator] 💤 战术休眠 {sleep_to_target / 1000:.1f}s，等待目标起始时间到达...")
+            logger.info(
+                f"{log_prefix} [SYNC] 💤 进入一阶段战术休眠 | sleep={sleep_to_target / 1000:.1f}s next_action={_format_bj_time(target_time_ms)}")
             await asyncio.sleep(sleep_to_target / 1000)
 
-        logger.info("[Orchestrator] 🔧 目标时间已现！触发【二次历史追赶】，提前获取已完全闭合的前置K线...")
+        hist_tracker_2 = {'done': 0, 'total': len(symbol_list), 'max_cost': 0, 'fetched_rows': 0, 'phase': 'HIST-2',
+                          'log_prefix': log_prefix, 'latest_ts': 0}
         gap_tasks = []
         for sym in symbol_list:
             # 动态算出缺口起点，避免拉取重复数据
             gap_start_ms = max(memory_pool[sym].keys()) if memory_pool[sym] else fetch_since_map[sym]
             gap_tasks.append(asyncio.create_task(
-                fetch_historical_rest(exchange, sym, timeframe, gap_start_ms, queue)
+                fetch_historical_rest(exchange, sym, timeframe, gap_start_ms, queue, hist_tracker_2)
             ))
         history_tasks.extend(gap_tasks)
 
         # 实时双擎机制分配：WS流可以即刻点火，监听收线全过程
         engine_tasks = []
         if use_ws:
-            engine_tasks.append(asyncio.create_task(fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url)))
+            engine_tasks.append(
+                asyncio.create_task(fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=log_prefix)))
 
         # [改造点3] 战术休眠第二阶段：死等最后 5 秒，再瞬间点爆无延迟脉冲 REST
         sleep_to_rest = target_close_time_ms - 5000 - exchange.milliseconds()
         if sleep_to_rest > 0:
             logger.info(
-                f"[Orchestrator] 💤 战术休眠 {sleep_to_rest / 1000:.1f}s，等待最后 5s 开启无延迟 REST 狂暴轮询...")
+                f"{log_prefix} [SYNC] 💤 挂起等待收线冲刺(最后5s) | sleep={sleep_to_rest / 1000:.1f}s next_action=脉冲轮询兜底")
             await asyncio.sleep(sleep_to_rest / 1000)
 
         if use_rest:
             engine_tasks.append(
                 asyncio.create_task(fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue)))
 
-        # 5. 阻塞等待：等待核心大脑发出完成信号
-        await completion_event.wait()
+        # 5. [改造点] 超时检测预警：正常收线保持静默，超时滞后则 O(N) 穿透点名
+        try:
+            # 预期收线界限后延 1 秒作为容忍阈值，超过则抛出 Warning
+            timeout = max(0.1, (target_close_time_ms + 1000 - exchange.milliseconds()) / 1000)
+            await asyncio.wait_for(completion_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            lag_symbols = set(symbol_list) - processor_stats["reached"]
+            # 仅截取前 3 个标的打印防止刷屏
+            logger.warning(f"{log_prefix} [RACE] ⚠️ 引擎收线滞后(>1s) | pending={list(lag_symbols)[:3]}... 持续兜底中")
+            await completion_event.wait()  # 打印完告警后，继续无限等待直至补齐
+
+        # [核心竞速指标计算]
+        close_latency_ms = exchange.milliseconds() - target_close_time_ms
+        tp = processor_stats.get('throughput', {})
+        win = processor_stats['winners']
+        det = processor_stats['details']
+        logger.info(
+            f"{log_prefix} [RACE] 🎯 目标全线闭合 | close_latency={close_latency_ms / 1000:.3f}s winner=(WS:{win['WS']}, REST:{win['REST_POLL']}) throughput=(ws:{tp.get('WS', 0)}, rest:{tp.get('REST_POLL', 0)}, hist:{tp.get('HIST', 0)}) details={det}")
 
         # 6. 发令枪响：瞬间强杀所有底层协程
-        logger.info("[Orchestrator] 🔫 目标全线圆满！发令枪响，瞬间强杀(Cancel)所有底层拉取协程...")
         all_tasks = history_tasks + engine_tasks + [processor_task]
         for task in all_tasks:
             if not task.done(): task.cancel()
@@ -333,7 +392,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
                                                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
         # 无阻塞落盘：直接把全量数据甩给后台线程
-        dispatch_background_save(full_dfs_for_cache)
+        dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=log_prefix)
 
         # 7. 数据清洗封装 (给用户返回精确切片的数据)
         # [终极修复] 消灭 O(N) 冗余计算：直接利用上面排好序的完美全量 DataFrame 利用 Pandas C底层向量化特性切片
@@ -347,12 +406,16 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             final_dfs[sym] = sliced_df
 
         total_pts = sum(len(df) for df in final_dfs.values())
-        logger.info(f"[Orchestrator] 🎉 任务结束! 瞬间返回 {total_pts} 条精准数据。(落盘任务已脱壳交由后台独立线程运行)")
+        total_runtime = time.time() - orchestrator_start_t
+        logger.info(
+            f"{log_prefix} [EXIT] 🎉 主任务脱壳交付 | range=[{_format_bj_time(start_time_ms)} ~ {_format_bj_time(target_time_ms)}] total_rows={total_pts} runtime={total_runtime:.2f}s")
         return final_dfs
 
     finally:
-        await exchange.close()
-
+        try:
+            await exchange.close()
+        except Exception as e:
+            logger.warning(f"{log_prefix} [EXIT] 释放交易所资源时出现异常: {e}")
 
 # =====================================================================
 # 🌟 对外暴露的公共 API [严格未修改]
@@ -378,15 +441,20 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
 # 🚀 启动入口 [严格未修改]
 # =====================================================================
 if __name__ == "__main__":
-    symbols = ["BTC/USDT:USDT", "ETH/USDT:USDT", "BNB/USDT:USDT"]
-    target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+
+    symbol_list = [
+        "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
+        "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
+    ]
+
+    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
     print(">>> 准备调用数据引擎...")
 
     result_map = snipe_kline_data(
-        symbol_list=symbols,
+        symbol_list=symbol_list,
         timeframe="1m",
-        days=5,  # 测试大天数，第二次运行将秒开
+        days=1,  # 测试大天数，第二次运行将秒开
         target_time_str=target_time,
         use_ws=True,
         use_rest=True,
