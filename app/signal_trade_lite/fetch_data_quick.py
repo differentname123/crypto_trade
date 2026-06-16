@@ -293,6 +293,45 @@ def parse_time_params(exchange, timeframe, days, target_time_str):
     return timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms
 
 
+async def check_time_sync(exchange, log_prefix=""):
+    """
+    检测本地物理机时间与 Binance 服务器时间的精准偏差与网络往返延迟 (RTT)。
+    采用标准 NTP 估计算法剔除网络传输误差。
+    """
+    try:
+        # 发起请求前的本地时间
+        t0 = time.time() * 1000
+
+        # 异步获取币安服务器时间
+        server_time = await exchange.fetch_time()
+
+        # 收到响应后的本地时间
+        t1 = time.time() * 1000
+
+        # 1. RTT (Round Trip Time): 网络往返总延迟
+        rtt = t1 - t0
+
+        # 2. 精准偏差 (Offset): 假设上下行网络是对称的，计算出请求到达币安的那一刻，我们本地是几点，然后与币安时间做差集
+        local_time_at_server = t0 + (rtt / 2)
+        offset = server_time - local_time_at_server
+
+        # 判断时钟快慢 (为了日志直观，我们将语义转换为：本地机器相对于服务器是快了还是慢了)
+        status = "落后" if offset > 0 else "超前"
+
+        logger.info(
+            f"{log_prefix} [PING] ⏱️ 时钟与网络基准测试 | RTT延迟: {rtt:.2f}ms | 本地时钟{status}服务器: {abs(offset):.2f}ms")
+
+        # 强预警机制：如果偏差超过 500ms，API 极易拒绝签名
+        if abs(offset) > 500:
+            logger.warning(
+                f"{log_prefix} [PING] ⚠️ 极高危预警：本地时间偏差过大(>{abs(offset):.0f}ms)！极易导致 API 签名失败，请立即执行 NTP 时间同步！")
+
+        return offset, rtt
+
+    except Exception as e:
+        logger.error(f"{log_prefix} [PING] ❌ 时钟同步检测失败: {e}")
+        return None, None
+
 async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_time_str,
                                            use_ws, use_rest, proxy_url):
     orchestrator_start_t = time.time()
@@ -307,7 +346,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
     try:
         await exchange.load_markets()
-
+        await check_time_sync(exchange, log_prefix)
         # 1. 计算时间参数
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
             exchange, timeframe, days, target_time_str)
@@ -465,27 +504,43 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
 # =====================================================================
 if __name__ == "__main__":
 
-    symbol_list = [
-        "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
-        "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
-    ]
+    while True:
+        symbol_list = [
+            "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
+            "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
+        ]
 
-    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
-    print(">>> 准备调用数据引擎...")
+        print(">>> 准备调用数据引擎...")
 
-    result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe="1m",
-        days=1,  # 测试大天数，第二次运行将秒开
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url='http://127.0.0.1:7890'
-    )
+        result_map = snipe_kline_data(
+            symbol_list=symbol_list,
+            timeframe="1m",
+            days=1,  # 测试大天数，第二次运行将秒开
+            target_time_str=target_time,
+            use_ws=True,
+            use_rest=True,
+            proxy_url='http://127.0.0.1:7890'
+        )
 
-    print("\n>>> 调用完毕，主线程继续执行！由于采用后台线程保存，你会立刻看到这行字。")
+        symbol_list = [
 
-    if result_map and "BTC/USDT:USDT" in result_map:
-        print("\n最终产出预览 (BTC):")
-        print(result_map["BTC/USDT:USDT"].tail())
+            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+
+            "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
+
+        ]
+        target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+
+        print(">>> 准备调用数据引擎...")
+
+        result_map = snipe_kline_data(
+            symbol_list=symbol_list,
+            timeframe="1m",
+            days=1,  # 测试大天数，第二次运行将秒开
+            target_time_str=target_time,
+            use_ws=True,
+            use_rest=True,
+            proxy_url='http://127.0.0.1:7890'
+        )
