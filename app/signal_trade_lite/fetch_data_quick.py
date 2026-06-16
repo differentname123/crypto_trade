@@ -7,6 +7,7 @@
 【终极优化版】修复主线程切片双重计算冗余、引入临时文件原子性落盘防损坏、静默回收取消协程防止内存泄露。
 【极限竞速版】二次历史前置释放、REST 脏数据严格过滤、最后 5s 无延迟脉冲式狂暴轮询。
 【生产监控版】引入 TraceID 链路追踪、Logfmt 结构化高密度聚合、静默成功与 O(N) 滞后点名机制。
+【防弹修复版】消除 WS 硬编码兼容全币种，注入协程防异常死锁装甲，引入物理时钟强判防流动性枯竭。
 """
 
 import asyncio
@@ -137,43 +138,58 @@ def dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=""
 
 
 # =====================================================================
-# 📦 模块二：核心处理器 (Consumer) [严格未修改]
+# 📦 模块二：核心处理器 (Consumer) [引入防弹异常捕获与物理时钟兜底]
 # =====================================================================
 async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
                          completion_event, memory_pool, processor_stats):
     reached_symbols = processor_stats["reached"]
     stats = {"HIST": 0, "WS": 0, "REST_POLL": 0}
 
-    while True:
-        symbol, kline, source, is_closed = await queue.get()
-        ts = int(kline[0])
-        stats[source] += 1
+    try:
+        while True:
+            symbol, kline, source, is_closed = await queue.get()
+            ts = int(kline[0])
+            stats[source] += 1
 
-        memory_pool[symbol][ts] = kline
+            memory_pool[symbol][ts] = kline
 
-        if symbol not in reached_symbols:
-            condition_ws_closed = (ts == target_time_ms and is_closed)
-            condition_next_candle = (ts >= target_time_ms + timeframe_ms)
+            if symbol not in reached_symbols:
+                current_sys_ms = time.time() * 1000
 
-            if condition_ws_closed or condition_next_candle:
-                reached_symbols.add(symbol)
-                processor_stats["winners"][source] += 1
+                condition_ws_closed = (ts == target_time_ms and is_closed)
+                condition_next_candle = (ts >= target_time_ms + timeframe_ms)
 
-                # 记录该币种闭合时的精确系统时间与方式
-                close_sys_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
-                processor_stats["details"][symbol.split(':')[0]] = f"{source}({close_sys_time})"
+                # [防死锁防线] 物理时钟强判：针对流动性弱的冷门币种，如果收到了目标K线且现实时间已跨越寿命终点 10 秒，强制闭合！
+                condition_time_force = (ts == target_time_ms and current_sys_ms > target_time_ms + timeframe_ms + 10000)
 
-                # [改造点] 取消单条频刷日志，保持静默，等待主协程汇报
-                if len(reached_symbols) == len(symbol_list):
-                    processor_stats["throughput"] = stats
-                    completion_event.set()
-                    queue.task_done()
-                    break
-        queue.task_done()
+                if condition_ws_closed or condition_next_candle or condition_time_force:
+                    reached_symbols.add(symbol)
+                    processor_stats["winners"][source] += 1
+
+                    # 记录该币种闭合时的精确系统时间与方式
+                    close_sys_time = datetime.now().strftime('%H:%M:%S.%f')[:-3]
+                    # 给强判脱困的币种打个 ⏱️ 标记，方便运维追踪复盘
+                    mark = "⏱️强判" if condition_time_force and not (
+                                condition_ws_closed or condition_next_candle) else ""
+                    processor_stats["details"][symbol.split(':')[0]] = f"{source}{mark}({close_sys_time})"
+
+                    # [改造点] 取消单条频刷日志，保持静默，等待主协程汇报
+                    if len(reached_symbols) == len(symbol_list):
+                        processor_stats["throughput"] = stats
+                        completion_event.set()
+                        queue.task_done()
+                        break
+            queue.task_done()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # [防静默崩溃] 捕获所有字典异常，强制释放事件锁，绝不让主线程无限死等卡住
+        logger.error(f"[Processor] ❌ 数据大脑发生致命异常: {e}，正在强制解除全局阻塞锁...")
+        completion_event.set()
 
 
 # =====================================================================
-# 🚜 模块三：数据搬运工 (Producers) [已引入 REST 核心保护]
+# 🚜 模块三：数据搬运工 (Producers) [已引入 REST 核心保护与WS动态映射]
 # =====================================================================
 async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tracker=None):
     start_t = time.time()
@@ -218,7 +234,9 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
 
 
 async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=""):
-    ws_symbols = [s.replace("/", "").split(":")[0].lower() for s in symbol_list]
+    # [核心修复] 动态构建 WS 的 raw_symbol (如 ETHUSDC) 到 target_symbol (如 ETH/USDC:USDC) 的映射字典
+    ws_mapping = {s.replace("/", "").split(":")[0].upper(): s for s in symbol_list}
+    ws_symbols = [k.lower() for k in ws_mapping.keys()]
     stream_url = f"wss://fstream.binance.com/market/stream?streams={'/'.join([f'{s}@kline_{timeframe}' for s in ws_symbols])}"
 
     try:
@@ -230,10 +248,14 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix
                         data = json.loads(msg.data)
                         if 'data' in data and 'k' in data['data']:
                             k_data = data['data']['k']
-                            target_symbol = f"{data['data']['s'][:-4]}/{data['data']['s'][-4:]}:USDT"
-                            kline = [int(k_data['t']), float(k_data['o']), float(k_data['h']),
-                                     float(k_data['l']), float(k_data['c']), float(k_data['v'])]
-                            await queue.put((target_symbol, kline, "WS", bool(k_data['x'])))
+                            raw_s = data['data']['s']
+
+                            # 通过字典动态匹配，彻底告别硬编码！完美兼容 USDC/USDT 等所有计价方式
+                            if raw_s in ws_mapping:
+                                target_symbol = ws_mapping[raw_s]
+                                kline = [int(k_data['t']), float(k_data['o']), float(k_data['h']),
+                                         float(k_data['l']), float(k_data['c']), float(k_data['v'])]
+                                await queue.put((target_symbol, kline, "WS", bool(k_data['x'])))
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -416,6 +438,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             await exchange.close()
         except Exception as e:
             logger.warning(f"{log_prefix} [EXIT] 释放交易所资源时出现异常: {e}")
+
 
 # =====================================================================
 # 🌟 对外暴露的公共 API [严格未修改]
