@@ -1,5 +1,6 @@
 import os
 import time
+import traceback
 import uuid
 import pandas as pd
 import csv
@@ -427,92 +428,102 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
     if result.status != ExecStatus.OK:
         logger.error(f"[RECORD] 发单失败/拒绝，状态已归档入库 | CID: {client_oid} | 记录状态: {result.status.value}")
 
+
+def safe_init_exchange(api_key, secret_key, proxies):
+    """
+    健壮性封装 1：具备无限重试能力的交易所初始化
+    防止程序在无人值守启动时，因短暂的网络断开而直接死亡。
+    """
+    retry_interval = 5
+    while True:
+        try:
+            logger.info(">>> 尝试初始化交易所实例...")
+            exchange = init_exchange(api_key, secret_key, proxies=proxies)
+            logger.info(">>> 交易所初始化成功！")
+            return exchange
+        except Exception as e:
+            logger.error(f"[初始化失败] 网络或 API 异常: {e}。{retry_interval} 秒后重试...")
+            time.sleep(retry_interval)
+            # 指数退避：每次重试等待时间延长，最高不超过 60 秒
+            retry_interval = min(retry_interval * 2, 60)
+
+
 def run_scheduler():
     """
-    智能两阶段调度器：
-    1. 休眠到 XX:55:00 -> 唤醒获取并缓存资产和持仓
-    2. 休眠到 XX:00:00 -> 唤醒执行 execute_trading_bot_workflow 生成最新信号 然后 精确执行本地文件信号
+    高可用调度器（极简且强健）：
+    包含 API 局部重试、全局异常兜底与错误隔离。
     """
     API_KEY = get_config('nana_biance_api_key')
     SECRET_KEY = get_config('nana_biance_api_secret')
+    PROXIES = {'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
 
-    logger.info(">>> 初始化交易所实例...")
-    try:
-        # 代理按需配置
-        exchange = init_exchange(API_KEY, SECRET_KEY,
-                                 proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
-    except Exception:
-        logger.critical("交易所初始化失败，程序退出。")
-        return
+    # 1. 永不宕机的初始化
+    exchange = safe_init_exchange(API_KEY, SECRET_KEY, PROXIES)
 
-    logger.info(">>> 应用层启动完成！进入调度循环...")
+    logger.info(">>> 调度系统已就绪，进入 7x24 小时主循环...")
 
     while True:
-        now = datetime.now()
-
-        # 计算下一个整点时间 (如 14:00:00)
-        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-
-        # 预加载时间设为整点前 5 分钟 (如 13:55:00)
-        preload_time = next_hour - timedelta(minutes=5)
-        next_hour_str = next_hour.strftime("%Y-%m-%d %H:%M")
-        # 目标唤醒时间设为精准整点 (如 14:00:00.000)
-        target_exec_time = next_hour
-
-        # 防御性初始化，防止后续因网络/执行异常导致变量未绑定
-        signal_df = None
-
-        # 阶段一：等待到达预加载时间 (XX:55:00)
-        if now < preload_time:
-            sleep_sec = (preload_time - now).total_seconds()
-            logger.info(f"[SCHEDULER] 休眠 {sleep_sec:.0f}s -> {preload_time.strftime('%H:%M:%S')} (目标: 数据预加载)")
-            # [深度优化] 放弃单次大段 sleep，改用每秒检查的细粒度轮询。
-            # 防止服务器系统时间 NTP 同步跳跃导致的长眠不醒。
-            while datetime.now() < preload_time:
-                time.sleep(1)
-
-        # ----------- 触发预加载 -----------
-        total_equity, position_cache, open_order_cache = preload_account_state(exchange)
-
-        # 阶段二：精细等待到达目标拔枪时间 (XX:00:00.000)
-        now = datetime.now()
-        if now < target_exec_time:
-            sleep_sec_final = (target_exec_time - now).total_seconds()
-            logger.info(f"[SCHEDULER] 资产数据就绪！屏息倒计时 {sleep_sec_final:.1f}s 准备极速唤醒...")
-
-            # [深度优化] 量化级混合精度等待 (普通休眠 + 极速自旋锁)
-            while True:
-                current_now = datetime.now()
-                remaining_time = (target_exec_time - current_now).total_seconds()
-
-                if remaining_time <= 0:
-                    break  # 时间到，立即出锁
-                elif remaining_time > 0.05:
-                    # 距离目标时间大于 50 毫秒，使用短暂 sleep 让出 CPU 给其他系统进程
-                    time.sleep(0.01)
-                else:
-                    # 剩余最后不到 50 毫秒！
-                    # 此时严禁使用 time.sleep()。直接执行 pass 进入死循环自旋（Spin-wait）。
-                    # 虽然会在这 50 毫秒内霸占单核 100% CPU，但能彻底消除操作系统线程调度造成的延迟，实现真正的微秒级同步。
-                    pass
-
-        # Jitter探针：监控 CPU 跳出死循环的精准漂移值，正数代表出锁慢了，负数代表快了
-        actual_exit = datetime.now()
-        drift_ms = (actual_exit - target_exec_time).total_seconds() * 1000
-        logger.info(
-            f"========== [SCHEDULER] 破壁出锁 | 实际跳出时间: {actual_exit.strftime('%H:%M:%S.%f')[:-3]} | 自旋误差(Jitter): {drift_ms:+.2f}ms ==========")
-
-        # ----------- 触发信号生成工作流 (XX:00:00 之后立刻执行) -----------
-        logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
-        t_wf = time.perf_counter()
         try:
-            signal_df = execute_trading_bot_workflow(next_hour_str)
-            logger.info(f">>> [WORKFLOW] 信号流水线执行完毕！| 耗时: {time.perf_counter() - t_wf:.2f}s")
-        except Exception as e:
-            logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e} | 耗时: {time.perf_counter() - t_wf:.2f}s")
+            now = datetime.now()
 
-        # ----------- 极速拔枪 -----------
-        execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache, signal_df)
+            # --- 时间锚点 ---
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            next_hour_str = next_hour.strftime("%Y-%m-%d %H:%M")
+            preload_time = next_hour - timedelta(minutes=5)
+
+            # --- 阶段一：等待预加载 ---
+            if now < preload_time:
+                sleep_sec = (preload_time - now).total_seconds()
+                logger.info(
+                    f"[SCHEDULER] 静态休眠 ({sleep_sec:.0f}s) -> 预计 {preload_time.strftime('%H:%M:%S')} 唤醒预加载")
+                while datetime.now() < preload_time:
+                    time.sleep(1)
+
+            # --- 阶段二：带容错的数据预加载 ---
+            # 健壮性封装 2：局部重试。允许拉取资产失败 3 次，防止偶发网络抖动破坏整点交易
+            total_equity, position_cache, open_order_cache = None, None, None
+            preload_success = False
+            for attempt in range(1, 4):
+                try:
+                    logger.info(f">>> [SCHEDULER] 尝试缓存账户资产 (第 {attempt}/3 次)...")
+                    total_equity, position_cache, open_order_cache = preload_account_state(exchange)
+                    preload_success = True
+                    logger.info(">>> [SCHEDULER] 资产缓存成功。")
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    logger.warning(f"[预加载警告] 第 {attempt} 次获取资产失败: {e}")
+                    time.sleep(3)  # 失败后缓 3 秒再试
+
+            if not preload_success:
+                logger.error("!!! [预加载严重错误] 连续 3 次拉取资产失败！为保障安全，放弃本轮调度。")
+                time.sleep(60)  # 休息一分钟，直接进入下一个周期的 while 循环
+                continue
+
+            # --- 阶段三：控制权移交 (信号计算与等待) ---
+            logger.info(f">>> [SCHEDULER] 进入信号流水线，移交控制权等待目标时间 {next_hour_str} ...")
+            t_wf = time.perf_counter()
+
+            # 工作流内部自主决定等待 K 线闭合并生成信号
+            signal_df = execute_trading_bot_workflow(next_hour_str)
+
+            logger.info(f">>> [WORKFLOW] 流水线执行完毕！耗时: {time.perf_counter() - t_wf:.2f}s")
+
+            # --- 阶段四：极速下单 ---
+            if signal_df is not None and not signal_df.empty:
+                logger.info(">>> [SCHEDULER] 收到有效信号，触发下单...")
+                execute_signals_fast(exchange, next_hour, total_equity, position_cache, open_order_cache, signal_df)
+            else:
+                logger.info(">>> [SCHEDULER] 本轮无交易信号。")
+
+        # 健壮性封装 3：全局终极兜底
+        except Exception as e:
+            # 捕获一切未预料到的致命错误，防止 while True 循环崩溃跳出
+            logger.error(f"!!! [SCHEDULER 主循环发生致命异常] !!!", exc_info=True)
+            logger.error(traceback.format_exc())  # 打印完整错误堆栈以便复盘调试
+
+            # 发生严重错误时，强制休眠 30 秒，防止死循环疯狂报错打满日志或导致 IP 被封
+            logger.info("系统将强制休眠 30 秒后尝试自我恢复...")
+            time.sleep(30)
 
 if __name__ == "__main__":
     run_scheduler()
