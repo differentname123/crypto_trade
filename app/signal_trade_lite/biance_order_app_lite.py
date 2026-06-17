@@ -468,7 +468,11 @@ def run_scheduler():
 
             # --- 时间锚点 ---
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            next_hour_str = next_hour.strftime("%Y-%m-%d %H:%M")
+            # 2. 减去 1 分钟得到 target_time
+            target_time = next_hour - timedelta(minutes=1)
+            target_time_str = target_time.strftime("%Y-%m-%d %H:%M")
+
+
             preload_time = next_hour - timedelta(minutes=5)
 
             # --- 阶段一：等待预加载 ---
@@ -500,11 +504,11 @@ def run_scheduler():
                 continue
 
             # --- 阶段三：控制权移交 (信号计算与等待) ---
-            logger.info(f">>> [SCHEDULER] 进入信号流水线，移交控制权等待目标时间 {next_hour_str} ...")
+            logger.info(f">>> [SCHEDULER] 进入信号流水线，移交控制权等待目标时间 {target_time_str} ...")
             t_wf = time.perf_counter()
 
             # 工作流内部自主决定等待 K 线闭合并生成信号
-            signal_df = execute_trading_bot_workflow(next_hour_str)
+            signal_df = execute_trading_bot_workflow(target_time_str)
 
             logger.info(f">>> [WORKFLOW] 流水线执行完毕！耗时: {time.perf_counter() - t_wf:.2f}s")
 
