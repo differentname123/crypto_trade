@@ -455,7 +455,7 @@ def run_scheduler():
 
         # 预加载时间设为整点前 5 分钟 (如 13:55:00)
         preload_time = next_hour - timedelta(minutes=5)
-
+        next_hour_str = next_hour.strftime("%Y-%m-%d %H:%M")
         # 目标唤醒时间设为精准整点 (如 14:00:00.000)
         target_exec_time = next_hour
 
@@ -506,7 +506,7 @@ def run_scheduler():
         logger.info(">>> [WORKFLOW] 启动交易机器人工作流 (生成最新信号)...")
         t_wf = time.perf_counter()
         try:
-            signal_df = execute_trading_bot_workflow()
+            signal_df = execute_trading_bot_workflow(next_hour_str)
             logger.info(f">>> [WORKFLOW] 信号流水线执行完毕！| 耗时: {time.perf_counter() - t_wf:.2f}s")
         except Exception as e:
             logger.error(f">>> [WORKFLOW] 信号生成异常中断: {e} | 耗时: {time.perf_counter() - t_wf:.2f}s")
