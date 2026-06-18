@@ -130,11 +130,11 @@ def sync_and_clean_orders(exchange, open_order_cache):
         # 情况 A: 订单仍在活动挂单缓存中
         if exch_oid in open_order_dict:
             # 校验超时 (大于 1 天)
-            if (now - sig_time) > timedelta(days=1):
+            if (now - sig_time) > timedelta(hours=2):
                 try:
                     exchange.cancel_order(exch_oid, sym)
                     df.at[index, 'exec_status'] = 'CANCELED_SUCCESS'
-                    df.at[index, 'error_msg'] = '系统自动清理超时(>1天)挂单: 成功'
+                    df.at[index, 'error_msg'] = '系统自动清理超时(>2小时)挂单: 成功'
                     df.at[index, 'update_time'] = now_str
                     # 撤单成功后，将其从内存 cache 剔除，防止本轮后续判断受阻
                     open_order_cache[sym] = [o for o in open_order_cache[sym] if str(o.get('id')) != exch_oid]
