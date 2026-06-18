@@ -523,7 +523,7 @@ def execute_trading_bot_workflow(target_time):
         use_rest=True,
         proxy_url=proxy_url
     )
-
+    run_logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
     # 1分钟周期的理论预期总行数：天数 * 24小时 * 60分钟 + 1根
     expected_rows = lookback_days * 24 * 60 + 1
 
