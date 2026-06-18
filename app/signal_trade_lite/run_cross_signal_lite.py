@@ -500,9 +500,10 @@ def execute_trading_bot_workflow(target_time):
     run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
 
     symbol_list = [
-        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-        "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
+        "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
+        "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
     ]
+
     timeframe = "1m"
     proxy_config = {
         'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
