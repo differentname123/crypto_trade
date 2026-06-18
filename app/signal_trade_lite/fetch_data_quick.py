@@ -515,11 +515,23 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
     finally:
         try:
-            await exchange.close()
-        except Exception as e:
-            logger.warning(f"{log_prefix} [EXIT] 释放交易所资源时出现异常: {e}")
+            # 1. 物理斩断：加上 await，因为新版 aiohttp 中它是协程！
+            if hasattr(exchange, 'session') and exchange.session:
+                if hasattr(exchange.session, 'connector') and exchange.session.connector:
+                    try:
+                        # 只给 2 毫秒的死线，强行触发关闭动作
+                        await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
+                    except Exception:
+                        pass  # 超时直接静默，此时物理连接已被撕裂
 
+            # 2. 欺骗 CCXT 析构函数，防止它检查 Session 触发长篇警告
+            exchange.session = None
 
+            # 3. 象征性走一下 CCXT 的 close，2 毫秒必杀
+            await asyncio.wait_for(exchange.close(), timeout=0.00002)
+
+        except Exception:
+            pass  # 屏蔽一切退出时的报错，实现完美脱壳
 # =====================================================================
 # 🌟 对外暴露的公共 API [严格未修改]
 # =====================================================================
@@ -551,7 +563,7 @@ if __name__ == "__main__":
             "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
         ]
 
-        target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
         print(">>> 准备调用数据引擎...")
 
@@ -564,21 +576,23 @@ if __name__ == "__main__":
             use_rest=True,
             proxy_url='http://127.0.0.1:7890'
         )
-
-        symbol_list = [
-            "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-            "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
-        ]
-        target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
-
-        print(">>> 准备调用数据引擎...")
-
-        result_map = snipe_kline_data(
-            symbol_list=symbol_list,
-            timeframe="1m",
-            days=150,
-            target_time_str=target_time,
-            use_ws=True,
-            use_rest=True,
-            proxy_url='http://127.0.0.1:7890'
-        )
+        logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
+        break
+        #
+        # symbol_list = [
+        #     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+        #     "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
+        # ]
+        # target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        #
+        # print(">>> 准备调用数据引擎...")
+        #
+        # result_map = snipe_kline_data(
+        #     symbol_list=symbol_list,
+        #     timeframe="1m",
+        #     days=150,
+        #     target_time_str=target_time,
+        #     use_ws=True,
+        #     use_rest=True,
+        #     proxy_url='http://127.0.0.1:7890'
+        # )

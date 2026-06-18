@@ -22,6 +22,13 @@ TRADE_RECORD_FILE = "trade_records.csv"
 POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10%
 LEVRAGE = 75  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 
+# 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
+RUNTIME_FALLBACK = {
+    "total_equity": 0.0,
+    "position_cache": None,
+    "open_order_cache": None
+}
+
 
 # ==========================================
 # 1. 记账系统：全链路追溯
@@ -192,6 +199,9 @@ def preload_account_state(exchange):
     在整点前 1 分钟提前获取并缓存账户权益、所有币种持仓以及当前活动挂单。
     防止整点时网络拥堵，确保整点只做发单动作。
     """
+    # 【修改点 2】：引入全局缓存变量
+    global RUNTIME_FALLBACK
+
     logger.info(">>> [PRELOAD] 启动资产与挂单预加载...")
     t_start = time.perf_counter()
     sync_cost, eq_cost, pos_cost, ord_cost = 0, 0, 0, 0
@@ -216,14 +226,20 @@ def preload_account_state(exchange):
     for attempt in range(3):
         t_eq = time.perf_counter()
         eq_status, total_equity = get_total_equity(exchange)
-        if eq_status == ExecStatus.OK:
+        if eq_status == ExecStatus.OK and total_equity > 0:
             eq_cost = (time.perf_counter() - t_eq) * 1000
+            RUNTIME_FALLBACK["total_equity"] = total_equity  # 【修改点 2】：拉取成功则更新缓存
             break
         logger.warning(f"[PRELOAD] 权益获取延迟/失败 (第{attempt + 1}/3次)，等待1秒后重试...")
         time.sleep(1)
 
+    # 【修改点 2】：失败时尝试使用缓存兜底
     if total_equity <= 0:
-        logger.error("[PRELOAD] 预加载总资产失败或为0，本轮开仓将受限！")
+        if RUNTIME_FALLBACK["total_equity"] > 0:
+            total_equity = RUNTIME_FALLBACK["total_equity"]
+            logger.warning(f"!!! [PRELOAD] 预加载总资产失败，已启用历史权益缓存续命: {total_equity:.2f} !!!")
+        else:
+            logger.error("[PRELOAD] 预加载总资产彻底失败或为0，且无可用历史缓存，本轮开仓将受限！")
 
     # 2. 获取全量持仓并构建缓存字典 (【修复2】：增加 3 次重试机制)
     position_success = False
@@ -238,14 +254,20 @@ def preload_account_state(exchange):
                 if amt != 0:
                     position_cache[sym] = amt
             position_success = True
+            RUNTIME_FALLBACK["position_cache"] = position_cache  # 【修改点 2】：拉取成功则更新缓存
             break
         except Exception as e:
             logger.warning(f"[PRELOAD] 拉取持仓失败 (第{attempt + 1}/3次): {e}")
             time.sleep(1)
 
+    # 【修改点 2】：失败时尝试使用缓存兜底
     if not position_success:
-        logger.error("[PRELOAD] 预加载持仓彻底失败，平仓操作可能会受阻！")
-        position_cache = None  # 标记为失败
+        if RUNTIME_FALLBACK["position_cache"] is not None:
+            position_cache = RUNTIME_FALLBACK["position_cache"]
+            logger.warning("!!! [PRELOAD] 预加载持仓失败，已启用历史持仓缓存续命（接受潜在错配风险） !!!")
+        else:
+            logger.error("[PRELOAD] 预加载持仓彻底失败，且无可用历史缓存，平仓操作可能会受阻！")
+            position_cache = None  # 标记为失败
 
     # 3. 获取全量活动挂单并构建缓存字典 (防止重复挂单) (【修复2】：增加 3 次重试机制)
     order_success = False
@@ -268,13 +290,19 @@ def preload_account_state(exchange):
             logger.warning(f"[PRELOAD] 拉取挂单失败 (第{attempt + 1}/3次): {e}")
             time.sleep(1)
 
+    # 【修改点 2】：失败时尝试使用缓存兜底
     if not order_success:
-        logger.error("[PRELOAD] 预加载挂单彻底失败，防重复挂单功能可能会受阻！")
-        open_order_cache = None  # 标记为失败
+        if RUNTIME_FALLBACK["open_order_cache"] is not None:
+            open_order_cache = RUNTIME_FALLBACK["open_order_cache"]
+            logger.warning("!!! [PRELOAD] 预加载挂单失败，已启用历史挂单缓存续命 !!!")
+        else:
+            logger.error("[PRELOAD] 预加载挂单彻底失败，防重复挂单功能可能会受阻！")
+            open_order_cache = None  # 标记为失败
 
     # 4. 同步并清理历史挂单，过滤完后返回最新的挂单缓存
     if open_order_cache is not None:
         open_order_cache = sync_and_clean_orders(exchange, open_order_cache)
+        RUNTIME_FALLBACK["open_order_cache"] = open_order_cache  # 同步后更新最新状态的缓存
 
     # 日志专点修改：补全了对时耗时，在预加载就绪日志中增加默认杠杆展示
     pos_len = len(position_cache) if position_cache is not None else 'FAIL'
@@ -351,7 +379,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
     # ---------------- 极速状态校验 (纯内存字典查询) ----------------
     if position_cache is None or open_order_cache is None:
-        logger.error(f"[EXEC] 致命拦截 | CID: {client_oid} | 原因: 预加载信息失败，放弃校验与下发。")
+        logger.error(f"[EXEC] 致命拦截 | CID: {client_oid} | 原因: 预加载信息失败且无可用缓存，放弃校验与下发。")
         return
 
     # 当前币种本地缓存的真实仓位与挂单信息
@@ -505,15 +533,21 @@ def run_scheduler():
                 try:
                     logger.info(f">>> [SCHEDULER] 尝试缓存账户资产 (第 {attempt}/3 次)...")
                     total_equity, position_cache, open_order_cache = preload_account_state(exchange)
-                    preload_success = True
-                    logger.info(">>> [SCHEDULER] 资产缓存成功。")
-                    break  # 成功则跳出重试循环
+
+                    # 【修改点 3】：修复原有直接赋值 True 被异常吞掉的漏洞。强制校验三个核心数据是否已可用（拉取成功或已启用缓存）
+                    if total_equity > 0 and position_cache is not None and open_order_cache is not None:
+                        preload_success = True
+                        logger.info(">>> [SCHEDULER] 资产数据已就绪（实时拉取或成功应用兜底缓存）。")
+                        break  # 成功则跳出重试循环
+                    else:
+                        logger.warning(f"[预加载警告] 第 {attempt} 次获取资产未能拿到完整数据或缓存，等待3秒后重试...")
+                        time.sleep(3)
                 except Exception as e:
-                    logger.warning(f"[预加载警告] 第 {attempt} 次获取资产失败: {e}")
+                    logger.warning(f"[预加载警告] 第 {attempt} 次发生未预料异常: {e}")
                     time.sleep(3)  # 失败后缓 3 秒再试
 
             if not preload_success:
-                logger.error("!!! [预加载严重错误] 连续 3 次拉取资产失败！为保障安全，放弃本轮调度。")
+                logger.error("!!! [预加载严重错误] 连续 3 次拉取失败且无兜底数据支撑！为保障安全，放弃本轮调度。")
                 time.sleep(60)  # 休息一分钟，直接进入下一个周期的 while 循环
                 continue
 
