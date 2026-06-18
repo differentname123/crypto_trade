@@ -19,7 +19,8 @@ from common.common_utils import get_config
 # 0. 配置与常量
 # ==========================================
 TRADE_RECORD_FILE = "trade_records.csv"
-POSITION_RISK_RATIO = 0.90  # 每次开仓占总资产的 10%
+POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10%
+LEVRAGE = 75  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 
 
 # ==========================================
@@ -275,15 +276,14 @@ def preload_account_state(exchange):
     if open_order_cache is not None:
         open_order_cache = sync_and_clean_orders(exchange, open_order_cache)
 
-    # 日志聚合探针：补全了对时耗时，并将多条分散的就绪日志合并为一条高密度日志
+    # 日志专点修改：补全了对时耗时，在预加载就绪日志中增加默认杠杆展示
     pos_len = len(position_cache) if position_cache is not None else 'FAIL'
     ord_len = len(open_order_cache) if open_order_cache is not None else 'FAIL'
     total_cost = (time.perf_counter() - t_start) * 1000
     logger.info(
-        f"[PRELOAD] 缓存就绪 | 总权益: {total_equity:.2f} USD | 有效持仓: {pos_len}种 | 存在挂单: {ord_len}种 | 耗时探针(对时/权益/持仓/挂单/总计): {sync_cost:.0f}ms / {eq_cost:.0f}ms / {pos_cost:.0f}ms / {ord_cost:.0f}ms / {total_cost:.0f}ms")
+        f"[PRELOAD] 缓存就绪 | 总权益: {total_equity:.2f} USD | 默认杠杆: {LEVRAGE}x | 有效持仓: {pos_len}种 | 存在挂单: {ord_len}种 | 耗时探针(对时/权益/持仓/挂单/总计): {sync_cost:.0f}ms / {eq_cost:.0f}ms / {pos_cost:.0f}ms / {ord_cost:.0f}ms / {total_cost:.0f}ms")
 
     return total_equity, position_cache, open_order_cache
-
 
 
 # ==========================================
@@ -295,10 +295,12 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     :param target_time: 目标整点时间 (datetime)
     """
     t_start = time.perf_counter()
-    target_position_value = total_equity * POSITION_RISK_RATIO
-    # 日志聚合：将触发时间和资金风控信息合并为一条极简表头日志，去除微秒中的多余尾数
+    # 核心修改点：将总资产乘上对于的杠杆倍数 LEVRAGE，计算出含杠杆后的风控名义限额
+    target_position_value = total_equity * LEVRAGE * POSITION_RISK_RATIO
+
+    # 日志专点修改：明确指出当前的杠杆倍数，并将“风控限额”明确注明为“风控限额(含杠杆)”
     logger.info(
-        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 风控限额: {target_position_value:.2f} ({POSITION_RISK_RATIO * 100:.0f}%) ==========")
+        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x | 风控限额(含杠杆): {target_position_value:.2f} ({POSITION_RISK_RATIO * 100:.0f}%) ==========")
 
     if signal_df is None or signal_df.empty:
         logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
@@ -324,7 +326,6 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
 
     logger.info(
         f"[EXEC] 本轮({target_time.strftime('%H:%M')})所有信号处理完毕 | 共匹配 {len(current_signals)} 条 | 模块总耗时: {(time.perf_counter() - t_start) * 1000:.1f}ms")
-
 
 
 def execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache):
@@ -437,8 +438,10 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
 
     # 剔除了原先的 [SUCCESS] 重复打印。因为 execute_order 里面已经打出了含完整 CID / EID 的详细发单日志
     # 这里仅在失败时补加一条归档状态的记录即可，避免高频日志刷屏。
+    # 日志专点修改：在发单失败的底层归档日志中指出对应的杠杆倍数情况
     if result.status != ExecStatus.OK:
-        logger.error(f"[RECORD] 发单失败/拒绝，状态已归档入库 | CID: {client_oid} | 记录状态: {result.status.value}")
+        logger.error(
+            f"[RECORD] 发单失败/拒绝，状态已归档入库 | CID: {client_oid} | 记录状态: {result.status.value} | 杠杆倍数: {LEVRAGE}x")
 
 
 def safe_init_exchange(api_key, secret_key, proxies):
@@ -483,7 +486,6 @@ def run_scheduler():
             # 2. 减去 1 分钟得到 target_time
             target_time = next_hour - timedelta(minutes=1)
             target_time_str = target_time.strftime("%Y-%m-%d %H:%M")
-
 
             preload_time = next_hour - timedelta(minutes=5)
 
@@ -540,6 +542,7 @@ def run_scheduler():
             # 发生严重错误时，强制休眠 30 秒，防止死循环疯狂报错打满日志或导致 IP 被封
             logger.info("系统将强制休眠 30 秒后尝试自我恢复...")
             time.sleep(30)
+
 
 if __name__ == "__main__":
     run_scheduler()
