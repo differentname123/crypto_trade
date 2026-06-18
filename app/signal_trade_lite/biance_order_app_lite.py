@@ -35,17 +35,21 @@ def record_trade(row, actual_time, total_equity, risk_ratio, target_value, amoun
     with open(TRADE_RECORD_FILE, mode='a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         if not file_exists:
-            # 表头：包含原始信号信息 + 实际执行信息 + 资产与风控信息 (新增 update_time)
+            # 表头：包含原始信号信息 + 实际执行信息 + 资产与风控信息
+            # 【修改点 1】：表头新增 symbol 字段，用于持久化记录交易对
             writer.writerow([
-                "signal_time", "action", "coin", "direction", "event", "signal_price",
+                "signal_time", "action", "coin", "symbol", "direction", "event", "signal_price",
                 "actual_trade_time", "update_time", "total_equity", "risk_ratio", "target_value", "exec_amount",
                 "exec_status", "client_oid", "exchange_oid", "error_msg"
             ])
 
+        # 【修改点 1 续】：安全提取 signal_df 中的 symbol 字段
+        symbol_val = str(row.get('symbol', '')).strip()
+
         # 初始发单时，更新时间 (update_time) 等于实际发单时间 (actual_time)
         writer.writerow([
             row['time'].strftime('%Y-%m-%d %H:%M:%S') if isinstance(row['time'], pd.Timestamp) else row['time'],
-            row['action'], row['coin'], row['direction'], row['event'], row['price'],
+            row['action'], row['coin'], symbol_val, row['direction'], row['event'], row['price'],
             actual_time, actual_time, total_equity, risk_ratio, target_value, amount, status.value, client_oid,
             exchange_oid, msg
         ])
@@ -111,7 +115,13 @@ def sync_and_clean_orders(exchange, open_order_cache):
         if status in terminal_states or not exch_oid or exch_oid == 'nan':
             continue
 
-        sym = f"{row['coin']}/USDT:USDT"
+        # 【修改点 2】：从 CSV 读取精确的 symbol，并向下兼容历史旧数据文件（若旧文件无该列则回退到强拼接）
+        sym_val = row.get('symbol')
+        if pd.isna(sym_val) or not str(sym_val).strip():
+            sym = f"{row['coin']}/USDT:USDT"
+        else:
+            sym = str(sym_val).strip()
+
         try:
             sig_time = pd.to_datetime(row['signal_time'])
         except Exception:
@@ -281,7 +291,7 @@ def preload_account_state(exchange):
 # ==========================================
 def execute_signals_fast(exchange, target_time, total_equity, position_cache, open_order_cache, signal_df):
     """
-    极速执行当前整点的信号（纯本地计算 + 直接发单）
+    极速执行当前整点的信号（纯本地计算 +直接发单）
     :param target_time: 目标整点时间 (datetime)
     """
     t_start = time.perf_counter()
@@ -323,7 +333,9 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
     direction = str(row['direction']).strip().upper()  # SHORT / LONG
     event = str(row['event']).strip().upper()  # OPEN / CLOSE
     price = float(row['price'])
-    symbol = f"{coin}/USDT:USDT"
+
+    # 【修改点 3】：直接提取 signal_df 中的精准 symbol 字段（移除对 USDT 的硬编码）
+    symbol = str(row['symbol']).strip()
 
     # 提取信号时间 (日+时+分)，确保挂单与具体的信号行绝对绑定
     sig_time = row['time'].strftime('%d%H%M') if isinstance(row['time'], pd.Timestamp) else pd.to_datetime(

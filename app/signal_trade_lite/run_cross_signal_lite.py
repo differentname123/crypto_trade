@@ -350,6 +350,12 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
     """
     all_strategy_ledgers = []
 
+    # [新增] 动态建立纯币种名到完整 symbol 的映射字典，避免硬编码后缀
+    coin_to_symbol = {}
+    for df in minute_klines_list:
+        if df is not None and not df.empty and 'coin_name' in df.columns and 'symbol' in df.columns:
+            coin_to_symbol[df['coin_name'].iloc[0]] = df['symbol'].iloc[0]
+
     # 循环遍历运行多个参数
     for params in strategy_params_list:
         strategy_name = params['STRATEGY_NAME']
@@ -391,6 +397,11 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
 
             # 新增参数标识，方便区分产生的交易数据
             trade_ledger_df['STRATEGY_NAME'] = strategy_name
+
+            # [新增] 动态为账本添加完整的 symbol 字段，若映射失败则根据示例规则自动拼接兜底
+            trade_ledger_df['symbol'] = trade_ledger_df['coin'].map(coin_to_symbol).fillna(
+                trade_ledger_df['coin'] + '/USDT:USDT')
+
             all_strategy_ledgers.append(trade_ledger_df)
 
             gen_count = len(trade_ledger_df)
@@ -540,6 +551,8 @@ def execute_trading_bot_workflow(target_time):
         # 提取纯币种名如 'BTC'
         coin_name = symbol.split('/')[0]
         df_klines['coin_name'] = coin_name
+        # [新增] 将完整的原始 symbol 存入 dataframe 中，向下游无损传递符号元数据
+        df_klines['symbol'] = symbol
 
         fetched_raw_data.append(df_klines)
 
@@ -553,7 +566,8 @@ def execute_trading_bot_workflow(target_time):
         signal_file_content = run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
         return signal_file_content
 
+
 if __name__ == "__main__":
-    target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
     execute_trading_bot_workflow(target_time)

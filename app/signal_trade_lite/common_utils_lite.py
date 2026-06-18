@@ -38,6 +38,7 @@ def setup_logger(log_dir="logs"):
 
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
+    logger.propagate = False
     return logger
 
 

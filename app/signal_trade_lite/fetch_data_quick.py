@@ -8,6 +8,7 @@
 【极限竞速版】二次历史前置释放、REST 脏数据严格过滤、最后 5s 无延迟脉冲式狂暴轮询。
 【生产监控版】引入 TraceID 链路追踪、Logfmt 结构化高密度聚合、静默成功与 O(N) 滞后点名机制。
 【防弹修复版】消除 WS 硬编码兼容全币种，注入协程防异常死锁装甲，引入物理时钟强判防流动性枯竭。
+【闪现交付版】主线程金蝉脱壳 O(1) 返回、剔除 datetime_bj 性能枷锁、后台线程接管全量清洗落盘。
 """
 
 import asyncio
@@ -138,13 +139,36 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
         f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
 
 
-def dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=""):
+def _background_pipeline_task(memory_pool_copy, cache_dir, log_prefix):
     """
-    启动独立守护线程进行全量覆盖覆写，彻底解放主线程
+    （被后台线程调用）承接主线程丢过来的全量脏活累活：巨量数据排序、构建 DataFrame、落盘
+    """
+    try:
+        MAX_CACHE_ROWS = 525600
+        full_dfs_for_cache = {}
+        for sym, kline_dict in memory_pool_copy.items():
+            all_klines = list(kline_dict.values())
+            all_klines.sort(key=lambda x: x[0])
+
+            if len(all_klines) > MAX_CACHE_ROWS:
+                all_klines = all_klines[-MAX_CACHE_ROWS:]
+
+            full_dfs_for_cache[sym] = pd.DataFrame(
+                all_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+
+        _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix)
+    except Exception as e:
+        logger.error(f"{log_prefix} [BACKGROUND_PIPE] ❌ 后台数据落盘流水线异常: {e}")
+
+
+def dispatch_background_save(memory_pool_copy, cache_dir="data", log_prefix=""):
+    """
+    启动独立守护线程进行全量覆盖覆写，彻底解放主线程 CPU
     """
     save_thread = threading.Thread(
-        target=_save_csv_sync_fast,
-        args=(full_dfs_for_cache, cache_dir, log_prefix),
+        target=_background_pipeline_task,
+        args=(memory_pool_copy, cache_dir, log_prefix),
         daemon=False
     )
     save_thread.start()
@@ -441,51 +465,52 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         logger.info(
             f"{log_prefix} [RACE] 🎯 目标全线闭合 | close_latency={close_latency_ms / 1000:.3f}s winner=(WS:{win['WS']}, REST:{win['REST_POLL']}) throughput=(ws:{tp.get('WS', 0)}, rest:{tp.get('REST_POLL', 0)}, hist:{tp.get('HIST', 0)}) details={det}")
 
-        # 6. 发令枪响：瞬间强杀所有底层协程
+        # 6. 发令枪响：瞬间强杀所有底层协程 (只杀双擎和处理器，不杀已经跑完的历史任务)
         all_tasks = engine_tasks + [processor_task]
         for task in all_tasks:
             if not task.done(): task.cancel()
 
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # 构建用于后台落盘的全量数据
-        MAX_CACHE_ROWS = 525600
-        full_dfs_for_cache = {}
-        for sym in symbol_list:
-            all_klines = list(memory_pool[sym].values())
-            all_klines.sort(key=lambda x: x[0])
-
-            if len(all_klines) > MAX_CACHE_ROWS:
-                all_klines = all_klines[-MAX_CACHE_ROWS:]
-
-            full_dfs_for_cache[sym] = pd.DataFrame(all_klines,
-                                                   columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-        # 无阻塞落盘
-        dispatch_background_save(full_dfs_for_cache, cache_dir="data", log_prefix=log_prefix)
-
-        # 7. 数据清洗封装
+        # =====================================================================
+        # 🚀 7. CPU 极限优化段：主线程金蝉脱壳、零阻塞构建极简返回数据
+        # =====================================================================
         final_dfs = {}
         expected_rows = int((target_time_ms - start_time_ms) / timeframe_ms) + 1
 
-        for sym, full_df in full_dfs_for_cache.items():
-            sliced_df = full_df[
-                (full_df['timestamp'] >= start_time_ms) & (full_df['timestamp'] <= target_time_ms)].reset_index(
-                drop=True)
-            sliced_df['datetime_bj'] = pd.to_datetime(sliced_df['timestamp'], unit='ms').dt.tz_localize(
-                'UTC').dt.tz_convert('Asia/Shanghai')
+        for sym in symbol_list:
+            # 第一层防线：极速字典推导式过滤（取代动辄几十万行的全量循环与判断）
+            sliced_klines = [
+                k for ts, k in memory_pool[sym].items()
+                if start_time_ms <= ts <= target_time_ms
+            ]
 
-            actual_rows = len(sliced_df)
+            # 第二层防线：局部极速排序（取代全量排序）
+            sliced_klines.sort(key=lambda x: x[0])
+
+            # 第三层防线：极简构建 Pandas (直接摒弃时区转换)
+            sliced_df = pd.DataFrame(
+                sliced_klines,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            final_dfs[sym] = sliced_df
+
+            # 数据完整性比对告警
+            actual_rows = len(sliced_klines)
             if actual_rows < expected_rows:
                 logger.warning(
                     f"{log_prefix} [CHECK] ⚠️ {sym} 数据存在断缺！预期 {expected_rows} 条，实际 {actual_rows} 条 (缺失 {expected_rows - actual_rows} 条)")
 
-            final_dfs[sym] = sliced_df
+        # =====================================================================
+        # 🤝 8. 后台交接：把沉重的 50+ 万条全量清洗与落盘，扔给子线程慢慢跑
+        # =====================================================================
+        memory_pool_copy = {sym: pool.copy() for sym, pool in memory_pool.items()}
+        dispatch_background_save(memory_pool_copy, cache_dir="data", log_prefix=log_prefix)
 
         total_pts = sum(len(df) for df in final_dfs.values())
         total_runtime = time.time() - orchestrator_start_t
         logger.info(
-            f"{log_prefix} [EXIT] 🎉 主任务脱壳交付 | range=[{_format_bj_time(start_time_ms)} ~ {_format_bj_time(target_time_ms)}] total_rows={total_pts} runtime={total_runtime:.2f}s")
+            f"{log_prefix} [EXIT] 🎉 主任务零阻塞闪现交付 | range=[{_format_bj_time(start_time_ms)} ~ {_format_bj_time(target_time_ms)}] total_rows={total_pts} runtime={total_runtime:.2f}s")
         return final_dfs
 
     finally:
@@ -526,7 +551,7 @@ if __name__ == "__main__":
             "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
         ]
 
-        target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
 
         print(">>> 准备调用数据引擎...")
 
@@ -544,7 +569,7 @@ if __name__ == "__main__":
             "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
             "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
         ]
-        target_time = (datetime.now() + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
 
         print(">>> 准备调用数据引擎...")
 
