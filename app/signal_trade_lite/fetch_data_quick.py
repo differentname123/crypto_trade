@@ -371,11 +371,22 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     run_id = f"T-{uuid.uuid4().hex[:4].upper()}"
     log_prefix = f"[{run_id}]"
 
-    exchange = ccxt.binance({
-        'enableRateLimit': True, 'options': {'defaultType': 'swap'},
-        'aiohttp_proxy': proxy_url, 'proxies': {'http': proxy_url, 'https': proxy_url}
-    })
+    # 1. 定义基础配置
+    exchange_config = {
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    }
 
+    # 2. 如果 proxy_url 存在（非 None 且非空），则动态注入代理配置
+    if proxy_url:
+        exchange_config['aiohttp_proxy'] = proxy_url
+        exchange_config['proxies'] = {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+
+    # 3. 使用配置字典初始化 Exchange
+    exchange = ccxt.binance(exchange_config)
     try:
         await exchange.load_markets()
         await check_time_sync(exchange, log_prefix)
@@ -536,7 +547,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 # 🌟 对外暴露的公共 API [严格未修改]
 # =====================================================================
 def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
-                     use_ws=True, use_rest=True, proxy_url='http://127.0.0.1:7890'):
+                     use_ws=True, use_rest=True, proxy_url=None):
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:

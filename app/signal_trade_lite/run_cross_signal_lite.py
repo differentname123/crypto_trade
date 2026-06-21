@@ -3,8 +3,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
 
-from app.signal_trade_lite.common_utils_lite import setup_logger
-from app.signal_trade_lite.fetch_data_quick import snipe_kline_data
+from common_utils_lite import setup_logger
+from fetch_data_quick import snipe_kline_data
 
 
 def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):

@@ -1,15 +1,11 @@
 import ccxt
-import logging
-import os
 import time
 import uuid
 
 from enum import Enum
-from logging.handlers import TimedRotatingFileHandler
 from ccxt.base.errors import NetworkError, InvalidOrder
 
-from app.signal_trade_lite.common_utils_lite import setup_logger
-from common.common_utils import get_config
+from common_utils_lite import setup_logger, get_config
 
 
 # ==========================================

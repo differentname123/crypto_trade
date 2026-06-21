@@ -6,14 +6,14 @@ import pandas as pd
 import csv
 from datetime import datetime, timedelta
 
-from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow
+from common_utils_lite import get_config
+from run_cross_signal_lite import execute_trading_bot_workflow
 # 从基础文件中导入核心组件 (假设基础文件名为 base_trader.py)
 # 确保 base_trader.py 中已经添加了上一轮我给你的 get_total_equity 函数
 from biance_order_lite import (
     init_exchange, execute_order, get_total_equity,
     ExecStatus, logger
 )
-from common.common_utils import get_config
 
 # ==========================================
 # 0. 配置与常量
