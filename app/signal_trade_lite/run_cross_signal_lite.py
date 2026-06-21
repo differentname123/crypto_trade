@@ -455,7 +455,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
 # ==========================================
 # 4. 程序入口点
 # ==========================================
-def execute_trading_bot_workflow(target_time):
+def execute_trading_bot_workflow(target_time, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
@@ -505,14 +505,6 @@ def execute_trading_bot_workflow(target_time):
     ]
 
     timeframe = "1m"
-    proxy_config = {
-        'http': 'http://127.0.0.1:7890',  # 请根据实际运行环境决定是否注释
-        'https': 'http://127.0.0.1:7890',
-    }
-
-    # 提取 proxy_url 适配新版引擎
-    proxy_url = proxy_config.get('http', '')
-
     # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
     result_map = snipe_kline_data(
         symbol_list=symbol_list,

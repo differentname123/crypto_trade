@@ -4,6 +4,7 @@ import traceback
 import uuid
 import pandas as pd
 import csv
+import platform  # 【修改点】：新增 platform 模块用于判断操作系统环境
 from datetime import datetime, timedelta
 
 from common_utils_lite import get_config
@@ -498,9 +499,19 @@ def run_scheduler():
     """
     API_KEY = get_config('nana_biance_api_key')
     SECRET_KEY = get_config('nana_biance_api_secret')
-    PROXIES = {'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
 
-    # 1. 永不宕机的初始化
+    # 【修改点】：动态环境检测判断是否启用代理
+    current_os = platform.system().lower()
+    if current_os == 'linux':
+        PROXIES = None
+        proxy_url = None
+        logger.info(f">>> [环境检测] 当前系统: Linux，判定为云端环境，已禁用代理。")
+    else:
+        PROXIES = {'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
+        proxy_url = 'http://127.0.0.1:7890'
+        logger.info(f">>> [环境检测] 当前系统: {current_os.capitalize()}，判定为本地环境，已启用代理: {proxy_url}。")
+
+    # 1. 永不宕机的初始化 (依据环境自适应传入代理状态)
     exchange = safe_init_exchange(API_KEY, SECRET_KEY, PROXIES)
 
     logger.info(">>> 调度系统已就绪，进入 7x24 小时主循环...")
@@ -555,8 +566,8 @@ def run_scheduler():
             logger.info(f">>> [SCHEDULER] 进入信号流水线，移交控制权等待目标时间 {target_time_str} ...")
             t_wf = time.perf_counter()
 
-            # 工作流内部自主决定等待 K 线闭合并生成信号
-            signal_df = execute_trading_bot_workflow(target_time_str)
+            # 工作流内部自主决定等待 K 线闭合并生成信号 (自适应传入对应的 proxy_url)
+            signal_df = execute_trading_bot_workflow(target_time_str, proxy_url=proxy_url)
 
             logger.info(f">>> [WORKFLOW] 流水线执行完毕！耗时: {time.perf_counter() - t_wf:.2f}s")
 
