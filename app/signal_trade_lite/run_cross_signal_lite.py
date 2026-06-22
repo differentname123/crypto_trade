@@ -237,8 +237,12 @@ def run_strategy_simulation(
                 net_pnl = sell_amount * (current_prices[idx_c] - cost) - fee
                 pnl_pct = (net_pnl / (cost * sell_amount)) * 100 if cost > 0 else 0.0
 
-                close_reason = "大盘开关关闭" if not is_btc_trend_on else "掉出排名"
-
+                if not is_btc_trend_on:
+                    close_reason = "大盘开关关闭"
+                elif current_mom[idx_c] <= 0:
+                    close_reason = "动量转负退场"
+                else:
+                    close_reason = "掉出前K名排名"
                 trade_ledger.append({
                     "time": current_time, "action": "SELL", "coin": c, "direction": "LONG", "event": "CLOSE",
                     "price": current_prices[idx_c], "amount": sell_amount, "value": actual_sell_val, "fee": fee,
@@ -259,8 +263,12 @@ def run_strategy_simulation(
                 net_pnl = buy_amount * (cost - current_prices[idx_c]) - fee
                 pnl_pct = (net_pnl / (cost * buy_amount)) * 100 if cost > 0 else 0.0
 
-                close_reason = "大盘开关关闭" if is_btc_trend_on else "掉出排名"
-
+                if is_btc_trend_on:
+                    close_reason = "大盘开关关闭"
+                elif current_mom[idx_c] >= 0:
+                    close_reason = "动量转正退场"
+                else:
+                    close_reason = "掉出前K名排名"
                 trade_ledger.append({
                     "time": current_time, "action": "BUY", "coin": c, "direction": "SHORT", "event": "CLOSE",
                     "price": current_prices[idx_c], "amount": buy_amount, "value": actual_buy_val, "fee": fee,
