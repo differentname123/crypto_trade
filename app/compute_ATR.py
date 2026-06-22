@@ -4907,7 +4907,7 @@ import pandas as pd
 import re
 
 
-def calculate_grid_atr_pct(df, day_list=[30, 90, 180, 365], timeframes=['1h'],
+def calculate_grid_atr_pct(df, day_list=[30, 90, 180, 365], timeframes=['12h'],
                            method_list=['trimmed']):
     """
     计算网格交易专用的不同时间维度、不同回溯天数下的 百分比ATR (ATR Percentage)。
