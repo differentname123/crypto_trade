@@ -4907,8 +4907,8 @@ import pandas as pd
 import re
 
 
-def calculate_grid_atr_pct(df, day_list=[90, 180, 360], timeframes=['1h', '4h', '8h'],
-                           method_list=['mean', 'median', 'trimmed', 'quantile_75']):
+def calculate_grid_atr_pct(df, day_list=[30, 90, 180, 365], timeframes=['1h'],
+                           method_list=['trimmed']):
     """
     计算网格交易专用的不同时间维度、不同回溯天数下的 百分比ATR (ATR Percentage)。
     代表该时间维度下，单根K线的平均真实波动幅度百分比。
@@ -4981,8 +4981,8 @@ def calculate_grid_atr_pct(df, day_list=[90, 180, 360], timeframes=['1h', '4h', 
                     elif method == 'median':
                         typical_atr = period_tr_pct.median()
                     elif method == 'trimmed':
-                        lower_bound = period_tr_pct.quantile(0.05)
-                        upper_bound = period_tr_pct.quantile(0.95)
+                        lower_bound = period_tr_pct.quantile(0.0)
+                        upper_bound = period_tr_pct.quantile(0.9)
                         filtered_tr = period_tr_pct[(period_tr_pct >= lower_bound) & (period_tr_pct <= upper_bound)]
                         typical_atr = filtered_tr.mean()
                     elif method.startswith('quantile_'):
