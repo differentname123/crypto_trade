@@ -21,7 +21,7 @@ from biance_order_lite import (
 # ==========================================
 TRADE_RECORD_FILE = "trade_records.csv"
 POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 target_weight)
-LEVRAGE = 75  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
+LEVRAGE = 10  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 
 # 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
 RUNTIME_FALLBACK = {
