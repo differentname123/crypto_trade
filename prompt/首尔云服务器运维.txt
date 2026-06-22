@@ -2,8 +2,10 @@
 具体页面：https://console.cloud.tencent.com/lighthouse/instance/detail?searchParams=rid%3D18&rid=18&id=lhins-337or9oa
 IPv4 43.131.225.155
 
-
 加密服务运维：
+
+
+
 # 激活环境
 source venv/bin/activate
 
@@ -11,6 +13,12 @@ source venv/bin/activate
 
 ```bash
 直接查看 app/signal_trade_lite/logs/trading_bot.log 就行了
+
+
+### 1. 查看实时日志（看脚本输出）
+
+```bash
+journalctl -u binance-trade -f
 
 ```
 

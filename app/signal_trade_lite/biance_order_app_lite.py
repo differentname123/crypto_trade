@@ -20,7 +20,7 @@ from biance_order_lite import (
 # 0. 配置与常量
 # ==========================================
 TRADE_RECORD_FILE = "trade_records.csv"
-POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10%
+POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 target_weight)
 LEVRAGE = 75  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 
 # 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
@@ -324,12 +324,10 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     :param target_time: 目标整点时间 (datetime)
     """
     t_start = time.perf_counter()
-    # 核心修改点：将总资产乘上对于的杠杆倍数 LEVRAGE，计算出含杠杆后的风控名义限额
-    target_position_value = total_equity * LEVRAGE * POSITION_RISK_RATIO
 
-    # 日志专点修改：明确指出当前的杠杆倍数，并将“风控限额”明确注明为“风控限额(含杠杆)”
+    # 【本次修改点】：去除了统一计算 target_position_value，并将开仓限额逻辑转移至内部各信号按照各自的 target_weight 单独计算
     logger.info(
-        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x | 风控限额(含杠杆): {target_position_value:.2f} ({POSITION_RISK_RATIO * 100:.0f}%) ==========")
+        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x | 风控限额(含杠杆): 根据各信号 target_weight 独立计算 ==========")
 
     if signal_df is None or signal_df.empty:
         logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
@@ -349,7 +347,8 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     # 3. 遍历并瞬发信号
     for _, row in current_signals.iterrows():
         try:
-            execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache)
+            # 【本次修改点】：去除了传入公共全局的风控限额 target_position_value
+            execute_single_signal(exchange, row, total_equity, position_cache, open_order_cache)
         except Exception as e:
             logger.error(f"单次发单异常拦截: {e}")
 
@@ -357,12 +356,16 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
         f"[EXEC] 本轮({target_time.strftime('%H:%M')})所有信号处理完毕 | 共匹配 {len(current_signals)} 条 | 模块总耗时: {(time.perf_counter() - t_start) * 1000:.1f}ms")
 
 
-def execute_single_signal(exchange, row, total_equity, target_position_value, position_cache, open_order_cache):
+def execute_single_signal(exchange, row, total_equity, position_cache, open_order_cache):
     coin = str(row['coin']).strip().upper()
     action = str(row['action']).strip().upper()  # BUY / SELL
     direction = str(row['direction']).strip().upper()  # SHORT / LONG
     event = str(row['event']).strip().upper()  # OPEN / CLOSE
     price = float(row['price'])
+
+    # 【本次修改点】：直接提取信号行中对应的仓位权重，并依此计算本信号特有的风控开仓额度
+    target_weight = float(row['target_weight'])
+    target_position_value = total_equity * LEVRAGE * target_weight
 
     # 【修改点 3】：直接提取 signal_df 中的精准 symbol 字段（移除对 USDT 的硬编码）
     symbol = str(row['symbol']).strip()
@@ -409,7 +412,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
     # 防呆/仓位拦截 (0 耗时)
     if event == "OPEN":
         if target_position_value <= 0:
-            logger.warning(f"[EXEC] 无效开仓 | CID: {client_oid} | 资金预加载为0。")
+            logger.warning(f"[EXEC] 无效开仓 | CID: {client_oid} | 资金预加载为0或目标权重异常。")
             return
         if (direction == "SHORT" and has_short) or (direction == "LONG" and has_long):
             logger.warning(
@@ -456,7 +459,7 @@ def execute_single_signal(exchange, row, total_equity, target_position_value, po
         row=row,
         actual_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         total_equity=total_equity,
-        risk_ratio=POSITION_RISK_RATIO,
+        risk_ratio=target_weight,  # 【本次修改点】：不再写入全局的 POSITION_RISK_RATIO，而是存入信号本身独有的 target_weight
         target_value=target_position_value,
         amount=amount,
         status=result.status,

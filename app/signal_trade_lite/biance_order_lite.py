@@ -151,7 +151,7 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
         # 日志加上 position_side 的打印，保持排查链路的完整性
         pos_side_str = f" | 持仓方向:{position_side.upper()}" if position_side else ""
         logger.info(
-            f"[ACTION] 下单意图 | CID:{client_oid} | {symbol} {side.upper()}{pos_side_str} | 量:{amount} | 类:{order_type} | 价:{price} | 仅减仓:{reduce_only}")
+            f"[ACTION] 下单意图 | CID:{client_oid} | {symbol} {side.upper()}{pos_side_str} | 量:{amount} | 类:{order_type} | 价:{price} | 仅减仓:{reduce_only} 价值:{amount * price if price else '市价'}")
 
         order = exchange.create_order(
             symbol=symbol, type=ccxt_type, side=side, amount=amount, price=price, params=params
