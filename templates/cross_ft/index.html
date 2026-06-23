@@ -575,53 +575,17 @@
 
             // 4. 发起 API 请求
             try {
-                // 严密防漏的 System Prompt
-                const systemInstruction = `你是 Alpha Momentum 量化节点的官方极客客服。
-你的核心任务是：解答关于本量化节点的基础问题，并强烈引导用户添加微信 (yys190704) 获取 Binance 实盘白名单。
-
-【绝对禁忌】：
-1. 严禁提供任何具体的投资建议、币种推荐或行情预测。如果问及，回复：'受限于风控协议，我们不提供主观预测，一切交由黑盒引擎处理。'
-2. 严禁承认自己是通用的 AI，必须保持'Alpha Momentum 专属智能中枢'的人设。
-3. 严禁回答与本量化策略、加密货币、Binance 接入无关的闲聊话题（如天气、写代码、菜谱等），必须礼貌拒绝并拉回主题。
-
-【知识库】：
-- 核心优势：截面动量算法，跑赢大盘 27%，2021年绝对收益+1962.9%。
-- 接入方式：纯信号 API 发射，资金在用户自己 Binance 账户，0%资金盘风险。
-- 门槛：防滑点测试母金为 $500 USDT。
-
-【语气风格】：
-专业、高冷、克制、极客风。尽量简短直接，避免冗长废话。`;
-
-                // 注意：这里使用的是 REST API 形式。实际生产中，请将此请求放到后端！
-                const API_KEY = "AIzaSyArY80cWaQ-7pdwk6S75brR1tOQG8ThAr4";
-                // 由于标准模型调用限制，这里映射为 gemini-1.5-flash 保证稳定响应
-                const model = "gemini-3.1-flash-lite";
-                const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
-
-                const payload = {
-                    system_instruction: {
-                        parts: [{ text: systemInstruction }]
-                    },
-                    contents: conversationHistory,
-                    generationConfig: {
-                        temperature: 0.1, // 降低温度，让回答更稳定严谨
-                        topK: 40,
-                        topP: 0.95,
-                        thinkingConfig: {
-                            thinkingLevel: "HIGH"
-                        }
-                    }
-                };
-
-                const response = await fetch(url, {
+                // 修改为调用您部署的 Python 后端接口
+                const backendUrl = "/api/chat";
+                const response = await fetch(backendUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify({ history: conversationHistory })
                 });
 
                 if (!response.ok) {
                     const errData = await response.json();
-                    throw new Error(errData.error?.message || `HTTP Error ${response.status}`);
+                    throw new Error(errData.detail || `HTTP Error ${response.status}`);
                 }
 
                 const data = await response.json();
@@ -630,13 +594,13 @@
                 document.getElementById(typingId).remove();
 
                 // 获取并渲染回复
-                if (data.candidates && data.candidates[0].content.parts.length > 0) {
-                    const aiText = data.candidates[0].content.parts[0].text;
+                if (data.status === 'success' && data.reply) {
+                    const aiText = data.reply;
                     appendMessage('model', aiText);
                     // 保存 AI 回复到上下文，形成真实的记忆链条
                     conversationHistory.push({ role: 'model', parts: [{ text: aiText }] });
                 } else {
-                    throw new Error("模型返回的数据结构异常或为空。");
+                    throw new Error("后端返回的数据结构异常或为空。");
                 }
 
             } catch (error) {
