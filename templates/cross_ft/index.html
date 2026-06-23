@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Alpha Momentum - 机构级量化信号节点</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        darkbg: '#050505',
+                        quantgreen: '#00fa9a',
+                        quantred: '#ff3b30',
+                        panel: '#111111',
+                        wechat: '#07C160'
+                    },
+                    fontFamily: {
+                        mono: ['"SF Mono"', 'Menlo', 'Monaco', 'Consolas', '"Liberation Mono"', '"Courier New"', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; background-color: #050505; color: white; -webkit-tap-highlight-color: transparent; }
+        .glass-panel { background: rgba(17, 17, 17, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5); }
+        .neon-text { text-shadow: 0 0 15px rgba(0, 250, 154, 0.4); }
+        .red-neon-text { text-shadow: 0 0 15px rgba(255, 59, 48, 0.4); }
+        .gradient-text { background: linear-gradient(to right, #ffffff, #888888); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+
+        /* 移动端/PC端兼容滑块 */
+        input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; margin: 20px 0; }
+        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 30px; width: 30px; border-radius: 50%; background: #00fa9a; cursor: pointer; margin-top: -13px; box-shadow: 0 0 20px rgba(0,250,154,0.6); border: 3px solid #050505; transition: transform 0.1s; }
+        input[type=range]::-webkit-slider-thumb:active { transform: scale(1.1); }
+        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; background: #333; border-radius: 2px; }
+
+        /* 弹窗极客动画 */
+        .modal-enter { animation: modalFadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        @keyframes modalFadeIn {
+            from { opacity: 0; transform: scale(0.95) translateY(10px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+
+        /* 网格卡片悬浮效果 */
+        .bento-card { transition: all 0.3s ease; }
+        .bento-card:hover { transform: translateY(-2px); border-color: rgba(0,250,154,0.3); background: rgba(20,20,20,0.9); }
+
+        /* AI 悬浮客服专属样式 */
+        #ai-chat-widget { transition: all 0.3s ease; }
+        .chat-scroll::-webkit-scrollbar { width: 4px; }
+        .chat-scroll::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+        .typing-indicator span { display: inline-block; width: 4px; height: 4px; background-color: #00fa9a; border-radius: 50%; animation: typing 1s infinite; margin: 0 2px; }
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes typing { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-3px); } }
+
+        /* 禁用状态的输入框样式 */
+        input:disabled { opacity: 0.5; cursor: not-allowed; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body class="antialiased selection:bg-quantgreen selection:text-black">
+
+    <nav class="fixed w-full z-40 glass-panel border-b border-gray-800">
+        <div class="max-w-7xl mx-auto px-4 md:px-8 h-16 flex justify-between items-center">
+            <div class="font-bold text-lg md:text-2xl tracking-widest text-white flex items-center">
+                <i class="fa-solid fa-layer-group text-quantgreen mr-2"></i>ALPHA<span class="text-gray-600 font-light">MOMENTUM</span>
+            </div>
+            <button onclick="copyWechat()" class="hidden md:flex bg-wechat hover:bg-green-500 text-white px-5 py-2 rounded text-sm font-bold transition-all items-center shadow-[0_0_15px_rgba(7,193,96,0.2)]">
+                <i class="fa-brands fa-weixin mr-2 text-lg"></i> 申请实盘白名单
+            </button>
+            <button onclick="copyWechat()" class="md:hidden text-wechat text-2xl px-2">
+                <i class="fa-brands fa-weixin"></i>
+            </button>
+        </div>
+    </nav>
+
+    <header class="pt-28 md:pt-40 pb-16 px-4 relative overflow-hidden">
+        <div class="absolute top-0 right-0 w-[500px] h-[500px] bg-quantgreen rounded-full opacity-[0.02] blur-[100px] pointer-events-none"></div>
+
+        <div class="max-w-7xl mx-auto flex flex-col lg:flex-row items-center gap-12">
+            <div class="flex-1 text-center lg:text-left z-10">
+                <div class="inline-flex items-center bg-gray-900 border border-gray-700 text-gray-300 px-4 py-1.5 rounded-full text-xs md:text-sm mb-6 font-mono tracking-wider">
+                    <span class="w-2 h-2 rounded-full bg-quantred animate-pulse mr-2"></span> 2026 极限避险模型
+                </div>
+                <h1 class="text-4xl md:text-6xl lg:text-7xl font-extrabold mb-6 leading-tight tracking-tight">
+                    当市场在哀嚎时<br>
+                    <span class="text-quantgreen neon-text">我们如何保住本金？</span>
+                </h1>
+                <p class="text-gray-400 text-base md:text-xl mb-8 max-w-2xl mx-auto lg:mx-0 leading-relaxed font-light">
+                    截面动量算法不预测顶底。在崩盘中启动绝对防守，在主升浪中疯狂掠夺。跑赢大盘27%的黑盒引擎，现对外开放信号接入。
+                </p>
+                <button onclick="copyWechat()" class="hidden lg:inline-flex items-center bg-white text-black font-bold text-lg px-8 py-4 rounded-full transition-transform hover:scale-105 shadow-[0_0_20px_rgba(255,255,255,0.2)]">
+                    获取 Binance 接入指南 <i class="fa-solid fa-arrow-right ml-3"></i>
+                </button>
+            </div>
+
+            <div class="flex-1 w-full z-10">
+                <div class="glass-panel rounded-2xl p-4 md:p-6 w-full shadow-2xl relative">
+                    <div class="absolute -top-3 -right-3 bg-quantred text-white text-[10px] md:text-xs font-bold px-3 py-1 rounded shadow-lg transform rotate-6">
+                        跑赢大盘 27%
+                    </div>
+                    <div class="flex justify-between items-end mb-4 border-b border-gray-800 pb-4">
+                        <div>
+                            <h3 class="text-gray-500 font-mono text-xs mb-1 tracking-widest uppercase">2026 YTD 收益回撤对比</h3>
+                            <div class="text-quantgreen text-xl md:text-2xl font-bold neon-text">策略 -6.0% <span class="text-xs text-gray-500 font-normal ml-2 bg-gray-800 px-2 py-0.5 rounded">防守级</span></div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-quantred text-sm md:text-base font-bold red-neon-text">基准 -33.0%</div>
+                        </div>
+                    </div>
+                    <div class="relative h-48 md:h-72 w-full">
+                        <canvas id="heroChart"></canvas>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <section class="py-16 px-4 bg-darkbg border-t border-gray-900">
+        <div class="max-w-7xl mx-auto">
+            <div class="mb-12 md:flex justify-between items-end">
+                <div>
+                    <h2 class="text-2xl md:text-4xl font-bold mb-2">核心基础绩效 <span class="text-gray-600 font-light">/ CORE METRICS</span></h2>
+                    <p class="text-gray-500 text-sm md:text-base">基于最佳时区表现的 5970 根 K 线全景回测回放。</p>
+                </div>
+                <div class="hidden md:block text-right font-mono text-xs text-gray-500">
+                    <div>FINAL_SCORE: 1.738</div>
+                    <div>DATA_SOURCE: BINANCE_FUTURES</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-6">
+                <div class="col-span-2 md:col-span-2 glass-panel p-6 rounded-2xl bento-card border border-gray-800 bg-gradient-to-br from-gray-900 to-black">
+                    <div class="text-gray-500 text-xs md:text-sm font-mono mb-2"><i class="fa-solid fa-rocket mr-1"></i> 累计绝对收益</div>
+                    <div class="text-4xl md:text-6xl font-black text-quantgreen neon-text mb-2">+1962.9%</div>
+                    <div class="flex gap-2 mt-4 text-[10px] md:text-xs">
+                        <span class="bg-gray-800 text-gray-300 px-2 py-1 rounded">牛市绝对收益 +2062.1%</span>
+                        <span class="bg-gray-800 text-gray-300 px-2 py-1 rounded">年化 +76.7%</span>
+                    </div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-gray-800 flex flex-col justify-center">
+                    <div class="text-gray-500 text-xs font-mono mb-1">胜率 (Win Rate)</div>
+                    <div class="text-2xl font-bold text-white mb-2">40.9%</div>
+                    <div class="w-full bg-gray-800 h-1 rounded"><div class="bg-gray-400 h-1 rounded" style="width: 40.9%"></div></div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-quantgreen/20 bg-quantgreen/5 flex flex-col justify-center">
+                    <div class="text-quantgreen text-xs font-mono mb-1">盈亏比 (P/L Ratio)</div>
+                    <div class="text-2xl font-bold text-quantgreen neon-text">2.04</div>
+                    <div class="text-[10px] text-gray-500 mt-1">主动切断亏损，让利润奔跑</div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-gray-800">
+                    <div class="text-gray-500 text-xs font-mono mb-2">最大回撤</div>
+                    <div class="text-xl font-bold text-quantred">-29.7%</div>
+                    <div class="text-[10px] text-gray-600 mt-1">远低于市场均值</div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-gray-800">
+                    <div class="text-gray-500 text-xs font-mono mb-2">盈利月占比</div>
+                    <div class="text-xl font-bold text-white">54.0%</div>
+                    <div class="text-[10px] text-gray-600 mt-1">跨越牛熊验证</div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-gray-800">
+                    <div class="text-gray-500 text-xs font-mono mb-2">币种集中度 HHI</div>
+                    <div class="text-xl font-bold text-white">0.225</div>
+                    <div class="text-[10px] text-gray-600 mt-1">极度分散，拒绝单点爆破</div>
+                </div>
+
+                <div class="glass-panel p-5 rounded-2xl bento-card border border-gray-800 relative overflow-hidden">
+                    <div class="absolute -right-4 -bottom-4 text-gray-800 text-6xl"><i class="fa-solid fa-filter"></i></div>
+                    <div class="text-gray-500 text-xs font-mono mb-2 relative z-10">Top3 剔除衰减</div>
+                    <div class="text-xl font-bold text-quantgreen relative z-10">+45.8%</div>
+                    <div class="text-[10px] text-gray-400 mt-1 relative z-10">不依赖单次狗屎运</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="py-20 px-4 border-t border-gray-900 relative">
+        <div class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-full h-[500px] bg-quantgreen rounded-full opacity-[0.02] blur-3xl pointer-events-none"></div>
+        <div class="max-w-4xl mx-auto text-center relative z-10">
+            <h2 class="text-2xl md:text-4xl font-bold mb-4">时间机器 <span class="text-gray-600 font-light">/ TIME MACHINE</span></h2>
+            <p class="text-gray-400 text-sm md:text-base mb-10">如果 2021 年你配置了本节点引擎...</p>
+
+            <div class="glass-panel rounded-2xl p-6 md:p-12 w-full border border-gray-800 shadow-2xl">
+                <div class="flex justify-between text-gray-500 font-mono text-xs mb-4">
+                    <span>INITIAL_CAPITAL</span>
+                    <span>ADJUST_SLIDER</span>
+                </div>
+                <div class="text-3xl md:text-4xl font-mono text-white mb-2" id="investment-display">$1,000</div>
+
+                <div class="py-4 px-2">
+                    <input type="range" id="investment-slider" min="100" max="10000" step="100" value="1000">
+                </div>
+
+                <div class="mt-8 p-6 md:p-8 bg-[#0a0a0c] rounded-xl border border-gray-800 relative overflow-hidden">
+                    <div class="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-quantgreen to-transparent opacity-50"></div>
+                    <p class="text-gray-500 text-xs font-mono mb-2 uppercase">Current_Net_Value (今天你的资产)</p>
+                    <div class="text-5xl md:text-7xl font-black text-quantgreen neon-text mb-4 font-mono tracking-tighter" id="result-display">$20,629</div>
+                    <div class="inline-block border border-quantgreen/30 bg-quantgreen/5 text-quantgreen px-3 py-1 rounded text-xs font-mono">
+                        ROI: 1962.9%
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="py-16 px-4 bg-[#080808] border-t border-gray-900">
+        <div class="max-w-7xl mx-auto">
+            <h2 class="text-2xl md:text-3xl font-bold mb-10 text-center gradient-text">底层构架与实盘同步节点解析</h2>
+
+            <div class="grid md:grid-cols-2 gap-6 md:gap-10">
+                <div class="border border-gray-800 rounded-2xl p-6 md:p-8 bg-panel">
+                    <h3 class="text-lg font-bold mb-4 text-white flex items-center">
+                        <i class="fa-solid fa-microchip text-gray-500 mr-3"></i> 历史测试沙盒引擎
+                    </h3>
+                    <p class="text-sm text-gray-400 leading-relaxed mb-6">
+                        以上 1962% 收益基于过去 5 年真实历史 K 线进行毫秒级回放得出。我们包含并展示了 294 天的最长水下期（回撤期），证明这是一个符合金融逻辑的现实系统，而非虚假的“永不亏损”模型。
+                    </p>
+                    <div class="bg-black p-4 rounded-lg border border-gray-800">
+                        <div class="text-xs text-gray-500 font-mono mb-1">年度表现拆解提取</div>
+                        <div class="text-sm text-gray-300">2021: <span class="text-quantgreen">+346.7%</span> (大牛市超额)</div>
+                        <div class="text-sm text-gray-300 mt-1">2022: <span class="text-quantgreen">+8.0%</span> (大盘跌-70.2%)</div>
+                    </div>
+                </div>
+
+                <div class="border border-quantgreen/50 rounded-2xl p-6 md:p-8 bg-panel relative shadow-[0_0_30px_rgba(0,250,154,0.05)]">
+                    <div class="absolute top-4 right-4 flex items-center bg-quantgreen/10 border border-quantgreen/30 text-quantgreen px-2 py-1 rounded text-[10px] font-mono">
+                        <span class="w-1.5 h-1.5 rounded-full bg-quantgreen mr-1.5 animate-[ping_1.5s_infinite]"></span> ONLINE
+                    </div>
+                    <h3 class="text-lg font-bold mb-4 text-quantgreen flex items-center">
+                        <i class="fa-solid fa-satellite-dish mr-3"></i> V3.0 Binance 实盘信号接口
+                    </h3>
+                    <p class="text-sm text-gray-300 leading-relaxed mb-6">
+                        由于策略容量极大，为确保外部大资金跟随者不产生致命滑点，团队已全新重开专属的纯信号 API 发射节点。
+                    </p>
+
+                    <div class="bg-[#050505] p-4 rounded-lg border border-gray-800 font-mono text-xs space-y-3">
+                        <div class="flex justify-between items-center pb-2 border-b border-gray-800">
+                            <span class="text-gray-500">接口所在平台</span>
+                            <span class="text-yellow-500 font-bold"><i class="fa-brands fa-binance mr-1"></i>Binance</span>
+                        </div>
+                        <div class="flex justify-between items-center pb-2 border-b border-gray-800">
+                            <span class="text-gray-500">资金池风险</span>
+                            <span class="text-white">0% (资金在您自己账户)</span>
+                        </div>
+                        <div class="flex justify-between items-center">
+                            <span class="text-gray-500">防滑点测试母金</span>
+                            <span class="text-quantgreen font-bold">$500.00 USDT</span>
+                        </div>
+                    </div>
+                    <div class="text-[10px] text-gray-500 mt-3">* 注：跳转币安后看到此测试资金及较短运行时间为正常现象，您跟随的是底层信号频率，而非母金规模。</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section class="py-20 px-4 bg-black text-center border-t border-gray-900 pb-32">
+        <div class="max-w-xl mx-auto">
+            <h2 class="text-3xl md:text-4xl font-bold mb-4">连接 Alpha 节点</h2>
+            <p class="text-gray-400 text-sm mb-8">因风控限制，实盘接口以【白名单制】私密开放。添加主理人微信进行资产验证，免费获取 Binance 自动跟随链接。</p>
+
+            <div class="inline-flex items-center bg-gray-900 border border-gray-800 rounded-full px-4 py-1.5 mb-8 text-xs font-mono">
+                <span class="text-gray-500 mr-2">BATCH_01:</span>
+                <span class="text-gray-300">剩余可用配额</span>
+                <span class="text-quantgreen font-bold ml-2">12 / 200</span>
+            </div>
+
+            <button onclick="copyWechat()" class="group relative w-full md:w-auto overflow-hidden rounded-xl bg-wechat hover:bg-green-500 text-white font-bold text-lg px-8 py-5 transition-all shadow-[0_0_25px_rgba(7,193,96,0.3)] flex items-center justify-center mx-auto">
+                <div class="absolute inset-0 w-full h-full bg-white/20 scale-x-0 group-hover:scale-x-100 origin-left transition-transform duration-300 ease-out"></div>
+                <i class="fa-brands fa-weixin text-2xl mr-3 relative z-10"></i>
+                <span class="relative z-10 tracking-wide">申请 API 节点白名单</span>
+            </button>
+
+            <p class="mt-5 text-[11px] text-gray-600 font-mono">ENCRYPTED_CHANNEL // MANUAL_REVIEW_REQUIRED</p>
+        </div>
+    </section>
+
+    <div class="md:hidden fixed bottom-0 left-0 w-full p-4 glass-panel border-t border-gray-800 z-40 bg-black/90">
+        <button onclick="copyWechat()" class="w-full bg-wechat text-white font-bold py-3.5 rounded-lg text-base shadow-[0_0_15px_rgba(7,193,96,0.4)] flex items-center justify-center animate-[pulse_2s_infinite]">
+            <i class="fa-brands fa-weixin mr-2 text-xl"></i> 立即获取实盘链接
+        </button>
+    </div>
+
+    <div id="wechatModal" class="fixed inset-0 z-50 flex items-center justify-center px-4 hidden">
+        <div class="absolute inset-0 bg-black/80 backdrop-blur-md transition-opacity" onclick="closeModal()"></div>
+
+        <div class="glass-panel border border-gray-700 rounded-2xl w-full max-w-sm relative z-10 p-1 modal-enter shadow-[0_0_50px_rgba(0,250,154,0.15)] bg-[#0a0a0c] overflow-hidden">
+            <div class="w-full h-1 bg-gradient-to-r from-transparent via-wechat to-transparent"></div>
+
+            <div class="p-6 text-center">
+                <div class="w-12 h-12 bg-wechat/10 border border-wechat/30 rounded-full flex items-center justify-center mx-auto mb-4 text-wechat text-xl">
+                    <i class="fa-solid fa-check"></i>
+                </div>
+                <h2 class="text-xl font-bold text-white mb-1">秘钥复制成功</h2>
+                <p class="text-xs text-gray-500 mb-5 font-mono">NODE_ADMIN_WECHAT_ID_COPIED</p>
+
+                <div class="bg-black border border-gray-800 rounded-xl p-4 mb-5 relative select-all">
+                    <span class="text-gray-500 text-[10px] uppercase block mb-1">请在微信添加管理员：</span>
+                    <span class="text-3xl font-mono text-white font-black tracking-widest" id="wechatId">yys190704</span>
+                </div>
+
+                <div class="bg-gray-900/50 p-3 rounded text-xs text-left text-gray-400 mb-6 border border-gray-800/50">
+                    <i class="fa-solid fa-circle-exclamation text-yellow-500 mr-1"></i> 通关暗号：添加时请务必备注 <span class="text-quantgreen font-bold px-1">Alpha节点</span>，否则系统将自动拒绝好友申请。
+                </div>
+
+                <div class="flex gap-3">
+                    <a href="weixin://" class="flex-1 py-3.5 rounded-lg bg-wechat hover:bg-green-500 transition-colors text-white text-sm font-bold flex items-center justify-center shadow-lg shadow-wechat/20">
+                        打开微信去粘贴 <i class="fa-solid fa-arrow-up-right-from-square text-[10px] ml-2"></i>
+                    </a>
+                </div>
+                <button onclick="closeModal()" class="mt-4 text-xs text-gray-600 hover:text-white transition-colors">稍后再试，关闭窗口</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="ai-trigger" class="fixed bottom-24 md:bottom-8 right-4 md:right-8 z-50 cursor-pointer transition-transform hover:scale-110" onclick="toggleChat()">
+        <div class="relative flex items-center justify-center w-14 h-14 bg-[#0a0a0c] border border-quantgreen rounded-full shadow-[0_0_20px_rgba(0,250,154,0.3)]">
+            <i class="fa-solid fa-robot text-quantgreen text-2xl"></i>
+            <span class="absolute -top-1 -right-1 flex h-4 w-4">
+                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-quantgreen opacity-75"></span>
+                <span class="relative inline-flex rounded-full h-4 w-4 bg-quantgreen border-2 border-black"></span>
+            </span>
+        </div>
+    </div>
+
+    <div id="ai-chat-widget" class="fixed bottom-40 md:bottom-28 right-4 md:right-8 z-50 w-[90%] md:w-96 max-w-sm glass-panel border border-gray-700 rounded-xl overflow-hidden hidden flex-col h-[500px] max-h-[70vh] shadow-[0_0_40px_rgba(0,0,0,0.8)] bg-[#050505]">
+        <!-- 修复点：增加 shrink-0 确保头部不被压缩 -->
+        <div class="flex items-center justify-between px-4 py-3 border-b border-gray-800 bg-[#0a0a0c] shrink-0">
+            <div class="flex items-center gap-2 text-quantgreen font-mono text-sm font-bold">
+                <i class="fa-solid fa-microchip"></i> Alpha Node AI
+            </div>
+            <button onclick="toggleChat()" class="text-gray-500 hover:text-white transition-colors"><i class="fa-solid fa-times"></i></button>
+        </div>
+
+        <!-- 修复点：增加 min-h-0 强制开启内部滚动，解决溢出塌陷问题 -->
+        <div id="chat-messages" class="flex-1 p-4 overflow-y-auto chat-scroll flex flex-col gap-4 text-sm min-h-0">
+            <div class="text-center text-xs text-gray-600 font-mono mb-2">SECURE_CONNECTION_ESTABLISHED</div>
+            <div class="flex items-start gap-2 max-w-[85%]">
+                <div class="w-6 h-6 rounded-full bg-quantgreen/10 border border-quantgreen/30 flex items-center justify-center text-quantgreen text-xs shrink-0 mt-1"><i class="fa-solid fa-robot"></i></div>
+                <div class="bg-[#111] border border-gray-800 text-gray-200 p-3 rounded-tr-xl rounded-b-xl leading-relaxed">
+                    您好，我是 Alpha Momentum 智能中枢。请问您对本量化节点有什么疑问？或者回复"接入"获取实盘白名单指南。
+                </div>
+            </div>
+        </div>
+
+        <!-- 修复点：增加 shrink-0 -->
+        <div id="chat-error" class="hidden bg-red-900/50 border-t border-red-800 text-red-200 text-xs p-2 font-mono break-all max-h-24 overflow-y-auto shrink-0"></div>
+
+        <!-- 修复点：增加 shrink-0 确保输入框永远在最底部，不会被顶飞 -->
+        <div class="p-3 border-t border-gray-800 bg-[#0a0a0c] flex items-center gap-2 shrink-0">
+            <input type="text" id="chat-input" placeholder="输入问题 / ENTER发送..." class="flex-1 bg-black border border-gray-700 rounded-lg px-3 py-2 text-white text-sm focus:outline-none focus:border-quantgreen transition-colors font-mono placeholder-gray-600" onkeypress="handleEnter(event)">
+            <button id="chat-send-btn" onclick="sendMessage()" class="bg-quantgreen text-black w-9 h-9 rounded-lg flex items-center justify-center hover:bg-green-400 transition-colors shadow-[0_0_10px_rgba(0,250,154,0.3)]">
+                <i class="fa-solid fa-paper-plane"></i>
+            </button>
+        </div>
+    </div>
+    <script>
+        // 1. 图表逻辑 (Chart.js - 样式更极客)
+        const ctx = document.getElementById('heroChart').getContext('2d');
+        const labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Now'];
+        const marketData = [0, -5, -12, -8, -18, -25, -22, -28, -33];
+        const strategyData = [0, 2, -1, 4, -2, -4, 1, -5, -6];
+
+        new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Market Benchmark',
+                        data: marketData,
+                        borderColor: '#ff3b30',
+                        borderWidth: 2,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        borderDash: [4, 4]
+                    },
+                    {
+                        label: 'Alpha Strategy',
+                        data: strategyData,
+                        borderColor: '#00fa9a',
+                        backgroundColor: (context) => {
+                            const chart = context.chart;
+                            const {ctx, chartArea} = chart;
+                            if (!chartArea) return;
+                            const gradient = ctx.createLinearGradient(0, chartArea.top, 0, chartArea.bottom);
+                            gradient.addColorStop(0, 'rgba(0, 250, 154, 0.2)');
+                            gradient.addColorStop(1, 'rgba(0, 250, 154, 0)');
+                            return gradient;
+                        },
+                        borderWidth: 3,
+                        tension: 0.4,
+                        fill: true,
+                        pointRadius: 3,
+                        pointBackgroundColor: '#050505',
+                        pointBorderColor: '#00fa9a',
+                        pointBorderWidth: 2
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    y: { grid: { color: 'rgba(255, 255, 255, 0.03)' }, ticks: { color: '#555', font: { family: 'monospace', size: 10 }, callback: v => v + '%' } },
+                    x: { grid: { display: false }, ticks: { color: '#555', font: { family: 'monospace', size: 10 } } }
+                },
+                interaction: { mode: 'index', intersect: false }
+            }
+        });
+
+        // 2. 交互式计算器逻辑
+        const slider = document.getElementById('investment-slider');
+        const displayInput = document.getElementById('investment-display');
+        const displayResult = document.getElementById('result-display');
+        const multiplier = 1 + 19.629;
+
+        const formatMoney = (num) => '$' + Math.round(num).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+
+        slider.addEventListener('input', function() {
+            const val = parseFloat(this.value);
+            displayInput.textContent = formatMoney(val);
+            displayResult.textContent = formatMoney(val * multiplier);
+        });
+
+        // 3. 一键复制微信核心逻辑 (兼容双端)
+        const targetWechat = 'yys190704';
+        const wechatModal = document.getElementById('wechatModal');
+
+        function copyWechat() {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(targetWechat).then(showWechatModal).catch(fallbackCopy);
+            } else {
+                fallbackCopy();
+            }
+        }
+
+        function fallbackCopy() {
+            let textArea = document.createElement("textarea");
+            textArea.value = targetWechat;
+            textArea.style.position = "fixed";
+            textArea.style.left = "-999999px";
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            try { document.execCommand('copy'); showWechatModal(); }
+            catch (err) { alert('复制失败，请手动添加：' + targetWechat); }
+            textArea.remove();
+        }
+
+        function showWechatModal() {
+            wechatModal.classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeModal() {
+            wechatModal.classList.add('hidden');
+            document.body.style.overflow = '';
+        }
+
+        // ==================== 4. AI 智能客服前端调用逻辑 ====================
+        const aiWidget = document.getElementById('ai-chat-widget');
+        const chatMessages = document.getElementById('chat-messages');
+        const chatInput = document.getElementById('chat-input');
+        const chatSendBtn = document.getElementById('chat-send-btn');
+        const chatError = document.getElementById('chat-error');
+
+        // 保存历史记录，保持对话上下文
+        let conversationHistory = [];
+        // 防抖：防止重复提交
+        let isGenerating = false;
+
+        function toggleChat() {
+            aiWidget.classList.toggle('hidden');
+            if (!aiWidget.classList.contains('hidden')) {
+                chatInput.focus();
+                scrollToBottom();
+            }
+        }
+
+        function handleEnter(e) {
+            if (e.key === 'Enter') sendMessage();
+        }
+
+        // 提取统一的滚动逻辑，增加小延迟确保 DOM 渲染完成
+        function scrollToBottom() {
+            setTimeout(() => {
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }, 50);
+        }
+
+        function appendMessage(role, text) {
+            const msgDiv = document.createElement('div');
+            if (role === 'user') {
+                msgDiv.className = 'flex items-start gap-2 max-w-[85%] self-end flex-row-reverse';
+                msgDiv.innerHTML = `
+                    <div class="w-6 h-6 rounded-full bg-gray-700 flex items-center justify-center text-white text-xs shrink-0 mt-1"><i class="fa-solid fa-user"></i></div>
+                    <div class="bg-gray-800 text-white p-3 rounded-tl-xl rounded-b-xl break-words">${text}</div>
+                `;
+            } else {
+                msgDiv.className = 'flex items-start gap-2 max-w-[85%]';
+
+                // 修复点：支持基础的 Markdown 换行和加粗渲染
+                let formattedText = text.replace(/\n/g, '<br>');
+                // 将 **内容** 替换为高亮的强文本
+                formattedText = formattedText.replace(/\*\*(.*?)\*\*/g, '<strong class="text-quantgreen">$1</strong>');
+
+                msgDiv.innerHTML = `
+                    <div class="w-6 h-6 rounded-full bg-quantgreen/10 border border-quantgreen/30 flex items-center justify-center text-quantgreen text-xs shrink-0 mt-1"><i class="fa-solid fa-robot"></i></div>
+                    <div class="bg-[#111] border border-gray-800 text-gray-200 p-3 rounded-tr-xl rounded-b-xl leading-relaxed break-words">
+                        ${formattedText}
+                    </div>
+                `;
+            }
+            chatMessages.appendChild(msgDiv);
+            scrollToBottom();
+        }
+
+        function showTyping() {
+            const id = 'typing-' + Date.now();
+            const msgDiv = document.createElement('div');
+            msgDiv.id = id;
+            msgDiv.className = 'flex items-start gap-2 max-w-[85%]';
+            msgDiv.innerHTML = `
+                <div class="w-6 h-6 rounded-full bg-quantgreen/10 border border-quantgreen/30 flex items-center justify-center text-quantgreen text-xs shrink-0 mt-1"><i class="fa-solid fa-robot"></i></div>
+                <div class="bg-[#111] border border-gray-800 text-quantgreen p-3 rounded-tr-xl rounded-b-xl typing-indicator h-[46px] flex items-center">
+                    <span></span><span></span><span></span>
+                </div>
+            `;
+            chatMessages.appendChild(msgDiv);
+            scrollToBottom();
+            return id;
+        }
+
+        function showError(msg) {
+            chatError.innerHTML = `<i class="fa-solid fa-triangle-exclamation mr-1"></i> [系统错误]: ${msg}`;
+            chatError.classList.remove('hidden');
+            setTimeout(() => { chatError.classList.add('hidden'); }, 10000); // 10秒后自动隐藏错误
+            scrollToBottom();
+        }
+
+        async function sendMessage() {
+            // 防止重复发送
+            if (isGenerating) return;
+
+            const text = chatInput.value.trim();
+            if (!text) return;
+
+            // 锁定状态
+            isGenerating = true;
+            chatInput.disabled = true;
+            chatSendBtn.disabled = true;
+
+            // 1. 渲染用户消息
+            appendMessage('user', text);
+            chatInput.value = '';
+            chatError.classList.add('hidden'); // 清除之前的报错
+
+            // 2. 记录到上下文
+            conversationHistory.push({ role: 'user', parts: [{ text: text }] });
+
+            // 3. 显示加载动画
+            const typingId = showTyping();
+
+            // 4. 发起 API 请求
+            try {
+                // 严密防漏的 System Prompt
+                const systemInstruction = `你是 Alpha Momentum 量化节点的官方极客客服。
+你的核心任务是：解答关于本量化节点的基础问题，并强烈引导用户添加微信 (yys190704) 获取 Binance 实盘白名单。
+
+【绝对禁忌】：
+1. 严禁提供任何具体的投资建议、币种推荐或行情预测。如果问及，回复：'受限于风控协议，我们不提供主观预测，一切交由黑盒引擎处理。'
+2. 严禁承认自己是通用的 AI，必须保持'Alpha Momentum 专属智能中枢'的人设。
+3. 严禁回答与本量化策略、加密货币、Binance 接入无关的闲聊话题（如天气、写代码、菜谱等），必须礼貌拒绝并拉回主题。
+
+【知识库】：
+- 核心优势：截面动量算法，跑赢大盘 27%，2021年绝对收益+1962.9%。
+- 接入方式：纯信号 API 发射，资金在用户自己 Binance 账户，0%资金盘风险。
+- 门槛：防滑点测试母金为 $500 USDT。
+
+【语气风格】：
+专业、高冷、克制、极客风。尽量简短直接，避免冗长废话。`;
+
+                // 注意：这里使用的是 REST API 形式。实际生产中，请将此请求放到后端！
+                const API_KEY = "AIzaSyArY80cWaQ-7pdwk6S75brR1tOQG8ThAr4";
+                // 由于标准模型调用限制，这里映射为 gemini-1.5-flash 保证稳定响应
+                const model = "gemini-3.1-flash-lite";
+                const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
+
+                const payload = {
+                    system_instruction: {
+                        parts: [{ text: systemInstruction }]
+                    },
+                    contents: conversationHistory,
+                    generationConfig: {
+                        temperature: 0.1, // 降低温度，让回答更稳定严谨
+                        topK: 40,
+                        topP: 0.95,
+                        thinkingConfig: {
+                            thinkingLevel: "HIGH"
+                        }
+                    }
+                };
+
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) {
+                    const errData = await response.json();
+                    throw new Error(errData.error?.message || `HTTP Error ${response.status}`);
+                }
+
+                const data = await response.json();
+
+                // 移除打字动画
+                document.getElementById(typingId).remove();
+
+                // 获取并渲染回复
+                if (data.candidates && data.candidates[0].content.parts.length > 0) {
+                    const aiText = data.candidates[0].content.parts[0].text;
+                    appendMessage('model', aiText);
+                    // 保存 AI 回复到上下文，形成真实的记忆链条
+                    conversationHistory.push({ role: 'model', parts: [{ text: aiText }] });
+                } else {
+                    throw new Error("模型返回的数据结构异常或为空。");
+                }
+
+            } catch (error) {
+                // 移除打字动画并明确抛出报错到前端界面
+                const typingElement = document.getElementById(typingId);
+                if (typingElement) typingElement.remove();
+
+                showError(error.message);
+                console.error("AI Request Error:", error);
+            } finally {
+                // 解除锁定并恢复焦点
+                isGenerating = false;
+                chatInput.disabled = false;
+                chatSendBtn.disabled = false;
+                setTimeout(() => chatInput.focus(), 50);
+            }
+        }
+    </script>
+</body>
+</html>
