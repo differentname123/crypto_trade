@@ -8,10 +8,25 @@ IPv4 43.131.225.155
 
 加密服务运维：
 
+网页服务：
+配置文件：
+/etc/systemd/system/alpha-web.service
+运行状态：
+systemctl status alpha-web
+实时日志：
+journalctl -u alpha-web -f
+重启：
+systemctl restart alpha-web
 
+关闭：
+systemctl stop alpha-web
 
 # 激活环境
 source venv/bin/activate
+
+自动交易机器人：
+配置文件：
+/etc/systemd/system/binance-trade.service
 
 ### 1. 查看实时日志（看脚本输出）
 
