@@ -198,8 +198,8 @@ def fetch_binance_1s_klines_by_time(symbol="BTCUSDT", start_time='2026-04-26 14:
 if __name__ == "__main__":
     # 调用封装好的函数
     # 请根据您的实际需求修改时间和币种
-    target_start = '2026-01-01 00:00:00'
-    target_end = '2026-06-03 00:00:00'
+    target_start = '2026-06-01 00:00:00'
+    target_end = '2026-06-06 00:00:00'
 
     df_result = fetch_binance_1s_klines_by_time(
         symbol="BTCUSDT",
