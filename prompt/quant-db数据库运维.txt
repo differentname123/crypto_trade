@@ -1,0 +1,23 @@
+1. 检查 K 线缓存的健康度（数据泵是否工作）
+这条语句能让你直观地看到每个币种目前缓存了多大的数据，以及最后一次拉取数据是什么时候：
+SELECT SUBSTR(symbol, 1, INSTR(symbol || '_', '_') - 1) AS 交易对, SUM(json_array_length(data)) AS K线总数量, SUM(length(data)) AS 总存储占用_字节, datetime(MIN(json_extract(data, '$[0][0]')) / 1000, 'unixepoch', 'localtime') AS 起始K线时间, datetime(MAX(last_updated) / 1000, 'unixepoch', 'localtime') AS 最新K线时间, COUNT(*) AS 数据库分块包裹数 FROM kline_cache GROUP BY SUBSTR(symbol, 1, INSTR(symbol || '_', '_') - 1) ORDER BY 总存储占用_字节 DESC;
+
+2. 统计推演信号的总量与分布
+查看系统运行至今，一共产生了多少条开平仓指令，以及各个币种的活跃度：
+SELECT
+    coin AS 币种,
+    action AS 动作,
+    COUNT(*) AS 触发次数
+FROM live_simulation_logs
+GROUP BY coin, action;
+
+
+
+
+3. 抽查最新的 5 条交易流水:
+SELECT * FROM live_simulation_logs ORDER BY time DESC LIMIT 5;
+
+4. 一键清空所有历史交易流水（洗盘重启）:
+DELETE FROM live_simulation_logs;
+-- 清空后重置自增 ID，保持洁癖
+UPDATE sqlite_sequence SET seq = 0 WHERE name = 'live_simulation_logs';
