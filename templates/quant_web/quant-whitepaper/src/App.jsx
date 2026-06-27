@@ -256,66 +256,184 @@ const Finale=()=>{
   const feats=['不预测市场，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
   const TH=[0.12,0.30,0.48,0.66,0.84];
   const [progress,setProgress]=useState(0),[holding,setHolding]=useState(false),[done,setDone]=useState(false),[val,setVal]=useState(0);
+
+  // 新增 ref 用于解耦 60fps 的 React 渲染
   const pRef=useRef(0),mode=useRef('idle'),raf=useRef(0),last=useRef(0);
-  const setP=v=>{pRef.current=v;setProgress(v);};
-  const loop=now=>{
-    const dt=now-last.current; last.current=now;
-    if(mode.current==='fill'){let p=pRef.current+dt/HOLD; if(p>=1){setP(1);mode.current='idle';setHolding(false);setDone(true);return;} setP(p);raf.current=requestAnimationFrame(loop);}
-    else if(mode.current==='decay'){let p=pRef.current-dt/500; if(p<=0){setP(0);mode.current='idle';return;} setP(p);raf.current=requestAnimationFrame(loop);}
+  const progressSpanRef = useRef(null);
+  const buttonRef = useRef(null);
+
+  const loop = now => {
+    const dt = now - last.current; last.current = now;
+    if (mode.current === 'fill') {
+      let p = pRef.current + dt / HOLD;
+
+      if (p >= 1) {
+        pRef.current = 1;
+        setProgress(1); // 结束时统一同步状态
+        if (progressSpanRef.current) progressSpanRef.current.style.width = '100%';
+        if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 35px rgba(52,224,161,0.35)`;
+        mode.current = 'idle';
+        setHolding(false);
+        setDone(true);
+        return;
+      }
+
+      // 仅在跨越检查点时更新 React 状态 (用于打钩动画)，其余时间纯 DOM 渲染以防卡顿
+      const oldRevealed = TH.filter(t => pRef.current >= t).length;
+      const newRevealed = TH.filter(t => p >= t).length;
+      if (newRevealed !== oldRevealed) setProgress(p);
+
+      pRef.current = p;
+      // 直接修改 DOM，绕过 React diff 机制，实现丝滑 60fps 且不卡主线程
+      if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
+      if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
+
+      raf.current = requestAnimationFrame(loop);
+
+    } else if (mode.current === 'decay') {
+      let p = pRef.current - dt / 500;
+
+      if (p <= 0) {
+        pRef.current = 0;
+        setProgress(0);
+        if (progressSpanRef.current) progressSpanRef.current.style.width = '0%';
+        if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 15px rgba(52,224,161,0.15)`;
+        mode.current = 'idle';
+        return;
+      }
+
+      const oldRevealed = TH.filter(t => pRef.current >= t).length;
+      const newRevealed = TH.filter(t => p >= t).length;
+      if (newRevealed !== oldRevealed) setProgress(p);
+
+      pRef.current = p;
+      if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
+      if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
+
+      raf.current = requestAnimationFrame(loop);
+    }
   };
-  const start=()=>{if(done)return;mode.current='fill';last.current=performance.now();cancelAnimationFrame(raf.current);raf.current=requestAnimationFrame(loop);setHolding(true);};
-  const end=()=>{if(done||mode.current!=='fill')return;setHolding(false);mode.current='decay';last.current=performance.now();cancelAnimationFrame(raf.current);raf.current=requestAnimationFrame(loop);};
+
+  const start=(e)=>{
+    if(done)return;
+    // 捕获指针焦点：手指轻微滑出边界也能锁定事件
+    if (e && e.pointerId !== undefined && e.target.setPointerCapture) {
+      try { e.target.setPointerCapture(e.pointerId); } catch(err){}
+    }
+    mode.current='fill';
+    last.current=performance.now();
+    cancelAnimationFrame(raf.current);
+    raf.current=requestAnimationFrame(loop);
+    setHolding(true);
+  };
+
+  const end=(e)=>{
+    // 释放指针焦点
+    if (e && e.pointerId !== undefined && e.target.releasePointerCapture) {
+      try { e.target.releasePointerCapture(e.pointerId); } catch(err){}
+    }
+    if(done||mode.current!=='fill')return;
+    setHolding(false);
+    mode.current='decay';
+    last.current=performance.now();
+    cancelAnimationFrame(raf.current);
+    raf.current=requestAnimationFrame(loop);
+  };
+
   useEffect(()=>()=>cancelAnimationFrame(raf.current),[]);
   useEffect(()=>{if(!done)return;let r;const s=performance.now();const t=now=>{const k=Math.min(1,(now-s)/3000);setVal(1962.9*(1-Math.pow(1-k,3)));if(k<1)r=requestAnimationFrame(t);};r=requestAnimationFrame(t);return()=>cancelAnimationFrame(r);},[done]);
-  const reset=()=>{setDone(false);setP(0);setVal(0);mode.current='idle';};
+  const reset=()=>{setDone(false);pRef.current=0;setProgress(0);setVal(0);mode.current='idle';};
+
   const revealed=TH.filter(t=>progress>=t).length;
   const eq=[[8,152],[28,150],[48,146],[68,149],[90,140],[110,143],[132,132],[154,135],[176,120],[198,123],[220,104],[242,100],[262,78],[282,58],[300,38],[314,22]];
+
   return(
     <section className="relative flex min-h-screen flex-col justify-center py-24">
       {done&&<div className="pointer-events-none fixed inset-0" style={{background:'radial-gradient(circle at 50% 40%, rgba(52,224,161,0.10), transparent 60%)'}}/>}
       <AnimatePresence mode="wait">
       {!done?(
-        <motion.div key="pre" exit={{opacity:0,scale:0.96}} transition={{duration:0.5}} className="flex flex-col items-center text-center">
-          <Reveal><p style={{fontFamily:SERIF,color:TXT}} className="text-3xl font-semibold leading-snug">五条法则，<br/>一条曲线。</p></Reveal>
-          <Reveal delay={0.1}><p style={{color:DIM}} className="mt-4 text-sm leading-relaxed">理念已尽数陈述。<br/>现在，按住下方，见证它穿越牛熊的威力。</p></Reveal>
-          <div className="mt-8 mb-8 flex w-full flex-col gap-2.5">
-            {feats.map((f,i)=>(
-              <motion.div key={i} animate={{opacity:i<revealed?1:0.18}} transition={{duration:0.4}}
-                className="flex items-center gap-3 rounded-xl border px-4 py-2.5"
-                style={{borderColor:i<revealed?'rgba(52,224,161,0.3)':HAIR,background:i<revealed?'rgba(52,224,161,0.06)':'transparent'}}>
-                <motion.span animate={{scale:i<revealed?1:0.6}} className="flex h-5 w-5 items-center justify-center rounded-full"
-                  style={{background:i<revealed?GREEN:'transparent',border:i<revealed?'none':`1px solid ${HAIR}`}}>
-                  {i<revealed&&<Check size={13} color={INK} strokeWidth={3}/>}
-                </motion.span>
-                <span style={{color:i<revealed?TXT:DIM}} className="text-sm font-medium">{f}</span>
-              </motion.div>
-            ))}
-          </div>
-          <button onPointerDown={start} onPointerUp={end} onPointerLeave={end} onPointerCancel={end} onContextMenu={e=>e.preventDefault()}
-            style={{touchAction:'none',userSelect:'none',WebkitUserSelect:'none',borderColor:GREEN,boxShadow:`0 0 ${20+progress*40}px rgba(52,224,161,${0.15+progress*0.4})`}}
-            className="relative w-full overflow-hidden rounded-full border-2 px-6 py-4 transition-transform active:scale-95">
-            <span className="absolute inset-y-0 left-0" style={{width:`${progress*100}%`,background:'rgba(52,224,161,0.22)'}}/>
-            <span className="relative flex items-center justify-center gap-2" style={{color:GREEN}}>
+          <motion.div key="pre" exit={{opacity: 0, scale: 0.96}} transition={{duration: 0.5}}
+                      className="flex flex-col items-center text-center">
+              <Reveal><p style={{fontFamily: SERIF, color: TXT}} className="text-3xl font-semibold leading-snug">五条法则，<br/>一条曲线。
+              </p></Reveal>
+              <Reveal delay={0.1}><p style={{color: DIM}} className="mt-4 text-sm leading-relaxed">理念已尽数陈述。<br/>现在，按住下方，见证它穿越牛熊的威力。
+              </p></Reveal>
+              <div className="mt-8 mb-8 flex w-full flex-col gap-2.5">
+                  {feats.map((f, i) => (
+                      <motion.div key={i} animate={{opacity: i < revealed ? 1 : 0.18}} transition={{duration: 0.4}}
+                                  className="flex items-center gap-3 rounded-xl border px-4 py-2.5"
+                                  style={{
+                                      borderColor: i < revealed ? 'rgba(52,224,161,0.3)' : HAIR,
+                                      background: i < revealed ? 'rgba(52,224,161,0.06)' : 'transparent'
+                                  }}>
+                          <motion.span animate={{scale: i < revealed ? 1 : 0.6}}
+                                       className="flex h-5 w-5 items-center justify-center rounded-full"
+                                       style={{
+                                           background: i < revealed ? GREEN : 'transparent',
+                                           border: i < revealed ? 'none' : `1px solid ${HAIR}`
+                                       }}>
+                              {i < revealed && <Check size={13} color={INK} strokeWidth={3}/>}
+                          </motion.span>
+                          <span style={{color: i < revealed ? TXT : DIM}} className="text-sm font-medium">{f}</span>
+                      </motion.div>
+                  ))}
+              </div>
+              <button onPointerDown={start} onPointerUp={end} onPointerLeave={end} onPointerCancel={end}
+                      onContextMenu={e => e.preventDefault()}
+                      onTouchStart={e => e.preventDefault()} /* 重点：拦截微信底层 touch 识别 */
+                      ref={buttonRef}
+                      style={{
+                          touchAction: 'none',
+                          userSelect: 'none',
+                          WebkitUserSelect: 'none',
+                          WebkitTouchCallout: 'none', /* 重点：禁止 iOS 微信长按菜单 */
+                          WebkitTapHighlightColor: 'transparent',
+                          borderColor: GREEN,
+                          transform: 'translateZ(0)',
+                          boxShadow: `0 0 ${15 + pRef.current * 20}px rgba(52,224,161,${0.15 + pRef.current * 0.2})`
+                      }}
+                      className="relative w-full overflow-hidden rounded-full border-2 px-6 py-4">
+
+                  {/* 移除 transition，直接靠 DOM 帧级刷新保证绝对平滑 */}
+                  <span ref={progressSpanRef} className="absolute inset-y-0 left-0" style={{
+                      width: `${pRef.current * 100}%`,
+                      background: 'rgba(52,224,161,0.22)'
+                  }}/>
+
+                  <span className="relative flex items-center justify-center gap-2"
+                        style={{color: GREEN, transform: 'translateZ(0)'}}>
               <Fingerprint size={18}/>
-              <span className="text-base font-semibold tracking-wide">{holding?'持续按住…':'按住 · 见识穿越牛熊的威力'}</span>
+              <span
+                  className="text-base font-semibold tracking-wide">{holding ? '持续按住…' : '按住 · 见识穿越牛熊的威力'}</span>
             </span>
-          </button>
-          <motion.p animate={{opacity:holding?0.4:0.7}} style={{fontFamily:MONO,color:DIM}} className="mt-4 text-xs tracking-widest">
-            {holding?'LOADING ···':'PRESS & HOLD · 长按解锁'}</motion.p>
-        </motion.div>
-      ):(
-        <motion.div key="post" initial={{opacity:0,scale:0.96}} animate={{opacity:1,scale:1}} transition={{duration:0.6,ease:EASE}}>
-          <p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-widest uppercase">Cumulative Return · 累计收益率 · 回测</p>
-          <div className="mt-2 flex items-end gap-1">
-            <span style={{fontFamily:MONO,color:GOLD}} className="text-2xl font-bold">+</span>
-            <span style={{fontFamily:MONO,color:GOLD,textShadow:'0 0 40px rgba(231,200,132,0.4)'}} className="text-6xl font-bold tracking-tight tabular-nums">{val.toFixed(1)}</span>
-            <span style={{fontFamily:MONO,color:GOLD}} className="mb-2 text-3xl font-bold">%</span>
-          </div>
-          <div className="mt-6 rounded-2xl border p-4" style={{borderColor:HAIR,background:'linear-gradient(180deg,#0F151E,#0B1118)'}}>
-            <svg viewBox="0 0 320 170" className="w-full h-44">
-              <defs><linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={GREEN} stopOpacity="0.3"/><stop offset="100%" stopColor={GREEN} stopOpacity="0"/></linearGradient></defs>
-              <motion.path d={area(eq,160)} fill="url(#eqg)" initial={{opacity:0}} animate={{opacity:1}} transition={{duration:2,delay:0.4}}/>
-              <motion.path d={smooth(eq)} fill="none" stroke={GREEN} strokeWidth="2.6" strokeLinecap="round" initial={{pathLength:0}} animate={{pathLength:1}} transition={{duration:3,ease:'easeOut'}}/>
+              </button>
+              <motion.p animate={{opacity: holding ? 0.4 : 0.7}} style={{fontFamily: MONO, color: DIM}}
+                        className="mt-4 text-xs tracking-widest">
+                  {holding ? 'LOADING ···' : 'PRESS & HOLD · 长按解锁'}</motion.p>
+          </motion.div>
+      ) : (
+          <motion.div key="post" initial={{opacity: 0, scale: 0.96}} animate={{opacity: 1, scale: 1}}
+                      transition={{duration: 0.6, ease: EASE}}>
+              <p style={{fontFamily: MONO, color: DIM}} className="text-xs tracking-widest uppercase">Cumulative Return
+                  · 累计收益率 · 回测</p>
+              <div className="mt-2 flex items-end gap-1">
+                  <span style={{fontFamily: MONO, color: GOLD}} className="text-2xl font-bold">+</span>
+                  <span style={{fontFamily: MONO, color: GOLD, textShadow: '0 0 40px rgba(231,200,132,0.4)'}}
+                        className="text-6xl font-bold tracking-tight tabular-nums">{val.toFixed(1)}</span>
+                  <span style={{fontFamily: MONO, color: GOLD}} className="mb-2 text-3xl font-bold">%</span>
+              </div>
+              <div className="mt-6 rounded-2xl border p-4"
+                   style={{borderColor: HAIR, background: 'linear-gradient(180deg,#0F151E,#0B1118)'}}>
+                  <svg viewBox="0 0 320 170" className="w-full h-44">
+                      <defs>
+                          <linearGradient id="eqg" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="0%" stopColor={GREEN} stopOpacity="0.3"/>
+                              <stop offset="100%" stopColor={GREEN} stopOpacity="0"/>
+                          </linearGradient>
+                      </defs>
+                      <motion.path d={area(eq, 160)} fill="url(#eqg)" initial={{opacity: 0}} animate={{opacity: 1}}
+                                   transition={{duration: 2, delay: 0.4}}/>
+                      <motion.path d={smooth(eq)} fill="none" stroke={GREEN} strokeWidth="2.6" strokeLinecap="round" initial={{pathLength:0}} animate={{pathLength:1}} transition={{duration:3,ease:'easeOut'}}/>
               <line x1="6" y1="160" x2="314" y2="160" stroke={HAIR}/>
             </svg>
           </div>
@@ -368,7 +486,7 @@ export default function App(){
           body={<>决定盈亏的，是赢与亏的<span style={{color:TXT}}>倍数</span>，不是赢与亏的次数。亏损次数可以更多，只要每次都小；盈利次数可以更少，只要足够大。</>}
           quote="截断亏损，让利润奔跑。" strategy="亏有底线，赢无上限。"
           chartLabel="RISK / REWARD · 盈亏天平"
-          caption={<>亏损 · 多而小 · <span style={{color:GREEN}}>有底线</span>　｜　盈利 · 少而大 · <span style={{color:GREEN}}>无上限</span>。天平，终究倒向盈利。</>}>
+          caption={<>亏损 · 多而小 · <span style={{color:GREEN}}>有底线</span> ｜ 盈利 · 少而大 · <span style={{color:GREEN}}>无上限</span>。天平，终究倒向盈利。</>}>
           <BalanceScale/>
         </Principle>
         <Principle idx="04" zh="穿越牛熊" en="All-Weather"
