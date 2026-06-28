@@ -18,12 +18,13 @@ const Reveal=({children,delay=0,y=24,className=''})=>(
     viewport={{once:true,amount:0.35}} transition={{duration:0.8,delay,ease:EASE}}>{children}</motion.div>
 );
 
-const SectionLabel=({idx,zh,en})=>(
+const SectionLabel=({idx,zh})=>(
   <Reveal>
     <div className="flex items-center gap-3">
       <span style={{fontFamily:MONO,color:GREEN}} className="text-sm font-medium">{idx}</span>
       <span className="h-px w-10" style={{background:`linear-gradient(90deg,${GREEN},transparent)`}}/>
-      <span style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-widest uppercase">{zh} · {en}</span>
+      {/* 移除英文翻译，仅保留代表动作的中文小标题，并将字体调大更加醒目 */}
+      <span style={{fontFamily:MONO,color:TXT}} className="text-base font-semibold tracking-widest">{zh}</span>
     </div>
   </Reveal>
 );
@@ -228,24 +229,29 @@ const ScrollBar=()=>{
   return <motion.div className="fixed left-0 top-0 z-50 h-0.5 w-full" style={{scaleX:scrollYProgress,transformOrigin:'0%',background:GREEN}}/>;
 };
 
-// HERO：宣告式标题 + 一句论点 + 滚动提示。金色「大胜」与结尾战绩首尾呼应
+// HERO：宣告式标题 + 一句论点 + 滚动提示。
 const Hero=()=>(
   <section className="relative flex min-h-screen flex-col justify-center py-24">
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
       <path d={poly([[0,180],[60,170],[60,150],[120,140],[120,120],[190,110],[190,86],[255,74],[255,50],[320,36]])} fill="none" stroke={GREEN} strokeWidth="1.5"/>
     </svg>
-    <motion.div initial={{opacity:0,y:16}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:EASE}}
-      style={{fontFamily:MONO,color:DIM}} className="mb-12 flex items-center gap-2 text-xs tracking-widest">
-      <span className="inline-block h-1.5 w-1.5 rounded-full" style={{background:GREEN}}/> ALPHA RESEARCH · 量化策略白皮书
-    </motion.div>
+
+    {/* 增加引子，取代原本特别小的废话字，并突出“赚钱” */}
+    <motion.h2 initial={{opacity:0,y:16}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:EASE}}
+      style={{fontFamily:SERIF,color:TXT}} className="mb-8 text-3xl font-medium tracking-wide">
+      怎样才能<span style={{color:GOLD, textShadow:'0 0 20px rgba(231,200,132,0.4)'}}>赚钱</span>？
+    </motion.h2>
+
     <motion.h1 initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.15,ease:EASE}}
       style={{fontFamily:SERIF,color:TXT}} className="text-5xl font-semibold leading-tight tracking-wide">
       不求常胜，<br/>但求<span style={{color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.35)'}}>大胜</span>。
     </motion.h1>
+
     <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.5,ease:EASE}}
       style={{color:DIM}} className="mt-8 text-lg leading-relaxed">
       穿越牛熊的，不是<span style={{color:TXT}}>预测</span>，是<span style={{color:GREEN}}>结构</span>。
     </motion.p>
+
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:1.2,duration:1}}
       className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1" style={{color:DIM}}>
       <motion.div animate={{y:[0,6,0]}} transition={{repeat:Infinity,duration:1.8}}><ChevronsDown size={18}/></motion.div>
@@ -255,19 +261,20 @@ const Hero=()=>(
 );
 
 // PRINCIPLE：每屏只有 洞察(金句) → 证据(图表) → 行动(本策略) 三个层级
-const Principle=({idx,zh,en,maxim,takeaway,children})=>(
+const Principle=({idx,zh,maxim,takeaway,children})=>(
   <section className="flex min-h-screen flex-col justify-center py-24">
-    <SectionLabel idx={idx} zh={zh} en={en}/>
+    <SectionLabel idx={idx} zh={zh}/>
     <Reveal delay={0.05}>
       <h2 style={{fontFamily:SERIF,color:TXT}} className="mt-7 text-3xl font-semibold leading-snug tracking-wide">{maxim}</h2>
     </Reveal>
     <ChartFrame>{children}</ChartFrame>
     <Reveal delay={0.1}>
-      <div className="mt-7 inline-flex items-center gap-3 rounded-full px-4 py-2.5"
-        style={{background:'rgba(52,224,161,0.08)'}}>
-        <span style={{fontFamily:MONO,color:GREEN}} className="text-xs font-semibold tracking-wider">本策略</span>
-        <span className="h-3 w-px" style={{background:'rgba(52,224,161,0.4)'}}/>
-        <span style={{color:TXT}} className="text-sm font-medium">{takeaway}</span>
+      {/* 调整 "本策略" 后面的内容，让其更加突出显眼 */}
+      <div className="mt-7 inline-flex items-center gap-3 rounded-full px-5 py-3"
+        style={{background:'rgba(52,224,161,0.08)', border: '1px solid rgba(52,224,161,0.2)'}}>
+        <span style={{fontFamily:MONO,color:GREEN}} className="text-sm font-semibold tracking-wider">本策略</span>
+        <span className="h-4 w-px" style={{background:'rgba(52,224,161,0.4)'}}/>
+        <span style={{color:GOLD, textShadow:'0 0 10px rgba(231,200,132,0.3)'}} className="text-lg font-bold tracking-wide">{takeaway}</span>
       </div>
     </Reveal>
   </section>
@@ -435,7 +442,7 @@ const Finale=()=>{
                         style={{color: GREEN, transform: 'translateZ(0)'}}>
               <Fingerprint size={18}/>
               <span
-                  className="text-base font-semibold tracking-wide">{holding ? '正在揭晓…' : '按住不放 · 揭晓战绩'}</span>
+                  className="text-base font-semibold tracking-wide">{holding ? '正在揭晓…' : '按住不放 · 见证穿越牛熊的威力'}</span>
             </span>
               </button>
               <motion.p animate={{opacity: holding ? 0.4 : 0.7}} style={{fontFamily: MONO, color: DIM}}
@@ -575,22 +582,22 @@ export default function App(){
       <ScrollBar/>
       <div className="relative z-10 mx-auto w-full max-w-md px-6">
         <Hero/>
-        <Principle idx="01" zh="不可预测" en="Unpredictable"
+        <Principle idx="01" zh="捕捉趋势"
           maxim="市场不可预测，规则方可长青。"
           takeaway="不预测，只跟随趋势">
           <MartingaleChart/>
         </Principle>
-        <Principle idx="02" zh="先求不死" en="Survival"
+        <Principle idx="02" zh="控制回撤"
           maxim="先求不死，再求大胜。"
           takeaway="回撤可控，绝不致命">
           <RecoveryChart/>
         </Principle>
-        <Principle idx="03" zh="非对称" en="Asymmetry"
+        <Principle idx="03" zh="及时止损"
           maxim="截断亏损，让利润奔跑。"
           takeaway="亏有底线，赢无上限">
           <BalanceScale/>
         </Principle>
-        <Principle idx="04" zh="穿越牛熊" en="All-Weather"
+        <Principle idx="04" zh="穿越牛熊"
           maxim="牛市决定收益，熊市决定复利。"
           takeaway="熊市不亏，牛市起飞">
           <div className="flex flex-col gap-4">
@@ -612,7 +619,7 @@ export default function App(){
             </div>
           </div>
         </Principle>
-        <Principle idx="05" zh="系统驱动" en="Systematic"
+        <Principle idx="05" zh="系统驱动"
           maxim="把交易交给系统，把情绪踢出局。"
           takeaway="规则驱动，透明可验">
           <SystematicChart/>
