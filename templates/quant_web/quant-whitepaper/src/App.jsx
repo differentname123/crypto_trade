@@ -28,37 +28,12 @@ const SectionLabel=({idx,zh,en})=>(
   </Reveal>
 );
 
-const GoldenQuote=({children})=>(
-  <Reveal delay={0.05}>
-    <div className="mt-6 flex gap-3">
-      <span className="w-0.5 rounded-full" style={{background:`linear-gradient(${GOLD},transparent)`}}/>
-      <div>
-        <div style={{fontFamily:MONO,color:GOLD}} className="mb-1 text-xs tracking-widest opacity-70">金句 · MAXIM</div>
-        <p style={{fontFamily:SERIF,color:GOLD,textShadow:'0 0 24px rgba(231,200,132,0.25)'}}
-          className="text-2xl font-medium leading-snug tracking-wide">{children}</p>
-      </div>
-    </div>
-  </Reveal>
-);
-
-const StrategyTag=({children})=>(
-  <Reveal delay={0.1}>
-    <div className="mt-6 inline-flex items-center gap-2.5 rounded-full border px-4 py-2.5"
-      style={{borderColor:'rgba(52,224,161,0.28)',background:'rgba(52,224,161,0.06)'}}>
-      <span style={{fontFamily:MONO,color:GREEN}} className="text-xs font-semibold tracking-wider">本策略</span>
-      <span className="h-3 w-px" style={{background:'rgba(52,224,161,0.4)'}}/>
-      <span style={{color:TXT}} className="text-sm font-medium">{children}</span>
-    </div>
-  </Reveal>
-);
-
-const ChartFrame=({label,caption,children})=>(
+// 图表容器：去掉冗余标题与注解，让图表自己说话
+const ChartFrame=({children})=>(
   <Reveal delay={0.12}>
     <figure className="mt-8 overflow-hidden rounded-2xl border p-4"
       style={{borderColor:HAIR,background:'linear-gradient(180deg,#0F151E,#0B1118)'}}>
-      {label&&<figcaption style={{fontFamily:MONO,color:DIM}} className="mb-2 text-xs tracking-wider">{label}</figcaption>}
       {children}
-      {caption&&<div style={{color:DIM}} className="mt-3 text-xs leading-relaxed">{caption}</div>}
     </figure>
   </Reveal>
 );
@@ -253,27 +228,24 @@ const ScrollBar=()=>{
   return <motion.div className="fixed left-0 top-0 z-50 h-0.5 w-full" style={{scaleX:scrollYProgress,transformOrigin:'0%',background:GREEN}}/>;
 };
 
+// HERO：宣告式标题 + 一句论点 + 滚动提示。金色「大胜」与结尾战绩首尾呼应
 const Hero=()=>(
   <section className="relative flex min-h-screen flex-col justify-center py-24">
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
       <path d={poly([[0,180],[60,170],[60,150],[120,140],[120,120],[190,110],[190,86],[255,74],[255,50],[320,36]])} fill="none" stroke={GREEN} strokeWidth="1.5"/>
     </svg>
     <motion.div initial={{opacity:0,y:16}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:EASE}}
-      style={{fontFamily:MONO,color:DIM}} className="mb-10 flex items-center gap-2 text-xs tracking-widest">
+      style={{fontFamily:MONO,color:DIM}} className="mb-12 flex items-center gap-2 text-xs tracking-widest">
       <span className="inline-block h-1.5 w-1.5 rounded-full" style={{background:GREEN}}/> ALPHA RESEARCH · 量化策略白皮书
     </motion.div>
     <motion.h1 initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.15,ease:EASE}}
-      style={{fontFamily:SERIF,color:TXT}} className="text-4xl font-semibold leading-tight tracking-wide">
-      在市场中，<br/>真正能<span style={{color:GREEN}}>赚钱</span>的<br/>策略是什么？
+      style={{fontFamily:SERIF,color:TXT}} className="text-5xl font-semibold leading-tight tracking-wide">
+      不求常胜，<br/>但求<span style={{color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.35)'}}>大胜</span>。
     </motion.h1>
-    <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.4,ease:EASE}}
-      style={{color:DIM}} className="mt-7 text-base leading-relaxed">
-      穿越周期的，从来不是预测的<span style={{color:TXT}}>胜率</span>，而是盈亏的<span style={{color:TXT}}>非对称结构</span>。
+    <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.5,ease:EASE}}
+      style={{color:DIM}} className="mt-8 text-lg leading-relaxed">
+      穿越牛熊的，不是<span style={{color:TXT}}>预测</span>，是<span style={{color:GREEN}}>结构</span>。
     </motion.p>
-    <motion.div initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.65,ease:EASE}} className="mt-10">
-      <p style={{fontFamily:SERIF,color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.3)'}} className="text-3xl font-semibold tracking-wide">不求常胜，但求大胜。</p>
-      <p style={{fontFamily:MONO,color:DIM}} className="mt-4 text-sm tracking-widest uppercase">Structure over Prediction</p>
-    </motion.div>
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:1.2,duration:1}}
       className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1" style={{color:DIM}}>
       <motion.div animate={{y:[0,6,0]}} transition={{repeat:Infinity,duration:1.8}}><ChevronsDown size={18}/></motion.div>
@@ -282,13 +254,22 @@ const Hero=()=>(
   </section>
 );
 
-const Principle=({idx,zh,en,body,quote,strategy,caption,chartLabel,children})=>(
+// PRINCIPLE：每屏只有 洞察(金句) → 证据(图表) → 行动(本策略) 三个层级
+const Principle=({idx,zh,en,maxim,takeaway,children})=>(
   <section className="flex min-h-screen flex-col justify-center py-24">
     <SectionLabel idx={idx} zh={zh} en={en}/>
-    <Reveal delay={0.05}><p style={{color:BODY}} className="mt-7 text-xl font-light leading-relaxed">{body}</p></Reveal>
-    <GoldenQuote>{quote}</GoldenQuote>
-    <StrategyTag>{strategy}</StrategyTag>
-    <ChartFrame label={chartLabel} caption={caption}>{children}</ChartFrame>
+    <Reveal delay={0.05}>
+      <h2 style={{fontFamily:SERIF,color:TXT}} className="mt-7 text-3xl font-semibold leading-snug tracking-wide">{maxim}</h2>
+    </Reveal>
+    <ChartFrame>{children}</ChartFrame>
+    <Reveal delay={0.1}>
+      <div className="mt-7 inline-flex items-center gap-3 rounded-full px-4 py-2.5"
+        style={{background:'rgba(52,224,161,0.08)'}}>
+        <span style={{fontFamily:MONO,color:GREEN}} className="text-xs font-semibold tracking-wider">本策略</span>
+        <span className="h-3 w-px" style={{background:'rgba(52,224,161,0.4)'}}/>
+        <span style={{color:TXT}} className="text-sm font-medium">{takeaway}</span>
+      </div>
+    </Reveal>
   </section>
 );
 
@@ -300,7 +281,7 @@ const WeChatIcon = ({ size = 24, className = "" }) => (
 
 const Finale=()=>{
   const HOLD=2400;
-  const feats=['不预测市场，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
+  const feats=['不预测，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
   const TH=[0.12,0.30,0.48,0.66,0.84];
   const [progress,setProgress]=useState(0),
         [holding,setHolding]=useState(false),
@@ -405,9 +386,9 @@ const Finale=()=>{
       {!done?(
           <motion.div key="pre" exit={{opacity: 0, scale: 0.96}} transition={{duration: 0.5}}
                       className="flex flex-col items-center text-center">
-              <Reveal><p style={{fontFamily: SERIF, color: TXT}} className="text-3xl font-semibold leading-snug">五条法则，<br/>一条曲线。
+              <Reveal><p style={{fontFamily: SERIF, color: TXT}} className="text-4xl font-semibold leading-snug">五条法则，<br/>一条曲线。
               </p></Reveal>
-              <Reveal delay={0.1}><p style={{color: DIM}} className="mt-4 text-sm leading-relaxed">理念已尽数陈述。<br/>现在，按住下方，见证它穿越牛熊的威力。
+              <Reveal delay={0.1}><p style={{color: DIM}} className="mt-5 text-base leading-relaxed">按住下方，<br/>见证它穿越牛熊。
               </p></Reveal>
               <div className="mt-8 mb-8 flex w-full flex-col gap-2.5">
                   {feats.map((f, i) => (
@@ -454,7 +435,7 @@ const Finale=()=>{
                         style={{color: GREEN, transform: 'translateZ(0)'}}>
               <Fingerprint size={18}/>
               <span
-                  className="text-base font-semibold tracking-wide">{holding ? '持续按住…' : '按住 · 见识穿越牛熊的威力'}</span>
+                  className="text-base font-semibold tracking-wide">{holding ? '正在揭晓…' : '按住不放 · 揭晓战绩'}</span>
             </span>
               </button>
               <motion.p animate={{opacity: holding ? 0.4 : 0.7}} style={{fontFamily: MONO, color: DIM}}
@@ -464,8 +445,7 @@ const Finale=()=>{
       ) : (
           <motion.div key="post" initial={{opacity: 0, scale: 0.96}} animate={{opacity: 1, scale: 1}}
                       transition={{duration: 0.6, ease: EASE}} className="w-full">
-              <p style={{fontFamily: MONO, color: DIM}} className="text-xs tracking-widest uppercase">Cumulative Return
-                  · 累计收益率 · 回测</p>
+              <p style={{fontFamily: MONO, color: DIM}} className="text-xs tracking-widest uppercase">Cumulative Return · 累计收益率 · 回测</p>
               <div className="mt-2 flex items-end gap-1">
                   <span style={{fontFamily: MONO, color: GOLD}} className="text-2xl font-bold">+</span>
                   <span style={{fontFamily: MONO, color: GOLD, textShadow: '0 0 40px rgba(231,200,132,0.4)'}}
@@ -498,36 +478,19 @@ const Finale=()=>{
             </div>
           </div>
 
-          <div className="mt-7 text-center">
-            <p style={{fontFamily:SERIF,color:GOLD}} className="text-xl font-semibold">不求常胜，但求大胜。</p>
+          <div className="mt-8 text-center">
+            <p style={{fontFamily:SERIF,color:GOLD}} className="text-2xl font-semibold">不求常胜，但求大胜。</p>
             <p style={{fontFamily:MONO,color:DIM}} className="mt-2 text-xs tracking-widest uppercase">Structure over Prediction</p>
           </div>
 
-          {/* 加入延时出场且包裹 height 动画：在3秒前完全不占高度，让上方大字图表独占屏幕。3秒后平滑向下撑开 */}
+          {/* CTA 延时浮出：先让大数字与曲线独占视野，再平滑展开转化区 */}
           <motion.div
             initial={{opacity: 0, height: 0, overflow: 'hidden'}}
             animate={{opacity: 1, height: 'auto'}}
-            transition={{delay: 3, duration: 0.8, ease: EASE}}
+            transition={{delay: 2.8, duration: 0.8, ease: EASE}}
           >
-            <div className="pt-10 pb-8">
-              <div className="flex w-full flex-col gap-2.5">
-                <p style={{fontFamily:MONO,color:DIM}} className="mb-2 text-center text-xs tracking-widest">贯彻五条理念 · 方能穿越牛熊</p>
-                {feats.map((f, i) => (
-                    <div key={i} className="flex items-center gap-3 rounded-xl border px-4 py-2.5"
-                         style={{
-                             borderColor: 'rgba(52,224,161,0.25)',
-                             background: 'rgba(52,224,161,0.05)'
-                         }}>
-                        <span className="flex h-5 w-5 items-center justify-center rounded-full"
-                              style={{ background: GREEN }}>
-                            <Check size={13} color={INK} strokeWidth={3}/>
-                        </span>
-                        <span style={{color: TXT}} className="text-sm font-medium">{f}</span>
-                    </div>
-                ))}
-              </div>
-
-              <div className="mt-10 flex flex-col items-center gap-4">
+            <div className="pt-10">
+              <div className="flex flex-col items-center gap-4">
                 <button onClick={handleApply} style={{
                     background: '#07C160',
                     color: '#FFFFFF'
@@ -537,10 +500,10 @@ const Finale=()=>{
                   <WeChatIcon size={24} />
                   申请实盘白名单
                 </button>
-                <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-2 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
+                <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-1 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
               </div>
 
-              <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*以上为历史回测数据，不代表未来收益，不构成投资建议。</p>
+              <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*历史回测数据，不代表未来收益，不构成投资建议。</p>
             </div>
           </motion.div>
         </motion.div>
@@ -568,18 +531,17 @@ const Finale=()=>{
                 <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#07C160]/20 bg-[#07C160]/10">
                   <Check className="text-[#07C160]" size={28} strokeWidth={3} />
                 </div>
-                <h3 className="mb-2 text-xl font-bold text-white">秘钥复制成功</h3>
-                <p style={{fontFamily: MONO}} className="mb-8 text-xs text-[#8A93A3]">NODE_ADMIN_WECHAT_ID_COPIED</p>
+                <h3 className="mb-6 text-xl font-bold text-white">微信号已复制</h3>
 
                 <div className="mb-4 w-full rounded-xl border border-white/5 bg-[#000000] py-5">
-                  <p className="mb-2 text-xs text-[#8A93A3]">请在微信添加管理员:</p>
+                  <p className="mb-2 text-xs text-[#8A93A3]">添加管理员微信</p>
                   <p style={{fontFamily: MONO}} className="text-3xl font-bold tracking-wider text-white">yys190704</p>
                 </div>
 
                 <div className="mb-8 w-full flex items-start gap-3 rounded-xl border border-white/5 bg-[#13171F] p-4 text-left">
                   <AlertCircle size={18} className="mt-0.5 shrink-0 text-[#F5A623]" />
                   <p className="text-xs leading-relaxed text-[#BCC2CE]">
-                    通关暗号：添加时请务必备注 <span className="font-bold text-[#07C160]">Alpha节点</span> ，否则系统将自动拒绝好友申请。
+                    添加时请备注 <span className="font-bold text-[#07C160]">Alpha节点</span>，否则系统将自动拒绝。
                   </p>
                 </div>
 
@@ -594,7 +556,7 @@ const Finale=()=>{
                   onClick={() => setShowModal(false)}
                   className="text-sm text-[#8A93A3] transition-colors hover:text-white"
                 >
-                  稍后再试，关闭窗口
+                  关闭窗口
                 </button>
               </div>
             </motion.div>
@@ -614,31 +576,23 @@ export default function App(){
       <div className="relative z-10 mx-auto w-full max-w-md px-6">
         <Hero/>
         <Principle idx="01" zh="不可预测" en="Unpredictable"
-          body={<>市场不可预测。没有人能每次都猜对，<span style={{color:RED}}>高胜率是一种昂贵的幻觉</span>——平静的表面下，藏着致命的尾部风险。</>}
-          quote="市场不可预测，规则方可长青。" strategy="不预测市场，只跟随趋势。"
-          chartLabel="MARTINGALE vs 本策略"
-          caption={<>红线 · 高胜率马丁：连赢之后，一次<span style={{color:RED}}>归零</span>。绿线 · 本策略：锯齿波动，<span style={{color:GREEN}}>阶梯向上</span>。</>}>
+          maxim="市场不可预测，规则方可长青。"
+          takeaway="不预测，只跟随趋势">
           <MartingaleChart/>
         </Principle>
         <Principle idx="02" zh="先求不死" en="Survival"
-          body={<>市场每天都有机会，账户没有。没人因为赚得慢而离开，<span style={{color:RED}}>但绝大多数人，都倒在一次大亏上</span>。活下来，永远比赚快钱重要。</>}
-          quote="先求不死，再求大胜。" strategy="赢到最后，比一直赢更重要。"
-          chartLabel="DRAWDOWN → RECOVERY · 回撤回本"
-          caption={<>亏损越深，回本越难：−50% 需 +100%，−90% 需 <span style={{color:RED}}>+900%</span>。<span style={{color:GREEN}}>本策略最大回撤仅 −20.5%</span>，回本只需 +25.8%——永不靠近深渊。</>}>
+          maxim="先求不死，再求大胜。"
+          takeaway="回撤可控，绝不致命">
           <RecoveryChart/>
         </Principle>
         <Principle idx="03" zh="非对称" en="Asymmetry"
-          body={<>决定盈亏的，是赢与亏的<span style={{color:TXT}}>倍数</span>，不是赢与亏的次数。亏损次数可以更多，只要每次都小；盈利次数可以更少，只要足够大。</>}
-          quote="截断亏损，让利润奔跑。" strategy="亏有底线，赢无上限。"
-          chartLabel="RISK / REWARD · 盈亏天平"
-          caption={<>亏损 · 多而小 · <span style={{color:GREEN}}>有底线</span> ｜ 盈利 · 少而大 · <span style={{color:GREEN}}>无上限</span>。天平，终究倒向盈利。</>}>
+          maxim="截断亏损，让利润奔跑。"
+          takeaway="亏有底线，赢无上限">
           <BalanceScale/>
         </Principle>
         <Principle idx="04" zh="穿越牛熊" en="All-Weather"
-          body={<>牛市里人人都是股神；熊市退潮，<span style={{color:RED}}>才知道谁在裸泳</span>。真正的复利，是熊市少亏、牛市敢赚的结果。</>}
-          quote="牛市决定收益，熊市决定复利。" strategy="熊市不亏，牛市起飞。"
-          chartLabel="BEAR / BULL · 穿越牛熊"
-          caption={<>熊市：基准下行，策略守住<span style={{color:GREEN}}>超额收益</span>。牛市：顺势放大，收益起飞。</>}>
+          maxim="牛市决定收益，熊市决定复利。"
+          takeaway="熊市不亏，牛市起飞">
           <div className="flex flex-col gap-4">
             <div>
               <div className="mb-1 flex items-center justify-between">
@@ -659,10 +613,8 @@ export default function App(){
           </div>
         </Principle>
         <Principle idx="05" zh="系统驱动" en="Systematic"
-          body={<>不依赖所谓的大牛喊单——<span style={{color:TXT}}>人会说谎，数据不会</span>。把每一笔交易交给规则，把情绪踢出场外，让纪律安静运行。</>}
-          quote="把交易交给系统，把情绪踢出局。" strategy="规则驱动，透明可验，做时间复利的朋友。"
-          chartLabel="SYSTEMATIC · 系统驱动"
-          caption={<>规则恒定，纪律执行，收益随时间稳定累积——安静运行，无需人管。</>}>
+          maxim="把交易交给系统，把情绪踢出局。"
+          takeaway="规则驱动，透明可验">
           <SystematicChart/>
           <RuleStatus/>
         </Principle>
