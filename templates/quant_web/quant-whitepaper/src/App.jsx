@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, useScroll, AnimatePresence } from 'framer-motion';
-import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink } from 'lucide-react';
+import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink, Lock, ShieldAlert } from 'lucide-react';
 
 const INK='#0A0E14', INK2='#0F151E', GREEN='#34E0A1', RED='#EF5B5B', GOLD='#E7C884',
   TXT='#E9ECF2', BODY='#BCC2CE', DIM='#8A93A3', HAIR='rgba(255,255,255,0.08)';
@@ -272,13 +272,11 @@ const RuleStatus=()=>{
   );
 };
 
-// 【修改点3】进度条绑定新的独立滚动容器
 const ScrollBar=({ scrollRef })=>{
   const {scrollYProgress}=useScroll({ container: scrollRef });
   return <motion.div className="fixed left-0 top-0 z-50 h-0.5 w-full" style={{scaleX:scrollYProgress,transformOrigin:'0%',background:GREEN}}/>;
 };
 
-// 【修改点2】将 max-w-md 居中等结构移到此处，并且配置强制吸附对齐 (scrollSnapAlign: 'center', scrollSnapStop: 'always')
 const Hero=()=>(
   <section className="relative flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
@@ -304,7 +302,6 @@ const Hero=()=>(
   </section>
 );
 
-// 【修改点2】
 const Principle=({idx,zh,maxim,takeaway,children})=>(
   <section className="flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
     <SectionLabel idx={idx} zh={zh}/>
@@ -334,11 +331,14 @@ const Finale=()=>{
   const feats=['不预测，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
   const TH=[0.12,0.30,0.48,0.66,0.84];
 
+  const WECHAT_ID = 'Alpha_Quant_01'; // 建议改为类似这样的微信号
+
   const [progress,setProgress]=useState(0),
         [holding,setHolding]=useState(false),
         [done,setDone]=useState(false),
         [val,setVal]=useState(0),
-        [showModal,setShowModal]=useState(false);
+        [showModal,setShowModal]=useState(false),
+        [agreed, setAgreed]=useState(false);
 
   const pRef=useRef(0), raf=useRef(0), last=useRef(0);
   const progressSpanRef = useRef(null);
@@ -379,7 +379,8 @@ const Finale=()=>{
   };
 
   const handleApply = () => {
-    try { navigator.clipboard.writeText('爱拼才会赢'); } catch (err) {}
+    if (!agreed) return;
+    try { navigator.clipboard.writeText(WECHAT_ID); } catch (err) {}
     setShowModal(true);
   };
 
@@ -401,6 +402,7 @@ const Finale=()=>{
     setProgress(0);
     setVal(0);
     setHolding(false);
+    setAgreed(false);
     pRef.current=0;
     if(progressSpanRef.current) progressSpanRef.current.style.width = '0%';
     if(buttonRef.current) buttonRef.current.style.boxShadow = `0 0 15px rgba(52,224,161,0.15)`;
@@ -410,7 +412,6 @@ const Finale=()=>{
   const eq=[[8,152],[28,150],[48,146],[68,149],[90,140],[110,143],[132,132],[154,135],[176,120],[198,123],[220,104],[242,100],[262,78],[282,58],[300,38],[314,22]];
 
   return(
-    // 【修改点2】
     <section className="relative flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
       {done&&<div className="pointer-events-none fixed inset-0" style={{background:'radial-gradient(circle at 50% 40%, rgba(52,224,161,0.10), transparent 60%)'}}/>}
       <AnimatePresence mode="wait">
@@ -501,7 +502,6 @@ const Finale=()=>{
           </div>
 
           <div className="mt-5 flex flex-col gap-3">
-            {/* 核心优势：高收益与高盈亏比 */}
             <div className="rounded-xl border p-4 flex justify-between items-center relative overflow-hidden" style={{borderColor:HAIR, background:'linear-gradient(135deg, rgba(52,224,161,0.12) 0%, rgba(52,224,161,0.02) 100%)'}}>
               <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(52,224,161,0.2)'}}>
                 <span style={{fontSize:'9px', color:GREEN, fontWeight:'bold'}}>核心优势</span>
@@ -518,7 +518,6 @@ const Finale=()=>{
             </div>
 
             <div className="grid grid-cols-2 gap-3">
-              {/* 交易特征 */}
               <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
                 <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">测试 5 年完成</p>
                 <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">1280 <span className="text-xs font-normal text-[#8A93A3]">笔</span></p>
@@ -527,8 +526,6 @@ const Finale=()=>{
                 <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">平均持仓时间</p>
                 <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">38.5 <span className="text-xs font-normal text-[#8A93A3]">h</span></p>
               </div>
-
-              {/* 风险与现实：真实胜率与回撤 */}
               <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
                  <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(231,200,132,0.15)'}}>
                   <span style={{fontSize:'9px', color:GOLD}}>真实特征</span>
@@ -546,35 +543,63 @@ const Finale=()=>{
             </div>
           </div>
 
-          <div className="mt-8 text-center">
-            <p style={{fontFamily:SERIF,color:GOLD}} className="text-2xl font-semibold">不求常胜，但求大胜。</p>
-            <p style={{fontFamily:MONO,color:DIM}} className="mt-2 text-xs tracking-widest uppercase">Structure over Prediction</p>
-          </div>
-
-          <motion.div
-            initial={{opacity: 0, height: 0, overflow: 'hidden'}}
-            animate={{opacity: 1, height: 'auto'}}
-            transition={{delay: 2.8, duration: 0.8, ease: EASE}}
-          >
-            <div className="pt-10">
-              <div className="flex flex-col items-center gap-4">
-                <button onClick={handleApply} style={{
-                    background: '#07C160',
-                    color: '#FFFFFF'
-                  }}
-                  className="flex w-full flex-col items-center justify-center gap-1 rounded-xl py-3.5 transition-transform active:scale-95 shadow-[0_4px_20px_rgba(7,193,96,0.25)]"
-                >
-                  <div className="flex items-center gap-2 text-[17px] font-bold tracking-wide">
-                    <WeChatIcon size={22} />
-                    添加微信 · 接入同款策略
-                  </div>
-                  <span className="text-[11px] text-white/85 tracking-widest font-medium">告别盯盘，让系统自动运行</span>
-                </button>
-                <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-1 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
+          <motion.div initial={{opacity: 0, y: 15}} animate={{opacity: 1, y: 0}} transition={{delay: 2.8, duration: 0.8, ease: EASE}}>
+            <div className="mt-8 rounded-xl border border-dashed border-[#E7C884]/30 bg-[#E7C884]/[0.03] p-5">
+              <div className="mb-4 flex items-center gap-2">
+                <ShieldAlert size={16} color={GOLD}/>
+                <span style={{fontFamily:MONO, color:GOLD}} className="text-xs font-bold tracking-widest">SYSTEM WARNING · 接入前必读</span>
               </div>
-
-              <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*历史回测数据，不代表未来收益，不构成投资建议。</p>
+              <ul className="flex flex-col gap-3.5">
+                {[
+                  {t:'极其枯燥乏味', d:'严格的信号过滤会导致极长时间空仓等待。如果您追求高频交易的刺激，请立即关闭本页面。'},
+                  {t:'存在连续止损', d:'胜率仅 41.9%，利润全靠高盈亏比。震荡市必定会经历连续的小额止损试错，以此换取大趋势的暴利。'},
+                  {t:'反人性执行', d:'放弃“一夜暴富”的短期幻想。本系统专注长线复利，市场狂热时可能强制空仓，需绝对服从机器纪律。'},
+                  {t:'拒绝造神神话', d:'绝不盲目抄底逃顶。系统严格执行右侧交易确认，主动放弃头部与尾部的高风险利润，只吃最确定的鱼身。'}
+                ].map((item, i) => (
+                  <li key={i} className="flex flex-col">
+                    <span style={{color:TXT}} className="mb-1 text-sm font-semibold">· {item.t}</span>
+                    <span style={{color:DIM}} className="text-[11px] leading-relaxed">{item.d}</span>
+                  </li>
+                ))}
+              </ul>
             </div>
+
+            <div
+              className="mt-6 mb-6 flex cursor-pointer items-start gap-3 rounded-lg p-2 transition-colors hover:bg-white/[0.02]"
+              onClick={()=>setAgreed(!agreed)}
+            >
+              <div className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${agreed ? 'border-[#34E0A1] bg-[#34E0A1]/20' : 'border-[#8A93A3]/50'}`}>
+                {agreed && <Check size={12} color={GREEN} strokeWidth={4}/>}
+              </div>
+              <p style={{color: DIM}} className="text-[11px] leading-relaxed">
+                我已理解：真正的交易是一场反人性的修行。<br/>想感受时间复利的魅力。
+              </p>
+            </div>
+
+            <div className="flex flex-col items-center gap-4">
+              <button
+                onClick={agreed ? handleApply : undefined}
+                style={{
+                  borderColor: agreed ? GREEN : HAIR,
+                  background: agreed ? 'rgba(52,224,161,0.08)' : 'transparent',
+                  opacity: agreed ? 1 : 0.4,
+                  cursor: agreed ? 'pointer' : 'not-allowed'
+                }}
+                className={`relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 transition-all duration-500 ${agreed ? 'shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]' : ''}`}
+              >
+                <div style={{color: agreed ? GREEN : DIM}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest transition-colors">
+                  {agreed ? <WeChatIcon size={18} /> : <Lock size={18} />}
+                  <span>{agreed ? '获取 Alpha 节点密钥' : '请先确认接受上述规则'}</span>
+                </div>
+                <span style={{fontFamily: MONO, color: DIM}} className="text-[11px] font-medium uppercase tracking-widest">
+                  Invitation Only · 凭口令获取信号
+                </span>
+              </button>
+
+              <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-1 rounded-full border px-4 py-2 text-xs tracking-widest transition-colors hover:text-white">↻ 重新演示</button>
+            </div>
+
+            <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*历史回测数据，不代表未来收益，不构成投资建议。</p>
           </motion.div>
         </motion.div>
       )}
@@ -595,36 +620,39 @@ const Finale=()=>{
               exit={{ scale: 0.95, y: 10 }}
               className="relative w-full max-w-sm overflow-hidden rounded-2xl border border-white/10 bg-[#0A0E14] shadow-2xl"
             >
-              <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#07C160] to-transparent opacity-50"></div>
+              <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
 
               <div className="flex flex-col items-center p-8 text-center">
-                <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#07C160]/20 bg-[#07C160]/10">
-                  <Check className="text-[#07C160]" size={28} strokeWidth={3} />
+                <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10">
+                  <Check className="text-[#34E0A1]" size={28} strokeWidth={3} />
                 </div>
-                <h3 className="mb-6 text-xl font-bold text-white">微信号已复制</h3>
+                <h3 className="mb-2 text-lg font-bold text-white tracking-wider">系统访问权限已生成</h3>
+                <p style={{color: DIM}} className="mb-6 text-xs">管理员节点已自动复制至剪贴板</p>
 
-                <div className="mb-4 w-full rounded-xl border border-white/5 bg-[#000000] py-5">
-                  <p className="mb-2 text-xs text-[#8A93A3]">添加管理员微信</p>
-                  <p style={{fontFamily: MONO}} className="text-3xl font-bold tracking-wider text-white">爱拼才会赢</p>
+                <div className="mb-5 w-full rounded-xl border border-white/5 bg-[#000000] py-4">
+                  <p className="mb-1 text-[10px] uppercase tracking-widest text-[#8A93A3]" style={{fontFamily:MONO}}>System Admin ID</p>
+                  <p style={{fontFamily: MONO, color: TXT}} className="text-2xl font-bold tracking-wider">{WECHAT_ID}</p>
                 </div>
 
-                <div className="mb-8 w-full flex items-start gap-3 rounded-xl border border-white/5 bg-[#13171F] p-4 text-left">
-                  <AlertCircle size={18} className="mt-0.5 shrink-0 text-[#F5A623]" />
-                  <p className="text-xs leading-relaxed text-[#BCC2CE]">
-                    添加时请备注 <span className="font-bold text-[#07C160]">Alpha节点</span>，否则系统将自动拒绝。
+                <div className="mb-8 flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left"
+                     style={{borderColor: 'rgba(231,200,132,0.2)', background: 'rgba(231,200,132,0.05)'}}>
+                  <AlertCircle size={16} className="mt-0.5 shrink-0" style={{color: GOLD}} />
+                  <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>
+                    出于严格风控，添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>Alpha节点</span>，否则您的请求将被系统无视。
                   </p>
                 </div>
 
                 <button
                   onClick={() => window.location.href = 'weixin://'}
-                  className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl bg-[#07C160] py-3.5 text-base font-bold text-white transition-colors hover:bg-[#06ad56] active:scale-95"
+                  style={{background: GREEN, color: INK}}
+                  className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95"
                 >
-                  打开微信去粘贴 <ExternalLink size={18} />
+                  打开微信前往验证 <ExternalLink size={16} />
                 </button>
 
                 <button
                   onClick={() => setShowModal(false)}
-                  className="text-sm text-[#8A93A3] transition-colors hover:text-white"
+                  className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white"
                 >
                   关闭窗口
                 </button>
@@ -638,7 +666,6 @@ const Finale=()=>{
 };
 
 export default function App(){
-  // 【修改点1】创建专属的滚动句柄，断绝被上层全局 HTML 干扰的可能
   const scrollRef = useRef(null);
 
   return(
@@ -647,7 +674,6 @@ export default function App(){
       <div className="pointer-events-none fixed inset-0" style={{background:'radial-gradient(circle at 50% 0%, rgba(52,224,161,0.06), transparent 55%)'}}/>
       <ScrollBar scrollRef={scrollRef} />
 
-      {/* 【修改点1】将这里改造为具有最高优先级、隔离环境的原生滚动容器 */}
       <div
         ref={scrollRef}
         className="relative z-10 h-full w-full overflow-y-auto overflow-x-hidden"
