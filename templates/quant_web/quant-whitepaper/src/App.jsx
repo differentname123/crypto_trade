@@ -375,7 +375,7 @@ const Finale=()=>{
   };
 
   const handleApply = () => {
-    try { navigator.clipboard.writeText('yys190704'); } catch (err) {}
+    try { navigator.clipboard.writeText('爱拼才会赢'); } catch (err) {}
     setShowModal(true);
   };
 
@@ -542,7 +542,7 @@ const Finale=()=>{
 
                 <div className="mb-4 w-full rounded-xl border border-white/5 bg-[#000000] py-5">
                   <p className="mb-2 text-xs text-[#8A93A3]">添加管理员微信</p>
-                  <p style={{fontFamily: MONO}} className="text-3xl font-bold tracking-wider text-white">yys190704</p>
+                  <p style={{fontFamily: MONO}} className="text-3xl font-bold tracking-wider text-white">爱拼才会赢</p>
                 </div>
 
                 <div className="mb-8 w-full flex items-start gap-3 rounded-xl border border-white/5 bg-[#13171F] p-4 text-left">
