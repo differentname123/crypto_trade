@@ -272,13 +272,15 @@ const RuleStatus=()=>{
   );
 };
 
-const ScrollBar=()=>{
-  const {scrollYProgress}=useScroll();
+// 【修改点3】进度条绑定新的独立滚动容器
+const ScrollBar=({ scrollRef })=>{
+  const {scrollYProgress}=useScroll({ container: scrollRef });
   return <motion.div className="fixed left-0 top-0 z-50 h-0.5 w-full" style={{scaleX:scrollYProgress,transformOrigin:'0%',background:GREEN}}/>;
 };
 
+// 【修改点2】将 max-w-md 居中等结构移到此处，并且配置强制吸附对齐 (scrollSnapAlign: 'center', scrollSnapStop: 'always')
 const Hero=()=>(
-  <section className="relative flex min-h-screen flex-col justify-center py-24">
+  <section className="relative flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
       <path d={poly([[0,180],[60,170],[60,150],[120,140],[120,120],[190,110],[190,86],[255,74],[255,50],[320,36]])} fill="none" stroke={GREEN} strokeWidth="1.5"/>
     </svg>
@@ -302,8 +304,9 @@ const Hero=()=>(
   </section>
 );
 
+// 【修改点2】
 const Principle=({idx,zh,maxim,takeaway,children})=>(
-  <section className="flex min-h-screen flex-col justify-center py-24">
+  <section className="flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
     <SectionLabel idx={idx} zh={zh}/>
     <Reveal delay={0.05}>
       <h2 style={{fontFamily:SERIF,color:TXT}} className="mt-7 text-3xl font-semibold leading-snug tracking-wide">{maxim}</h2>
@@ -341,7 +344,6 @@ const Finale=()=>{
   const progressSpanRef = useRef(null);
   const buttonRef = useRef(null);
 
-  // 核心交互修改：只要触发一次，直接走到底部，不可逆蓄力。完美规避系统长按菜单弹出打断。
   const loop = now => {
     const dt = now - last.current; last.current = now;
     let p = pRef.current + dt / HOLD;
@@ -408,7 +410,8 @@ const Finale=()=>{
   const eq=[[8,152],[28,150],[48,146],[68,149],[90,140],[110,143],[132,132],[154,135],[176,120],[198,123],[220,104],[242,100],[262,78],[282,58],[300,38],[314,22]];
 
   return(
-    <section className="relative flex min-h-screen flex-col justify-center py-24">
+    // 【修改点2】
+    <section className="relative flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
       {done&&<div className="pointer-events-none fixed inset-0" style={{background:'radial-gradient(circle at 50% 40%, rgba(52,224,161,0.10), transparent 60%)'}}/>}
       <AnimatePresence mode="wait">
       {!done?(
@@ -439,13 +442,9 @@ const Finale=()=>{
                   ))}
               </div>
 
-              {/* 还原 UI：按下去自动蓄力，不再受手势离开或系统长按干扰 */}
               <button onPointerDown={start} onClick={start}
                       onContextMenu={e => e.preventDefault()}
-                      onTouchStart={e => {
-                        // 阻止 iOS 下的选词放大镜和默认滑动等
-                        // e.preventDefault(); 如果阻止这个可能导致无法滚动，可根据实际体验斟酌，目前保留事件透传，因为onPointerDown已经接管
-                      }}
+                      onTouchStart={e => { }}
                       ref={buttonRef}
                       style={{
                           touchAction: 'none',
@@ -600,12 +599,21 @@ const Finale=()=>{
 };
 
 export default function App(){
+  // 【修改点1】创建专属的滚动句柄，断绝被上层全局 HTML 干扰的可能
+  const scrollRef = useRef(null);
+
   return(
-    <div style={{background:INK,color:TXT,fontFamily:SANS}} className="relative min-h-screen w-full overflow-x-hidden">
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;600;700&display=swap');html{scroll-behavior:smooth;}::selection{background:rgba(52,224,161,0.3);}`}</style>
+    <div style={{background:INK,color:TXT,fontFamily:SANS}} className="relative h-screen w-full overflow-hidden">
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;500;600;700&display=swap');::selection{background:rgba(52,224,161,0.3);}`}</style>
       <div className="pointer-events-none fixed inset-0" style={{background:'radial-gradient(circle at 50% 0%, rgba(52,224,161,0.06), transparent 55%)'}}/>
-      <ScrollBar/>
-      <div className="relative z-10 mx-auto w-full max-w-md px-6">
+      <ScrollBar scrollRef={scrollRef} />
+
+      {/* 【修改点1】将这里改造为具有最高优先级、隔离环境的原生滚动容器 */}
+      <div
+        ref={scrollRef}
+        className="relative z-10 h-full w-full overflow-y-auto overflow-x-hidden"
+        style={{ scrollSnapType: 'y mandatory' }}
+      >
         <Hero/>
         <Principle idx="01" zh="捕捉趋势"
           maxim="市场不可预测，规则方可长青。"
