@@ -499,14 +499,50 @@ const Finale=()=>{
               <line x1="6" y1="160" x2="314" y2="160" stroke={HAIR}/>
             </svg>
           </div>
-          <div className="mt-5 grid grid-cols-2 gap-3">
-            <div className="rounded-xl border p-4" style={{borderColor:HAIR}}>
-              <p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">全程最大回撤</p>
-              <p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">−20.5%</p>
+
+          <div className="mt-5 flex flex-col gap-3">
+            {/* 核心优势：高收益与高盈亏比 */}
+            <div className="rounded-xl border p-4 flex justify-between items-center relative overflow-hidden" style={{borderColor:HAIR, background:'linear-gradient(135deg, rgba(52,224,161,0.12) 0%, rgba(52,224,161,0.02) 100%)'}}>
+              <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(52,224,161,0.2)'}}>
+                <span style={{fontSize:'9px', color:GREEN, fontWeight:'bold'}}>核心优势</span>
+              </div>
+              <div>
+                <p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">平均年化收益</p>
+                <p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">76.7%</p>
+              </div>
+              <div className="h-10 w-px" style={{background:'rgba(52,224,161,0.2)'}}></div>
+              <div className="text-right pr-2">
+                <p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">盈亏比</p>
+                <p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">2.01</p>
+              </div>
             </div>
-            <div className="rounded-xl border p-4" style={{borderColor:HAIR}}>
-              <p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">收益 / 回撤</p>
-              <p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">95.8×</p>
+
+            <div className="grid grid-cols-2 gap-3">
+              {/* 交易特征 */}
+              <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
+                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">测试 5 年完成</p>
+                <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">1280 <span className="text-xs font-normal text-[#8A93A3]">笔</span></p>
+              </div>
+              <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
+                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">平均持仓时间</p>
+                <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">38.5 <span className="text-xs font-normal text-[#8A93A3]">h</span></p>
+              </div>
+
+              {/* 风险与现实：真实胜率与回撤 */}
+              <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
+                 <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(231,200,132,0.15)'}}>
+                  <span style={{fontSize:'9px', color:GOLD}}>真实特征</span>
+                </div>
+                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">策略胜率</p>
+                <p style={{fontFamily:MONO,color:GOLD}} className="text-lg font-bold tabular-nums">41.9%</p>
+              </div>
+              <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
+                 <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(239,91,91,0.15)'}}>
+                  <span style={{fontSize:'9px', color:RED}}>极限风险</span>
+                </div>
+                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">最大回撤</p>
+                <p style={{fontFamily:MONO,color:RED}} className="text-lg font-bold tabular-nums">−20.5%</p>
+              </div>
             </div>
           </div>
 
@@ -526,10 +562,13 @@ const Finale=()=>{
                     background: '#07C160',
                     color: '#FFFFFF'
                   }}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl py-4 text-lg font-bold tracking-wide transition-transform active:scale-95"
+                  className="flex w-full flex-col items-center justify-center gap-1 rounded-xl py-3.5 transition-transform active:scale-95 shadow-[0_4px_20px_rgba(7,193,96,0.25)]"
                 >
-                  <WeChatIcon size={24} />
-                  申请实盘白名单
+                  <div className="flex items-center gap-2 text-[17px] font-bold tracking-wide">
+                    <WeChatIcon size={22} />
+                    添加微信 · 接入同款策略
+                  </div>
+                  <span className="text-[11px] text-white/85 tracking-widest font-medium">告别盯盘，让系统自动运行</span>
                 </button>
                 <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-1 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
               </div>
