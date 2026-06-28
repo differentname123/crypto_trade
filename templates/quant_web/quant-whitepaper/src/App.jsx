@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, useScroll, AnimatePresence } from 'framer-motion';
-import { ChevronsDown, Check, Fingerprint } from 'lucide-react';
+import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink } from 'lucide-react';
 
 const INK='#0A0E14', INK2='#0F151E', GREEN='#34E0A1', RED='#EF5B5B', GOLD='#E7C884',
   TXT='#E9ECF2', BODY='#BCC2CE', DIM='#8A93A3', HAIR='rgba(255,255,255,0.08)';
@@ -87,33 +87,74 @@ const MartingaleChart=()=>{
   );
 };
 
-const RecoveryChart=()=>{
-  const mx=l=>44+(l/0.95)*262, my=g=>185-(Math.min(g,1000)/1000)*163;
-  const pts=[]; for(let l=0;l<=0.9001;l+=0.03) pts.push([mx(l),my(l/(1-l)*100)]);
-  const M=[[0.1,11,'−10% → +11%','start'],[0.5,100,'−50% → +100%','start'],[0.9,900,'−90% → +900%','end']];
-  return(
-    <svg viewBox="0 0 320 210" className="w-full h-56">
-      <rect x="44" y="20" width={mx(0.205)-44} height="165" fill="rgba(52,224,161,0.08)"/>
-      <rect x={mx(0.55)} y="20" width={306-mx(0.55)} height="165" fill="rgba(239,91,91,0.06)"/>
-      <line x1="44" y1="185" x2="306" y2="185" stroke={HAIR}/>
-      <line x1="44" y1="20" x2="44" y2="185" stroke={HAIR}/>
-      <motion.path d={smooth(pts)} fill="none" stroke={TXT} strokeWidth="2"
-        initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.8,ease:'easeInOut'}}/>
-      <motion.path d={`M ${mx(0.9)} ${my(900)} L ${mx(0.94)} 26`} fill="none" stroke={RED} strokeWidth="1.4" strokeDasharray="3 3"
-        initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.6}}/>
-      <motion.text x={mx(0.94)+2} y="24" style={{fontFamily:MONO}} fontSize="12" fill={RED}
-        initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.8}}>∞</motion.text>
-      {M.map(([l,g,t,a],i)=>(
-        <g key={i}>
-          <motion.circle cx={mx(l)} cy={my(g)} r="3.2" fill={RED} initial={{opacity:0,scale:0}} whileInView={{opacity:1,scale:1}} viewport={{once:true,amount:0.5}} transition={{delay:1+i*0.25}}/>
-          <motion.text x={a==='end'?mx(l)-6:mx(l)+6} y={my(g)+(g>500?12:-6)} textAnchor={a} style={{fontFamily:MONO}} fontSize="9" fill={RED}
-            initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.1+i*0.25}}>{t}</motion.text>
-        </g>
-      ))}
-      <motion.rect x="44" y={my(25.8)} width={mx(0.205)-44} height="3" fill={GREEN} initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.8}}/>
-      <motion.text x={mx(0.205)+6} y={my(25.8)+4} style={{fontFamily:MONO}} fontSize="9" fill={GREEN}
-        initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.9}}>本策略 −20.5%</motion.text>
-      <text x="50" y="202" style={{fontFamily:MONO}} fontSize="8" fill={DIM}>回撤幅度 →</text>
+const RecoveryChart = () => {
+  const cx = 95;
+  const rows = [
+    { label: '日常波动', down: 10, up: 11.1, downW: 10, upW: 11, color: DIM },
+    { label: '本策略极限', down: 20.5, up: 25.8, downW: 20.5, upW: 25.8, color: GREEN, focus: true },
+    { label: '腰斩警戒线', down: 50, up: 100, downW: 50, upW: 100, color: GOLD },
+    { label: '万劫不复', down: 90, up: 900, downW: 90, upW: 170, color: RED, isMax: true }
+  ];
+
+  return (
+    <svg viewBox="0 0 320 230" className="w-full h-64">
+      <defs>
+        <linearGradient id="fadeRed" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor={RED} stopOpacity="1"/>
+          <stop offset="60%" stopColor={RED} stopOpacity="0.8"/>
+          <stop offset="100%" stopColor={INK} stopOpacity="0"/>
+        </linearGradient>
+        <linearGradient id="focusGreen" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor={GREEN} stopOpacity="0.15"/>
+          <stop offset="100%" stopColor={GREEN} stopOpacity="0"/>
+        </linearGradient>
+      </defs>
+
+      <text x={cx - 10} y="20" style={{fontFamily:MONO}} fontSize="9" fill={DIM} textAnchor="end">跌幅 ↓</text>
+      <line x1={cx} y1="12" x2={cx} y2="24" stroke={HAIR} />
+      <text x={cx + 10} y="20" style={{fontFamily:MONO}} fontSize="9" fill={DIM} textAnchor="start">回本需涨幅 ↑</text>
+
+      <motion.line x1={cx} y1="35" x2={cx} y2="225" stroke={HAIR} strokeDasharray="2 3"
+        initial={{pathLength:0}} whileInView={{pathLength:1}} transition={{duration:1}} />
+
+      {rows.map((r, i) => {
+        const y = 55 + i * 48;
+        return (
+          <g key={i}>
+            {r.focus && (
+              <motion.rect x="0" y={y-22} width="320" height="42" fill="url(#focusGreen)"
+                initial={{opacity:0}} whileInView={{opacity:1}} transition={{delay:0.5}} />
+            )}
+            <text x={cx + 10} y={y - 12} style={{fontFamily:SANS}} fontSize="10" fill={r.focus ? GREEN : TXT} opacity={r.focus ? 1 : 0.6}>
+              {r.label}
+            </text>
+            <motion.rect
+              x={cx - r.downW} y={y - 4} width={r.downW} height="8" rx="2"
+              fill={r.focus ? 'rgba(52,224,161,0.3)' : 'rgba(239,91,91,0.4)'}
+              style={{ transformOrigin: 'right' }}
+              initial={{ scaleX: 0 }} whileInView={{ scaleX: 1 }}
+              viewport={{ once: true, amount: 0.5 }}
+              transition={{ duration: 0.8, delay: i * 0.15 + 0.2, ease: 'easeOut' }}
+            />
+            <motion.text x={cx - r.downW - 8} y={y + 4} style={{fontFamily:MONO}} fontSize="10" fill={r.focus ? GREEN : RED} textAnchor="end"
+              initial={{ opacity: 0, x: 5 }} whileInView={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.15 + 0.6 }}>
+              −{r.down}%
+            </motion.text>
+            <motion.rect
+              x={cx} y={y - 4} width={r.upW} height="8" rx="2"
+              fill={r.focus ? GREEN : (r.isMax ? 'url(#fadeRed)' : TXT)}
+              style={{ transformOrigin: 'left' }}
+              initial={{ scaleX: 0 }} whileInView={{ scaleX: 1 }}
+              viewport={{ once: true, amount: 0.5 }}
+              transition={{ duration: 1.2, delay: i * 0.15 + 0.3, type: 'spring', bounce: 0.25 }}
+            />
+            <motion.text x={cx + r.upW + (r.isMax ? 0 : 8)} y={y + 4} style={{fontFamily:MONO}} fontSize="10" fill={r.focus ? GREEN : (r.isMax ? RED : TXT)} textAnchor="start"
+              initial={{ opacity: 0, x: -5 }} whileInView={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.15 + 0.8 }}>
+              +{r.up}% {r.isMax && <tspan fill={RED} fontSize="12" dy="1">∞</tspan>}
+            </motion.text>
+          </g>
+        )
+      })}
     </svg>
   );
 };
@@ -251,13 +292,22 @@ const Principle=({idx,zh,en,body,quote,strategy,caption,chartLabel,children})=>(
   </section>
 );
 
+const WeChatIcon = ({ size = 24, className = "" }) => (
+  <svg viewBox="0 0 1024 1024" width={size} height={size} className={className} fill="currentColor">
+    <path d="M682.667 768c-23.467 0-46.934-4.267-66.134-10.667L541.867 800c-12.8 6.4-27.734 0-32-10.667-2.134-8.533-2.134-14.933 0-21.333l19.2-57.6c-49.067-34.133-78.934-83.2-78.934-138.667 0-100.266 98.134-181.333 219.734-181.333 119.466 0 219.733 81.067 219.733 181.333s-98.133 181.333-219.733 181.334z m130.133-270.933c10.667 0 19.2-8.534 19.2-19.2s-8.533-19.2-19.2-19.2-19.2 8.533-19.2 19.2 8.533 19.2 19.2 19.2z m-162.133-38.4c-10.667 0-19.2 8.533-19.2 19.2s8.533 19.2 19.2 19.2 19.2-8.533 19.2-19.2-8.533-19.2-19.2-19.2zM401.067 661.333c-36.267 0-70.4-10.667-100.267-25.6l-98.133 53.334c-17.067 8.533-36.267 0-42.667-14.934-2.133-10.666-2.133-19.2 0-29.866l23.467-78.934c-61.867-51.2-100.267-117.333-100.267-194.133 0-145.067 140.8-262.4 313.6-262.4 174.933 0 315.733 117.333 315.733 262.4 0 27.733-4.267 55.467-12.8 81.067-10.667-2.133-21.333-2.133-32-2.133-142.933 0-258.133 100.267-258.133 226.133 0 59.733 27.733 115.2 76.8 153.6-27.733 21.333-57.6 32-85.333 32z m-123.734-352c-14.933 0-27.733 12.8-27.733 27.734s12.8 27.733 27.733 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z m219.734 0c-14.934 0-27.734 12.8-27.734 27.734s12.8 27.733 27.734 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z"/>
+  </svg>
+);
+
 const Finale=()=>{
   const HOLD=2400;
   const feats=['不预测市场，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
   const TH=[0.12,0.30,0.48,0.66,0.84];
-  const [progress,setProgress]=useState(0),[holding,setHolding]=useState(false),[done,setDone]=useState(false),[val,setVal]=useState(0);
+  const [progress,setProgress]=useState(0),
+        [holding,setHolding]=useState(false),
+        [done,setDone]=useState(false),
+        [val,setVal]=useState(0),
+        [showModal,setShowModal]=useState(false);
 
-  // 新增 ref 用于解耦 60fps 的 React 渲染
   const pRef=useRef(0),mode=useRef('idle'),raf=useRef(0),last=useRef(0);
   const progressSpanRef = useRef(null);
   const buttonRef = useRef(null);
@@ -269,7 +319,7 @@ const Finale=()=>{
 
       if (p >= 1) {
         pRef.current = 1;
-        setProgress(1); // 结束时统一同步状态
+        setProgress(1);
         if (progressSpanRef.current) progressSpanRef.current.style.width = '100%';
         if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 35px rgba(52,224,161,0.35)`;
         mode.current = 'idle';
@@ -278,13 +328,11 @@ const Finale=()=>{
         return;
       }
 
-      // 仅在跨越检查点时更新 React 状态 (用于打钩动画)，其余时间纯 DOM 渲染以防卡顿
       const oldRevealed = TH.filter(t => pRef.current >= t).length;
       const newRevealed = TH.filter(t => p >= t).length;
       if (newRevealed !== oldRevealed) setProgress(p);
 
       pRef.current = p;
-      // 直接修改 DOM，绕过 React diff 机制，实现丝滑 60fps 且不卡主线程
       if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
       if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
 
@@ -316,7 +364,6 @@ const Finale=()=>{
 
   const start=(e)=>{
     if(done)return;
-    // 捕获指针焦点：手指轻微滑出边界也能锁定事件
     if (e && e.pointerId !== undefined && e.target.setPointerCapture) {
       try { e.target.setPointerCapture(e.pointerId); } catch(err){}
     }
@@ -328,7 +375,6 @@ const Finale=()=>{
   };
 
   const end=(e)=>{
-    // 释放指针焦点
     if (e && e.pointerId !== undefined && e.target.releasePointerCapture) {
       try { e.target.releasePointerCapture(e.pointerId); } catch(err){}
     }
@@ -338,6 +384,11 @@ const Finale=()=>{
     last.current=performance.now();
     cancelAnimationFrame(raf.current);
     raf.current=requestAnimationFrame(loop);
+  };
+
+  const handleApply = () => {
+    try { navigator.clipboard.writeText('yys190704'); } catch (err) {}
+    setShowModal(true);
   };
 
   useEffect(()=>()=>cancelAnimationFrame(raf.current),[]);
@@ -380,13 +431,13 @@ const Finale=()=>{
               </div>
               <button onPointerDown={start} onPointerUp={end} onPointerLeave={end} onPointerCancel={end}
                       onContextMenu={e => e.preventDefault()}
-                      onTouchStart={e => e.preventDefault()} /* 重点：拦截微信底层 touch 识别 */
+                      onTouchStart={e => e.preventDefault()}
                       ref={buttonRef}
                       style={{
                           touchAction: 'none',
                           userSelect: 'none',
                           WebkitUserSelect: 'none',
-                          WebkitTouchCallout: 'none', /* 重点：禁止 iOS 微信长按菜单 */
+                          WebkitTouchCallout: 'none',
                           WebkitTapHighlightColor: 'transparent',
                           borderColor: GREEN,
                           transform: 'translateZ(0)',
@@ -394,7 +445,6 @@ const Finale=()=>{
                       }}
                       className="relative w-full overflow-hidden rounded-full border-2 px-6 py-4">
 
-                  {/* 移除 transition，直接靠 DOM 帧级刷新保证绝对平滑 */}
                   <span ref={progressSpanRef} className="absolute inset-y-0 left-0" style={{
                       width: `${pRef.current * 100}%`,
                       background: 'rgba(52,224,161,0.22)'
@@ -413,7 +463,7 @@ const Finale=()=>{
           </motion.div>
       ) : (
           <motion.div key="post" initial={{opacity: 0, scale: 0.96}} animate={{opacity: 1, scale: 1}}
-                      transition={{duration: 0.6, ease: EASE}}>
+                      transition={{duration: 0.6, ease: EASE}} className="w-full">
               <p style={{fontFamily: MONO, color: DIM}} className="text-xs tracking-widest uppercase">Cumulative Return
                   · 累计收益率 · 回测</p>
               <div className="mt-2 flex items-end gap-1">
@@ -447,14 +497,109 @@ const Finale=()=>{
               <p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">95.8×</p>
             </div>
           </div>
+
           <div className="mt-7 text-center">
             <p style={{fontFamily:SERIF,color:GOLD}} className="text-xl font-semibold">不求常胜，但求大胜。</p>
             <p style={{fontFamily:MONO,color:DIM}} className="mt-2 text-xs tracking-widest uppercase">Structure over Prediction</p>
-            <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-6 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
           </div>
-          <p style={{color:DIM}} className="mt-6 text-center text-xs leading-relaxed opacity-60">*以上为历史回测数据，不代表未来收益，不构成投资建议。</p>
+
+          {/* 加入延时出场且包裹 height 动画：在3秒前完全不占高度，让上方大字图表独占屏幕。3秒后平滑向下撑开 */}
+          <motion.div
+            initial={{opacity: 0, height: 0, overflow: 'hidden'}}
+            animate={{opacity: 1, height: 'auto'}}
+            transition={{delay: 3, duration: 0.8, ease: EASE}}
+          >
+            <div className="pt-10 pb-8">
+              <div className="flex w-full flex-col gap-2.5">
+                <p style={{fontFamily:MONO,color:DIM}} className="mb-2 text-center text-xs tracking-widest">贯彻五条理念 · 方能穿越牛熊</p>
+                {feats.map((f, i) => (
+                    <div key={i} className="flex items-center gap-3 rounded-xl border px-4 py-2.5"
+                         style={{
+                             borderColor: 'rgba(52,224,161,0.25)',
+                             background: 'rgba(52,224,161,0.05)'
+                         }}>
+                        <span className="flex h-5 w-5 items-center justify-center rounded-full"
+                              style={{ background: GREEN }}>
+                            <Check size={13} color={INK} strokeWidth={3}/>
+                        </span>
+                        <span style={{color: TXT}} className="text-sm font-medium">{f}</span>
+                    </div>
+                ))}
+              </div>
+
+              <div className="mt-10 flex flex-col items-center gap-4">
+                <button onClick={handleApply} style={{
+                    background: '#07C160',
+                    color: '#FFFFFF'
+                  }}
+                  className="flex w-full items-center justify-center gap-2 rounded-xl py-4 text-lg font-bold tracking-wide transition-transform active:scale-95"
+                >
+                  <WeChatIcon size={24} />
+                  申请实盘白名单
+                </button>
+                <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-2 rounded-full border px-4 py-2 text-xs tracking-widest">↻ 重新演示</button>
+              </div>
+
+              <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*以上为历史回测数据，不代表未来收益，不构成投资建议。</p>
+            </div>
+          </motion.div>
         </motion.div>
       )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 flex items-center justify-center p-6 backdrop-blur-md"
+            style={{ background: 'rgba(10, 14, 20, 0.85)' }}
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 10 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 10 }}
+              className="relative w-full max-w-sm overflow-hidden rounded-2xl border border-white/10 bg-[#0A0E14] shadow-2xl"
+            >
+              <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#07C160] to-transparent opacity-50"></div>
+
+              <div className="flex flex-col items-center p-8 text-center">
+                <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#07C160]/20 bg-[#07C160]/10">
+                  <Check className="text-[#07C160]" size={28} strokeWidth={3} />
+                </div>
+                <h3 className="mb-2 text-xl font-bold text-white">秘钥复制成功</h3>
+                <p style={{fontFamily: MONO}} className="mb-8 text-xs text-[#8A93A3]">NODE_ADMIN_WECHAT_ID_COPIED</p>
+
+                <div className="mb-4 w-full rounded-xl border border-white/5 bg-[#000000] py-5">
+                  <p className="mb-2 text-xs text-[#8A93A3]">请在微信添加管理员:</p>
+                  <p style={{fontFamily: MONO}} className="text-3xl font-bold tracking-wider text-white">yys190704</p>
+                </div>
+
+                <div className="mb-8 w-full flex items-start gap-3 rounded-xl border border-white/5 bg-[#13171F] p-4 text-left">
+                  <AlertCircle size={18} className="mt-0.5 shrink-0 text-[#F5A623]" />
+                  <p className="text-xs leading-relaxed text-[#BCC2CE]">
+                    通关暗号：添加时请务必备注 <span className="font-bold text-[#07C160]">Alpha节点</span> ，否则系统将自动拒绝好友申请。
+                  </p>
+                </div>
+
+                <button
+                  onClick={() => window.location.href = 'weixin://'}
+                  className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl bg-[#07C160] py-3.5 text-base font-bold text-white transition-colors hover:bg-[#06ad56] active:scale-95"
+                >
+                  打开微信去粘贴 <ExternalLink size={18} />
+                </button>
+
+                <button
+                  onClick={() => setShowModal(false)}
+                  className="text-sm text-[#8A93A3] transition-colors hover:text-white"
+                >
+                  稍后再试，关闭窗口
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
       </AnimatePresence>
     </section>
   );
