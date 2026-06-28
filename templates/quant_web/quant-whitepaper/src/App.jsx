@@ -23,13 +23,11 @@ const SectionLabel=({idx,zh})=>(
     <div className="flex items-center gap-3">
       <span style={{fontFamily:MONO,color:GREEN}} className="text-sm font-medium">{idx}</span>
       <span className="h-px w-10" style={{background:`linear-gradient(90deg,${GREEN},transparent)`}}/>
-      {/* 移除英文翻译，仅保留代表动作的中文小标题，并将字体调大更加醒目 */}
       <span style={{fontFamily:MONO,color:TXT}} className="text-base font-semibold tracking-widest">{zh}</span>
     </div>
   </Reveal>
 );
 
-// 图表容器：去掉冗余标题与注解，让图表自己说话
 const ChartFrame=({children})=>(
   <Reveal delay={0.12}>
     <figure className="mt-8 overflow-hidden rounded-2xl border p-4"
@@ -44,20 +42,23 @@ const MartingaleChart=()=>{
   const r=[[10,160],[60,150],[110,140],[160,130],[210,120],[245,113]];
   return(
     <svg viewBox="0 0 320 200" className="w-full h-56">
+      <defs>
+        <linearGradient id="marting" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={GREEN} stopOpacity="0.25"/><stop offset="100%" stopColor={GREEN} stopOpacity="0"/></linearGradient>
+      </defs>
       <line x1="6" y1="175" x2="314" y2="175" stroke={HAIR}/>
-      <text x="8" y="190" style={{fontFamily:MONO}} fontSize="8" fill={DIM}>ZERO · 归零线</text>
       <motion.path d={poly(r)+' L 245 184 L 280 184'} fill="none" stroke={RED} strokeWidth="2.2" strokeLinecap="round"
         initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.8,ease:'easeInOut'}}/>
       <motion.circle cx="263" cy="184" r="4" fill={RED} initial={{opacity:0,scale:0}} whileInView={{opacity:1,scale:1}} viewport={{once:true,amount:0.5}} transition={{delay:1.8}}/>
       <motion.circle cx="263" cy="184" r="4" fill="none" stroke={RED} strokeWidth="1.5"
         initial={{opacity:0}} whileInView={{opacity:[0.8,0],scale:[1,3]}} viewport={{once:true,amount:0.5}} transition={{delay:1.9,duration:1.4,repeat:Infinity}}/>
-      <motion.text x="280" y="178" textAnchor="end" style={{fontFamily:MONO}} fontSize="9" fill={RED}
+      <motion.text x="280" y="171" textAnchor="end" style={{fontFamily:MONO}} fontSize="11" fill={RED}
         initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:2}}>−100% 归零</motion.text>
-      <motion.text x="58" y="138" style={{fontFamily:MONO}} fontSize="9" fill={RED}
+      <motion.text x="58" y="136" style={{fontFamily:MONO}} fontSize="11" fill={RED}
         initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:0.8}}>马丁策略</motion.text>
+      <motion.path d={area(g,175)} fill="url(#marting)" initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.8,delay:0.4}}/>
       <motion.path d={poly(g)} fill="none" stroke={GREEN} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"
         initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.8,ease:'easeInOut',delay:0.4}}/>
-      <motion.text x="300" y="38" textAnchor="end" style={{fontFamily:MONO}} fontSize="9" fill={GREEN}
+      <motion.text x="300" y="38" textAnchor="end" style={{fontFamily:MONO}} fontSize="11" fill={GREEN}
         initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{delay:2.2}}>本策略 · 阶梯向上</motion.text>
     </svg>
   );
@@ -86,9 +87,9 @@ const RecoveryChart = () => {
         </linearGradient>
       </defs>
 
-      <text x={cx - 10} y="20" style={{fontFamily:MONO}} fontSize="9" fill={DIM} textAnchor="end">跌幅 ↓</text>
+      <text x={cx - 10} y="20" style={{fontFamily:MONO}} fontSize="11" fill={DIM} textAnchor="end">跌幅 ↓</text>
       <line x1={cx} y1="12" x2={cx} y2="24" stroke={HAIR} />
-      <text x={cx + 10} y="20" style={{fontFamily:MONO}} fontSize="9" fill={DIM} textAnchor="start">回本需涨幅 ↑</text>
+      <text x={cx + 10} y="20" style={{fontFamily:MONO}} fontSize="11" fill={DIM} textAnchor="start">回本需涨幅 ↑</text>
 
       <motion.line x1={cx} y1="35" x2={cx} y2="225" stroke={HAIR} strokeDasharray="2 3"
         initial={{pathLength:0}} whileInView={{pathLength:1}} transition={{duration:1}} />
@@ -101,32 +102,32 @@ const RecoveryChart = () => {
               <motion.rect x="0" y={y-22} width="320" height="42" fill="url(#focusGreen)"
                 initial={{opacity:0}} whileInView={{opacity:1}} transition={{delay:0.5}} />
             )}
-            <text x={cx + 10} y={y - 12} style={{fontFamily:SANS}} fontSize="10" fill={r.focus ? GREEN : TXT} opacity={r.focus ? 1 : 0.6}>
+            <text x={cx + 10} y={y - 12} style={{fontFamily:SANS}} fontSize="12" fill={r.focus ? GREEN : TXT} opacity={r.focus ? 1 : 0.6}>
               {r.label}
             </text>
             <motion.rect
-              x={cx - r.downW} y={y - 4} width={r.downW} height="8" rx="2"
-              fill={r.focus ? 'rgba(52,224,161,0.3)' : 'rgba(239,91,91,0.4)'}
+              x={cx - r.downW} y={y - 5} width={r.downW} height="10" rx="3"
+              fill={r.focus ? 'rgba(52,224,161,0.4)' : 'rgba(239,91,91,0.4)'}
               style={{ transformOrigin: 'right' }}
               initial={{ scaleX: 0 }} whileInView={{ scaleX: 1 }}
               viewport={{ once: true, amount: 0.5 }}
               transition={{ duration: 0.8, delay: i * 0.15 + 0.2, ease: 'easeOut' }}
             />
-            <motion.text x={cx - r.downW - 8} y={y + 4} style={{fontFamily:MONO}} fontSize="10" fill={r.focus ? GREEN : RED} textAnchor="end"
+            <motion.text x={cx - r.downW - 8} y={y + 4} style={{fontFamily:MONO}} fontSize="11" fill={r.focus ? GREEN : RED} textAnchor="end"
               initial={{ opacity: 0, x: 5 }} whileInView={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.15 + 0.6 }}>
               −{r.down}%
             </motion.text>
             <motion.rect
-              x={cx} y={y - 4} width={r.upW} height="8" rx="2"
+              x={cx} y={y - 5} width={r.upW} height="10" rx="3"
               fill={r.focus ? GREEN : (r.isMax ? 'url(#fadeRed)' : TXT)}
               style={{ transformOrigin: 'left' }}
               initial={{ scaleX: 0 }} whileInView={{ scaleX: 1 }}
               viewport={{ once: true, amount: 0.5 }}
               transition={{ duration: 1.2, delay: i * 0.15 + 0.3, type: 'spring', bounce: 0.25 }}
             />
-            <motion.text x={cx + r.upW + (r.isMax ? 0 : 8)} y={y + 4} style={{fontFamily:MONO}} fontSize="10" fill={r.focus ? GREEN : (r.isMax ? RED : TXT)} textAnchor="start"
+            <motion.text x={cx + r.upW + (r.isMax ? 0 : 8)} y={y + 4} style={{fontFamily:MONO}} fontSize="11" fill={r.focus ? GREEN : (r.isMax ? RED : TXT)} textAnchor="start"
               initial={{ opacity: 0, x: -5 }} whileInView={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.15 + 0.8 }}>
-              +{r.up}% {r.isMax && <tspan fill={RED} fontSize="12" dy="1">∞</tspan>}
+              +{r.up}% {r.isMax && <tspan fill={RED} fontSize="14" dy="2">∞</tspan>}
             </motion.text>
           </g>
         )
@@ -140,21 +141,25 @@ const BalanceScale=()=>{
   const gain=[[236,104],[262,104],[249,82]];
   return(
     <svg viewBox="0 0 320 200" className="w-full h-56">
+      <defs>
+        <radialGradient id="redCoin" cx="35%" cy="35%" r="65%"><stop offset="0%" stopColor="#ff8a8a"/><stop offset="100%" stopColor={RED}/></radialGradient>
+        <radialGradient id="greenCoin" cx="35%" cy="35%" r="65%"><stop offset="0%" stopColor="#7affca"/><stop offset="100%" stopColor={GREEN}/></radialGradient>
+      </defs>
       <line x1="40" y1="180" x2="280" y2="180" stroke={HAIR}/>
-      <path d="M160 118 L150 180 L170 180 Z" fill="rgba(255,255,255,0.05)" stroke={HAIR}/>
+      <path d="M160 118 L150 180 L170 180 Z" fill="rgba(255,255,255,0.12)" stroke="rgba(255,255,255,0.25)"/>
       <motion.g style={{transformBox:'view-box',transformOrigin:'160px 118px'}}
         initial={{rotate:0}} whileInView={{rotate:7}} viewport={{once:true,amount:0.5}} transition={{delay:1,duration:1.2,ease:EASE}}>
         <rect x="40" y="116" width="240" height="5" rx="2.5" fill={TXT} opacity="0.85"/>
         <circle cx="160" cy="118" r="6" fill={INK} stroke={TXT}/>
-        {loss.map((p,i)=>(<motion.circle key={'l'+i} cx={p[0]} cy={p[1]} r="6" fill={RED}
+        {loss.map((p,i)=>(<motion.circle key={'l'+i} cx={p[0]} cy={p[1]} r="6" fill="url(#redCoin)"
           initial={{opacity:0,cy:p[1]-30}} whileInView={{opacity:0.9,cy:p[1]}} viewport={{once:true,amount:0.5}}
           transition={{delay:0.1+i*0.06,type:'spring',stiffness:200,damping:14}}/>))}
-        {gain.map((p,i)=>(<motion.circle key={'g'+i} cx={p[0]} cy={p[1]} r="13" fill={GREEN}
+        {gain.map((p,i)=>(<motion.circle key={'g'+i} cx={p[0]} cy={p[1]} r="13" fill="url(#greenCoin)"
           initial={{opacity:0,cy:p[1]-30}} whileInView={{opacity:0.95,cy:p[1]}} viewport={{once:true,amount:0.5}}
           transition={{delay:0.3+i*0.12,type:'spring',stiffness:200,damping:14}}/>))}
       </motion.g>
-      <text x="62" y="160" textAnchor="middle" style={{fontFamily:MONO}} fontSize="9" fill={RED}>亏损 · 多而小</text>
-      <text x="250" y="160" textAnchor="middle" style={{fontFamily:MONO}} fontSize="9" fill={GREEN}>盈利 · 少而大</text>
+      <text x="62" y="160" textAnchor="middle" style={{fontFamily:MONO}} fontSize="11" fill={RED}>亏损 · 多而小</text>
+      <text x="250" y="160" textAnchor="middle" style={{fontFamily:MONO}} fontSize="11" fill={GREEN}>盈利 · 少而大</text>
     </svg>
   );
 };
@@ -164,11 +169,14 @@ const BearChart=()=>{
   const strat=[[10,45],[55,42],[105,46],[155,40],[205,44],[255,37],[290,34]];
   return(
     <svg viewBox="0 0 300 150" className="w-full h-40">
-      <path d={poly([...strat,...[...bench].reverse()])+' Z'} fill="rgba(52,224,161,0.12)"/>
+      <defs>
+        <linearGradient id="bearg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={GREEN} stopOpacity="0.25"/><stop offset="100%" stopColor={GREEN} stopOpacity="0"/></linearGradient>
+      </defs>
       <line x1="6" y1="45" x2="294" y2="45" stroke={HAIR} strokeDasharray="3 3"/>
+      <motion.path d={area(strat, 140)} fill="url(#bearg)" initial={{opacity:0}} whileInView={{opacity:1}} viewport={{once:true,amount:0.5}} transition={{duration:1,delay:0.3}}/>
       <motion.path d={smooth(bench)} fill="none" stroke={RED} strokeWidth="2" initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.4,ease:'easeInOut'}}/>
       <motion.path d={smooth(strat)} fill="none" stroke={GREEN} strokeWidth="2.2" initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.4,ease:'easeInOut',delay:0.3}}/>
-      <text x="8" y="40" style={{fontFamily:MONO}} fontSize="8" fill={DIM}>0</text>
+      <text x="8" y="40" style={{fontFamily:MONO}} fontSize="11" fill={DIM}>0</text>
     </svg>
   );
 };
@@ -183,6 +191,46 @@ const BullChart=()=>{
       <motion.path d={smooth(bench)} fill="none" stroke={DIM} strokeWidth="1.6" strokeDasharray="4 4" initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.4}}/>
       <motion.path d={smooth(strat)} fill="none" stroke={GREEN} strokeWidth="2.4" strokeLinecap="round" initial={{pathLength:0}} whileInView={{pathLength:1}} viewport={{once:true,amount:0.5}} transition={{duration:1.6,ease:'easeInOut',delay:0.3}}/>
     </svg>
+  );
+};
+
+const BullBearTabs = () => {
+  const [tab, setTab] = useState('bear');
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setTab(prev => prev === 'bear' ? 'bull' : 'bear');
+    }, 3000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="flex flex-col">
+      <div className="mb-6 flex w-full rounded-lg bg-[#0F151E] p-1 border border-white/5">
+        <button onClick={()=>setTab('bear')} className={`flex-1 rounded-md py-2 text-xs font-bold tracking-widest transition-colors ${tab==='bear'?'bg-[#34E0A1]/15 text-[#34E0A1]':'text-[#8A93A3]'}`}>熊市不亏</button>
+        <button onClick={()=>setTab('bull')} className={`flex-1 rounded-md py-2 text-xs font-bold tracking-widest transition-colors ${tab==='bull'?'bg-[#34E0A1]/15 text-[#34E0A1]':'text-[#8A93A3]'}`}>牛市起飞</button>
+      </div>
+      <div className="relative min-h-[190px]">
+        <AnimatePresence mode="wait">
+          {tab === 'bear' ? (
+            <motion.div key="bear" initial={{opacity:0,y:10}} animate={{opacity:1,y:0}} exit={{opacity:0,y:-10}} transition={{duration:0.3}}>
+              <div className="mb-2 flex items-center justify-end">
+                <span style={{fontFamily:MONO,color:DIM}} className="text-xs">基准 <span style={{color:RED}}>−38.2%</span> · 策略 <span style={{color:GREEN}}>+6.5%</span></span>
+              </div>
+              <BearChart/>
+              <p style={{fontFamily:MONO,color:GREEN}} className="mt-2 text-xs">↑ 超额收益 +44.7%</p>
+            </motion.div>
+          ) : (
+            <motion.div key="bull" initial={{opacity:0,y:10}} animate={{opacity:1,y:0}} exit={{opacity:0,y:-10}} transition={{duration:0.3}}>
+              <div className="mb-2 flex items-center justify-end">
+                <span style={{fontFamily:MONO,color:DIM}} className="text-xs">基准 +120% · 策略 <span style={{color:GREEN}}>+312%</span></span>
+              </div>
+              <BullChart/>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+    </div>
   );
 };
 
@@ -229,29 +277,23 @@ const ScrollBar=()=>{
   return <motion.div className="fixed left-0 top-0 z-50 h-0.5 w-full" style={{scaleX:scrollYProgress,transformOrigin:'0%',background:GREEN}}/>;
 };
 
-// HERO：宣告式标题 + 一句论点 + 滚动提示。
 const Hero=()=>(
   <section className="relative flex min-h-screen flex-col justify-center py-24">
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
       <path d={poly([[0,180],[60,170],[60,150],[120,140],[120,120],[190,110],[190,86],[255,74],[255,50],[320,36]])} fill="none" stroke={GREEN} strokeWidth="1.5"/>
     </svg>
-
-    {/* 增加引子，取代原本特别小的废话字，并突出“赚钱” */}
     <motion.h2 initial={{opacity:0,y:16}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:EASE}}
       style={{fontFamily:SERIF,color:TXT}} className="mb-8 text-3xl font-medium tracking-wide">
       怎样才能<span style={{color:GOLD, textShadow:'0 0 20px rgba(231,200,132,0.4)'}}>赚钱</span>？
     </motion.h2>
-
     <motion.h1 initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.15,ease:EASE}}
       style={{fontFamily:SERIF,color:TXT}} className="text-5xl font-semibold leading-tight tracking-wide">
       不求常胜，<br/>但求<span style={{color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.35)'}}>大胜</span>。
     </motion.h1>
-
     <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.5,ease:EASE}}
       style={{color:DIM}} className="mt-8 text-lg leading-relaxed">
       穿越牛熊的，不是<span style={{color:TXT}}>预测</span>，是<span style={{color:GREEN}}>结构</span>。
     </motion.p>
-
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:1.2,duration:1}}
       className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1" style={{color:DIM}}>
       <motion.div animate={{y:[0,6,0]}} transition={{repeat:Infinity,duration:1.8}}><ChevronsDown size={18}/></motion.div>
@@ -260,7 +302,6 @@ const Hero=()=>(
   </section>
 );
 
-// PRINCIPLE：每屏只有 洞察(金句) → 证据(图表) → 行动(本策略) 三个层级
 const Principle=({idx,zh,maxim,takeaway,children})=>(
   <section className="flex min-h-screen flex-col justify-center py-24">
     <SectionLabel idx={idx} zh={zh}/>
@@ -269,12 +310,11 @@ const Principle=({idx,zh,maxim,takeaway,children})=>(
     </Reveal>
     <ChartFrame>{children}</ChartFrame>
     <Reveal delay={0.1}>
-      {/* 调整 "本策略" 后面的内容，让其更加突出显眼 */}
-      <div className="mt-7 inline-flex items-center gap-3 rounded-full px-5 py-3"
-        style={{background:'rgba(52,224,161,0.08)', border: '1px solid rgba(52,224,161,0.2)'}}>
-        <span style={{fontFamily:MONO,color:GREEN}} className="text-sm font-semibold tracking-wider">本策略</span>
-        <span className="h-4 w-px" style={{background:'rgba(52,224,161,0.4)'}}/>
-        <span style={{color:GOLD, textShadow:'0 0 10px rgba(231,200,132,0.3)'}} className="text-lg font-bold tracking-wide">{takeaway}</span>
+      <div className="mt-7 inline-flex items-center gap-3 border-l-[3px] py-2.5 pl-4 pr-6"
+        style={{borderColor: GREEN, background: 'linear-gradient(90deg, rgba(52,224,161,0.1) 0%, transparent 100%)'}}>
+        <span style={{fontFamily:MONO,color:GREEN}} className="text-xs font-bold tracking-wider">本策略</span>
+        <span className="h-3 w-px" style={{background:'rgba(52,224,161,0.3)'}}/>
+        <span style={{color:TXT}} className="text-base font-bold tracking-wide">{takeaway}</span>
       </div>
     </Reveal>
   </section>
@@ -290,88 +330,50 @@ const Finale=()=>{
   const HOLD=2400;
   const feats=['不预测，只跟随趋势','先求不死，再求大胜','亏有底线，赢无上限','熊市不亏，牛市起飞','规则驱动，透明可验'];
   const TH=[0.12,0.30,0.48,0.66,0.84];
+
   const [progress,setProgress]=useState(0),
         [holding,setHolding]=useState(false),
         [done,setDone]=useState(false),
         [val,setVal]=useState(0),
         [showModal,setShowModal]=useState(false);
 
-  const pRef=useRef(0),mode=useRef('idle'),raf=useRef(0),last=useRef(0);
+  const pRef=useRef(0), raf=useRef(0), last=useRef(0);
   const progressSpanRef = useRef(null);
   const buttonRef = useRef(null);
 
+  // 核心交互修改：只要触发一次，直接走到底部，不可逆蓄力。完美规避系统长按菜单弹出打断。
   const loop = now => {
     const dt = now - last.current; last.current = now;
-    if (mode.current === 'fill') {
-      let p = pRef.current + dt / HOLD;
+    let p = pRef.current + dt / HOLD;
 
-      if (p >= 1) {
-        pRef.current = 1;
-        setProgress(1);
-        if (progressSpanRef.current) progressSpanRef.current.style.width = '100%';
-        if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 35px rgba(52,224,161,0.35)`;
-        mode.current = 'idle';
-        setHolding(false);
-        setDone(true);
-        return;
-      }
-
-      const oldRevealed = TH.filter(t => pRef.current >= t).length;
-      const newRevealed = TH.filter(t => p >= t).length;
-      if (newRevealed !== oldRevealed) setProgress(p);
-
-      pRef.current = p;
-      if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
-      if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
-
-      raf.current = requestAnimationFrame(loop);
-
-    } else if (mode.current === 'decay') {
-      let p = pRef.current - dt / 500;
-
-      if (p <= 0) {
-        pRef.current = 0;
-        setProgress(0);
-        if (progressSpanRef.current) progressSpanRef.current.style.width = '0%';
-        if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 15px rgba(52,224,161,0.15)`;
-        mode.current = 'idle';
-        return;
-      }
-
-      const oldRevealed = TH.filter(t => pRef.current >= t).length;
-      const newRevealed = TH.filter(t => p >= t).length;
-      if (newRevealed !== oldRevealed) setProgress(p);
-
-      pRef.current = p;
-      if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
-      if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
-
-      raf.current = requestAnimationFrame(loop);
+    if (p >= 1) {
+      pRef.current = 1;
+      setProgress(1);
+      if (progressSpanRef.current) progressSpanRef.current.style.width = '100%';
+      if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 35px rgba(52,224,161,0.35)`;
+      setHolding(false);
+      setDone(true);
+      return;
     }
+
+    const oldRevealed = TH.filter(t => pRef.current >= t).length;
+    const newRevealed = TH.filter(t => p >= t).length;
+    if (newRevealed !== oldRevealed) setProgress(p);
+
+    pRef.current = p;
+    if (progressSpanRef.current) progressSpanRef.current.style.width = `${p * 100}%`;
+    if (buttonRef.current) buttonRef.current.style.boxShadow = `0 0 ${15 + p * 20}px rgba(52,224,161,${0.15 + p * 0.2})`;
+
+    raf.current = requestAnimationFrame(loop);
   };
 
-  const start=(e)=>{
-    if(done)return;
-    if (e && e.pointerId !== undefined && e.target.setPointerCapture) {
-      try { e.target.setPointerCapture(e.pointerId); } catch(err){}
-    }
-    mode.current='fill';
-    last.current=performance.now();
+  const start = (e) => {
+    if(done || holding) return;
+    if(e && e.preventDefault) e.preventDefault();
+    last.current = performance.now();
     cancelAnimationFrame(raf.current);
-    raf.current=requestAnimationFrame(loop);
+    raf.current = requestAnimationFrame(loop);
     setHolding(true);
-  };
-
-  const end=(e)=>{
-    if (e && e.pointerId !== undefined && e.target.releasePointerCapture) {
-      try { e.target.releasePointerCapture(e.pointerId); } catch(err){}
-    }
-    if(done||mode.current!=='fill')return;
-    setHolding(false);
-    mode.current='decay';
-    last.current=performance.now();
-    cancelAnimationFrame(raf.current);
-    raf.current=requestAnimationFrame(loop);
   };
 
   const handleApply = () => {
@@ -380,8 +382,27 @@ const Finale=()=>{
   };
 
   useEffect(()=>()=>cancelAnimationFrame(raf.current),[]);
-  useEffect(()=>{if(!done)return;let r;const s=performance.now();const t=now=>{const k=Math.min(1,(now-s)/3000);setVal(1962.9*(1-Math.pow(1-k,3)));if(k<1)r=requestAnimationFrame(t);};r=requestAnimationFrame(t);return()=>cancelAnimationFrame(r);},[done]);
-  const reset=()=>{setDone(false);pRef.current=0;setProgress(0);setVal(0);mode.current='idle';};
+  useEffect(()=>{
+    if(!done) return;
+    let r; const s=performance.now();
+    const t=now=>{
+      const k=Math.min(1,(now-s)/1500);
+      setVal(1962.9*(1-Math.pow(1-k,3)));
+      if(k<1) r=requestAnimationFrame(t);
+    };
+    r=requestAnimationFrame(t);
+    return()=>cancelAnimationFrame(r);
+  },[done]);
+
+  const reset=()=>{
+    setDone(false);
+    setProgress(0);
+    setVal(0);
+    setHolding(false);
+    pRef.current=0;
+    if(progressSpanRef.current) progressSpanRef.current.style.width = '0%';
+    if(buttonRef.current) buttonRef.current.style.boxShadow = `0 0 15px rgba(52,224,161,0.15)`;
+  };
 
   const revealed=TH.filter(t=>progress>=t).length;
   const eq=[[8,152],[28,150],[48,146],[68,149],[90,140],[110,143],[132,132],[154,135],[176,120],[198,123],[220,104],[242,100],[262,78],[282,58],[300,38],[314,22]];
@@ -392,7 +413,7 @@ const Finale=()=>{
       <AnimatePresence mode="wait">
       {!done?(
           <motion.div key="pre" exit={{opacity: 0, scale: 0.96}} transition={{duration: 0.5}}
-                      className="flex flex-col items-center text-center">
+                      className="flex flex-col items-center text-center w-full">
               <Reveal><p style={{fontFamily: SERIF, color: TXT}} className="text-4xl font-semibold leading-snug">五条法则，<br/>一条曲线。
               </p></Reveal>
               <Reveal delay={0.1}><p style={{color: DIM}} className="mt-5 text-base leading-relaxed">按住下方，<br/>见证它穿越牛熊。
@@ -417,9 +438,14 @@ const Finale=()=>{
                       </motion.div>
                   ))}
               </div>
-              <button onPointerDown={start} onPointerUp={end} onPointerLeave={end} onPointerCancel={end}
+
+              {/* 还原 UI：按下去自动蓄力，不再受手势离开或系统长按干扰 */}
+              <button onPointerDown={start} onClick={start}
                       onContextMenu={e => e.preventDefault()}
-                      onTouchStart={e => e.preventDefault()}
+                      onTouchStart={e => {
+                        // 阻止 iOS 下的选词放大镜和默认滑动等
+                        // e.preventDefault(); 如果阻止这个可能导致无法滚动，可根据实际体验斟酌，目前保留事件透传，因为onPointerDown已经接管
+                      }}
                       ref={buttonRef}
                       style={{
                           touchAction: 'none',
@@ -431,7 +457,7 @@ const Finale=()=>{
                           transform: 'translateZ(0)',
                           boxShadow: `0 0 ${15 + pRef.current * 20}px rgba(52,224,161,${0.15 + pRef.current * 0.2})`
                       }}
-                      className="relative w-full overflow-hidden rounded-full border-2 px-6 py-4">
+                      className="relative w-full overflow-hidden rounded-full border-2 px-6 py-4 cursor-pointer">
 
                   <span ref={progressSpanRef} className="absolute inset-y-0 left-0" style={{
                       width: `${pRef.current * 100}%`,
@@ -440,10 +466,10 @@ const Finale=()=>{
 
                   <span className="relative flex items-center justify-center gap-2"
                         style={{color: GREEN, transform: 'translateZ(0)'}}>
-              <Fingerprint size={18}/>
-              <span
-                  className="text-base font-semibold tracking-wide">{holding ? '正在揭晓…' : '按住不放 · 见证穿越牛熊的威力'}</span>
-            </span>
+                    <Fingerprint size={18}/>
+                    <span
+                        className="text-base font-semibold tracking-wide">{holding ? '正在揭晓…' : '按住不放 · 见证穿越牛熊的威力'}</span>
+                  </span>
               </button>
               <motion.p animate={{opacity: holding ? 0.4 : 0.7}} style={{fontFamily: MONO, color: DIM}}
                         className="mt-4 text-xs tracking-widest">
@@ -490,7 +516,6 @@ const Finale=()=>{
             <p style={{fontFamily:MONO,color:DIM}} className="mt-2 text-xs tracking-widest uppercase">Structure over Prediction</p>
           </div>
 
-          {/* CTA 延时浮出：先让大数字与曲线独占视野，再平滑展开转化区 */}
           <motion.div
             initial={{opacity: 0, height: 0, overflow: 'hidden'}}
             animate={{opacity: 1, height: 'auto'}}
@@ -600,24 +625,7 @@ export default function App(){
         <Principle idx="04" zh="穿越牛熊"
           maxim="牛市决定收益，熊市决定复利。"
           takeaway="熊市不亏，牛市起飞">
-          <div className="flex flex-col gap-4">
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <span style={{fontFamily:MONO,color:RED}} className="text-xs tracking-wider">熊市 · BEAR</span>
-                <span style={{fontFamily:MONO,color:DIM}} className="text-xs">基准 <span style={{color:RED}}>−38.2%</span> · 策略 <span style={{color:GREEN}}>+6.5%</span></span>
-              </div>
-              <BearChart/>
-              <p style={{fontFamily:MONO,color:GREEN}} className="text-xs">↑ 超额收益 +44.7%</p>
-            </div>
-            <div className="h-px w-full" style={{background:HAIR}}/>
-            <div>
-              <div className="mb-1 flex items-center justify-between">
-                <span style={{fontFamily:MONO,color:GREEN}} className="text-xs tracking-wider">牛市 · BULL</span>
-                <span style={{fontFamily:MONO,color:DIM}} className="text-xs">基准 +120% · 策略 <span style={{color:GREEN}}>+312%</span></span>
-              </div>
-              <BullChart/>
-            </div>
-          </div>
+          <BullBearTabs/>
         </Principle>
         <Principle idx="05" zh="系统驱动"
           maxim="把交易交给系统，把情绪踢出局。"
