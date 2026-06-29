@@ -310,9 +310,10 @@ const Finale=({ onViewRadar })=>{
   useEffect(()=>()=>cancelAnimationFrame(raf.current),[]);
 
   // 优化：挂载 Framer Motion 动画，脱离 React 管线渲染数字滚动
+  // 修改处：duration 设为 3，与下方折线图绘制时间保持完全一致
   useEffect(()=>{
     if(!done) return;
-    const controls = animate(valMotion, 1962.9, { duration: 1.5, ease: EASE });
+    const controls = animate(valMotion, 1962.9, { duration: 3, ease: EASE });
     return controls.stop;
   },[done, valMotion]);
 
@@ -368,40 +369,41 @@ const Finale=({ onViewRadar })=>{
               <div className="mt-6 rounded-2xl border p-4" style={{borderColor: HAIR, background: 'linear-gradient(180deg,#0F151E,#0B1118)'}}>
                   <svg viewBox="0 0 320 170" className="w-full h-44">
                       <motion.path d={area(eq, 160)} fill="url(#g-eq)" initial={{opacity: 0}} animate={{opacity: 1}} transition={{duration: 2, delay: 0.4}}/>
-                      <motion.path d={smooth(eq)} fill="none" stroke={GREEN} strokeWidth="2.6" strokeLinecap="round" initial={{pathLength:0}} animate={{pathLength:1}} transition={{duration:3,ease:'easeOut'}}/>
+                      {/* 修改处：ease 设为 EASE，与上方数字滚动曲线保持完全一致 */}
+                      <motion.path d={smooth(eq)} fill="none" stroke={GREEN} strokeWidth="2.6" strokeLinecap="round" initial={{pathLength:0}} animate={{pathLength:1}} transition={{duration:3,ease:EASE}}/>
               <line x1="6" y1="160" x2="314" y2="160" stroke={HAIR}/>
             </svg>
           </div>
 
-          <div className="mt-5 flex flex-col gap-3">
-            <div className="rounded-xl border p-4 flex justify-between items-center relative overflow-hidden" style={{borderColor:HAIR, background:'linear-gradient(135deg, rgba(52,224,161,0.12) 0%, rgba(52,224,161,0.02) 100%)'}}>
-              <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(52,224,161,0.2)'}}><span style={{fontSize:'9px', color:GREEN, fontWeight:'bold'}}>核心优势</span></div>
-              <div><p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">平均年化收益</p><p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">76.7%</p></div>
-              <div className="h-10 w-px" style={{background:'rgba(52,224,161,0.2)'}}></div>
-              <div className="text-right pr-2"><p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">盈亏比</p><p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">2.01</p></div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
-                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">测试 5 年完成</p>
-                <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">1280 <span className="text-xs font-normal text-[#8A93A3]">笔</span></p>
-              </div>
-              <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
-                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">平均持仓时间</p>
-                <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">38.5 <span className="text-xs font-normal text-[#8A93A3]">h</span></p>
-              </div>
-              <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
-                 <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(231,200,132,0.15)'}}><span style={{fontSize:'9px', color:GOLD}}>真实特征</span></div>
-                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">策略胜率</p><p style={{fontFamily:MONO,color:GOLD}} className="text-lg font-bold tabular-nums">41.9%</p>
-              </div>
-              <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
-                 <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(239,91,91,0.15)'}}><span style={{fontSize:'9px', color:RED}}>极限风险</span></div>
-                <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">最大回撤</p><p style={{fontFamily:MONO,color:RED}} className="text-lg font-bold tabular-nums">−20.5%</p>
-              </div>
-            </div>
-          </div>
-
           <motion.div initial={{opacity: 0, y: 15}} animate={{opacity: 1, y: 0}} transition={{delay: 2.8, duration: 0.8, ease: EASE}}>
+            <div className="mt-5 flex flex-col gap-3">
+              <div className="rounded-xl border p-4 flex justify-between items-center relative overflow-hidden" style={{borderColor:HAIR, background:'linear-gradient(135deg, rgba(52,224,161,0.12) 0%, rgba(52,224,161,0.02) 100%)'}}>
+                <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(52,224,161,0.2)'}}><span style={{fontSize:'9px', color:GREEN, fontWeight:'bold'}}>核心优势</span></div>
+                <div><p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">平均年化收益</p><p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">76.7%</p></div>
+                <div className="h-10 w-px" style={{background:'rgba(52,224,161,0.2)'}}></div>
+                <div className="text-right pr-2"><p style={{fontFamily:MONO,color:DIM}} className="text-xs tracking-wider">盈亏比</p><p style={{fontFamily:MONO,color:GREEN}} className="mt-1 text-2xl font-bold tabular-nums">2.01</p></div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
+                  <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">测试 5 年完成</p>
+                  <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">1280 <span className="text-xs font-normal text-[#8A93A3]">笔</span></p>
+                </div>
+                <div className="rounded-xl border p-3.5" style={{borderColor:HAIR}}>
+                  <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">平均持仓时间</p>
+                  <p style={{fontFamily:MONO,color:TXT}} className="text-lg font-bold tabular-nums">38.5 <span className="text-xs font-normal text-[#8A93A3]">h</span></p>
+                </div>
+                <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
+                   <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(231,200,132,0.15)'}}><span style={{fontSize:'9px', color:GOLD}}>真实特征</span></div>
+                  <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">策略胜率</p><p style={{fontFamily:MONO,color:GOLD}} className="text-lg font-bold tabular-nums">41.9%</p>
+                </div>
+                <div className="rounded-xl border p-3.5 relative overflow-hidden" style={{borderColor:HAIR}}>
+                   <div className="absolute top-0 right-0 rounded-bl-lg px-2 py-0.5" style={{background:'rgba(239,91,91,0.15)'}}><span style={{fontSize:'9px', color:RED}}>极限风险</span></div>
+                  <p style={{fontFamily:MONO,color:DIM}} className="text-[11px] tracking-wider mb-1">最大回撤</p><p style={{fontFamily:MONO,color:RED}} className="text-lg font-bold tabular-nums">−20.5%</p>
+                </div>
+              </div>
+            </div>
+
             <button onClick={onViewRadar} style={{ borderColor: GREEN, background: 'rgba(52,224,161,0.08)' }} className="mt-8 relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 transition-all duration-500 shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]">
               <div style={{color: GREEN}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest"><Activity size={18} /><span>查看实时交易信号</span></div>
             </button>
