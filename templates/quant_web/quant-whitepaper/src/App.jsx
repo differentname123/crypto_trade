@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, useScroll, AnimatePresence, useMotionValue, useTransform, animate } from 'framer-motion';
-import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink, Lock, ShieldAlert, Zap, RefreshCw, Database, Clock, Activity, ArrowLeft } from 'lucide-react';
+import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink, Lock, ShieldAlert, Zap, RefreshCw, Database, Clock, Activity, ArrowLeft, ArrowRight } from 'lucide-react';
 
 // ================= [ CONSTANTS & UTILS ] =================
 const INK='#0A0E14', INK2='#0F151E', GREEN='#34E0A1', RED='#EF5B5B', GOLD='#E7C884',
@@ -125,7 +125,6 @@ const BalanceScale=()=>{
   );
 };
 
-// 重构：合并 BearChart 和 BullChart 为同一组件
 const AreaChart = ({ type }) => {
   const isBear = type === 'bear';
   const bench = isBear ? [[10,45],[55,55],[105,72],[155,95],[205,114],[255,126],[290,131]] : [[10,128],[55,118],[105,108],[155,98],[205,90],[255,84],[290,80]];
@@ -148,7 +147,6 @@ const AreaChart = ({ type }) => {
 const BullBearTabs = () => {
   const [tab, setTab] = useState('bear');
   useEffect(() => {
-    // 增加 tab 依赖项，手动点击时完美重置定时器
     const timer = setInterval(() => setTab(prev => prev === 'bear' ? 'bull' : 'bear'), 3000);
     return () => clearInterval(timer);
   }, [tab]);
@@ -219,7 +217,7 @@ const ScrollBar=({ scrollRef })=>{
 };
 
 // ================= [ SECTIONS ] =================
-const Hero=()=>(
+const Hero=({ hasVisited, onSkip })=>(
   <section className="relative flex min-h-screen flex-col justify-center py-24 mx-auto w-full max-w-md px-6" style={{ scrollSnapAlign: 'center', scrollSnapStop: 'always' }}>
     <svg viewBox="0 0 320 200" preserveAspectRatio="xMidYMid slice" className="pointer-events-none absolute inset-x-0 bottom-10 w-full opacity-10">
       <path d={poly([[0,180],[60,170],[60,150],[120,140],[120,120],[190,110],[190,86],[255,74],[255,50],[320,36]])} fill="none" stroke={GREEN} strokeWidth="1.5"/>
@@ -227,6 +225,19 @@ const Hero=()=>(
     <motion.h2 initial={{opacity:0,y:16}} animate={{opacity:1,y:0}} transition={{duration:0.8,ease:EASE}} style={{fontFamily:SERIF,color:TXT}} className="mb-8 text-3xl font-medium tracking-wide">怎样才能<span style={{color:GOLD, textShadow:'0 0 20px rgba(231,200,132,0.4)'}}>赚钱</span>？</motion.h2>
     <motion.h1 initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.15,ease:EASE}} style={{fontFamily:SERIF,color:TXT}} className="text-5xl font-semibold leading-tight tracking-wide">不求常胜，<br/>但求<span style={{color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.35)'}}>大胜</span>。</motion.h1>
     <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.5,ease:EASE}} style={{color:DIM}} className="mt-8 text-lg leading-relaxed">穿越牛熊的，不是<span style={{color:TXT}}>预测</span>，是<span style={{color:GREEN}}>结构</span>。</motion.p>
+
+    {/* 【修改点：严格复用回测结果处的按钮样式与文案】 */}
+    {hasVisited && (
+      <motion.button
+        initial={{opacity:0}} animate={{opacity:1}} transition={{delay:0.8,duration:0.8}}
+        onClick={onSkip}
+        style={{ borderColor: GREEN, background: 'rgba(52,224,161,0.08)' }}
+        className="mt-8 relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 transition-all duration-500 shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]"
+      >
+        <div style={{color: GREEN}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest"><Activity size={18} /><span>查看实时交易信号</span></div>
+      </motion.button>
+    )}
+
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:1.2,duration:1}} className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1" style={{color:DIM}}>
       <motion.div animate={{y:[0,6,0]}} transition={{repeat:Infinity,duration:1.8}}><ChevronsDown size={18}/></motion.div>
       <span style={{fontFamily:MONO}} className="text-xs tracking-widest">SCROLL</span>
@@ -264,7 +275,6 @@ const Finale=({ onViewRadar })=>{
         [holding,setHolding]=useState(false),
         [done,setDone]=useState(false);
 
-  // 优化：使用 Framer Motion 原生值替代高频 React state 更新
   const valMotion = useMotionValue(0);
   const valRounded = useTransform(valMotion, v => v.toFixed(1));
 
@@ -288,7 +298,6 @@ const Finale=({ onViewRadar })=>{
 
     const oldRevealed = TH.filter(t => pRef.current >= t).length;
     const newRevealed = TH.filter(t => p >= t).length;
-    // 仅当 checkmark 数量变化时才触发 React 渲染
     if (newRevealed !== oldRevealed) setProgress(p);
 
     pRef.current = p;
@@ -309,8 +318,6 @@ const Finale=({ onViewRadar })=>{
 
   useEffect(()=>()=>cancelAnimationFrame(raf.current),[]);
 
-  // 优化：挂载 Framer Motion 动画，脱离 React 管线渲染数字滚动
-  // 修改处：duration 设为 3，与下方折线图绘制时间保持完全一致
   useEffect(()=>{
     if(!done) return;
     const controls = animate(valMotion, 1962.9, { duration: 3, ease: EASE });
@@ -369,7 +376,6 @@ const Finale=({ onViewRadar })=>{
               <div className="mt-6 rounded-2xl border p-4" style={{borderColor: HAIR, background: 'linear-gradient(180deg,#0F151E,#0B1118)'}}>
                   <svg viewBox="0 0 320 170" className="w-full h-44">
                       <motion.path d={area(eq, 160)} fill="url(#g-eq)" initial={{opacity: 0}} animate={{opacity: 1}} transition={{duration: 2, delay: 0.4}}/>
-                      {/* 修改处：ease 设为 EASE，与上方数字滚动曲线保持完全一致 */}
                       <motion.path d={smooth(eq)} fill="none" stroke={GREEN} strokeWidth="2.6" strokeLinecap="round" initial={{pathLength:0}} animate={{pathLength:1}} transition={{duration:3,ease:EASE}}/>
               <line x1="6" y1="160" x2="314" y2="160" stroke={HAIR}/>
             </svg>
@@ -419,8 +425,12 @@ const Finale=({ onViewRadar })=>{
 
 const SignalRadar = ({ onBack }) => {
   const WECHAT_ID = 'Alpha_Quant_01';
+
+  const [showWarningModal, setShowWarningModal] = useState(false);
+  const [modalStep, setModalStep] = useState(1);
   const [agreed, setAgreed] = useState(false);
-  const [showModal, setShowModal] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+
   const [signalData, setSignalData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchTime, setFetchTime] = useState('--');
@@ -450,7 +460,7 @@ const SignalRadar = ({ onBack }) => {
   const handleApply = () => {
     if (!agreed) return;
     try { navigator.clipboard.writeText(WECHAT_ID); } catch (err) {}
-    setShowModal(true);
+    setModalStep(2);
   };
 
   if (!signalData) {
@@ -461,6 +471,8 @@ const SignalRadar = ({ onBack }) => {
       </div>
     );
   }
+
+  const displayHistory = showHistory ? signalData.historyPositions : signalData.historyPositions.slice(0, 3);
 
   return (
     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="min-h-screen py-10 px-4 mx-auto w-full max-w-md">
@@ -511,12 +523,23 @@ const SignalRadar = ({ onBack }) => {
         )}
       </div>
 
+      <div className="mb-10 rounded-xl border p-5 shadow-lg" style={{borderColor: 'rgba(52,224,161,0.25)', background: 'linear-gradient(135deg, rgba(52,224,161,0.06) 0%, transparent 100%)'}}>
+        <div className="flex items-center gap-2 mb-3">
+          <Zap size={16} color={GREEN}/>
+          <span style={{fontFamily: MONO, color: GREEN}} className="text-sm font-bold tracking-widest">SYSTEM UPGRADE | 自动化实盘接入</span>
+        </div>
+        <p className="text-xs text-[#BCC2CE] mb-4 leading-relaxed">当前页面信号免费公开，但人工盯盘必定产生时间滑点。为实现毫秒级系统执行，现免费开放 Alpha 节点 API 自动化交易权限申请。</p>
+        <button onClick={() => {setShowWarningModal(true); setModalStep(1); setAgreed(false);}} style={{background: GREEN, color: INK}} className="flex w-full items-center justify-center gap-2 rounded-lg py-3 text-[14px] font-bold transition-transform active:scale-[0.98]">
+          申请 API 自动化对接权限 <ArrowRight size={16} />
+        </button>
+      </div>
+
       <h3 className="text-[#8A93A3] font-bold mb-4">历史记录 (已平仓)</h3>
       <div className="flex flex-col gap-3 mb-12">
-        {signalData.historyPositions.length === 0 ? (
+        {displayHistory.length === 0 ? (
            <div className="text-center py-6 text-[#8A93A3] text-sm border border-dashed border-white/10 rounded-lg">暂无历史记录</div>
         ) : (
-          signalData.historyPositions.map((pos, idx) => {
+          displayHistory.map((pos, idx) => {
             const actionColor = pos.isBuyAction ? '#34E0A1' : '#EF5B5B';
             const actionBorder = pos.isBuyAction ? 'rgba(52,224,161,0.3)' : 'rgba(239,91,91,0.3)';
             const actionBg = pos.isBuyAction ? 'rgba(52,224,161,0.1)' : 'rgba(239,91,91,0.1)';
@@ -539,54 +562,68 @@ const SignalRadar = ({ onBack }) => {
             )
           })
         )}
-      </div>
 
-      <div className="mt-8 rounded-xl border border-dashed border-[#E7C884]/30 bg-[#E7C884]/[0.03] p-5">
-        <div className="mb-4 flex items-center gap-2"><ShieldAlert size={16} color={GOLD}/><span style={{fontFamily:MONO, color:GOLD}} className="text-xs font-bold tracking-widest">SYSTEM WARNING · 接入前必读</span></div>
-        <ul className="flex flex-col gap-3.5">
-          {[
-            {t:'极其枯燥乏味', d:'严格的信号过滤会导致极长时间空仓等待。如果您追求高频交易的刺激，请立即关闭本页面。'},
-            {t:'存在连续止损', d:'胜率仅 41.9%，利润全靠高盈亏比。震荡市必定会经历连续的小额止损试错，以此换取大趋势的暴利。'},
-            {t:'反人性执行', d:'放弃“一夜暴富”的短期幻想。本系统专注长线复利，市场狂热时可能强制空仓，需绝对服从机器纪律。'},
-            {t:'拒绝造神神话', d:'绝不盲目抄底逃顶。系统严格执行右侧交易确认，主动放弃头部与尾部的高风险利润，只吃最确定的鱼身。'}
-          ].map((item, i) => (
-            <li key={i} className="flex flex-col"><span style={{color:TXT}} className="mb-1 text-sm font-semibold">· {item.t}</span><span style={{color:DIM}} className="text-[11px] leading-relaxed">{item.d}</span></li>
-          ))}
-        </ul>
+        {!showHistory && signalData.historyPositions.length > 3 && (
+          <button onClick={() => setShowHistory(true)} className="w-full rounded-lg border border-white/5 bg-white/[0.02] py-3 text-xs text-[#8A93A3] hover:text-white transition-colors mt-2">
+            展开全部历史交易记录
+          </button>
+        )}
       </div>
-
-      <div className="mt-6 mb-6 flex cursor-pointer items-start gap-3 rounded-lg p-2 transition-colors hover:bg-white/[0.02]" onClick={()=>setAgreed(!agreed)}>
-        <div className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${agreed ? 'border-[#34E0A1] bg-[#34E0A1]/20' : 'border-[#8A93A3]/50'}`}>
-          {agreed && <Check size={12} color={GREEN} strokeWidth={4}/>}
-        </div>
-        <p style={{color: DIM}} className="text-[11px] leading-relaxed">我已理解：真正的交易是一场反人性的修行。<br/>想感受时间复利的魅力。</p>
-      </div>
-
-      <button onClick={agreed ? handleApply : undefined} disabled={!agreed} style={{ borderColor: agreed ? GREEN : HAIR, background: agreed ? 'rgba(52,224,161,0.08)' : 'transparent', opacity: agreed ? 1 : 0.4, cursor: agreed ? 'pointer' : 'not-allowed' }} className={`relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 mb-10 transition-all duration-500 ${agreed ? 'shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]' : ''}`}>
-        <div style={{color: agreed ? GREEN : DIM}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest transition-colors">{agreed ? <WeChatIcon size={18} /> : <Lock size={18} />}<span>{agreed ? '获取 Alpha 节点密钥' : '请先确认接受上述规则'}</span></div>
-        <span style={{fontFamily: MONO, color: DIM}} className="text-[11px] font-medium uppercase tracking-widest">Invitation Only · 凭口令获取信号</span>
-      </button>
 
       <AnimatePresence>
-        {showModal && (
+        {showWarningModal && (
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center p-6 backdrop-blur-md" style={{ background: 'rgba(10, 14, 20, 0.85)' }}>
             <motion.div initial={{ scale: 0.95, y: 10 }} animate={{ scale: 1, y: 0 }} exit={{ scale: 0.95, y: 10 }} className="relative w-full max-w-sm overflow-hidden rounded-2xl border border-white/10 bg-[#0A0E14] shadow-2xl">
-              <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
-              <div className="flex flex-col items-center p-8 text-center">
-                <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
-                <h3 className="mb-2 text-lg font-bold text-white tracking-wider">系统访问权限已生成</h3>
-                <p style={{color: DIM}} className="mb-6 text-xs">管理员节点已自动复制至剪贴板</p>
-                <div className="mb-5 w-full rounded-xl border border-white/5 bg-[#000000] py-4">
-                  <p className="mb-1 text-[10px] uppercase tracking-widest text-[#8A93A3]" style={{fontFamily:MONO}}>System Admin ID</p>
-                  <p style={{fontFamily: MONO, color: TXT}} className="text-2xl font-bold tracking-wider">{WECHAT_ID}</p>
-                </div>
-                <div className="mb-8 flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left" style={{borderColor: 'rgba(231,200,132,0.2)', background: 'rgba(231,200,132,0.05)'}}>
-                  <AlertCircle size={16} className="mt-0.5 shrink-0" style={{color: GOLD}} />
-                  <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>出于严格风控，添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>Alpha节点</span>，否则您的请求将被系统无视。</p>
-                </div>
-                <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信前往验证 <ExternalLink size={16} /></button>
-                <button onClick={() => setShowModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white">关闭窗口</button>
-              </div>
+
+              {modalStep === 1 ? (
+                <>
+                  <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#EF5B5B] to-transparent opacity-50"></div>
+                  <div className="flex flex-col p-6 text-left">
+                    <div className="mb-4 flex items-center gap-2"><ShieldAlert size={20} color={RED}/><span style={{fontFamily:MONO, color:RED}} className="text-base font-bold tracking-widest">SYSTEM WARNING<br/>接入前必读</span></div>
+                    <ul className="flex flex-col gap-3.5 mb-6">
+                      {[
+                        {t:'极其枯燥乏味', d:'严格的信号过滤会导致极长时间空仓等待。如果您追求高频交易的刺激，请立即关闭本页面。'},
+                        {t:'存在连续止损', d:'胜率仅 41.9%，利润全靠高盈亏比。震荡市必定会经历连续的小额止损试错，以此换取大趋势的暴利。'},
+                        {t:'反人性执行', d:'放弃“一夜暴富”的短期幻想。本系统专注长线复利，市场狂热时可能强制空仓，需绝对服从机器纪律。'},
+                        {t:'拒绝造神神话', d:'绝不盲目抄底逃顶。系统严格执行右侧交易确认，主动放弃头部与尾部的高风险利润，只吃最确定的鱼身。'}
+                      ].map((item, i) => (
+                        <li key={i} className="flex flex-col"><span style={{color:TXT}} className="mb-1 text-sm font-semibold">· {item.t}</span><span style={{color:DIM}} className="text-[11px] leading-relaxed">{item.d}</span></li>
+                      ))}
+                    </ul>
+
+                    <div className="mb-6 flex cursor-pointer items-start gap-3 rounded-lg p-3 transition-colors bg-white/[0.03] border border-white/5" onClick={()=>setAgreed(!agreed)}>
+                      <div className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${agreed ? 'border-[#34E0A1] bg-[#34E0A1]/20' : 'border-[#8A93A3]/50'}`}>
+                        {agreed && <Check size={12} color={GREEN} strokeWidth={4}/>}
+                      </div>
+                      <p style={{color: DIM}} className="text-[11px] leading-relaxed">我已理解：真正的交易是一场反人性的修行。绝无暴富幻想，接受连续止损，严格服从系统纪律。</p>
+                    </div>
+
+                    <button onClick={agreed ? handleApply : undefined} disabled={!agreed} style={{ background: agreed ? GREEN : 'rgba(255,255,255,0.05)', color: agreed ? INK : DIM, opacity: agreed ? 1 : 0.5}} className={`w-full flex items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-all ${agreed ? 'active:scale-[0.98] shadow-[0_0_15px_rgba(52,224,161,0.2)]' : 'cursor-not-allowed'}`}>
+                       {agreed ? <Zap size={18} /> : <Lock size={18} />} 获取自动化接入密钥
+                    </button>
+                    <button onClick={() => setShowWarningModal(false)} className="mt-4 text-xs text-center w-full text-[#8A93A3] hover:text-white transition-colors">放弃接入，关闭窗口</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
+                  <div className="flex flex-col items-center p-8 text-center">
+                    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
+                    <h3 className="mb-2 text-lg font-bold text-white tracking-wider">系统访问权限已生成</h3>
+                    <p style={{color: DIM}} className="mb-6 text-xs">管理员节点已自动复制至剪贴板</p>
+                    <div className="mb-5 w-full rounded-xl border border-white/5 bg-[#000000] py-4">
+                      <p className="mb-1 text-[10px] uppercase tracking-widest text-[#8A93A3]" style={{fontFamily:MONO}}>System Architect ID</p>
+                      <p style={{fontFamily: MONO, color: TXT}} className="text-2xl font-bold tracking-wider">{WECHAT_ID}</p>
+                    </div>
+                    <div className="mb-8 flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left" style={{borderColor: 'rgba(231,200,132,0.2)', background: 'rgba(231,200,132,0.05)'}}>
+                      <AlertCircle size={16} className="mt-0.5 shrink-0" style={{color: GOLD}} />
+                      <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>出于严格的技术风控，添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>自动化API对接</span>，以便获取开发文档与系统密钥。</p>
+                    </div>
+                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信前往验证 <ExternalLink size={16} /></button>
+                    <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white">完成并关闭窗口</button>
+                  </div>
+                </>
+              )}
             </motion.div>
           </motion.div>
         )}
@@ -598,6 +635,21 @@ const SignalRadar = ({ onBack }) => {
 export default function App(){
   const scrollRef = useRef(null);
   const [view, setView] = useState('landing');
+  const [hasVisited, setHasVisited] = useState(false);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setHasVisited(localStorage.getItem('hasVisitedRadar') === 'true');
+    }
+  }, []);
+
+  const goToRadar = () => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('hasVisitedRadar', 'true');
+    }
+    setHasVisited(true);
+    setView('radar');
+  };
 
   return(
     <div style={{background:INK,color:TXT,fontFamily:SANS}} className="relative h-screen w-full overflow-hidden">
@@ -609,13 +661,13 @@ export default function App(){
         <>
           <ScrollBar scrollRef={scrollRef} />
           <div ref={scrollRef} className="relative z-10 h-full w-full overflow-y-auto overflow-x-hidden" style={{ scrollSnapType: 'y mandatory' }}>
-            <Hero/>
+            <Hero hasVisited={hasVisited} onSkip={goToRadar}/>
             <Principle idx="01" zh="捕捉趋势" maxim="市场不可预测，规则方可长青。" takeaway="不预测，只跟随趋势"><MartingaleChart/></Principle>
             <Principle idx="02" zh="控制回撤" maxim="先求不死，再求大胜。" takeaway="回撤可控，绝不致命"><RecoveryChart/></Principle>
             <Principle idx="03" zh="及时止损" maxim="截断亏损，让利润奔跑。" takeaway="亏有底线，赢无上限"><BalanceScale/></Principle>
             <Principle idx="04" zh="穿越牛熊" maxim="牛市决定收益，熊市决定复利。" takeaway="熊市不亏，牛市起飞"><BullBearTabs/></Principle>
             <Principle idx="05" zh="系统驱动" maxim="把交易交给系统，把情绪踢出局。" takeaway="规则驱动，透明可验"><SystematicChart/><RuleStatus/></Principle>
-            <Finale onViewRadar={() => setView('radar')}/>
+            <Finale onViewRadar={goToRadar}/>
           </div>
         </>
       ) : (
