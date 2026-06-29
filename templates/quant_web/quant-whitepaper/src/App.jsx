@@ -675,29 +675,36 @@ const fetchSignals = async () => {
                 <>
                   <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#EF5B5B] to-transparent opacity-50"></div>
                   <div className="flex flex-col p-6 text-left">
-                    <div className="mb-4 flex items-center gap-2"><ShieldAlert size={20} color={RED}/><span style={{fontFamily:MONO, color:RED}} className="text-base font-bold tracking-widest">SYSTEM WARNING<br/>接入前必读</span></div>
-                    <ul className="flex flex-col gap-3.5 mb-6">
+                    <div className="mb-4 flex items-center gap-2"><ShieldAlert size={20} color={RED}/><span style={{fontFamily:MONO, color:RED}} className="text-base font-bold tracking-widest">SYSTEM WARNING<br/>接入须知</span></div>
+
+                    <ul className="flex flex-col gap-4 mb-6">
                       {[
-                        {t:'极其枯燥乏味', d:'严格的信号过滤会导致极长时间空仓等待。如果您追求高频交易的刺激，请立即关闭本页面。'},
-                        {t:'存在连续止损', d:'胜率仅 41.9%，利润全靠高盈亏比。震荡市必定会经历连续的小额止损试错，以此换取大趋势的暴利。'},
-                        {t:'反人性执行', d:'放弃“一夜暴富”的短期幻想。本系统专注长线复利，市场狂热时可能强制空仓，需绝对服从机器纪律。'},
-                        {t:'拒绝造神神话', d:'绝不盲目抄底逃顶。系统严格执行右侧交易确认，主动放弃头部与尾部的高风险利润，只吃最确定的鱼身。'}
+                        {t:'低频交易', d:'大量时间空仓，拒绝高频无效操作，不适合追求高频刺激的用户。'},
+                        {t:'接受止损', d:'用连续的小额亏损，换取单次大赚。靠高盈亏比与大趋势获利。'},
+                        {t:'机器纪律', d:'放弃短期暴富幻想，绝对服从系统。做时间的朋友。'},
+                        {t:'顺势而为', d:'不抄底不逃顶，只吃确定性的波段，专注长线复利。'}
                       ].map((item, i) => (
-                        <li key={i} className="flex flex-col"><span style={{color:TXT}} className="mb-1 text-sm font-semibold">· {item.t}</span><span style={{color:DIM}} className="text-[11px] leading-relaxed">{item.d}</span></li>
+                        <li key={i} className="flex items-start gap-2.5">
+                          <div className="mt-1.5 flex h-1.5 w-1.5 shrink-0 rounded-full bg-[#EF5B5B]/80"></div>
+                          <div className="flex flex-col">
+                            <span style={{color:TXT}} className="text-[14px] font-bold tracking-wide">{item.t}</span>
+                            <span style={{color:DIM}} className="text-[12px] mt-0.5 leading-relaxed">{item.d}</span>
+                          </div>
+                        </li>
                       ))}
                     </ul>
 
-                    <div className="mb-6 flex cursor-pointer items-start gap-3 rounded-lg p-3 transition-colors bg-white/[0.03] border border-white/5" onClick={()=>setAgreed(!agreed)}>
-                      <div className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${agreed ? 'border-[#34E0A1] bg-[#34E0A1]/20' : 'border-[#8A93A3]/50'}`}>
+                    <div className="mb-6 flex cursor-pointer items-center gap-3 rounded-lg p-3 transition-colors bg-white/[0.03] border border-white/5" onClick={()=>setAgreed(!agreed)}>
+                      <div className={`flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-all ${agreed ? 'border-[#34E0A1] bg-[#34E0A1]/20' : 'border-[#8A93A3]/50'}`}>
                         {agreed && <Check size={12} color={GREEN} strokeWidth={4}/>}
                       </div>
-                      <p style={{color: DIM}} className="text-[11px] leading-relaxed">我已理解：真正的交易是一场反人性的修行。感受时间复利的魅力。</p>
+                      <p style={{color: DIM}} className="text-[12px]">我已理解：交易是一场反人性的修行，感受时间复利魅力。</p>
                     </div>
 
                     <button onClick={agreed ? handleApply : undefined} disabled={!agreed} style={{ background: agreed ? GREEN : 'rgba(255,255,255,0.05)', color: agreed ? INK : DIM, opacity: agreed ? 1 : 0.5}} className={`w-full flex items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-all ${agreed ? 'active:scale-[0.98] shadow-[0_0_15px_rgba(52,224,161,0.2)]' : 'cursor-not-allowed'}`}>
-                       {agreed ? <Zap size={18} /> : <Lock size={18} />} 获取自动化接入密钥
+                       {agreed ? <Zap size={18} /> : <Lock size={18} />} 获取自动化接入
                     </button>
-                    <button onClick={() => setShowWarningModal(false)} className="mt-4 text-xs text-center w-full text-[#8A93A3] hover:text-white transition-colors">放弃接入，关闭窗口</button>
+                    <button onClick={() => setShowWarningModal(false)} className="mt-4 text-xs text-center w-full text-[#8A93A3] hover:text-white transition-colors">暂不接入，关闭窗口</button>
                   </div>
                 </>
               ) : (
@@ -705,18 +712,18 @@ const fetchSignals = async () => {
                   <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
                   <div className="flex flex-col items-center p-8 text-center">
                     <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
-                    <h3 className="mb-2 text-lg font-bold text-white tracking-wider">系统访问权限已生成</h3>
-                    <p style={{color: DIM}} className="mb-6 text-xs">管理员微信号已自动复制至剪贴板</p>
+                    <h3 className="mb-1 text-lg font-bold text-white tracking-wider">权限生成成功</h3>
+                    <p style={{color: DIM}} className="mb-6 text-xs">微信 ID 已自动复制至剪贴板</p>
                     <div className="mb-5 w-full rounded-xl border border-white/5 bg-[#000000] py-4">
                       <p className="mb-1 text-[10px] uppercase tracking-widest text-[#8A93A3]" style={{fontFamily:MONO}}>System Architect ID</p>
                       <p style={{fontFamily: MONO, color: TXT}} className="text-2xl font-bold tracking-wider">{WECHAT_ID}</p>
                     </div>
                     <div className="mb-8 flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left" style={{borderColor: 'rgba(231,200,132,0.2)', background: 'rgba(231,200,132,0.05)'}}>
                       <AlertCircle size={16} className="mt-0.5 shrink-0" style={{color: GOLD}} />
-                      <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>出于严格的技术风控，添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>实时跟单</span>，以便获取跟单教程。</p>
+                      <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>实时跟单</span>，以获取对接教程。</p>
                     </div>
-                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信前往验证 <ExternalLink size={16} /></button>
-                    <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white">完成并关闭窗口</button>
+                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信验证 <ExternalLink size={16} /></button>
+                    <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white">完成并关闭</button>
                   </div>
                 </>
               )}
