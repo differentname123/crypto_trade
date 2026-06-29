@@ -40,6 +40,91 @@ const ChartFrame=({children})=>(
   </Reveal>
 );
 
+// 新增：高转化率交互按钮组件
+const RadarButton = ({ onClick, text = "查看实时交易信号" }) => (
+  <motion.button
+    onClick={onClick}
+    whileHover={{ scale: 1.02 }}
+    whileTap={{ scale: 0.98 }}
+    className="group relative mt-8 flex w-full flex-col items-center justify-center gap-1.5 overflow-hidden rounded-xl border py-4 transition-all duration-300 shadow-[0_0_20px_rgba(52,224,161,0.15)] hover:shadow-[0_0_30px_rgba(52,224,161,0.25)]"
+    style={{ borderColor: GREEN, background: 'linear-gradient(180deg, rgba(52,224,161,0.12) 0%, rgba(10,14,20,0.9) 100%)' }}
+  >
+    {/* 扫光动效 (Shimmer) */}
+    <motion.div
+      className="absolute inset-0 z-0 w-[200%] opacity-40"
+      style={{ background: 'linear-gradient(90deg, transparent, rgba(52,224,161,0.3), transparent)' }}
+      animate={{ x: ['-100%', '100%'] }}
+      transition={{ repeat: Infinity, duration: 2.5, ease: 'easeInOut' }}
+    />
+
+    <div className="relative z-10 flex items-center gap-3 text-[16px] font-bold tracking-widest" style={{ color: GREEN }}>
+      {/* 呼吸红点/绿点表示 LIVE */}
+      <div className="relative flex h-3 w-3 items-center justify-center">
+        <motion.span animate={{ scale: [1, 2.2, 1], opacity: [0.8, 0, 0.8] }} transition={{ repeat: Infinity, duration: 2 }} className="absolute inline-flex h-full w-full rounded-full opacity-75" style={{ backgroundColor: GREEN }} />
+        <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ backgroundColor: GREEN }} />
+      </div>
+      <span className="group-hover:text-white transition-colors duration-300">{text}</span>
+      <ArrowRight size={18} className="group-hover:translate-x-1 transition-transform duration-300" />
+    </div>
+    <p className="relative z-10 text-[10px] tracking-widest transition-colors" style={{ fontFamily: MONO, color: DIM }}>
+      SYSTEM ACTIVE · LIVE DATA
+    </p>
+  </motion.button>
+);
+
+// 新增：量化引擎运行状态组件 (用于雷达页面)
+const StrategyEngineStatus = () => {
+const tickerTexts = [
+    "正在同步全局 Order Book 毫秒级深度快照...",
+    "清洗异常 Tick 数据，屏蔽短期市场噪音...",
+    "跨周期均线系统共振度校验中...",
+    "正在重算动量与波动率因子暴露度...",
+    "支撑/阻力位热力图重构完成 [OK]",
+    "当前波动率偏度超限，强制启动空仓保护机制...",
+    "系统判定处于无序震荡期，维持静默观望...",
+    "左侧抄底特征明显，系统已拒绝执行开仓...",
+    "耐心潜伏，等待放量突破的右侧确立信号...",
+    "黑天鹅预警模块持续运行，当前风险 [LOW]...",
+    "滑点与冲击成本动态预估模型运转中...",
+  ];
+  const [idx, setIdx] = useState(0);
+
+  useEffect(() => {
+    const timer = setInterval(() => setIdx((prev) => (prev + 1) % tickerTexts.length), 3000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="mb-6 flex items-center justify-between rounded-xl border p-4 shadow-lg backdrop-blur-sm" style={{ borderColor: 'rgba(52,224,161,0.2)', background: 'linear-gradient(90deg, rgba(52,224,161,0.08) 0%, rgba(10,14,20,0.5) 100%)' }}>
+      <div className="flex items-center gap-4">
+        {/* 雷达扫描外圈 + 心跳内圈 */}
+        <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full border" style={{ borderColor: 'rgba(52,224,161,0.3)', background: 'rgba(52,224,161,0.1)' }}>
+          <Activity size={18} color={GREEN} />
+          <motion.svg className="absolute inset-0 h-full w-full" viewBox="0 0 100 100">
+            <motion.circle cx="50" cy="50" r="48" fill="none" stroke={GREEN} strokeWidth="2" strokeDasharray="40 260" strokeLinecap="round" animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 3, ease: "linear" }} />
+          </motion.svg>
+        </div>
+        <div className="flex flex-col overflow-hidden">
+          <span style={{ fontFamily: MONO, color: GREEN }} className="text-xs font-bold tracking-widest mb-1">
+            策略引擎循环分析
+          </span>
+          <div className="h-4 relative w-48">
+            <AnimatePresence mode="wait">
+              <motion.span key={idx} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} transition={{ duration: 0.3 }} style={{ fontFamily: MONO, color: DIM }} className="absolute text-[10px] whitespace-nowrap">
+                {tickerTexts[idx]}
+              </motion.span>
+            </AnimatePresence>
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-col items-center gap-1 shrink-0">
+        <motion.div animate={{ opacity: [0.3, 1, 0.3] }} transition={{ repeat: Infinity, duration: 1.2 }} className="h-2 w-2 rounded-full" style={{ background: GREEN }} />
+        <span style={{ fontFamily: MONO, fontSize: '8px', color: GREEN }}>运行中</span>
+      </div>
+    </div>
+  );
+};
+
 // 全局 SVG Defs (消灭数百行重复渐变代码)
 const GlobalSvgDefs=()=>(
   <svg style={{width:0,height:0,position:'absolute'}} aria-hidden="true">
@@ -226,16 +311,11 @@ const Hero=({ hasVisited, onSkip })=>(
     <motion.h1 initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.15,ease:EASE}} style={{fontFamily:SERIF,color:TXT}} className="text-5xl font-semibold leading-tight tracking-wide">不求常胜，<br/>但求<span style={{color:GOLD,textShadow:'0 0 30px rgba(231,200,132,0.35)'}}>大胜</span>。</motion.h1>
     <motion.p initial={{opacity:0,y:20}} animate={{opacity:1,y:0}} transition={{duration:0.9,delay:0.5,ease:EASE}} style={{color:DIM}} className="mt-8 text-lg leading-relaxed">穿越牛熊的，不是<span style={{color:TXT}}>预测</span>，是<span style={{color:GREEN}}>结构</span>。</motion.p>
 
-    {/* 【修改点：严格复用回测结果处的按钮样式与文案】 */}
+    {/* 替换为新的重构按钮 */}
     {hasVisited && (
-      <motion.button
-        initial={{opacity:0}} animate={{opacity:1}} transition={{delay:0.8,duration:0.8}}
-        onClick={onSkip}
-        style={{ borderColor: GREEN, background: 'rgba(52,224,161,0.08)' }}
-        className="mt-8 relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 transition-all duration-500 shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]"
-      >
-        <div style={{color: GREEN}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest"><Activity size={18} /><span>查看实时交易信号</span></div>
-      </motion.button>
+      <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:0.8,duration:0.8}}>
+        <RadarButton onClick={onSkip} />
+      </motion.div>
     )}
 
     <motion.div initial={{opacity:0}} animate={{opacity:1}} transition={{delay:1.2,duration:1}} className="absolute inset-x-0 bottom-8 flex flex-col items-center gap-1" style={{color:DIM}}>
@@ -410,9 +490,9 @@ const Finale=({ onViewRadar })=>{
               </div>
             </div>
 
-            <button onClick={onViewRadar} style={{ borderColor: GREEN, background: 'rgba(52,224,161,0.08)' }} className="mt-8 relative flex w-full flex-col items-center justify-center gap-1.5 rounded-xl border py-4 transition-all duration-500 shadow-[0_0_20px_rgba(52,224,161,0.12)] active:scale-[0.98]">
-              <div style={{color: GREEN}} className="flex items-center gap-2.5 text-[16px] font-bold tracking-widest"><Activity size={18} /><span>查看实时交易信号</span></div>
-            </button>
+            {/* 替换为新的重构按钮 */}
+            <RadarButton onClick={onViewRadar} />
+
             <button onClick={reset} style={{borderColor:HAIR,color:DIM,fontFamily:MONO}} className="mt-4 mx-auto block rounded-full border px-4 py-2 text-xs tracking-widest transition-colors hover:text-white">↻ 重新演示</button>
             <p style={{color:DIM}} className="mt-8 text-center text-xs leading-relaxed opacity-60">*历史回测数据，不代表未来收益，不构成投资建议。</p>
           </motion.div>
@@ -478,7 +558,7 @@ const SignalRadar = ({ onBack }) => {
     <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="min-h-screen py-10 px-4 mx-auto w-full max-w-md">
       <button onClick={onBack} className="flex items-center gap-1 text-[#8A93A3] text-sm mb-6 hover:text-white transition-colors"><ArrowLeft size={16}/> 返回回测</button>
 
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-1.5 text-[#3C82F6]"><Zap size={20} fill="currentColor" /><span className="font-bold text-lg tracking-wide text-white">交易信号雷达</span></div>
         <div className="flex items-center gap-2 text-[#8A93A3] text-xs">
           <div className="flex flex-col text-right"><span>最后更新</span><span style={{fontFamily: MONO}}>{fetchTime}</span></div>
@@ -487,6 +567,9 @@ const SignalRadar = ({ onBack }) => {
           </button>
         </div>
       </div>
+
+      {/* 新增：引擎运行状态板 */}
+      <StrategyEngineStatus />
 
       <div className="grid grid-cols-2 gap-3 mb-8">
         <div className="bg-[#0F151E] border border-white/5 rounded-xl p-3 shadow-sm">
