@@ -710,20 +710,25 @@ const fetchSignals = async () => {
               ) : (
                 <>
                   <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
-                  <div className="flex flex-col items-center p-8 text-center">
-                    <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
-                    <h3 className="mb-1 text-lg font-bold text-white tracking-wider">权限生成成功</h3>
-                    <p style={{color: DIM}} className="mb-6 text-xs">微信 ID 已自动复制至剪贴板</p>
-                    <div className="mb-5 w-full rounded-xl border border-white/5 bg-[#000000] py-4">
-                      <p className="mb-1 text-[10px] uppercase tracking-widest text-[#8A93A3]" style={{fontFamily:MONO}}>System Architect ID</p>
-                      <p style={{fontFamily: MONO, color: TXT}} className="text-2xl font-bold tracking-wider">{WECHAT_ID}</p>
+                  <div className="flex flex-col items-center p-8 text-center pb-6">
+                    <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
+                    <h3 className="text-lg font-bold text-white tracking-wider">已复制微信号</h3>
+                    <p style={{color: DIM}} className="mt-1.5 mb-6 text-xs">请前往微信添加助手完成对接</p>
+
+                    <div className="mb-6 w-full rounded-xl border border-white/5 bg-[#000000] p-4 flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[13px] text-[#8A93A3]">微信号</span>
+                        <span style={{fontFamily: MONO, color: TXT}} className="text-[17px] font-bold tracking-wider">{WECHAT_ID}</span>
+                      </div>
+                      <div className="h-px w-full bg-white/5"></div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[13px] text-[#8A93A3]">验证口令</span>
+                        <span style={{color: GOLD}} className="text-[17px] font-bold tracking-widest">实时跟单</span>
+                      </div>
                     </div>
-                    <div className="mb-8 flex w-full items-start gap-3 rounded-xl border px-4 py-3.5 text-left" style={{borderColor: 'rgba(231,200,132,0.2)', background: 'rgba(231,200,132,0.05)'}}>
-                      <AlertCircle size={16} className="mt-0.5 shrink-0" style={{color: GOLD}} />
-                      <p className="text-xs leading-relaxed" style={{color: '#BCC2CE'}}>添加时请务必发送验证口令 <span className="font-bold tracking-widest" style={{color: GOLD}}>实时跟单</span>，以获取对接教程。</p>
-                    </div>
-                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信验证 <ExternalLink size={16} /></button>
-                    <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white">完成并关闭</button>
+
+                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信 <ExternalLink size={16} /></button>
+                    <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white p-2">关闭</button>
                   </div>
                 </>
               )}
