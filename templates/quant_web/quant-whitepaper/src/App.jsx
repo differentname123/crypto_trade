@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, useScroll, AnimatePresence } from 'framer-motion';
-import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink, Lock, ShieldAlert, Zap, RefreshCw, Trophy, Database, Clock, ChevronDown, Activity, ArrowLeft } from 'lucide-react';
+import { ChevronsDown, Check, Fingerprint, AlertCircle, ExternalLink, Lock, ShieldAlert, Zap, RefreshCw, Database, Clock, Activity, ArrowLeft } from 'lucide-react';
 
 const INK='#0A0E14', INK2='#0F151E', GREEN='#34E0A1', RED='#EF5B5B', GOLD='#E7C884',
   TXT='#E9ECF2', BODY='#BCC2CE', DIM='#8A93A3', HAIR='rgba(255,255,255,0.08)';
@@ -566,6 +566,7 @@ const SignalRadar = ({ onBack }) => {
   // --- API 数据状态 ---
   const [signalData, setSignalData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [fetchTime, setFetchTime] = useState('--');
 
   const fetchSignals = async () => {
     setIsLoading(true);
@@ -576,6 +577,11 @@ const SignalRadar = ({ onBack }) => {
 
       const data = await response.json();
       setSignalData(data);
+
+      // 前端发起请求的本地时刻
+      const now = new Date();
+      const pad = (n) => n.toString().padStart(2, '0');
+      setFetchTime(`${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`);
 
     } catch (error) {
       console.error("获取信号失败:", error);
@@ -620,7 +626,7 @@ const SignalRadar = ({ onBack }) => {
         <div className="flex items-center gap-2 text-[#8A93A3] text-xs">
           <div className="flex flex-col text-right">
             <span>最后更新</span>
-            <span style={{fontFamily: MONO}}>{signalData.updateTime}</span>
+            <span style={{fontFamily: MONO}}>{fetchTime}</span>
           </div>
           <button
             onClick={fetchSignals}
@@ -636,26 +642,14 @@ const SignalRadar = ({ onBack }) => {
         <div className="bg-[#0F151E] border border-white/5 rounded-xl p-3 shadow-sm">
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-1 text-[#E7C884] text-xs"><Database size={12}/>累计收益</div>
-            <div className="flex items-center gap-1 bg-[#1A222C] px-1.5 py-0.5 rounded text-[10px] text-[#BCC2CE]">50%仓 <ChevronDown size={10}/></div>
           </div>
           <div className="text-[#34E0A1] text-xl font-bold" style={{fontFamily: MONO}}>{signalData.stats.totalReturn}</div>
         </div>
         <div className="bg-[#0F151E] border border-white/5 rounded-xl p-3 shadow-sm">
-          <div className="flex items-center gap-1 text-[#E7C884] text-xs mb-2"><Trophy size={12}/>策略胜率</div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-white text-xl font-bold" style={{fontFamily: MONO}}>{signalData.stats.winRate}</span>
-            <span className="text-[#8A93A3] text-[11px]" style={{fontFamily: MONO}}>{signalData.stats.winRateDetail}</span>
-          </div>
-        </div>
-        <div className="bg-[#0F151E] border border-white/5 rounded-xl p-3 shadow-sm">
-          <div className="flex items-center gap-1 text-[#8A93A3] text-[10px] mb-1.5"><Database size={10}/>共有数据时间范围</div>
+          <div className="flex items-center gap-1 text-[#8A93A3] text-[10px] mb-1.5"><Clock size={10}/>统计信号时间范围</div>
           <div className="text-[#BCC2CE] text-[10px] leading-tight whitespace-pre-line" style={{fontFamily: MONO}}>
             {signalData.stats.timeRange}
           </div>
-        </div>
-        <div className="bg-[#0F151E] border border-white/5 rounded-xl p-3 shadow-sm">
-          <div className="flex items-center gap-1 text-[#8A93A3] text-[10px] mb-1.5"><Clock size={10}/>最新推演计算时间</div>
-          <div className="text-[#BCC2CE] text-[10px] mt-2" style={{fontFamily: MONO}}>{signalData.updateTime}</div>
         </div>
       </div>
 
@@ -664,25 +658,30 @@ const SignalRadar = ({ onBack }) => {
         {signalData.currentPositions.length === 0 ? (
            <div className="text-center py-6 text-[#8A93A3] text-sm border border-dashed border-white/10 rounded-lg">暂无当前持仓</div>
         ) : (
-          signalData.currentPositions.map((pos, idx) => (
-            <div key={idx} className="border-l-[3px] border-l-[#EF5B5B] bg-[#0F151E] border border-y-white/5 border-r-white/5 rounded-lg p-4 shadow-sm">
-              <div className="text-[#8A93A3] text-[10px] mb-3" style={{fontFamily: MONO}}>开仓时间 · {pos.time}</div>
-              <div className="flex items-center gap-2 mb-4">
-                <span className="text-white text-2xl font-bold tracking-wider">{pos.symbol}</span>
-                <span className="bg-[#EF5B5B] text-white text-[10px] font-bold px-1.5 py-0.5 rounded">{pos.side}</span>
-              </div>
-              <div className="flex bg-[#161C24] rounded-lg p-3">
-                <div className="flex-1">
-                  <div className="text-[#8A93A3] text-[10px] mb-1">开仓价格 (USDT)</div>
-                  <div className="text-white font-bold" style={{fontFamily: MONO}}>{pos.price}</div>
+          signalData.currentPositions.map((pos, idx) => {
+            // 前端只负责拿后端的 isBuy 布尔值来分配颜色
+            const themeColor = pos.isBuy ? '#34E0A1' : '#EF5B5B';
+
+            return (
+              <div key={idx} className="bg-[#0F151E] border border-y-white/5 border-r-white/5 rounded-lg p-4 shadow-sm" style={{ borderLeft: `3px solid ${themeColor}` }}>
+                <div className="text-[#8A93A3] text-[10px] mb-3" style={{fontFamily: MONO}}>开仓时间 · {pos.time}</div>
+                <div className="flex items-center gap-2 mb-4">
+                  <span className="text-white text-2xl font-bold tracking-wider">{pos.symbol}</span>
+                  <span className="text-white text-[10px] font-bold px-1.5 py-0.5 rounded" style={{ backgroundColor: themeColor }}>{pos.side}</span>
                 </div>
-                <div className="flex-1">
-                  <div className="text-[#8A93A3] text-[10px] mb-1">仓位占比</div>
-                  <div className="text-[#3C82F6] font-bold" style={{fontFamily: MONO}}>{pos.size}</div>
+                <div className="flex bg-[#161C24] rounded-lg p-3">
+                  <div className="flex-1">
+                    <div className="text-[#8A93A3] text-[10px] mb-1">开仓价格 (USDT)</div>
+                    <div className="text-white font-bold" style={{fontFamily: MONO}}>{pos.price}</div>
+                  </div>
+                  <div className="flex-1">
+                    <div className="text-[#8A93A3] text-[10px] mb-1">仓位占比</div>
+                    <div className="text-[#3C82F6] font-bold" style={{fontFamily: MONO}}>{pos.size}</div>
+                  </div>
                 </div>
               </div>
-            </div>
-          ))
+            )
+          })
         )}
       </div>
 
@@ -691,29 +690,36 @@ const SignalRadar = ({ onBack }) => {
         {signalData.historyPositions.length === 0 ? (
            <div className="text-center py-6 text-[#8A93A3] text-sm border border-dashed border-white/10 rounded-lg">暂无历史记录</div>
         ) : (
-          signalData.historyPositions.map((pos, idx) => (
-            <div key={idx} className="bg-[#0F151E] border border-white/5 rounded-lg p-4 shadow-sm">
-              <div className="flex justify-between items-center mb-3">
-                <div className="flex items-center gap-2">
-                  <span className="text-white font-bold">{pos.symbol}</span>
-                  <span className="border border-[#EF5B5B]/30 text-[#EF5B5B] text-[10px] px-1.5 py-0.5 rounded">{pos.action}</span>
+          signalData.historyPositions.map((pos, idx) => {
+            // 根据后端的 isBuyAction 判断红绿色系
+            const actionColor = pos.isBuyAction ? '#34E0A1' : '#EF5B5B';
+            const actionBorder = pos.isBuyAction ? 'rgba(52,224,161,0.3)' : 'rgba(239,91,91,0.3)';
+            const actionBg = pos.isBuyAction ? 'rgba(52,224,161,0.1)' : 'rgba(239,91,91,0.1)';
+
+            return (
+              <div key={idx} className="bg-[#0F151E] border border-white/5 rounded-lg p-4 shadow-sm">
+                <div className="flex justify-between items-center mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-white font-bold">{pos.symbol}</span>
+                    <span className="border text-[10px] px-1.5 py-0.5 rounded" style={{ borderColor: actionBorder, color: actionColor, backgroundColor: actionBg }}>{pos.action}</span>
+                  </div>
+                  <span className={`font-bold ${pos.isWin ? 'text-[#34E0A1]' : 'text-[#EF5B5B]'}`} style={{fontFamily: MONO}}>{pos.pnl}</span>
                 </div>
-                <span className={`font-bold ${pos.isWin ? 'text-[#34E0A1]' : 'text-[#EF5B5B]'}`} style={{fontFamily: MONO}}>{pos.pnl}</span>
+                <div className="h-px bg-white/5 mb-3 w-full" />
+                <div className="flex justify-between items-end">
+                  <div>
+                    <div className="text-[#8A93A3] text-[10px] mb-1">开仓 · {pos.openTime}</div>
+                    <div className="text-[#BCC2CE] text-xs" style={{fontFamily: MONO}}>{pos.openPrice}</div>
+                  </div>
+                  <div className="w-px h-6 bg-white/5 mx-2" />
+                  <div className="text-right">
+                    <div className="text-[#8A93A3] text-[10px] mb-1">平仓 · {pos.closeTime}</div>
+                    <div className="text-[#BCC2CE] text-xs" style={{fontFamily: MONO}}>{pos.closePrice}</div>
+                  </div>
+                </div>
               </div>
-              <div className="h-px bg-white/5 mb-3 w-full" />
-              <div className="flex justify-between items-end">
-                <div>
-                  <div className="text-[#8A93A3] text-[10px] mb-1">开仓 · {pos.openTime}</div>
-                  <div className="text-[#BCC2CE] text-xs" style={{fontFamily: MONO}}>{pos.openPrice}</div>
-                </div>
-                <div className="w-px h-6 bg-white/5 mx-2" />
-                <div className="text-right">
-                  <div className="text-[#8A93A3] text-[10px] mb-1">平仓 · {pos.closeTime}</div>
-                  <div className="text-[#BCC2CE] text-xs" style={{fontFamily: MONO}}>{pos.closePrice}</div>
-                </div>
-              </div>
-            </div>
-          ))
+            )
+          })
         )}
       </div>
 
