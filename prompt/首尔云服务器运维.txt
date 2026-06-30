@@ -6,13 +6,10 @@
 
 * 🌐 **域名管理 (Spaceship):**
 * 订单/域名控制台: [点击访问 Spaceship 订单详情]
-
-
+* 代理专用二级域名: `proxy.easyeverything.top`
 * ☁️ **服务器管理 (腾讯云轻量应用服务器):**
 * 公网 IPv4 地址: `43.131.225.155`
 * 服务器控制台: [点击访问 腾讯云 Lighthouse 实例详情]
-
-
 
 ---
 
@@ -24,8 +21,6 @@
 * **Nginx 路由分发规则:**
 * **前端网页:** 默认请求由 Nginx 返回 `/var/www/alpha-web/` 下的构建文件。找不到对应路径时，保底返回 `index.html`（支持 SPA 路由）。
 * **后端接口:** 带有 `/api/` 的请求，Nginx 会内部转发给本地 `8000` 端口的 Python 后端处理。
-
-
 
 ### 2. 核心文件路径 (代码与配置)
 
@@ -47,13 +42,12 @@
 2. 服务器清空旧代码：`rm -rf /var/www/alpha-web/*`
 3. 上传新代码：将本地 `dist` 文件夹内的**所有内容**上传至 `/var/www/alpha-web/`
 4. 修复文件权限 (防止 403 错误)：
+
 ```bash
 chown -R www-data:www-data /var/www/alpha-web
 chmod -R 755 /var/www/alpha-web
 
 ```
-
-
 
 🟢 **Python 后端更新 (代码修改后必做)**
 修改了 `alpha_api.py` 后，必须重启服务生效：
@@ -100,21 +94,74 @@ systemctl reload nginx
 * 看系统报错/崩溃: `journalctl -u binance-trade -f`
 * 看具体交易详情: `tail -f app/signal_trade_lite/logs/trading_bot.log`
 
+---
 
+## 四、 服务 C：HTTPS 安全代理节点 (GOST Proxy)
+
+### 1. 整体架构 (网络流量走向)
+
+* **访问链路:** 本地 Python 代码 ➔ Cloudflare (仅 DNS 解析，**灰色云朵**) ➔ 服务器 443 端口 ➔ GOST 代理 ➔ 海外目标服务
+* **关键特性:** 无需本地客户端，占用极低 (内存 ~10MB)，通过 Let's Encrypt 证书伪装成标准 HTTPS 流量防 GFW 封锁。
+
+### 2. 核心文件路径
+
+| 组件 | 文件/目录路径 | 修改场景说明 |
+| --- | --- | --- |
+| **代理主程序** | `/usr/local/bin/gost` | GOST 单文件绿色版二进制程序 |
+| **系统服务配置** | `/etc/systemd/system/gost.service` | 修改代理的 **账号、密码** 或监听端口 |
+| **SSL 证书路径** | `/etc/letsencrypt/live/proxy.easyeverything.top/` | 包含 `fullchain.pem` 和 `privkey.pem` |
+| **证书自动续期** | `/etc/letsencrypt/renewal/proxy.easyeverything.top.conf` | Let's Encrypt 自动续期及重启 Hook 配置 |
+
+### 3. 常用运维操作与调用代码
+
+* 🟢 **修改配置后重启:** ```bash
+systemctl daemon-reload
+systemctl restart gost
+
+```
+* 🟡 **查看运行状态与报错:** ```bash
+systemctl status gost
+journalctl -u gost -n 50 -f
+
+```
+
+* 🚀 **本地代码直接调用模板 (Python):**
+
+```python
+import requests
+
+# 格式: https://账号:密码@域名:443
+PROXY_URL = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+proxies = {
+    "http": PROXY_URL,
+    "https": PROXY_URL,
+}
+# 在请求中传入 proxies 参数即可无缝翻墙直连 API
+response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
+
+```
 
 ---
 
-## 四、 常见故障排查 (避坑指南)
+## 五、 常见故障排查 (避坑指南)
 
 ### 🚨 故障 1：前端更新后，浏览器依旧白屏 / 无法显示新功能
 
 * **症状：** 服务器上的代码明明是最新的，但访问域名没有任何变化。
 * **根本原因：** Cloudflare 边缘节点或浏览器本地存在“死缓存”。
 * **解决方案：**
+
 1. 登录 Cloudflare 控制台 -> Caching (缓存) -> Configuration (配置)。
 2. 点击 **`Purge Everything`** (清除所有缓存)。
 3. *开发调试期建议：* 在 Cloudflare Quick Actions 中开启 **`Development Mode`** (开发模式，暂停缓存 3 小时)。
 4. 浏览器端按 `Ctrl + F5` 强制刷新，或在 F12 Network 面板中勾选 `Disable cache` 后刷新。
 
+### 🚨 故障 2：本地代码调用代理时提示 `ConnectTimeoutError`
 
----
+* **症状：** Python 脚本运行后卡住，大约 10 秒后抛出类似 `ProxyError: Unable to connect to proxy (connect timeout=10)` 的错误。
+* **根本原因：** 本地发出的流量请求未成功到达云服务器内部，通常被防火墙丢弃或 DNS 寻址错误。
+* **解决方案：**
+
+1. **查外层防火墙：** 登录【腾讯云控制台】➔ 找到服务器实例 ➔ **安全组（防火墙）**，确保入站规则中已添加放行 **`TCP 443`** 端口的策略。
+2. **查云朵状态：** 登录【Cloudflare】，确保 `proxy` 域名的 Proxy status 为 **灰色云朵 (DNS only)**。如果是橙色，代理流量会被 CDN 拦截。
+3. **查本地缓存：** 在本地 Windows `cmd` 运行 `ping proxy.easyeverything.top`，若返回的不是腾讯云服务器 IP，执行 `ipconfig /flushdns` 刷新本地 DNS 缓存。
