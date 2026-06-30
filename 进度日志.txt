@@ -448,7 +448,7 @@ d
     已完成:
         1.打算新部署一个服务器上的代理使用gost，供本地稳定使用
         2.完成代理的部署和文档的维护
-        3.新增gmail账号的维护，以及gemini web的正确调用，新增图片生成
+        3.新增gmail账号的维护，以及gemini web的正确调用（https://github.com/HanaokaYuzu/Gemini-API#list-available-models），新增图片生成
         4.新增 gemini_api的代码适配
 
     待完成：
