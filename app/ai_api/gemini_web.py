@@ -20,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_FILE = r'W:\project\python_project\crypto_trade\config\gemini_web.json'
 STATS_FILE = CONFIG_FILE.replace(".json", "_stats.json")
 
+
 # ==========================================
 # 1. 基础工具类：文件锁 (保持不变)
 # ==========================================
@@ -49,7 +50,7 @@ class SimpleFileLock:
 
 
 # ==========================================
-# 2. 核心修改：账号管理器
+# 2. 核心修改：账号管理器 (保持不变)
 # ==========================================
 
 class GeminiAccountManager:
@@ -198,12 +199,12 @@ class GeminiAccountManager:
 
 
 # ==========================================
-# 3. 异步请求逻辑 (核心部分)
+# 3. 异步请求逻辑 (核心部分修改：增加图片保存支持)
 # ==========================================
 
-async def _do_gemini_request(cookie_str, prompt, model_name, files):
+async def _do_gemini_request(cookie_str, prompt, model_name, files, output_img_dir="output_images"):
     """
-    此函数与原始代码中的 _async_task 保持高度一致。
+    修改点：支持保存响应中的图片，并返回 (text, image_paths)
     """
     PROXY_URL = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
 
@@ -217,7 +218,7 @@ async def _do_gemini_request(cookie_str, prompt, model_name, files):
     if not psid:
         raise ValueError("Cookie 无效：缺少 __Secure-1PSID")
 
-    # 【修改 2】: 保持与原始代码一致，添加文件存在性检查
+    # 保持与原始代码一致，添加文件存在性检查
     if files:
         for f in files:
             if not os.path.exists(f):
@@ -228,22 +229,39 @@ async def _do_gemini_request(cookie_str, prompt, model_name, files):
     try:
         await client.init(timeout=600, auto_close=False, auto_refresh=True)
         response = await client.generate_content(prompt, model=model_name, files=files)
-        return response.text
+
+        # === 新增：处理图片生成与保存逻辑 ===
+        saved_image_paths = []
+        if response.images:
+            # 确保输出目录存在 (使用当前文件的同级或相对目录均可)
+            save_dir = os.path.join(BASE_DIR, output_img_dir)
+            os.makedirs(save_dir, exist_ok=True)
+
+            for i, image in enumerate(response.images):
+                # 生成唯一文件名防止并发覆盖
+                filename = f"gen_img_{int(time.time() * 1000)}_{i}.png"
+                # 调用底层的异步 save 方法保存图片
+                await image.save(path=save_dir + "/", filename=filename, verbose=False)
+                # 记录绝对路径
+                saved_image_paths.append(os.path.join(save_dir, filename))
+
+        # 返回 文本 和 成功保存的图片路径列表
+        return response.text, saved_image_paths
     except Exception as e:
         # 向上抛出异常，由外部统一处理
         raise e
 
 
 # ==========================================
-# 4. 对外接口
+# 4. 对外接口 (修改：返回接收结构)
 # ==========================================
 
 
 manager = GeminiAccountManager(str(CONFIG_FILE), str(STATS_FILE))
 
 
-# 【修改 3】: 实现无可用账号时的阻塞等待
-def generate_gemini_content_managed(prompt, model_name="gemini-3.0-pro", files=None, wait_timeout=600):
+def generate_gemini_content_managed(prompt, model_name="gemini-3.0-pro", files=None, wait_timeout=600,
+                                    output_img_dir="output_images"):
     """
     对外提供的统一接口。
 
@@ -252,13 +270,14 @@ def generate_gemini_content_managed(prompt, model_name="gemini-3.0-pro", files=N
         model_name (str): 模型名称。gemini-3.0-pro, gemini-2.5-pro, gemini-2.5-flash
         files (list, optional): 文件路径列表。
         wait_timeout (int): 当无可用账号时，最长等待时间（秒）。
+        output_img_dir (str): 生成图片的保存目录。
 
     Returns:
-        tuple: (error_info, response_str)
+        tuple: (error_info, response_str, saved_images)
     """
     pid = os.getpid()
     tid = threading.get_ident()
-    log_prefix = f"[System][PID:{pid},TID:{tid}]" # 创建一个统一的日志前缀
+    log_prefix = f"[System][PID:{pid},TID:{tid}]"
     # ====================================
 
     start_time = time.time()
@@ -271,47 +290,49 @@ def generate_gemini_content_managed(prompt, model_name="gemini-3.0-pro", files=N
             break
 
         elapsed = int(time.time() - start_time)
-        # === 修改日志输出 ===
         print(f"{log_prefix} 无可用账号，进入等待... (已等待 {elapsed}s / {wait_timeout}s)")
         time.sleep(random.uniform(10, 20))
 
     if not account_name:
-        return f"System Busy: 等待 {wait_timeout} 秒后仍无可用账号。", None
+        return f"System Busy: 等待 {wait_timeout} 秒后仍无可用账号。", None, None
 
-    # === 修改日志输出 ===
     print(f"{log_prefix} 分配账号: {account_name}")
 
     error_detail = None
     result_text = None
+    saved_images = []
 
     try:
-        result_text = asyncio.run(_do_gemini_request(cookie, prompt, model_name, files))
+        # === 修改点：同时接收 result_text 和 saved_images ===
+        result_text, saved_images = asyncio.run(_do_gemini_request(cookie, prompt, model_name, files, output_img_dir))
     except Exception as e:
         error_detail = f"发生错误: {str(e)}\n\n堆栈追踪:\n{traceback.format_exc()}"
     finally:
-        # === 修改日志输出 ===
         print(f"{log_prefix} 释放账号: {account_name}")
         manager.release_account(account_name, error_detail)
 
-    return error_detail, result_text
+    # === 修改点：返回 3个参数 ===
+    return error_detail, result_text, saved_images
 
 
 # ==========================================
-# 测试部分
+# 测试部分 (修改以适配新的返回值格式)
 # ==========================================
 
 if __name__ == "__main__":
 
     print("开始测试...")
-    test_file = ['test.mp4']
+    test_file = [r"C:\Users\zxh\Desktop\temp\test.mp4"]
 
-    prompt = "你是谁"
+    # 明确在 prompt 中包含“生成一张”以触发模型画图工具
+    prompt = "你是谁？并帮我生成一张图片：一只赛博朋克风格的猫咪在喝咖啡，背景是霓虹灯城市。"
 
-    for i in range(22):
+    for i in range(1):  # 测试1次即可验证图片生成
         try:
-            err, res = generate_gemini_content_managed(
+            # === 修改点：接收 err, res, images 三个返回值 ===
+            err, res, images = generate_gemini_content_managed(
                 prompt=prompt,
-                model_name="gemini-3-flash",
+                model_name="gemini-3-pro-advanced",
                 # files=test_file
             )
 
@@ -320,6 +341,15 @@ if __name__ == "__main__":
                 print(err)
             else:
                 print("\n======== 调用成功 ========")
-                print(res)
+                print(f"文本回复:\n{res}")
+
+                # === 新增：打印图片结果 ===
+                if images:
+                    print(f"\n成功生成了 {len(images)} 张图片，保存在以下路径：")
+                    for img in images:
+                        print(f" - {img}")
+                else:
+                    print("\n[注] 模型未返回任何图片。")
+
         except Exception as e:
             print(f"测试过程中发生异常: {str(e)}")
