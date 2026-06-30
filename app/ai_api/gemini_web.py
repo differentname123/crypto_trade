@@ -103,11 +103,22 @@ class GeminiAccountManager:
             config_list = raw_config.get('cookie_list', [])
 
             # 构建 config 映射: name -> cookie
+            # 构建 config 映射: name -> cookie
+            # [修改点] 增加过滤条件：必须存在 name，且 cookie_str 存在且去除空格后不为空
             valid_accounts_map = {
-                item['name']: item.get('cookie_str', '')
-                for item in config_list if item.get('name')
+                item['name']: item['cookie_str']
+                for item in config_list
+                if item.get('name') and item.get('cookie_str', '').strip()
             }
-
+            # ==========================================
+            # 【新增】打印账号统计日志
+            # ==========================================
+            total_accounts = len(config_list)
+            valid_accounts = len(valid_accounts_map)
+            invalid_accounts = total_accounts - valid_accounts
+            print(
+                f"[Manager] 账号池状态: 配置总数 {total_accounts} 个 | 有效可用 {valid_accounts} 个 | 自动过滤无效 {invalid_accounts} 个")
+            # ==========================================
             # 2. 读取 Stats
             stats = self._read_json_safe(self.stats_path)
 

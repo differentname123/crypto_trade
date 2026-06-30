@@ -286,8 +286,8 @@ def wait_until_file_ready(client: genai.Client, file_obj, poll_interval: int = 1
 def with_proxy(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7890'
-        os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7890'
+        os.environ['HTTP_PROXY'] = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+        os.environ['HTTPS_PROXY'] = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
         try:
             return func(*args, **kwargs)
         finally:
