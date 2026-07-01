@@ -122,6 +122,12 @@ def _evaluate_sequence(seq, volume_multiplier):
     first_price = first_trade['avgPrice']
     position_side = first_trade['positionSide']
 
+    # 新增条件：序列的平均数量必须大于初始的数量
+    total_qty = sum(trade['executedQty'] for trade in seq)
+    avg_qty = total_qty / len(seq)
+    if avg_qty <= first_trade['executedQty']:
+        return False, None, []
+
     is_martingale = False
     seq_multipliers = []
 
@@ -149,7 +155,6 @@ def _evaluate_sequence(seq, volume_multiplier):
         return True, seq, seq_multipliers
 
     return False, None, []
-
 
 
 # =====================================================================
@@ -404,12 +409,19 @@ if __name__ == "__main__":
                 all_files.append(os.path.join(root, file))
 
     for file_path in all_files:
+        # if "5014426348046646785" not in file_path:
+        #     continue
         all_data = read_json(file_path)
         # 为每个元素增加一个 'orderTime_str' 字段，值为 'timestamp' 转换为可读的时间
         for trade in all_data:
             trade['orderTime_str'] = datetime.datetime.fromtimestamp(trade['orderTime'] / 1000).strftime('%Y-%m-%d %H:%M:%S')
 
         result = calculate_martingale_rate_simplified(all_data)
+        martingale_rate_percent = result['summary']['martingale_rate_percent']
+        evidences = result['evidences']
+        if martingale_rate_percent > 50:
+            print(f"文件: {file_path} | 马丁格尔率: {martingale_rate_percent}% | 警告：马丁格尔行为过于频繁！")
+
         result1 = calculate_tail_risk_index(all_data)
         result2 = calculate_slippage_trap_ratio(all_data)
         result3 = calculate_vw_hold_ratio(all_data)
