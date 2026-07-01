@@ -303,7 +303,7 @@ def fetch_binance_copy_traders(target_count: int) -> list:
 
 if __name__ == "__main__":
 
-    traders_list = fetch_binance_copy_traders(200)
+    traders_list = fetch_binance_copy_traders(400)
     trader_map = {trader['leadPortfolioId']: trader['nickname'] for trader in traders_list}
 
     # 你只需要在这里修改时间！
