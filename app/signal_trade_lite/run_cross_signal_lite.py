@@ -110,7 +110,7 @@ def run_strategy_simulation(
     BTC_TREND_WINDOW = strategy_params['BTC_TREND_WINDOW']
     TOP_K = int(strategy_params.get('TOP_K', 2))
     MAX_WEIGHT = strategy_params['MAX_WEIGHT']
-    FEE_RATE = 0.0005
+    FEE_RATE = 0.000
 
     # 提取纯币种名称列（即收盘价列）
     target_coins = [c for c in df_cross_section.columns if
