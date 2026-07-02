@@ -443,7 +443,7 @@ def calculate_vw_hold_ratio(trades):
     }
 
 
-def get_detect_report(all_data):
+def get_detect_report(all_data, file_name):
     # 初始化当前文件的数据行，首先放入 file_name
     row_data = {'file_name': file_name, 'data_len': len(all_data)}
     detail_map = {}

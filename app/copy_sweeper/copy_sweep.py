@@ -5,15 +5,17 @@ import requests
 import json
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from common.common_utils import save_json
-
+from app.copy_sweeper.copy_sweep_detect import get_detect_report
+from common.common_utils import save_json, read_json
+def ms_to_time_str(ms):
+    """将毫秒时间戳转换回标准时间字符串"""
+    return datetime.fromtimestamp(ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
 
 def time_str_to_ms(time_str):
     dt_obj = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
     return int(dt_obj.timestamp() * 1000)
-
 
 def fetch_history_by_time_range(portfolio_id, start_time_str, end_time_str, max_count=0, max_retries=3):
     """
@@ -350,30 +352,130 @@ def extract_lead_id(url: str) -> str:
     return None
 
 
+
+def smart_fetch_history_by_time_range(portfolio_id, target_start_str, target_end_str, file_path, max_count=0,
+                                      max_retries=3):
+    """
+    智能历史订单拉取器（带本地缓存合并与差集填补功能）
+    """
+    target_start_ms = time_str_to_ms(target_start_str)
+    target_end_ms = time_str_to_ms(target_end_str)
+
+    # 1. 读取本地现有数据
+    local_data = read_json(file_path)
+
+    # 提取时间戳和已有 ID 集合（用于后续去重）
+    existing_times = []
+    unique_orders = {}
+
+    for order in local_data:
+        # 严格使用 orderUpdateTime 作为时间基准
+        t = order.get("orderUpdateTime")
+        if t:
+            existing_times.append(int(t))
+
+        # 根据你的数据结构，构建“组合唯一键”进行去重 (币种_仓位方向_交易方向_数量_更新时间)
+        uid = f"{order.get('symbol')}_{order.get('positionSide')}_{order.get('side')}_{order.get('executedQty')}_{order.get('orderUpdateTime')}"
+        unique_orders[uid] = order
+
+    newly_fetched_data = []
+    missing_ranges = []
+
+    # 2. 判断需要补齐的时间段
+    if not existing_times:
+        # 本地毫无数据，直接全量拉取
+        print(f"📄 本地无缓存数据，将全量拉取 [{target_start_str}] -> [{target_end_str}]")
+        missing_ranges.append((target_start_ms, target_end_ms))
+    else:
+        local_min_ms = min(existing_times)
+        local_max_ms = max(existing_times)
+
+        print(
+            f"📦 本地已缓存 {len(local_data)} 条数据。缓存区间: [{ms_to_time_str(local_min_ms)}] -> [{ms_to_time_str(local_max_ms)}]")
+
+        # 检查是否需要拉取更老的数据（尾部填补）
+        if target_start_ms < local_min_ms:
+            # 填补 [目标开始, 本地最早 - 1毫秒]
+            older_end_ms = min(target_end_ms, local_min_ms - 1)
+            missing_ranges.append((target_start_ms, older_end_ms))
+
+        # 检查是否需要拉取更新的数据（头部填补）
+        if target_end_ms > local_max_ms:
+            # 填补 [本地最晚 + 1毫秒, 目标结束]
+            newer_start_ms = max(target_start_ms, local_max_ms + 1)
+            missing_ranges.append((newer_start_ms, target_end_ms))
+
+        if not missing_ranges:
+            print("✅ 目标时间段已完全包含在本地缓存中，无需调用 API！")
+
+    # 3. 执行分段拉取
+    for start_ms, end_ms in missing_ranges:
+        start_str = ms_to_time_str(start_ms)
+        end_str = ms_to_time_str(end_ms)
+        print(f"\n⏳ 开始填补缺失时间段: [{start_str}] -> [{end_str}]")
+
+        # 调用你原有的基础拉取函数
+        fetched = fetch_history_by_time_range(
+            portfolio_id=portfolio_id,
+            start_time_str=start_str,
+            end_time_str=end_str,
+            max_count=max_count,
+            max_retries=max_retries
+        )
+        newly_fetched_data.extend(fetched)
+
+    # 4. 合并数据并去重
+    for order in newly_fetched_data:
+        uid = f"{order.get('symbol')}_{order.get('positionSide')}_{order.get('side')}_{order.get('executedQty')}_{order.get('orderUpdateTime')}"
+        unique_orders[uid] = order
+
+    all_merged_data = list(unique_orders.values())
+
+    # 严格按照 orderUpdateTime 降序排序（最新时间在最前）
+    all_merged_data.sort(key=lambda x: int(x.get("orderUpdateTime", 0)), reverse=True)
+
+    # 5. 更新本地缓存文件（直接调用你导入的 save_json）
+    save_json(file_path, all_merged_data)
+    print(f"💾 数据已更新保存至 {file_path}，当前总缓存数: {len(all_merged_data)}")
+
+    # 6. 过滤并返回调用者真正需要的目标时间段内的数据
+    final_result = [
+        x for x in all_merged_data
+        if target_start_ms <= int(x.get("orderUpdateTime", 0)) <= target_end_ms
+    ]
+
+    print(f"✨ 智能拉取完成！目标区间内共有数据: {len(final_result)} 条\n")
+    return final_result
+
+
 def get_report(url_str):
     lead_id = extract_lead_id(url_str)
     if not lead_id:
         print(f"❌ 无法从链接中提取 Lead ID: {url_str}")
         return {}
 
+    max_day = 3
+    # 获取当前的时间
+    now = datetime.now()
+    # TARGET_END为当前时间
+    TARGET_END = now.strftime("%Y-%m-%d %H:%M:%S")
+    # TARGET_START为 往前推 max_day 天
+    TARGET_START = (now - timedelta(days=max_day)).strftime("%Y-%m-%d %H:%M:%S")
+    output_dir = "temp_data"
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"{lead_id}.json")
+    all_data = smart_fetch_history_by_time_range(lead_id, TARGET_START, TARGET_END, output_file)
+    row_data, detail_map = get_detect_report(all_data,lead_id)
+
+    return detail_map
 
 if __name__ == "__main__":
 
-    traders_list = fetch_binance_copy_traders(400)
-    trader_map = {trader['leadPortfolioId']: trader['nickname'] for trader in traders_list}
+    # # 拉取所有的biance带单的人
+    # traders_list = fetch_binance_copy_traders(400)
+    # trader_map = {trader['leadPortfolioId']: trader['nickname'] for trader in traders_list}
 
-    # 你只需要在这里修改时间！
-    # 格式严格为：'YYYY-MM-DD HH:MM:SS'
-    TARGET_START = "2026-05-30 23:59:59"  # 你想要追溯到的最早时间
-    TARGET_END = "2026-06-30 23:59:59"  # 你想要拉取的最新截止时间
+    url_str = 'https://www.binance.com/zh-CN/copy-trading/lead-details/5014426348046646785'
 
-    output_dir = "temp_data"
-    os.makedirs(output_dir, exist_ok=True)
-    for portfolio_id, nickname in trader_map.items():
-        output_file = os.path.join(output_dir, f"{portfolio_id}_{nickname}.json")
-        if os.path.exists(output_file):
-            print(f"⚠️ 文件已存在，跳过: {output_file}")
-            continue
-
-        all_data = fetch_history_by_time_range(portfolio_id, TARGET_START, TARGET_END)
-        save_json(output_file, all_data)
+    detail_map = get_report(url_str)
+    print()
