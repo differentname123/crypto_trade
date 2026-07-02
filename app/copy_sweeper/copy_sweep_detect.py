@@ -446,13 +446,13 @@ def calculate_vw_hold_ratio(trades):
 def get_detect_report(all_data):
     # 初始化当前文件的数据行，首先放入 file_name
     row_data = {'file_name': file_name, 'data_len': len(all_data)}
-    detail_list = []
+    detail_map = {}
     # ==========================================
     # 模块 1: 马丁格尔率 (如果你不想计算，直接注释掉这整个区块)
     # ==========================================
     result = calculate_martingale_rate_simplified(all_data)
     row_data.update(result.get('summary', {}))  # 收集 summary
-    detail_list.append(result)
+    detail_map['martingale'] = result  # 收集 detail
 
     # 马丁格尔率的警告逻辑
     if 'summary' in result:  # 增加一个安全判断，防止字典为空报错
@@ -466,8 +466,7 @@ def get_detect_report(all_data):
     # ==========================================
     result1 = calculate_tail_risk_index(all_data)
     row_data.update(result1.get('summary', {}))  # 收集 summary
-    detail_list.append(result1)
-
+    detail_map['tail_risk'] = result1  # 收集 detail
 
     # 尾部风险的警告逻辑
     if 'summary' in result1:
@@ -481,19 +480,17 @@ def get_detect_report(all_data):
     # ==========================================
     result2 = calculate_slippage_trap_ratio(all_data)
     row_data.update(result2.get('summary', {}))  # 收集 summary
-    detail_list.append(result2)
-
+    detail_map['slippage_trap'] = result2  # 收集 detail
     #
     # # ==========================================
     # # 模块 4: VW 持仓比例 (如果你不想计算，直接注释掉这整个区块)
     # # ==========================================
     result3 = calculate_vw_hold_ratio(all_data)
     row_data.update(result3)  # 收集 summary
-    detail_list.append(result3)
-
+    detail_map['vw_hold_ratio'] = result3  # 收集 detail
     # ------------------------------------------
     # 将当前文件收集完毕的完整 row_data 追加到列表中
-    return row_data, detail_list
+    return row_data, detail_map
 
 
 if __name__ == "__main__":
@@ -518,7 +515,7 @@ if __name__ == "__main__":
             trade['orderUpdateTime_str'] = datetime.datetime.fromtimestamp(trade['orderUpdateTime'] / 1000).strftime(
                 '%Y-%m-%d %H:%M:%S')
 
-        row_data, detail_list = get_detect_report(all_data)
+        row_data, detail_map = get_detect_report(all_data)
         summary_data_list.append(row_data)
 
     # 循环结束后，将收集到的列表转换为 DataFrame
