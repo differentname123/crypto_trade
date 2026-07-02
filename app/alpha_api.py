@@ -1,3 +1,5 @@
+import math
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -191,6 +193,16 @@ def get_signals():
 
     return res_data  # 异常兜底，同样交由 FastAPI 序列化
 
+def sanitize_floats(obj):
+    if isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            return 0  # 或者返回 None，前端好处理
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_floats(i) for i in obj]
+    return obj
 
 @app.post('/api/report')
 def fetch_copy_trade_report(payload: dict):
@@ -206,7 +218,7 @@ def fetch_copy_trade_report(payload: dict):
 
         # 直接调用 get_report
         report_data = get_report(url_str)
-        return report_data
+        return sanitize_floats(report_data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

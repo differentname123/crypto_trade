@@ -464,6 +464,7 @@ def get_report(url_str):
     output_dir = "temp_data"
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"{lead_id}.json")
+    print(f"📊 正在生成报告，拉取时间范围: [{TARGET_START}] -> [{TARGET_END}]，输出文件: {output_file}")
     all_data = smart_fetch_history_by_time_range(lead_id, TARGET_START, TARGET_END, output_file)
     row_data, detail_map = get_detect_report(all_data,lead_id)
 
