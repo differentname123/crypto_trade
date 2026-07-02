@@ -6,6 +6,9 @@ import pandas as pd
 import httpx
 import os
 import platform  # 核心改动：引入平台识别库
+
+from app.copy_sweeper.copy_sweep import get_report
+
 app = FastAPI()
 
 # 极致宽松的 CORS 策略，允许任何来源、任何服务器调用
@@ -187,6 +190,25 @@ def get_signals():
         print(f"数据处理报错: {e}")
 
     return res_data  # 异常兜底，同样交由 FastAPI 序列化
+
+
+@app.post('/api/report')
+def fetch_copy_trade_report(payload: dict):
+    """
+    不需要声明 Pydantic 模型，直接接收 payload 字典
+    例如请求体发送：{"url": "https://xxxxx"}
+    """
+    try:
+        # 在函数内部直接从字典中处理和提取 url_str
+        url_str = payload.get("url", "")
+        if not url_str:
+            raise HTTPException(status_code=400, detail="请求体中缺少 'url' 参数")
+
+        # 直接调用 get_report
+        report_data = get_report(url_str)
+        return report_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # 将这段加在代码的最下面

@@ -1,5 +1,6 @@
 import os
-
+import re
+from urllib.parse import urlparse
 import requests
 import json
 import time
@@ -299,6 +300,61 @@ def fetch_binance_copy_traders(target_count: int) -> list:
     print(f"\n拉取完成，最终获取数量: {len(all_traders)} 条。")
     return all_traders
 
+
+
+
+
+def extract_lead_id(url: str) -> str:
+    """
+    从币安带单链接中提取纯数字 ID。
+
+    参数:
+        url (str): 包含带单者 ID 的链接
+
+    返回:
+        str: 提取出的数字 ID。如果提取失败或输入不合法，返回 None。
+    """
+    # 1. 基础的输入校验
+    if not url or not isinstance(url, str):
+        return None
+
+    url = url.strip()  # 去除首尾可能带入的空格或换行符
+
+    # 2. 核心方法：使用正则表达式精准匹配 'lead-details/' 后面的数字
+    # \d+ 表示匹配一个或多个数字，() 用于提取这部分内容
+    pattern = re.compile(r'lead-details/(\d+)')
+    match = pattern.search(url)
+
+    if match:
+        return match.group(1)
+
+    # 3. 增强健壮性（Fallback 机制）：
+    # 如果未来币安把 'lead-details' 改成了 'portfolio' 或者其他词，上面的正则会失效。
+    # 我们可以通过解析 URL 的 Path，寻找里面那串极长的数字（通常超过 15 位）来兜底。
+    try:
+        parsed_url = urlparse(url)
+        path = parsed_url.path  # 获取 URL 路径，自动过滤掉 ?timeRange=30D 这种查询参数
+
+        # 匹配以 / 开头，且连续数字长度大于 15 位的字符串
+        fallback_pattern = re.compile(r'/(\d{15,})')
+        fallback_match = fallback_pattern.search(path)
+
+        if fallback_match:
+            return fallback_match.group(1)
+
+    except Exception as e:
+        # 捕捉解析异常，防止程序崩溃
+        pass
+
+    # 如果都找不到，返回 None
+    return None
+
+
+def get_report(url_str):
+    lead_id = extract_lead_id(url_str)
+    if not lead_id:
+        print(f"❌ 无法从链接中提取 Lead ID: {url_str}")
+        return {}
 
 
 if __name__ == "__main__":

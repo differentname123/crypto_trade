@@ -452,6 +452,8 @@ def get_detect_report(all_data):
     # ==========================================
     result = calculate_martingale_rate_simplified(all_data)
     row_data.update(result.get('summary', {}))  # 收集 summary
+    result['evidences'] = result.get('evidences', [[]])[0:2]
+
     detail_map['martingale'] = result  # 收集 detail
 
     # 马丁格尔率的警告逻辑
@@ -466,6 +468,8 @@ def get_detect_report(all_data):
     # ==========================================
     result1 = calculate_tail_risk_index(all_data)
     row_data.update(result1.get('summary', {}))  # 收集 summary
+    result1['evidences'] = result1.get('evidences', [[]])[0:2]
+
     detail_map['tail_risk'] = result1  # 收集 detail
 
     # 尾部风险的警告逻辑
@@ -480,6 +484,7 @@ def get_detect_report(all_data):
     # ==========================================
     result2 = calculate_slippage_trap_ratio(all_data)
     row_data.update(result2.get('summary', {}))  # 收集 summary
+    result2['evidences'] = result2.get('evidences', [[]])[0:2]
     detail_map['slippage_trap'] = result2  # 收集 detail
     #
     # # ==========================================
