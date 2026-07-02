@@ -447,6 +447,25 @@ def get_detect_report(all_data, file_name):
     # 初始化当前文件的数据行，首先放入 file_name
     row_data = {'file_name': file_name, 'data_len': len(all_data)}
     detail_map = {}
+
+    # ==========================================
+    # 新增: 提取总览数据并写入 detail_map
+    # ==========================================
+    overview_data = {
+        "total_trades": len(all_data),
+        "start_time": None,
+        "end_time": None,
+        "risk_score":50
+    }
+    if all_data:
+        # 提取所有的 orderTime 并在计算前过滤掉 None 值，保证代码健壮性
+        order_times = [item.get("orderTime") for item in all_data if item.get("orderTime") is not None]
+        if order_times:
+            overview_data["start_time"] = min(order_times)
+            overview_data["end_time"] = max(order_times)
+
+    detail_map['overview'] = overview_data
+
     # ==========================================
     # 模块 1: 马丁格尔率 (如果你不想计算，直接注释掉这整个区块)
     # ==========================================
@@ -485,18 +504,20 @@ def get_detect_report(all_data, file_name):
     result2 = calculate_slippage_trap_ratio(all_data)
     row_data.update(result2.get('summary', {}))  # 收集 summary
     result2['evidences'] = result2.get('evidences', [[]])[0:2]
+
     detail_map['slippage_trap'] = result2  # 收集 detail
-    #
-    # # ==========================================
-    # # 模块 4: VW 持仓比例 (如果你不想计算，直接注释掉这整个区块)
-    # # ==========================================
+
+    # ==========================================
+    # 模块 4: VW 持仓比例 (如果你不想计算，直接注释掉这整个区块)
+    # ==========================================
     result3 = calculate_vw_hold_ratio(all_data)
     row_data.update(result3)  # 收集 summary
+
     detail_map['vw_hold_ratio'] = result3  # 收集 detail
+
     # ------------------------------------------
     # 将当前文件收集完毕的完整 row_data 追加到列表中
     return row_data, detail_map
-
 
 if __name__ == "__main__":
     # raw_data 替换为你上下文中的完整 JSON 列表
@@ -520,7 +541,7 @@ if __name__ == "__main__":
             trade['orderUpdateTime_str'] = datetime.datetime.fromtimestamp(trade['orderUpdateTime'] / 1000).strftime(
                 '%Y-%m-%d %H:%M:%S')
 
-        row_data, detail_map = get_detect_report(all_data)
+        row_data, detail_map = get_detect_report(all_data, file_name)
         summary_data_list.append(row_data)
 
     # 循环结束后，将收集到的列表转换为 DataFrame
