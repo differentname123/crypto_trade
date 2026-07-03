@@ -100,7 +100,8 @@ def run_strategy_simulation(
         strategy_params: dict,
         trade_mode: str,
         initial_capital: float = 10000.0,
-        start_trade_date: str = '2026-04-27 00:00:00'
+        start_trade_date: str = '2026-04-27 00:00:00',
+        logger = None
 ) -> pd.DataFrame:
     """
     流式模拟引擎：基于横截面特征，运行策略状态机推演，生成与回测 100% 一致的交易账本记录。
@@ -351,10 +352,10 @@ def run_strategy_simulation(
                         })
 
         # --- 新增：打印最新一根 K 线的详细情况 (含参数周期、零动量价格及价格偏差) ---
-        if i == len(df_cross_section) - 1:
-            print(f"\n{'=' * 25} 最新 K 线信号详情 {'=' * 25}")
-            print(f"时间: {current_time}")
-            print(f"策略参数: 动量周期={MOM_WINDOW}, 波动率周期={VOL_WINDOW}, 前K名={TOP_K}")
+        if i == len(df_cross_section) - 1 and logger is not None:
+            logger.info(f"\n{'=' * 25} 最新 K 线信号详情 {'=' * 25}")
+            logger.info(f"时间: {current_time}")
+            logger.info(f"策略参数: 动量周期={MOM_WINDOW}, 波动率周期={VOL_WINDOW}, 前K名={TOP_K}")
 
             # 提取大盘数据与偏差
             btc_idx = coin_to_idx.get('BTC', -1)
@@ -363,21 +364,21 @@ def run_strategy_simulation(
                 current_btc_ma = btc_ma_arr[i]
                 btc_deviation = (current_btc_price - current_btc_ma) / current_btc_ma if current_btc_ma > 0 else 0.0
 
-                print(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
-                print(f"  ├─ BTC 当前价: {current_btc_price:.2f}")
-                print(f"  ├─ 均线阈值 ({BTC_TREND_WINDOW} 周期): {current_btc_ma:.2f}")
-                print(f"  └─ 当前偏差幅度: {btc_deviation:+.2%}")
+                logger.info(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
+                logger.info(f"  ├─ BTC 当前价: {current_btc_price:.2f}")
+                logger.info(f"  ├─ 均线阈值 ({BTC_TREND_WINDOW} 周期): {current_btc_ma:.2f}")
+                logger.info(f"  └─ 当前偏差幅度: {btc_deviation:+.2%}")
             else:
-                print(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
+                logger.info(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
 
-            print(f"当前策略模式: {trade_mode}")
-            print(f"本期信号诊断: {kline_signal_diagnostics[i]}")
+            logger.info(f"当前策略模式: {trade_mode}")
+            logger.info(f"本期信号诊断: {kline_signal_diagnostics[i]}")
 
             # 判断当前激活的候选列表
             active_candidates = candidate_longs if is_btc_trend_on else candidate_shorts
             direction_str = "做多候选" if is_btc_trend_on else "做空候选"
 
-            print("-" * 20 + " 候选币种详细参数 " + "-" * 20)
+            logger.info("-" * 20 + " 候选币种详细参数 " + "-" * 20)
             if active_candidates:
                 for c in active_candidates:
                     idx = coin_to_idx[c]
@@ -385,14 +386,14 @@ def run_strategy_simulation(
                     p_threshold = ref_price_arr[i, idx]
                     p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
 
-                    print(
+                    logger.info(
                         f"[{direction_str}] 标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
-                    print(
+                    logger.info(
                         f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
             else:
-                print("当前无候选发车币种 (可能原因: 动量不达标 / 策略模式限制 / 未到发车时间)。")
+                logger.info("当前无候选发车币种 (可能原因: 动量不达标 / 策略模式限制 / 未到发车时间)。")
 
-            print("-" * 20 + " 其他未入选币种情况 " + "-" * 20)
+            logger.info("-" * 20 + " 其他未入选币种情况 " + "-" * 20)
             other_coins = [c for c in target_coins if c not in active_candidates]
             for c in other_coins:
                 idx = coin_to_idx[c]
@@ -400,12 +401,12 @@ def run_strategy_simulation(
                 p_threshold = ref_price_arr[i, idx]
                 p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
 
-                print(
+                logger.info(
                     f"[未入选]   标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
-                print(
+                logger.info(
                     f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
 
-            print("=" * 68 + "\n")
+            logger.info("=" * 68 + "\n")
 
     # 将状态原因落表追踪
     df_cross_section['signal_status'] = kline_signal_diagnostics
@@ -451,7 +452,8 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
         trade_ledger_df = run_strategy_simulation(
             df_cross_section=df_4h_features,
             strategy_params=params,
-            trade_mode=trade_mode
+            trade_mode=trade_mode,
+            logger=logger
         )
 
         if trade_ledger_df.empty:
