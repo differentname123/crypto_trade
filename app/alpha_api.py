@@ -9,7 +9,7 @@ import httpx
 import os
 import platform  # 核心改动：引入平台识别库
 
-from app.copy_sweeper.copy_sweep import get_report
+from copy_sweep import get_report
 
 app = FastAPI()
 
