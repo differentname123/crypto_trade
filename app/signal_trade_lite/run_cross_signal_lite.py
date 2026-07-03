@@ -153,6 +153,14 @@ def run_strategy_simulation(
     vol_arr = df_volatility_pct.values
     btc_trend_arr = df_btc_trend_active.values
     close_arr = df_close.values
+
+    # --- 新增：为日志提取必需的基准数组 ---
+    # 1. 提取 MOM_WINDOW 周期前的价格作为零动量阈值价格矩阵
+    ref_price_arr = df_close.shift(MOM_WINDOW).values
+    # 2. 提取 BTC 均线数组，避免在循环体内产生 pd.Series 寻址开销
+    btc_ma_arr = df_btc_ma.values
+    # -----------------------------------
+
     time_index = df_cross_section.index
 
     # === 状态机初始化 ===
@@ -341,6 +349,63 @@ def run_strategy_simulation(
                             "reason": "Signal Entry Short", "target_weight": target_weight, "pnl": np.nan,
                             "top_k": TOP_K, "max_weight": MAX_WEIGHT
                         })
+
+        # --- 新增：打印最新一根 K 线的详细情况 (含参数周期、零动量价格及价格偏差) ---
+        if i == len(df_cross_section) - 1:
+            print(f"\n{'=' * 25} 最新 K 线信号详情 {'=' * 25}")
+            print(f"时间: {current_time}")
+            print(f"策略参数: 动量周期={MOM_WINDOW}, 波动率周期={VOL_WINDOW}, 前K名={TOP_K}")
+
+            # 提取大盘数据与偏差
+            btc_idx = coin_to_idx.get('BTC', -1)
+            if btc_idx != -1:
+                current_btc_price = current_prices[btc_idx]
+                current_btc_ma = btc_ma_arr[i]
+                btc_deviation = (current_btc_price - current_btc_ma) / current_btc_ma if current_btc_ma > 0 else 0.0
+
+                print(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
+                print(f"  ├─ BTC 当前价: {current_btc_price:.2f}")
+                print(f"  ├─ 均线阈值 ({BTC_TREND_WINDOW} 周期): {current_btc_ma:.2f}")
+                print(f"  └─ 当前偏差幅度: {btc_deviation:+.2%}")
+            else:
+                print(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
+
+            print(f"当前策略模式: {trade_mode}")
+            print(f"本期信号诊断: {kline_signal_diagnostics[i]}")
+
+            # 判断当前激活的候选列表
+            active_candidates = candidate_longs if is_btc_trend_on else candidate_shorts
+            direction_str = "做多候选" if is_btc_trend_on else "做空候选"
+
+            print("-" * 20 + " 候选币种详细参数 " + "-" * 20)
+            if active_candidates:
+                for c in active_candidates:
+                    idx = coin_to_idx[c]
+                    p_current = current_prices[idx]
+                    p_threshold = ref_price_arr[i, idx]
+                    p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
+
+                    print(
+                        f"[{direction_str}] 标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
+                    print(
+                        f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
+            else:
+                print("当前无候选发车币种 (可能原因: 动量不达标 / 策略模式限制 / 未到发车时间)。")
+
+            print("-" * 20 + " 其他未入选币种情况 " + "-" * 20)
+            other_coins = [c for c in target_coins if c not in active_candidates]
+            for c in other_coins:
+                idx = coin_to_idx[c]
+                p_current = current_prices[idx]
+                p_threshold = ref_price_arr[i, idx]
+                p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
+
+                print(
+                    f"[未入选]   标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
+                print(
+                    f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
+
+            print("=" * 68 + "\n")
 
     # 将状态原因落表追踪
     df_cross_section['signal_status'] = kline_signal_diagnostics
