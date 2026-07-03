@@ -234,10 +234,11 @@ def calculate_tail_risk_index(trades):
         max_loss = abs(worst_loss_trade['totalPnl'])
         evidences = [worst_loss_trade]
 
-    median_profit = statistics.median(profits) if profits else 0.0
-    index_val = (max_loss / median_profit) if median_profit > 0 else (float('1000') if max_loss > 0 else 0.0)
+
 
     win_count, loss_count = len(profits), len(loss_trades)
+    median_profit = sum(profits) / win_count if win_count > 0 else 0.0
+    index_val = (max_loss / median_profit) if median_profit > 0 else (float('1000') if max_loss > 0 else 0.0)
     avg_profit = sum(profits) / win_count if win_count > 0 else 0.0
     avg_loss = sum(abs(t['totalPnl']) for t in loss_trades) / loss_count if loss_count > 0 else 0.0
     normal_pnl_ratio = (avg_profit / avg_loss) if avg_loss > 0 else (float('1000') if avg_profit > 0 else 0.0)
@@ -414,7 +415,7 @@ def fetch_history_by_time_range(portfolio_id, start_time_str, end_time_str, max_
     return all_orders
 
 
-def smart_fetch_history_by_time_range(portfolio_id, target_start_str, target_end_str, file_path, max_count=100,
+def smart_fetch_history_by_time_range(portfolio_id, target_start_str, target_end_str, file_path, max_count=200,
                                       max_retries=3):
     """智能历史订单拉取器（带本地缓存合并与差集填补功能）"""
     target_start_ms, target_end_ms = time_str_to_ms(target_start_str), time_str_to_ms(target_end_str)

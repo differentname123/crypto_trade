@@ -168,7 +168,7 @@ const RISK_CONFIG = [
         buildNode: (d) => {
             const s = d.tail_risk.summary;
             return {
-                headline: (hl) => <>单笔最大亏损 <b className={hl}>-{fmt.usd(s.max_single_loss)} U</b>，单笔中位盈利 <b
+                headline: (hl) => <>单笔最大亏损 <b className={hl}>-{fmt.usd(s.max_single_loss)} U</b>，平均盈利 <b
                     className={hl}>{fmt.num(s.median_single_profit, 2)} U</b>，要 <b
                     className={hl}>{fmt.int(s.tail_risk_index)} 笔</b>盈利才填得平</>,
                 stats: [],
@@ -487,7 +487,7 @@ function HoldRatioEvidence({data}) {
                 ))}
             </div>
             {r != null && <div
-                className="rounded-2xl bg-black/20 border border-white/5 p-4 text-sm text-slate-300">同样一笔单，亏钱时他愿意扛 <span
+                className="rounded-2xl bg-black/20 border border-white/5 p-4 text-sm text-slate-300">同样一笔单，亏钱时愿意扛 <span
                 className="text-amber-400 font-bold text-lg">{fmt.num(r, 2)}</span> 倍于盈利时的时间才肯松手。</div>}
         </div>
     );
