@@ -493,7 +493,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             # 第一层防线：极速字典推导式过滤（取代动辄几十万行的全量循环与判断）
             sliced_klines = [
                 k for ts, k in memory_pool[sym].items()
-                if start_time_ms <= ts <= target_time_ms
+                if ts <= target_time_ms
             ]
 
             # 第二层防线：局部极速排序（取代全量排序）
