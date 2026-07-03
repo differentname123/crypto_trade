@@ -10,7 +10,7 @@ import {
  * 1. 配置 & 样式字典
  * ========================================================================= */
 const LEVEL_STYLES = {
-  high:   { label: '高危', hex: '#f43f5e', Icon: ShieldAlert,   text: 'text-rose-400',    border: 'border-rose-500/40',    strip: 'bg-rose-500/10 border-rose-500/25',      badge: 'bg-rose-500/15 text-rose-300' },
+  high:   { label: '高危', hex: '#ef4444', Icon: ShieldAlert,   text: 'text-red-400',    border: 'border-red-500/40',    strip: 'bg-red-500/10 border-red-500/25',      badge: 'bg-red-500/15 text-red-300' },
   medium: { label: '警惕', hex: '#f59e0b', Icon: AlertTriangle, text: 'text-amber-400',   border: 'border-amber-500/40',   strip: 'bg-amber-500/10 border-amber-500/25',    badge: 'bg-amber-500/15 text-amber-300' },
   low:    { label: '稳健', hex: '#10b981', Icon: ShieldCheck,   text: 'text-emerald-400', border: 'border-emerald-500/30', strip: 'bg-emerald-500/5 border-emerald-500/20', badge: 'bg-emerald-500/15 text-emerald-300' },
 };
@@ -107,13 +107,9 @@ const RISK_CONFIG = [
       });
       return {
         headline: (hl) => maxLen > 1
-          ? <>最凶一次<b className={hl}>连续加仓 {maxLen} 笔</b>，仓位滚到<b className={hl}> 约 ×{maxMult.toFixed(1)}</b></>
-          : <>共 <b className={hl}>{fmt.int(s.martingale_sequences)} 次</b>「越亏越加」，占全部加仓 <b className={hl}>{fmt.pct(s.martingale_rate_percent)}</b></>,
-        stats: [
-          { label: '危险加仓占比', value: fmt.pct(s.martingale_rate_percent) },
-          { label: '越亏越加次数', value: fmt.int(s.martingale_sequences) },
-          { label: '总加仓次数', value: fmt.int(s.total_add_sequences) },
-        ],
+          ? <>危险加仓占比 <b className={hl}>{fmt.pct(s.martingale_rate_percent)}</b>，最凶一次连续加仓 <b className={hl}>{maxLen} 笔</b>，仓位放大至初始的 <b className={`${hl} text-lg font-bold`}>{maxMult.toFixed(1)} 倍</b></>
+          : <>危险加仓占比 <b className={hl}>{fmt.pct(s.martingale_rate_percent)}</b>，共 <b className={hl}>{fmt.int(s.martingale_sequences)} 次</b>「越亏越加」</>,
+        stats: [],
         Component: MartingaleEvidence, data: d.martingale,
       };
     }
@@ -126,12 +122,8 @@ const RISK_CONFIG = [
     buildNode: (d) => {
       const s = d.tail_risk.summary;
       return {
-        headline: (hl) => <>单笔最大亏损 <b className={hl}>-{fmt.usd(s.max_single_loss)} U</b>，要 <b className={hl}>{fmt.int(s.tail_risk_index)} 笔</b>盈利才填得平</>,
-        stats: [
-          { label: '尾部风险指数', value: fmt.int(s.tail_risk_index) },
-          { label: '盈利 / 亏损笔数', value: `${fmt.int(s.win_count)} / ${fmt.int(s.loss_count)}` },
-          { label: '单笔中位盈利', value: fmt.num(s.median_single_profit, 2) },
-        ],
+        headline: (hl) => <>单笔最大亏损 <b className={hl}>-{fmt.usd(s.max_single_loss)} U</b>，单笔中位盈利 <b className={hl}>{fmt.num(s.median_single_profit, 2)} U</b>，要 <b className={hl}>{fmt.int(s.tail_risk_index)} 笔</b>盈利才填得平</>,
+        stats: [],
         Component: TailRiskEvidence, data: d.tail_risk,
       };
     }
@@ -146,12 +138,8 @@ const RISK_CONFIG = [
       const evs = d.slippage_trap.evidences || [];
       const fastest = evs.reduce((m, e) => (e.hold_time_ms != null && e.hold_time_ms < m ? e.hold_time_ms : m), Infinity);
       return {
-        headline: (hl) => <>最快 <b className={hl}>{fastest === Infinity ? '—' : fmt.duration(fastest)}</b>就平仓，<b className={hl}>{fmt.pct(s.slippage_trap_ratio_percent)}</b> 的交易都这样快进快出</>,
-        stats: [
-          { label: '超短持仓占比', value: fmt.pct(s.slippage_trap_ratio_percent) },
-          { label: '超短持仓次数', value: fmt.int(s.short_hold_sequences) },
-          { label: '平均持仓时长', value: s.average_hold_time_minutes != null ? `${fmt.num(s.average_hold_time_minutes, 0)} 分钟` : '—' },
-        ],
+        headline: (hl) => <>最快 <b className={hl}>{fastest === Infinity ? '—' : fmt.duration(fastest)}</b>就平仓，<b className={hl}>{fmt.pct(s.slippage_trap_ratio_percent)}</b> 的交易都这样快进快出，平均持仓 <b className={hl}>{s.average_hold_time_minutes != null ? `${fmt.num(s.average_hold_time_minutes, 0)} 分钟` : '—'}</b></>,
+        stats: [],
         Component: SlippageEvidence, data: d.slippage_trap,
       };
     }
@@ -246,7 +234,7 @@ const Feature = ({ icon: Icon, title, desc }) => (
 );
 
 /* =========================================================================
- * 7. 证据组件（原始成交明细：时间 / 均价 / 数量 三件套）
+ * 7. 证据组件
  * ========================================================================= */
 function MartingaleEvidence({ data }) {
   const evs = data?.evidences || [];
@@ -256,32 +244,20 @@ function MartingaleEvidence({ data }) {
     <div className="space-y-4 mt-4">
       <ExplainBox>「越亏越加」指行情不利时不断加大买入摊低成本。只要单边行情持续，仓位会像滚雪球般膨胀，最终可能瞬间爆仓——跟单者往往连反应时间都没有。</ExplainBox>
       {evs.slice(0, 3).map((seq, i) => {
-        const first = seq[0], last = seq[seq.length - 1];
-        const priceChg = first.avgPrice ? ((last.avgPrice - first.avgPrice) / first.avgPrice) * 100 : 0;
-        const totalQty = seq.reduce((a, t) => a + (t.executedQty || 0), 0);
+        const first = seq[0];
         const maxQty = Math.max(...seq.map(t => t.executedQty || 0)) || 1;
         const isLong = first.positionSide === 'LONG';
         return (
           <div key={i} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-            <div className="flex flex-wrap items-center gap-2 mb-3">
+            <div className="flex flex-wrap items-center gap-2 mb-4">
               <span className="font-mono font-semibold text-slate-100">{first.symbol}</span>
-              <span className={`text-xs px-2 py-0.5 rounded ${isLong ? 'bg-emerald-500/15 text-emerald-300' : 'bg-rose-500/15 text-rose-300'}`}>{isLong ? '做多' : '做空'}</span>
+              <span className={`text-xs px-2 py-0.5 rounded ${isLong ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-300'}`}>{isLong ? '做多' : '做空'}</span>
               <span className="text-xs text-slate-500">连续加仓 {seq.length} 次</span>
-            </div>
-            <div className="grid grid-cols-2 gap-2 mb-4">
-              <div className="rounded-lg bg-slate-900/70 p-2.5">
-                <div className="text-xs text-slate-500">成本均价</div>
-                <div className="text-sm text-slate-200 mt-0.5 tabular-nums">{fmt.price(first.avgPrice)} → {fmt.price(last.avgPrice)} <span className="text-amber-400">({priceChg > 0 ? '+' : ''}{priceChg.toFixed(1)}%)</span></div>
-              </div>
-              <div className="rounded-lg bg-slate-900/70 p-2.5">
-                <div className="text-xs text-slate-500">仓位放大</div>
-                <div className="text-sm text-slate-200 mt-0.5 tabular-nums">{fmt.qty(first.executedQty)} → {fmt.qty(totalQty)} <span className="text-rose-400">(×{(totalQty / (first.executedQty || 1)).toFixed(1)})</span></div>
-              </div>
             </div>
             <div className="flex items-center gap-2 text-xs text-slate-600 mb-1.5 px-0.5">
               <span className="w-20 shrink-0">时间</span>
               <span className="w-14 shrink-0 text-right">均价</span>
-              <span className="flex-1 text-right">数量（逐笔加大）</span>
+              <span className="flex-1 text-right">数量</span>
             </div>
             <div className="space-y-1.5">
               {seq.map((t, idx) => (
@@ -290,7 +266,7 @@ function MartingaleEvidence({ data }) {
                   <span className="w-14 shrink-0 text-right text-slate-400 tabular-nums">{fmt.price(t.avgPrice)}</span>
                   <div className="flex-1 flex items-center gap-2">
                     <div className="flex-1 h-4 bg-slate-800/70 rounded overflow-hidden">
-                      <div className="h-full rounded" style={{ width: `${(t.executedQty / maxQty) * 100}%`, minWidth: '6px', background: 'linear-gradient(90deg,#7f1d1d,#fb7185)' }} />
+                      <div className="h-full rounded" style={{ width: `${(t.executedQty / maxQty) * 100}%`, minWidth: '6px', background: 'linear-gradient(90deg,#7f1d1d,#f87171)' }} />
                     </div>
                     <span className="w-12 shrink-0 text-right text-slate-200 tabular-nums font-medium">{fmt.qty(t.executedQty)}</span>
                   </div>
@@ -300,7 +276,7 @@ function MartingaleEvidence({ data }) {
           </div>
         );
       })}
-      {evs.length > 3 && <p className="text-center text-xs text-slate-500 pt-1">另有 {evs.length - 3} 组类似加仓序列未展示</p>}
+      <p className="text-center text-xs text-slate-500 pt-2">类似的情况一共有 {data?.summary?.martingale_sequences || 0} 次</p>
     </div>
   );
 }
@@ -308,23 +284,21 @@ function MartingaleEvidence({ data }) {
 function TailRiskEvidence({ data }) {
   const ev = data?.evidences?.[0];
   const s = data?.summary || {};
-  const total = (s.win_count || 0) + (s.loss_count || 0);
-  const winRate = total > 0 ? (s.win_count / total) * 100 : null;
 
   return (
     <div className="space-y-4 mt-4">
       <ExplainBox>高胜率 ≠ 稳赚。这类交易员靠大量小额盈利堆出漂亮胜率，但盈亏极不对称——一次黑天鹅巨亏，足以吞掉之前数月的全部利润。</ExplainBox>
       {ev && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/5 p-4">
+        <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-4">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs text-slate-400">单笔最大亏损 · <span className="font-mono">{ev.symbol}</span></div>
-              <div className="text-3xl font-bold text-rose-400 mt-1 tabular-nums">{fmt.usd(ev.totalPnl)} <span className="text-base font-normal text-slate-500">USDT</span></div>
+              <div className="text-3xl font-bold text-red-400 mt-1 tabular-nums">{fmt.usd(ev.totalPnl)} <span className="text-base font-normal text-slate-500">USDT</span></div>
             </div>
-            <Flame className="text-rose-500/60 shrink-0" size={38} />
+            <Flame className="text-red-500/60 shrink-0" size={38} />
           </div>
           {(ev.orderUpdateTime != null || ev.orderUpdateTime_str || ev.avgPrice != null || ev.executedQty != null) && (
-            <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-rose-500/15 text-xs">
+            <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-red-500/15 text-xs">
               <div><div className="text-slate-500">平仓时间</div><div className="text-slate-300 tabular-nums mt-0.5">{evTime(ev, true)}</div></div>
               <div><div className="text-slate-500">成交均价</div><div className="text-slate-300 tabular-nums mt-0.5">{fmt.price(ev.avgPrice)}</div></div>
               <div><div className="text-slate-500">成交数量</div><div className="text-slate-300 tabular-nums mt-0.5">{fmt.qty(ev.executedQty)}</div></div>
@@ -334,17 +308,7 @@ function TailRiskEvidence({ data }) {
       )}
       {s.tail_risk_index != null && (
         <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4 text-sm text-slate-300 leading-relaxed">
-          这一笔亏损，需要约 <span className="text-rose-400 font-bold text-lg">{fmt.int(s.tail_risk_index)}</span> 笔正常盈利单才能补回来。
-        </div>
-      )}
-      {winRate != null && (
-        <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4">
-          <div className="flex justify-between text-xs mb-2"><span className="text-emerald-400">盈利 {fmt.int(s.win_count)} 笔</span><span className="text-rose-400">亏损 {fmt.int(s.loss_count)} 笔</span></div>
-          <div className="h-2.5 rounded-full overflow-hidden bg-slate-800 flex">
-            <div className="h-full bg-emerald-500" style={{ width: `${winRate}%` }} />
-            <div className="h-full bg-rose-500" style={{ width: `${100 - winRate}%` }} />
-          </div>
-          <p className="text-xs text-slate-500 mt-2">胜率看着很高，但决定盈亏的是每笔的「大小」，不是「次数」。</p>
+          这一笔亏损，需要约 <span className="text-red-400 font-bold text-lg">{fmt.int(s.tail_risk_index)}</span> 笔正常盈利单才能补回来。
         </div>
       )}
     </div>
@@ -377,7 +341,7 @@ function SlippageEvidence({ data }) {
             <div className="space-y-1">
               {trades.map((t, idx) => (
                 <div key={idx} className="flex items-center gap-2 text-xs bg-slate-900/50 px-2.5 py-1.5 rounded">
-                  <span className={`w-12 shrink-0 font-medium ${idx === 0 ? 'text-emerald-400' : idx === trades.length - 1 ? 'text-rose-400' : 'text-slate-400'}`}>{idx === 0 ? '开仓' : idx === trades.length - 1 ? '平仓' : '加仓'}</span>
+                  <span className={`w-12 shrink-0 font-medium ${idx === 0 ? 'text-emerald-400' : idx === trades.length - 1 ? 'text-red-400' : 'text-slate-400'}`}>{idx === 0 ? '开仓' : idx === trades.length - 1 ? '平仓' : '加仓'}</span>
                   <span className="flex-1 text-slate-400 tabular-nums">{evTime(t, true)}</span>
                   <span className="w-20 text-right text-slate-300 tabular-nums">{fmt.price(t.avgPrice)}</span>
                   <span className="w-14 text-right text-slate-300 tabular-nums">{fmt.qty(t.executedQty)}</span>
@@ -387,6 +351,7 @@ function SlippageEvidence({ data }) {
           </div>
         );
       })}
+      <p className="text-center text-xs text-slate-500 pt-2">类似的情况一共有 {data?.summary?.short_hold_sequences || 0} 次</p>
     </div>
   );
 }
@@ -397,7 +362,7 @@ function HoldRatioEvidence({ data }) {
   const maxT = Math.max(p || 0, l || 0) || 1;
   const rows = [
     { label: '盈利单 · 平均持仓', val: p, bar: 'bg-emerald-500', text: 'text-emerald-400' },
-    { label: '亏损单 · 平均持仓', val: l, bar: 'bg-rose-500', text: 'text-rose-400' },
+    { label: '亏损单 · 平均持仓', val: l, bar: 'bg-red-500', text: 'text-red-400' },
   ];
   return (
     <div className="space-y-4 mt-4">
@@ -490,14 +455,14 @@ const InputView = ({ onSubmit }) => {
       <div className="w-full max-w-xl text-center">
         <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-slate-800/60 border border-slate-700 mb-6"><Radar className="text-emerald-400" size={30} /></div>
         <h1 className="text-3xl md:text-4xl font-bold text-slate-100">跟单风险透视镜</h1>
-        <p className="text-slate-400 mt-3 md:text-lg leading-relaxed">粘贴币安带单员链接，看穿漂亮收益率背后<span className="text-rose-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
+        <p className="text-slate-400 mt-3 md:text-lg leading-relaxed">粘贴币安带单员链接，看穿漂亮收益率背后<span className="text-red-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
 
         <form onSubmit={submit} className="mt-8">
           <div className="relative">
             <Link2 className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
             <input value={url} onChange={(e) => { setUrl(e.target.value); setErr(''); }} placeholder="粘贴带单员主页链接…" className="w-full pl-11 pr-4 py-3.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-100 placeholder-slate-600 text-sm focus:outline-none focus:border-emerald-500/60 focus:ring-2 focus:ring-emerald-500/20 transition" />
           </div>
-          {err && <p className="text-rose-400 text-xs mt-2 text-left">{err}</p>}
+          {err && <p className="text-red-400 text-xs mt-2 text-left">{err}</p>}
           <button type="submit" className="w-full mt-3 py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold transition flex items-center justify-center gap-2"><Search size={18} /> 一键透视风险</button>
         </form>
 
@@ -529,7 +494,7 @@ const LoadingView = () => {
 
 const ErrorView = ({ message, onRetry, onReset }) => (
   <div className="min-h-screen flex flex-col items-center justify-center px-4 text-center">
-    <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-rose-500/10 border border-rose-500/30 mb-5"><XCircle className="text-rose-400" size={32} /></div>
+    <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-red-500/10 border border-red-500/30 mb-5"><XCircle className="text-red-400" size={32} /></div>
     <h2 className="text-xl font-semibold text-slate-100">检测失败</h2>
     <p className="text-sm text-slate-400 mt-2 max-w-sm">{message}</p>
     <div className="flex gap-3 mt-6">
@@ -551,7 +516,15 @@ const ReportView = ({ report, target, onReset }) => {
 
   const isEmpty = !report || Object.keys(report).length === 0;
   const isZero = !isEmpty && ov.total_trades === 0;
-  const summaryText = highCount > 0 ? `发现 ${highCount} 项致命风险` : medCount > 0 ? `发现 ${medCount} 项需警惕的信号` : '各项指标暂无明显异常';
+
+  // 计算天数跨度和直观的日期展示
+  let daysSpan = '—';
+  let dateStr = '—';
+  if (ov.start_time && ov.end_time) {
+    const diff = new Date(ov.end_time).getTime() - new Date(ov.start_time).getTime();
+    daysSpan = Math.max(1, Math.ceil(diff / 86400000));
+    dateStr = `${fmt.date(ov.start_time).split(' ')[0]} 至 ${fmt.date(ov.end_time).split(' ')[0]}`;
+  }
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-6 md:py-10">
@@ -570,12 +543,19 @@ const ReportView = ({ report, target, onReset }) => {
             <RiskGauge score={riskScore} level={level} />
             <div className="mt-5">
               <h2 className="text-2xl font-bold" style={{ color: LEVEL_STYLES[level].hex }}>{verdict.word}</h2>
-              <p className="text-slate-400 text-sm mt-1.5">{verdict.advice} · <span className="text-slate-300">{summaryText}</span></p>
             </div>
-            <div className="mt-6 inline-flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-xs bg-slate-950/50 border border-slate-800/60 rounded-xl px-5 py-3">
-              <div className="flex gap-2"><span className="text-slate-500">交易笔数</span><span className="text-slate-200 tabular-nums">{fmt.int(ov.total_trades)} 笔</span></div>
-              <div className="w-px h-4 bg-slate-800 hidden sm:block" />
-              <div className="flex gap-2"><span className="text-slate-500">数据区间</span><span className="text-slate-200 tabular-nums">{fmt.date(ov.start_time)} 至 {fmt.date(ov.end_time)}</span></div>
+
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              <div className="flex items-center gap-2.5 bg-slate-950/50 border border-slate-800/60 rounded-xl px-4 py-2.5">
+                <span className="text-slate-500 text-sm">交易笔数</span>
+                <span className="text-slate-200 font-semibold tabular-nums">{fmt.int(ov.total_trades)} <span className="text-xs font-normal text-slate-500">笔</span></span>
+              </div>
+              <div className="flex items-center gap-2.5 bg-slate-950/50 border border-slate-800/60 rounded-xl px-4 py-2.5">
+                <span className="text-slate-500 text-sm">交易跨度</span>
+                <span className="text-slate-200 font-semibold tabular-nums">{daysSpan} <span className="text-xs font-normal text-slate-500">天</span></span>
+                <div className="w-px h-3 bg-slate-700 mx-1" />
+                <span className="text-slate-400 text-xs tabular-nums">{dateStr}</span>
+              </div>
             </div>
           </motion.div>
 
