@@ -414,7 +414,7 @@ def fetch_history_by_time_range(portfolio_id, start_time_str, end_time_str, max_
     return all_orders
 
 
-def smart_fetch_history_by_time_range(portfolio_id, target_start_str, target_end_str, file_path, max_count=0,
+def smart_fetch_history_by_time_range(portfolio_id, target_start_str, target_end_str, file_path, max_count=100,
                                       max_retries=3):
     """智能历史订单拉取器（带本地缓存合并与差集填补功能）"""
     target_start_ms, target_end_ms = time_str_to_ms(target_start_str), time_str_to_ms(target_end_str)
@@ -565,7 +565,7 @@ def get_report(url_str):
 
     now = datetime.now()
     TARGET_END = now.strftime("%Y-%m-%d %H:%M:%S")
-    TARGET_START = (now - timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+    TARGET_START = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
 
     output_dir = "temp_data"
     os.makedirs(output_dir, exist_ok=True)
@@ -582,6 +582,16 @@ def get_report(url_str):
 # 模块 6：Main 执行区
 # =====================================================================
 if __name__ == "__main__":
+    # # 拉取所有的biance带单的人
+    traders_list = fetch_binance_copy_traders(400)
+    trader_map = {trader['leadPortfolioId']: trader['nickname'] for trader in traders_list}
+
+    for lead_id, nickname in trader_map.items():
+        print(f"\n🔹 分析带单者: {nickname} | Lead ID: {lead_id}")
+        url_str = f"https://www.binance.com/zh-CN/copy-trading/lead-details/{lead_id}"
+        detail_map = get_report(url_str)
+        print(f"✅ 分析完成，输出概览: {json.dumps(detail_map.get('overview'), indent=4, ensure_ascii=False)}")
+        time.sleep(random.uniform(1.5, 3.0))
     # 示例调用
     url_str = 'https://www.binance.com/zh-CN/copy-trading/lead-details/5014426348046646785'
     detail_map = get_report(url_str)
