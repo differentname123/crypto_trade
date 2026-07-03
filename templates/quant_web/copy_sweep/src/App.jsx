@@ -575,6 +575,8 @@ function DimensionCard({dim, expanded, onToggle}) {
 const InputView = ({onSubmit}) => {
     const [url, setUrl] = useState('');
     const [err, setErr] = useState('');
+    const [showTutorial, setShowTutorial] = useState(false);
+
     const submit = (e) => {
         e.preventDefault();
         url.trim() ? onSubmit(url.trim()) : setErr('请先粘贴交易员主页链接');
@@ -600,14 +602,55 @@ const InputView = ({onSubmit}) => {
                         <input value={url} onChange={(e) => {
                             setUrl(e.target.value);
                             setErr('');
-                        }} placeholder="粘贴带单员主页链接…"
-                               className="w-full pl-12 pr-4 py-4 rounded-2xl bg-white/5 border border-white/10 backdrop-blur-xl text-slate-100 placeholder-slate-600 text-sm focus:outline-none focus:border-emerald-500/50 focus:bg-white/10 focus:ring-4 focus:ring-emerald-500/10 transition-all"/>
+                        }} placeholder="示例：https://www.binance.com/zh-CN/copy-trading/lead-details/8888"
+                               className="w-full pl-12 pr-4 py-4 rounded-2xl bg-white/5 border border-white/10 backdrop-blur-xl text-slate-100 placeholder-slate-500 text-sm focus:outline-none focus:border-emerald-500/50 focus:bg-white/10 focus:ring-4 focus:ring-emerald-500/10 transition-all"/>
                     </div>
                     {err && <p className="text-red-400 text-xs mt-2.5 text-left px-1">{err}</p>}
                     <motion.button whileHover={{scale: 1.01}} whileTap={{scale: 0.985}} type="submit"
                                    className="w-full mt-3.5 py-4 rounded-2xl bg-gradient-to-b from-emerald-400 to-emerald-500 hover:from-emerald-300 hover:to-emerald-400 text-slate-950 font-semibold shadow-lg shadow-emerald-500/25 transition-colors flex items-center justify-center gap-2">
                         <Search size={18}/> 一键透视风险
                     </motion.button>
+
+                    <div className="mt-5 flex flex-col items-center">
+                        <button type="button" onClick={() => setShowTutorial(!showTutorial)}
+                                className="text-xs text-slate-500 hover:text-emerald-400 transition-colors flex items-center gap-1 select-none">
+                            <span className="underline underline-offset-4">如何获取带单员链接？</span>
+                            <ChevronDown size={14}
+                                         className={`transition-transform duration-300 ${showTutorial ? 'rotate-180' : ''}`}/>
+                        </button>
+                        <AnimatePresence>
+                            {showTutorial && (
+                                <motion.div
+                                    initial={{opacity: 0, height: 0}}
+                                    animate={{opacity: 1, height: 'auto'}}
+                                    exit={{opacity: 0, height: 0}}
+                                    transition={{duration: 0.35, ease: EASE}}
+                                    className="overflow-hidden w-full mt-3"
+                                >
+                                    <div
+                                        className="bg-black/20 border border-white/5 rounded-2xl p-4 text-sm text-slate-300 text-left space-y-3 shadow-inner">
+                                        <div className="flex items-start gap-2.5">
+                                            <span
+                                                className="w-5 h-5 rounded-full bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 text-xs font-semibold mt-0.5">1</span>
+                                            <p className="leading-relaxed">第一步：进入带单员的带单主页</p>
+                                        </div>
+                                        <div className="flex items-start gap-2.5">
+                                            <span
+                                                className="w-5 h-5 rounded-full bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 text-xs font-semibold mt-0.5">2</span>
+                                            <p className="leading-relaxed">第二步：点击右上角的分享按钮</p>
+                                        </div>
+                                        <div className="flex items-start gap-2.5">
+                                            <span
+                                                className="w-5 h-5 rounded-full bg-emerald-500/15 text-emerald-400 flex items-center justify-center shrink-0 text-xs font-semibold mt-0.5">3</span>
+                                            <p className="leading-relaxed">第三步：点击 <strong
+                                                className="text-emerald-400 font-medium">[复制]</strong> 就已经获取到链接了
+                                            </p>
+                                        </div>
+                                    </div>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+                    </div>
                 </form>
 
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-12 text-left">
@@ -705,8 +748,17 @@ const ReportView = ({report, target, onReset}) => {
                     {isEmpty ? <XCircle className="mx-auto text-slate-500 mb-4" size={48}/> :
                         <Search className="mx-auto text-emerald-400 mb-4" size={48}/>}
                     <h3 className="text-lg font-semibold text-slate-200 tracking-tight">{isEmpty ? '未获取到有效数据' : '该交易员暂无交易记录'}</h3>
-                    <p className="text-sm text-slate-500 mt-2">{isEmpty ? '请确认链接正确，或稍后重试。' : '无法基于空白记录进行风险评估。'}</p>
-                </div>
+                    <p className="text-sm text-slate-500 mt-2">
+                        {isEmpty ? (
+                            '请确认链接正确，或稍后重试。'
+                        ) : (
+                            <>
+                                无法基于空白记录进行风险评估。(只支持
+                                <span className="font-bold text-blue-500 mx-0.5">公域</span>
+                                带单的分析)
+                            </>
+                        )}
+                    </p></div>
             ) : (
                 <>
                     <motion.div initial={{opacity: 0, y: 16, scale: 0.98}} animate={{opacity: 1, y: 0, scale: 1}}
