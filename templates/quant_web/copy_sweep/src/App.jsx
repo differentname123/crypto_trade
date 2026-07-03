@@ -7,12 +7,19 @@ import {
 } from 'lucide-react';
 
 /* =========================================================================
+ * 0. 设计常量（苹果风）
+ * ========================================================================= */
+const FONT_STACK = '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif';
+const EASE = [0.16, 1, 0.3, 1];
+const GRAIN = "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")";
+
+/* =========================================================================
  * 1. 配置 & 样式字典
  * ========================================================================= */
 const LEVEL_STYLES = {
-  high:   { label: '高危', hex: '#ef4444', Icon: ShieldAlert,   text: 'text-red-400',    border: 'border-red-500/40',    strip: 'bg-red-500/10 border-red-500/25',      badge: 'bg-red-500/15 text-red-300' },
-  medium: { label: '警惕', hex: '#f59e0b', Icon: AlertTriangle, text: 'text-amber-400',   border: 'border-amber-500/40',   strip: 'bg-amber-500/10 border-amber-500/25',    badge: 'bg-amber-500/15 text-amber-300' },
-  low:    { label: '稳健', hex: '#10b981', Icon: ShieldCheck,   text: 'text-emerald-400', border: 'border-emerald-500/30', strip: 'bg-emerald-500/5 border-emerald-500/20', badge: 'bg-emerald-500/15 text-emerald-300' },
+  high:   { label: '高危', hex: '#ff453a', Icon: ShieldAlert,   text: 'text-red-400',    border: 'border-red-500/20',    strip: 'bg-red-500/10 border-red-500/20',      badge: 'bg-red-500/15 text-red-300' },
+  medium: { label: '警惕', hex: '#ff9f0a', Icon: AlertTriangle, text: 'text-amber-400',   border: 'border-amber-500/20',   strip: 'bg-amber-500/10 border-amber-500/20',    badge: 'bg-amber-500/15 text-amber-300' },
+  low:    { label: '稳健', hex: '#30d158', Icon: ShieldCheck,   text: 'text-emerald-400', border: 'border-emerald-500/15', strip: 'bg-emerald-500/10 border-emerald-500/20', badge: 'bg-emerald-500/15 text-emerald-300' },
 };
 
 const OVERVIEW = {
@@ -53,7 +60,6 @@ const fmt = {
   },
 };
 
-// 统一处理成交时间（时间戳 或 "YYYY-MM-DD HH:MM:SS" 字符串）
 const evTime = (t, sec = false) => {
   if (t?.orderUpdateTime != null) {
     const d = new Date(t.orderUpdateTime);
@@ -87,7 +93,7 @@ function useCountUp(target, duration = 1400) {
 }
 
 /* =========================================================================
- * 3. 维度配置字典（新增或修改维度只需动这里）
+ * 3. 维度配置字典
  * ========================================================================= */
 const RISK_CONFIG = [
   {
@@ -203,32 +209,34 @@ function useRiskAnalysis() {
  * 6. 基础 UI 组件
  * ========================================================================= */
 const ExplainBox = ({ children }) => (
-  <div className="rounded-xl bg-slate-800/40 border border-slate-700/50 p-3.5 text-sm text-slate-300 leading-relaxed flex gap-2.5">
+  <div className="rounded-2xl bg-white/5 border border-white/10 p-4 text-sm text-slate-300 leading-relaxed flex gap-3">
     <AlertTriangle size={16} className="text-amber-400 shrink-0 mt-0.5" /> <p>{children}</p>
   </div>
 );
 
 const SafeNote = ({ text }) => (
-  <div className="mt-4 rounded-xl bg-emerald-500/5 border border-emerald-500/20 p-4 flex items-center gap-3 text-sm text-emerald-300">
+  <div className="mt-4 rounded-2xl bg-emerald-500/5 border border-emerald-500/20 p-4 flex items-center gap-3 text-sm text-emerald-300">
     <CheckCircle2 size={18} className="shrink-0" /> <span>{text}</span>
   </div>
 );
 
 const StatChips = ({ stats }) => !stats?.length ? null : (
-  <div className="grid grid-cols-3 gap-2">
+  <div className="grid grid-cols-3 gap-1.5 sm:gap-2">
     {stats.map((s, i) => (
-      <div key={i} className="rounded-lg bg-slate-950/50 border border-slate-800 p-2.5 text-center">
-        <div className="text-xs text-slate-500 truncate">{s.label}</div>
-        <div className="text-sm font-semibold text-slate-200 mt-0.5 tabular-nums">{s.value}</div>
+      <div key={i} className="rounded-xl bg-black/20 border border-white/5 p-2 sm:p-2.5 text-center">
+        <div className="text-[10px] sm:text-xs text-slate-500 truncate">{s.label}</div>
+        <div className="text-xs sm:text-sm font-semibold text-slate-200 mt-0.5 tabular-nums truncate">{s.value}</div>
       </div>
     ))}
   </div>
 );
 
 const Feature = ({ icon: Icon, title, desc }) => (
-  <div className="rounded-xl bg-slate-900/50 border border-slate-800 p-4">
-    <Icon className="text-emerald-400" size={20} />
-    <h3 className="text-slate-200 font-medium mt-2 text-sm">{title}</h3>
+  <div className="rounded-2xl bg-white/5 border border-white/10 backdrop-blur-xl p-4 transition-colors hover:bg-white/10">
+    <div className="inline-flex w-9 h-9 rounded-xl bg-emerald-500/10 items-center justify-center">
+      <Icon className="text-emerald-400" size={18} />
+    </div>
+    <h3 className="text-slate-200 font-medium mt-3 text-sm">{title}</h3>
     <p className="text-slate-500 text-xs mt-1 leading-relaxed">{desc}</p>
   </div>
 );
@@ -248,27 +256,27 @@ function MartingaleEvidence({ data }) {
         const maxQty = Math.max(...seq.map(t => t.executedQty || 0)) || 1;
         const isLong = first.positionSide === 'LONG';
         return (
-          <div key={i} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+          <div key={i} className="rounded-2xl border border-white/5 bg-black/20 p-3 sm:p-4">
             <div className="flex flex-wrap items-center gap-2 mb-4">
               <span className="font-mono font-semibold text-slate-100">{first.symbol}</span>
-              <span className={`text-xs px-2 py-0.5 rounded ${isLong ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-300'}`}>{isLong ? '做多' : '做空'}</span>
+              <span className={`text-xs px-2 py-0.5 rounded-md ${isLong ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-300'}`}>{isLong ? '做多' : '做空'}</span>
               <span className="text-xs text-slate-500">连续加仓 {seq.length} 次</span>
             </div>
-            <div className="flex items-center gap-2 text-xs text-slate-600 mb-1.5 px-0.5">
-              <span className="w-20 shrink-0">时间</span>
-              <span className="w-14 shrink-0 text-right">均价</span>
+            <div className="flex items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs text-slate-600 mb-1.5 px-0.5">
+              <span className="w-[72px] sm:w-20 shrink-0">时间</span>
+              <span className="w-14 sm:w-16 shrink-0 text-right">均价</span>
               <span className="flex-1 text-right">数量</span>
             </div>
             <div className="space-y-1.5">
               {seq.map((t, idx) => (
-                <div key={idx} className="flex items-center gap-2 text-xs">
-                  <span className="w-20 shrink-0 text-slate-500 tabular-nums">{evTime(t)}</span>
-                  <span className="w-14 shrink-0 text-right text-slate-400 tabular-nums">{fmt.price(t.avgPrice)}</span>
-                  <div className="flex-1 flex items-center gap-2">
-                    <div className="flex-1 h-4 bg-slate-800/70 rounded overflow-hidden">
-                      <div className="h-full rounded" style={{ width: `${(t.executedQty / maxQty) * 100}%`, minWidth: '6px', background: 'linear-gradient(90deg,#7f1d1d,#f87171)' }} />
+                <div key={idx} className="flex items-center gap-1.5 sm:gap-2 text-[11px] sm:text-xs">
+                  <span className="w-[72px] sm:w-20 shrink-0 text-slate-500 tabular-nums truncate">{evTime(t)}</span>
+                  <span className="w-14 sm:w-16 shrink-0 text-right text-slate-400 tabular-nums truncate">{fmt.price(t.avgPrice)}</span>
+                  <div className="flex-1 flex items-center gap-1.5 sm:gap-2">
+                    <div className="flex-1 h-3 sm:h-4 bg-white/5 rounded-md overflow-hidden">
+                      <div className="h-full rounded-md" style={{ width: `${(t.executedQty / maxQty) * 100}%`, minWidth: '6px', background: 'linear-gradient(90deg,#7f1d1d,#f87171)' }} />
                     </div>
-                    <span className="w-12 shrink-0 text-right text-slate-200 tabular-nums font-medium">{fmt.qty(t.executedQty)}</span>
+                    <span className="min-w-[40px] sm:min-w-[48px] shrink-0 text-right text-slate-200 tabular-nums font-medium truncate">{fmt.qty(t.executedQty)}</span>
                   </div>
                 </div>
               ))}
@@ -289,17 +297,17 @@ function TailRiskEvidence({ data }) {
     <div className="space-y-4 mt-4">
       <ExplainBox>高胜率 ≠ 稳赚。漂亮胜率的背后，往往隐藏着不对称的盈亏比——一次黑天鹅巨亏，足以吞掉数月的全部利润</ExplainBox>
       {ev && (
-        <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-4">
+        <div className="rounded-2xl border border-red-500/25 bg-red-500/5 p-4">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs text-slate-400">单笔最大亏损 · <span className="font-mono">{ev.symbol}</span></div>
-              <div className="text-3xl font-bold text-red-400 mt-1 tabular-nums">{fmt.usd(ev.totalPnl)} <span className="text-base font-normal text-slate-500">USDT</span></div>
+              <div className="text-2xl sm:text-3xl font-bold text-red-400 mt-1 tabular-nums tracking-tight">{fmt.usd(ev.totalPnl)} <span className="text-sm sm:text-base font-normal text-slate-500">USDT</span></div>
             </div>
             <Flame className="text-red-500/60 shrink-0" size={38} />
           </div>
           {(ev.orderUpdateTime != null || ev.orderUpdateTime_str || ev.avgPrice != null || ev.executedQty != null) && (
-            <div className="grid grid-cols-3 gap-2 mt-3 pt-3 border-t border-red-500/15 text-xs">
-              <div><div className="text-slate-500">平仓时间</div><div className="text-slate-300 tabular-nums mt-0.5">{evTime(ev, true)}</div></div>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 sm:gap-3 mt-3 pt-3 border-t border-red-500/15 text-xs">
+              <div className="col-span-2 sm:col-span-1"><div className="text-slate-500">平仓时间</div><div className="text-slate-300 tabular-nums mt-0.5">{evTime(ev, true)}</div></div>
               <div><div className="text-slate-500">成交均价</div><div className="text-slate-300 tabular-nums mt-0.5">{fmt.price(ev.avgPrice)}</div></div>
               <div><div className="text-slate-500">成交数量</div><div className="text-slate-300 tabular-nums mt-0.5">{fmt.qty(ev.executedQty)}</div></div>
             </div>
@@ -307,7 +315,7 @@ function TailRiskEvidence({ data }) {
         </div>
       )}
       {s.tail_risk_index != null && (
-        <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4 text-sm text-slate-300 leading-relaxed">
+        <div className="rounded-2xl bg-black/20 border border-white/5 p-4 text-sm text-slate-300 leading-relaxed">
           这一笔亏损，需要约 <span className="text-red-400 font-bold text-lg">{fmt.int(s.tail_risk_index)}</span> 笔正常盈利单才能补回来。
         </div>
       )}
@@ -325,26 +333,26 @@ function SlippageEvidence({ data }) {
       {evs.slice(0, 4).map((e, i) => {
         const trades = e.sequence_trades || [];
         return (
-          <div key={i} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+          <div key={i} className="rounded-2xl border border-white/5 bg-black/20 p-3 sm:p-4">
             <div className="flex items-center justify-between mb-3">
               <span className="font-mono text-slate-200">{trades[0]?.symbol || '—'}</span>
               <div className="flex items-center gap-1.5 text-amber-400">
                 <Zap size={14} /><span className="font-bold tabular-nums">{fmt.duration(e.hold_time_ms)}</span><span className="text-xs text-slate-500 font-normal">极速平仓</span>
               </div>
             </div>
-            <div className="flex items-center gap-2 text-xs text-slate-600 mb-1.5 px-0.5">
-              <span className="w-12 shrink-0">动作</span>
+            <div className="flex items-center gap-1 sm:gap-2 text-[11px] sm:text-xs text-slate-600 mb-1.5 px-0.5">
+              <span className="w-9 sm:w-12 shrink-0">动作</span>
               <span className="flex-1">时间</span>
-              <span className="w-20 text-right">均价</span>
+              <span className="w-16 sm:w-20 text-right">均价</span>
               <span className="w-14 text-right">数量</span>
             </div>
             <div className="space-y-1">
               {trades.map((t, idx) => (
-                <div key={idx} className="flex items-center gap-2 text-xs bg-slate-900/50 px-2.5 py-1.5 rounded">
-                  <span className={`w-12 shrink-0 font-medium ${idx === 0 ? 'text-emerald-400' : idx === trades.length - 1 ? 'text-red-400' : 'text-slate-400'}`}>{idx === 0 ? '开仓' : idx === trades.length - 1 ? '平仓' : '加仓'}</span>
-                  <span className="flex-1 text-slate-400 tabular-nums">{evTime(t, true)}</span>
-                  <span className="w-20 text-right text-slate-300 tabular-nums">{fmt.price(t.avgPrice)}</span>
-                  <span className="w-14 text-right text-slate-300 tabular-nums">{fmt.qty(t.executedQty)}</span>
+                <div key={idx} className="flex items-center gap-1 sm:gap-2 text-[11px] sm:text-xs bg-white/5 px-1.5 sm:px-2.5 py-1.5 rounded-lg">
+                  <span className={`w-9 sm:w-12 shrink-0 font-medium ${idx === 0 ? 'text-emerald-400' : idx === trades.length - 1 ? 'text-red-400' : 'text-slate-400'}`}>{idx === 0 ? '开仓' : idx === trades.length - 1 ? '平仓' : '加仓'}</span>
+                  <span className="flex-1 text-slate-400 tabular-nums truncate">{evTime(t, true)}</span>
+                  <span className="w-16 sm:w-20 text-right text-slate-300 tabular-nums truncate">{fmt.price(t.avgPrice)}</span>
+                  <span className="w-14 text-right text-slate-300 tabular-nums truncate">{fmt.qty(t.executedQty)}</span>
                 </div>
               ))}
             </div>
@@ -367,20 +375,20 @@ function HoldRatioEvidence({ data }) {
   return (
     <div className="space-y-4 mt-4">
       <ExplainBox>健康的交易应「截断亏损、让利润奔跑」。这里正好相反：赚一点就急着落袋，亏了却长期死扛期待反转——一旦遭遇单边下跌，跟单者极易被无情套牢甚至强平</ExplainBox>
-      <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4 space-y-3">
+      <div className="rounded-2xl bg-black/20 border border-white/5 p-4 space-y-3">
         {rows.map(row => (
           <div key={row.label}>
             <div className="flex justify-between text-xs mb-1">
               <span className={row.text}>{row.label}</span>
               <span className="text-slate-300 tabular-nums">{fmt.duration(row.val)}</span>
             </div>
-            <div className="h-3 rounded-full bg-slate-800 overflow-hidden">
+            <div className="h-3 rounded-full bg-white/5 overflow-hidden">
               <div className={`h-full ${row.bar} rounded-full`} style={{ width: `${((row.val || 0) / maxT) * 100}%` }} />
             </div>
           </div>
         ))}
       </div>
-      {r != null && <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4 text-sm text-slate-300">同样一笔单，亏钱时他愿意扛 <span className="text-amber-400 font-bold text-lg">{fmt.num(r, 2)}</span> 倍于盈利时的时间才肯松手。</div>}
+      {r != null && <div className="rounded-2xl bg-black/20 border border-white/5 p-4 text-sm text-slate-300">同样一笔单，亏钱时他愿意扛 <span className="text-amber-400 font-bold text-lg">{fmt.num(r, 2)}</span> 倍于盈利时的时间才肯松手。</div>}
     </div>
   );
 }
@@ -390,15 +398,22 @@ function HoldRatioEvidence({ data }) {
  * ========================================================================= */
 function RiskGauge({ score, level }) {
   const meta = LEVEL_STYLES[level], val = useCountUp(score), R = 80, C = 2 * Math.PI * R, offset = C * (1 - val / 100);
+  const gid = `gauge-${level}`;
   return (
     <div className="relative w-48 h-48 mx-auto">
       <svg viewBox="0 0 200 200" className="w-full h-full -rotate-90">
-        <circle cx="100" cy="100" r={R} fill="none" stroke="#1e293b" strokeWidth="12" />
-        <circle cx="100" cy="100" r={R} fill="none" stroke={meta.hex} strokeWidth="12" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={offset} style={{ filter: `drop-shadow(0 0 8px ${meta.hex}70)` }} />
+        <defs>
+          <linearGradient id={gid} x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stopColor={meta.hex} stopOpacity="0.55" />
+            <stop offset="100%" stopColor={meta.hex} />
+          </linearGradient>
+        </defs>
+        <circle cx="100" cy="100" r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="10" />
+        <circle cx="100" cy="100" r={R} fill="none" stroke={`url(#${gid})`} strokeWidth="10" strokeLinecap="round" strokeDasharray={C} strokeDashoffset={offset} style={{ filter: `drop-shadow(0 0 10px ${meta.hex}66)` }} />
       </svg>
       <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="text-6xl font-bold tabular-nums leading-none" style={{ color: meta.hex }}>{Math.round(val)}</span>
-        <span className="text-xs text-slate-500 mt-2 tracking-wide">风险评分 / 100</span>
+        <span className="text-6xl font-semibold tabular-nums leading-none tracking-tight" style={{ color: meta.hex, textShadow: `0 0 28px ${meta.hex}55` }}>{Math.round(val)}</span>
+        <span className="text-xs text-slate-500 mt-2.5 tracking-wide">风险评分 / 100</span>
       </div>
     </div>
   );
@@ -407,13 +422,13 @@ function RiskGauge({ score, level }) {
 function DimensionCard({ dim, expanded, onToggle }) {
   const meta = LEVEL_STYLES[dim.level];
   return (
-    <div className={`rounded-2xl border ${meta.border} bg-slate-900/50 overflow-hidden`}>
-      <button onClick={onToggle} className="w-full text-left p-4 md:p-5 hover:bg-slate-800/20 transition-colors">
+    <div className={`rounded-2xl border ${meta.border} bg-white/5 backdrop-blur-xl overflow-hidden transition-colors`}>
+      <button onClick={onToggle} className="w-full text-left p-4 md:p-5 hover:bg-white/5 transition-colors">
         <div className="flex items-center gap-3 md:gap-4">
-          <div className={`shrink-0 w-11 h-11 rounded-xl border ${meta.strip} flex items-center justify-center`}><dim.icon className={meta.text} size={22} /></div>
+          <div className={`shrink-0 w-11 h-11 rounded-2xl border ${meta.strip} flex items-center justify-center`}><dim.icon className={meta.text} size={22} /></div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
-              <h3 className="font-semibold text-slate-100">{dim.title}</h3>
+              <h3 className="font-semibold text-slate-100 tracking-tight">{dim.title}</h3>
               <span className={`text-xs px-2 py-0.5 rounded-full ${meta.badge}`}>{meta.label}</span>
               <span className="text-xs text-slate-600 hidden sm:inline">· {dim.term}</span>
             </div>
@@ -421,16 +436,16 @@ function DimensionCard({ dim, expanded, onToggle }) {
           </div>
           <ChevronDown className={`text-slate-500 shrink-0 transition-transform duration-300 ${expanded ? 'rotate-180' : ''}`} size={20} />
         </div>
-        <div className={`mt-3 rounded-xl border ${meta.strip} px-3.5 py-2.5 flex items-start gap-2.5`}>
+        <div className={`mt-3.5 rounded-xl border ${meta.strip} px-4 py-3 flex items-start gap-2.5`}>
           <meta.Icon className={`${meta.text} shrink-0 mt-0.5`} size={15} />
           <p className="text-xs md:text-sm text-slate-300 leading-snug">{dim.headline(meta.text)}</p>
         </div>
       </button>
       <AnimatePresence initial={false}>
         {expanded && (
-          <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.3, ease: 'easeInOut' }} style={{ overflow: 'hidden' }}>
+          <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.35, ease: EASE }} style={{ overflow: 'hidden' }}>
             <div className="px-4 md:px-5 pb-5">
-              <div className="border-t border-slate-800 pt-4">
+              <div className="border-t border-white/5 pt-4">
                 <StatChips stats={dim.stats} />
                 <dim.Component data={dim.data} />
               </div>
@@ -451,27 +466,31 @@ const InputView = ({ onSubmit }) => {
   const submit = (e) => { e.preventDefault(); url.trim() ? onSubmit(url.trim()) : setErr('请先粘贴交易员主页链接'); };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center px-4 py-10">
-      <div className="w-full max-w-xl text-center">
-        <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-slate-800/60 border border-slate-700 mb-6"><Radar className="text-emerald-400" size={30} /></div>
-        <h1 className="text-3xl md:text-4xl font-bold text-slate-100">跟单风险透视镜</h1>
-        <p className="text-slate-400 mt-3 md:text-lg leading-relaxed">粘贴币安带单员链接，透视漂亮收益率背后<span className="text-red-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
+    <div className="min-h-screen flex flex-col items-center justify-center px-5 py-12">
+      <motion.div initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.7, ease: EASE }} className="w-full max-w-xl text-center">
+        <div className="inline-flex items-center justify-center w-16 h-16 rounded-3xl bg-gradient-to-b from-white/10 to-white/5 border border-white/10 backdrop-blur-xl mb-7 shadow-2xl shadow-emerald-500/10">
+          <Radar className="text-emerald-400" size={30} />
+        </div>
+        <h1 className="text-4xl md:text-5xl font-semibold tracking-tight bg-gradient-to-b from-white to-slate-400 bg-clip-text text-transparent">跟单风险透视镜</h1>
+        <p className="text-slate-400 mt-4 md:text-lg leading-relaxed">粘贴币安带单员链接，透视漂亮收益率背后<span className="text-red-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
 
-        <form onSubmit={submit} className="mt-8">
-          <div className="relative">
-            <Link2 className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500" size={18} />
-            <input value={url} onChange={(e) => { setUrl(e.target.value); setErr(''); }} placeholder="粘贴带单员主页链接…" className="w-full pl-11 pr-4 py-3.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-100 placeholder-slate-600 text-sm focus:outline-none focus:border-emerald-500/60 focus:ring-2 focus:ring-emerald-500/20 transition" />
+        <form onSubmit={submit} className="mt-9">
+          <div className="relative group">
+            <Link2 className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 group-focus-within:text-emerald-400 transition-colors" size={18} />
+            <input value={url} onChange={(e) => { setUrl(e.target.value); setErr(''); }} placeholder="粘贴带单员主页链接…" className="w-full pl-12 pr-4 py-4 rounded-2xl bg-white/5 border border-white/10 backdrop-blur-xl text-slate-100 placeholder-slate-600 text-sm focus:outline-none focus:border-emerald-500/50 focus:bg-white/10 focus:ring-4 focus:ring-emerald-500/10 transition-all" />
           </div>
-          {err && <p className="text-red-400 text-xs mt-2 text-left">{err}</p>}
-          <button type="submit" className="w-full mt-3 py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold transition flex items-center justify-center gap-2"><Search size={18} /> 一键透视风险</button>
+          {err && <p className="text-red-400 text-xs mt-2.5 text-left px-1">{err}</p>}
+          <motion.button whileHover={{ scale: 1.01 }} whileTap={{ scale: 0.985 }} type="submit" className="w-full mt-3.5 py-4 rounded-2xl bg-gradient-to-b from-emerald-400 to-emerald-500 hover:from-emerald-300 hover:to-emerald-400 text-slate-950 font-semibold shadow-lg shadow-emerald-500/25 transition-colors flex items-center justify-center gap-2">
+            <Search size={18} /> 一键透视风险
+          </motion.button>
         </form>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-10 text-left">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-12 text-left">
           <Feature icon={Layers} title="警惕越亏越加" desc="看清赌徒式加仓的爆仓隐患" />
           <Feature icon={TrendingDown} title="深挖赢小亏大" desc="高胜率背后往往藏着致命巨亏" />
           <Feature icon={Clock} title="还原真实持仓" desc="识别闪电平仓与死扛坏习惯" />
         </div>
-      </div>
+      </motion.div>
     </div>
   );
 };
@@ -482,25 +501,28 @@ const LoadingView = () => {
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-4">
       <div className="relative w-28 h-28 flex items-center justify-center">
-        <motion.div className="absolute inset-0 rounded-full border-2 border-emerald-500/20" animate={{ scale: [1, 1.15, 1], opacity: [0.5, 0.2, 0.5] }} transition={{ duration: 1.6, repeat: Infinity }} />
-        <motion.div className="absolute inset-0 rounded-full border-t-2 border-emerald-400" animate={{ rotate: 360 }} transition={{ duration: 1.2, repeat: Infinity, ease: 'linear' }} />
-        <Radar className="text-emerald-400" size={36} />
+        <motion.div className="absolute inset-0 rounded-full bg-emerald-500/10 blur-2xl" animate={{ scale: [1, 1.2, 1], opacity: [0.35, 0.7, 0.35] }} transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }} />
+        <motion.div className="absolute inset-2 rounded-full border border-emerald-500/15" animate={{ scale: [1, 1.15, 1], opacity: [0.6, 0.2, 0.6] }} transition={{ duration: 1.6, repeat: Infinity }} />
+        <motion.div className="absolute inset-2 rounded-full border-t-2 border-emerald-400" animate={{ rotate: 360 }} transition={{ duration: 1.2, repeat: Infinity, ease: 'linear' }} />
+        <Radar className="text-emerald-400 relative" size={34} />
       </div>
-      <h2 className="text-slate-200 font-semibold mt-8">正在透视交易风险</h2>
-      <AnimatePresence mode="wait"><motion.p key={step} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} className="text-sm text-slate-500 mt-2 h-5">{LOADING_STEPS[step]}</motion.p></AnimatePresence>
+      <h2 className="text-slate-200 font-medium mt-8 tracking-tight">正在透视交易风险</h2>
+      <AnimatePresence mode="wait"><motion.p key={step} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -6 }} className="text-sm text-slate-500 mt-2.5 h-5">{LOADING_STEPS[step]}</motion.p></AnimatePresence>
     </div>
   );
 };
 
 const ErrorView = ({ message, onRetry, onReset }) => (
   <div className="min-h-screen flex flex-col items-center justify-center px-4 text-center">
-    <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-red-500/10 border border-red-500/30 mb-5"><XCircle className="text-red-400" size={32} /></div>
-    <h2 className="text-xl font-semibold text-slate-100">检测失败</h2>
-    <p className="text-sm text-slate-400 mt-2 max-w-sm">{message}</p>
-    <div className="flex gap-3 mt-6">
-      <button onClick={onRetry} className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-medium transition">重试</button>
-      <button onClick={onReset} className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 transition">返回</button>
-    </div>
+    <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: 0.5, ease: EASE }} className="flex flex-col items-center">
+      <div className="inline-flex items-center justify-center w-16 h-16 rounded-3xl bg-red-500/10 border border-red-500/25 backdrop-blur-xl mb-5"><XCircle className="text-red-400" size={32} /></div>
+      <h2 className="text-xl font-semibold text-slate-100 tracking-tight">检测失败</h2>
+      <p className="text-sm text-slate-400 mt-2 max-w-sm leading-relaxed">{message}</p>
+      <div className="flex gap-3 mt-6">
+        <motion.button whileTap={{ scale: 0.97 }} onClick={onRetry} className="px-5 py-2.5 rounded-2xl bg-gradient-to-b from-emerald-400 to-emerald-500 text-slate-950 font-medium shadow-lg shadow-emerald-500/20 transition">重试</motion.button>
+        <motion.button whileTap={{ scale: 0.97 }} onClick={onReset} className="px-5 py-2.5 rounded-2xl bg-white/5 border border-white/10 hover:bg-white/10 text-slate-200 transition">返回</motion.button>
+      </div>
+    </motion.div>
   </div>
 );
 
@@ -512,7 +534,7 @@ const ReportView = ({ report, target, onReset }) => {
   const verdict = OVERVIEW[level];
   const highCount = dims.filter(d => d.level === 'high').length;
   const medCount = dims.filter(d => d.level === 'medium').length;
-  const [openKey, setOpenKey] = useState(() => (dims.find(d => d.level === 'high') || dims.find(d => d.level === 'medium'))?.key || null);
+  const [openKey, setOpenKey] = useState(null);
 
   const isEmpty = !report || Object.keys(report).length === 0;
   const isZero = !isEmpty && ov.total_trades === 0;
@@ -532,35 +554,40 @@ const ReportView = ({ report, target, onReset }) => {
       {target && <div className="text-xs text-slate-500 mb-4 truncate">分析目标：{target}</div>}
 
       {isEmpty || isZero ? (
-        <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-10 text-center">
+        <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl p-10 text-center">
           {isEmpty ? <XCircle className="mx-auto text-slate-500 mb-4" size={48} /> : <Search className="mx-auto text-emerald-400 mb-4" size={48} />}
-          <h3 className="text-lg font-semibold text-slate-200">{isEmpty ? '未获取到有效数据' : '该交易员暂无交易记录'}</h3>
+          <h3 className="text-lg font-semibold text-slate-200 tracking-tight">{isEmpty ? '未获取到有效数据' : '该交易员暂无交易记录'}</h3>
           <p className="text-sm text-slate-500 mt-2">{isEmpty ? '请确认链接正确，或稍后重试。' : '无法基于空白记录进行风险评估。'}</p>
         </div>
       ) : (
         <>
-          <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }} className="rounded-3xl border bg-gradient-to-b from-slate-900/80 to-slate-900/40 p-6 md:p-8 mb-5 text-center" style={{ borderColor: LEVEL_STYLES[level].hex + '40' }}>
-            <RiskGauge score={riskScore} level={level} />
-            <div className="mt-5">
-              <h2 className="text-2xl font-bold" style={{ color: LEVEL_STYLES[level].hex }}>{verdict.word}</h2>
-            </div>
-
-            <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
-              <div className="flex items-center gap-2.5 bg-slate-950/50 border border-slate-800/60 rounded-xl px-4 py-2.5">
-                <span className="text-slate-500 text-sm">交易笔数</span>
-                <span className="text-slate-200 font-semibold tabular-nums">{fmt.int(ov.total_trades)} <span className="text-xs font-normal text-slate-500">笔</span></span>
+          <motion.div initial={{ opacity: 0, y: 16, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }} transition={{ duration: 0.55, ease: EASE }} className="relative rounded-3xl border bg-gradient-to-b from-white/10 to-white/5 backdrop-blur-2xl p-6 md:p-9 mb-5 text-center overflow-hidden" style={{ borderColor: LEVEL_STYLES[level].hex + '30' }}>
+            <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-72 h-72 rounded-full pointer-events-none" style={{ background: LEVEL_STYLES[level].hex, opacity: 0.12, filter: 'blur(80px)' }} />
+            <div className="relative">
+              <RiskGauge score={riskScore} level={level} />
+              <div className="mt-5">
+                <h2 className="text-2xl md:text-3xl font-semibold tracking-tight" style={{ color: LEVEL_STYLES[level].hex, textShadow: `0 0 30px ${LEVEL_STYLES[level].hex}40` }}>{verdict.word}</h2>
               </div>
-              <div className="flex items-center gap-2.5 bg-slate-950/50 border border-slate-800/60 rounded-xl px-4 py-2.5">
-                <span className="text-slate-500 text-sm">所分析交易跨度</span>
-                <span className="text-slate-200 font-semibold tabular-nums">{daysSpan} <span className="text-xs font-normal text-slate-500">天</span></span>
-                <div className="w-px h-3 bg-slate-700 mx-1" />
-                <span className="text-slate-400 text-xs tabular-nums">{dateStr}</span>
+
+              <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+                <div className="flex items-center gap-2.5 bg-black/20 border border-white/10 rounded-2xl px-4 py-2.5">
+                  <span className="text-slate-500 text-sm">交易笔数</span>
+                  <span className="text-slate-200 font-semibold tabular-nums">{fmt.int(ov.total_trades)} <span className="text-xs font-normal text-slate-500">笔</span></span>
+                </div>
+                <div className="flex flex-col sm:flex-row items-center gap-1 sm:gap-2.5 bg-black/20 border border-white/10 rounded-2xl px-4 py-2.5">
+                  <div className="flex items-center gap-2.5">
+                    <span className="text-slate-500 text-sm">所分析交易跨度</span>
+                    <span className="text-slate-200 font-semibold tabular-nums">{daysSpan} <span className="text-xs font-normal text-slate-500">天</span></span>
+                  </div>
+                  <div className="hidden sm:block w-px h-3 bg-white/10 mx-1" />
+                  <span className="text-slate-400 text-xs tabular-nums">{dateStr}</span>
+                </div>
               </div>
             </div>
           </motion.div>
 
           {dims.length === 0 ? (
-            <div className="rounded-2xl border border-slate-800 bg-slate-900/50 p-10 text-center"><ShieldCheck className="mx-auto text-emerald-400 mb-4" size={48} /><h3 className="text-slate-200 font-semibold">未检测到可分析的风险维度</h3></div>
+            <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl p-10 text-center"><ShieldCheck className="mx-auto text-emerald-400 mb-4" size={48} /><h3 className="text-slate-200 font-semibold tracking-tight">未检测到可分析的风险维度</h3></div>
           ) : (
             <>
               <div className="flex items-center gap-2 px-1 mb-3 mt-6">
@@ -570,7 +597,7 @@ const ReportView = ({ report, target, onReset }) => {
               </div>
               <div className="space-y-3">
                 {dims.map((d, i) => (
-                  <motion.div key={d.key} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, delay: i * 0.06 }}>
+                  <motion.div key={d.key} initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4, delay: i * 0.06, ease: EASE }}>
                     <DimensionCard dim={d} expanded={openKey === d.key} onToggle={() => setOpenKey(openKey === d.key ? null : d.key)} />
                   </motion.div>
                 ))}
@@ -590,11 +617,21 @@ const ReportView = ({ report, target, onReset }) => {
 export default function App() {
   const { status, report, error, target, run, reset, retry } = useRiskAnalysis();
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-950 to-slate-900 text-slate-100 antialiased selection:bg-emerald-500/30">
-      {status === 'idle' && <InputView onSubmit={run} />}
-      {status === 'loading' && <LoadingView />}
-      {status === 'error' && <ErrorView message={error} onRetry={retry} onReset={reset} />}
-      {status === 'success' && <ReportView report={report} target={target} onReset={reset} />}
+    <div className="relative min-h-screen text-slate-100 antialiased selection:bg-emerald-500/30 overflow-x-hidden" style={{ background: '#060709', fontFamily: FONT_STACK }}>
+      {/* 环境光晕 */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute left-1/2 -translate-x-1/2 -top-40 w-96 h-96 rounded-full" style={{ background: 'radial-gradient(circle, rgba(16,185,129,0.16), transparent 70%)', filter: 'blur(50px)' }} />
+        <div className="absolute right-0 top-1/3 w-80 h-80 rounded-full" style={{ background: 'radial-gradient(circle, rgba(59,130,246,0.10), transparent 70%)', filter: 'blur(70px)' }} />
+        <div className="absolute left-0 bottom-0 w-80 h-80 rounded-full" style={{ background: 'radial-gradient(circle, rgba(139,92,246,0.08), transparent 70%)', filter: 'blur(70px)' }} />
+      </div>
+      {/* 细腻噪点质感 */}
+      <div className="pointer-events-none fixed inset-0" style={{ backgroundImage: GRAIN, opacity: 0.05 }} />
+      <div className="relative">
+        {status === 'idle' && <InputView onSubmit={run} />}
+        {status === 'loading' && <LoadingView />}
+        {status === 'error' && <ErrorView message={error} onRetry={retry} onReset={reset} />}
+        {status === 'success' && <ReportView report={report} target={target} onReset={reset} />}
+      </div>
     </div>
   );
 }
