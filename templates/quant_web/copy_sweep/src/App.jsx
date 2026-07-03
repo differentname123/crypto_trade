@@ -16,15 +16,15 @@ const LEVEL_STYLES = {
 };
 
 const OVERVIEW = {
-  high:   { word: '高危跟单对象', advice: '强烈建议规避' },
-  medium: { word: '需保持警惕',   advice: '跟单前请看清下方证据' },
+  high:   { word: '高危交易特征', advice: '谨慎跟单' },
+  medium: { word: '需保持警惕',   advice: '跟单前请看清下方数据' },
   low:    { word: '暂无明显危险', advice: '仍需你独立判断' },
 };
 
 const LOADING_STEPS = [
   '正在调取历史真实成交…',
   '还原每一次加仓与平仓…',
-  '揪出被藏起来的巨亏时刻…',
+  '还原历史真实的巨亏时刻…',
   '核算真实盈亏与持仓习惯…',
   '生成你的跟单风险体检报告…',
 ];
@@ -92,7 +92,7 @@ function useCountUp(target, duration = 1400) {
 const RISK_CONFIG = [
   {
     key: 'martingale', title: '越亏越加仓', term: '马丁格尔', icon: Layers,
-    plain: '亏损时不断加倍下注，赌对小赚，赌错爆仓归零',
+    plain: '亏损时不断加倍仓位，扛过小赚，扛不过爆仓归零',
     extractValue: (d) => d?.martingale?.summary?.martingale_rate_percent,
     thresholds: [10, 25, 60],
     buildNode: (d) => {
@@ -129,7 +129,7 @@ const RISK_CONFIG = [
     }
   },
   {
-    key: 'slippage_trap', title: '闪电平仓', term: '滑点陷阱', icon: Zap,
+    key: 'slippage_trap', title: '闪电平仓', term: '滑点风险', icon: Zap,
     plain: '几秒极速平仓，你的跟单成交时价格早已变天',
     extractValue: (d) => d?.slippage_trap?.summary?.slippage_trap_ratio_percent,
     thresholds: [8, 18, 40],
@@ -287,7 +287,7 @@ function TailRiskEvidence({ data }) {
 
   return (
     <div className="space-y-4 mt-4">
-      <ExplainBox>高胜率 ≠ 稳赚。这类交易员靠大量小额盈利堆出漂亮胜率，但盈亏极不对称——一次黑天鹅巨亏，足以吞掉之前数月的全部利润。</ExplainBox>
+      <ExplainBox>高胜率 ≠ 稳赚。漂亮胜率的背后，往往隐藏着不对称的盈亏比——一次黑天鹅巨亏，足以吞掉数月的全部利润</ExplainBox>
       {ev && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/5 p-4">
           <div className="flex items-center justify-between">
@@ -321,7 +321,7 @@ function SlippageEvidence({ data }) {
 
   return (
     <div className="space-y-3 mt-4">
-      <ExplainBox>交易员几秒内极速平仓，而你的跟单单因网络与撮合延迟，往往买在更高、卖在更低，白白把利润让给对手盘。</ExplainBox>
+      <ExplainBox>几秒极速平仓，而因网络与撮合延迟，你的跟单往往买在更高、卖在更低，白白把利润消耗在滑点上</ExplainBox>
       {evs.slice(0, 4).map((e, i) => {
         const trades = e.sequence_trades || [];
         return (
@@ -366,7 +366,7 @@ function HoldRatioEvidence({ data }) {
   ];
   return (
     <div className="space-y-4 mt-4">
-      <ExplainBox>健康的交易应「截断亏损、让利润奔跑」。这里正好相反：赚一点就急着跑，亏了却死扛赌反转——这是纪律失控的典型信号。</ExplainBox>
+      <ExplainBox>健康的交易应「截断亏损、让利润奔跑」。这里正好相反：赚一点就急着落袋，亏了却长期死扛期待反转——一旦遭遇单边下跌，跟单者极易被无情套牢甚至强平</ExplainBox>
       <div className="rounded-xl bg-slate-950/60 border border-slate-800 p-4 space-y-3">
         {rows.map(row => (
           <div key={row.label}>
@@ -455,7 +455,7 @@ const InputView = ({ onSubmit }) => {
       <div className="w-full max-w-xl text-center">
         <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-slate-800/60 border border-slate-700 mb-6"><Radar className="text-emerald-400" size={30} /></div>
         <h1 className="text-3xl md:text-4xl font-bold text-slate-100">跟单风险透视镜</h1>
-        <p className="text-slate-400 mt-3 md:text-lg leading-relaxed">粘贴币安带单员链接，看穿漂亮收益率背后<span className="text-red-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
+        <p className="text-slate-400 mt-3 md:text-lg leading-relaxed">粘贴币安带单员链接，透视漂亮收益率背后<span className="text-red-400 font-medium">真正会让你亏钱</span>的操作习惯。</p>
 
         <form onSubmit={submit} className="mt-8">
           <div className="relative">
@@ -467,8 +467,8 @@ const InputView = ({ onSubmit }) => {
         </form>
 
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-10 text-left">
-          <Feature icon={Layers} title="识破越亏越加" desc="看清赌徒式加仓的爆仓隐患" />
-          <Feature icon={TrendingDown} title="拆穿赢小亏大" desc="高胜率背后往往藏着致命巨亏" />
+          <Feature icon={Layers} title="警惕越亏越加" desc="看清赌徒式加仓的爆仓隐患" />
+          <Feature icon={TrendingDown} title="深挖赢小亏大" desc="高胜率背后往往藏着致命巨亏" />
           <Feature icon={Clock} title="还原真实持仓" desc="识别闪电平仓与死扛坏习惯" />
         </div>
       </div>
@@ -551,7 +551,7 @@ const ReportView = ({ report, target, onReset }) => {
                 <span className="text-slate-200 font-semibold tabular-nums">{fmt.int(ov.total_trades)} <span className="text-xs font-normal text-slate-500">笔</span></span>
               </div>
               <div className="flex items-center gap-2.5 bg-slate-950/50 border border-slate-800/60 rounded-xl px-4 py-2.5">
-                <span className="text-slate-500 text-sm">交易跨度</span>
+                <span className="text-slate-500 text-sm">所分析交易跨度</span>
                 <span className="text-slate-200 font-semibold tabular-nums">{daysSpan} <span className="text-xs font-normal text-slate-500">天</span></span>
                 <div className="w-px h-3 bg-slate-700 mx-1" />
                 <span className="text-slate-400 text-xs tabular-nums">{dateStr}</span>

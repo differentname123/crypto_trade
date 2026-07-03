@@ -225,7 +225,7 @@ def calculate_tail_risk_index(trades):
 
     # 5. 防零除异常处理 (尾部风险)
     if median_profit == 0:
-        index_val = float('inf') if max_loss > 0 else 0.0
+        index_val = float('1000') if max_loss > 0 else 0.0
     else:
         index_val = max_loss / median_profit
 
@@ -241,7 +241,7 @@ def calculate_tail_risk_index(trades):
     avg_loss = sum(losses_abs) / loss_count if loss_count > 0 else 0.0
 
     if avg_loss == 0:
-        normal_pnl_ratio = float('inf') if avg_profit > 0 else 0.0
+        normal_pnl_ratio = float('1000') if avg_profit > 0 else 0.0
     else:
         normal_pnl_ratio = avg_profit / avg_loss
     # ================= 新增逻辑区块结束 =================
@@ -432,7 +432,7 @@ def calculate_vw_hold_ratio(trades):
 
     # 防零除异常处理 (如果没有盈利单，亏损持仓比例视作无限大)
     if avg_profit_hold == 0:
-        vw_index = float('inf') if avg_loss_hold > 0 else 0.0
+        vw_index = float('10000') if avg_loss_hold > 0 else 0.0
     else:
         vw_index = avg_loss_hold / avg_profit_hold
 
@@ -457,6 +457,7 @@ def get_detect_report(all_data, file_name):
         "end_time": None,
         "risk_score":50
     }
+    risk_score = 0
     if all_data:
         # 提取所有的 orderTime 并在计算前过滤掉 None 值，保证代码健壮性
         order_times = [item.get("orderTime") for item in all_data if item.get("orderTime") is not None]
@@ -471,25 +472,23 @@ def get_detect_report(all_data, file_name):
     # ==========================================
     result = calculate_martingale_rate_simplified(all_data)
     row_data.update(result.get('summary', {}))  # 收集 summary
-    result['evidences'] = result.get('evidences', [[]])[0:2]
-
-    detail_map['martingale'] = result  # 收集 detail
-
+    result['evidences'] = result.get('evidences', [[]])[0:1]
     # 马丁格尔率的警告逻辑
     if 'summary' in result:  # 增加一个安全判断，防止字典为空报错
         martingale_rate_percent = result['summary'].get('martingale_rate_percent', 0)
         evidences = result.get('evidences', [[]])
         if martingale_rate_percent > 10 and len(evidences[0]) > 2:
             print(f"文件: {file_name} | 马丁格尔率: {martingale_rate_percent}% | 警告：马丁格尔行为过于频繁！")
+            detail_map['martingale'] = result  # 收集 detail
+            risk_score += 25
 
     # ==========================================
     # 模块 2: 尾部风险 (如果你不想计算，直接注释掉这整个区块)
     # ==========================================
     result1 = calculate_tail_risk_index(all_data)
     row_data.update(result1.get('summary', {}))  # 收集 summary
-    result1['evidences'] = result1.get('evidences', [[]])[0:2]
+    result1['evidences'] = result1.get('evidences', [[]])[0:1]
 
-    detail_map['tail_risk'] = result1  # 收集 detail
 
     # 尾部风险的警告逻辑
     if 'summary' in result1:
@@ -497,6 +496,8 @@ def get_detect_report(all_data, file_name):
         normal_pnl_ratio = result1['summary'].get('normal_pnl_ratio', 1.0)
         if tail_risk_index > 20 or normal_pnl_ratio < 0.3:
             print(f"文件: {file_name} | 尾部风险剥离比: {tail_risk_index} | 警告：尾部风险过高！")
+            detail_map['tail_risk'] = result1  # 收集 detail
+            risk_score += 25
 
     # ==========================================
     # 模块 3: 滑点陷阱比例 (如果你不想计算，直接注释掉这整个区块)
@@ -505,7 +506,11 @@ def get_detect_report(all_data, file_name):
     row_data.update(result2.get('summary', {}))  # 收集 summary
     result2['evidences'] = result2.get('evidences', [[]])[0:2]
 
-    detail_map['slippage_trap'] = result2  # 收集 detail
+    slippage_trap_ratio_percent = result2['summary'].get('slippage_trap_ratio_percent', 0)
+    if slippage_trap_ratio_percent > 30:
+        print(f"文件: {file_name} | 绞肉机比例: {slippage_trap_ratio_percent}% | 警告：带单者操作周期过短，跟单者可能被隐形摩擦成本收割！")
+        detail_map['slippage_trap'] = result2  # 收集 detail
+        risk_score += 25
 
     # ==========================================
     # 模块 4: VW 持仓比例 (如果你不想计算，直接注释掉这整个区块)
@@ -513,8 +518,12 @@ def get_detect_report(all_data, file_name):
     result3 = calculate_vw_hold_ratio(all_data)
     row_data.update(result3)  # 收集 summary
 
-    detail_map['vw_hold_ratio'] = result3  # 收集 detail
-
+    vw_hold_ratio = result3.get('vw_hold_ratio', 0)
+    if vw_hold_ratio > 5.0:
+        print(f"文件: {file_name} | VW 持仓比例: {vw_hold_ratio} | 警告：带单者在错误方向上重仓且迟迟不认错，跟单者可能爆仓！")
+        detail_map['vw_hold_ratio'] = result3
+        risk_score += 25
+    detail_map['overview']['risk_score'] = risk_score
     # ------------------------------------------
     # 将当前文件收集完毕的完整 row_data 追加到列表中
     return row_data, detail_map
