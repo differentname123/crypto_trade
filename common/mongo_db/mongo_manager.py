@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from utils.mongo_base import MongoBase
+from common.mongo_db.mongo_base import MongoBase
 
 
 class MongoManager:

@@ -13,7 +13,7 @@ from pymongo import MongoClient, UpdateOne, ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError, DuplicateKeyError, BulkWriteError
 from bson.objectid import ObjectId
 
-from utils.common_utils import get_config
+from common.common_utils import get_config
 
 
 class MongoBase:
