@@ -21,7 +21,7 @@ from biance_order_lite import (
 # ==========================================
 TRADE_RECORD_FILE = "trade_records.csv"
 POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 target_weight)
-LEVRAGE = 10  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
+LEVRAGE = 1  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 MIN_ORDER_VALUE = 5.0  # 最小下单金额 (USD)，防止过小订单被拒绝
 # 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
 RUNTIME_FALLBACK = {
@@ -366,6 +366,10 @@ def execute_single_signal(exchange, row, total_equity, position_cache, open_orde
     # 【本次修改点】：直接提取信号行中对应的仓位权重，并依此计算本信号特有的风控开仓额度
     target_weight = float(row['target_weight'])
     target_position_value = total_equity * LEVRAGE * target_weight
+
+    # 输入详细的日志
+    logger.info(f"[EXEC] 信号解析 | 币种: {coin} | 方向: {direction} | 动作: {action} | 开平: {event} | 价格: {price:.2f} | 权重: {target_weight:.3f} | 目标开仓额度: {target_position_value:.2f} 总资产: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x 目标权重: {target_weight:.3f}")
+
 
     # 【修改点 3】：直接提取 signal_df 中的精准 symbol 字段（移除对 USDT 的硬编码）
     symbol = str(row['symbol']).strip()

@@ -544,7 +544,7 @@ def execute_trading_bot_workflow(target_time, proxy_url=None):
             'MOM_WINDOW': 48,
             'VOL_WINDOW': 42,
             'BTC_TREND_WINDOW': 120,
-            'MAX_WEIGHT': 0.5,
+            'MAX_WEIGHT': 2.6,
             'TOP_K': 1,
             'TIME_OFFSET': '2h',
             'TRADE_MODE': 'LONG_ONLY'
@@ -554,7 +554,7 @@ def execute_trading_bot_workflow(target_time, proxy_url=None):
             'MOM_WINDOW': 90,
             'VOL_WINDOW': 120,
             'BTC_TREND_WINDOW': 720,
-            'MAX_WEIGHT': 0.05,
+            'MAX_WEIGHT': 0.4,
             'TOP_K': 3,
             'TIME_OFFSET': '0h',
             'TRADE_MODE': 'SHORT_ONLY'
