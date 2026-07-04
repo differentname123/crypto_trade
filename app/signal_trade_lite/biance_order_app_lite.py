@@ -20,7 +20,7 @@ from biance_order_lite import (
 # 0. 配置与常量
 # ==========================================
 TRADE_RECORD_FILE = "trade_records.csv"
-POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 target_weight)
+POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 max_weight)
 LEVRAGE = 1  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 MIN_ORDER_VALUE = 5.0  # 最小下单金额 (USD)，防止过小订单被拒绝
 # 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
@@ -325,9 +325,9 @@ def execute_signals_fast(exchange, target_time, total_equity, position_cache, op
     """
     t_start = time.perf_counter()
 
-    # 【本次修改点】：去除了统一计算 target_position_value，并将开仓限额逻辑转移至内部各信号按照各自的 target_weight 单独计算
+    # 【本次修改点】：去除了统一计算 target_position_value，并将开仓限额逻辑转移至内部各信号按照各自的 max_weight 单独计算
     logger.info(
-        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x | 风控限额(含杠杆): 根据各信号 target_weight 独立计算 ==========")
+        f"========== [EXEC] 准点触发: {datetime.now().strftime('%H:%M:%S.%f')[:-3]} | 总权益: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x | 风控限额(含杠杆): 根据各信号 max_weight 独立计算 ==========")
 
     if signal_df is None or signal_df.empty:
         logger.info(f"[EXEC] 当前时间点无交易信号 | 文件过滤耗时: {(time.perf_counter() - t_start) * 1000:.2f}ms")
@@ -364,11 +364,11 @@ def execute_single_signal(exchange, row, total_equity, position_cache, open_orde
     price = float(row['price'])
 
     # 【本次修改点】：直接提取信号行中对应的仓位权重，并依此计算本信号特有的风控开仓额度
-    target_weight = float(row['target_weight'])
-    target_position_value = total_equity * LEVRAGE * target_weight
+    max_weight = float(row['max_weight'])
+    target_position_value = total_equity * LEVRAGE * max_weight
 
     # 输入详细的日志
-    logger.info(f"[EXEC] 信号解析 | 币种: {coin} | 方向: {direction} | 动作: {action} | 开平: {event} | 价格: {price:.2f} | 权重: {target_weight:.3f} | 目标开仓额度: {target_position_value:.2f} 总资产: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x 目标权重: {target_weight:.3f}")
+    logger.info(f"[EXEC] 信号解析 | 币种: {coin} | 方向: {direction} | 动作: {action} | 开平: {event} | 价格: {price:.2f} | 权重: {max_weight:.3f} | 目标开仓额度: {target_position_value:.2f} 总资产: {total_equity:.2f} | 杠杆倍数: {LEVRAGE}x 目标权重: {max_weight:.3f}")
 
 
     # 【修改点 3】：直接提取 signal_df 中的精准 symbol 字段（移除对 USDT 的硬编码）
@@ -464,7 +464,7 @@ def execute_single_signal(exchange, row, total_equity, position_cache, open_orde
         row=row,
         actual_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         total_equity=total_equity,
-        risk_ratio=target_weight,  # 【本次修改点】：不再写入全局的 POSITION_RISK_RATIO，而是存入信号本身独有的 target_weight
+        risk_ratio=max_weight,  # 【本次修改点】：不再写入全局的 POSITION_RISK_RATIO，而是存入信号本身独有的 max_weight
         target_value=target_position_value,
         amount=amount,
         status=result.status,
