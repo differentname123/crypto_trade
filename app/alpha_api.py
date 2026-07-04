@@ -125,17 +125,23 @@ def get_signals():
 
             if event == 'OPEN':
                 weight = row.get('weight')
-                active_pos[coin] = {
+                # 修复核心：使用复合Key（币种_开仓方向），防止多空同开时覆盖
+                pos_key = f"{coin}_{is_buy}"
+                active_pos[pos_key] = {
                     'symbol': coin, 'side': side_text, 'isBuy': is_buy,
                     'time': str(row['time']), 'price': str(row['price']),
                     'size': f"{weight * 100:g}%" if weight is not None else "--"
                 }
             elif event == 'CLOSE':
-                open_p = active_pos.pop(coin, {})
+                # 修复核心：平仓时 action 是反的（SELL平多，BUY平空），所以开仓方向是 not is_buy
+                orig_is_buy = not is_buy
+                pos_key = f"{coin}_{orig_is_buy}"
+                open_p = active_pos.pop(pos_key, {})
+
                 raw_history.append({
                     'coin': coin,
-                    'action_text': open_p.get('side', side_text),
-                    'is_buy_action': open_p.get('isBuy', is_buy),
+                    'action_text': open_p.get('side', '开多' if orig_is_buy else '开空'),
+                    'is_buy_action': open_p.get('isBuy', orig_is_buy),
                     'open_time': open_p.get('time', '--'), 'close_time': row['time'],
                     'open_price': open_p.get('price', '--'), 'close_price': row['price'],
                     'pnl': row['pnl']
@@ -153,7 +159,8 @@ def get_signals():
             raw_history = raw_history[best_idx:]
 
         opt_pnl = sum((r['pnl'] or 0) for r in raw_history)
-        print(f"[{res_data['updateTime']}] 策略执行: 原{original_count}条, 剔除{original_count - len(raw_history)}条, 留{len(raw_history)}条, 优化总收益: {opt_pnl:.2f}%")
+        print(
+            f"[{res_data['updateTime']}] 策略执行: 原{original_count}条, 剔除{original_count - len(raw_history)}条, 留{len(raw_history)}条, 优化总收益: {opt_pnl:.2f}%")
 
         # 倒序并准备组装前端数据
         raw_history.sort(key=sort_key_lambda, reverse=True)
@@ -161,7 +168,8 @@ def get_signals():
 
         if raw_history:
             start_r = raw_history[-1]  # 由于已经降序排列，最后一个是最老的记录
-            start_t = start_r['open_time'] if start_r.get('open_time', '--') != '--' else start_r.get('close_time', '--')
+            start_t = start_r['open_time'] if start_r.get('open_time', '--') != '--' else start_r.get('close_time',
+                                                                                                      '--')
             res_data["stats"] = {
                 "totalReturn": f"+{opt_pnl:.2f}%" if opt_pnl > 0 else f"{opt_pnl:.2f}%",
                 "timeRange": f"{start_t}\n至\n{raw_history[0].get('close_time', '--')}"
