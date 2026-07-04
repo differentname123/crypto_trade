@@ -509,7 +509,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
                         f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
                 elif row['event'] == 'OPEN':
                     logger.info(
-                        f"   🟢 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
+                        f"   🔴 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
         logger.info("-" * 70)
 
     # 3. 汇总并导出完整的流水日志
