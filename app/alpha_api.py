@@ -107,6 +107,7 @@ def get_signals():
 
         # Pandas 清理数据
         df = pd.read_csv(CSV_FILE_PATH).rename(columns=lambda x: x.strip())
+        df = df[pd.to_datetime(df['time']) <= pd.Timestamp.now()]
         df = df[['time', 'action', 'event', 'coin', 'price', 'target_weight', 'pnl']].rename(
             columns={'target_weight': 'weight'})
         df = df.where(pd.notna(df), None)
