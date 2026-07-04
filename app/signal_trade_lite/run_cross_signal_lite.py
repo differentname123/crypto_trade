@@ -636,10 +636,6 @@ def execute_trading_bot_workflow(target_time, proxy_url=None):
 
 
 if __name__ == "__main__":
-    print(67.25 * 77.69)
-    print(1.32 * 19.83)
+    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
-    #
-    # target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
-    #
-    # execute_trading_bot_workflow(target_time)
+    execute_trading_bot_workflow(target_time)
