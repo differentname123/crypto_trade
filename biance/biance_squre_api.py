@@ -11,6 +11,9 @@
 import json
 import logging
 import os
+import random
+import time
+import traceback
 import uuid
 
 import requests
@@ -49,8 +52,8 @@ def publish_to_binance_square(api_key, text_content):
 
     # 局部代理配置，只影响当前请求
     proxies = {
-        "http": "http://127.0.0.1:7890",
-        "https": "http://127.0.0.1:7890"
+        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
+        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
     }
 
     # 隐藏掉中间的 API Key 字符，避免在控制台全量打印（官方安全规范）
@@ -83,6 +86,71 @@ def publish_to_binance_square(api_key, text_content):
     except requests.exceptions.RequestException as e:
         logger.error(f"🚨 发帖网络请求异常 | Key: {masked_key} | 异常信息: {e}")
         return False
+
+
+def clean_binance_post_data(raw_data_list):
+    """
+    清洗币安广场帖子数据的函数
+    :param raw_data_list: 原始 JSON 对象的列表 (List[dict])
+    :return: 清洗后的精简数据列表 (List[dict])，发生致命错误返回 []
+    """
+    if not isinstance(raw_data_list, list):
+        logger.error("Data clean failed: Input is not a list.")
+        return []
+
+    cleaned_list = []
+    original_count = len(raw_data_list)
+
+    try:
+        for item in raw_data_list:
+            if not isinstance(item, dict):
+                continue
+
+            # 提取图片元数据
+            images_clean = []
+            for img in item.get("imageMetaList") or []:
+                if isinstance(img, dict):
+                    images_clean.append({
+                        "url": img.get("url"),
+                        "width": img.get("width"),
+                        "height": img.get("height")
+                    })
+
+            # 组装清洗后的数据实体
+            cleaned_item = {
+                "id": item.get("id"),
+                "webLink": item.get("webLink"),
+                "date": item.get("date"),
+                "author": {
+                    "squareAuthorId": item.get("squareAuthorId"),
+                    "username": item.get("username"),
+                    "authorName": item.get("authorName")
+                },
+                "content": item.get("content"),
+                "images": images_clean,
+                "engagement": {
+                    "viewCount": item.get("viewCount") or 0,
+                    "likeCount": item.get("likeCount") or 0,
+                    "commentCount": item.get("commentCount") or 0
+                }
+            }
+
+            # 数据完整性底线校验：没有 ID 放弃保留
+            if cleaned_item.get("id"):
+                cleaned_list.append(cleaned_item)
+            else:
+                logger.warning(f"Skipped item due to missing ID: {item}")
+
+        # 核心日志：只保留这一条最重要的成功汇总
+        logger.info(f"Data clean completed: {original_count} in -> {len(cleaned_list)} out.")
+
+        return cleaned_list
+
+    except Exception as e:
+        traceback.print_exc()
+        # 异常日志精简
+        logger.error(f"Data clean aborted due to exception: {e}")
+        return []
 
 
 def get_binance_feed(token="DOGE", desire_count=20, orderBy=2):
@@ -132,8 +200,8 @@ def get_binance_feed(token="DOGE", desire_count=20, orderBy=2):
 
     # 局部代理配置，只影响当前请求
     proxies = {
-        "http": "http://127.0.0.1:7890",
-        "https": "http://127.0.0.1:7890"
+        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
+        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
     }
 
     try:
@@ -216,8 +284,8 @@ def follow_binance_square_user(
         "targetSquareUid": target_uid
     }
     proxies = {
-        "http": "http://127.0.0.1:7890",
-        "https": "http://127.0.0.1:7890"
+        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
+        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
     }
 
     try:
@@ -237,6 +305,110 @@ def follow_binance_square_user(
         resp_text = e.response.text if hasattr(e, 'response') and e.response is not None else "无响应内容"
         logger.error(f"🚨 关注用户请求异常 | 目标UID: {target_uid} | 异常信息: {e} | 响应内容: {resp_text}")
         return {}
+
+
+def fetch_binance_feed_recommend(required_count,content_ids=[]):
+    """
+    不断拉取币安广场的推荐数据，直到满足需要的数量
+
+    :param required_count: 需要拉取的目标数据总数 (vos 的数量)
+    :return: 包含目标数据的列表
+    """
+    url = "https://www.binance.com/bapi/composite/v9/friendly/pgc/feed/feed-recommend/list"
+
+    # 代理设置
+    proxy_url = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+    proxies = {
+        "http": proxy_url,
+        "https": proxy_url
+    }
+
+    # 请求头 (精简掉所有登录、设备及强验证相关的长段冗余字段，仅保留基础字段与防拦截动态UUID)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5",
+        "lang": "zh-CN",
+        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),
+        "X-TRACE-ID": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "versioncode": "web",
+        "BNC-Time-Zone": "Asia/Shanghai",
+        "referrer": "https://www.binance.com/zh-CN/square"
+    }
+
+    all_vos = []
+    page_index = 1
+    page_size = 20
+
+    # 最大重试次数设置
+    max_retries = 5
+    retry_count = 0
+
+    # 不断循环，直到收集的数量满足要求
+    while len(all_vos) < required_count:
+        # 省略了 userBehaviors，因为这是公共流抓取，强行上报陈旧或伪造的曝光id/ts毫无意义且有反爬风险
+        payload = {
+            "pageIndex": page_index,
+            "pageSize": page_size,
+            "scene": "web-homepage",
+            "contentIds": content_ids
+        }
+
+        try:
+            # 发起请求
+            response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
+            response.raise_for_status()
+            res_data = response.json()
+
+            # 安全解析逻辑：确保结构存在且类型正确
+            if res_data and isinstance(res_data.get("data"), dict):
+                vos = res_data["data"].get("vos")
+
+                # 如果vos为空或不存在，说明流到底了，直接结束
+                if not vos:
+                    logger.warning("接口未返回更多的 vos 数据，可能已经到底。")
+                    break
+
+                all_vos.extend(vos)
+                logger.info(f"第 {page_index} 页抓取成功，新增 {len(vos)} 条，当前总计：{len(all_vos)} 条")
+
+                # 提取已获取内容的ID，追加到 content_ids 中供下一次请求使用
+                for item in vos:
+                    item_id = item.get("id") or item.get("contentId")
+                    if item_id:
+                        content_ids.append(str(item_id))
+
+                # 递增页码并重置重试次数
+                page_index += 1
+                retry_count = 0
+            else:
+                logger.error(f"非预期的数据结构: {res_data}")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.warning(f"数据结构错误累计达到 {max_retries} 次，停止重试。")
+                    break
+
+        except Exception as e:
+            logger.error(f"请求发生异常: {e}")
+            retry_count += 1
+            if retry_count >= max_retries:
+                logger.warning(f"请求异常累计达到 {max_retries} 次，停止重试。")
+                break
+
+    # 允许结果多于目标数量，直接原样返回全部爬取到的完整列表
+    return all_vos
+
+
+if __name__ == "__main__":
+
+
+    # 获取指定的推荐信息
+    target_count = 50
+    results = fetch_binance_feed_recommend(required_count=target_count)
+    pure_results = clean_binance_post_data(results)
+    logger.info(f"拉取完成！最终返回 {len(results)} 条记录。")
 
 
 if __name__ == "__main__":
@@ -259,7 +431,7 @@ if __name__ == "__main__":
     logger.info("=" * 40)
     logger.info("1. 测试: 获取币安 Feed 数据")
     logger.info("=" * 40)
-    feed_data = get_binance_feed(token="DOGE", desire_count=2)
+    feed_data = get_binance_feed(token="DOGE", desire_count=20)
     logger.info(f"✅ 获取到 {len(feed_data)} 条 Feed 数据。\n")
     #
     # # logger.info("=" * 40)
