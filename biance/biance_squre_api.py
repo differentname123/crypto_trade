@@ -6,9 +6,10 @@
 :last_date:
     2026/4/7 0:23
 :description:
-    
+
 """
 import json
+import logging
 import os
 import uuid
 
@@ -16,7 +17,12 @@ import requests
 import pandas as pd
 import datetime
 
-from common.common_utils import get_config
+from common.common_utils import get_config, setup_logger
+
+setup_logger()
+
+# 2. 拿到属于当前文件的专属 logger
+logger = logging.getLogger(__name__)
 
 
 def publish_to_binance_square(api_key, text_content):
@@ -47,10 +53,13 @@ def publish_to_binance_square(api_key, text_content):
         "https": "http://127.0.0.1:7890"
     }
 
+    # 隐藏掉中间的 API Key 字符，避免在控制台全量打印（官方安全规范）
+    masked_key = f"{api_key[:5]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
+    # 提取内容摘要，防止内容过长刷屏
+    text_summary = text_content[:20].replace('\n', ' ') + ("..." if len(text_content) > 20 else "")
+
     try:
-        # 隐藏掉中间的 API Key 字符，避免在控制台全量打印（官方安全规范）
-        masked_key = f"{api_key[:5]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
-        print(f"⏳ 正在向币安广场发送发帖请求 (使用 Key: {masked_key})...")
+        logger.info(f"⏳ 开始向币安广场发帖 | Key: {masked_key} | 内容摘要: {text_summary}")
 
         # 增加 proxies 参数
         response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
@@ -58,26 +67,21 @@ def publish_to_binance_square(api_key, text_content):
 
         # 判断业务是否成功
         if result.get('success') or str(result.get('code')) == '000000':
-            print("✅ 恭喜！发布成功！")
-
-            # 根据规范，获取返回数据中的 id 来拼接你的帖子直达链接
             post_id = result.get('data', {}).get('id')
-            if post_id:
-                post_url = f"https://www.binance.com/square/post/{post_id}"
-                print(f"👉 帖子链接: {post_url}")
+            post_url = f"https://www.binance.com/square/post/{post_id}" if post_id else "未知链接"
+            # 聚合成功日志
+            logger.info(f"✅ 发帖成功 | 帖子ID: {post_id} | 直达链接: {post_url}")
             return True
 
         else:
-            print("❌ 发布失败，接口返回信息:")
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-
-            # 如果报 220009 错误，说明达到了每日发帖上限
-            if str(result.get('code')) == '220009':
-                print("💡 提示：该错误码通常表示已达到每日发帖数量上限 (Daily post limit)。")
+            # 聚合失败信息、错误码解读、接口原报文至一行，避免多行打印被并发冲散
+            error_code = str(result.get('code'))
+            hint = " (💡提示: 已达每日发帖上限 Daily limit)" if error_code == '220009' else ""
+            logger.error(f"❌ 发帖失败 | 错误码: {error_code}{hint} | 完整响应: {result}")
             return False
 
     except requests.exceptions.RequestException as e:
-        print(f"🚨 网络请求发生异常: {e}")
+        logger.error(f"🚨 发帖网络请求异常 | Key: {masked_key} | 异常信息: {e}")
         return False
 
 
@@ -133,6 +137,8 @@ def get_binance_feed(token="DOGE", desire_count=20, orderBy=2):
     }
 
     try:
+        logger.info(f"⏳ 开始获取Feed数据 | Token: {token} | 期望条数: {desire_count} | 排序: {orderBy}")
+
         response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=10)
         response.raise_for_status()
         res_data = response.json()
@@ -141,12 +147,15 @@ def get_binance_feed(token="DOGE", desire_count=20, orderBy=2):
         if res_data and isinstance(res_data.get("data"), dict):
             vos = res_data["data"].get("vos")
             if isinstance(vos, list):
+                logger.info(f"✅ 获取Feed数据成功 | Token: {token} | 实际获取条数: {len(vos)}")
                 return vos
 
+        # 补充空数据情况下的警告日志，方便排查是否是风控拦截导致格式变了
+        logger.warning(f"⚠️ Feed数据为空或解析失败 | Token: {token} | 响应摘要: {str(res_data)[:200]}")
         return []
     except Exception as e:
         # 捕获所有异常(断网、代理失效、JSON解析失败等)，确保不影响调用方
-        print(f"获取Feed请求失败: {e}")
+        logger.error(f"🚨 获取Feed请求失败 | Token: {token} | 异常信息: {e}")
         return []
 
 
@@ -212,49 +221,54 @@ def follow_binance_square_user(
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=10)        # 币安接口通常返回 HTTP 200，具体业务成功与否看 JSON 里的 code 字段
+        logger.info(f"⏳ 开始关注广场用户 | 目标UID: {target_uid} | TraceID: {trace_id}")
+
+        response = requests.post(url, headers=headers, json=payload, proxies=proxies,
+                                 timeout=10)  # 币安接口通常返回 HTTP 200，具体业务成功与否看 JSON 里的 code 字段
         response.raise_for_status()
-        return response.json()
+
+        resp_json = response.json()
+        logger.info(
+            f"✅ 关注用户请求完成 | 目标UID: {target_uid} | 返回Code: {resp_json.get('code')} | 完整响应: {resp_json}")
+        return resp_json
+
     except requests.exceptions.RequestException as e:
-        print(f"请求失败: {e}")
-        # 返回原始响应以便调试
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"响应内容: {e.response.text}")
+        # 将错误信息聚合在一行
+        resp_text = e.response.text if hasattr(e, 'response') and e.response is not None else "无响应内容"
+        logger.error(f"🚨 关注用户请求异常 | 目标UID: {target_uid} | 异常信息: {e} | 响应内容: {resp_text}")
         return {}
 
 
 if __name__ == "__main__":
-
-    # 替换为你实际抓取到的最新 Cookie (请注意保护个人隐私，不要在公开代码库中泄露)
-    MY_COOKIE = """bnc-uuid=2772e08c-2f51-4f76-a3a7-f8d5700463fb; BNC_FV_KEY=33e0521b114aa99a931a3ed42ca03cf0147220b0; lang=zh-CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.17001513.1774485620; se_sd=AwODgTQ9QRODlRUEMEAYgZZAwVQgMEXWlZcJeW0RVVQWwFVNWVIC1; se_gd=gMaWgRxAOBIDFMTxWAQMgZZEFVhYGBXWlRSJeW0RVVQWwE1NWV4R1; se_gsd=SjUiKz9jJislGSMsNQMxBS4ECVBSBgVRWF5CW1FUVFVWNFNT1; bu_s=default; g_state={"i_l":0,"i_ll":1774485995809,"i_b":"NKbj7qtR4btoqh2wSA9LO71loBb9HeqsXc2dMxItGG0","i_e":{"enable_itp_optimization":0}}; BNC-Location=CN; theme=light; neo-theme=light; _gid=GA1.2.1014400770.1775363722; aws-waf-token=49523bea-cc30-499d-a6b5-7bb90a39c73e:AQoAhq9Ms/ICAAAA:zFrMUI32RGjn21sFH0tvoqKElNySMSYU8MiIuoJAVDtXDx000yMwC3zqBa1Qa7LApGeXibZUCk4DvTVmY03GcodqnyNhbyIoe11vHrdIaiRNOCpNQ8DKQ1iDndciMjQXY3c6ZKP+3vK/S8fg8PImMas8pAkK7GvaG8SkAb1F+RvJ5YbXEOnorSTveSc61n8E3kg=; changeBasisTimeZone=; _uetsid=c9f13b7031ca11f1950ba10f78e7c9e6; _uetvid=5eef827028ac11f18ddb31237e05f437; futures-layout=pro; _h_desk_key=8ea5542d32cc4284879ca8a4fc7ad41a; BNC_FV_KEY_T=101-Ylebao0wIcEz2Uj9MpbnsXPTrZWNWkYZp3hQyb1VE8vcKbwuvXsebklUt%2BlP0cq24ACFZyMmaWab5EPoNZ%2FyLg%3D%3D-KCNuKETgXuNoVNoZxGJBdA%3D%3D-2d; BNC_FV_KEY_EXPIRE=1775580632060; s9r1=9295BE8EC4891D0CFBBF5377C54B9454; r20t=web.D6D0A9FDF865D8BFC6029A44842218F3; r30t=1; cr00=156D95BCEAE710B7D5E8FC3A9885B90E; d1og=web.1229561321.7C28B45C2405D999E4CD78CE8DAD6698; r2o1=web.1229561321.19F0081C45D206B68BE35A511F1AB277; f30l=web.1229561321.72BF426ACE0E086CEB5DE498225372F0; currentAccount=; logined=y; p20t=web.1229561321.4519E52C213DCEFA2E046A8E6753B05E; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221229561321%22%2C%22first_id%22%3A%2219c67f1247fd9f-0944324976c3ab8-26061d51-2359296-19c67f12480b26%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTljNjdmMTI0N2ZkOWYtMDk0NDMyNDk3NmMzYWI4LTI2MDYxZDUxLTIzNTkyOTYtMTljNjdmMTI0ODBiMjYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjI5NTYxMzIxIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221229561321%22%7D%2C%22%24device_id%22%3A%2219c67f2cd51ef8-07bb7118048b2d8-26061d51-2359296-19c67f2cd52129f%22%7D; OptanonConsent=isGpcEnabled=0&datestamp=Tue+Apr+07+2026+18%3A52%3A41+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202506.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&consentId=5029ba14-0415-4560-be72-530391e051ed&interactionCount=1&isAnonUser=1&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&AwaitingReconsent=false; _ga=GA1.1.1913380912.1772289141; _ga_3WP50LGEEC=GS2.1.s1775559031$o31$g1$t1775559167$j6$l0$h0"""
-    TARGET_UID = "CfexsWwIVYYbr1N5GJXlVQ"
-
-    # 执行关注
-    result = follow_binance_square_user(
-        target_uid=TARGET_UID,
-        cookie_str=MY_COOKIE
-        # 如果报错风控拦截，你需要在这里手动传入最新的 csrf_token 和 fvideo_token
-    )
-
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
+    # # 替换为你实际抓取到的最新 Cookie (请注意保护个人隐私，不要在公开代码库中泄露)
+    # MY_COOKIE = """bnc-uuid=2772e08c-2f51-4f76-a3a7-f8d5700463fb; BNC_FV_KEY=33e0521b114aa99a931a3ed42ca03cf0147220b0; lang=zh-CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.17001513.1774485620; se_sd=AwODgTQ9QRODlRUEMEAYgZZAwVQgMEXWlZcJeW0RVVQWwFVNWVIC1; se_gd=gMaWgRxAOBIDFMTxWAQMgZZEFVhYGBXWlRSJeW0RVVQWwE1NWV4R1; se_gsd=SjUiKz9jJislGSMsNQMxBS4ECVBSBgVRWF5CW1FUVFVWNFNT1; bu_s=default; g_state={"i_l":0,"i_ll":1774485995809,"i_b":"NKbj7qtR4btoqh2wSA9LO71loBb9HeqsXc2dMxItGG0","i_e":{"enable_itp_optimization":0}}; BNC-Location=CN; theme=light; neo-theme=light; _gid=GA1.2.1014400770.1775363722; aws-waf-token=49523bea-cc30-499d-a6b5-7bb90a39c73e:AQoAhq9Ms/ICAAAA:zFrMUI32RGjn21sFH0tvoqKElNySMSYU8MiIuoJAVDtXDx000yMwC3zqBa1Qa7LApGeXibZUCk4DvTVmY03GcodqnyNhbyIoe11vHrdIaiRNOCpNQ8DKQ1iDndciMjQXY3c6ZKP+3vK/S8fg8PImMas8pAkK7GvaG8SkAb1F+RvJ5YbXEOnorSTveSc61n8E3kg=; changeBasisTimeZone=; _uetsid=c9f13b7031ca11f1950ba10f78e7c9e6; _uetvid=5eef827028ac11f18ddb31237e05f437; futures-layout=pro; _h_desk_key=8ea5542d32cc4284879ca8a4fc7ad41a; BNC_FV_KEY_T=101-Ylebao0wIcEz2Uj9MpbnsXPTrZWNWkYZp3hQyb1VE8vcKbwuvXsebklUt%2BlP0cq24ACFZyMmaWab5EPoNZ%2FyLg%3D%3D-KCNuKETgXuNoVNoZxGJBdA%3D%3D-2d; BNC_FV_KEY_EXPIRE=1775580632060; s9r1=9295BE8EC4891D0CFBBF5377C54B9454; r20t=web.D6D0A9FDF865D8BFC6029A44842218F3; r30t=1; cr00=156D95BCEAE710B7D5E8FC3A9885B90E; d1og=web.1229561321.7C28B45C2405D999E4CD78CE8DAD6698; r2o1=web.1229561321.19F0081C45D206B68BE35A511F1AB277; f30l=web.1229561321.72BF426ACE0E086CEB5DE498225372F0; currentAccount=; logined=y; p20t=web.1229561321.4519E52C213DCEFA2E046A8E6753B05E; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221229561321%22%2C%22first_id%22%3A%2219c67f1247fd9f-0944324976c3ab8-26061d51-2359296-19c67f12480b26%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTljNjdmMTI0N2ZkOWYtMDk0NDMyNDk3NmMzYWI4LTI2MDYxZDUxLTIzNTkyOTYtMTljNjdmMTI0ODBiMjYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjI5NTYxMzIxIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221229561321%22%7D%2C%22%24device_id%22%3A%2219c67f2cd51ef8-07bb7118048b2d8-26061d51-2359296-19c67f2cd52129f%22%7D; OptanonConsent=isGpcEnabled=0&datestamp=Tue+Apr+07+2026+18%3A52%3A41+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202506.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&consentId=5029ba14-0415-4560-be72-530391e051ed&interactionCount=1&isAnonUser=1&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&AwaitingReconsent=false; _ga=GA1.1.1913380912.1772289141; _ga_3WP50LGEEC=GS2.1.s1775559031$o31$g1$t1775559167$j6$l0$h0"""
+    # TARGET_UID = "CfexsWwIVYYbr1N5GJXlVQ"
     #
+    # # 执行关注
+    # result = follow_binance_square_user(
+    #     target_uid=TARGET_UID,
+    #     cookie_str=MY_COOKIE
+    #     # 如果报错风控拦截，你需要在这里手动传入最新的 csrf_token 和 fvideo_token
+    # )
     #
+    # logger.info(f"执行关注最终结果: {json.dumps(result, ensure_ascii=False)}")
+
+
+
+
+    logger.info("=" * 40)
+    logger.info("1. 测试: 获取币安 Feed 数据")
+    logger.info("=" * 40)
+    feed_data = get_binance_feed(token="DOGE", desire_count=2)
+    logger.info(f"✅ 获取到 {len(feed_data)} 条 Feed 数据。\n")
     #
-    # # print("=" * 40)
-    # # print("1. 测试: 获取币安 Feed 数据")
-    # # print("=" * 40)
-    # # feed_data = get_binance_feed(token="DOGE", desire_count=2)
-    # # print(f"✅ 获取到 {len(feed_data)} 条 Feed 数据。\n")
+    # # logger.info("=" * 40)
+    # # logger.info("3. 测试: 广场自动化发帖")
+    # # logger.info("=" * 40)
+    # # YOUR_SQUARE_API_KEY = get_config("myself_square_api_key")
+    # # test_text = """$ETH $BTC 祝愿大家发大财 天天开心"""
     #
-    # print("=" * 40)
-    # print("3. 测试: 广场自动化发帖")
-    # print("=" * 40)
-    # YOUR_SQUARE_API_KEY = get_config("myself_square_api_key")
-    # test_text = """$ETH $BTC 祝愿大家发大财 天天开心"""
-    #
-    # if YOUR_SQUARE_API_KEY != "替换成你的_API_KEY":
-    #     publish_to_binance_square(api_key=YOUR_SQUARE_API_KEY, text_content=test_text)
-    # else:
-    #     print("⚠️ 请先在代码中填入你的 API Key 再运行发帖测试！\n")
+    # # if YOUR_SQUARE_API_KEY != "替换成你的_API_KEY":
+    # #     publish_to_binance_square(api_key=YOUR_SQUARE_API_KEY, text_content=test_text)
+    # # else:
+    # #     logger.warning("⚠️ 请先在代码中填入你的 API Key 再运行发帖测试！\n")

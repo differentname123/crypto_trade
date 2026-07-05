@@ -14,6 +14,57 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
+# common/log_config.py
+import logging
+import os
+from logging.handlers import TimedRotatingFileHandler
+
+
+def setup_logger(log_dir="logs", app_name="BinanceBot"):
+    """
+    初始化全局日志配置。
+    支持在多个文件中重复调用，但实际只会初始化一次。
+    """
+    os.makedirs(log_dir, exist_ok=True)
+
+    # 获取根记录器
+    logger = logging.getLogger()
+
+    # 【核心安全阀】：如果已经有 Handler，说明被其他文件初始化过了，直接跳过！
+    # 这一步极其重要，否则你在 10 个文件里调用，一行日志就会被打印 10 次。
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+
+    # 包含 文件名.函数名:行号 的终极溯源格式
+    formatter = logging.Formatter(
+        '%(asctime)s,%(msecs)03d | %(levelname)s | [%(name)s.%(funcName)s:%(lineno)d] | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # 按天切割日志
+    log_file_path = os.path.join(log_dir, f"{app_name}.log")
+    file_handler = TimedRotatingFileHandler(
+        filename=log_file_path,
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+
+    # 控制台输出
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    logger.propagate = False
+
+    return logger
+
 def read_json(json_path):
     """
     读取 JSON 文件并返回内容。
