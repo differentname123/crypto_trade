@@ -149,7 +149,7 @@ def get_signals():
                 })
 
         # 核心策略：利用 Lambda 作为排序 key (如果开仓时间失效，自动兜底平仓时间)
-        sort_key_lambda = lambda r: r['open_time'] if r.get('open_time', '--') != '--' else r.get('close_time', '')
+        sort_key_lambda = lambda r: (r.get('close_time', ''), r.get('open_time', ''))
 
         raw_history.sort(key=sort_key_lambda)  # 升序
         original_count = len(raw_history)

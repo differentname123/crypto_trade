@@ -21,7 +21,7 @@ import requests
 import pandas as pd
 import datetime
 
-from common.common_utils import get_config, setup_logger
+from common.common_utils import get_config, setup_logger, save_json, read_json
 
 setup_logger()
 
@@ -625,8 +625,322 @@ def fetch_binance_feed(count=20, keyword=None, token=None, **kwargs):
         logger.info(f"🔄 自动路由: [推荐流模式] | 目标条数: {count}")
         content_ids = kwargs.get("content_ids", [])
         feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
-    clean_feed_list = clean_universal_binance_data(feed_list)
-    return clean_feed_list
+    # clean_feed_list = clean_universal_binance_data(feed_list)
+    return feed_list
+
+def clean_short_posts(raw_data_list):
+    cleaned_list = []
+
+    for raw_item in raw_data_list:
+        # 1. 安全提取正文
+        text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
+
+        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
+        raw_coins = raw_item.get("coinPairList") or []
+        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
+
+        # 从 tradingPairsV2 中提取防漏抓
+        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
+        for pair in trading_pairs_v2:
+            code = pair.get("code")
+            if code:
+                cleaned_coins_list.append(code.strip())
+
+        # 合并、去重，并统一转大写
+        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
+
+        # 3. 修复 Hashtags 首尾空格问题
+        raw_hashtags = raw_item.get("hashtagList", [])
+        cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
+
+        # 组装数据
+        cleaned_data = {
+            "metadata": {
+                "post_id": raw_item.get("id"),
+                "card_type": raw_item.get("cardType"),
+                "publish_time": raw_item.get("date"),
+                "url": raw_item.get("webLink"),
+                "is_ai_generated": raw_item.get("isCreatedByAI", False)
+            },
+            "author": {
+                "author_id": raw_item.get("squareAuthorId"),
+                "username": raw_item.get("username"),
+                "author_name": raw_item.get("authorName"),
+                "is_verified": raw_item.get("authorVerificationType", 0) > 0
+            },
+            "content": {
+                "title": raw_item.get("title"),
+                "text_content": text_content,
+                "hashtags": cleaned_hashtags,
+                "mentioned_coins": cleaned_coins
+            },
+            "media": {
+                "images": raw_item.get("images", [])
+            },
+            "engagement": {
+                "view_count": raw_item.get("viewCount", 0),
+                "like_count": raw_item.get("likeCount", 0),
+                "comment_count": raw_item.get("commentCount", 0),
+                "share_count": raw_item.get("shareCount", 0),
+                "quote_count": raw_item.get("quoteCount", 0)
+            }
+        }
+
+        cleaned_list.append(cleaned_data)
+
+    return cleaned_list
+
+
+def clean_reply_posts(raw_data_list):
+    """
+    专门清洗 BUZZ_REPLY_POST_LIST (串烧/盖楼帖) 类型的数据
+    :param raw_data_list: 原始数据列表 (List[Dict])
+    :return: 解包并清洗后的独立帖子列表 (List[Dict])
+    """
+    cleaned_list = []
+
+    for raw_container in raw_data_list:
+        # 确保这是我们要处理的盖楼帖类型
+        if raw_container.get("cardType") != "BUZZ_REPLY_POST_LIST":
+            continue
+
+        # 提取盖楼帖里面的所有真实子帖子
+        reply_post_list = raw_container.get("replyPostList", [])
+
+        for raw_item in reply_post_list:
+            # 1. 安全提取正文
+            text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
+
+            # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
+            raw_coins = raw_item.get("coinPairList") or []
+            cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
+
+            # 从 tradingPairsV2 中提取防漏抓
+            trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
+            for pair in trading_pairs_v2:
+                code = pair.get("code")
+                if code:
+                    cleaned_coins_list.append(code.strip())
+
+            # 合并、去重，并统一转大写
+            cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
+
+            # 3. Hashtags 去首尾空格
+            raw_hashtags = raw_item.get("hashtagList", [])
+            cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
+
+            # 4. 组装数据
+            cleaned_data = {
+                "metadata": {
+                    "post_id": raw_item.get("id"),
+                    "card_type": raw_item.get("cardType", "BUZZ_SHORT"),
+                    "publish_time": raw_item.get("date"),
+                    "url": raw_item.get("webLink"),
+                    "is_ai_generated": raw_item.get("isCreatedByAI", False),
+                    # 新增这个标记，方便后续分析知道这是不是一条跟帖
+                    "is_reply_post": raw_item.get("isReplyPost", False)
+                },
+                "author": {
+                    "author_id": raw_item.get("squareAuthorId"),
+                    "username": raw_item.get("username"),
+                    "author_name": raw_item.get("authorName"),
+                    "is_verified": raw_item.get("authorVerificationType", 0) > 0
+                },
+                "content": {
+                    "title": raw_item.get("title"),
+                    "text_content": text_content,
+                    "hashtags": cleaned_hashtags,
+                    "mentioned_coins": cleaned_coins
+                },
+                "media": {
+                    "images": raw_item.get("images", [])
+                },
+                "engagement": {
+                    "view_count": raw_item.get("viewCount", 0),
+                    "like_count": raw_item.get("likeCount", 0),
+                    "comment_count": raw_item.get("commentCount", 0),
+                    "share_count": raw_item.get("shareCount", 0),
+                    "quote_count": raw_item.get("quoteCount", 0)
+                }
+            }
+
+            # 将解包后的单条清洗数据放入结果列表中
+            cleaned_list.append(cleaned_data)
+
+    return cleaned_list
+
+
+def clean_video_posts(raw_data_list):
+    """
+    专门清洗 BUZZ_VIDEO (视频帖) 类型的数据
+    :param raw_data_list: 原始数据列表 (List[Dict])
+    :return: 清洗后的新数据列表 (List[Dict])
+    """
+    cleaned_list = []
+
+    for raw_item in raw_data_list:
+        # 如果你想做混合处理，可以加这个判断：if raw_item.get("cardType") != "BUZZ_VIDEO": continue
+
+        # 1. 安全提取正文和标题
+        title = raw_item.get("title", "").strip() if raw_item.get("title") else None
+        text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
+
+        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
+        raw_coins = raw_item.get("coinPairList") or []
+        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
+
+        # 从 tradingPairsV2 中提取防漏抓
+        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
+        for pair in trading_pairs_v2:
+            code = pair.get("code")
+            if code:
+                cleaned_coins_list.append(code.strip())
+
+        # 合并、去重，并统一转大写
+        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
+
+        # 3. Hashtags 去首尾空格
+        raw_hashtags = raw_item.get("hashtagList", [])
+        cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
+
+        # 4. 重点：提取视频专属资源 (直链、封面、时长)
+        video_info = None
+        # 兼容两种取值路径：顶层 videoLink 或 嵌套在 videoVO 里
+        video_link = raw_item.get("videoLink") or raw_item.get("videoVO", {}).get("videoLink")
+
+        if video_link:
+            video_info = {
+                "video_url": video_link,
+                "cover_image_url": raw_item.get("coverLight") or raw_item.get("coverMeta", {}).get("url"),
+                "duration_seconds": raw_item.get("videoTimeSeconds") or raw_item.get("videoVO", {}).get(
+                    "videoTimeSeconds", 0)
+            }
+
+        # 5. 组装最终数据
+        cleaned_data = {
+            "metadata": {
+                "post_id": raw_item.get("id"),
+                "card_type": raw_item.get("cardType", "BUZZ_VIDEO"),
+                "publish_time": raw_item.get("date"),
+                "url": raw_item.get("webLink"),
+                "is_ai_generated": raw_item.get("isCreatedByAI", False)
+            },
+            "author": {
+                "author_id": raw_item.get("squareAuthorId"),
+                "username": raw_item.get("username"),
+                "author_name": raw_item.get("authorName"),
+                "is_verified": raw_item.get("authorVerificationType", 0) > 0
+            },
+            "content": {
+                "title": title,
+                "text_content": text_content,
+                "hashtags": cleaned_hashtags,
+                "mentioned_coins": cleaned_coins
+            },
+            "media": {
+                "images": raw_item.get("images", []),  # 视频帖的纯图片通常为空，保留格式统一
+                "video": video_info  # 视频专属属性
+            },
+            "engagement": {
+                "view_count": raw_item.get("viewCount", 0),
+                "like_count": raw_item.get("likeCount", 0),
+                "comment_count": raw_item.get("commentCount", 0),
+                "share_count": raw_item.get("shareCount", 0),
+                "quote_count": raw_item.get("quoteCount", 0)
+            }
+        }
+
+        cleaned_list.append(cleaned_data)
+
+    return cleaned_list
+
+
+def clean_long_posts(raw_data_list):
+    """
+    无损清洗 BUZZ_LONG (长文帖) 类型的数据
+    忠实保留原始文本，精细化分类图片属性。
+    """
+    cleaned_list = []
+
+    for raw_item in raw_data_list:
+        if raw_item.get("cardType") != "BUZZ_LONG":
+            continue
+
+        # 1. 忠实提取标题和正文（不干预内容）
+        title = raw_item.get("title")
+        # 优先取 content，如果为空则取 subTitle
+        text_content = raw_item.get("content") or raw_item.get("subTitle") or ""
+
+        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
+        raw_coins = raw_item.get("coinPairList") or []
+        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
+
+        # 从 tradingPairsV2 中提取防漏抓
+        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
+        for pair in trading_pairs_v2:
+            code = pair.get("code")
+            if code:
+                cleaned_coins_list.append(code.strip())
+
+        # 合并、去重，并统一转大写
+        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
+
+        # 3. 忠实合并标签 (去首尾空格防脏数据)
+        raw_tags_1 = raw_item.get("hashtagList") or []
+        raw_tags_2 = raw_item.get("hashtagIdentifyList") or []
+        cleaned_hashtags = list(set(ht.strip() for ht in (raw_tags_1 + raw_tags_2) if ht))
+
+        # 4. 🚀 重点：精细化分离图片属性 (封面图 vs 列表内嵌图)
+        cover_image = None
+        cover_meta = raw_item.get("coverMeta")
+        # 提取封面
+        if cover_meta and isinstance(cover_meta, dict):
+            cover_image = cover_meta.get("url")
+        elif raw_item.get("coverLight"):
+            cover_image = raw_item.get("coverLight")
+
+        # 提取正文内嵌图 (保留有序列表，以此体现插入的相对先后顺序)
+        inline_images = raw_item.get("images") or []
+
+        # 5. 组装数据
+        cleaned_data = {
+            "metadata": {
+                "post_id": raw_item.get("id"),
+                "card_type": raw_item.get("cardType", "BUZZ_LONG"),
+                "publish_time": raw_item.get("date"),
+                "url": raw_item.get("webLink"),
+                "is_ai_generated": raw_item.get("isCreatedByAI", False)
+            },
+            "author": {
+                "author_id": raw_item.get("squareAuthorId"),
+                "username": raw_item.get("username"),
+                "author_name": raw_item.get("authorName"),
+                "is_verified": raw_item.get("authorVerificationType", 0) > 0
+            },
+            "content": {
+                "title": title,
+                "text_content": text_content,
+                "hashtags": cleaned_hashtags,
+                "mentioned_coins": cleaned_coins
+            },
+            "media": {
+                "cover_image": cover_image,  # 明确标注这是封面图
+                "inline_images": inline_images  # 明确标注这是文章中包含的图(按顺序)
+            },
+            "engagement": {
+                "view_count": raw_item.get("viewCount", 0),
+                "like_count": raw_item.get("likeCount", 0),
+                "comment_count": raw_item.get("commentCount", 0),
+                "share_count": raw_item.get("shareCount", 0),
+                "quote_count": raw_item.get("quoteCount", 0)
+            }
+        }
+
+        cleaned_list.append(cleaned_data)
+
+    return cleaned_list
+
+
 def pull_feed_demo():
     # 拉取帖子数据
     master_feed_list = []
@@ -635,19 +949,21 @@ def pull_feed_demo():
 
     # 1. 抓取推荐流 (100条)
     logger.info("\n--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=200)
+    recommend_data = fetch_binance_feed(count=500)
     master_feed_list.extend(recommend_data)
 
     # 2. 抓取搜索流 (以 "doge" 为例，100条)
-    logger.info("\n--- 2. 准备抓取: 搜索流 (doge) ---")
-    search_data = fetch_binance_feed(keyword="doge", count=200)
+    logger.info("\n--- 2. 准备抓取: 搜索流 (ETH) ---")
+    search_data = fetch_binance_feed(keyword="ETH", count=500)
     master_feed_list.extend(search_data)
 
     # 3. 抓取特定币种流 (以 "BTC" 为例，100条，按热门排序)
     logger.info("\n--- 3. 准备抓取: 币种流 (BTC) ---")
-    token_data = fetch_binance_feed(token="BTC", count=200, orderBy=1)
+    token_data = fetch_binance_feed(token="BTC", count=500, orderBy=1)
     master_feed_list.extend(token_data)
 
+    master_feed_list = read_json("master_feed_list.json")
+    save_json("master_feed_list.json", master_feed_list)
     # 4. 全局终极去重（防止不同信息流之间的数据交叉重叠）
     global_seen_ids = set()
     final_clean_list = []
@@ -663,6 +979,7 @@ def pull_feed_demo():
 
     # 5. 按照 cardType 分组，每种类型最多保留 5 条数据
     logger.info("\n--- 5. 开始按 cardType 分组提取 (每种最多5条) ---")
+    group_map = {}
 
     filter_list = []
     card_type_counts = {}  # 用字典来记录每种类型的数量
@@ -670,8 +987,8 @@ def pull_feed_demo():
     for item in final_clean_list:
         # 获取 cardType，缺省为 "UNKNOWN" 防报错
         card_type = item.get("cardType", "UNKNOWN")
-        if card_type == "SPACE_LIVE" or card_type == "POLL":
-            continue
+        # if card_type == "SPACE_LIVE" or card_type == "POLL":
+        #     continue
         # 获取当前类型已经存入 filter_list 的数量，默认为 0
         current_count = card_type_counts.get(card_type, 0)
 
@@ -680,6 +997,9 @@ def pull_feed_demo():
             filter_list.append(item)
             # 计数器加 1
             card_type_counts[card_type] = current_count + 1
+            if card_type not in group_map:
+                group_map[card_type] = []
+            group_map[card_type].append(item)
 
     # 打印最终的分组结果
     logger.info(f"🗂️ 分组提取完成！共发现 {len(card_type_counts)} 种不同的 cardType。")
@@ -691,6 +1011,16 @@ def pull_feed_demo():
         logger.info(f"   - {c_type}: {count} 条")
 
     clean_filter_list = clean_universal_binance_data(filter_list)
+    all_clean_list = []
+    short_result_list = clean_short_posts(group_map['BUZZ_SHORT'])
+    all_clean_list.extend(short_result_list)
+    replay_result_list = clean_reply_posts(group_map['BUZZ_REPLY_POST_LIST'])
+    all_clean_list.extend(replay_result_list)
+    video_result_list = clean_video_posts(group_map['BUZZ_VIDEO'])
+    all_clean_list.extend(video_result_list)
+    long_result_list = clean_long_posts(group_map['BUZZ_LONG'])
+    all_clean_list.extend(long_result_list)
+
     print()
 
 
