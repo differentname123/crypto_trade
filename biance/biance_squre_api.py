@@ -628,6 +628,77 @@ def fetch_binance_feed(count=20, keyword=None, token=None, **kwargs):
     # clean_feed_list = clean_universal_binance_data(feed_list)
     return feed_list
 
+def fetch_binance_post_detail(post_id):
+    """
+    根据文章 ID 获取币安广场帖子的详细内容
+
+    :param post_id: 文章/帖子的唯一 ID (例如: 341500227496929)
+    :return: 包含详情数据的字典 (通常为解析后的 'data' 字段)，如果失败则返回 None
+    """
+    # 动态拼接详情页的 API URL
+    url = f"https://www.binance.com/bapi/composite/v3/friendly/pgc/special/content/detail/{post_id}"
+
+    # 统一代理设置格式
+    proxies = {
+        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
+        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+    }
+
+    # 简化 Header：去除了繁琐的 device-info、视频 token 和指纹，保留核心验证头
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "lang": "zh-CN",
+        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),  # 动态生成避免被追踪特征
+        "X-TRACE-ID": str(uuid.uuid4()),  # 动态生成避免被追踪特征
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "BNC-Time-Zone": "Asia/Shanghai",
+        "referrer": f"https://www.binance.com/zh-CN/square/post/{post_id}"  # referrer 也需要动态跟随 post_id
+    }
+
+    max_retries = 5
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            # 注意：原 fetch 请求是 GET 方法，不需要传 payload/json body
+            response = requests.get(url, headers=headers, proxies=proxies, timeout=15)
+
+            # 统一强暴露 400+ 报错
+            if response.status_code >= 400:
+                logger.error(f"🚨 HTTP {response.status_code} 报错，币安服务器返回详细原因: {response.text}")
+
+            # 触发 HTTP 错误异常（走入 except 分支重试）
+            response.raise_for_status()
+            res_data = response.json()
+
+            # 统一安全解析结构，通常详情在 data 字段下
+            data_field = res_data.get("data")
+
+            if not data_field:
+                logger.warning(f"⚠️ 详情接口未返回有效数据 (Post ID: {post_id}): {res_data}")
+            else:
+                logger.info(f"✅ 成功获取文章详情 (Post ID: {post_id})")
+
+            return data_field
+
+        except Exception as e:
+            # 统一重试日志格式
+            logger.error(f"🚨 请求文章详情发生异常 (Post ID: {post_id}): {e}")
+            retry_count += 1
+
+            if retry_count >= max_retries:
+                logger.warning(f"❌ 请求异常累计达到 {max_retries} 次，停止重试。")
+                break
+
+            # 统一增加防风控休眠 (失败时休眠，防止高频轰炸被封 IP)
+            time.sleep(random.uniform(0.5, 1.5))
+
+    return None
+
+
 def clean_short_posts(raw_data_list):
     cleaned_list = []
 
@@ -940,6 +1011,126 @@ def clean_long_posts(raw_data_list):
 
     return cleaned_list
 
+def clean_long_posts_detail(raw_data_list):
+    """
+    专门针对带有 `body` 富文本结构的数据进行核心内容与媒体解析。
+
+    :param raw_data_list: 包含 raw_item 的列表
+    :return: 仅包含 text_content 和 media 的全新列表
+    """
+    cleaned_list = []
+
+    for raw_item in raw_data_list:
+        body_str = raw_item.get("body")
+
+        text_content = ""
+        inline_images = []
+
+        # 1. 核心解析逻辑：深度解构 body 富文本
+        if body_str:
+            try:
+                body_data = json.loads(body_str)
+                # 获取渲染顺序
+                order_list = body_data.get("layout", {}).get("ViewInstance0", [])
+                # 🚀 致命 Bug 修复点：所有的具体节点数据其实都藏在 hash 这个字典里！
+                hash_dict = body_data.get("hash", {})
+
+                full_text_parts = []
+
+                def extract_node(node):
+                    """递归解析单个富文本节点"""
+                    if not isinstance(node, dict):
+                        return ""
+
+                    node_id = node.get("id")
+                    config = node.get("config", {})
+
+                    # A. 提取图片节点，将其转换为带位置信息的文本标记
+                    if node_id == "RichTextImage":
+                        src = config.get("src")
+                        caption = config.get("caption", "")
+                        if src:
+                            inline_images.append(src)
+                            # 生成供大模型阅读的标记
+                            img_mark = f"\n\n[插图: {src}"
+                            if caption:
+                                img_mark += f" | 描述: {caption}"
+                            img_mark += "]\n\n"
+                            return img_mark
+                        return ""
+
+                    # B. 提取基础文本与标签
+                    if node_id in ("RichTextText", "RichTextHashTag", "RichTextCoinPair"):
+                        return config.get("content", "")
+
+                    # C. 处理硬换行
+                    if node_id == "RichTextHardBreak":
+                        return "\n"
+
+                    # D. 递归处理容器节点 (段落、列表、引用等)
+                    content_list = config.get("content", [])
+                    if not isinstance(content_list, list):
+                        content_list = []
+
+                    child_texts = [extract_node(child) for child in content_list]
+                    res = "".join(child_texts)
+
+                    # E. 列表项增加项目符号
+                    if node_id == "RichTextListItem":
+                        res = "• " + res + "\n"
+
+                    return res
+
+                # 按 layout 指定的顺序拼装全部分块
+                for uid in order_list:
+                    # 🚀 致命 Bug 修复点：从 hash_dict 里根据 uid 取出块内容
+                    block = hash_dict.get(uid, {})
+
+                    # 空行处理
+                    if block.get("empty"):
+                        full_text_parts.append("\n")
+                        continue
+
+                    block_text = extract_node(block)
+                    if block_text:
+                        # 对于段落、引用等块级元素，追加换行
+                        if block.get("id") in ("RichTextParagraph", "RichTextQuote", "RichTextHeader", "RichTextList"):
+                            full_text_parts.append(block_text + "\n")
+                        else:
+                            full_text_parts.append(block_text)
+
+                # 合并文本并清理多余的连续空白行（保留最多两个换行符）
+                raw_parsed_text = "".join(full_text_parts)
+                text_content = re.sub(r'\n{3,}', '\n\n', raw_parsed_text).strip()
+
+            except json.JSONDecodeError:
+                # 容错：如果 JSON 解析失败，尝试使用外层的备用字段
+                text_content = raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle") or ""
+        else:
+            # 兜底：如果完全没有 body 字段，按优先级获取纯文本
+            text_content = raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle") or ""
+
+        # 2. 提取封面图 (Cover)
+        cover_image = None
+        # 兼容不同层级的封面图数据结构
+        cover_meta = raw_item.get("coverMeta")
+        if cover_meta and isinstance(cover_meta, dict):
+            cover_image = cover_meta.get("url")
+        elif raw_item.get("cover"):
+            cover_image = raw_item.get("cover")
+
+        # 3. 组装极致纯净的数据结构
+        cleaned_data = {
+            "core_text_content": text_content,
+            "media": {
+                "cover_image": cover_image,
+                "inline_images": inline_images
+            }
+        }
+
+        cleaned_list.append(cleaned_data)
+
+    return cleaned_list
 
 def pull_feed_demo():
     # 拉取帖子数据
@@ -947,20 +1138,20 @@ def pull_feed_demo():
 
     logger.info("========== 🚀 开始全量数据抓取测试 ==========")
 
-    # 1. 抓取推荐流 (100条)
-    logger.info("\n--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=500)
-    master_feed_list.extend(recommend_data)
-
-    # 2. 抓取搜索流 (以 "doge" 为例，100条)
-    logger.info("\n--- 2. 准备抓取: 搜索流 (ETH) ---")
-    search_data = fetch_binance_feed(keyword="ETH", count=500)
-    master_feed_list.extend(search_data)
-
-    # 3. 抓取特定币种流 (以 "BTC" 为例，100条，按热门排序)
-    logger.info("\n--- 3. 准备抓取: 币种流 (BTC) ---")
-    token_data = fetch_binance_feed(token="BTC", count=500, orderBy=1)
-    master_feed_list.extend(token_data)
+    # # 1. 抓取推荐流 (100条)
+    # logger.info("\n--- 1. 准备抓取: 推荐流 ---")
+    # recommend_data = fetch_binance_feed(count=500)
+    # master_feed_list.extend(recommend_data)
+    #
+    # # 2. 抓取搜索流 (以 "doge" 为例，100条)
+    # logger.info("\n--- 2. 准备抓取: 搜索流 (ETH) ---")
+    # search_data = fetch_binance_feed(keyword="ETH", count=500)
+    # master_feed_list.extend(search_data)
+    #
+    # # 3. 抓取特定币种流 (以 "BTC" 为例，100条，按热门排序)
+    # logger.info("\n--- 3. 准备抓取: 币种流 (BTC) ---")
+    # token_data = fetch_binance_feed(token="BTC", count=500, orderBy=1)
+    # master_feed_list.extend(token_data)
 
     master_feed_list = read_json("master_feed_list.json")
     save_json("master_feed_list.json", master_feed_list)
@@ -993,7 +1184,7 @@ def pull_feed_demo():
         current_count = card_type_counts.get(card_type, 0)
 
         # 核心判断：如果该类型保存的数据还不到 5 条，就继续保留
-        if current_count < 20:
+        if current_count < 10:
             filter_list.append(item)
             # 计数器加 1
             card_type_counts[card_type] = current_count + 1
@@ -1021,10 +1212,29 @@ def pull_feed_demo():
     long_result_list = clean_long_posts(group_map['BUZZ_LONG'])
     all_clean_list.extend(long_result_list)
 
+    long_result_list = clean_long_posts(group_map['BUZZ_LONG'])
+
+    # BUZZ_LONG类型的帖子要拉取详细的内容才是完整的内容，在这个基础上进行清洗才有意义
+    post_detail_list = []
+    for detail in group_map['BUZZ_LONG']:
+        post_id = detail.get('id')
+        post_detail = fetch_binance_post_detail(post_id)
+        if post_detail:
+            post_detail_list.append(post_detail)
+    long_result_list = clean_long_posts_detail(post_detail_list)
+
+
+    post_detail_list = read_json("post_detail_list.json")
+    long_result_list = clean_long_posts_detail(post_detail_list)
+
+    save_json("post_detail_list.json", post_detail_list)
     print()
 
 
+
+
 if __name__ == "__main__":
+    # post_detail = fetch_binance_post_detail('341457719024369')
     pull_feed_demo()
 
     print()
