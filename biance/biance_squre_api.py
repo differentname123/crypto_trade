@@ -18,6 +18,8 @@ import uuid
 import requests
 
 from common.common_utils import get_config, setup_logger, save_json, read_json
+from common.mongo_db.mongo_base import gen_db_object
+from common.mongo_db.mongo_manager import UniversalPostManager
 
 setup_logger()
 
@@ -231,15 +233,19 @@ def get_standard_schema():
     确保所有类型的帖子拥有绝对一致的字段结构，防止后续入库或分析时出现 KeyError
     """
     return {
+        # --- 提取到第一层的核心索引与高频过滤字段 ---
+        "post_id": None,
+        "publish_time": 0,
+        "author_id": None,
+        "card_type": "UNKNOWN",
+        "source":"biance",
+
+        # --- 降级后的内层容器 ---
         "metadata": {
-            "post_id": None,
-            "card_type": "UNKNOWN",
-            "publish_time": 0,
             "url": None,
             "is_ai_generated": False
         },
         "author": {
-            "author_id": None,
             "username": None,
             "author_name": None,
             "is_verified": False
@@ -251,11 +257,11 @@ def get_standard_schema():
             "mentioned_coins": []
         },
         "media": {
-            "cover_image": None,  # 视频或长文的封面
-            "images": [],  # 普通帖子的图片列表
-            "inline_images": [],  # 长文内嵌的图片列表 (保留阅读顺序)
-            "video_url": None,  # 视频直链
-            "video_duration": 0  # 视频时长
+            "cover_image": None,
+            "images": [],
+            "inline_images": [],
+            "video_url": None,
+            "video_duration": 0
         },
         "engagement": {
             "view_count": 0,
@@ -324,21 +330,25 @@ def _assemble_common(raw_item, card_type_default, title, text_content, hashtags)
     """
     data = get_standard_schema()
 
+    # 1. 顶层核心字段直接赋值
+    data["post_id"] = raw_item.get("id")
+    data["publish_time"] = raw_item.get("date", 0)
+    data["author_id"] = raw_item.get("squareAuthorId")
+    data["card_type"] = raw_item.get("cardType", card_type_default)
+
+    # 2. 剩余的基础元数据与作者信息
     data["metadata"].update({
-        "post_id": raw_item.get("id"),
-        "card_type": raw_item.get("cardType", card_type_default),
-        "publish_time": raw_item.get("date"),
         "url": raw_item.get("webLink"),
         "is_ai_generated": raw_item.get("isCreatedByAI", False)
     })
 
     data["author"].update({
-        "author_id": raw_item.get("squareAuthorId"),
         "username": raw_item.get("username"),
         "author_name": raw_item.get("authorName"),
         "is_verified": raw_item.get("authorVerificationType", 0) > 0
     })
 
+    # 3. 内容与媒体与互动数据组装保持不变
     data["content"].update({
         "title": title,
         "text_content": text_content,
@@ -355,7 +365,6 @@ def _assemble_common(raw_item, card_type_default, title, text_content, hashtags)
     })
 
     return data
-
 
 # ============================================================
 # 各类型专用清洗器 (仅保留差异化的 media 处理)
@@ -690,9 +699,11 @@ def update_posts_in_place(final_clean_list):
     failed = 0
 
     for item in final_clean_list:
-        post_id = item.get('metadata', {}).get('post_id')
+        # 【修改点】：直接从第一层读取 post_id
+        post_id = item.get('post_id')
         try:
-            card_type = item.get('metadata', {}).get('card_type')
+            # 【修改点】：直接从第一层读取 card_type
+            card_type = item.get('card_type')
             if not post_id:
                 continue
 
@@ -759,7 +770,6 @@ def update_posts_in_place(final_clean_list):
     logger.info(
         f"✅ 详情与多模态融合完毕 | 长文深度更新={long_updated} 条 | 非长文媒体拼接={other_updated} 条 | 失败={failed} 条")
     return final_clean_list
-
 
 def _extract_vos(res_data):
     """安全解析币安响应体，兼容 data 为 dict / list / 空 的多种结构"""
@@ -1066,21 +1076,23 @@ if __name__ == "__main__":
 
     # 1. 抓取推荐流
     logger.info("--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=100)
+    recommend_data = fetch_binance_feed(count=10)
     master_feed_list.extend(recommend_data)
 
     # 2. 抓取搜索流 (以 "ETH" 为例)
     logger.info("--- 2. 准备抓取: 搜索流 (ETH) ---")
-    search_data = fetch_binance_feed(keyword="ETH", count=100)
+    search_data = fetch_binance_feed(keyword="ETH", count=10)
     master_feed_list.extend(search_data)
 
     # 3. 抓取特定币种流 (以 "BTC" 为例，按热门排序)
     logger.info("--- 3. 准备抓取: 币种流 (BTC) ---")
-    token_data = fetch_binance_feed(token="BTC", count=100, orderBy=1)
+    token_data = fetch_binance_feed(token="BTC", count=10, orderBy=1)
     master_feed_list.extend(token_data)
 
     logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
 
     temp_all_result_list = clean_universal_posts(master_feed_list)
     final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
-    print()
+    db_instance = gen_db_object()
+    post_manager = UniversalPostManager(db_instance)
+    post_manager.upsert_posts(final_temp_all_result_list)

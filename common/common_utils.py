@@ -39,7 +39,7 @@ def setup_logger(log_dir="logs", app_name="BinanceBot"):
 
     # 包含 文件名.函数名:行号 的终极溯源格式
     formatter = logging.Formatter(
-        '%(asctime)s,%(msecs)03d | %(levelname)s | [%(name)s.%(funcName)s:%(lineno)d] | %(message)s',
+        '%(asctime)s,%(msecs)03d | %(levelname)s | [%(funcName)s] | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
