@@ -21,27 +21,30 @@ setup_logger()
 logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
-    master_feed_list = []
 
-    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
 
-    # 1. 抓取推荐流
-    logger.info("--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=10)
-    master_feed_list.extend(recommend_data)
+    while True:
+        master_feed_list = []
 
-    # 2. 抓取搜索流 (以 "ETH" 为例)
-    logger.info("--- 2. 准备抓取: 搜索流 (ETH) ---")
-    search_data = fetch_binance_feed(keyword="ETH", count=10)
-    master_feed_list.extend(search_data)
+        logger.info("========== 🚀 开始全量数据抓取测试 ==========")
 
-    # 3. 抓取特定币种流 (以 "BTC" 为例，按热门排序)
-    logger.info("--- 3. 准备抓取: 币种流 (BTC) ---")
-    token_data = fetch_binance_feed(token="BTC", count=10, orderBy=1)
-    master_feed_list.extend(token_data)
+        # 1. 抓取推荐流
+        logger.info("--- 1. 准备抓取: 推荐流 ---")
+        recommend_data = fetch_binance_feed(count=10)
+        master_feed_list.extend(recommend_data)
 
-    logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
+        # 2. 抓取搜索流 (以 "ETH" 为例)
+        logger.info("--- 2. 准备抓取: 搜索流 (ETH) ---")
+        search_data = fetch_binance_feed(keyword="ETH", count=10)
+        master_feed_list.extend(search_data)
 
-    db_instance = gen_db_object()
-    post_manager = UniversalPostManager(db_instance)
-    post_manager.upsert_posts(master_feed_list)
+        # 3. 抓取特定币种流 (以 "BTC" 为例，按热门排序)
+        logger.info("--- 3. 准备抓取: 币种流 (BTC) ---")
+        token_data = fetch_binance_feed(token="BTC", count=10, orderBy=1)
+        master_feed_list.extend(token_data)
+
+        logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
+
+        db_instance = gen_db_object()
+        post_manager = UniversalPostManager(db_instance)
+        post_manager.upsert_posts(master_feed_list)

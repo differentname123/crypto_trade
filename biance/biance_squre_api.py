@@ -786,7 +786,11 @@ def update_posts_in_place(final_clean_list):
             if media_info.get('cover_image'):
                 urls_to_download.add(media_info['cover_image'])
             if media_info.get('video_url'):
-                urls_to_download.add(media_info['video_url'])
+                video_duration = media_info.get('video_duration', 0)
+                if video_duration < 300:
+                    urls_to_download.add(media_info['video_url'])
+                else:
+                    logger.warning(f"[DOWNLOAD] 视频过长，跳过下载 | post_id={post_id} | duration={video_duration}s | url={media_info['video_url']}")
             for img_url in media_info.get('images', []):
                 if img_url:
                     urls_to_download.add(img_url)
@@ -804,6 +808,7 @@ def update_posts_in_place(final_clean_list):
             for url in urls_to_download:
                 try:
                     # 统一下载到 ./media_downloads 文件夹 (避免与代码混放，可自行修改目录)
+                    # logger.info(f"[DOWNLOAD] 开始下载媒体资源 | post_id={post_id} | url={url}")
                     local_path = download_web_media(url=url, save_dir="./media_downloads", proxy=proxy_url)
                     if local_path:
                         media_info['local_mapping'][url] = local_path
@@ -1296,7 +1301,7 @@ if __name__ == "__main__":
 
     # 1. 抓取推荐流
     logger.info("--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=10)
+    recommend_data = fetch_binance_feed(count=100)
     master_feed_list.extend(recommend_data)
 
     # 2. 抓取搜索流 (以 "ETH" 为例)
