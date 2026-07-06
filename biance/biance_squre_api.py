@@ -18,8 +18,6 @@ import uuid
 import requests
 
 from common.common_utils import get_config, setup_logger, save_json, read_json
-from common.mongo_db.mongo_base import gen_db_object
-from common.mongo_db.mongo_manager import UniversalPostManager
 
 setup_logger()
 
@@ -1093,6 +1091,3 @@ if __name__ == "__main__":
 
     temp_all_result_list = clean_universal_posts(master_feed_list)
     final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
-    db_instance = gen_db_object()
-    post_manager = UniversalPostManager(db_instance)
-    post_manager.upsert_posts(final_temp_all_result_list)
