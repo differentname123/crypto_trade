@@ -210,8 +210,6 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
                     if len(reached_symbols) == len(symbol_list):
                         processor_stats["throughput"] = stats
                         completion_event.set()
-                        queue.task_done()
-                        break
             queue.task_done()
     except asyncio.CancelledError:
         raise
@@ -226,7 +224,7 @@ async def data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
 async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tracker=None):
     start_t = time.time()
     limit = 1000
-    curr_since = since_ms
+    curr_since = since_ms - 60 * 60 * 1000
     total_fetched = 0
     latest_ts = 0
 
@@ -467,7 +465,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
         # 【重点修改】：在这里确保所有尽力而为的历史拉取已交卷，保证最后交付的数据尽可能补全缺口
         await asyncio.gather(*history_tasks, return_exceptions=True)
-
+        await queue.join()
         # [核心竞速指标计算]
         close_latency_ms = exchange.milliseconds() - target_close_time_ms
         tp = processor_stats.get('throughput', {})

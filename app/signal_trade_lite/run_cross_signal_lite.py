@@ -578,7 +578,10 @@ def execute_trading_bot_workflow(target_time, proxy_url=None):
         "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
         "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
     ]
-
+    symbol_list = [
+        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+        "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
+    ]
     timeframe = "1m"
     # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
     result_map = snipe_kline_data(
@@ -636,6 +639,11 @@ def execute_trading_bot_workflow(target_time, proxy_url=None):
 
 
 if __name__ == "__main__":
+
+    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
+    # 将timestamp 从ms转换为 北京时间
+    df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+
     target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
-    execute_trading_bot_workflow(target_time)
+    execute_trading_bot_workflow(target_time, 'http://127.0.0.1:7890')

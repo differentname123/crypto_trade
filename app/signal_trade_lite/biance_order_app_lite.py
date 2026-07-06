@@ -23,6 +23,9 @@ TRADE_RECORD_FILE = "trade_records.csv"
 POSITION_RISK_RATIO = 0.1  # 每次开仓占总资产的 10% (已废弃作为全局开仓比例，仅保留定义防报错，现使用信号自带 max_weight)
 LEVRAGE = 1  # 杠杆倍数 (如果需要开杠杆仓位，可以在 execute_order 中使用这个参数)
 MIN_ORDER_VALUE = 5.0  # 最小下单金额 (USD)，防止过小订单被拒绝
+MAX_ORDER_VALUE = 60  # 最大下单金额 (USD)，防止仓位太大
+
+
 # 【修改点 1】：新增全局运行时缓存字典，用于 API 拉取失败时的无缝兜底续命
 RUNTIME_FALLBACK = {
     "total_equity": 0.0,
@@ -418,7 +421,12 @@ def execute_single_signal(exchange, row, total_equity, position_cache, open_orde
         if target_position_value <= 0:
             logger.warning(f"[EXEC] 无效开仓 | CID: {client_oid} | 资金预加载为0或目标权重异常。")
             return
-        target_position_value = max(target_position_value, MIN_ORDER_VALUE)
+
+        target_position_value = min(
+            max(target_position_value, MIN_ORDER_VALUE),
+            MAX_ORDER_VALUE,
+        )
+
         if (direction == "SHORT" and has_short) or (direction == "LONG" and has_long):
             logger.warning(
                 f"[EXEC] 重复开仓拦截 | CID: {client_oid} | 缓存显示已有 {direction} 仓位 ({current_pos_amt})。")
@@ -505,8 +513,8 @@ def run_scheduler():
     高可用调度器（极简且强健）：
     包含 API 局部重试、全局异常兜底与错误隔离。
     """
-    API_KEY = get_config('nana_biance_api_key')
-    SECRET_KEY = get_config('nana_biance_api_secret')
+    API_KEY = get_config('nana_biance_api_copy_key')
+    SECRET_KEY = get_config('nana_biance_api_copy_secret')
 
     # 【修改点】：动态环境检测判断是否启用代理
     current_os = platform.system().lower()
