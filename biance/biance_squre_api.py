@@ -1,4 +1,4 @@
-# -- coding: utf-8 --
+# -*- coding: utf-8 -*-
 """:authors:
     zhuxiaohu
 :create_date:
@@ -10,23 +10,89 @@
 """
 import json
 import logging
-import os
 import random
 import re
 import time
-import traceback
 import uuid
 
 import requests
-import pandas as pd
-import datetime
 
 from common.common_utils import get_config, setup_logger, save_json, read_json
 
 setup_logger()
 
-# 2. 拿到属于当前文件的专属 logger
+# 拿到属于当前文件的专属 logger
 logger = logging.getLogger(__name__)
+
+# ============================================================
+# 全局常量：集中管理代理、分页、重试策略与正则，避免散落重复
+# ============================================================
+PROXIES = {
+    "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
+    "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+}
+PAGE_SIZE = 20
+MAX_RETRIES = 5
+REQUEST_TIMEOUT = 15
+
+# 模块级预编译正则（性能优化：避免逐字段/逐条重复编译）
+_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\ufeff\u202a-\u202e]')  # 零宽字符、排版控制符等
+_MULTI_NEWLINE_RE = re.compile(r'\n{3,}')
+
+
+def pull_feed_demo():
+    # 拉取帖子数据
+    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
+
+    master_feed_list = read_json("master_feed_list.json")
+    save_json("master_feed_list.json", master_feed_list)
+
+    # 4. 全局终极去重（防止不同信息流之间的数据交叉重叠）
+    global_seen_ids = set()
+    final_clean_list = []
+
+    for item in master_feed_list:
+        item_id = item.get("id") or item.get("contentId")
+        if item_id and item_id not in global_seen_ids:
+            global_seen_ids.add(item_id)
+            final_clean_list.append(item)
+
+    logger.info(f"✨ 全局去重完成: 发现并移除跨流重复数据 {len(master_feed_list) - len(final_clean_list)} 条。")
+    logger.info(f"🎉 最终可用的纯净大列表总数据量: {len(final_clean_list)} 条记录！")
+
+    # 5. 按照 cardType 分组，每种类型最多保留 20 条数据
+    logger.info("\n--- 5. 开始按 cardType 分组提取 (每种最多20条) ---")
+    group_map = {}
+    filter_list = []
+    card_type_counts = {}  # 用字典来记录每种类型的数量
+
+    for item in final_clean_list:
+        # 获取 cardType，缺省为 "UNKNOWN" 防报错
+        card_type = item.get("cardType", "UNKNOWN")
+
+        # 获取当前类型已经存入 filter_list 的数量，默认为 0
+        current_count = card_type_counts.get(card_type, 0)
+
+        # 核心判断：如果该类型保存的数据还不到 20 条，就继续保留
+        if current_count < 20:
+            filter_list.append(item)
+            # 计数器加 1
+            card_type_counts[card_type] = current_count + 1
+            if card_type not in group_map:
+                group_map[card_type] = []
+            group_map[card_type].append(item)
+
+    # 打印最终的分组结果
+    logger.info(f"🗂️ 分组提取完成！共发现 {len(card_type_counts)} 种不同的 cardType。")
+    logger.info(f"🎉 最终的 filter_list 包含 {len(filter_list)} 条记录！")
+
+    # 直观地打印出每种类型具体保留了多少条，方便你核对数据分布
+    logger.info("📊 各类型保留数量统计:")
+    for c_type, count in card_type_counts.items():
+        logger.info(f"   - {c_type}: {count} 条")
+
+    temp_all_result_list = clean_universal_posts(filter_list)
+    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
 
 
 def publish_to_binance_square(api_key, text_content):
@@ -51,12 +117,6 @@ def publish_to_binance_square(api_key, text_content):
         "bodyTextOnly": text_content
     }
 
-    # 局部代理配置，只影响当前请求
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
-
     # 隐藏掉中间的 API Key 字符，避免在控制台全量打印（官方安全规范）
     masked_key = f"{api_key[:5]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
     # 提取内容摘要，防止内容过长刷屏
@@ -65,8 +125,8 @@ def publish_to_binance_square(api_key, text_content):
     try:
         logger.info(f"⏳ 开始向币安广场发帖 | Key: {masked_key} | 内容摘要: {text_summary}")
 
-        # 增加 proxies 参数
-        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
+        # 使用全局 proxies 和 timeout 配置
+        response = requests.post(url, headers=headers, json=payload, proxies=PROXIES, timeout=REQUEST_TIMEOUT)
         result = response.json()
 
         # 判断业务是否成功
@@ -106,7 +166,6 @@ def follow_binance_square_user(
     :param fvideo_token: 风控加密 Token
     :return: 接口返回的 JSON 字典
     """
-
     url = "https://www.binance.com/bapi/composite/v2/private/pgc/user/follow"
 
     # 动态生成 Trace ID，模拟前端每次请求的不同行为
@@ -145,15 +204,12 @@ def follow_binance_square_user(
     payload = {
         "targetSquareUid": target_uid
     }
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
 
     try:
         logger.info(f"⏳ 开始关注广场用户 | 目标UID: {target_uid} | TraceID: {trace_id}")
 
-        response = requests.post(url, headers=headers, json=payload, proxies=proxies,
+        # 使用全局代理配置
+        response = requests.post(url, headers=headers, json=payload, proxies=PROXIES,
                                  timeout=10)  # 币安接口通常返回 HTTP 200，具体业务成功与否看 JSON 里的 code 字段
         response.raise_for_status()
 
@@ -167,510 +223,6 @@ def follow_binance_square_user(
         resp_text = e.response.text if hasattr(e, 'response') and e.response is not None else "无响应内容"
         logger.error(f"🚨 关注用户请求异常 | 目标UID: {target_uid} | 异常信息: {e} | 响应内容: {resp_text}")
         return {}
-
-
-def fetch_binance_feed_recommend(required_count, content_ids=None):
-    """
-    不断拉取币安广场的推荐数据，直到满足需要的数量
-
-    :param required_count: 需要拉取的目标数据总数 (vos 的数量)
-    :param content_ids: 已经抓取过的内容ID列表，用于去重和向下滑动参数
-    :return: 包含目标数据的列表
-    """
-    # 修复 Python 危险的默认可变参数问题
-    if content_ids is None:
-        content_ids = []
-
-    url = "https://www.binance.com/bapi/composite/v9/friendly/pgc/feed/feed-recommend/list"
-
-    # 统一代理设置格式
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
-
-    # 请求头保持原样
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5",
-        "lang": "zh-CN",
-        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),
-        "X-TRACE-ID": str(uuid.uuid4()),
-        "Content-Type": "application/json",
-        "clienttype": "web",
-        "versioncode": "web",
-        "BNC-Time-Zone": "Asia/Shanghai",
-        "referrer": "https://www.binance.com/zh-CN/square"
-    }
-
-    all_vos = []
-    page_index = 1
-    page_size = 20
-    max_retries = 5
-    retry_count = 0
-
-    while len(all_vos) < required_count:
-        payload = {
-            "pageIndex": page_index,
-            "pageSize": page_size,
-            "scene": "web-homepage",
-            "contentIds": content_ids
-        }
-
-        try:
-            response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
-
-            # 统一强暴露 400+ 报错
-            if response.status_code >= 400:
-                logger.error(f"🚨 HTTP {response.status_code} 报错，币安服务器返回详细原因: {response.text}")
-
-            response.raise_for_status()
-            res_data = response.json()
-
-            # 统一安全解析结构
-            data_field = res_data.get("data")
-            vos = []
-            if isinstance(data_field, dict):
-                vos = data_field.get("vos") or data_field.get("list") or []
-            elif isinstance(data_field, list):
-                vos = data_field
-
-            if not vos:
-                logger.warning("⚠️ 推荐接口未返回更多数据，可能已经到底。")
-                break
-
-            all_vos.extend(vos)
-            logger.info(f"第 {page_index} 页抓取成功，新增 {len(vos)} 条，当前总计：{len(all_vos)} 条")
-
-            # 提取已获取内容的ID供下一次请求使用
-            for item in vos:
-                item_id = item.get("id") or item.get("contentId")
-                if item_id:
-                    content_ids.append(str(item_id))
-
-            page_index += 1
-            retry_count = 0
-
-            # 统一增加防风控休眠
-            time.sleep(random.uniform(0.5, 1.5))
-
-        except Exception as e:
-            # 统一重试日志格式
-            logger.error(f"🚨 请求发生异常: {e}")
-            retry_count += 1
-            if retry_count >= max_retries:
-                logger.warning(f"❌ 请求异常累计达到 {max_retries} 次，停止重试。")
-                break
-
-    # 统一去重逻辑与日志
-    seen_ids = set()
-    deduped_vos = []
-    for item in all_vos:
-        item_id = item.get("id") or item.get("contentId")
-        if item_id not in seen_ids:
-            seen_ids.add(item_id)
-            deduped_vos.append(item)
-
-    original_count = len(all_vos)
-    deduped_count = len(deduped_vos)
-    logger.info(
-        f"✅ [推荐流] 去重完成 | 抓取: {original_count} 条 | 移除重复: {original_count - deduped_count} 条 | 最终保留: {deduped_count} 条")
-
-    return deduped_vos
-
-
-def fetch_binance_feed_search(keyword, required_count, search_type=1):
-    """
-    不断拉取币安广场的搜索结果，直到满足需要的数量或没有更多数据
-
-    :param keyword: 搜索关键词 (例如 "doge")
-    :param required_count: 需要拉取的目标数据总数
-    :param search_type: 搜索类型，默认为1 (通常代表综合或文章)
-    :return: 包含目标搜索结果的列表
-    """
-    url = "https://www.binance.com/bapi/composite/v2/friendly/pgc/feed/search/list"
-
-    # 统一代理设置格式
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
-
-    # 请求头保持原样
-    headers = {
-        "User-Agent": "Mozilla/5.0 ...",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9...",
-        "device-info": "",
-        "lang": "zh-CN",
-        "Content-Type": "application/json",
-        "clienttype": "web",
-        "versioncode": "2.61.0",
-        "BNC-UUID": str(uuid.uuid4()),
-        "referrer": f"https://www.binance.com/zh-CN/square/search?s={keyword}"
-    }
-
-    all_vos = []
-    page_index = 1
-    page_size = 20
-    max_retries = 5
-    retry_count = 0
-
-    while len(all_vos) < required_count:
-        payload = {
-            "scene": "web",
-            "pageIndex": page_index,
-            "pageSize": page_size,
-            "searchContent": keyword,
-            "type": search_type
-        }
-
-        try:
-            response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
-
-            # 统一强暴露 400+ 报错
-            if response.status_code >= 400:
-                logger.error(f"🚨 HTTP {response.status_code} 报错，币安服务器返回详细原因: {response.text}")
-
-            response.raise_for_status()
-            res_data = response.json()
-
-            # 统一安全解析结构
-            data_field = res_data.get("data")
-            vos = []
-            if isinstance(data_field, dict):
-                vos = data_field.get("vos") or data_field.get("list") or []
-            elif isinstance(data_field, list):
-                vos = data_field
-
-            if not vos:
-                logger.warning(f"⚠️ 搜索接口未返回更多数据，关键词 '{keyword}' 可能已到底。")
-                break
-
-            all_vos.extend(vos)
-            logger.info(f"第 {page_index} 页抓取成功，新增 {len(vos)} 条，当前总计：{len(all_vos)} 条")
-
-            page_index += 1
-            retry_count = 0
-
-            # 统一增加防风控休眠
-            time.sleep(random.uniform(0.5, 1.5))
-
-        except Exception as e:
-            # 统一重试日志格式
-            logger.error(f"🚨 请求发生异常: {e}")
-            retry_count += 1
-            if retry_count >= max_retries:
-                logger.warning(f"❌ 请求异常累计达到 {max_retries} 次，停止重试。")
-                break
-
-    # 统一去重逻辑与日志
-    seen_ids = set()
-    deduped_vos = []
-    for item in all_vos:
-        item_id = item.get("id") or item.get("contentId")
-        if item_id not in seen_ids:
-            seen_ids.add(item_id)
-            deduped_vos.append(item)
-
-    original_count = len(all_vos)
-    deduped_count = len(deduped_vos)
-    logger.info(
-        f"✅ [搜索:{keyword}] 去重完成 | 抓取: {original_count} 条 | 移除重复: {original_count - deduped_count} 条 | 最终保留: {deduped_count} 条")
-
-    return deduped_vos
-
-
-def get_binance_feed_token(token="DOGE", required_count=20, orderBy=2):
-    """
-    获取币安指定币种的社区 Feed 数据
-
-    :param token: 币种名称 (如 "DOGE")
-    :param required_count: 期望获取的数据条数，默认为 20
-    :param orderBy: 1 代表热门，2 代表最新
-    :return: 目标 vos 列表，失败或无数据时返回 []
-    """
-    url = "https://www.binance.com/bapi/composite/v4/friendly/pgc/feed/trade/list"
-
-    # 请求头保持原样
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5",
-        "lang": "zh-CN",
-        "Content-Type": "application/json",
-        "clienttype": "web",
-        "device-info": "",
-        "BNC-UUID": str(uuid.uuid4()),
-        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),
-        "X-TRACE-ID": str(uuid.uuid4()),
-        "csrftoken": "d41d8cd98f00b204e9800998ecf8427e",
-        "BNC-Time-Zone": "Asia/Shanghai",
-        "referrer": f"https://www.binance.com/zh-CN/square/community?token={token}"
-    }
-
-    # 统一代理设置格式
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
-
-    all_vos = []
-    page_index = 1
-    page_size = 20
-    max_retries = 5
-    retry_count = 0
-
-    logger.info(f"⏳ 开始获取Feed数据 | Token: {token} | 目标条数: {required_count} | 排序: {orderBy}")
-
-    while len(all_vos) < required_count:
-        payload = {
-            "token": token,
-            "pageIndex": page_index,
-            "pageSize": page_size,
-            "scene": 2,
-            "orderBy": orderBy
-        }
-
-        try:
-            response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=15)
-
-            # 统一强暴露 400+ 报错
-            if response.status_code >= 400:
-                logger.error(f"🚨 HTTP {response.status_code} 报错，币安服务器返回详细原因: {response.text}")
-
-            response.raise_for_status()
-            res_data = response.json()
-
-            # 统一安全解析结构
-            data_field = res_data.get("data")
-            vos = []
-            if isinstance(data_field, dict):
-                vos = data_field.get("vos") or data_field.get("list") or []
-            elif isinstance(data_field, list):
-                vos = data_field
-
-            if not vos:
-                logger.warning(f"⚠️ 币种接口未返回更多数据，Token '{token}' 可能已经到底。")
-                break
-
-            all_vos.extend(vos)
-            logger.info(f"第 {page_index} 页抓取成功，新增 {len(vos)} 条，当前总计：{len(all_vos)} 条")
-
-            page_index += 1
-            retry_count = 0
-
-            # 统一增加防风控休眠
-            time.sleep(random.uniform(0.5, 1.5))
-
-        except Exception as e:
-            # 统一重试日志格式
-            logger.error(f"🚨 请求发生异常: {e}")
-            retry_count += 1
-            if retry_count >= max_retries:
-                logger.warning(f"❌ 请求异常累计达到 {max_retries} 次，停止重试。")
-                break
-
-    # 统一去重逻辑与日志
-    seen_ids = set()
-    deduped_vos = []
-    for item in all_vos:
-        item_id = item.get("id") or item.get("contentId")
-        if item_id not in seen_ids:
-            seen_ids.add(item_id)
-            deduped_vos.append(item)
-
-    original_count = len(all_vos)
-    deduped_count = len(deduped_vos)
-    logger.info(
-        f"✅ [币种:{token}] 去重完成 | 抓取: {original_count} 条 | 移除重复: {original_count - deduped_count} 条 | 最终保留: {deduped_count} 条")
-
-    return deduped_vos
-
-
-def fetch_binance_feed(count=20, keyword=None, token=None, **kwargs):
-    """
-    统一的币安广场数据拉取接口（智能路由版）
-    根据传入的参数自动判断拉取模式：
-    - 传 keyword -> 走搜索流
-    - 传 token -> 走币种流
-    - 都不传 -> 走推荐流
-    """
-    # 1. 优先判断是否是“搜索流” (传了 keyword)
-    if keyword:
-        logger.info(f"🔄 自动路由: [搜索模式] | 关键词: {keyword} | 目标条数: {count}")
-        search_type = kwargs.get("search_type", 1)
-        feed_list = fetch_binance_feed_search(keyword=keyword, required_count=count, search_type=search_type)
-
-    # 2. 判断是否是“指定币种流” (传了 token)
-    elif token:
-        token = str(token).upper()  # 自动转大写容错
-        logger.info(f"🔄 自动路由: [币种模式] | 币种: {token} | 目标条数: {count}")
-        order_by = kwargs.get("orderBy", 2)
-        # 统一参数名：将 desire_count 替换为了 required_count
-        feed_list = get_binance_feed_token(token=token, required_count=count, orderBy=order_by)
-
-    # 3. 如果什么目标都没传，默认走“推荐流”
-    else:
-        logger.info(f"🔄 自动路由: [推荐流模式] | 目标条数: {count}")
-        content_ids = kwargs.get("content_ids", [])
-        feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
-    # clean_feed_list = clean_universal_binance_data(feed_list)
-    return feed_list
-
-def fetch_binance_post_detail(post_id):
-    """
-    根据文章 ID 获取币安广场帖子的详细内容
-
-    :param post_id: 文章/帖子的唯一 ID (例如: 341500227496929)
-    :return: 包含详情数据的字典 (通常为解析后的 'data' 字段)，如果失败则返回 None
-    """
-    # 动态拼接详情页的 API URL
-    url = f"https://www.binance.com/bapi/composite/v3/friendly/pgc/special/content/detail/{post_id}"
-
-    # 统一代理设置格式
-    proxies = {
-        "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-        "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
-    }
-
-    # 简化 Header：去除了繁琐的 device-info、视频 token 和指纹，保留核心验证头
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "lang": "zh-CN",
-        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),  # 动态生成避免被追踪特征
-        "X-TRACE-ID": str(uuid.uuid4()),  # 动态生成避免被追踪特征
-        "Content-Type": "application/json",
-        "clienttype": "web",
-        "BNC-Time-Zone": "Asia/Shanghai",
-        "referrer": f"https://www.binance.com/zh-CN/square/post/{post_id}"  # referrer 也需要动态跟随 post_id
-    }
-
-    max_retries = 5
-    retry_count = 0
-
-    while retry_count < max_retries:
-        try:
-            # 注意：原 fetch 请求是 GET 方法，不需要传 payload/json body
-            response = requests.get(url, headers=headers, proxies=proxies, timeout=15)
-
-            # 统一强暴露 400+ 报错
-            if response.status_code >= 400:
-                logger.error(f"🚨 HTTP {response.status_code} 报错，币安服务器返回详细原因: {response.text}")
-
-            # 触发 HTTP 错误异常（走入 except 分支重试）
-            response.raise_for_status()
-            res_data = response.json()
-
-            # 统一安全解析结构，通常详情在 data 字段下
-            data_field = res_data.get("data")
-
-            if not data_field:
-                logger.warning(f"⚠️ 详情接口未返回有效数据 (Post ID: {post_id}): {res_data}")
-            else:
-                logger.info(f"✅ 成功获取文章详情 (Post ID: {post_id})")
-
-            return data_field
-
-        except Exception as e:
-            # 统一重试日志格式
-            logger.error(f"🚨 请求文章详情发生异常 (Post ID: {post_id}): {e}")
-            retry_count += 1
-
-            if retry_count >= max_retries:
-                logger.warning(f"❌ 请求异常累计达到 {max_retries} 次，停止重试。")
-                break
-
-            # 统一增加防风控休眠 (失败时休眠，防止高频轰炸被封 IP)
-            time.sleep(random.uniform(0.5, 1.5))
-
-    return None
-
-def pull_feed_demo():
-    # 拉取帖子数据
-    master_feed_list = []
-
-    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
-
-    # # 1. 抓取推荐流 (100条)
-    # logger.info("\n--- 1. 准备抓取: 推荐流 ---")
-    # recommend_data = fetch_binance_feed(count=500)
-    # master_feed_list.extend(recommend_data)
-    #
-    # # 2. 抓取搜索流 (以 "doge" 为例，100条)
-    # logger.info("\n--- 2. 准备抓取: 搜索流 (ETH) ---")
-    # search_data = fetch_binance_feed(keyword="ETH", count=500)
-    # master_feed_list.extend(search_data)
-    #
-    # # 3. 抓取特定币种流 (以 "BTC" 为例，100条，按热门排序)
-    # logger.info("\n--- 3. 准备抓取: 币种流 (BTC) ---")
-    # token_data = fetch_binance_feed(token="BTC", count=500, orderBy=1)
-    # master_feed_list.extend(token_data)
-
-    master_feed_list = read_json("master_feed_list.json")
-    save_json("master_feed_list.json", master_feed_list)
-    # 4. 全局终极去重（防止不同信息流之间的数据交叉重叠）
-    global_seen_ids = set()
-    final_clean_list = []
-
-    for item in master_feed_list:
-        item_id = item.get("id") or item.get("contentId")
-        if item_id and item_id not in global_seen_ids:
-            global_seen_ids.add(item_id)
-            final_clean_list.append(item)
-
-    logger.info(f"✨ 全局去重完成: 发现并移除跨流重复数据 {len(master_feed_list) - len(final_clean_list)} 条。")
-    logger.info(f"🎉 最终可用的纯净大列表总数据量: {len(final_clean_list)} 条记录！")
-
-    # 5. 按照 cardType 分组，每种类型最多保留 5 条数据
-    logger.info("\n--- 5. 开始按 cardType 分组提取 (每种最多5条) ---")
-    group_map = {}
-
-    filter_list = []
-    card_type_counts = {}  # 用字典来记录每种类型的数量
-
-    for item in final_clean_list:
-        # 获取 cardType，缺省为 "UNKNOWN" 防报错
-        card_type = item.get("cardType", "UNKNOWN")
-        # if card_type == "SPACE_LIVE" or card_type == "POLL":
-        #     continue
-        # 获取当前类型已经存入 filter_list 的数量，默认为 0
-        current_count = card_type_counts.get(card_type, 0)
-
-        # 核心判断：如果该类型保存的数据还不到 5 条，就继续保留
-        if current_count < 20:
-            filter_list.append(item)
-            # 计数器加 1
-            card_type_counts[card_type] = current_count + 1
-            if card_type not in group_map:
-                group_map[card_type] = []
-            group_map[card_type].append(item)
-
-    # 打印最终的分组结果
-    logger.info(f"🗂️ 分组提取完成！共发现 {len(card_type_counts)} 种不同的 cardType。")
-    logger.info(f"🎉 最终的 filter_list 包含 {len(filter_list)} 条记录！")
-
-    # 直观地打印出每种类型具体保留了多少条，方便你核对数据分布
-    logger.info("📊 各类型保留数量统计:")
-    for c_type, count in card_type_counts.items():
-        logger.info(f"   - {c_type}: {count} 条")
-
-    temp_all_result_list = clean_universal_posts(filter_list)
-    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
-    print()
-
-
-import re
-import json
-
-# ============================================================
-# 模块级预编译正则（性能优化：避免逐字段/逐条重复编译）
-# ============================================================
-_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\ufeff\u202a-\u202e]')  # 零宽字符、排版控制符等
-_MULTI_NEWLINE_RE = re.compile(r'\n{3,}')
 
 
 def get_standard_schema():
@@ -699,11 +251,11 @@ def get_standard_schema():
             "mentioned_coins": []
         },
         "media": {
-            "cover_image": None,   # 视频或长文的封面
-            "images": [],          # 普通帖子的图片列表
-            "inline_images": [],   # 长文内嵌的图片列表 (保留阅读顺序)
-            "video_url": None,     # 视频直链
-            "video_duration": 0    # 视频时长
+            "cover_image": None,  # 视频或长文的封面
+            "images": [],  # 普通帖子的图片列表
+            "inline_images": [],  # 长文内嵌的图片列表 (保留阅读顺序)
+            "video_url": None,  # 视频直链
+            "video_duration": 0  # 视频时长
         },
         "engagement": {
             "view_count": 0,
@@ -835,11 +387,18 @@ def clean_short_posts(raw_data_list):
 def clean_reply_posts(raw_data_list):
     """
     清洗 BUZZ_REPLY_POST_LIST (串烧/盖楼帖) 类型数据
-    需先剥离容器，再逐一清洗内部真实子帖
+    需先剥离容器，再根据内部真实子帖的类型，动态分发给对应的专用清洗器，防止多模态数据丢失
     """
     cleaned_list = []
     container_failed = 0
-    item_failed = 0
+
+    # 建立局部路由字典，复用已有的各类型专用清洗器
+    # 这样子帖中的视频、长文就不会丢失独有的媒体提取逻辑
+    processor_map = {
+        'BUZZ_SHORT': clean_short_posts,
+        'BUZZ_VIDEO': clean_video_posts,
+        'BUZZ_LONG': clean_long_posts
+    }
 
     for raw_container in raw_data_list:
         try:
@@ -847,29 +406,33 @@ def clean_reply_posts(raw_data_list):
             if raw_container.get("cardType") != "BUZZ_REPLY_POST_LIST":
                 continue
 
-            for raw_item in raw_container.get("replyPostList", []):
-                try:
-                    data = _assemble_common(
-                        raw_item,
-                        card_type_default="BUZZ_SHORT",
-                        title=_clean_title(raw_item.get("title")),
-                        text_content=_clean_text(raw_item.get("content")),
-                        hashtags=_extract_hashtags(raw_item)
-                    )
-                    data["media"]["images"] = raw_item.get("images", [])
-                    cleaned_list.append(data)
-                except Exception as e:
-                    item_failed += 1
-                    logger.error(
-                        f"[BUZZ_REPLY] 子帖清洗失败 | container_id={raw_container.get('id')} "
-                        f"| post_id={raw_item.get('id')} | error={e}", exc_info=True)
+            # 获取容器内包裹的子帖列表
+            reply_post_list = raw_container.get("replyPostList", [])
+
+            # 将当前容器内的子帖按 cardType 进行分组
+            child_group_map = {}
+            for raw_item in reply_post_list:
+                # 若子帖无类型，兜底降级为短帖处理
+                c_type = raw_item.get("cardType", "BUZZ_SHORT")
+                child_group_map.setdefault(c_type, []).append(raw_item)
+
+            # 分发给对应的专属清洗器处理
+            for c_type, items in child_group_map.items():
+                # 如果遇到未知类型，同样使用短帖清洗器兜底
+                processor_func = processor_map.get(c_type, clean_short_posts)
+                child_cleaned_list = processor_func(items)
+
+                if child_cleaned_list:
+                    cleaned_list.extend(child_cleaned_list)
 
         except Exception as e:
             container_failed += 1
             logger.error(f"[BUZZ_REPLY] 容器解析失败 | container_id={raw_container.get('id')} | error={e}",
                          exc_info=True)
 
-    logger.info(f"[BUZZ_REPLY] 清洗完成 | 子帖成功={len(cleaned_list)} 子帖失败={item_failed} 容器失败={container_failed}")
+    # 注：子帖清洗的失败日志会由专属清洗器自行打印，这里只统计最终产出和容器解析失败数
+    logger.info(
+        f"[BUZZ_REPLY] 容器解析及子帖清洗完成 | 共提取有效子帖={len(cleaned_list)} 条 | 容器失败={container_failed}")
     return cleaned_list
 
 
@@ -897,7 +460,8 @@ def clean_video_posts(raw_data_list):
                 cover_meta = raw_item.get("coverMeta") or {}
                 data["media"]["video_url"] = video_link
                 data["media"]["cover_image"] = raw_item.get("coverLight") or cover_meta.get("url")
-                data["media"]["video_duration"] = raw_item.get("videoTimeSeconds") or video_vo.get("videoTimeSeconds", 0)
+                data["media"]["video_duration"] = raw_item.get("videoTimeSeconds") or video_vo.get("videoTimeSeconds",
+                                                                                                   0)
 
             cleaned_list.append(data)
         except Exception as e:
@@ -1197,8 +761,326 @@ def update_posts_in_place(final_clean_list):
     return final_clean_list
 
 
+def _extract_vos(res_data):
+    """安全解析币安响应体，兼容 data 为 dict / list / 空 的多种结构"""
+    data_field = res_data.get("data")
+    if isinstance(data_field, dict):
+        return data_field.get("vos") or data_field.get("list") or []
+    if isinstance(data_field, list):
+        return data_field
+    return []
+
+
+def _dedup_vos(all_vos, label):
+    """基于 id / contentId 去重，并打印一条高密度的去重结果日志"""
+    seen_ids = set()
+    deduped = []
+    for item in all_vos:
+        item_id = item.get("id") or item.get("contentId")
+        if item_id not in seen_ids:
+            seen_ids.add(item_id)
+            deduped.append(item)
+
+    logger.info(
+        f"✅ [{label}] 去重完成 | 抓取 {len(all_vos)} 条 | "
+        f"移除重复 {len(all_vos) - len(deduped)} 条 | 最终保留 {len(deduped)} 条"
+    )
+    return deduped
+
+
+def _paginate_feed(url, headers, build_payload, required_count, label, on_page=None):
+    """
+    币安广场分页采集核心引擎（POST 分页流通用）
+
+    :param url:            接口地址
+    :param headers:        端点专属请求头
+    :param build_payload:  接收 page_index，返回该页 payload 的构造函数
+    :param required_count: 目标采集条数
+    :param label:          业务标签，用于日志上下文（如 "推荐流"、"搜索:ETH"）
+    :param on_page:        每页成功后的回调 (vos)，用于推荐流回填 content_ids 等场景
+    :return:               去重后的 vos 列表
+    """
+    all_vos = []
+    page_index = 1
+    retry_count = 0
+
+    while len(all_vos) < required_count:
+        payload = build_payload(page_index)
+        response = None
+        try:
+            response = requests.post(
+                url, headers=headers, json=payload,
+                proxies=PROXIES, timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            vos = _extract_vos(response.json())
+            if not vos:
+                logger.warning(
+                    f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束（已获取 {len(all_vos)} 条）"
+                )
+                break
+
+            all_vos.extend(vos)
+            if on_page:
+                on_page(vos)
+
+            logger.info(
+                f"📥 [{label}] 第 {page_index} 页成功 | "
+                f"新增 {len(vos)} 条 | 累计 {len(all_vos)}/{required_count}"
+            )
+
+            page_index += 1
+            retry_count = 0
+            time.sleep(random.uniform(0.5, 1.5))  # 防风控休眠
+
+        except Exception as e:
+            # 聚合式单条错误日志：一行内还原完整排查上下文
+            detail = ""
+            if response is not None and response.status_code >= 400:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            retry_count += 1
+            logger.error(
+                f"🚨 [{label}] 第 {page_index} 页请求失败 "
+                f"(第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
+            )
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止采集")
+                break
+            time.sleep(random.uniform(0.5, 1.5))  # 异常退避休眠，避免高频空转轰炸
+
+    return _dedup_vos(all_vos, label)
+
+
+def fetch_binance_feed_recommend(required_count, content_ids=None):
+    """
+    不断拉取币安广场的推荐数据，直到满足需要的数量
+
+    :param required_count: 需要拉取的目标数据总数 (vos 的数量)
+    :param content_ids: 已经抓取过的内容ID列表，用于去重和向下滑动参数
+    :return: 包含目标数据的列表
+    """
+    # 修复 Python 危险的默认可变参数问题
+    if content_ids is None:
+        content_ids = []
+
+    url = "https://www.binance.com/bapi/composite/v9/friendly/pgc/feed/feed-recommend/list"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5",
+        "lang": "zh-CN",
+        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),
+        "X-TRACE-ID": str(uuid.uuid4()),
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "versioncode": "web",
+        "BNC-Time-Zone": "Asia/Shanghai",
+        "referrer": "https://www.binance.com/zh-CN/square"
+    }
+
+    def build_payload(page_index):
+        return {
+            "pageIndex": page_index,
+            "pageSize": PAGE_SIZE,
+            "scene": "web-homepage",
+            "contentIds": content_ids
+        }
+
+    def collect_ids(vos):
+        # 推荐流独有：将本页 ID 回填至 content_ids，作为下一页的下滑去重参数
+        for item in vos:
+            item_id = item.get("id") or item.get("contentId")
+            if item_id:
+                content_ids.append(str(item_id))
+
+    return _paginate_feed(url, headers, build_payload, required_count, "推荐流", on_page=collect_ids)
+
+
+def fetch_binance_feed_search(keyword, required_count, search_type=1):
+    """
+    不断拉取币安广场的搜索结果，直到满足需要的数量或没有更多数据
+
+    :param keyword: 搜索关键词 (例如 "doge")
+    :param required_count: 需要拉取的目标数据总数
+    :param search_type: 搜索类型，默认为1 (通常代表综合或文章)
+    :return: 包含目标搜索结果的列表
+    """
+    url = "https://www.binance.com/bapi/composite/v2/friendly/pgc/feed/search/list"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 ...",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9...",
+        "device-info": "",
+        "lang": "zh-CN",
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "versioncode": "2.61.0",
+        "BNC-UUID": str(uuid.uuid4()),
+        "referrer": f"https://www.binance.com/zh-CN/square/search?s={keyword}"
+    }
+
+    def build_payload(page_index):
+        return {
+            "scene": "web",
+            "pageIndex": page_index,
+            "pageSize": PAGE_SIZE,
+            "searchContent": keyword,
+            "type": search_type
+        }
+
+    return _paginate_feed(url, headers, build_payload, required_count, f"搜索:{keyword}")
+
+
+def get_binance_feed_token(token="DOGE", required_count=20, orderBy=2):
+    """
+    获取币安指定币种的社区 Feed 数据
+
+    :param token: 币种名称 (如 "DOGE")
+    :param required_count: 期望获取的数据条数，默认为 20
+    :param orderBy: 1 代表热门，2 代表最新
+    :return: 目标 vos 列表，失败或无数据时返回 []
+    """
+    url = "https://www.binance.com/bapi/composite/v4/friendly/pgc/feed/trade/list"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,zh-TW;q=0.8,zh-HK;q=0.7,en-US;q=0.6,en;q=0.5",
+        "lang": "zh-CN",
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "device-info": "",
+        "BNC-UUID": str(uuid.uuid4()),
+        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),
+        "X-TRACE-ID": str(uuid.uuid4()),
+        "csrftoken": "d41d8cd98f00b204e9800998ecf8427e",
+        "BNC-Time-Zone": "Asia/Shanghai",
+        "referrer": f"https://www.binance.com/zh-CN/square/community?token={token}"
+    }
+
+    logger.info(f"⏳ [币种:{token}] 开始采集 | 目标条数: {required_count} | 排序: {orderBy}")
+
+    def build_payload(page_index):
+        return {
+            "token": token,
+            "pageIndex": page_index,
+            "pageSize": PAGE_SIZE,
+            "scene": 2,
+            "orderBy": orderBy
+        }
+
+    return _paginate_feed(url, headers, build_payload, required_count, f"币种:{token}")
+
+
+def fetch_binance_feed(count=20, keyword=None, token=None, **kwargs):
+    """
+    统一的币安广场数据拉取接口（智能路由版）
+    根据传入的参数自动判断拉取模式：
+    - 传 keyword -> 走搜索流
+    - 传 token -> 走币种流
+    - 都不传 -> 走推荐流
+    """
+    # 1. 优先判断是否是“搜索流” (传了 keyword)
+    if keyword:
+        logger.info(f"🔄 自动路由: [搜索模式] | 关键词: {keyword} | 目标条数: {count}")
+        search_type = kwargs.get("search_type", 1)
+        feed_list = fetch_binance_feed_search(keyword=keyword, required_count=count, search_type=search_type)
+
+    # 2. 判断是否是“指定币种流” (传了 token)
+    elif token:
+        token = str(token).upper()  # 自动转大写容错
+        logger.info(f"🔄 自动路由: [币种模式] | 币种: {token} | 目标条数: {count}")
+        order_by = kwargs.get("orderBy", 2)
+        feed_list = get_binance_feed_token(token=token, required_count=count, orderBy=order_by)
+
+    # 3. 如果什么目标都没传，默认走“推荐流”
+    else:
+        logger.info(f"🔄 自动路由: [推荐流模式] | 目标条数: {count}")
+        content_ids = kwargs.get("content_ids", [])
+        feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
+    return feed_list
+
+
+def fetch_binance_post_detail(post_id):
+    """
+    根据文章 ID 获取币安广场帖子的详细内容
+
+    :param post_id: 文章/帖子的唯一 ID (例如: 341500227496929)
+    :return: 包含详情数据的字典 (通常为解析后的 'data' 字段)，如果失败则返回 None
+    """
+    url = f"https://www.binance.com/bapi/composite/v3/friendly/pgc/special/content/detail/{post_id}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "lang": "zh-CN",
+        "X-UI-REQUEST-TRACE": str(uuid.uuid4()),  # 动态生成避免被追踪特征
+        "X-TRACE-ID": str(uuid.uuid4()),  # 动态生成避免被追踪特征
+        "Content-Type": "application/json",
+        "clienttype": "web",
+        "BNC-Time-Zone": "Asia/Shanghai",
+        "referrer": f"https://www.binance.com/zh-CN/square/post/{post_id}"  # referrer 动态跟随 post_id
+    }
+
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        response = None
+        try:
+            # 详情接口为 GET 请求，无需 payload
+            response = requests.get(url, headers=headers, proxies=PROXIES, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+
+            data_field = response.json().get("data")
+            if not data_field:
+                logger.warning(f"⚠️ [详情:{post_id}] 接口未返回有效数据")
+            else:
+                logger.info(f"✅ [详情:{post_id}] 获取文章详情成功")
+
+            # 与原逻辑一致：拿到响应即返回（无有效数据时不重试）
+            return data_field
+
+        except Exception as e:
+            detail = ""
+            if response is not None and response.status_code >= 400:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+            retry_count += 1
+            logger.error(
+                f"🚨 [详情:{post_id}] 请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
+            )
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"❌ [详情:{post_id}] 连续失败达到 {MAX_RETRIES} 次上限，终止")
+                break
+            time.sleep(random.uniform(0.5, 1.5))  # 失败退避休眠
+
+    return None
+
+
 if __name__ == "__main__":
-    master_feed_list = read_json("master_feed_list.json")
+    master_feed_list = []
+
+    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
+
+    # 1. 抓取推荐流
+    logger.info("--- 1. 准备抓取: 推荐流 ---")
+    recommend_data = fetch_binance_feed(count=100)
+    master_feed_list.extend(recommend_data)
+
+    # 2. 抓取搜索流 (以 "ETH" 为例)
+    logger.info("--- 2. 准备抓取: 搜索流 (ETH) ---")
+    search_data = fetch_binance_feed(keyword="ETH", count=100)
+    master_feed_list.extend(search_data)
+
+    # 3. 抓取特定币种流 (以 "BTC" 为例，按热门排序)
+    logger.info("--- 3. 准备抓取: 币种流 (BTC) ---")
+    token_data = fetch_binance_feed(token="BTC", count=100, orderBy=1)
+    master_feed_list.extend(token_data)
+
+    logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
+
     temp_all_result_list = clean_universal_posts(master_feed_list)
     final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
     print()
