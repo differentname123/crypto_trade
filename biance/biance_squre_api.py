@@ -89,115 +89,6 @@ def publish_to_binance_square(api_key, text_content):
         return False
 
 
-def clean_universal_binance_data(raw_data_list):
-    """
-    终极清洗函数：丢弃无用类型，拉平嵌套内容，找回核心作者ID，并去除占位符。
-    """
-    if not isinstance(raw_data_list, list):
-        logger.error("Data clean failed: Input is not a list.")
-        return []
-
-    cleaned_list = []
-
-    def process_item(item):
-        if not isinstance(item, dict):
-            return
-
-        card_type = item.get("cardType", "UNKNOWN")
-
-        # 规则 1：彻底丢弃纯语聊房 (没有文章内容) 和 投票帖 (POLL)
-        if card_type == "SPACE_LIVE" or card_type == "POLL":
-            return
-
-        # 规则 2：拉平嵌套的“推文串”，剥洋葱提取有效内容
-        if card_type == "BUZZ_REPLY_POST_LIST":
-            for nested_item in item.get("replyPostList") or []:
-                process_item(nested_item)
-            return
-
-        # 规则 3：智能拼接完整文本（已加入复读机修复逻辑）
-        text_content = ""
-        if card_type == "BUZZ_LONG":
-            title = item.get("title") or ""
-            sub_title = item.get("subTitle") or ""
-            content = item.get("content") or ""
-
-            # 顺手修复媒体号API可能返回的字符串 "null"
-            if sub_title.strip().lower() == "null":
-                sub_title = ""
-
-            # 核心修复：消除长文标题与正文重复的“复读机”现象
-            # 如果正文开头已经包含了标题，就不需要再在前面拼接标题了
-            if title and content.startswith(title):
-                title_part = ""
-            elif title:
-                title_part = f"【{title}】\n"
-            else:
-                title_part = ""
-
-            # 将有效的部分按顺序拼接
-            parts = [p for p in [title_part, sub_title, content] if p]
-            text_content = "\n\n".join(parts)
-        else:
-            text_content = item.get("content") or ""
-
-        # 清除币安前端挂件宏定义如 {future}(BTCUSDT)
-        text_content = re.sub(r'\{.*?\}.*?\)', '', text_content).strip()
-
-        # 规则 4：找回完整的作者信息（核心跟踪字段）
-        author_info = item.get("author") or {}
-        square_author_id = author_info.get("squareAuthorId") or item.get("squareAuthorId")
-        username = author_info.get("username") or item.get("username")
-        author_name = author_info.get("authorName") or item.get("authorName")
-
-        # 规则 5：提取媒体资源
-        media_urls = []
-        for img in item.get("imageMetaList") or []:
-            if isinstance(img, dict) and img.get("url"):
-                media_urls.append(img.get("url"))
-
-        cover_meta = item.get("coverMeta")
-        if isinstance(cover_meta, dict) and cover_meta.get("url"):
-            media_urls.append(cover_meta.get("url"))
-
-        video_vo = item.get("videoVO")
-        if isinstance(video_vo, dict) and video_vo.get("videoLink"):
-            media_urls.append(video_vo.get("videoLink"))
-
-        # 统一组装对象
-        cleaned_item = {
-            "post_id": item.get("id"),
-            "card_type": card_type,
-            "publish_time": item.get("date"),
-            "url": item.get("webLink") or item.get("quotedContentWebLink"),
-            "author": {
-                "squareAuthorId": square_author_id,
-                "username": username,
-                "authorName": author_name
-            },
-            "text_content": text_content,
-            "media_urls": list(set(media_urls)),
-            "metrics": {
-                "viewCount": item.get("viewCount") or 0,
-                "likeCount": item.get("likeCount") or 0,
-                "commentCount": item.get("commentCount") or 0
-            }
-        }
-
-        # 底线校验：必须有 ID 和 正文才入库
-        if cleaned_item["post_id"] and len(cleaned_item["text_content"]) > 0:
-            cleaned_list.append(cleaned_item)
-
-    try:
-        for item in raw_data_list:
-            process_item(item)
-
-        logger.info(f"Data clean complete. Extracted {len(cleaned_list)} pure article records.")
-        return cleaned_list
-    except Exception as e:
-        logger.error(f"Data clean aborted due to exception: {e}")
-        return []
-
 def follow_binance_square_user(
         target_uid: str,
         cookie_str: str,
@@ -698,440 +589,6 @@ def fetch_binance_post_detail(post_id):
 
     return None
 
-
-def clean_short_posts(raw_data_list):
-    cleaned_list = []
-
-    for raw_item in raw_data_list:
-        # 1. 安全提取正文
-        text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
-
-        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
-        raw_coins = raw_item.get("coinPairList") or []
-        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
-
-        # 从 tradingPairsV2 中提取防漏抓
-        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
-        for pair in trading_pairs_v2:
-            code = pair.get("code")
-            if code:
-                cleaned_coins_list.append(code.strip())
-
-        # 合并、去重，并统一转大写
-        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
-
-        # 3. 修复 Hashtags 首尾空格问题
-        raw_hashtags = raw_item.get("hashtagList", [])
-        cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
-
-        # 组装数据
-        cleaned_data = {
-            "metadata": {
-                "post_id": raw_item.get("id"),
-                "card_type": raw_item.get("cardType"),
-                "publish_time": raw_item.get("date"),
-                "url": raw_item.get("webLink"),
-                "is_ai_generated": raw_item.get("isCreatedByAI", False)
-            },
-            "author": {
-                "author_id": raw_item.get("squareAuthorId"),
-                "username": raw_item.get("username"),
-                "author_name": raw_item.get("authorName"),
-                "is_verified": raw_item.get("authorVerificationType", 0) > 0
-            },
-            "content": {
-                "title": raw_item.get("title"),
-                "text_content": text_content,
-                "hashtags": cleaned_hashtags,
-                "mentioned_coins": cleaned_coins
-            },
-            "media": {
-                "images": raw_item.get("images", [])
-            },
-            "engagement": {
-                "view_count": raw_item.get("viewCount", 0),
-                "like_count": raw_item.get("likeCount", 0),
-                "comment_count": raw_item.get("commentCount", 0),
-                "share_count": raw_item.get("shareCount", 0),
-                "quote_count": raw_item.get("quoteCount", 0)
-            }
-        }
-
-        cleaned_list.append(cleaned_data)
-
-    return cleaned_list
-
-
-def clean_reply_posts(raw_data_list):
-    """
-    专门清洗 BUZZ_REPLY_POST_LIST (串烧/盖楼帖) 类型的数据
-    :param raw_data_list: 原始数据列表 (List[Dict])
-    :return: 解包并清洗后的独立帖子列表 (List[Dict])
-    """
-    cleaned_list = []
-
-    for raw_container in raw_data_list:
-        # 确保这是我们要处理的盖楼帖类型
-        if raw_container.get("cardType") != "BUZZ_REPLY_POST_LIST":
-            continue
-
-        # 提取盖楼帖里面的所有真实子帖子
-        reply_post_list = raw_container.get("replyPostList", [])
-
-        for raw_item in reply_post_list:
-            # 1. 安全提取正文
-            text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
-
-            # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
-            raw_coins = raw_item.get("coinPairList") or []
-            cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
-
-            # 从 tradingPairsV2 中提取防漏抓
-            trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
-            for pair in trading_pairs_v2:
-                code = pair.get("code")
-                if code:
-                    cleaned_coins_list.append(code.strip())
-
-            # 合并、去重，并统一转大写
-            cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
-
-            # 3. Hashtags 去首尾空格
-            raw_hashtags = raw_item.get("hashtagList", [])
-            cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
-
-            # 4. 组装数据
-            cleaned_data = {
-                "metadata": {
-                    "post_id": raw_item.get("id"),
-                    "card_type": raw_item.get("cardType", "BUZZ_SHORT"),
-                    "publish_time": raw_item.get("date"),
-                    "url": raw_item.get("webLink"),
-                    "is_ai_generated": raw_item.get("isCreatedByAI", False),
-                    # 新增这个标记，方便后续分析知道这是不是一条跟帖
-                    "is_reply_post": raw_item.get("isReplyPost", False)
-                },
-                "author": {
-                    "author_id": raw_item.get("squareAuthorId"),
-                    "username": raw_item.get("username"),
-                    "author_name": raw_item.get("authorName"),
-                    "is_verified": raw_item.get("authorVerificationType", 0) > 0
-                },
-                "content": {
-                    "title": raw_item.get("title"),
-                    "text_content": text_content,
-                    "hashtags": cleaned_hashtags,
-                    "mentioned_coins": cleaned_coins
-                },
-                "media": {
-                    "images": raw_item.get("images", [])
-                },
-                "engagement": {
-                    "view_count": raw_item.get("viewCount", 0),
-                    "like_count": raw_item.get("likeCount", 0),
-                    "comment_count": raw_item.get("commentCount", 0),
-                    "share_count": raw_item.get("shareCount", 0),
-                    "quote_count": raw_item.get("quoteCount", 0)
-                }
-            }
-
-            # 将解包后的单条清洗数据放入结果列表中
-            cleaned_list.append(cleaned_data)
-
-    return cleaned_list
-
-
-def clean_video_posts(raw_data_list):
-    """
-    专门清洗 BUZZ_VIDEO (视频帖) 类型的数据
-    :param raw_data_list: 原始数据列表 (List[Dict])
-    :return: 清洗后的新数据列表 (List[Dict])
-    """
-    cleaned_list = []
-
-    for raw_item in raw_data_list:
-        # 如果你想做混合处理，可以加这个判断：if raw_item.get("cardType") != "BUZZ_VIDEO": continue
-
-        # 1. 安全提取正文和标题
-        title = raw_item.get("title", "").strip() if raw_item.get("title") else None
-        text_content = raw_item.get("content", "").strip() if raw_item.get("content") else ""
-
-        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
-        raw_coins = raw_item.get("coinPairList") or []
-        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
-
-        # 从 tradingPairsV2 中提取防漏抓
-        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
-        for pair in trading_pairs_v2:
-            code = pair.get("code")
-            if code:
-                cleaned_coins_list.append(code.strip())
-
-        # 合并、去重，并统一转大写
-        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
-
-        # 3. Hashtags 去首尾空格
-        raw_hashtags = raw_item.get("hashtagList", [])
-        cleaned_hashtags = [ht.strip() for ht in raw_hashtags if ht]
-
-        # 4. 重点：提取视频专属资源 (直链、封面、时长)
-        video_info = None
-        # 兼容两种取值路径：顶层 videoLink 或 嵌套在 videoVO 里
-        video_link = raw_item.get("videoLink") or raw_item.get("videoVO", {}).get("videoLink")
-
-        if video_link:
-            video_info = {
-                "video_url": video_link,
-                "cover_image_url": raw_item.get("coverLight") or raw_item.get("coverMeta", {}).get("url"),
-                "duration_seconds": raw_item.get("videoTimeSeconds") or raw_item.get("videoVO", {}).get(
-                    "videoTimeSeconds", 0)
-            }
-
-        # 5. 组装最终数据
-        cleaned_data = {
-            "metadata": {
-                "post_id": raw_item.get("id"),
-                "card_type": raw_item.get("cardType", "BUZZ_VIDEO"),
-                "publish_time": raw_item.get("date"),
-                "url": raw_item.get("webLink"),
-                "is_ai_generated": raw_item.get("isCreatedByAI", False)
-            },
-            "author": {
-                "author_id": raw_item.get("squareAuthorId"),
-                "username": raw_item.get("username"),
-                "author_name": raw_item.get("authorName"),
-                "is_verified": raw_item.get("authorVerificationType", 0) > 0
-            },
-            "content": {
-                "title": title,
-                "text_content": text_content,
-                "hashtags": cleaned_hashtags,
-                "mentioned_coins": cleaned_coins
-            },
-            "media": {
-                "images": raw_item.get("images", []),  # 视频帖的纯图片通常为空，保留格式统一
-                "video": video_info  # 视频专属属性
-            },
-            "engagement": {
-                "view_count": raw_item.get("viewCount", 0),
-                "like_count": raw_item.get("likeCount", 0),
-                "comment_count": raw_item.get("commentCount", 0),
-                "share_count": raw_item.get("shareCount", 0),
-                "quote_count": raw_item.get("quoteCount", 0)
-            }
-        }
-
-        cleaned_list.append(cleaned_data)
-
-    return cleaned_list
-
-
-def clean_long_posts(raw_data_list):
-    """
-    无损清洗 BUZZ_LONG (长文帖) 类型的数据
-    忠实保留原始文本，精细化分类图片属性。
-    """
-    cleaned_list = []
-
-    for raw_item in raw_data_list:
-        if raw_item.get("cardType") != "BUZZ_LONG":
-            continue
-
-        # 1. 忠实提取标题和正文（不干预内容）
-        title = raw_item.get("title")
-        # 优先取 content，如果为空则取 subTitle
-        text_content = raw_item.get("content") or raw_item.get("subTitle") or ""
-
-        # 2. 修复提到币种 (完全依赖 API 的结构化字段，摒弃正则防脏数据)
-        raw_coins = raw_item.get("coinPairList") or []
-        cleaned_coins_list = [coin.replace('$', '').strip() for coin in raw_coins if coin]
-
-        # 从 tradingPairsV2 中提取防漏抓
-        trading_pairs_v2 = raw_item.get("tradingPairsV2") or []
-        for pair in trading_pairs_v2:
-            code = pair.get("code")
-            if code:
-                cleaned_coins_list.append(code.strip())
-
-        # 合并、去重，并统一转大写
-        cleaned_coins = list(set(coin.upper() for coin in cleaned_coins_list if coin))
-
-        # 3. 忠实合并标签 (去首尾空格防脏数据)
-        raw_tags_1 = raw_item.get("hashtagList") or []
-        raw_tags_2 = raw_item.get("hashtagIdentifyList") or []
-        cleaned_hashtags = list(set(ht.strip() for ht in (raw_tags_1 + raw_tags_2) if ht))
-
-        # 4. 🚀 重点：精细化分离图片属性 (封面图 vs 列表内嵌图)
-        cover_image = None
-        cover_meta = raw_item.get("coverMeta")
-        # 提取封面
-        if cover_meta and isinstance(cover_meta, dict):
-            cover_image = cover_meta.get("url")
-        elif raw_item.get("coverLight"):
-            cover_image = raw_item.get("coverLight")
-
-        # 提取正文内嵌图 (保留有序列表，以此体现插入的相对先后顺序)
-        inline_images = raw_item.get("images") or []
-
-        # 5. 组装数据
-        cleaned_data = {
-            "metadata": {
-                "post_id": raw_item.get("id"),
-                "card_type": raw_item.get("cardType", "BUZZ_LONG"),
-                "publish_time": raw_item.get("date"),
-                "url": raw_item.get("webLink"),
-                "is_ai_generated": raw_item.get("isCreatedByAI", False)
-            },
-            "author": {
-                "author_id": raw_item.get("squareAuthorId"),
-                "username": raw_item.get("username"),
-                "author_name": raw_item.get("authorName"),
-                "is_verified": raw_item.get("authorVerificationType", 0) > 0
-            },
-            "content": {
-                "title": title,
-                "text_content": text_content,
-                "hashtags": cleaned_hashtags,
-                "mentioned_coins": cleaned_coins
-            },
-            "media": {
-                "cover_image": cover_image,  # 明确标注这是封面图
-                "inline_images": inline_images  # 明确标注这是文章中包含的图(按顺序)
-            },
-            "engagement": {
-                "view_count": raw_item.get("viewCount", 0),
-                "like_count": raw_item.get("likeCount", 0),
-                "comment_count": raw_item.get("commentCount", 0),
-                "share_count": raw_item.get("shareCount", 0),
-                "quote_count": raw_item.get("quoteCount", 0)
-            }
-        }
-
-        cleaned_list.append(cleaned_data)
-
-    return cleaned_list
-
-def clean_long_posts_detail(raw_data_list):
-    """
-    专门针对带有 `body` 富文本结构的数据进行核心内容与媒体解析。
-
-    :param raw_data_list: 包含 raw_item 的列表
-    :return: 仅包含 text_content 和 media 的全新列表
-    """
-    cleaned_list = []
-
-    for raw_item in raw_data_list:
-        body_str = raw_item.get("body")
-
-        text_content = ""
-        inline_images = []
-
-        # 1. 核心解析逻辑：深度解构 body 富文本
-        if body_str:
-            try:
-                body_data = json.loads(body_str)
-                # 获取渲染顺序
-                order_list = body_data.get("layout", {}).get("ViewInstance0", [])
-                # 🚀 致命 Bug 修复点：所有的具体节点数据其实都藏在 hash 这个字典里！
-                hash_dict = body_data.get("hash", {})
-
-                full_text_parts = []
-
-                def extract_node(node):
-                    """递归解析单个富文本节点"""
-                    if not isinstance(node, dict):
-                        return ""
-
-                    node_id = node.get("id")
-                    config = node.get("config", {})
-
-                    # A. 提取图片节点，将其转换为带位置信息的文本标记
-                    if node_id == "RichTextImage":
-                        src = config.get("src")
-                        caption = config.get("caption", "")
-                        if src:
-                            inline_images.append(src)
-                            # 生成供大模型阅读的标记
-                            img_mark = f"\n\n[插图: {src}"
-                            if caption:
-                                img_mark += f" | 描述: {caption}"
-                            img_mark += "]\n\n"
-                            return img_mark
-                        return ""
-
-                    # B. 提取基础文本与标签
-                    if node_id in ("RichTextText", "RichTextHashTag", "RichTextCoinPair"):
-                        return config.get("content", "")
-
-                    # C. 处理硬换行
-                    if node_id == "RichTextHardBreak":
-                        return "\n"
-
-                    # D. 递归处理容器节点 (段落、列表、引用等)
-                    content_list = config.get("content", [])
-                    if not isinstance(content_list, list):
-                        content_list = []
-
-                    child_texts = [extract_node(child) for child in content_list]
-                    res = "".join(child_texts)
-
-                    # E. 列表项增加项目符号
-                    if node_id == "RichTextListItem":
-                        res = "• " + res + "\n"
-
-                    return res
-
-                # 按 layout 指定的顺序拼装全部分块
-                for uid in order_list:
-                    # 🚀 致命 Bug 修复点：从 hash_dict 里根据 uid 取出块内容
-                    block = hash_dict.get(uid, {})
-
-                    # 空行处理
-                    if block.get("empty"):
-                        full_text_parts.append("\n")
-                        continue
-
-                    block_text = extract_node(block)
-                    if block_text:
-                        # 对于段落、引用等块级元素，追加换行
-                        if block.get("id") in ("RichTextParagraph", "RichTextQuote", "RichTextHeader", "RichTextList"):
-                            full_text_parts.append(block_text + "\n")
-                        else:
-                            full_text_parts.append(block_text)
-
-                # 合并文本并清理多余的连续空白行（保留最多两个换行符）
-                raw_parsed_text = "".join(full_text_parts)
-                text_content = re.sub(r'\n{3,}', '\n\n', raw_parsed_text).strip()
-
-            except json.JSONDecodeError:
-                # 容错：如果 JSON 解析失败，尝试使用外层的备用字段
-                text_content = raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle") or ""
-        else:
-            # 兜底：如果完全没有 body 字段，按优先级获取纯文本
-            text_content = raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle") or ""
-
-        # 2. 提取封面图 (Cover)
-        cover_image = None
-        # 兼容不同层级的封面图数据结构
-        cover_meta = raw_item.get("coverMeta")
-        if cover_meta and isinstance(cover_meta, dict):
-            cover_image = cover_meta.get("url")
-        elif raw_item.get("cover"):
-            cover_image = raw_item.get("cover")
-
-        # 3. 组装极致纯净的数据结构
-        cleaned_data = {
-            "core_text_content": text_content,
-            "media": {
-                "cover_image": cover_image,
-                "inline_images": inline_images
-            }
-        }
-
-        cleaned_list.append(cleaned_data)
-
-    return cleaned_list
-
 def pull_feed_demo():
     # 拉取帖子数据
     master_feed_list = []
@@ -1184,7 +641,7 @@ def pull_feed_demo():
         current_count = card_type_counts.get(card_type, 0)
 
         # 核心判断：如果该类型保存的数据还不到 5 条，就继续保留
-        if current_count < 10:
+        if current_count < 20:
             filter_list.append(item)
             # 计数器加 1
             card_type_counts[card_type] = current_count + 1
@@ -1201,65 +658,547 @@ def pull_feed_demo():
     for c_type, count in card_type_counts.items():
         logger.info(f"   - {c_type}: {count} 条")
 
-    clean_filter_list = clean_universal_binance_data(filter_list)
-    all_clean_list = []
-    short_result_list = clean_short_posts(group_map['BUZZ_SHORT'])
-    all_clean_list.extend(short_result_list)
-    replay_result_list = clean_reply_posts(group_map['BUZZ_REPLY_POST_LIST'])
-    all_clean_list.extend(replay_result_list)
-    video_result_list = clean_video_posts(group_map['BUZZ_VIDEO'])
-    all_clean_list.extend(video_result_list)
-    long_result_list = clean_long_posts(group_map['BUZZ_LONG'])
-    all_clean_list.extend(long_result_list)
-
-    long_result_list = clean_long_posts(group_map['BUZZ_LONG'])
-
-    # BUZZ_LONG类型的帖子要拉取详细的内容才是完整的内容，在这个基础上进行清洗才有意义
-    post_detail_list = []
-    for detail in group_map['BUZZ_LONG']:
-        post_id = detail.get('id')
-        post_detail = fetch_binance_post_detail(post_id)
-        if post_detail:
-            post_detail_list.append(post_detail)
-    long_result_list = clean_long_posts_detail(post_detail_list)
-
-
-    post_detail_list = read_json("post_detail_list.json")
-    long_result_list = clean_long_posts_detail(post_detail_list)
-
-    save_json("post_detail_list.json", post_detail_list)
+    temp_all_result_list = clean_universal_posts(filter_list)
+    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
     print()
 
 
+import re
+import json
+
+# ============================================================
+# 模块级预编译正则（性能优化：避免逐字段/逐条重复编译）
+# ============================================================
+_INVISIBLE_RE = re.compile(r'[\u200b-\u200f\ufeff\u202a-\u202e]')  # 零宽字符、排版控制符等
+_MULTI_NEWLINE_RE = re.compile(r'\n{3,}')
+
+
+def get_standard_schema():
+    """
+    统一的数据骨架 (Schema Template)
+    确保所有类型的帖子拥有绝对一致的字段结构，防止后续入库或分析时出现 KeyError
+    """
+    return {
+        "metadata": {
+            "post_id": None,
+            "card_type": "UNKNOWN",
+            "publish_time": 0,
+            "url": None,
+            "is_ai_generated": False
+        },
+        "author": {
+            "author_id": None,
+            "username": None,
+            "author_name": None,
+            "is_verified": False
+        },
+        "content": {
+            "title": None,
+            "text_content": "",
+            "hashtags": [],
+            "mentioned_coins": []
+        },
+        "media": {
+            "cover_image": None,   # 视频或长文的封面
+            "images": [],          # 普通帖子的图片列表
+            "inline_images": [],   # 长文内嵌的图片列表 (保留阅读顺序)
+            "video_url": None,     # 视频直链
+            "video_duration": 0    # 视频时长
+        },
+        "engagement": {
+            "view_count": 0,
+            "like_count": 0,
+            "comment_count": 0,
+            "share_count": 0,
+            "quote_count": 0
+        }
+    }
+
+
+# ============================================================
+# 通用原子工具 (跨清洗器复用，保持扁平不深套)
+# ============================================================
+def _clean_text(raw):
+    """清理不可见字符并去首尾空格；空值安全返回空串"""
+    if not raw:
+        return ""
+    return _INVISIBLE_RE.sub('', raw).strip()
+
+
+def _clean_title(raw):
+    """标题清理：空值返回 None，否则清理不可见字符并去空格"""
+    if not raw:
+        return None
+    return _INVISIBLE_RE.sub('', raw).strip()
+
+
+def _extract_coins(raw_item):
+    """
+    提取提到的币种：完全依赖 API 结构化字段（摒弃正则防脏数据）
+    来源1: coinPairList (去 $ 符号)
+    来源2: tradingPairsV2[].code (防漏抓)
+    最终合并、去重、统一大写
+    """
+    coins = [coin.replace('$', '').strip() for coin in (raw_item.get("coinPairList") or []) if coin]
+
+    for pair in (raw_item.get("tradingPairsV2") or []):
+        code = pair.get("code")
+        if code:
+            coins.append(code.strip())
+
+    return list(set(coin.upper() for coin in coins if coin))
+
+
+def _extract_hashtags(raw_item, merge_keys=None):
+    """
+    提取并清理 Hashtags（去首尾空格防脏数据）
+    默认仅取 hashtagList；传入 merge_keys 时额外合并并去重（长文场景）
+    """
+    tags = list(raw_item.get("hashtagList") or [])
+
+    if merge_keys:
+        for key in merge_keys:
+            tags += (raw_item.get(key) or [])
+        return list(set(ht.strip() for ht in tags if ht))
+
+    return [ht.strip() for ht in tags if ht]
+
+
+def _assemble_common(raw_item, card_type_default, title, text_content, hashtags):
+    """
+    套用统一 Schema，组装所有类型共有的四大区块
+    (metadata / author / content / engagement)
+    差异化的 media 由各清洗器在返回后自行填充
+    """
+    data = get_standard_schema()
+
+    data["metadata"].update({
+        "post_id": raw_item.get("id"),
+        "card_type": raw_item.get("cardType", card_type_default),
+        "publish_time": raw_item.get("date"),
+        "url": raw_item.get("webLink"),
+        "is_ai_generated": raw_item.get("isCreatedByAI", False)
+    })
+
+    data["author"].update({
+        "author_id": raw_item.get("squareAuthorId"),
+        "username": raw_item.get("username"),
+        "author_name": raw_item.get("authorName"),
+        "is_verified": raw_item.get("authorVerificationType", 0) > 0
+    })
+
+    data["content"].update({
+        "title": title,
+        "text_content": text_content,
+        "hashtags": hashtags,
+        "mentioned_coins": _extract_coins(raw_item)
+    })
+
+    data["engagement"].update({
+        "view_count": raw_item.get("viewCount", 0),
+        "like_count": raw_item.get("likeCount", 0),
+        "comment_count": raw_item.get("commentCount", 0),
+        "share_count": raw_item.get("shareCount", 0),
+        "quote_count": raw_item.get("quoteCount", 0)
+    })
+
+    return data
+
+
+# ============================================================
+# 各类型专用清洗器 (仅保留差异化的 media 处理)
+# ============================================================
+def clean_short_posts(raw_data_list):
+    """清洗 BUZZ_SHORT (短帖) 类型数据"""
+    cleaned_list = []
+    failed = 0
+
+    for raw_item in raw_data_list:
+        try:
+            data = _assemble_common(
+                raw_item,
+                card_type_default=None,
+                title=_clean_title(raw_item.get("title")),
+                text_content=_clean_text(raw_item.get("content")),
+                hashtags=_extract_hashtags(raw_item)
+            )
+            data["media"]["images"] = raw_item.get("images", [])
+            cleaned_list.append(data)
+        except Exception as e:
+            failed += 1
+            logger.error(f"[BUZZ_SHORT] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
+
+    logger.info(f"[BUZZ_SHORT] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    return cleaned_list
+
+
+def clean_reply_posts(raw_data_list):
+    """
+    清洗 BUZZ_REPLY_POST_LIST (串烧/盖楼帖) 类型数据
+    需先剥离容器，再逐一清洗内部真实子帖
+    """
+    cleaned_list = []
+    container_failed = 0
+    item_failed = 0
+
+    for raw_container in raw_data_list:
+        try:
+            # 仅处理盖楼帖容器
+            if raw_container.get("cardType") != "BUZZ_REPLY_POST_LIST":
+                continue
+
+            for raw_item in raw_container.get("replyPostList", []):
+                try:
+                    data = _assemble_common(
+                        raw_item,
+                        card_type_default="BUZZ_SHORT",
+                        title=_clean_title(raw_item.get("title")),
+                        text_content=_clean_text(raw_item.get("content")),
+                        hashtags=_extract_hashtags(raw_item)
+                    )
+                    data["media"]["images"] = raw_item.get("images", [])
+                    cleaned_list.append(data)
+                except Exception as e:
+                    item_failed += 1
+                    logger.error(
+                        f"[BUZZ_REPLY] 子帖清洗失败 | container_id={raw_container.get('id')} "
+                        f"| post_id={raw_item.get('id')} | error={e}", exc_info=True)
+
+        except Exception as e:
+            container_failed += 1
+            logger.error(f"[BUZZ_REPLY] 容器解析失败 | container_id={raw_container.get('id')} | error={e}",
+                         exc_info=True)
+
+    logger.info(f"[BUZZ_REPLY] 清洗完成 | 子帖成功={len(cleaned_list)} 子帖失败={item_failed} 容器失败={container_failed}")
+    return cleaned_list
+
+
+def clean_video_posts(raw_data_list):
+    """清洗 BUZZ_VIDEO (视频帖) 类型数据，平铺视频专属资源到 media"""
+    cleaned_list = []
+    failed = 0
+
+    for raw_item in raw_data_list:
+        try:
+            data = _assemble_common(
+                raw_item,
+                card_type_default="BUZZ_VIDEO",
+                title=_clean_title(raw_item.get("title")),
+                text_content=_clean_text(raw_item.get("content")),
+                hashtags=_extract_hashtags(raw_item)
+            )
+
+            data["media"]["images"] = raw_item.get("images", [])
+
+            # 修复原潜在 Bug：videoVO / coverMeta 存在但值为 None 时的 AttributeError
+            video_vo = raw_item.get("videoVO") or {}
+            video_link = raw_item.get("videoLink") or video_vo.get("videoLink")
+            if video_link:
+                cover_meta = raw_item.get("coverMeta") or {}
+                data["media"]["video_url"] = video_link
+                data["media"]["cover_image"] = raw_item.get("coverLight") or cover_meta.get("url")
+                data["media"]["video_duration"] = raw_item.get("videoTimeSeconds") or video_vo.get("videoTimeSeconds", 0)
+
+            cleaned_list.append(data)
+        except Exception as e:
+            failed += 1
+            logger.error(f"[BUZZ_VIDEO] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
+
+    logger.info(f"[BUZZ_VIDEO] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    return cleaned_list
+
+
+def clean_long_posts(raw_data_list):
+    """
+    无损清洗 BUZZ_LONG (长文帖) 类型数据
+    忠实保留原始文本，精细化分离封面图与内嵌图
+    """
+    cleaned_list = []
+    failed = 0
+
+    for raw_item in raw_data_list:
+        try:
+            if raw_item.get("cardType") != "BUZZ_LONG":
+                continue
+
+            data = _assemble_common(
+                raw_item,
+                card_type_default="BUZZ_LONG",
+                title=_clean_title(raw_item.get("title")),
+                text_content=_clean_text(raw_item.get("content") or raw_item.get("subTitle")),
+                hashtags=_extract_hashtags(raw_item, merge_keys=["hashtagIdentifyList"])
+            )
+
+            # 精细化分离封面图 (coverMeta.url 优先，其次 coverLight)
+            cover_image = None
+            cover_meta = raw_item.get("coverMeta")
+            if cover_meta and isinstance(cover_meta, dict):
+                cover_image = cover_meta.get("url")
+            elif raw_item.get("coverLight"):
+                cover_image = raw_item.get("coverLight")
+
+            data["media"]["cover_image"] = cover_image
+            data["media"]["inline_images"] = raw_item.get("images") or []
+
+            cleaned_list.append(data)
+        except Exception as e:
+            failed += 1
+            logger.error(f"[BUZZ_LONG] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
+
+    logger.info(f"[BUZZ_LONG] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    return cleaned_list
+
+
+def clean_long_posts_detail(raw_data_list):
+    """
+    针对带有 `body` 富文本结构的长文详情，做核心内容与内嵌媒体的深度解析
+    解析失败时优雅降级到 bodyTextOnly / content / subTitle
+    """
+    cleaned_list = []
+    failed = 0
+
+    for raw_item in raw_data_list:
+        try:
+            body_str = raw_item.get("body")
+            text_content = ""
+            inline_images = []
+
+            if body_str:
+                try:
+                    body_data = json.loads(body_str)
+                    order_list = body_data.get("layout", {}).get("ViewInstance0", [])
+                    hash_dict = body_data.get("hash", {})
+                    full_text_parts = []
+
+                    def extract_node(node):
+                        """递归解析单个富文本节点"""
+                        if not isinstance(node, dict):
+                            return ""
+
+                        node_id = node.get("id")
+                        config = node.get("config", {})
+
+                        # 图片节点：记录 src 并生成阅读标记
+                        if node_id == "RichTextImage":
+                            src = config.get("src")
+                            if not src:
+                                return ""
+                            inline_images.append(src)
+                            caption = config.get("caption", "")
+                            img_mark = f"\n\n[插图: {src}"
+                            if caption:
+                                img_mark += f" | 描述: {caption}"
+                            return img_mark + "]\n\n"
+
+                        # 叶子文本节点
+                        if node_id in ("RichTextText", "RichTextHashTag", "RichTextCoinPair"):
+                            return config.get("content", "")
+
+                        if node_id == "RichTextHardBreak":
+                            return "\n"
+
+                        # 容器节点：递归拼接子节点
+                        content_list = config.get("content", [])
+                        if not isinstance(content_list, list):
+                            content_list = []
+                        res = "".join(extract_node(child) for child in content_list)
+
+                        if node_id == "RichTextListItem":
+                            res = "• " + res + "\n"
+
+                        return res
+
+                    for uid in order_list:
+                        block = hash_dict.get(uid, {})
+                        if block.get("empty"):
+                            full_text_parts.append("\n")
+                            continue
+
+                        block_text = extract_node(block)
+                        if not block_text:
+                            continue
+
+                        if block.get("id") in ("RichTextParagraph", "RichTextQuote", "RichTextHeader", "RichTextList"):
+                            full_text_parts.append(block_text + "\n")
+                        else:
+                            full_text_parts.append(block_text)
+
+                    raw_parsed_text = "".join(full_text_parts)
+                    raw_text_content = _MULTI_NEWLINE_RE.sub('\n\n', raw_parsed_text).strip()
+                    # 清理富文本提取出的不可见字符（此处不能再 strip 破坏内部排版，故单独处理）
+                    text_content = _INVISIBLE_RE.sub('', raw_text_content)
+
+                except json.JSONDecodeError:
+                    text_content = _clean_text(
+                        raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle"))
+            else:
+                text_content = _clean_text(
+                    raw_item.get("bodyTextOnly") or raw_item.get("content") or raw_item.get("subTitle"))
+
+            # 提取封面图 (coverMeta.url 优先，其次 cover)
+            cover_image = None
+            cover_meta = raw_item.get("coverMeta")
+            if cover_meta and isinstance(cover_meta, dict):
+                cover_image = cover_meta.get("url")
+            elif raw_item.get("cover"):
+                cover_image = raw_item.get("cover")
+
+            cleaned_list.append({
+                "core_text_content": text_content,
+                "media": {
+                    "cover_image": cover_image,
+                    "inline_images": inline_images
+                }
+            })
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"[LONG_DETAIL] 长文详情解析失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
+
+    if failed:
+        logger.warning(f"[LONG_DETAIL] 详情解析存在失败 | 成功={len(cleaned_list)} 失败={failed}")
+    return cleaned_list
+
+
+# ============================================================
+# 主流程编排
+# ============================================================
+def clean_universal_posts(final_clean_list):
+    """
+    通用清洗调度：
+    1. 按 post_id 去重（节省算力）
+    2. 按 cardType 分组统计
+    3. 分发到各专用清洗器
+    4. 合并结果返回
+    """
+    card_type_counts = {}
+    group_map = {}
+    seen_post_ids = set()
+    unique_count = 0
+
+    # ---------- 1. 去重 + 分组统计 ----------
+    for item in final_clean_list:
+        post_id = item.get("id")
+        if post_id:
+            if post_id in seen_post_ids:
+                continue
+            seen_post_ids.add(post_id)
+
+        unique_count += 1
+        card_type = item.get("cardType", "UNKNOWN")
+        card_type_counts[card_type] = card_type_counts.get(card_type, 0) + 1
+        group_map.setdefault(card_type, []).append(item)
+
+    # 高密度单条日志：一次性呈现去重结果、种类数与完整分布，建立清晰排查上下文
+    logger.info(
+        f"🗂️ 分组去重完成 | 唯一记录={unique_count} | cardType种类={len(card_type_counts)} | 分布={card_type_counts}")
+
+    # ---------- 2. 分发处理与合并 ----------
+    all_clean_list = []
+    processor_map = {
+        'BUZZ_SHORT': clean_short_posts,
+        'BUZZ_REPLY_POST_LIST': clean_reply_posts,
+        'BUZZ_VIDEO': clean_video_posts,
+        'BUZZ_LONG': clean_long_posts
+    }
+
+    for card_type, processor_func in processor_map.items():
+        if card_type in group_map:
+            result_list = processor_func(group_map[card_type])
+            if result_list:
+                all_clean_list.extend(result_list)
+
+    logger.info(f"🎉 通用清洗合并完毕 | 最终产出={len(all_clean_list)} 条")
+    return all_clean_list
+
+
+def update_posts_in_place(final_clean_list):
+    """
+    就地更新(In-place)帖子内容：
+    - 长文：回源抓取详情、覆盖正文、补齐封面标记与内嵌图
+    - 非长文：将图片/视频资源以标记形式融合进正文尾部，供大模型阅读
+    """
+    if not final_clean_list:
+        return []
+
+    long_updated = 0
+    other_updated = 0
+    failed = 0
+
+    for item in final_clean_list:
+        post_id = item.get('metadata', {}).get('post_id')
+        try:
+            card_type = item.get('metadata', {}).get('card_type')
+            if not post_id:
+                continue
+
+            # ---------- 1. 长文：回源深度处理 ----------
+            if card_type == 'BUZZ_LONG':
+                post_detail = fetch_binance_post_detail(post_id)
+                if not post_detail:
+                    continue
+
+                cleaned_details = clean_long_posts_detail([post_detail])
+                if not cleaned_details:
+                    continue
+
+                detail_item = cleaned_details[0]
+                core_text = detail_item.get('core_text_content', '')
+
+                # 补齐长文封面标记供大模型阅读
+                cover_image = detail_item.get('media', {}).get('cover_image')
+                if cover_image:
+                    cover_mark = f"[长文封面: {cover_image}]"
+                    if cover_mark not in core_text:
+                        core_text = f"{cover_mark}\n\n{core_text}" if core_text else cover_mark
+
+                if core_text:
+                    item['content']['text_content'] = core_text
+
+                item['media']['cover_image'] = cover_image
+                item['media']['inline_images'] = detail_item.get('media', {}).get('inline_images', [])
+
+                long_updated += 1
+
+            # ---------- 2. 非长文：多模态标记融合 ----------
+            else:
+                media_info = item.get('media', {})
+                media_marks = []
+
+                # A. 普通图片
+                for img_url in media_info.get('images', []):
+                    if img_url:
+                        media_marks.append(f"[插图: {img_url}]")
+
+                # B. 视频及其封面
+                video_url = media_info.get('video_url')
+                if video_url:
+                    cover_image = media_info.get('cover_image')
+                    if cover_image:
+                        media_marks.append(f"[视频封面: {cover_image}]")
+                    media_marks.append(f"[视频: {video_url}]")
+
+                # C. 拼接到正文尾部
+                if media_marks:
+                    original_text = item.get('content', {}).get('text_content', '').strip()
+                    marks_text = "\n".join(media_marks)
+                    if marks_text not in original_text:
+                        item['content']['text_content'] = (
+                            f"{original_text}\n\n{marks_text}" if original_text else marks_text)
+
+                other_updated += 1
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"[UPDATE] 就地更新多模态信息失败 | post_id={post_id} | error={e}", exc_info=True)
+
+    logger.info(
+        f"✅ 详情与多模态融合完毕 | 长文深度更新={long_updated} 条 | 非长文媒体拼接={other_updated} 条 | 失败={failed} 条")
+    return final_clean_list
 
 
 if __name__ == "__main__":
-    # post_detail = fetch_binance_post_detail('341457719024369')
-    pull_feed_demo()
-
+    master_feed_list = read_json("master_feed_list.json")
+    temp_all_result_list = clean_universal_posts(master_feed_list)
+    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
     print()
-    #
-    # # logger.info("=" * 40)
-    # # logger.info("3. 测试: 广场自动化发帖")
-    # # logger.info("=" * 40)
-    # # YOUR_SQUARE_API_KEY = get_config("myself_square_api_key")
-    # # test_text = """$ETH $BTC 祝愿大家发大财 天天开心"""
-    #
-    # # if YOUR_SQUARE_API_KEY != "替换成你的_API_KEY":
-    # #     publish_to_binance_square(api_key=YOUR_SQUARE_API_KEY, text_content=test_text)
-    # # else:
-    # #     logger.warning("⚠️ 请先在代码中填入你的 API Key 再运行发帖测试！\n")
-
-
-    # # 替换为你实际抓取到的最新 Cookie (请注意保护个人隐私，不要在公开代码库中泄露)
-    # MY_COOKIE = """bnc-uuid=2772e08c-2f51-4f76-a3a7-f8d5700463fb; BNC_FV_KEY=33e0521b114aa99a931a3ed42ca03cf0147220b0; lang=zh-CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.17001513.1774485620; se_sd=AwODgTQ9QRODlRUEMEAYgZZAwVQgMEXWlZcJeW0RVVQWwFVNWVIC1; se_gd=gMaWgRxAOBIDFMTxWAQMgZZEFVhYGBXWlRSJeW0RVVQWwE1NWV4R1; se_gsd=SjUiKz9jJislGSMsNQMxBS4ECVBSBgVRWF5CW1FUVFVWNFNT1; bu_s=default; g_state={"i_l":0,"i_ll":1774485995809,"i_b":"NKbj7qtR4btoqh2wSA9LO71loBb9HeqsXc2dMxItGG0","i_e":{"enable_itp_optimization":0}}; BNC-Location=CN; theme=light; neo-theme=light; _gid=GA1.2.1014400770.1775363722; aws-waf-token=49523bea-cc30-499d-a6b5-7bb90a39c73e:AQoAhq9Ms/ICAAAA:zFrMUI32RGjn21sFH0tvoqKElNySMSYU8MiIuoJAVDtXDx000yMwC3zqBa1Qa7LApGeXibZUCk4DvTVmY03GcodqnyNhbyIoe11vHrdIaiRNOCpNQ8DKQ1iDndciMjQXY3c6ZKP+3vK/S8fg8PImMas8pAkK7GvaG8SkAb1F+RvJ5YbXEOnorSTveSc61n8E3kg=; changeBasisTimeZone=; _uetsid=c9f13b7031ca11f1950ba10f78e7c9e6; _uetvid=5eef827028ac11f18ddb31237e05f437; futures-layout=pro; _h_desk_key=8ea5542d32cc4284879ca8a4fc7ad41a; BNC_FV_KEY_T=101-Ylebao0wIcEz2Uj9MpbnsXPTrZWNWkYZp3hQyb1VE8vcKbwuvXsebklUt%2BlP0cq24ACFZyMmaWab5EPoNZ%2FyLg%3D%3D-KCNuKETgXuNoVNoZxGJBdA%3D%3D-2d; BNC_FV_KEY_EXPIRE=1775580632060; s9r1=9295BE8EC4891D0CFBBF5377C54B9454; r20t=web.D6D0A9FDF865D8BFC6029A44842218F3; r30t=1; cr00=156D95BCEAE710B7D5E8FC3A9885B90E; d1og=web.1229561321.7C28B45C2405D999E4CD78CE8DAD6698; r2o1=web.1229561321.19F0081C45D206B68BE35A511F1AB277; f30l=web.1229561321.72BF426ACE0E086CEB5DE498225372F0; currentAccount=; logined=y; p20t=web.1229561321.4519E52C213DCEFA2E046A8E6753B05E; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221229561321%22%2C%22first_id%22%3A%2219c67f1247fd9f-0944324976c3ab8-26061d51-2359296-19c67f12480b26%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTljNjdmMTI0N2ZkOWYtMDk0NDMyNDk3NmMzYWI4LTI2MDYxZDUxLTIzNTkyOTYtMTljNjdmMTI0ODBiMjYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjI5NTYxMzIxIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221229561321%22%7D%2C%22%24device_id%22%3A%2219c67f2cd51ef8-07bb7118048b2d8-26061d51-2359296-19c67f2cd52129f%22%7D; OptanonConsent=isGpcEnabled=0&datestamp=Tue+Apr+07+2026+18%3A52%3A41+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202506.1.0&browserGpcFlag=0&isIABGlobal=false&hosts=&consentId=5029ba14-0415-4560-be72-530391e051ed&interactionCount=1&isAnonUser=1&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&AwaitingReconsent=false; _ga=GA1.1.1913380912.1772289141; _ga_3WP50LGEEC=GS2.1.s1775559031$o31$g1$t1775559167$j6$l0$h0"""
-    # TARGET_UID = "CfexsWwIVYYbr1N5GJXlVQ"
-    #
-    # # 执行关注
-    # result = follow_binance_square_user(
-    #     target_uid=TARGET_UID,
-    #     cookie_str=MY_COOKIE
-    #     # 如果报错风控拦截，你需要在这里手动传入最新的 csrf_token 和 fvideo_token
-    # )
-    #
-    # logger.info(f"执行关注最终结果: {json.dumps(result, ensure_ascii=False)}")
