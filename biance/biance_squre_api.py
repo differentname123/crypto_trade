@@ -18,7 +18,7 @@ import uuid
 import requests
 
 from common.common_utils import get_config, setup_logger, save_json, read_json, download_web_media
-
+from urllib.parse import quote
 setup_logger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -986,7 +986,7 @@ def fetch_binance_feed_search(keyword, required_count, search_type=1):
     :return: 包含目标搜索结果的列表
     """
     url = "https://www.binance.com/bapi/composite/v2/friendly/pgc/feed/search/list"
-
+    encoded_keyword = quote(keyword)
     headers = {
         "User-Agent": "Mozilla/5.0 ...",
         "Accept": "*/*",
@@ -997,7 +997,7 @@ def fetch_binance_feed_search(keyword, required_count, search_type=1):
         "clienttype": "web",
         "versioncode": "2.61.0",
         "BNC-UUID": str(uuid.uuid4()),
-        "referrer": f"https://www.binance.com/zh-CN/square/search?s={keyword}"
+        "referrer": f"https://www.binance.com/zh-CN/square/search?s={encoded_keyword}"
     }
 
     def build_payload(page_index):
@@ -1295,6 +1295,9 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10):
 
 
 if __name__ == "__main__":
+
+
+
     master_feed_list = []
 
     logger.info("========== 🚀 开始全量数据抓取测试 ==========")
