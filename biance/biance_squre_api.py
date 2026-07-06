@@ -17,10 +17,11 @@ import uuid
 
 import requests
 
-from common.common_utils import get_config, setup_logger, save_json, read_json
+from common.common_utils import get_config, setup_logger, save_json, read_json, download_web_media
 
 setup_logger()
-
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 # 拿到属于当前文件的专属 logger
 logger = logging.getLogger(__name__)
 
@@ -236,7 +237,7 @@ def get_standard_schema():
         "publish_time": 0,
         "author_id": None,
         "card_type": "UNKNOWN",
-        "source":"biance",
+        "source": "biance",
 
         # --- 降级后的内层容器 ---
         "metadata": {
@@ -259,7 +260,8 @@ def get_standard_schema():
             "images": [],
             "inline_images": [],
             "video_url": None,
-            "video_duration": 0
+            "video_duration": 0,
+            "local_mapping": {}  # 【新增】用于保存网络 URL -> 本地文件路径 的映射关系
         },
         "engagement": {
             "view_count": 0,
@@ -267,7 +269,8 @@ def get_standard_schema():
             "comment_count": 0,
             "share_count": 0,
             "quote_count": 0
-        }
+        },
+        "comments": []
     }
 
 
@@ -363,6 +366,7 @@ def _assemble_common(raw_item, card_type_default, title, text_content, hashtags)
     })
 
     return data
+
 
 # ============================================================
 # 各类型专用清洗器 (仅保留差异化的 media 处理)
@@ -688,19 +692,28 @@ def update_posts_in_place(final_clean_list):
     就地更新(In-place)帖子内容：
     - 长文：回源抓取详情、覆盖正文、补齐封面标记与内嵌图
     - 非长文：将图片/视频资源以标记形式融合进正文尾部，供大模型阅读
+    - 【新增】评论：利用已有接口拉取并清洗前 10 条热门评论并挂载到原数据结构中
     """
     if not final_clean_list:
         return []
 
     long_updated = 0
     other_updated = 0
+    comments_fetched = 0  # 【新增】评论拉取成功计数器
     failed = 0
 
+    # 全局媒体下载计数器
+    total_download_urls = 0
+    total_download_success = 0
+
+    # 下载前仅打印一行总结性日志
+    logger.info(f"⏳ 开始并发/同步执行 {len(final_clean_list)} 条数据的多模态详情更新、媒体下载与评论拉取...")
+
     for item in final_clean_list:
-        # 【修改点】：直接从第一层读取 post_id
+        # 直接从第一层读取 post_id
         post_id = item.get('post_id')
         try:
-            # 【修改点】：直接从第一层读取 card_type
+            # 直接从第一层读取 card_type
             card_type = item.get('card_type')
             if not post_id:
                 continue
@@ -761,13 +774,65 @@ def update_posts_in_place(final_clean_list):
 
                 other_updated += 1
 
+            # ---------- 3. 统一拦截媒体资源，下载并建立映射 ----------
+            media_info = item.get('media', {})
+            # 兼容处理，确保 local_mapping 存在
+            if 'local_mapping' not in media_info:
+                media_info['local_mapping'] = {}
+
+            urls_to_download = set()  # 使用 Set 自动去重
+
+            # 收集该帖子内所有可能存在的非空 URL
+            if media_info.get('cover_image'):
+                urls_to_download.add(media_info['cover_image'])
+            if media_info.get('video_url'):
+                urls_to_download.add(media_info['video_url'])
+            for img_url in media_info.get('images', []):
+                if img_url:
+                    urls_to_download.add(img_url)
+            for img_url in media_info.get('inline_images', []):
+                if img_url:
+                    urls_to_download.add(img_url)
+
+            # 累计总体需要下载的媒体数
+            total_download_urls += len(urls_to_download)
+
+            # 使用文件顶部全局的 PROXIES 字典
+            proxy_url = PROXIES.get("http")
+
+            # 开始执行下载，并保存映射
+            for url in urls_to_download:
+                try:
+                    # 统一下载到 ./media_downloads 文件夹 (避免与代码混放，可自行修改目录)
+                    local_path = download_web_media(url=url, save_dir="./media_downloads", proxy=proxy_url)
+                    if local_path:
+                        media_info['local_mapping'][url] = local_path
+                        total_download_success += 1  # 累计成功下载总数
+                except Exception as dl_e:
+                    logger.error(f"[DOWNLOAD] 媒体资源下载失败 | post_id={post_id} | url={url} | error={dl_e}")
+
+            # ---------- 4. 【新增】拉取帖子评论数据 ----------
+            try:
+                # 默认拉取最热的前10条评论。独立 try-except 避免影响主干逻辑
+                replies = fetch_binance_replies(content_id=post_id, sort_by=1, required_count=10)
+                item['comments'] = replies  # 直接将清洗后的字典列表挂载到原数据结构中
+                if replies:
+                    comments_fetched += 1
+            except Exception as reply_e:
+                logger.error(f"[COMMENTS] 评论拉取失败 | post_id={post_id} | error={reply_e}")
+
         except Exception as e:
             failed += 1
             logger.error(f"[UPDATE] 就地更新多模态信息失败 | post_id={post_id} | error={e}", exc_info=True)
 
+    # 将高密度的下载与评论抓取总结信息，一步到位聚合进最终的这一行日志中
     logger.info(
-        f"✅ 详情与多模态融合完毕 | 长文深度更新={long_updated} 条 | 非长文媒体拼接={other_updated} 条 | 失败={failed} 条")
+        f"✅ 详情与多模态融合完毕 | 长文深度更新={long_updated} 条 | 非长文媒体拼接={other_updated} 条 | "
+        f"评论拉取成功={comments_fetched} 条 | "
+        f"媒体下载成功率={total_download_success}/{total_download_urls} | 失败={failed} 条"
+    )
     return final_clean_list
+
 
 def _extract_vos(res_data):
     """安全解析币安响应体，兼容 data 为 dict / list / 空 的多种结构"""
@@ -1009,7 +1074,10 @@ def fetch_binance_feed(count=20, keyword=None, token=None, **kwargs):
         logger.info(f"🔄 自动路由: [推荐流模式] | 目标条数: {count}")
         content_ids = kwargs.get("content_ids", [])
         feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
-    return feed_list
+
+    clean_feed_list = clean_universal_posts(feed_list)
+    final_clean_feed_list = update_posts_in_place(clean_feed_list)
+    return final_clean_feed_list
 
 
 def fetch_binance_post_detail(post_id):
@@ -1067,6 +1135,160 @@ def fetch_binance_post_detail(post_id):
     return None
 
 
+def clean_binance_replies(raw_replies):
+    """
+    清洗币安广场评论数据，提取高价值字段并进行扁平化处理
+
+    :param raw_replies: 从 API 获取的原始 JSON 列表
+    :return: 清洗后的精简字典列表
+    """
+    cleaned_data = []
+
+    for item in raw_replies:
+        # 1. 格式化时间 (将 13 位毫秒级时间戳转换为直观字符串)
+        create_time_ms = item.get("createTime")
+
+        # 2. 文本内容策略：中文直接用原文，非中文优先使用自带的翻译数据
+        original_text = item.get("bodyTextOnly", "")
+        detected_lang = item.get("detectedLang", "")
+
+        # 判断原文是否为中文 (包含 zh-CN, zh-TW 等)
+        is_chinese = detected_lang.startswith("zh") or item.get("lan") == "cn"
+
+        if is_chinese:
+            content = original_text
+        else:
+            # 非中文时，尝试获取 translatedData 中的 content
+            translated_data = item.get("translatedData") or {}
+            translated_text = translated_data.get("content", "")
+
+            # 如果有翻译结果，使用翻译结果；如果没有（比如系统没来得及翻译），则用原文兜底
+            content = translated_text if translated_text else original_text
+
+        # 3. 构建极简数据结构
+        clean_item = {
+            "reply_id": item.get("id"),
+            "parent_id": item.get("parentContentId"),
+            "create_time": create_time_ms,
+
+            # 作者信息
+            "author_uid": item.get("squareUid"),
+            "author_name": item.get("displayName"),
+
+            # 统一处理后的正文内容
+            "content": content.strip() if content else "",
+
+            # 互动数据
+            "likes": item.get("likeCount", 0),
+            "replies": item.get("replyCount", 0),
+            "views": item.get("viewCount", 0)
+        }
+
+        cleaned_data.append(clean_item)
+
+    return cleaned_data
+
+
+def fetch_binance_replies(content_id, sort_by=1, required_count=10):
+    """
+    获取币安广场帖子的评论列表（支持分页、重试、指定数量采集）
+
+    :param content_id:        帖子内容的 ID (int)
+    :param sort_by:           排序规则 (int)。0: 最新, 1: 最热 (默认), 2: 最相关
+    :param required_count:    需要获取的评论总条数 (int)
+    :return:                  评论列表 (list)
+    """
+    url = "https://www.binance.com/bapi/composite/v1/friendly/pgc/replyPost/list"
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "lang": "zh-CN",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+
+    all_replies = []
+    page_index = 1
+    retry_count = 0
+    label = f"评论流: {content_id}"
+
+    # ==========================
+    # 分页与重试引擎
+    # ==========================
+    while len(all_replies) < required_count:
+        payload = {
+            "pageIndex": page_index,
+            "pageSize": 20,
+            "sortBy": sort_by,
+            "contentId": int(content_id),
+            "authorSquareUid": ""
+        }
+
+        response = None
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            json_resp = response.json()
+
+            # 业务层校验
+            if not json_resp.get("success"):
+                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message')}")
+                break  # 业务错误通常不可重试（如参数错误、Token过期），直接退出
+
+            # 数据解析提取（适配不同接口可能存在的结构差异）
+            data = json_resp.get("data", [])
+            # 兼容：如果 data 是字典，列表通常在 data['list'] 或 data['replyList'] 中
+            page_items = data if isinstance(data, list) else data.get("list", [])
+
+            if not page_items:
+                logger.warning(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_replies)} 条)")
+                break
+
+            all_replies.extend(page_items)
+
+            logger.info(
+                f"📥 [{label}] 第 {page_index} 页成功 | "
+                f"新增 {len(page_items)} 条 | 累计 {len(all_replies)}/{required_count}"
+            )
+
+            # 成功后状态重置并进入下一页
+            page_index += 1
+            retry_count = 0
+            time.sleep(random.uniform(0.5, 1.5))  # 防风控休眠
+
+        except Exception as e:
+            # 核心改进：聚合式单条错误日志，完整暴露排查上下文
+            detail = ""
+            if response is not None:
+                # 截取前 500 个字符的 HTML/JSON 文本，用于判断是否触发 WAF (Cloudflare 等)
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+
+            retry_count += 1
+            logger.error(
+                f"🚨 [{label}] 第 {page_index} 页请求失败 "
+                f"(第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
+            )
+
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止采集。")
+                break
+
+            time.sleep(random.uniform(1.0, 3.0))  # 异常退避休眠，稍长一点避免封IP
+
+    clean_all_replies = clean_binance_replies(all_replies)
+
+    return clean_all_replies
+
+
 if __name__ == "__main__":
     master_feed_list = []
 
@@ -1088,6 +1310,3 @@ if __name__ == "__main__":
     master_feed_list.extend(token_data)
 
     logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
-
-    temp_all_result_list = clean_universal_posts(master_feed_list)
-    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)

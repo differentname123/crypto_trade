@@ -42,8 +42,6 @@ if __name__ == "__main__":
 
     logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
 
-    temp_all_result_list = clean_universal_posts(master_feed_list)
-    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
     db_instance = gen_db_object()
     post_manager = UniversalPostManager(db_instance)
-    post_manager.upsert_posts(final_temp_all_result_list)
+    post_manager.upsert_posts(master_feed_list)
