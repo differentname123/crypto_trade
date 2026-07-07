@@ -121,15 +121,31 @@ def fetch_follow_content():
     # 如果需要纯粹的一维列表（共 82 个独立关键词），直接遍历上述列表即可
     print(f"成功加载，共聚合 {len(aggregated_binance_follow_keywords)} 个唯一搜索关键词。")
 
-
     while True:
         master_feed_list = []
+        # 1. 从数据库查询历史数据
+        binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
+        # 2. 核心改造：提取 post_id 构建全局记忆 Set（集合）
+        existing_ids = set()
+        for post in binance_posts:
+            post_id = post.get("post_id") if isinstance(post, dict) else getattr(post, "post_id", None)
+            if post_id:
+                existing_ids.add(str(post_id))
+        logger.info(f"🧠 本轮构建记忆库完成: 数据库中已有 {len(existing_ids)} 条历史帖子记录。")
         for search_key in aggregated_binance_follow_keywords:
             logger.info(f"--- 准备抓取: 搜索流 ({search_key}) ---")
-            search_data = fetch_binance_feed(keyword=search_key, count=10)
+
+            # 3. 将 existing_ids 传给底层抓取函数，实现“见老停抓/滤旧存新”
+            search_data = fetch_binance_feed(
+                keyword=search_key,
+                count=10,
+                existing_ids=existing_ids  # <-- 核心新增参数
+            )
             master_feed_list.extend(search_data)
-        logger.info(f"抓取完成，共获取 {len(master_feed_list)} 条数据，准备保存...")
-        post_manager.upsert_posts(master_feed_list)
+        logger.info(f"✅ 抓取完成，本轮共获取【全新数据】 {len(master_feed_list)} 条，准备保存...")
+        # 4. 优化数据库写入 & 智能休眠机制
+        if master_feed_list:
+            post_manager.upsert_posts(master_feed_list)
 
 
 if __name__ == "__main__":
