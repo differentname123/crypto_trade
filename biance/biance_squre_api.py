@@ -150,80 +150,67 @@ def publish_to_binance_square(api_key, text_content):
         return False
 
 
-def follow_binance_square_user(
-        target_uid: str,
-        cookie_str: str,
-        csrf_token: str = "2d2f5e35a6c06fdcaffb1cc4aed07e97",
-        fvideo_id: str = "33e0521b114aa99a931a3ed42ca03cf0147220b0",
-        fvideo_token: str = "ifVrRUBCY6qZCeXZsw01SxM6jd0Qo0DWME1oJyDSMHiKii4Xt+8Z608h1u5uwoc2D3SD9SVR+b1vZ9oEIFXnHWvGvXQu9e+pgXh8z2nwJW+MBnod2sizCGcpYJZ+kxiA7J91RuB6pTuW3PGelPy1bNHH4GpnujoVmjyQ5jyh/Vp9v+SB6KskCh/TgksSbn85o=2c"
-) -> dict:
+
+def toggle_binance_follow(target_uid, action, cookies, csrf_token, session=None):
     """
-    通过币安私有API关注币安广场用户。
-
-    :param target_uid: 目标用户的 Square UID (例如: "CfexsWwIVYYbr1N5GJXlVQ")
-    :param cookie_str: 完整的 Cookie 字符串
-    :param csrf_token: 请求头中的 csrftoken
-    :param fvideo_id: 风控设备标识 ID
-    :param fvideo_token: 风控加密 Token
-    :return: 接口返回的 JSON 字典
+    操作币安广场用户的关注状态，单次请求不重试
     """
-    url = "https://www.binance.com/bapi/composite/v2/private/pgc/user/follow"
+    if action not in ["follow", "unfollow"]:
+        logger.error("❌ 无效的操作类型，只能是 'follow' 或 'unfollow'")
+        return False
 
-    # 动态生成 Trace ID，模拟前端每次请求的不同行为
-    trace_id = str(uuid.uuid4())
+    url = f"https://www.binance.com/bapi/composite/v2/private/pgc/user/{action}"
+    label = f"{'关注' if action == 'follow' else '取消关注'}: {target_uid}"
 
+    # 基础 Headers
     headers = {
         "accept": "*/*",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "bnc-level": "0",
-        "bnc-location": "CN",
-        "bnc-time-zone": "Asia/Shanghai",
-        "bnc-uuid": "2772e08c-2f51-4f76-a3a7-f8d5700463fb",  # 可考虑也提取为参数
         "clienttype": "web",
         "content-type": "application/json",
-        "cookie": cookie_str,
-        "csrftoken": csrf_token,
-        # device-info 保持与你的请求一致（Base64编码后的设备指纹）
-        "device-info": "eyJzY3JlZW5fcmVzb2x1dGlvbiI6IjIwNDgsMTE1MiIsImF2YWlsYWJsZV9zY3JlZW5fcmVzb2x1dGlvbiI6IjIwNDgsMTEwNCIsInN5c3RlbV92ZXJzaW9uIjoiV2luZG93cyAxMCIsImJyYW5kX21vZGVsIjoidW5rbm93biIsInN5c3RlbV9sYW5nIjoiemgtQ04iLCJ0aW1lem9uZSI6IkdNVCswODowMCIsInRpbWV6b25lT2Zmc2V0IjotNDgwLCJ1c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzE0Ni4wLjAuMCBTYWZhcmkvNTM3LjM2IiwibGlzdF9wbHVnaW4iOiJQREYgVmlld2VyLENocm9tZSBQREYgVmlld2VyLENocm9taXVtIFBERiBWaWV3ZXIsTWljcm9zb2Z0IEVkZ2UgUERGIFZpZXdlcixXZWJLaXQgYnVpbHQtaW4gUERGIiwiY2FudmFzX2NvZGUiOiJmZDJkMWY1NyIsIndlYmdsX3ZlbmRvciI6Ikdvb2dsZSBJbmMuIChOVklESUEpIiwid2ViZ2xfcmVuZGVyZXIiOiJBTkdMRSAoTlZJRElBLCBOVklESUEgR2VGb3JjZSBSVFggMzA5MCAoMHgwMDAwMjIwNCkgRGlyZWN0M0QxMSB2c181XzAgcHNfNV8wLCBEM0QxMSkiLCJhdWRpbyI6IjEyNC4wNDM0NzUyNzUxNjA3NCIsInBsYXRmb3JtIjoiV2luMzIiLCJ3ZWJfdGltZXpvbmUiOiJBc2lhL1NoYW5naGFpIiwiZGV2aWNlX25hbWUiOiJDaHJvbWUgVjE0Ni4wLjAuMCAoV2luZG93cykiLCJmaW5nZXJwcmludCI6ImQzM2I2OTcxYTY3NWUxN2RkODJiMGZmOTFkMDcyOTczIiwiZGV2aWNlX2lkIjoiIiwicmVsYXRlZF9kZXZpY2VfaWRzIjoiIn0=",
-        "fvideo-id": fvideo_id,
-        "fvideo-token": fvideo_token,
         "lang": "zh-CN",
+        "cookie": cookies,
+        "csrftoken": csrf_token,
         "origin": "https://www.binance.com",
-        "priority": "u=1, i",
-        "referer": f"https://www.binance.com/zh-CN/square/post/309692475255842?sqb=1",
-        "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "same-origin",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        "x-trace-id": trace_id,
-        "x-ui-request-trace": trace_id
+        "referer": "https://www.binance.com/",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
     }
 
     payload = {
         "targetSquareUid": target_uid
     }
 
-    try:
-        logger.info(f"⏳ 开始关注广场用户 | 目标UID: {target_uid} | TraceID: {trace_id}")
+    req_client = session if session else requests
 
-        # 使用全局代理配置
-        response = requests.post(url, headers=headers, json=payload, proxies=PROXIES,
-                                 timeout=10)  # 币安接口通常返回 HTTP 200，具体业务成功与否看 JSON 里的 code 字段
+    try:
+        # 直接发起单次请求，带上代理
+        response = req_client.post(
+            url,
+            headers=headers,
+            json=payload,
+            proxies=PROXIES,
+            timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
 
-        resp_json = response.json()
-        logger.info(
-            f"✅ 关注用户请求完成 | 目标UID: {target_uid} | 返回Code: {resp_json.get('code')} | 完整响应: {resp_json}")
-        return resp_json
+        json_resp = response.json()
 
-    except requests.exceptions.RequestException as e:
-        # 将错误信息聚合在一行
-        resp_text = e.response.text if hasattr(e, 'response') and e.response is not None else "无响应内容"
-        logger.error(f"🚨 关注用户请求异常 | 目标UID: {target_uid} | 异常信息: {e} | 响应内容: {resp_text}")
-        return {}
+        if json_resp.get("success"):
+            logger.info(f"✅ [{label}] 操作成功！")
+            return True
+        else:
+            code = json_resp.get("code")
+            msg = json_resp.get("message", "未知错误")
+            logger.error(f"❌ [{label}] API 业务错误 | Code: {code} | Msg: {msg}")
+            return False
+
+    except Exception as e:
+        detail = ""
+        if 'response' in locals() and response is not None:
+            detail = f" | HTTP {response.status_code} | 返回数据: {response.text[:200]}"
+
+        logger.error(f"🚨 [{label}] 网络或请求异常{detail} | 报错: {e}")
+        return False
 
 
 def get_standard_schema():
@@ -1342,6 +1329,117 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
     clean_all_replies = clean_binance_replies(all_replies)
 
     return clean_all_replies
+
+def fetch_binance_relations(target_username, relation_type, required_count, session=None):
+    """
+    聚合获取币安广场指定用户的关注/粉丝列表 (无需登录鉴权)
+    参数:
+        - relation_type: "following" (获取关注) 或 "followers" (获取粉丝)
+    """
+    if relation_type not in ["following", "followers"]:
+        logger.error("❌ relation_type 只能是 'following' 或 'followers'")
+        return []
+
+    # 根据不同类型分配 URL 和日志标签
+    if relation_type == "following":
+        url = "https://www.binance.com/bapi/composite/v3/friendly/pgc/user/following"
+        label = f"关注列表: {target_username}"
+    else:
+        url = "https://www.binance.com/bapi/composite/v3/friendly/pgc/user/queryFollowers"
+        label = f"粉丝列表: {target_username}"
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "origin": "https://www.binance.com",
+        "referer": f"https://www.binance.com/zh-CN/square/profile/{target_username}/{relation_type}",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    }
+
+    all_items = []
+    page_index = 1
+    page_size = 20
+    retry_count = 0
+
+    req_client = session if session else requests
+
+    while len(all_items) < required_count:
+        # 构造差异化的 Payload
+        if relation_type == "following":
+            payload = {
+                "targetUsername": target_username,
+                "pageIndex": page_index,
+                "pageSize": page_size
+            }
+        else:
+            payload = {
+                "username": target_username,
+                "pageIndex": page_index,
+                "pageSize": page_size,
+                "offset": (page_index - 1) * page_size
+            }
+
+        response = None
+        try:
+            response = req_client.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            json_resp = response.json()
+
+            if not json_resp.get("success"):
+                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message', '未知错误')}")
+                break
+
+            data_obj = json_resp.get("data")
+            if not data_obj:
+                logger.info(f"⚠️ [{label}] 第 {page_index} 页无数据，采集提前结束")
+                break
+
+            # 差异化提取返回数据
+            page_items = data_obj.get("followers", []) if isinstance(data_obj, dict) else []
+            if not page_items:
+                logger.info(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_items)} 条)")
+                break
+
+            all_items.extend(page_items)
+
+            logger.info(
+                f"📥 [{label}] 第 {page_index} 页成功 | "
+                f"新增 {len(page_items)} 条 | 累计 {len(all_items)}/{required_count}"
+            )
+
+            page_index += 1
+            retry_count = 0
+            time.sleep(random.uniform(0.5, 1.5))
+
+        except Exception as e:
+            detail = ""
+            if response is not None:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+
+            retry_count += 1
+            logger.warning(
+                f"🚨 [{label}] 第 {page_index} 页请求失败 "
+                f"(第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
+            )
+
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，终止当前采集。")
+                break
+
+            time.sleep(random.uniform(2.0, 4.0))
+
+    return all_items[:required_count]
+
 
 
 if __name__ == "__main__":
