@@ -391,7 +391,7 @@ def clean_short_posts(raw_data_list):
             failed += 1
             logger.error(f"[BUZZ_SHORT] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
 
-    logger.info(f"[BUZZ_SHORT] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    logger.debug(f"[BUZZ_SHORT] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
     return cleaned_list
 
 
@@ -442,7 +442,7 @@ def clean_reply_posts(raw_data_list):
                          exc_info=True)
 
     # 注：子帖清洗的失败日志会由专属清洗器自行打印，这里只统计最终产出和容器解析失败数
-    logger.info(
+    logger.debug(
         f"[BUZZ_REPLY] 容器解析及子帖清洗完成 | 共提取有效子帖={len(cleaned_list)} 条 | 容器失败={container_failed}")
     return cleaned_list
 
@@ -479,7 +479,7 @@ def clean_video_posts(raw_data_list):
             failed += 1
             logger.error(f"[BUZZ_VIDEO] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
 
-    logger.info(f"[BUZZ_VIDEO] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    logger.debug(f"[BUZZ_VIDEO] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
     return cleaned_list
 
 
@@ -520,7 +520,7 @@ def clean_long_posts(raw_data_list):
             failed += 1
             logger.error(f"[BUZZ_LONG] 帖子清洗失败 | post_id={raw_item.get('id')} | error={e}", exc_info=True)
 
-    logger.info(f"[BUZZ_LONG] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
+    logger.debug(f"[BUZZ_LONG] 清洗完成 | 成功={len(cleaned_list)} 失败={failed}")
     return cleaned_list
 
 
@@ -664,8 +664,7 @@ def clean_universal_posts(final_clean_list):
         card_type_counts[card_type] = card_type_counts.get(card_type, 0) + 1
         group_map.setdefault(card_type, []).append(item)
 
-    # 高密度单条日志：一次性呈现去重结果、种类数与完整分布，建立清晰排查上下文
-    logger.info(
+    logger.debug(
         f"🗂️ 分组去重完成 | 唯一记录={unique_count} | cardType种类={len(card_type_counts)} | 分布={card_type_counts}")
 
     # ---------- 2. 分发处理与合并 ----------
@@ -683,7 +682,7 @@ def clean_universal_posts(final_clean_list):
             if result_list:
                 all_clean_list.extend(result_list)
 
-    logger.info(f"🎉 通用清洗合并完毕 | 最终产出={len(all_clean_list)} 条")
+    logger.info(f"🗂️ [清洗分发] 完成 | 共处理:{unique_count}条 | 分布:{card_type_counts} | 有效产出:{len(all_clean_list)}条")
     return all_clean_list
 
 
@@ -837,7 +836,7 @@ def update_posts_in_place(final_clean_list):
         'failed': 0
     }
 
-    logger.info(f"⏳ 开始并发执行 {len(final_clean_list)} 条数据的多模态详情更新、媒体下载与评论拉取...")
+    logger.debug(f"⏳ 开始并发执行 {len(final_clean_list)} 条数据的多模态详情更新、媒体下载与评论拉取...")
 
     # 启用全局 Session 以实现 TCP 连接复用，大幅降低网络延迟
     with requests.Session() as session:
@@ -864,11 +863,11 @@ def update_posts_in_place(final_clean_list):
 
     # 最终结果高密度日志输出
     logger.info(
-        f"✅ 详情与多模态融合并发完毕 | 长文深度更新={total_stats['long_updated']} 条 | "
-        f"非长文媒体拼接={total_stats['other_updated']} 条 | "
-        f"评论拉取成功={total_stats['comments_fetched']} 条 | "
-        f"媒体下载成功率={total_stats['total_download_success']}/{total_stats['total_download_urls']} | "
-        f"失败={total_stats['failed']} 条"
+        f"✅ [并发拉取] 融合完毕 | 长文更新:{total_stats['long_updated']} | "
+        f"媒体拼接:{total_stats['other_updated']} | "
+        f"下载成功:{total_stats['total_download_success']}/{total_stats['total_download_urls']} | "
+        f"评论拉取:{total_stats['comments_fetched']} | "
+        f"失败:{total_stats['failed']}"
     )
 
     return final_clean_list
@@ -893,7 +892,7 @@ def _dedup_vos(all_vos, label):
             seen_ids.add(item_id)
             deduped.append(item)
 
-    logger.info(
+    logger.debug(
         f"✅ [{label}] 去重完成 | 抓取 {len(all_vos)} 条 | "
         f"移除重复 {len(all_vos) - len(deduped)} 条 | 最终保留 {len(deduped)} 条"
     )
@@ -928,7 +927,7 @@ def _paginate_feed(url, headers, build_payload, required_count, label, on_page=N
 
             vos = _extract_vos(response.json())
             if not vos:
-                logger.warning(
+                logger.debug(
                     f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束（已获取 {len(all_vos)} 条）"
                 )
                 break
@@ -937,7 +936,7 @@ def _paginate_feed(url, headers, build_payload, required_count, label, on_page=N
             if on_page:
                 on_page(vos)
 
-            logger.info(
+            logger.debug(
                 f"📥 [{label}] 第 {page_index} 页成功 | "
                 f"新增 {len(vos)} 条 | 累计 {len(all_vos)}/{required_count}"
             )
@@ -952,7 +951,7 @@ def _paginate_feed(url, headers, build_payload, required_count, label, on_page=N
             if response is not None and response.status_code >= 400:
                 detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
             retry_count += 1
-            logger.error(
+            logger.warning(
                 f"🚨 [{label}] 第 {page_index} 页请求失败 "
                 f"(第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
             )
@@ -1097,21 +1096,24 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
     elif isinstance(existing_ids, list):
         existing_ids = set(existing_ids)
 
+    # 提取标签供后续聚合日志使用
+    task_label = keyword if keyword else (token if token else "推荐流")
+
     # 1. 优先判断是否是“搜索流” (传了 keyword)
     if keyword:
-        logger.info(f"🔄 自动路由: [搜索模式] | 关键词: {keyword} | 目标条数: {count}")
+        logger.info(f"🚀 开始探测: [搜索流] 关键词: {keyword} | 目标条数: {count}")
         search_type = kwargs.get("search_type", 1)
         feed_list = fetch_binance_feed_search(keyword=keyword, required_count=count, search_type=search_type)
 
     # 2. 判断是否是“指定币种流” (传了 token)
     elif token:
-        logger.info(f"🔄 自动路由: [币种模式] | 币种: {token} | 目标条数: {count}")
+        logger.info(f"🚀 开始探测: [币种流] 币种: {token} | 目标条数: {count}")
         order_by = kwargs.get("orderBy", 2)
         feed_list = get_binance_feed_token(token=token, required_count=count, orderBy=order_by)
 
     # 3. 如果什么目标都没传，默认走“推荐流”
     else:
-        logger.info(f"🔄 自动路由: [推荐流模式] | 目标条数: {count}")
+        logger.info(f"🚀 开始探测: [推荐流] | 目标条数: {count}")
         content_ids = kwargs.get("content_ids", [])
         feed_list = fetch_binance_feed_recommend(required_count=count, content_ids=content_ids)
 
@@ -1132,9 +1134,12 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
         else:
             intercepted_count += 1
 
-    if intercepted_count > 0:
-        logger.info(
-            f"🛡️ 拦截生效: 成功在底层拦截 {intercepted_count} 条已处理过的重复帖子！仅放行 {len(filtered_feed_list)} 条新帖。")
+    # 零数据阻断（Early Exit），极大减少不必要的日志和计算
+    if len(filtered_feed_list) == 0:
+        logger.info(f"🛑 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理")
+        return []
+    else:
+        logger.info(f"📥 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖")
     # ==========================================
 
     # 只有【纯净的新数据】才有资格进入下面极其耗时的清洗和下载流程
@@ -1177,7 +1182,7 @@ def fetch_binance_post_detail(post_id, session=None):
             if not data_field:
                 logger.warning(f"⚠️ [详情:{post_id}] 接口未返回有效数据")
             else:
-                logger.info(f"✅ [详情:{post_id}] 获取文章详情成功")
+                logger.debug(f"✅ [详情:{post_id}] 获取文章详情成功")
 
             return data_field
 
@@ -1186,7 +1191,7 @@ def fetch_binance_post_detail(post_id, session=None):
             if response is not None and response.status_code >= 400:
                 detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
             retry_count += 1
-            logger.error(
+            logger.warning(
                 f"🚨 [详情:{post_id}] 请求失败 (第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
             )
             if retry_count >= MAX_RETRIES:
@@ -1303,12 +1308,12 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
             page_items = data if isinstance(data, list) else data.get("list", [])
 
             if not page_items:
-                logger.warning(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_replies)} 条)")
+                logger.debug(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_replies)} 条)")
                 break
 
             all_replies.extend(page_items)
 
-            logger.info(
+            logger.debug(
                 f"📥 [{label}] 第 {page_index} 页成功 | "
                 f"新增 {len(page_items)} 条 | 累计 {len(all_replies)}/{required_count}"
             )
@@ -1323,7 +1328,7 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
                 detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
 
             retry_count += 1
-            logger.error(
+            logger.warning(
                 f"🚨 [{label}] 第 {page_index} 页请求失败 "
                 f"(第 {retry_count}/{MAX_RETRIES} 次){detail} | 异常: {e}"
             )

@@ -138,7 +138,7 @@ def fetch_follow_content():
             # 3. 将 existing_ids 传给底层抓取函数，实现“见老停抓/滤旧存新”
             search_data = fetch_binance_feed(
                 keyword=search_key,
-                count=10,
+                count=1000,
                 existing_ids=existing_ids  # <-- 核心新增参数
             )
             master_feed_list.extend(search_data)
