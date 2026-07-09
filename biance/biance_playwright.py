@@ -24,7 +24,7 @@ import traceback
 # 配置区域
 # ==============================================================================
 # 用于保存浏览器登录状态的目录，请确保该目录可写
-USER_DATA_DIR = r"W:\temp\coin"
+USER_DATA_DIR = r"W:\temp\dahao"
 # 登录目标地址
 LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
@@ -310,35 +310,15 @@ def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[st
     # 【核心调整】：让 with 语句包裹整个错误捕获流程
     with sync_playwright() as p:
         try:
-            if (15 <= datetime.datetime.now().hour < 15):
-                context = p.chromium.launch_persistent_context(
-                    channel="chrome",
-                    user_data_dir=user_data_dir,
-                    headless=False,
-                    viewport={'width': 1920, 'height': 1080},
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-gpu',
-                        '--window-position=-10000,-10000',
-                        '--no-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-renderer-backgrounding',
-                        '--disable-background-timer-throttling',
-                        '--disable-backgrounding-occluded-windows',
-                        '--disable-features=CalculateNativeWinOcclusion',
-                        '--disable-breakpad',
-                    ],
-                    ignore_default_args=["--enable-automation"]
-                )
-            else:
-                context = p.chromium.launch_persistent_context(
-                    channel="chrome",
-                    user_data_dir=user_data_dir,
-                    headless=False,
-                    args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--disable-gpu',
-                          '--window-position=0,0'],
-                    ignore_default_args=["--enable-automation"]
-                )
+
+            context = p.chromium.launch_persistent_context(
+                channel="chrome",
+                user_data_dir=user_data_dir,
+                headless=False,
+                args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--disable-gpu',
+                      '--window-position=0,0'],
+                ignore_default_args=["--enable-automation"]
+            )
 
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(60000)
@@ -411,7 +391,7 @@ if __name__ == '__main__':
     # ==================================
     # 步骤 1：首次使用请取消下面这行的注释进行登录
     # ==================================
-    # login_and_save_session()
+    login_and_save_session()
 
     # ==================================
     # 步骤 2：登录成功后，使用自动化评论功能
