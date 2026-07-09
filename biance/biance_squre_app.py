@@ -303,7 +303,7 @@ def _get_uids_from_recent_posts(post_manager, days_ago=7, limit=50000):
     return extracted_uids
 
 
-def auto_sync_binance_follows(user_key=f"dahao"):
+def auto_sync_binance_follows(user_key=f"nana"):
     """
     主流程：自动化同步并执行币安广场关注任务
     """
@@ -367,18 +367,15 @@ def auto_sync_binance_follows(user_key=f"dahao"):
             cookies=my_cookies,
             csrf_token=csrf_token
         )
-
         if is_success:
             success_count += 1
         else:
             fail_count += 1
-
         # ⚠️ 极度重要：防风控休眠机制
         # 如果这是最后一条，就不需要休眠了
         if index < len(final_uids_to_follow):
-            # 随机休眠 2.0 到 5.5 秒，模拟真人操作节奏
-            sleep_time = random.uniform(2.0, 5.5)
-            logger.debug(f"⏳ 防风控休眠 {sleep_time:.2f} 秒...")
+            sleep_time = random.uniform(60, 90)
+            logger.info(f"⏳ 防风控休眠 {sleep_time:.2f} 秒...")
             time.sleep(sleep_time)
 
     logger.info(f"========== 🏁 任务执行完毕 | 成功: {success_count} | 失败: {fail_count} ==========")
