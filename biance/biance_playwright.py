@@ -143,51 +143,60 @@ def _submit_comment(page: Page, editor_container, comment: str, image_path: Opti
 
     # --- 第 1 步：点击伪装框唤醒真实编辑器 ---
     print("[*] 正在唤醒编辑器...")
-    # [特征锚点 2 - 伪装框]: 容器里第一个 input
     fake_input = editor_container.locator('input[type="text"], input[placeholder]').first
     fake_input.click()
 
-    # [特征锚点 3 - 真编辑器]: 带有 contenteditable="true" 和 ProseMirror 的 div
     real_editor = editor_container.locator('div[contenteditable="true"].ProseMirror').first
     expect(real_editor).to_be_editable(timeout=8000)
 
-    # --- 第 2 步：模拟真人逐字输入 ---
-    print("[*] 编辑器就绪，开始填入文字...")
-    real_editor.click()
-    # 弃用 keyboard.type，使用更底层的 press_sequentially 模拟真实物理敲击
-    real_editor.press_sequentially(comment, delay=30)
-    print("[+] 文字填写完毕。")
-
-    # --- 第 3 步：确定性传图 (告别 sleep) ---
+    # --- 第 2 步：【优化核心】先传图，防抖动，防吞字 ---
+    # 原因：部分现代框架在上传图片后会触发重绘(Re-render)，从而清空之前输入的未绑定文本。先传图可破此局。
     if image_path and os.path.exists(image_path):
         print(f"[*] 准备上传图片: {image_path}")
         try:
-            # 直接暴力向底层 input 注入文件，最稳
             file_input = editor_container.locator('input[type="file"]').first
             file_input.set_input_files(image_path)
+            print("[*] 图片已注入，等待前端渲染机制稳定...")
 
-            # [特征锚点 4 - 图片预览]: 传图后出现的缩略图大框
-            preview_box = editor_container.locator('div.images-box-item').first
-            print("[*] 图片已注入，等待服务器返回缩略图...")
-
-            # 见图行事：最多等30秒。如果网快 0.5秒出来，代码就0.5秒放行
-            preview_box.wait_for(state="visible", timeout=30000)
-            print("[+] 图片渲染成功！")
+            # 弃用不稳定的死类名(images-box-item)，改用普适缓冲，规避 DOM 改版导致的 30 秒卡死
+            page.wait_for_timeout(3500)
+            print("[+] 图片加载及页面状态机刷新完成。")
         except Exception as e:
-            print(f"[!] 警告: 图片上传似乎失败或超时，将降级发送纯文本。原因: {e}")
+            print(f"[!] 警告: 图片上传环节发生异常，将尝试降级发送纯文本。原因: {e}")
+
+    # --- 第 3 步：模拟真人逐字输入 (二次校验加固) ---
+    print("[*] 编辑器就绪，开始填入文字...")
+    real_editor.click()
+    page.wait_for_timeout(800)  # 停顿，等待光标彻底聚焦和框架稳定
+
+    # 稍微降速以适应富文本编辑器的监听器
+    real_editor.press_sequentially(comment, delay=60)
+
+    # 【核心防御】：校验文字是否真的存活，如果被吞直接重补
+    page.wait_for_timeout(500)
+    if not real_editor.inner_text().strip():
+        print("[!] 检测到文字被前端框架静默清空，触发重试补录...")
+        real_editor.click()
+        real_editor.press_sequentially(comment, delay=60)
+
+    print("[+] 文字填写并校验挂载完毕。")
 
     # --- 第 4 步：防抖拦截与按钮就绪检查 ---
     print("[*] 检查发送按钮状态...")
-    # [特征锚点 5 - 发送按钮]: 容器内的发送按钮
     send_button = editor_container.locator("button").filter(
         has_text=re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
     ).first
 
-    # [特征锚点 6 - 按钮不可用特征]: aria-disabled="true"
-    # 等待按钮脱离 disabled 状态（等待图片传完后台防抖结束）
-    expect(send_button).not_to_have_attribute("aria-disabled", "true", timeout=15000)
+    # 【优化核心】：直接使用原生的启用状态断言，替代容易变动的 aria-disabled
+    try:
+        expect(send_button).to_be_enabled(timeout=10000)
+    except Exception:
+        print("[!] 警告: 发送按钮预期状态未达标，但将尝试强制执行流...")
 
-    # --- 第 5 步：API 状态机 + 降级点击 + DOM 兜底 (核心神技) ---
+    # [拦截数据] 获取点击发送前的真实文本长度，防止假成功
+    text_before_send = real_editor.inner_text().strip()
+
+    # --- 第 5 步：API 状态机 + 降级点击 + DOM 兜底 ---
     print("[*] 执行发送操作 (API网络监听护航中)...")
 
     api_success = False
@@ -195,7 +204,6 @@ def _submit_comment(page: Page, editor_container, comment: str, image_path: Opti
 
     try:
         # 挂起 API 监听网兜: 盯死 pgc/content/add 接口，限时 10 秒
-        # [特征锚点 7 - 发送 API]: URL 包含 /pgc/content/add
         with page.expect_response(
                 lambda response: "pgc/content/add" in response.url and response.request.method == "POST",
                 timeout=10000) as response_info:
@@ -213,7 +221,6 @@ def _submit_comment(page: Page, editor_container, comment: str, image_path: Opti
         resp = response_info.value
         json_data = resp.json()
 
-        # [特征锚点 8 - 成功标志]: code 为 "000000" 或 success 为 true
         if json_data.get("code") == "000000" or json_data.get("success") is True:
             api_success = True
             print(f"[+] API 返回底层确认，评论 100% 发送成功！(耗时极短)")
@@ -224,16 +231,18 @@ def _submit_comment(page: Page, editor_container, comment: str, image_path: Opti
 
     except PlaywrightTimeoutError:
         print("[*] API 监听超时(可能接口改版或网络极卡)，启动老版本 DOM 兜底校验...")
-        pass  # 不报错，交给下面的 DOM 兜底处理
+        pass
 
-    # 【DOM 兜底检验】如果 API 没抓到，用原来的方法看字数变没变少
+        # 【优化核心：DOM 兜底检验修复】
     if not api_success:
-        time.sleep(2)  # 给前端一点渲染收起的时间
-        current_text = real_editor.inner_text().strip() if real_editor.is_visible() else ""
-        if len(current_text) < (len(comment.strip()) / 3):
-            print("[+] DOM 兜底校验通过：输入框文字已清空，判定为成功！")
+        time.sleep(3)  # 给前端一点渲染收起的时间
+        text_after_send = real_editor.inner_text().strip() if real_editor.is_visible() else ""
+
+        # 修复逻辑漏洞：必须是发送前确实有字，且发送后字被清空，才能判定为成功
+        if len(text_before_send) > 0 and len(text_after_send) < (len(text_before_send) / 3):
+            print("[+] DOM 兜底校验通过：输入框文字已成功清空，判定为成功！")
         else:
-            raise Exception("发送操作已执行，但输入框未清空且API无响应，疑似发送失败。")
+            raise Exception("发送操作已执行，但输入框未清空且API无响应，疑似发送失败 (或者按钮根本没激活)。")
 
 
 def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[str] = None,
@@ -262,7 +271,7 @@ def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[st
             page.goto(post_url)
             page.wait_for_load_state("domcontentloaded")
 
-            # 【前置探活】：检查是否处于登录状态 (通过右下角有没有全局的发帖按钮等特征，这里用松散校验)
+            # 【前置探活】：检查是否处于登录状态
             if page.locator("a[href*='login']").is_visible(timeout=3000):
                 raise Exception("检测到登录失效 (页面存在 Login 按钮)，请重新执行 login_and_save_session。")
 
@@ -317,7 +326,7 @@ if __name__ == '__main__':
     test_msg = "少即是多，慢即是快。同频共振！🚀"
 
     # 无图测试设为 None，有图填绝对路径
-    test_img = None
+    test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
 
     err, success = comment_on_binance_post(test_url, test_msg, test_img)
 
