@@ -391,13 +391,13 @@ if __name__ == '__main__':
     # ==================================
     # 步骤 1：首次使用请取消下面这行的注释进行登录
     # ==================================
-    login_and_save_session()
+    # login_and_save_session()
 
     # ==================================
     # 步骤 2：登录成功后，使用自动化评论功能
     # ==================================
     test_post_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
-    test_comment_text = "携手共进！"
+    test_comment_text = "携手共进！一起加油"
 
     # 【新增测试用例】：填写本地图片的绝对路径，如果不需要发图片，保持为 None 即可
     test_image_path = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-2366355a6874.png"
