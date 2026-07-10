@@ -129,7 +129,9 @@ def fetch_follow_content():
         master_feed_list = []
         # 1. 从数据库查询历史数据
         binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
+        auto_sync_binance_follows("dahao")
         auto_sync_binance_follows()
+
         # 2. 核心改造：提取 post_id 构建全局记忆 Set（集合）
         existing_ids = set()
         for post in binance_posts:
@@ -328,7 +330,7 @@ def auto_sync_binance_follows(user_key=f"nana"):
 
     # 3. 拉取远端数据
     following_uids, followers_uids = _get_current_relations(my_name, max_count=10000)
-    extracted_uids = _get_uids_from_recent_posts(post_manager, days_ago=300, limit=50000)
+    extracted_uids = _get_uids_from_recent_posts(post_manager, days_ago=30, limit=50000)
 
     # 4. 核心逻辑运算 (利用 Set 的高效运算机制)
     # 集合A: 帖子中提取出来的，且我还没关注的
