@@ -340,7 +340,7 @@ def auto_sync_binance_follows(user_key=f"nana"):
     extracted_uids = _get_uids_from_recent_posts(post_manager, days_ago=30, limit=50000)
 
 
-    valid_square_uid_list = get_worth_following_list(initial_user_name_list=following_user_name_list, target_count=100, visited_user_name_list=[], exist_uids=list(following_uids))
+    valid_square_uid_list = get_worth_following_list(initial_user_name_list=following_user_name_list, target_count=200, visited_user_name_list=[], exist_uids=list(following_uids))
 
     extracted_uids = extracted_uids.union(set(valid_square_uid_list))
     # 4. 核心逻辑运算 (利用 Set 的高效运算机制)
@@ -508,7 +508,7 @@ def get_worth_following_list(initial_user_name_list, target_count, visited_user_
     logger.info(
         f"🚀 种子初始化成功！实际作为本轮种子的有 {len(current_batch)} 人。已排除的历史(存在)UID有 {len(exist_uids_set)} 个。")
 
-    max_workers = 5
+    max_workers = 20
 
     def _check_user_task(name):
         # 传入内存中的 user_info_map 进行查询和更新
