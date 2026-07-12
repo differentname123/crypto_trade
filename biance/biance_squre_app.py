@@ -18,6 +18,7 @@ from biance.biance_squre_api import fetch_binance_feed, clean_universal_posts, u
 from common.common_utils import setup_logger, get_config, read_json, save_json
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
+import concurrent.futures
 
 setup_logger()
 
@@ -129,6 +130,8 @@ def fetch_follow_content():
         master_feed_list = []
         # 1. 从数据库查询历史数据
         binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
+
+
         auto_sync_binance_follows("dahao")
         auto_sync_binance_follows()
 
@@ -336,6 +339,10 @@ def auto_sync_binance_follows(user_key=f"nana"):
     following_uids,following_user_name_list, followers_uids, followers_user_name_list = _get_current_relations(my_name, max_count=10000)
     extracted_uids = _get_uids_from_recent_posts(post_manager, days_ago=30, limit=50000)
 
+
+    valid_square_uid_list = get_worth_following_list(initial_user_name_list=following_user_name_list, target_count=100, visited_user_name_list=[], exist_uids=list(following_uids))
+
+    extracted_uids = extracted_uids.union(set(valid_square_uid_list))
     # 4. 核心逻辑运算 (利用 Set 的高效运算机制)
     # 集合A: 帖子中提取出来的，且我还没关注的
     need_to_follow_from_posts = extracted_uids - following_uids
@@ -441,33 +448,142 @@ def predict_follow_back(follow_count, follower_count):
         }
 
 
-def is_need_follow_user(user_name):
+def is_need_follow_user(user_name, user_info_map):
     """
-    判断是否需要关注某个用户
-    :param user_name:
-    :return:
+    判断是否需要关注某个用户 (已移除内部文件读写，纯内存运算适配并发)
     """
-    user_info_path = f"user_profile.json"
-    user_info_map = read_json(user_info_path)
-
     if user_name not in user_info_map:
-        user_info = fetch_binance_user_profile(username)
-        user_info_map[user_name] = user_info
+        user_info = fetch_binance_user_profile(user_name)
+        if not user_info:
+            return False, None
+
+        # === 仅在此处修改：只保留预测和业务所需的必要字段，进行内存瘦身 ===
+        pruned_info = {
+            'squareUid': user_info.get('squareUid'),
+            'totalFollowCount': user_info.get('totalFollowCount', 0),
+            'totalFollowerCount': user_info.get('totalFollowerCount', 0)
+        }
+
+        # 写入内存字典 (Python 字典单键赋值是线程安全的)
+        user_info_map[user_name] = pruned_info
     else:
         user_info = user_info_map[user_name]
 
-    save_json(user_info, f"{user_name}_profile.json")
     follow_count = user_info.get('totalFollowCount', 0)
     follower_count = user_info.get('totalFollowerCount', 0)
+    square_uid = user_info.get('squareUid')
+
     predict_info = predict_follow_back(follow_count, follower_count)
 
-    return predict_info['is_recommended'], predict_info['squareUid']
+    return predict_info['is_recommended'], square_uid
 
+
+def get_worth_following_list(initial_user_name_list, target_count, visited_user_name_list, exist_uids):
+    """
+    基于种子用户不断裂变，使用多线程并发获取值得关注的用户
+    (增加外层批量保存缓存数据功能 & 存在列表过滤)
+    """
+    logger.info(f"🕸️ 开始并发裂变获取，目标数量: {target_count}")
+
+    if not initial_user_name_list:
+        logger.error("❌ 致命错误: 传入的 initial_user_name_list 为空！无法启动裂变，请检查外层调用参数。")
+        return []
+
+    # 统一将 exist_uids 转为字符串集合，防止因为 int 和 str 类型不同导致比对失败
+    exist_uids_set = set(str(uid) for uid in (exist_uids or []))
+
+    # 1. 在最外层统一读取历史画像文件，避免并发读写冲突
+    user_info_path = "user_profile.json"
+    user_info_map = read_json(user_info_path) or {}
+
+    valid_square_uids = set()
+    visited_names_set = set(visited_user_name_list)
+    current_batch = set(initial_user_name_list) - visited_names_set
+
+    if not current_batch:
+        logger.warning(
+            f"⚠️ 初始名单包含 {len(initial_user_name_list)} 人，但剔除 visited_user_name_list 后剩余 0 人。裂变终止。")
+        return []
+
+    logger.info(
+        f"🚀 种子初始化成功！实际作为本轮种子的有 {len(current_batch)} 人。已排除的历史(存在)UID有 {len(exist_uids_set)} 个。")
+
+    max_workers = 5
+
+    def _check_user_task(name):
+        # 传入内存中的 user_info_map 进行查询和更新
+        is_rec, uid = is_need_follow_user(name, user_info_map)
+        return name, is_rec, uid
+
+    def _get_relations_task(name):
+        return _get_current_relations(name, max_count=1000)
+
+    while current_batch and len(valid_square_uids) < target_count:
+        logger.info(f"--- 🔄 本层待检测用户: {len(current_batch)} 人 (并发度: {max_workers}) ---")
+
+        successful_names = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_name = {executor.submit(_check_user_task, name): name for name in current_batch}
+
+            for future in concurrent.futures.as_completed(future_to_name):
+                name = future_to_name[future]
+
+                visited_names_set.add(name)
+                if name not in visited_user_name_list:
+                    visited_user_name_list.append(name)
+
+                try:
+                    name, is_recommended, square_uid = future.result()
+                    if is_recommended and square_uid:
+                        # === 新增逻辑：判断是否在 exist_uids 中 ===
+                        if str(square_uid) not in exist_uids_set:
+                            valid_square_uids.add(square_uid)
+                            successful_names.append(name)
+                            logger.info(
+                                f"🎯 命中新目标! [{name}] 符合条件. 当前进度: {len(valid_square_uids)}/{target_count}")
+
+                            if len(valid_square_uids) >= target_count:
+                                break
+                        else:
+                            # 虽然不计数，但该用户是优质节点，保留作为下一层的裂变种子
+                            successful_names.append(name)
+                            logger.info(f"⏭️ [{name}] 优质但已在 exist_uids 中，跳过计数，仅保留为下一层裂变种子。")
+
+                except Exception as e:
+                    logger.error(f"❌ 检查用户 [{name}] 时发生异常: {e}")
+
+        if len(valid_square_uids) >= target_count:
+            break
+
+        current_batch = set()
+        if successful_names:
+            logger.info(f"🔍 目标未满，并发获取 {len(successful_names)} 个优质用户的关系链...")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_seed = {executor.submit(_get_relations_task, seed): seed for seed in successful_names}
+
+                for future in concurrent.futures.as_completed(future_to_seed):
+                    try:
+                        following_uids, following_names, followers_uids, follower_names = future.result()
+                        current_batch.update(following_names)
+                        current_batch.update(follower_names)
+                    except Exception as e:
+                        logger.error(f"❌ 获取关系链时发生异常: {e}")
+
+            current_batch -= visited_names_set
+        else:
+            logger.warning("⚠️ 本批次没有符合要求的用户，裂变断层。")
+
+    # 2. 整个裂变网络跑完后，在外层统一落盘保存一次
+    save_json(user_info_map, user_info_path)
+    logger.info(f"💾 用户画像缓存已批量落盘保存至 {user_info_path}")
+
+    logger.info(f"🎉 裂变获取任务结束，最终获取到 {len(valid_square_uids)} 个有效目标 UID。")
+    return list(valid_square_uids)
 
 
 if __name__ == "__main__":
-    username = "insights_anchor"
-    _get_current_relations(username)
     try:
         fetch_follow_content()
     except Exception as e:
