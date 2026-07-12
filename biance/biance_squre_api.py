@@ -1441,6 +1441,86 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
     return all_items[:required_count]
 
 
+def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3):
+    """
+    获取币安广场用户的公开主页信息
+
+    :param username: 目标用户名 (例如: "Insights_Anchor")
+    :param session: 外部传入的 requests.Session() 对象，用于连接池复用
+    :param proxies: 代理配置，例如 {"http": "...", "https": "..."}
+    :param timeout: 请求超时时间
+    :param max_retries: 最大重试次数
+    :return: 包含用户信息的字典，失败则返回 None
+    """
+    url = "https://www.binance.com/bapi/composite/v3/friendly/pgc/user/client"
+
+    # 精简 Headers：保留基础的语言、客户端类型和 User-Agent 即可满足公共接口校验
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "lang": "zh-CN",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    }
+
+    # 构造请求体，默认开启所有的查询开关
+    payload = {
+        "username": username,
+        "getFollowCount": True,
+        "queryFollowersInfo": True,
+        "queryRelationTokens": True
+    }
+
+    label = f"用户主页: {username}"
+    req_client = session if session else requests
+    retry_count = 0
+
+    # 采用和你参考代码一致的重试逻辑，但去掉了分页的 while
+    while retry_count < max_retries:
+        response = None
+        try:
+            response = req_client.post(
+                url,
+                headers=headers,
+                json=payload,
+                proxies=PROXIES,
+                timeout=timeout
+            )
+            response.raise_for_status()
+
+            json_resp = response.json()
+
+            # 校验币安 API 业务层的 success 字段
+            if not json_resp.get("success"):
+                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message')}")
+                return {}
+
+            data = json_resp.get("data")
+            logger.debug(f"📥 [{label}] 数据获取成功")
+            return data
+
+        except Exception as e:
+            detail = ""
+            if response is not None:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:500]}"
+
+            retry_count += 1
+            logger.warning(
+                f"🚨 [{label}] 请求失败 "
+                f"(第 {retry_count}/{max_retries} 次){detail} | 异常: {e}"
+            )
+
+            if retry_count >= max_retries:
+                logger.error(f"❌ [{label}] 连续失败达到 {max_retries} 次上限，终止采集。")
+                break
+
+            # 失败后随机休眠 1~3 秒再重试，防封控
+            time.sleep(random.uniform(1.0, 3.0))
+
+    return {}
+
+
 
 if __name__ == "__main__":
 

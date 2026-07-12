@@ -14,8 +14,8 @@ import time
 from datetime import datetime, timedelta
 
 from biance.biance_squre_api import fetch_binance_feed, clean_universal_posts, update_posts_in_place, \
-    toggle_binance_follow, fetch_binance_relations
-from common.common_utils import setup_logger, get_config
+    toggle_binance_follow, fetch_binance_relations, fetch_binance_user_profile
+from common.common_utils import setup_logger, get_config, read_json, save_json
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
@@ -264,30 +264,34 @@ def extract_mutual_follow_users(posts: list, target_time_str: str) -> set:
 
     return extracted_uids
 
-def _get_current_relations(my_name, max_count=10000):
+def _get_current_relations(user_name, max_count=10):
     """
     内部辅助函数：获取当前的关注和粉丝集合 (直接返回 set，优化后续的交并差集运算)
     """
-    logger.info(f"🔍 开始获取 [{my_name}] 的社交关系链...")
+    logger.info(f"🔍 开始获取 [{user_name}] 的社交关系链...")
 
     following_list = fetch_binance_relations(
-        target_username=my_name,
+        target_username=user_name,
         relation_type="following",
         required_count=max_count
     )
     # 直接使用集合推导式，过滤掉空 UID
     following_uids = {user.get('squareUid') for user in following_list if user.get('squareUid')}
+
+    following_user_name_list = [user.get('username') for user in following_list if user.get('username')]
     logger.info(f"✅ 成功获取关注列表，共 {len(following_uids)} 人")
 
     followers_list = fetch_binance_relations(
-        target_username=my_name,
+        target_username=user_name,
         relation_type="followers",
         required_count=max_count
     )
     followers_uids = {user.get('squareUid') for user in followers_list if user.get('squareUid')}
+    followers_user_name_list = [user.get('username') for user in followers_list if user.get('username')]
+
     logger.info(f"✅ 成功获取粉丝列表，共 {len(followers_uids)} 人")
 
-    return following_uids, followers_uids
+    return following_uids,following_user_name_list, followers_uids, followers_user_name_list
 
 
 def _get_uids_from_recent_posts(post_manager, days_ago=7, limit=50000):
@@ -329,7 +333,7 @@ def auto_sync_binance_follows(user_key=f"nana"):
         return
 
     # 3. 拉取远端数据
-    following_uids, followers_uids = _get_current_relations(my_name, max_count=10000)
+    following_uids,following_user_name_list, followers_uids, followers_user_name_list = _get_current_relations(my_name, max_count=10000)
     extracted_uids = _get_uids_from_recent_posts(post_manager, days_ago=30, limit=50000)
 
     # 4. 核心逻辑运算 (利用 Set 的高效运算机制)
@@ -383,8 +387,87 @@ def auto_sync_binance_follows(user_key=f"nana"):
     logger.info(f"========== 🏁 任务执行完毕 | 成功: {success_count} | 失败: {fail_count} ==========")
 
 
-if __name__ == "__main__":
+def predict_follow_back(follow_count, follower_count):
+    """
+    根据关注数和粉丝数，判断目标用户回关的概率是否大概率(>50%)。
+    返回一个字典，包含是否建议关注(is_recommended)、预计概率(probability)和具体原因(reason)。
+    """
+    # 0. 基础排错：防止除以 0 的情况
+    if follower_count == 0:
+        return {
+            "is_recommended": False,
+            "probability": "< 5%",
+            "reason": "粉丝数为0，绝对的死号或新号，无参考价值。"
+        }
 
+    # 1. 第一道漏斗：粉丝数框定 (锁定能看见你，且珍惜粉丝的人)
+    if not (100 <= follower_count <= 3000):
+        return {
+            "is_recommended": False,
+            "probability": "< 10%",
+            "reason": f"粉丝数({follower_count})不在黄金区间(100~3000)。小于100是边缘号，大于3000消息易被折叠或有包袱。"
+        }
+
+    # 2. 第二道漏斗：关注数框定 (排除高冷自闭号和海量营销号)
+    if not (200 <= follow_count <= 1500):
+        return {
+            "is_recommended": False,
+            "probability": "< 10%",
+            "reason": f"关注数({follow_count})不在安全区间(200~1500)。小于200极度排外，大于1500信息流爆炸或是脚本号。"
+        }
+
+    # 3. 第三道漏斗：关注/粉丝比例 (锁定互惠心理)
+    ratio = follow_count / follower_count
+    if not (0.8 <= ratio <= 1.5):
+        return {
+            "is_recommended": False,
+            "probability": "< 20%",
+            "reason": f"比例({ratio:.2f})不在互惠区间(0.8~1.5)。不是高冷白嫖党就是单向看客。"
+        }
+
+    # === 只要活着走到这里的，绝对是优质目标 (胜率 > 50%) ===
+
+    if ratio >= 1.0:
+        return {
+            "is_recommended": True,
+            "probability": "70% - 90%",
+            "reason": "绝对VIP目标：活跃真人且关注数大于等于粉丝数，处于强烈的涨粉需求期，必回关！"
+        }
+    else:
+        return {
+            "is_recommended": True,
+            "probability": "50% - 70%",
+            "reason": "优质目标：非常健康的社交活跃用户，数据咬得很紧，大概率顺手回关。"
+        }
+
+
+def is_need_follow_user(user_name):
+    """
+    判断是否需要关注某个用户
+    :param user_name:
+    :return:
+    """
+    user_info_path = f"user_profile.json"
+    user_info_map = read_json(user_info_path)
+
+    if user_name not in user_info_map:
+        user_info = fetch_binance_user_profile(username)
+        user_info_map[user_name] = user_info
+    else:
+        user_info = user_info_map[user_name]
+
+    save_json(user_info, f"{user_name}_profile.json")
+    follow_count = user_info.get('totalFollowCount', 0)
+    follower_count = user_info.get('totalFollowerCount', 0)
+    predict_info = predict_follow_back(follow_count, follower_count)
+
+    return predict_info['is_recommended'], predict_info['squareUid']
+
+
+
+if __name__ == "__main__":
+    username = "insights_anchor"
+    _get_current_relations(username)
     try:
         fetch_follow_content()
     except Exception as e:
