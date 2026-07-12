@@ -576,7 +576,7 @@ def get_worth_following_list(initial_user_name_list, target_count, visited_user_
             logger.warning("⚠️ 本批次没有符合要求的用户，裂变断层。")
 
     # 2. 整个裂变网络跑完后，在外层统一落盘保存一次
-    save_json(user_info_map, user_info_path)
+    save_json(user_info_path, user_info_map)
     logger.info(f"💾 用户画像缓存已批量落盘保存至 {user_info_path}")
 
     logger.info(f"🎉 裂变获取任务结束，最终获取到 {len(valid_square_uids)} 个有效目标 UID。")
