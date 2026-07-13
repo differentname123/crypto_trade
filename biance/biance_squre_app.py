@@ -20,7 +20,8 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 setup_logger()
 
 # 拿到属于当前文件的专属 logger
@@ -272,7 +273,7 @@ def _get_current_relations(user_name, max_count=10):
     """
     内部辅助函数：获取当前的关注和粉丝集合 (直接返回 set，优化后续的交并差集运算)
     """
-    logger.info(f"🔍 开始获取 [{user_name}] 的社交关系链...")
+    # logger.info(f"🔍 开始获取 [{user_name}] 的社交关系链...")
 
     following_list = fetch_binance_relations(
         target_username=user_name,
@@ -286,7 +287,7 @@ def _get_current_relations(user_name, max_count=10):
     following_map = {user.get('username'): user.get('squareUid') for user in following_list if user.get('username') and user.get('squareUid')}
 
 
-    logger.info(f"✅ 成功获取关注列表，共 {len(following_map)} 人")
+    logger.info(f"✅ [{user_name}] 成功获取关注列表，共 {len(following_map)} 人")
 
     followers_list = fetch_binance_relations(
         target_username=user_name,
@@ -481,15 +482,27 @@ def is_need_follow_user(user_name, user_info_map):
     return predict_info
 
 
+# 假设 logger, _get_current_relations, is_need_follow_user, read_json, save_json 已在外部定义
+
 # ==================== 抽取：获取关系的单任务 ====================
-def _fetch_relation_task(user_name, max_count, has_cache):
-    if has_cache:
-        logger.info(f"⚠️ [{user_name}] 已在缓存中，跳过重复获取关系链。")
+def _fetch_relation_task(user_name, max_count, cached_relations):
+    """
+    获取关系链的单任务：传入的 cached_relations 必须是字典或 None，彻底阻断网络请求
+    """
+    # 【修复1】：正确处理传入的字典缓存，不再报错崩溃
+    if cached_relations:
+        # 降级为 debug 防止几万个缓存命中直接刷爆控制台
+        # logger.debug(f"♻️ [{user_name}] 命中关系链缓存，真正跳过网络请求。")
+        return user_name, cached_relations.get('following', {}), cached_relations.get('followers', {})
+
     following_map, follower_map = _get_current_relations(user_name, max_count)
     return user_name, following_map, follower_map
 
 
-def get_all_relations(user_name_list, max_count=1000, all_user_map={}):
+def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
+    if all_user_map is None:
+        all_user_map = {}
+
     current_user_map = {}
 
     logger.info(f"🔄 [关系链获取] 开始并发请求，目标用户数: {len(user_name_list)}，并发度: 20")
@@ -497,35 +510,52 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map={}):
     with ThreadPoolExecutor(max_workers=20) as executor:
         future_to_user = {}
         for user_name in user_name_list:
-            has_cache = (user_name in all_user_map and
-                         'following' in all_user_map[user_name] and
-                         'followers' in all_user_map[user_name])
+            # 【修复1】：提取真正的缓存字典传入，而不是布尔值
+            user_data = all_user_map.get(user_name, {})
+            has_valid_cache = 'following' in user_data and 'followers' in user_data
+            cached_data = user_data if has_valid_cache else None
 
-            future = executor.submit(_fetch_relation_task, user_name, max_count, has_cache)
+            future = executor.submit(_fetch_relation_task, user_name, max_count, cached_data)
             future_to_user[future] = user_name
+
+        success_count = 0
+        cache_hit_count = 0
 
         for future in as_completed(future_to_user):
             user_name = future_to_user[future]
             try:
                 _, following_map, follower_map = future.result()
-                all_user_map[user_name] = {
-                    "following": following_map,
-                    "followers": follower_map
-                }
+
+                # 判断是否是缓存命中（通过判断原来数据有没有来粗略统计，仅用于日志展示）
+                if 'following' in all_user_map.get(user_name, {}):
+                    cache_hit_count += 1
+
+                # 【修复2】：增量更新字典，绝不覆盖原有的画像特征（Profile）数据！
+                if user_name not in all_user_map:
+                    all_user_map[user_name] = {}
+                all_user_map[user_name]["following"] = following_map
+                all_user_map[user_name]["followers"] = follower_map
+
                 current_user_map[user_name] = {
                     "following": following_map,
                     "followers": follower_map
                 }
+                success_count += 1
                 logger.debug(f"✅ 成功获取 [{user_name}] 关系链: 关注 {len(following_map)} | 粉丝 {len(follower_map)}")
             except Exception as e:
                 logger.error(f"❌ [关系链获取] 用户 [{user_name}] 获取异常: {e}")
 
-    logger.info(f"✅ [关系链获取] 本批次并发执行完毕，共获取 {len(current_user_map)} 名用户数据。")
+    logger.info(
+        f"✅ [关系链获取] 执行完毕: 共获取 {success_count} 名用户数据 (其中 {cache_hit_count} 名极速命中缓存跳过网络)。")
     return current_user_map
 
 
 # ==================== 抽取：预测用户的单任务 ====================
-def _evaluate_user_task(user_name, square_uid, user_info_map):
+def _evaluate_user_task(user_name, square_uid, user_info_map, stop_event):
+    # 【修复4】：线程池真正停止的拦截点。如果收到停止信号，直接退出不发请求！
+    if stop_event.is_set():
+        return user_name, square_uid, None  # 返回 None 标识被中止
+
     predict_info = is_need_follow_user(user_name, user_info_map)
     return user_name, square_uid, predict_info
 
@@ -533,21 +563,21 @@ def _evaluate_user_task(user_name, square_uid, user_info_map):
 def get_worth_following_list(initial_user_name_list, target_count):
     """
     基于种子用户不断裂变，使用多线程并发获取值得关注的用户
-    (增加外层批量保存缓存数据功能 & 存在列表过滤)
     """
     logger.info(f"🕸️ 开始并发裂变获取，目标数量: {target_count}")
 
     if not initial_user_name_list:
-        logger.error("❌ 致命错误: 传入的 initial_user_name_list 为空！无法启动裂变，请检查外层调用参数。")
+        logger.error("❌ 致命错误: 传入的 initial_user_name_list 为空！")
         return []
 
-    # 1. 在最外层统一读取历史画像文件，避免并发读写冲突
     user_info_path = "user_profile.json"
     user_info_map = read_json(user_info_path)
     valid_square_uids = set()
     this_turn_good_users = initial_user_name_list
 
-    turn_count = 1  # 增加轮次计数器辅助日志
+    # 【修复3】：初始化全局黑名单，杜绝同一个人被重复预测导致的死循环
+    evaluated_users = set()
+    turn_count = 1
 
     while len(valid_square_uids) < target_count:
         logger.info(
@@ -555,7 +585,6 @@ def get_worth_following_list(initial_user_name_list, target_count):
 
         current_user_info_map = get_all_relations(this_turn_good_users, max_count=1000, all_user_map=user_info_map)
 
-        # 解析出current_user_map所有的user_name和squareUid，构建一个全局的已存在UID集合
         current_user_id_map = {}
         for user_name, relations in current_user_info_map.items():
             current_user_id_map.update(relations.get('following', {}))
@@ -563,41 +592,60 @@ def get_worth_following_list(initial_user_name_list, target_count):
 
         this_turn_good_users = []
 
-        logger.info(f"🔍 [画像预测] 本轮待分析关系链用户数: {len(current_user_id_map)}，开始20线程并发预测...")
+        # 【修复3】：在扔进线程池前，严格剔除历史上已经被分析过的人
+        pending_users = {uname: uid for uname, uid in current_user_id_map.items() if uname not in evaluated_users}
+
+        if not pending_users:
+            logger.warning("⚠️ 警告：本轮关系链中未发现任何【未被分析过】的新用户，裂变链条闭环断裂，提前退出！")
+            break
+
+        logger.info(
+            f"🔍 [画像预测] 本轮提取 {len(current_user_id_map)} 人，去重后真正待预测新用户: {len(pending_users)} 人，启动并发预测...")
+
+        # 【修复4】：创建全局停止信号对象
+        stop_event = threading.Event()
 
         with ThreadPoolExecutor(max_workers=20) as executor:
-            # 提交所有待预测用户任务
-            future_to_user = {
-                executor.submit(_evaluate_user_task, user_name, square_uid, user_info_map): user_name
-                for user_name, square_uid in current_user_id_map.items()
-            }
+            future_to_user = {}
+            for user_name, square_uid in pending_users.items():
+                evaluated_users.add(user_name)  # 加入全局黑名单
+                # 注入 stop_event 供子线程自省
+                future = executor.submit(_evaluate_user_task, user_name, square_uid, user_info_map, stop_event)
+                future_to_user[future] = user_name
 
-            # 并发收集结果
             for future in as_completed(future_to_user):
                 user_name = future_to_user[future]
                 try:
                     _, uid, predict_info = future.result()
+
+                    # 识别被 stop_event 强制停止的任务
+                    if predict_info is None:
+                        continue
+
                     is_recommended = predict_info.get('is_recommended', False)
-                    # 保留原判断逻辑
                     if is_recommended and uid and str(uid):
                         this_turn_good_users.append(user_name)
                         valid_square_uids.add(str(uid))
+                        # 控制台打印这句是有必要的，给用户吃下定心丸，看到进度在涨
                         logger.info(
                             f"🌟 发现高潜用户: [{user_name}] | 当前达标进度: {len(valid_square_uids)}/{target_count}")
 
-                        # 提前终止判断，防止无用的持续解析
+                        # 【修复4】：不仅仅 break，还要拉响全局停止警报
                         if len(valid_square_uids) >= target_count:
-                            logger.info("🎉 达标数量已满足，正在停止本轮并发预测解析...")
+                            logger.info("🎉 达标数量已满足，正在向线程池发送阻断信号，秒级停止剩余任务...")
+                            stop_event.set()  # 唤醒所有排队中/刚执行的线程立刻 return
+                            # 对 python 3.9+ 还能顺手把还没调度的任务直接取消
+                            for f in future_to_user:
+                                f.cancel()
                             break
                 except Exception as e:
                     logger.error(f"❌ [画像预测] 用户 [{user_name}] 预测异常: {e}")
 
         logger.info(
-            f"💾 [数据持久化] 第 {turn_count} 轮结束，发现新高潜种子: {len(this_turn_good_users)} 人，正在保存全量用户画像...")
+            f"💾 [数据持久化] 第 {turn_count} 轮结束，发现新高潜种子: {len(this_turn_good_users)} 人，正在保存增量合并后的画像...")
         save_json(user_info_path, user_info_map)
         turn_count += 1
 
-        # 兜底逻辑：防止裂变断层导致死循环
         if not this_turn_good_users and len(valid_square_uids) < target_count:
             logger.warning("⚠️ 警告：本轮未发现任何新的高潜用户，裂变链条断裂，提前退出！")
             break

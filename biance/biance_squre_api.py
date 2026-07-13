@@ -914,19 +914,19 @@ def _paginate_feed(url, headers, build_payload, required_count, label, on_page=N
 
             vos = _extract_vos(response.json())
             if not vos:
-                logger.debug(
-                    f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束（已获取 {len(all_vos)} 条）"
-                )
+                # logger.debug(
+                #     f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束（已获取 {len(all_vos)} 条）"
+                # )
                 break
 
             all_vos.extend(vos)
             if on_page:
                 on_page(vos)
 
-            logger.debug(
-                f"📥 [{label}] 第 {page_index} 页成功 | "
-                f"新增 {len(vos)} 条 | 累计 {len(all_vos)}/{required_count}"
-            )
+            # logger.debug(
+            #     f"📥 [{label}] 第 {page_index} 页成功 | "
+            #     f"新增 {len(vos)} 条 | 累计 {len(all_vos)}/{required_count}"
+            # )
 
             page_index += 1
             retry_count = 0
@@ -1295,15 +1295,15 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
             page_items = data if isinstance(data, list) else data.get("list", [])
 
             if not page_items:
-                logger.debug(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_replies)} 条)")
+                # logger.debug(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_replies)} 条)")
                 break
 
             all_replies.extend(page_items)
 
-            logger.debug(
-                f"📥 [{label}] 第 {page_index} 页成功 | "
-                f"新增 {len(page_items)} 条 | 累计 {len(all_replies)}/{required_count}"
-            )
+            # logger.debug(
+            #     f"📥 [{label}] 第 {page_index} 页成功 | "
+            #     f"新增 {len(page_items)} 条 | 累计 {len(all_replies)}/{required_count}"
+            # )
 
             page_index += 1
             retry_count = 0
@@ -1407,15 +1407,15 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
             # 差异化提取返回数据
             page_items = data_obj.get("followers", []) if isinstance(data_obj, dict) else []
             if not page_items:
-                logger.info(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_items)} 条)")
+                # logger.info(f"⚠️ [{label}] 第 {page_index} 页无更多数据，采集结束 (已获取 {len(all_items)} 条)")
                 break
 
             all_items.extend(page_items)
 
-            logger.info(
-                f"📥 [{label}] 第 {page_index} 页成功 | "
-                f"新增 {len(page_items)} 条 | 累计 {len(all_items)}/{required_count}"
-            )
+            # logger.info(
+            #     f"📥 [{label}] 第 {page_index} 页成功 | "
+            #     f"新增 {len(page_items)} 条 | 累计 {len(all_items)}/{required_count}"
+            # )
 
             page_index += 1
             retry_count = 0
