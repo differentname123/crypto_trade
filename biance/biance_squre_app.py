@@ -274,7 +274,7 @@ def _get_current_relations(user_name, max_count=10):
     内部辅助函数：获取当前的关注和粉丝集合 (直接返回 set，优化后续的交并差集运算)
     """
     # logger.info(f"🔍 开始获取 [{user_name}] 的社交关系链...")
-
+    start_time = time.time()
     following_list = fetch_binance_relations(
         target_username=user_name,
         relation_type="following",
@@ -286,9 +286,6 @@ def _get_current_relations(user_name, max_count=10):
     following_user_name_list = [user.get('username') for user in following_list if user.get('username')]
     following_map = {user.get('username'): user.get('squareUid') for user in following_list if user.get('username') and user.get('squareUid')}
 
-
-    logger.info(f"✅ [{user_name}] 成功获取关注列表，共 {len(following_map)} 人")
-
     followers_list = fetch_binance_relations(
         target_username=user_name,
         relation_type="followers",
@@ -298,7 +295,7 @@ def _get_current_relations(user_name, max_count=10):
     followers_user_name_list = [user.get('username') for user in followers_list if user.get('username')]
     follower_map = {user.get('username'): user.get('squareUid') for user in followers_list if user.get('username') and user.get('squareUid')}
 
-    logger.info(f"✅ 成功获取粉丝列表，共 {len(follower_map)} 人")
+    logger.info(f"✅  [{user_name}] 成功获取关注列表，共 {len(following_map)} 人 成功获取粉丝列表，共 {len(follower_map)} 人 耗时 {time.time() - start_time:.2f} 秒")
 
     return following_map, follower_map
 
