@@ -398,86 +398,111 @@ def auto_sync_binance_follows(user_key=f"nana"):
     logger.info(f"========== 🏁 任务执行完毕 | 成功: {success_count} | 失败: {fail_count} ==========")
 
 
-def predict_follow_back(follow_count, follower_count):
+def predict_follow_back(user_info):
     """
-    根据关注数和粉丝数，判断目标用户回关的概率是否大概率(>50%)。
-    返回一个字典，包含是否建议关注(is_recommended)、预计概率(probability)和具体原因(reason)。
+    根据多维度的用户画像，判断目标用户回关的概率。
+    加入低质量、封禁状态、0互动死号、以及最后活跃时间的拦截漏斗。
     """
-    # 0. 基础排错：防止除以 0 的情况
+    follow_count = user_info.get('totalFollowCount', 0)
+    follower_count = user_info.get('totalFollowerCount', 0)
+
+    # ================= 1. 官方风控与状态过滤 (一票否决) =================
+    if user_info.get('lowQuality', False):
+        return {"is_recommended": False, "probability": "0%", "reason": "官方标记的低质量/降权号"}
+
+    if user_info.get('userStatus', 1) != 1:
+        return {"is_recommended": False, "probability": "0%", "reason": "账号状态异常(封禁或静默)"}
+
+    # ================= 2. 僵尸号/机器号过滤 =================
+    # 如果关注数很大，但发帖和点赞全是0，极大可能是刷粉脚本或抽奖机器
+    if user_info.get('totalListedPostCount', 0) == 0 and user_info.get('totalLikeCount', 0) == 0:
+        if follow_count > 50:
+            return {"is_recommended": False, "probability": "0%", "reason": "0发帖0点赞的批量机器/僵尸号"}
+
+    # ================= 3. 活跃度时间过滤 (沉寂号) =================
+    modify_time_ms = user_info.get('modifyTime', 0)
+    if modify_time_ms > 0:
+        # 计算距离现在有多少天没有动过资料
+        days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
+        if days_inactive > 180:  # 超过半年没活跃过
+            return {"is_recommended": False, "probability": "< 5%",
+                    "reason": f"长达 {int(days_inactive)} 天未活跃的沉寂号"}
+
+    # ================= 4. T0 级强意图核武器 (直接保送) =================
+    # 顺手把 biography 加上，如果简介里写了互关，无视下面所有条件直接关注
+    bio = user_info.get('biography', '').lower()
+    if any(k in bio for k in ['互关', '互粉', '必回', 'f4f', 'follow back']):
+        return {"is_recommended": True, "probability": "99%", "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
+
+    # ================= 5. 数据比例核心漏斗 =================
     if follower_count == 0:
-        return {
-            "is_recommended": False,
-            "probability": "< 5%",
-            "reason": "粉丝数为0，绝对的死号或新号，无参考价值。"
-        }
+        return {"is_recommended": False, "probability": "< 5%", "reason": "粉丝数为0，绝对的死号或新号。"}
 
-    # 1. 第一道漏斗：粉丝数框定 (锁定能看见你，且珍惜粉丝的人)
-    if not (100 <= follower_count <= 3000):
-        return {
-            "is_recommended": False,
-            "probability": "< 10%",
-            "reason": f"粉丝数({follower_count})不在黄金区间(100~3000)。小于100是边缘号，大于3000消息易被折叠或有包袱。"
-        }
+    # 将区间收缩到最饥渴的范围
+    if not (50 <= follower_count <= 1500):
+        return {"is_recommended": False, "probability": "< 10%",
+                "reason": f"粉丝数({follower_count})不在饥渴区间(50~1500)。"}
 
-    # 2. 第二道漏斗：关注数框定 (排除高冷自闭号和海量营销号)
-    if not (200 <= follow_count <= 1500):
-        return {
-            "is_recommended": False,
-            "probability": "< 10%",
-            "reason": f"关注数({follow_count})不在安全区间(200~1500)。小于200极度排外，大于1500信息流爆炸或是脚本号。"
-        }
+    if not (100 <= follow_count <= 1500):
+        return {"is_recommended": False, "probability": "< 10%",
+                "reason": f"关注数({follow_count})不在安全区间(100~1500)。"}
 
-    # 3. 第三道漏斗：关注/粉丝比例 (锁定互惠心理)
     ratio = follow_count / follower_count
     if not (0.8 <= ratio <= 1.5):
-        return {
-            "is_recommended": False,
-            "probability": "< 20%",
-            "reason": f"比例({ratio:.2f})不在互惠区间(0.8~1.5)。不是高冷白嫖党就是单向看客。"
-        }
+        return {"is_recommended": False, "probability": "< 20%", "reason": f"比例({ratio:.2f})不在互惠区间(0.8~1.5)。"}
 
-    # === 只要活着走到这里的，绝对是优质目标 (胜率 > 50%) ===
-
+    # === 走到这里的，是优质活跃真人目标 ===
     if ratio >= 1.0:
-        return {
-            "is_recommended": True,
-            "probability": "70% - 90%",
-            "reason": "绝对VIP目标：活跃真人且关注数大于等于粉丝数，处于强烈的涨粉需求期，必回关！"
-        }
+        return {"is_recommended": True, "probability": "70% - 90%",
+                "reason": "强潜目标：活跃真人且关注数大于等于粉丝数，必回关！"}
     else:
-        return {
-            "is_recommended": True,
-            "probability": "50% - 70%",
-            "reason": "优质目标：非常健康的社交活跃用户，数据咬得很紧，大概率顺手回关。"
-        }
+        return {"is_recommended": False, "probability": "50% - 70%",
+                "reason": "优质目标：健康的社交活跃用户，大概率顺手回关。"}
 
 
 def is_need_follow_user(user_name, user_info_map):
     """
-    判断是否需要关注某个用户 (已移除内部文件读写，纯内存运算适配并发)
+    判断是否需要关注某个用户 (加入结果硬缓存，避免重复拉取和重复预测)
     """
-    if 'totalFollowCount' not in user_info_map.get(user_name, {}):
-        user_info = fetch_binance_user_profile(user_name)
-        if not user_info:
-            return False, None
+    # 1. 【防重复机制】：如果这个用户之前已经预测过，直接返回本地缓存的结果！
+    if user_name in user_info_map and 'predict_info' in user_info_map[user_name]:
+        return user_info_map[user_name]['predict_info']
 
-        # === 仅在此处修改：只保留预测和业务所需的必要字段，进行内存瘦身 ===
+    # 2. 如果没有基础数据，拉取 API
+    if 'squareUid' not in user_info_map.get(user_name, {}):
+        user_info = fetch_binance_user_profile(user_name)
+
+        # 如果 API 拉取失败（网络问题或账号注销）
+        if not user_info:
+            # 记录失败状态，下次再碰到他，直接拦截，不会再去傻傻发网络请求
+            failed_predict = {"is_recommended": False, "probability": "0%", "reason": "API拉取失败或用户不存在"}
+            user_info_map.setdefault(user_name, {})['predict_info'] = failed_predict
+            return failed_predict
+
+        # 3. 内存瘦身：只保留对我们过滤和预测有用的关键字段
         pruned_info = {
             'squareUid': user_info.get('squareUid'),
             'totalFollowCount': user_info.get('totalFollowCount', 0),
-            'totalFollowerCount': user_info.get('totalFollowerCount', 0)
+            'totalFollowerCount': user_info.get('totalFollowerCount', 0),
+            'lowQuality': user_info.get('lowQuality', False),
+            'userStatus': user_info.get('userStatus', 1),
+            'totalListedPostCount': user_info.get('totalListedPostCount', 0),
+            'totalLikeCount': user_info.get('totalLikeCount', 0),
+            'modifyTime': user_info.get('modifyTime', 0),
+            'biography': user_info.get('biography', '')  # 顺手加上用于 T0 判定
         }
-
-        # 写入内存字典 (使用 setdefault 保证多线程并发时字典键赋值的安全)
         user_info_map.setdefault(user_name, {}).update(pruned_info)
     else:
         user_info = user_info_map[user_name]
 
-    follow_count = user_info.get('totalFollowCount', 0)
-    follower_count = user_info.get('totalFollowerCount', 0)
-    predict_info = predict_follow_back(follow_count, follower_count)
-    return predict_info
+    # 4. 执行预测引擎
+    predict_info = predict_follow_back(user_info)
 
+    # 5. 【持久化结果】：把预测结果写进 user_info_map
+    # 下次就算重启脚本，从 json 加载出来的 map 里也有这个结果，彻底阻断重复预测
+    user_info_map[user_name]['predict_info'] = predict_info
+
+    return predict_info
 
 # 假设 logger, _get_current_relations, is_need_follow_user, read_json, save_json 已在外部定义
 
