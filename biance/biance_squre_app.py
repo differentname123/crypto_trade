@@ -22,10 +22,12 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 setup_logger()
 
 # 拿到属于当前文件的专属 logger
 logger = logging.getLogger(__name__)
+
 
 def fetch_follow_content():
     db_instance = gen_db_object()
@@ -132,7 +134,6 @@ def fetch_follow_content():
         master_feed_list = []
         # 1. 从数据库查询历史数据
         binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
-
 
         auto_sync_binance_follows("dahao")
         auto_sync_binance_follows()
@@ -269,6 +270,7 @@ def extract_mutual_follow_users(posts: list, target_time_str: str) -> set:
 
     return extracted_uids
 
+
 def _get_current_relations(user_name, max_count=10):
     """
     内部辅助函数：获取当前的关注和粉丝集合 (直接返回 set，优化后续的交并差集运算)
@@ -284,7 +286,8 @@ def _get_current_relations(user_name, max_count=10):
     following_uids = {user.get('squareUid') for user in following_list if user.get('squareUid')}
 
     following_user_name_list = [user.get('username') for user in following_list if user.get('username')]
-    following_map = {user.get('username'): user.get('squareUid') for user in following_list if user.get('username') and user.get('squareUid')}
+    following_map = {user.get('username'): user.get('squareUid') for user in following_list if
+                     user.get('username') and user.get('squareUid')}
 
     followers_list = fetch_binance_relations(
         target_username=user_name,
@@ -293,9 +296,11 @@ def _get_current_relations(user_name, max_count=10):
     )
     followers_uids = {user.get('squareUid') for user in followers_list if user.get('squareUid')}
     followers_user_name_list = [user.get('username') for user in followers_list if user.get('username')]
-    follower_map = {user.get('username'): user.get('squareUid') for user in followers_list if user.get('username') and user.get('squareUid')}
+    follower_map = {user.get('username'): user.get('squareUid') for user in followers_list if
+                    user.get('username') and user.get('squareUid')}
 
-    logger.info(f"✅  [{user_name}] 成功获取关注列表，共 {len(following_map)} 人 成功获取粉丝列表，共 {len(follower_map)} 人 耗时 {time.time() - start_time:.2f} 秒")
+    logger.info(
+        f"✅  [{user_name}] 成功获取关注列表，共 {len(following_map)} 人 成功获取粉丝列表，共 {len(follower_map)} 人 耗时 {time.time() - start_time:.2f} 秒")
 
     return following_map, follower_map
 
@@ -424,7 +429,7 @@ def predict_follow_back(user_info):
     if modify_time_ms > 0:
         # 计算距离现在有多少天没有动过资料
         days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
-        if days_inactive > 180:  # 超过半年没活跃过
+        if days_inactive > 30:  # 超过半年没活跃过
             return {"is_recommended": False, "probability": "< 5%",
                     "reason": f"长达 {int(days_inactive)} 天未活跃的沉寂号"}
 
@@ -466,7 +471,13 @@ def is_need_follow_user(user_name, user_info_map):
     """
     # 1. 【防重复机制】：如果这个用户之前已经预测过，直接返回本地缓存的结果！
     if user_name in user_info_map and 'predict_info' in user_info_map[user_name]:
-        return user_info_map[user_name]['predict_info']
+        predict_info = user_info_map[user_name]['predict_info']
+        # 【修改：旧缓存清洗】如果历史缓存中判断他为 False，立刻剥离所有无用的大体量数据，释放内存与硬盘空间
+        if predict_info.get('is_recommended') is False:
+            keys_to_remove = [k for k in user_info_map[user_name].keys() if k not in ('predict_info', 'squareUid')]
+            for k in keys_to_remove:
+                del user_info_map[user_name][k]
+        return predict_info
 
     # 2. 如果没有基础数据，拉取 API
     if 'squareUid' not in user_info_map.get(user_name, {}):
@@ -476,7 +487,8 @@ def is_need_follow_user(user_name, user_info_map):
         if not user_info:
             # 记录失败状态，下次再碰到他，直接拦截，不会再去傻傻发网络请求
             failed_predict = {"is_recommended": False, "probability": "0%", "reason": "API拉取失败或用户不存在"}
-            user_info_map.setdefault(user_name, {})['predict_info'] = failed_predict
+            # 【修改：最简存储】失败的号只存极简结论，防膨胀
+            user_info_map[user_name] = {'predict_info': failed_predict}
             return failed_predict
 
         # 3. 内存瘦身：只保留对我们过滤和预测有用的关键字段
@@ -499,10 +511,19 @@ def is_need_follow_user(user_name, user_info_map):
     predict_info = predict_follow_back(user_info)
 
     # 5. 【持久化结果】：把预测结果写进 user_info_map
-    # 下次就算重启脚本，从 json 加载出来的 map 里也有这个结果，彻底阻断重复预测
-    user_info_map[user_name]['predict_info'] = predict_info
+    # 【修改：数据拦截分流】如果不值得关注，仅保存用于跳过拉取的最简信息
+    if predict_info.get('is_recommended') is False:
+        square_uid = user_info_map.get(user_name, {}).get('squareUid')
+        user_info_map[user_name] = {
+            'predict_info': predict_info,
+            'squareUid': square_uid
+        }
+    else:
+        # 对值得关注的高潜用户，完整保留他的 profile 和 predict_info
+        user_info_map[user_name]['predict_info'] = predict_info
 
     return predict_info
+
 
 # 假设 logger, _get_current_relations, is_need_follow_user, read_json, save_json 已在外部定义
 
@@ -532,8 +553,14 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
     with ThreadPoolExecutor(max_workers=20) as executor:
         future_to_user = {}
         for user_name in user_name_list:
-            # 【修复1】：提取真正的缓存字典传入，而不是布尔值
             user_data = all_user_map.get(user_name, {})
+
+            # 【修改：终极拦截机制】只要我们明确判定过他 is_recommended 为 False，绝对不拉取他的关系链！
+            if user_data.get('predict_info', {}).get('is_recommended') is False:
+                # 扔一个空的占位符进去，保证裂变链条不崩溃，同时跳过网络请求
+                current_user_map[user_name] = {"following": {}, "followers": {}}
+                continue
+
             has_valid_cache = 'following' in user_data and 'followers' in user_data
             cached_data = user_data if has_valid_cache else None
 
@@ -555,8 +582,11 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
                 # 【修复2】：增量更新字典，绝不覆盖原有的画像特征（Profile）数据！
                 if user_name not in all_user_map:
                     all_user_map[user_name] = {}
-                all_user_map[user_name]["following"] = following_map
-                all_user_map[user_name]["followers"] = follower_map
+
+                # 【修改：只为有价值的目标落地关系链】
+                if all_user_map[user_name].get('predict_info', {}).get('is_recommended') is not False:
+                    all_user_map[user_name]["following"] = following_map
+                    all_user_map[user_name]["followers"] = follower_map
 
                 current_user_map[user_name] = {
                     "following": following_map,
