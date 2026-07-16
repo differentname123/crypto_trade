@@ -271,7 +271,7 @@ def extract_mutual_follow_users(posts: list, target_time_str: str) -> set:
     return extracted_uids
 
 
-def _get_current_relations(user_name, max_count=10):
+def _get_current_relations(user_name, max_count=10, progress_ctx=None):
     """
     内部辅助函数：获取当前的关注和粉丝集合 (直接返回 set，优化后续的交并差集运算)
     """
@@ -299,11 +299,17 @@ def _get_current_relations(user_name, max_count=10):
     follower_map = {user.get('username'): user.get('squareUid') for user in followers_list if
                     user.get('username') and user.get('squareUid')}
 
+    # ================= 进度信息格式化 =================
+    progress_str = ""
+    if progress_ctx is not None:
+        with progress_ctx["lock"]:
+            progress_ctx["count"] += 1
+            progress_str = f"[{progress_ctx['count']}/{progress_ctx['total']}] "
+
     logger.info(
-        f"✅  [{user_name}] 成功获取关注列表，共 {len(following_map)} 人 成功获取粉丝列表，共 {len(follower_map)} 人 耗时 {time.time() - start_time:.2f} 秒")
+        f"{progress_str}✅  [{user_name}] 成功获取关注列表，共 {len(following_map)} 人 成功获取粉丝列表，共 {len(follower_map)} 人 耗时 {time.time() - start_time:.2f} 秒")
 
     return following_map, follower_map
-
 
 def _get_uids_from_recent_posts(post_manager, days_ago=7, limit=50000):
     """
@@ -435,7 +441,8 @@ def predict_follow_back(user_info):
 
     # ================= 4. T0 级强意图核武器 (直接保送) =================
     # 顺手把 biography 加上，如果简介里写了互关，无视下面所有条件直接关注
-    bio = user_info.get('biography', '').lower()
+    bio = (user_info.get('biography') or '').lower()
+
     if any(k in bio for k in ['互关', '互粉', '必回', 'f4f', 'follow back']):
         return {"is_recommended": True, "probability": "99%", "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
 
@@ -525,20 +532,22 @@ def is_need_follow_user(user_name, user_info_map):
     return predict_info
 
 
-# 假设 logger, _get_current_relations, is_need_follow_user, read_json, save_json 已在外部定义
-
 # ==================== 抽取：获取关系的单任务 ====================
-def _fetch_relation_task(user_name, max_count, cached_relations):
+def _fetch_relation_task(user_name, max_count, cached_relations, progress_ctx=None):
     """
     获取关系链的单任务：传入的 cached_relations 必须是字典或 None，彻底阻断网络请求
     """
     # 【修复1】：正确处理传入的字典缓存，不再报错崩溃
     if cached_relations:
+        # 如果命中缓存跳过网络请求，也需要让整体进度 +1
+        if progress_ctx is not None:
+            with progress_ctx["lock"]:
+                progress_ctx["count"] += 1
         # 降级为 debug 防止几万个缓存命中直接刷爆控制台
         # logger.debug(f"♻️ [{user_name}] 命中关系链缓存，真正跳过网络请求。")
         return user_name, cached_relations.get('following', {}), cached_relations.get('followers', {})
 
-    following_map, follower_map = _get_current_relations(user_name, max_count)
+    following_map, follower_map = _get_current_relations(user_name, max_count, progress_ctx)
     return user_name, following_map, follower_map
 
 
@@ -547,8 +556,16 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
         all_user_map = {}
 
     current_user_map = {}
+    total_users = len(user_name_list)
 
-    logger.info(f"🔄 [关系链获取] 开始并发请求，目标用户数: {len(user_name_list)}，并发度: 20")
+    logger.info(f"🔄 [关系链获取] 开始并发请求，目标用户数: {total_users}，并发度: 20")
+
+    # ================= 初始化线程安全的进度上下文 =================
+    progress_ctx = {
+        "count": 0,
+        "total": total_users,
+        "lock": threading.Lock()
+    }
 
     with ThreadPoolExecutor(max_workers=20) as executor:
         future_to_user = {}
@@ -559,12 +576,17 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
             if user_data.get('predict_info', {}).get('is_recommended') is False:
                 # 扔一个空的占位符进去，保证裂变链条不崩溃，同时跳过网络请求
                 current_user_map[user_name] = {"following": {}, "followers": {}}
+
+                # 直接被拦截的用户也属于任务总数的一部分，进度 +1
+                with progress_ctx["lock"]:
+                    progress_ctx["count"] += 1
                 continue
 
             has_valid_cache = 'following' in user_data and 'followers' in user_data
             cached_data = user_data if has_valid_cache else None
 
-            future = executor.submit(_fetch_relation_task, user_name, max_count, cached_data)
+            # 将进度上下文透传给具体的 worker
+            future = executor.submit(_fetch_relation_task, user_name, max_count, cached_data, progress_ctx)
             future_to_user[future] = user_name
 
         success_count = 0
@@ -600,7 +622,6 @@ def get_all_relations(user_name_list, max_count=1000, all_user_map=None):
     logger.info(
         f"✅ [关系链获取] 执行完毕: 共获取 {success_count} 名用户数据 (其中 {cache_hit_count} 名极速命中缓存跳过网络)。")
     return current_user_map
-
 
 # ==================== 抽取：预测用户的单任务 ====================
 def _evaluate_user_task(user_name, square_uid, user_info_map, stop_event):
@@ -657,7 +678,7 @@ def get_worth_following_list(initial_user_name_list, target_count):
         # 【修复4】：创建全局停止信号对象
         stop_event = threading.Event()
 
-        with ThreadPoolExecutor(max_workers=20) as executor:
+        with ThreadPoolExecutor(max_workers=30) as executor:
             future_to_user = {}
             for user_name, square_uid in pending_users.items():
                 evaluated_users.add(user_name)  # 加入全局黑名单
