@@ -13,6 +13,7 @@ from common.common_utils import get_config, setup_logger
 
 logger = setup_logger()
 
+
 # ==========================================
 # 1. 数据与统计层 (Append-Only Ledger)
 # ==========================================
@@ -66,9 +67,10 @@ class GridNode:
         self.last_update_ts = time.time()
 
     def generate_oid(self, strategy_id, action):
-        """生成确定性幂等单号: 前缀_策略ID_节点ID_动作_轮次 (限制36字符)"""
-        # 示例: GD_S1_N01_B_0 (B=Buy开仓, S=Sell平仓)
-        return f"GD_{strategy_id}_{self.node_id}_{action}_{self.cycle_count}"
+        """生成绝对确定的唯一单号: 前缀_策略ID_节点ID_动作_轮次_毫秒级时间戳后缀 (限制36字符)"""
+        # 示例: GD_S1_N01_B_0_12345678 (即使反复重试单号也具有唯一性，彻底消除混淆)
+        ts_suffix = str(int(time.time() * 1000))[-8:]
+        return f"GD_{strategy_id}_{self.node_id}_{action}_{self.cycle_count}_{ts_suffix}"
 
     def process_event(self, event, exchange, symbol, strategy_id, ledger):
         """
@@ -108,13 +110,21 @@ class GridNode:
                 f"[NODE_STATE] {self.node_id} | 订单被撤销或拒单, 触发原样重挂 | CID:{self.active_client_oid}")
             ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED", self.active_client_oid, 0, 0, "WARN",
                           msg="触发补挂")
-            # 保持状态不变，复用原OID重挂
+            # 保持状态不变，但生成全新的单号重挂 (自动治愈外部环境干扰)
             target_price = self.target_open_price if self.state == "WAIT_OPEN" else self.target_close_price
             side = "buy" if self.state == "WAIT_OPEN" else "sell"
+
+            action_code = "B" if self.state == "WAIT_OPEN" else "S"
+            self.active_client_oid = self.generate_oid(strategy_id, action_code)
             self._place_limit_order(exchange, symbol, side, target_price, ledger)
 
     def _place_limit_order(self, exchange, symbol, side, price, ledger):
         """执行挂单动作并更新自身记录"""
+
+        # 核心：预写式意向记账（WAL），留下“犯罪现场”
+        ledger.append(self.node_id, self.cycle_count, "INTENT", self.active_client_oid, price, self.quantity,
+                      "PENDING", msg="准备发送挂单网络包")
+
         res = execute_order(
             exchange=exchange, symbol=symbol, side=side, amount=self.quantity,
             client_oid=self.active_client_oid, order_type='limit', price=price,
@@ -151,38 +161,214 @@ class GridStrategy:
         self.precision_info = fetch_market_precision(exchange, symbol)
         self.event_queue = queue.Queue()  # 事件总线 (WS和REST对账产生的事件都在这里排队)
 
-    def generate_nodes(self, min_price, max_price, grid_num, quantity):
-        """初始化生成节点拓扑"""
-        step = (max_price - min_price) / grid_num
-        for i in range(grid_num):
+    def generate_nodes(self, min_price, max_price, price_ratio, quantity):
+        """等比初始化生成节点拓扑，并处理由于价格过低导致的精度碰撞问题"""
+        current_close = max_price
+        ratio_factor = 1.0 + price_ratio / 100.0
+        i = 0
+
+        while current_close > min_price:
+            raw_open = current_close / ratio_factor
+
+            # 修约格式化
+            fmt_close, _ = format_price_amount(current_close, 0, self.precision_info)
+            fmt_open, _ = format_price_amount(raw_open, 0, self.precision_info)
+
+            # 【等比网格的精度碰撞拦截】
+            # 如果经过 tickSize 精度修约后，计算出的开仓价竟然 >= 平仓价，网格发生重叠塌陷。
+            if fmt_open >= fmt_close:
+                logger.warning(f"[STRATEGY] 价格 {current_close} 处触发精度碰撞 (修约后均为 {fmt_close})，"
+                               f"此区间的 {price_ratio}% 等比价差已小于交易所的最小刻度 (tickSize)。终止生成后续下沿节点。")
+                break
+
+            if fmt_open < min_price:
+                break
+
             node_id = f"N{i:03d}"
-            open_price = min_price + i * step
-            close_price = open_price + step
-            self.nodes[node_id] = GridNode(node_id, open_price, close_price, quantity, self.precision_info)
-        logger.info(f"[STRATEGY] 成功生成 {len(self.nodes)} 个网格节点区间: [{min_price} - {max_price}]")
+            # 创建等比节点，下沿为格式化后的开仓价，上沿为格式化后的平仓价
+            self.nodes[node_id] = GridNode(node_id, fmt_open, fmt_close, quantity, self.precision_info)
+
+            # 严格以当前的格式化开仓价，作为下个节点的平仓价 (完美拼合相连)
+            current_close = fmt_open
+            i += 1
+
+        logger.info(
+            f"[STRATEGY] 成功生成 {len(self.nodes)} 个等比网格节点区间: [{min_price} - {max_price}], Ratio: {price_ratio}%")
+
+    def run_reconciliation(self, is_startup=False):
+        """
+        [大一统对账引擎]
+        涵盖冷启动恢复与运行时掉单修复，基于 WAL 与快照比对。
+        """
+        prefix = f"GD_{self.strategy_id}_"
+
+        # 1. 获取全局活动挂单快照 (降频降消耗，优先快照过滤)
+        try:
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+        except Exception as e:
+            logger.error(f"[RECONCILE] 获取全局挂单快照失败: {e}")
+            return
+
+        active_exchange_cids = {o.get('clientOrderId', '') for o in open_orders if
+                                o.get('clientOrderId', '').startswith(prefix)}
+
+        # 加载本地账本(仅在冷启动时按需读取，优化运行时性能)
+        df = None
+        if is_startup:
+            import os
+            if os.path.exists(self.ledger.filename):
+                try:
+                    df = pd.read_csv(self.ledger.filename)
+                except Exception as e:
+                    logger.error(f"[RECONCILE] 读取本地账本失败: {e}")
+
+        # 2. 对账算法 (Diff 检查与时光机推演)
+        nodes_to_point_check = []
+
+        for node_id, node in self.nodes.items():
+            # ====================================================
+            # 场景 A: 冷启动对账 (状态 INIT，需从硬盘 WAL 回溯)
+            # ====================================================
+            if is_startup and node.state == "INIT":
+                if df is None or df.empty or node_id not in df['node_id'].values:
+                    continue
+
+                node_df = df[df['node_id'] == node_id]
+                if node_df.empty:
+                    continue
+
+                # 提取最新 3 个 OID 进行多级回溯
+                cids = node_df['client_oid'].drop_duplicates().tolist()[-3:]
+                cids.reverse()  # [N, N-1, N-2]
+
+                truth_order = None
+                truth_cid = None
+
+                for cid in cids:
+                    # 极速路径：如果在快照里，直接免除 API 点查！
+                    if cid in active_exchange_cids:
+                        truth_order = next((o for o in open_orders if o.get('clientOrderId') == cid), None)
+                        if truth_order:
+                            truth_cid = cid
+                            break
+
+                    # 兜底路径：快照没有，利用点查接口强校验是否已成交/撤销
+                    try:
+                        order_info = fetch_single_order(self.exchange, self.symbol, cid)
+                        time.sleep(0.05)  # 点查限流
+                        if order_info:
+                            truth_order = order_info
+                            truth_cid = cid
+                            break
+                    except Exception:
+                        pass
+
+                if truth_order:
+                    self._align_node_state(node, truth_cid, truth_order)
+                else:
+                    logger.warning(
+                        f"[RECONCILE] {node_id} 回溯了3个历史单号均查无此单，判定为未送达的幽灵单，节点等待重新铺设。")
+
+            # ====================================================
+            # 场景 B: 运行时对账 (状态 WAIT_*，检测是否静默掉单)
+            # ====================================================
+            elif not is_startup and node.state in ["WAIT_OPEN", "WAIT_CLOSE"]:
+                # 排除最近 5 秒刚动过的节点(防止状态机与 REST 快照延迟形成数据竞态)
+                if time.time() - node.last_update_ts < 5.0:
+                    continue
+
+                expected_cid = node.active_client_oid
+                # 期待挂单但在交易所快照中消失，加入点查队列
+                if expected_cid not in active_exchange_cids:
+                    nodes_to_point_check.append(node)
+
+        # 3. 运行时的掉单点查与修复
+        if not is_startup and nodes_to_point_check:
+            logger.warning(f"[WATCHDOG] 发现 {len(nodes_to_point_check)} 个节点存在掉单悬挂，发起兜底查询...")
+            for node in nodes_to_point_check:
+                cid = node.active_client_oid
+                try:
+                    order_info = fetch_single_order(self.exchange, self.symbol, cid)
+                    if order_info:
+                        self._align_node_state(node, cid, order_info)
+
+                    else:
+                        # 【修复点】：运行时查无此单，绝对是网络幽灵单！立刻合成 CANCELED 触发原样重挂
+                        logger.warning(f"[WATCHDOG_FIX] 确认为未送达币安的幽灵单，合成 CANCELED 触发重挂 | CID:{cid}")
+                        synthetic_event = {
+                            'client_oid': cid,
+                            'status': 'CANCELED',
+                            'fill_price': 0, 'fill_qty': 0
+                        }
+                        self.event_queue.put(synthetic_event)
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"[WATCHDOG] 点查异常 CID:{cid} | {e}")
+
+    def _align_node_state(self, node, truth_cid, truth_order):
+        """核心私有方法：根据交易所真相，强制拨正节点指针并产出合成事件"""
+        parts = truth_cid.split('_')
+        if len(parts) >= 5:
+            action = parts[3]  # 'B' or 'S'
+            cycle = int(parts[4])
+
+            # 拨正内存指针
+            node.cycle_count = cycle
+            node.active_client_oid = truth_cid
+            node.active_exchange_oid = truth_order.get('id', '')
+
+            status = truth_order.get('status', '').upper()
+            logger.info(f"[RECONCILE_ALIGN] 锁定真相锚点 | {node.node_id} | CID:{truth_cid} | 状态:{status}")
+
+            # 基础推演：节点停留在发起该意图的状态
+            node.state = "WAIT_OPEN" if action == "B" else "WAIT_CLOSE"
+
+            # 顺滑事件分发
+            if status in ["CLOSED", "FILLED"]:
+                synthetic_event = {
+                    'client_oid': truth_cid,
+                    'status': 'FILLED',
+                    'fill_price': float(truth_order.get('average', 0) or truth_order.get('price', 0)),
+                    'fill_qty': float(truth_order.get('filled', 0))
+                }
+                self.event_queue.put(synthetic_event)
+            elif status in ["CANCELED", "EXPIRED", "REJECTED"]:
+                synthetic_event = {
+                    'client_oid': truth_cid,
+                    'status': 'CANCELED',
+                    'fill_price': 0,
+                    'fill_qty': 0
+                }
+                self.event_queue.put(synthetic_event)
 
     def initialize_market_placement(self, current_price):
         """
         初始化铺位核心逻辑 (解决现价穿越问题)
-        1. 现价下方的节点: 挂 WAIT_OPEN (Limit Buy)
-        2. 现价上方的节点: 聚合市价买入总底仓，然后逐个挂 WAIT_CLOSE (Limit Sell)
         """
         buy_nodes = []
         sell_nodes = []
 
         for node in self.nodes.values():
+            if node.state != "INIT":
+                continue  # 经过初始对账，证明它是老节点且有正在进行中的逻辑，跳过挂单
+
             if node.target_open_price < current_price:
                 buy_nodes.append(node)
             else:
                 sell_nodes.append(node)
 
         logger.info(
-            f"[INIT_PLACE] 现价 {current_price} | 需挂买单节点:{len(buy_nodes)} | 需建底仓并挂卖单节点:{len(sell_nodes)}")
+            f"[INIT_PLACE] 现价 {current_price} | 纯新节点待铺设: 挂买单:{len(buy_nodes)} | 建底仓并挂卖单:{len(sell_nodes)}")
+
+        if not buy_nodes and not sell_nodes:
+            logger.info("[INIT_PLACE] 所有节点均已从硬盘账本顺利恢复进度，无需新增初始铺位。")
+            return
 
         # 阶段 A: 处理现价上方的节点 (先聚合市价建仓，再挂出平仓卖单)
         if sell_nodes:
             total_qty = sum(node.quantity for node in sell_nodes)
-            agg_buy_oid = f"GD_{self.strategy_id}_INIT_AGG_BUY"
+            agg_buy_oid = f"GD_{self.strategy_id}_INIT_AGG_BUY_{int(time.time())}"
+
             logger.info(f"[INIT_PLACE] 执行聚合市价底仓买入 | 总量: {total_qty}")
 
             res = execute_order(self.exchange, self.symbol, "buy", total_qty, agg_buy_oid, order_type="market",
@@ -215,7 +401,7 @@ class GridStrategy:
                 event = self.event_queue.get(timeout=1.0)
                 # event = {"client_oid": "...", "status": "FILLED", "fill_price":..., "fill_qty":...}
 
-                # 路由到具体节点 (通过解析 CID: GD_S1_N01_B_0)
+                # 路由到具体节点 (通过解析 CID: GD_S1_N01_B_0_12345678)
                 parts = event['client_oid'].split('_')
                 if len(parts) >= 3 and parts[0] == "GD" and parts[1] == self.strategy_id:
                     node_id = parts[2]
@@ -237,8 +423,7 @@ class GridStrategy:
 # ==========================================
 class ReconcilerThread(threading.Thread):
     """
-    REST 看门狗独立线程。统一产出"标准事件"推入主 Event Queue。
-    实现：交易所为真相源的混合对账。
+    REST 看门狗独立线程。调用统一对账引擎，产出标准事件推入 Event Queue。
     """
 
     def __init__(self, strategy, interval_sec=30):
@@ -248,77 +433,14 @@ class ReconcilerThread(threading.Thread):
         self.daemon = True
 
     def run(self):
-        logger.info(f"[WATCHDOG] 启动混合对账看门狗，周期 {self.interval} 秒")
+        logger.info(f"[WATCHDOG] 启动看门狗线程，周期 {self.interval} 秒")
         while True:
             time.sleep(self.interval)
             try:
-                self._run_reconciliation()
+                # 调用统一大引擎 (is_startup=False)
+                self.strategy.run_reconciliation(is_startup=False)
             except Exception as e:
-                logger.error(f"[WATCHDOG] 对账轮次异常: {e}")
-
-    def _run_reconciliation(self):
-        t0 = time.perf_counter()
-        exchange = self.strategy.exchange
-        symbol = self.strategy.symbol
-        strategy_id = self.strategy.strategy_id
-
-        # 1. 获取全局活动挂单快照
-        open_orders = exchange.fetch_open_orders(symbol)
-
-        # 2. 隔离过滤：只认本策略生成的单
-        active_exchange_cids = set()
-        prefix = f"GD_{strategy_id}_"
-        for o in open_orders:
-            cid = o.get('clientOrderId', '')
-            if cid.startswith(prefix):
-                active_exchange_cids.add(cid)
-
-        # 3. 对账算法 (Diff)
-        nodes_to_check = []
-        for node in self.strategy.nodes.values():
-            if node.state in ["WAIT_OPEN", "WAIT_CLOSE"]:
-                # 排除最近 5 秒刚动过的节点(防止状态机和REST延迟形成数据竞态)
-                if time.time() - node.last_update_ts < 5.0:
-                    continue
-
-                expected_cid = node.active_client_oid
-                # 如果本地期待挂单，但在交易所快照中消失了！
-                if expected_cid not in active_exchange_cids:
-                    nodes_to_check.append(node)
-
-        if not nodes_to_check:
-            return  # 一致，无事发生
-
-        logger.warning(f"[WATCHDOG] 发现 {len(nodes_to_check)} 个节点存在掉单悬挂，发起兜底查询...")
-
-        # 4. 点查补救 (点查确认 -> 合成标准事件推入队列)
-        for node in nodes_to_check:
-            cid = node.active_client_oid
-            order_info = fetch_single_order(exchange, symbol, cid)
-            if not order_info:
-                continue
-
-            status = order_info['status'].upper()
-
-            # 合成标准事件
-            synthetic_event = {
-                'client_oid': cid,
-                'status': 'UNKNOWN',
-                'fill_price': float(order_info.get('average', 0) or order_info.get('price', 0)),
-                'fill_qty': float(order_info.get('filled', 0))
-            }
-
-            if status == "CLOSED":
-                logger.info(f"[WATCHDOG_FIX] 确认为遗漏的成交单，合成 FILLED 事件 | CID:{cid}")
-                synthetic_event['status'] = "FILLED"
-                self.strategy.event_queue.put(synthetic_event)
-
-            elif status in ["CANCELED", "EXPIRED", "REJECTED"]:
-                logger.warning(f"[WATCHDOG_FIX] 确认为被撤销/失效单，合成 CANCELED 事件促发补挂 | CID:{cid}")
-                synthetic_event['status'] = "CANCELED"
-                self.strategy.event_queue.put(synthetic_event)
-
-            time.sleep(0.1)  # 点查限流保护
+                logger.error(f"[WATCHDOG] 统一对账轮次异常: {e}")
 
 
 # ==========================================
@@ -337,29 +459,28 @@ def main_app():
     SYMBOL = "SOL/USDT:USDT"
     STRATEGY_ID = "S01"
 
-    # 初始化网关 (复用你现有的 init_exchange 即可)
+    # 初始化网关
     exchange = safe_init_exchange(api_key, secret_key, proxies)
 
     ledger = GridLedger()
     strategy = GridStrategy(STRATEGY_ID, SYMBOL, exchange, ledger)
 
-    # 极简配置：60000 - 65000，10个网格，每个网格买 0.01 BTC
-    strategy.generate_nodes(50, 70, grid_num=10, quantity=0.1)
+    # 生成等比网格: 50 到 70区间，每格跨度2%，单个网格仓位 0.1
+    strategy.generate_nodes(50, 70, price_ratio=2, quantity=0.1)
 
     # 模拟获取当前市价
     ticker = exchange.fetch_ticker(SYMBOL)
     current_price = ticker['last']
 
-    # 铺单初始化
+    # 强制在第一单网络请求发生前，调用统一引擎执行冷启动对账（防重启爆铺、断电掉单）
+    strategy.run_reconciliation(is_startup=True)
+
+    # 铺单初始化 (已在内部实现跳过已恢复的活跃挂单，杜绝重复铺单)
     strategy.initialize_market_placement(current_price)
 
-    # 启动看门狗对账线程
+    # 启动看门狗对账线程 (复用 run_reconciliation 统一逻辑)
     watchdog = ReconcilerThread(strategy, interval_sec=30)
     watchdog.start()
-
-    # 【扩展】：如果你有 WS 监听器，只需在 WS 的 on_message 回调中，
-    # 解析出 status="FILLED" 且 clientOrderId 以 "GD_S01" 开头的数据，
-    # 包装成 `{'client_oid': x, 'status': 'FILLED', ...}` 调用 `strategy.event_queue.put(event)` 即可。
 
     # 阻塞启动主循环
     strategy.run_main_loop()
