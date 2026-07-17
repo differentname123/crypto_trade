@@ -136,7 +136,7 @@ def fetch_follow_content():
         binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
 
         auto_sync_binance_follows("dahao")
-        auto_sync_binance_follows()
+        auto_sync_binance_follows("nana")
 
         # 2. 核心改造：提取 post_id 构建全局记忆 Set（集合）
         existing_ids = set()

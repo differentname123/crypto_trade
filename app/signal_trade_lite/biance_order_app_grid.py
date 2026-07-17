@@ -22,11 +22,13 @@ import threading
 from enum import Enum
 from datetime import datetime
 
+import multiprocessing
+
 from app.signal_trade_lite.biance_order_lite import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
 )
-from common.common_utils import get_config, setup_logger
+from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
 
 logger = setup_logger(app_name="GridTrader")
 
@@ -143,8 +145,8 @@ class GridLedger:
     """
     COLUMNS = ["ts", "node_id", "cycle", "action", "client_oid", "price", "amount", "status", "msg"]
 
-    def __init__(self, filename="grid_ledger.csv"):
-        self.filename = filename
+    def __init__(self, strategy_id):
+        self.filename = f"grid_ledger_{strategy_id}.csv"
         if not os.path.exists(self.filename):
             with open(self.filename, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(self.COLUMNS)
@@ -588,32 +590,67 @@ class ReconcilerThread(threading.Thread):
                 logger.error(f"[WATCHDOG] 对账轮次异常: {e}")
 
 
-# ==========================================
-# 6. 顶层入口
-# ==========================================
-def main_app():
-    """依赖组装 -> 冷启动对账 -> 铺单初始化 -> 启动看门狗 -> 阻塞进入主循环。"""
+def run_single_strategy(config):
+    """子进程入口：完全独立的执行环境"""
+
+    # 【新增代码 1】：防极端强杀监控线程 (不侵入 strategy 核心代码)
+    import os, sys, time, threading
+    def _parent_watchdog():
+        while True:
+            # 如果是非Windows环境且父进程变成 init(1) 或 0，说明主进程已被强杀暴毙
+            if sys.platform != "win32" and os.getppid() in (1, 0):
+                os._exit(0)  # 物理级斩断孤儿进程
+            time.sleep(2)
+
+    threading.Thread(target=_parent_watchdog, daemon=True).start()
+
     api_key = get_config("myself_biance_api_key")
     secret_key = get_config("myself_biance_api_secret")
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
     }
 
-    config = GridConfig(
-        strategy_id="S01", symbol="SOL/USDT:USDT",
-        min_price=50, max_price=70, price_ratio=2, quantity=0.1,
-    )
-
-    # 依赖显式注入, 便于替换为模拟盘 / 回测
+    # 注意：每个进程拥有自己独立的 exchange、broker、ledger 实例
     exchange = safe_init_exchange(api_key, secret_key, proxies)
     broker = ExchangeBroker(exchange, config.symbol)
-    ledger = GridLedger()
+    ledger = GridLedger(config.strategy_id)  # 传入 strategy_id 实现账本隔离
     strategy = GridStrategy(config, broker, ledger)
 
-    strategy.recover()                       # 1) 冷启动对账 (单线程, 防重启爆铺/断电掉单)
-    strategy.initialize_market_placement()   # 2) 铺单初始化 (跳过已恢复节点, 即时接管越价成交)
-    ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=1).start()  # 3) 只读看门狗
-    strategy.run_main_loop()                 # 4) 阻塞进入主循环 (唯一写者)
+    strategy.recover()
+    strategy.initialize_market_placement()
+    # 建议看门狗周期稍微调大一点(比如5秒)，防止多进程并发请求导致触发交易所频率限制
+    ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=1).start()
+    strategy.run_main_loop()
+
+
+def main_app():
+    """主进程：只负责读取配置、拉起并守护各个子进程"""
+    configs = [
+        GridConfig(
+            strategy_id="S01", symbol="SOL/USDT:USDT",
+            min_price=50, max_price=80, price_ratio=0.5, quantity=0.1,
+        )
+    ]
+
+    processes = []
+
+    # 遍历配置，为每个币种拉起一个独立的进程
+    for config in configs:
+        p = multiprocessing.Process(target=run_single_strategy, args=(config,))
+        p.daemon = True  # 【新增代码 2】：设置为守护进程，主进程正常结束或报错崩溃时，带走子进程
+        p.start()
+        processes.append(p)
+        logger.info(f"[SYSTEM] 已拉起独立进程 | {config.strategy_id} - {config.symbol} (PID: {p.pid})")
+
+    logger.info("[SYSTEM] 所有币种进程启动完毕，主进程进入守护模式。")
+
+    # 主进程挂起，等待子进程执行（也就是一直运行下去）
+    # 【新增代码 3】：捕获终端断开或 kill 的异常，防止 p.join 变成死锁
+    try:
+        for p in processes:
+            p.join()
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 
 if __name__ == "__main__":
