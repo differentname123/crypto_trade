@@ -244,6 +244,18 @@ def get_total_equity(exchange):
         logger.error(f"[EQUITY_REJECT] 获取账户总权益失败 耗时:{latency}ms | {e}")
         return ExecStatus.REJECT, 0.0
 
+def safe_init_exchange(api_key, secret_key, proxies):
+    """交易所初始化: 指数退避重试直至成功 (退避上限 60s)"""
+    interval = 5
+    while True:
+        try:
+            ex = init_exchange(api_key, secret_key, proxies=proxies)
+            logger.info("[INIT] 交易所初始化成功")
+            return ex
+        except Exception as e:
+            logger.error(f"[INIT] 失败: {e}, {interval}s 后重试")
+            time.sleep(interval)
+            interval = min(interval * 2, 60)
 
 # ==========================================
 # 5. 上层应用模拟 (Main 演示)

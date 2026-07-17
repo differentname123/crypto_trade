@@ -12,7 +12,7 @@ from run_cross_signal_lite import execute_trading_bot_workflow
 # 确保 base_trader.py (或 biance_order_lite) 中已提供必要组件
 from biance_order_lite import (
     init_exchange, execute_order, get_total_equity,
-    ExecStatus, logger
+    ExecStatus, logger, safe_init_exchange
 )
 
 # ==========================================
@@ -410,20 +410,6 @@ def execute_single_signal(exchange, row, total_equity, position_cache, open_orde
             position_cache[pos_key] -= amount
 
 
-# ==========================================
-# 4. 高可用调度器
-# ==========================================
-def safe_init_exchange(api_key, secret_key, proxies):
-    retry_interval = 5
-    while True:
-        try:
-            exchange = init_exchange(api_key, secret_key, proxies=proxies)
-            logger.info(">>> 交易所初始化成功！")
-            return exchange
-        except Exception as e:
-            logger.error(f"[初始化失败] 网络异常: {e}。{retry_interval}s 后重试...")
-            time.sleep(retry_interval)
-            retry_interval = min(retry_interval * 2, 60)
 
 
 def run_scheduler():

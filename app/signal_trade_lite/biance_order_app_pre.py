@@ -30,7 +30,7 @@ from common_utils_lite import get_config
 from run_cross_signal_lite import execute_trading_bot_workflow
 from biance_order_lite import (
     init_exchange, execute_order, get_total_equity,
-    ExecStatus, logger
+    ExecStatus, logger, safe_init_exchange
 )
 
 # ==========================================
@@ -663,18 +663,7 @@ def execute_signals(exchange, target_time, total_equity, position_cache, open_or
 # ==========================================
 # L6. 高可用调度器 (顶层流程编排)
 # ==========================================
-def safe_init_exchange(api_key, secret_key, proxies):
-    """交易所初始化: 指数退避重试直至成功 (退避上限 60s)"""
-    interval = 5
-    while True:
-        try:
-            ex = init_exchange(api_key, secret_key, proxies=proxies)
-            logger.info("[INIT] 交易所初始化成功")
-            return ex
-        except Exception as e:
-            logger.error(f"[INIT] 失败: {e}, {interval}s 后重试")
-            time.sleep(interval)
-            interval = min(interval * 2, 60)
+
 
 
 def run_scheduler():
