@@ -1,3 +1,5 @@
+import math
+
 import ccxt
 import time
 import uuid
@@ -256,6 +258,55 @@ def safe_init_exchange(api_key, secret_key, proxies):
             logger.error(f"[INIT] 失败: {e}, {interval}s 后重试")
             time.sleep(interval)
             interval = min(interval * 2, 60)
+
+
+def fetch_market_precision(exchange, symbol):
+    """
+    获取交易对的精度信息（价格精度和数量精度）
+    """
+    try:
+        exchange.load_markets()
+        market = exchange.market(symbol)
+        price_precision = market['precision']['price']
+        amount_precision = market['precision']['amount']
+        return {'price': price_precision, 'amount': amount_precision}
+    except Exception as e:
+        logger.error(f"[MARKET] 获取 {symbol} 精度失败: {e}")
+        return None
+
+
+def format_price_amount(price, amount, precision):
+    """
+    按交易所要求的精度格式化价格和数量，采用向下取整策约，防止精度溢出导致拒单
+    """
+    p_prec = precision['price']
+    a_prec = precision['amount']
+
+    # 将精度转换为小数位数，例如 0.001 -> 3
+    p_decimals = max(0, int(round(-math.log10(p_prec)))) if p_prec < 1 else 0
+    a_decimals = max(0, int(round(-math.log10(a_prec)))) if a_prec < 1 else 0
+
+    formatted_price = float(f"{price:.{p_decimals}f}")
+    formatted_amount = float(f"{amount:.{a_decimals}f}")
+    return formatted_price, formatted_amount
+
+
+def fetch_single_order(exchange, symbol, client_oid):
+    """
+    单笔订单兜底查询 (精确对账用)
+    """
+    t0 = time.perf_counter()
+    try:
+        order = exchange.fetch_order(client_oid, symbol, params={"origClientOrderId": client_oid})
+        latency = int((time.perf_counter() - t0) * 1000)
+        logger.debug(f"[FETCH_ORDER] 耗时:{latency}ms | CID:{client_oid} | 状态:{order['status']}")
+        return order
+    except InvalidOrder:
+        logger.warning(f"[FETCH_ORDER] 查无此单 (可能已被清理) | CID:{client_oid}")
+        return {"status": "canceled", "filled": 0.0, "average": 0.0}  # 视同撤销
+    except Exception as e:
+        logger.error(f"[FETCH_ORDER] 查询失败 | CID:{client_oid} | {e}")
+        return None
 
 # ==========================================
 # 5. 上层应用模拟 (Main 演示)
