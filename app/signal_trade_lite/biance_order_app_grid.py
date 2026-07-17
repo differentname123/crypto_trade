@@ -291,7 +291,6 @@ class GridStrategy:
                     order_info = fetch_single_order(self.exchange, self.symbol, cid)
                     if order_info:
                         self._align_node_state(node, cid, order_info)
-
                     else:
                         # 【修复点】：运行时查无此单，绝对是网络幽灵单！立刻合成 CANCELED 触发原样重挂
                         logger.warning(f"[WATCHDOG_FIX] 确认为未送达币安的幽灵单，合成 CANCELED 触发重挂 | CID:{cid}")
@@ -343,55 +342,39 @@ class GridStrategy:
 
     def initialize_market_placement(self, current_price):
         """
-        初始化铺位核心逻辑 (解决现价穿越问题)
+        初始化铺位核心逻辑 (高内聚版本)
+        彻底取消对"现价上下"的杂糅判断。所有新节点统一挂出独立的【限价买单】。
+        - 现价下方的节点，会被币安挂在盘口正常等待。
+        - 现价上方的节点，会被币安撮合引擎作为 Taker 瞬间成交。
+        随后触发对账引擎，利用大一统的对账逻辑自动处理瞬间成交的单据。
         """
-        buy_nodes = []
-        sell_nodes = []
+        logger.info(f"[INIT_PLACE] 开始执行铺单初始化，当前参考现价: {current_price}")
+        init_count = 0
 
         for node in self.nodes.values():
             if node.state != "INIT":
-                continue  # 经过初始对账，证明它是老节点且有正在进行中的逻辑，跳过挂单
+                continue  # 经过冷启动对账，证明它是老节点且有正在进行中的逻辑，跳过挂单
 
-            if node.target_open_price < current_price:
-                buy_nodes.append(node)
-            else:
-                sell_nodes.append(node)
-
-        logger.info(
-            f"[INIT_PLACE] 现价 {current_price} | 纯新节点待铺设: 挂买单:{len(buy_nodes)} | 建底仓并挂卖单:{len(sell_nodes)}")
-
-        if not buy_nodes and not sell_nodes:
-            logger.info("[INIT_PLACE] 所有节点均已从硬盘账本顺利恢复进度，无需新增初始铺位。")
-            return
-
-        # 阶段 A: 处理现价上方的节点 (先聚合市价建仓，再挂出平仓卖单)
-        if sell_nodes:
-            total_qty = sum(node.quantity for node in sell_nodes)
-            agg_buy_oid = f"GD_{self.strategy_id}_INIT_AGG_BUY_{int(time.time())}"
-
-            logger.info(f"[INIT_PLACE] 执行聚合市价底仓买入 | 总量: {total_qty}")
-
-            res = execute_order(self.exchange, self.symbol, "buy", total_qty, agg_buy_oid, order_type="market",
-                                position_side="LONG")
-            if res.status != ExecStatus.OK:
-                logger.critical("[INIT_PLACE] 聚合建仓失败，中止初始化流程！请人工干预。")
-                raise Exception("Initialization Aggregated Buy Failed")
-
-            time.sleep(1)  # 节流缓冲
-
-            # 挂卖单
-            for node in sell_nodes:
-                node.state = "WAIT_CLOSE"
-                node.active_client_oid = node.generate_oid(self.strategy_id, "S")
-                node._place_limit_order(self.exchange, self.symbol, "sell", node.target_close_price, self.ledger)
-                time.sleep(0.05)  # 简易节流
-
-        # 阶段 B: 处理现价下方的节点 (逐个挂买单)
-        for node in buy_nodes:
+            init_count += 1
+            # 统一动作：所有新节点无差别进入开仓等待，并挂限价买单
             node.state = "WAIT_OPEN"
             node.active_client_oid = node.generate_oid(self.strategy_id, "B")
             node._place_limit_order(self.exchange, self.symbol, "buy", node.target_open_price, self.ledger)
-            time.sleep(0.05)
+            time.sleep(0.05)  # 限流保护
+
+        if init_count == 0:
+            logger.info("[INIT_PLACE] 所有节点均已从硬盘账本顺利恢复进度，无需新增初始铺位。")
+        else:
+            logger.info(f"[INIT_PLACE] 成功发送 {init_count} 个新节点的初始买单。正呼叫对账引擎接管越价成交的底仓单...")
+
+            # 给币安撮合引擎以及本地网络极短的缓冲时间
+            time.sleep(1.0)
+
+            # 关键：主动触发一次非启动期的运行时对账。
+            # 那些挂价高于现价的限价买单，会被币安瞬间撮合成交。
+            # 对账引擎会发现这些单不在挂单簿里，进而查出 FILLED 状态并往总线推入事件。
+            # 从而完美闭环驱动主循环挂出对应的卖单！
+            self.run_reconciliation(is_startup=False)
 
     def run_main_loop(self):
         """单线程安全主循环：不断消费事件驱动状态机"""
