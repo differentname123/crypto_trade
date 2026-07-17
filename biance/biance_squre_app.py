@@ -436,6 +436,8 @@ def producer_fetch_content_main():
     logger.info(f"========== 📡 生产者抓取引擎启动 (MongoDB 管道已建立) ==========")
 
     while True:
+        time.sleep(10000)
+
         try:
             # 查底层字典作为过滤边界
             binance_posts = post_manager.find_posts_by_source("biance", limit=50000)
