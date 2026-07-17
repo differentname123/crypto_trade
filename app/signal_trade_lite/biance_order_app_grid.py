@@ -334,7 +334,7 @@ def main_app():
         proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
         proxy_url = "http://127.0.0.1:7890"
 
-    SYMBOL = "BTC/USDT"
+    SYMBOL = "SOL/USDT:USDT"
     STRATEGY_ID = "S01"
 
     # 初始化网关 (复用你现有的 init_exchange 即可)
@@ -344,7 +344,7 @@ def main_app():
     strategy = GridStrategy(STRATEGY_ID, SYMBOL, exchange, ledger)
 
     # 极简配置：60000 - 65000，10个网格，每个网格买 0.01 BTC
-    strategy.generate_nodes(60000, 65000, grid_num=10, quantity=0.01)
+    strategy.generate_nodes(50, 70, grid_num=10, quantity=0.1)
 
     # 模拟获取当前市价
     ticker = exchange.fetch_ticker(SYMBOL)
@@ -366,5 +366,5 @@ def main_app():
 
 
 if __name__ == "__main__":
-    # main_app()
+    main_app()
     pass
