@@ -23,13 +23,14 @@ import aiohttp
 import threading
 from datetime import datetime, timedelta
 
+from app.signal_trade_lite.common_utils_lite import setup_logger
+
 # 解除 Pandas 控制台打印限制
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 
 # 配置基础日志
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger("QuantSniper")
+logger = setup_logger()
 
 
 def _format_bj_time(ts_ms):

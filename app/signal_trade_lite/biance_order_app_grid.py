@@ -23,14 +23,14 @@ from enum import Enum
 from datetime import datetime
 
 import multiprocessing
+from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
 
+logger = setup_logger(app_name="GridTrader")
 from app.signal_trade_lite.biance_order_lite import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
 )
-from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
 
-logger = setup_logger(app_name="GridTrader")
 
 # ==========================================
 # 0. 可调参数 (消灭魔术数字)

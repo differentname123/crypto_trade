@@ -217,7 +217,7 @@ if __name__ == "__main__":
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2021-01-01_merged.csv"},
+        # {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SKYUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2021-01-01_merged.csv"},

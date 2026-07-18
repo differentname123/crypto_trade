@@ -26,11 +26,13 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from common_utils_lite import get_config
+from common_utils_lite import get_config, setup_logger
+logger = setup_logger(app_name="cross_momentum")
+
+
 from run_cross_signal_lite import execute_trading_bot_workflow
-from biance_order_lite import (
-    init_exchange, execute_order, get_total_equity,
-    ExecStatus, logger, safe_init_exchange
+from biance_order_lite import ( execute_order, get_total_equity,
+    ExecStatus, safe_init_exchange
 )
 
 # ==========================================
