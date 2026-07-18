@@ -35,14 +35,13 @@ from app.signal_trade_lite.biance_order_lite import (
 # ==========================================
 # 0. 可调参数 (消灭魔术数字)
 # ==========================================
-POINT_CHECK_DELAY_COLD = 0.05  # 冷启动点查限流
-POINT_CHECK_DELAY_RUNTIME = 0.1  # 运行时点查限流
-PLACE_THROTTLE_SEC = 0.05  # 批量铺单限流
-INIT_SETTLE_WAIT_SEC = 1.0  # 铺单后等待撮合/网络传播的缓冲
-COLD_START_BACKTRACK = 3  # 冷启动每个节点回溯的历史单号数量
-ORDER_GRACE_PERIOD = 5.0  # 定义 5 秒绝对冷静期
-PRICE_BAND_RATIO = 1.04  # 开仓买单价相对现价的安全上限倍数 (交易所硬限约1.05, 留1%容错防mark/last偏差)
-
+RECONCILE_SKIP_WINDOW_SEC = 5.0    # 运行时对账跳过"刚动过"的节点, 规避 REST 快照传播延迟造成的误判
+POINT_CHECK_DELAY_COLD = 0.05      # 冷启动点查限流
+POINT_CHECK_DELAY_RUNTIME = 0.1    # 运行时点查限流
+PLACE_THROTTLE_SEC = 0.05          # 批量铺单限流
+INIT_SETTLE_WAIT_SEC = 1.0         # 铺单后等待撮合/网络传播的缓冲
+COLD_START_BACKTRACK = 3           # 冷启动每个节点回溯的历史单号数量
+ORDER_GRACE_PERIOD = 5.0  # 定义 10 秒冷静期
 
 # ==========================================
 # 1. 枚举与值对象 (类型安全 + 去魔法字符串)
@@ -51,7 +50,6 @@ class NodeState(Enum):
     INIT = "INIT"
     WAIT_OPEN = "WAIT_OPEN"
     WAIT_CLOSE = "WAIT_CLOSE"
-    SLEEP = "SLEEP"  # 惰性休眠: 已初始化、无持仓, 因开仓价越现价安全带暂不挂单, 待唤醒
     ERROR = "ERROR"
 
 
@@ -85,13 +83,6 @@ class OrderEvent:
         self.fill_qty = fill_qty
 
 
-class MarketPriceEvent:
-    """现价心跳事件: 看门狗主动拉取的大盘现价, 用于唤醒休眠节点 (与订单事件解耦, 不污染 OrderEvent)。"""
-
-    def __init__(self, current_price):
-        self.current_price = current_price
-
-
 class GridConfig:
     """策略配置: 集中管理原本散落在 main 里的参数。"""
 
@@ -111,7 +102,6 @@ class NodeContext:
         self.broker = broker
         self.ledger = ledger
         self.strategy_id = strategy_id
-        self.current_price = 0.0  # 全局参考现价(水位线): 仅主线程写, 节点决策时只读, 天然无锁
 
 
 class OidCodec:
@@ -142,26 +132,6 @@ class OidCodec:
     @classmethod
     def prefix_for(cls, strategy_id):
         return f"{cls.PREFIX}_{strategy_id}_"
-
-
-# 价格偏离风控拒单的粗粒度特征词 (命中则降级休眠, 而非打入不可逆 ERROR)
-_PRICE_BAND_ERR_KEYS = (
-    "percent_price",  # PERCENT_PRICE 过滤器
-    "-4131",  # 币安合约价格偏离拒单码
-    "-1013",  # Filter failure (运行时多为现价带越界)
-    "limit price can",  # "Limit price can't be higher/lower than ..."
-    "price is outside",
-    "outside of the price",
-    "price band",
-)
-
-
-def _is_price_band_error(msg):
-    """粗粒度识别"价格偏离风控"类拒单: 命中则降级休眠, 待现价靠拢再唤醒。"""
-    if not msg:
-        return False
-    m = str(msg).lower()
-    return any(k in m for k in _PRICE_BAND_ERR_KEYS)
 
 
 # ==========================================
@@ -267,18 +237,10 @@ class GridNode:
 
     # ---------- 对外能力 ----------
     def open_as_new(self):
-        """初始铺位: 过偏离度卡点 -> 带内挂限价买单进入 WAIT_OPEN, 越带则转入 SLEEP。"""
-        self._arm_open()
-
-    def wake_up(self):
-        """主线程唤醒: 目标开仓价已回落进安全带, 正式铺设开仓买单 (仅 SLEEP 态可调)。"""
-        if self.state != NodeState.SLEEP:
-            return
-        self.ctx.ledger.append(self.node_id, self.cycle_count, "WAKE_UP",
-                               "", self.target_open_price, self.quantity, "OK", msg="现价靠拢, 唤醒铺单")
-        logger.info(
-            f"[WAKE] {self.node_id} cycle={self.cycle_count} 休眠唤醒 -> 铺设开仓买单 @{self.target_open_price}")
-        self._arm_open()
+        """初始铺位: 进入开仓等待并挂出限价买单。"""
+        self.state = NodeState.WAIT_OPEN
+        self.active_client_oid = self._new_oid(OrderAction.BUY)
+        self._place_limit_order(OrderAction.BUY, self.target_open_price)
 
     def align(self, cycle, client_oid, exchange_oid, action):
         """依对账真相拨正内存指针 (仅冷启动、单线程环境下调用)。"""
@@ -320,53 +282,26 @@ class GridNode:
         logger.info(f"[FILL] {self.node_id} cycle={self.cycle_count} 平仓成交 "
                     f"@{event.fill_price} x{event.fill_qty} 套利+1 | WAIT_CLOSE->WAIT_OPEN")
         self.cycle_count += 1
-        # 反手开仓同样过偏离度卡点 (平仓后无持仓, 越带可安全休眠; 常态下开仓价必在带内)
-        self._arm_open()
-
-    def _on_canceled(self):
-        """撤销/拒单 -> 保持状态, 换全新单号原样重挂 (自愈外部干扰)。"""
-        if self.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
-            return  # ERROR / INIT / SLEEP 不参与自动重挂
-        self.ctx.ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED",
-                               self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
-        logger.warning(f"[HEAL] {self.node_id} cycle={self.cycle_count} 订单撤销/拒单, "
-                       f"重挂 | 旧CID:{self.active_client_oid}")
-        if self.state == NodeState.WAIT_OPEN:
-            # 开仓补挂: 过偏离度卡点, 越带则休眠等待唤醒 (防重挂再次触发价格风控)
-            self._arm_open()
-        else:
-            # 平仓补挂: 持仓节点绝不休眠, 原样重挂卖单
-            self.active_client_oid = self._new_oid(OrderAction.SELL)
-            self._place_limit_order(OrderAction.SELL, self.target_close_price)
-
-    # ---------- 内部工具 ----------
-    def _arm_open(self):
-        """开仓统一入口: 目标开仓价在现价安全带内则挂买单进入 WAIT_OPEN, 否则转入 SLEEP 休眠。"""
-        if not self._within_band(self.target_open_price):
-            self._enter_sleep(self.target_open_price)
-            return
         self.state = NodeState.WAIT_OPEN
         self.active_client_oid = self._new_oid(OrderAction.BUY)
         self._place_limit_order(OrderAction.BUY, self.target_open_price)
 
-    def _within_band(self, price):
-        """开仓买价是否在现价安全带内; 无参考现价时保守放行, 交由下单反应式兜底。"""
-        ref = self.ctx.current_price
-        if not ref or ref <= 0:
-            return True
-        return price <= ref * PRICE_BAND_RATIO
+    def _on_canceled(self):
+        """撤销/拒单 -> 保持状态, 换全新单号原样重挂 (自愈外部干扰)。"""
+        if self.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
+            return  # ERROR / INIT 不参与自动重挂
+        self.ctx.ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED",
+                               self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
+        logger.warning(f"[HEAL] {self.node_id} cycle={self.cycle_count} 订单撤销/拒单, "
+                       f"原样重挂 | 旧CID:{self.active_client_oid}")
+        if self.state == NodeState.WAIT_OPEN:
+            action, price = OrderAction.BUY, self.target_open_price
+        else:
+            action, price = OrderAction.SELL, self.target_close_price
+        self.active_client_oid = self._new_oid(action)
+        self._place_limit_order(action, price)
 
-    def _enter_sleep(self, price):
-        """转入休眠: 不发任何交易所请求, 仅落账登记意向, 待主循环按现价唤醒。"""
-        self.state = NodeState.SLEEP
-        self.active_client_oid = ""
-        self.active_exchange_oid = ""
-        self.last_update_ts = time.time()
-        self.ctx.ledger.append(self.node_id, self.cycle_count, "INTENT_SLEEP",
-                               "", price, self.quantity, "SLEEP",
-                               msg=f"开仓价{price}越现价{PRICE_BAND_RATIO}倍安全带, 惰性休眠")
-        logger.info(f"[SLEEP] {self.node_id} cycle={self.cycle_count} 目标开仓价{price}超安全带, 休眠不铺单")
-
+    # ---------- 内部工具 ----------
     def _new_oid(self, action):
         return OidCodec.build(self.ctx.strategy_id, self.node_id, action, self.cycle_count)
 
@@ -375,7 +310,7 @@ class GridNode:
         # WAL: 预写式意向记账, 即使随后进程崩溃也可据此追溯
         self.ctx.ledger.append(self.node_id, self.cycle_count, "INTENT",
                                self.active_client_oid, price, self.quantity, "PENDING", msg="待发送")
-        self.last_update_ts = time.time()
+
         res = self.ctx.broker.place_limit(action, self.quantity, price, self.active_client_oid, self.position_side)
         self.last_update_ts = time.time()
         tag = f"{self.node_id} {action.value}@{price} x{self.quantity} CID:{self.active_client_oid}"
@@ -390,14 +325,8 @@ class GridNode:
             self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                    self.active_client_oid, price, self.quantity, "UNKNOWN")
             logger.critical(f"[PLACE] {tag} -> UNKNOWN 下单状态未知, 转入防御等待对账介入")
-        elif action == OrderAction.BUY and _is_price_band_error(res.error_msg):
-            # 价格偏离风控拒单(开仓买单): 降级休眠而非 ERROR, 待现价靠拢由主循环重新唤醒 (弥补mark/last偏差与竞态)
-            self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
-                                   self.active_client_oid, price, self.quantity, "SLEEP", msg=res.error_msg)
-            logger.warning(f"[PLACE] {tag} -> 价格越界被拒, 降级休眠等待唤醒 | {res.error_msg}")
-            self._enter_sleep(price)
         else:
-            # 业务拒单(如余额不足) / 平仓越界等: 进入 ERROR 挂起 (持仓节点绝不休眠)
+            # 业务拒单(如余额不足), 进入 ERROR 挂起
             self.state = NodeState.ERROR
             self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                    self.active_client_oid, price, self.quantity, "ERROR", msg=res.error_msg)
@@ -482,7 +411,7 @@ class ReconciliationEngine:
         logger.info(f"[RECOVER] 冷启动对账完成 | 成功锚定恢复 {aligned} 个节点")
 
     # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
-    def repair_runtime(self, nodes):
+    def repair_runtime(self, nodes, skip_recent=True):
         """只读比对锁定掉单悬挂 -> 点查确认 -> 投递事件; 全程不修改任何节点内存。"""
         active_cids, open_orders = self._snapshot()
         if open_orders is None:
@@ -491,11 +420,13 @@ class ReconciliationEngine:
         now = time.time()
         suspects = []  # 检测点固定 (node, cid), 规避与主线程写入的数据竞态
         for node in nodes.values():
-            if now - node.last_update_ts < ORDER_GRACE_PERIOD:
+            if time.time() - node.last_update_ts < ORDER_GRACE_PERIOD:
                 continue
             if node.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
-                continue  # SLEEP / ERROR / INIT 无活动挂单, 天然跳过
-
+                continue
+            # 跳过刚动过的节点, 防止状态机与 REST 快照传播延迟造成误判 (init 场景传 False 以即时接管越价成交)
+            if skip_recent and now - node.last_update_ts < RECONCILE_SKIP_WINDOW_SEC:
+                continue
             cid = node.active_client_oid
             if cid not in active_cids:
                 suspects.append((node, cid))
@@ -515,15 +446,6 @@ class ReconciliationEngine:
                 time.sleep(POINT_CHECK_DELAY_RUNTIME)
             except Exception as e:
                 logger.error(f"[WATCHDOG] 点查异常 CID:{cid} | {e}")
-
-    def publish_market_price(self):
-        """现价心跳: 主动拉一次大盘现价包装成事件推入总线, 兜底跳空/单边无成交导致的唤醒死锁。"""
-        try:
-            price = self.broker.fetch_last_price()
-            if price and float(price) > 0:
-                self.event_queue.put(MarketPriceEvent(float(price)))
-        except Exception as e:
-            logger.error(f"[WATCHDOG] 现价心跳获取失败: {e}")
 
     # ---------- 内部工具 ----------
     def _snapshot(self):
@@ -583,7 +505,7 @@ class ReconciliationEngine:
 # 5. 主控与调度 (GridStrategy / Watchdog)
 # ==========================================
 class GridStrategy:
-    """策略主控: 组装依赖, 持有节点集合, 负责初始铺单与事件主循环(路由+唤醒)。"""
+    """策略主控: 组装依赖, 持有节点集合, 负责初始铺单与事件主循环(路由)。"""
 
     def __init__(self, config, broker, ledger):
         self.config = config
@@ -592,7 +514,6 @@ class GridStrategy:
         self.event_queue = queue.Queue()
 
         ctx = NodeContext(broker, ledger, config.strategy_id)
-        self.ctx = ctx  # 持有 ctx 以维护全局参考现价(水位线): 主线程唯一写者
         self.nodes = build_geometric_grid(config, broker, ctx)
         self.engine = ReconciliationEngine(broker, ledger, config.strategy_id, self.event_queue)
 
@@ -602,13 +523,11 @@ class GridStrategy:
 
     def initialize_market_placement(self):
         """
-        铺单初始化: 所有新节点过偏离度卡点后统一处理。
-        现价下方 / 现价上方安全带内 -> 挂限价买单 (下方等待, 上方作为 Taker 瞬时成交);
-        超出安全带(现价1.04倍以上) -> 转入 SLEEP 休眠, 不发请求, 待主循环按现价唤醒。
-        随后即时对账接管越价成交底仓, 闭环驱动挂出对应卖单。
+        铺单初始化: 所有新节点统一挂限价买单。
+        现价下方 -> 正常挂盘等待; 现价上方 -> 被撮合引擎作为 Taker 瞬时成交。
+        随后即时对账(skip_recent=False)接管越价成交, 闭环驱动挂出对应卖单。
         """
         current_price = self.broker.fetch_last_price()
-        self.ctx.current_price = float(current_price) if current_price else 0.0  # 铺单前先立起水位线供偏离度前置校验
 
         init_count = 0
         for node in self.nodes.values():
@@ -616,60 +535,29 @@ class GridStrategy:
                 continue  # 已由冷启动对账恢复的老节点, 跳过, 杜绝重复铺单
             init_count += 1
             node.open_as_new()
-            if node.state != NodeState.SLEEP:
-                time.sleep(PLACE_THROTTLE_SEC)  # 仅真正发出请求的节点参与限流, 休眠节点零成本
+            time.sleep(PLACE_THROTTLE_SEC)
 
         if init_count == 0:
             logger.info(f"[INIT] 全部节点已从账本恢复进度, 无需新增铺位 | 参考现价 {current_price}")
             return
 
-        placed = sum(1 for n in self.nodes.values() if n.state in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE))
-        sleeping = sum(1 for n in self.nodes.values() if n.state == NodeState.SLEEP)
-        logger.info(f"[INIT] 遍历 {init_count} 个新节点 | 参考现价 {current_price} | 全网 铺单 {placed} 个, "
-                    f"休眠 {sleeping} 个(超{PRICE_BAND_RATIO}倍安全带暂缓), 呼叫对账引擎兜底...")
+        logger.info(f"[INIT] 铺出 {init_count} 个新节点初始买单 | 参考现价 {current_price}, "
+                    f"呼叫对账引擎接管越价成交底仓...")
         time.sleep(INIT_SETTLE_WAIT_SEC)  # 给撮合与网络传播极短缓冲
-        self.engine.repair_runtime(self.nodes)
+        self.engine.repair_runtime(self.nodes, skip_recent=False)
 
     def run_main_loop(self):
-        """单线程主循环 (唯一写者): 消费事件 -> 路由/唤醒 -> 串行推演状态机。"""
+        """单线程主循环 (唯一写者): 消费事件 -> 路由到节点 -> 串行推演状态机。"""
         logger.info("[MAIN] 策略主循环启动, 开始监听事件...")
         while True:
             try:
                 event = self.event_queue.get(timeout=1.0)
-                if isinstance(event, MarketPriceEvent):
-                    self._on_market_price(event.current_price)  # 现价心跳: 更新水位线并唤醒休眠节点
-                else:
-                    self._route(event)
-                    if event.status == OrderStatus.FILLED and event.fill_price > 0:
-                        self._on_market_price(event.fill_price)  # 白嫖成交价更新水位线并唤醒 (零 API 成本)
+                self._route(event)
             except queue.Empty:
                 pass
             except Exception as e:
                 logger.error(f"[MAIN] 事件处理异常: {e}")
                 time.sleep(1)
-
-    def _on_market_price(self, price):
-        """更新全局参考现价(水位线)并扫描唤醒已进入安全带的休眠节点。"""
-        if not price or price <= 0:
-            return
-        self.ctx.current_price = float(price)
-        self._wake_sleepers()
-
-    def _wake_sleepers(self):
-        """遍历 SLEEP 节点, 目标开仓价已落入现价安全带者逐一唤醒 (主线程串行, 单写者不变)。"""
-        ref = self.ctx.current_price
-        if not ref or ref <= 0:
-            return
-        woke = 0
-        for node in self.nodes.values():
-            if node.state != NodeState.SLEEP:
-                continue
-            if node.target_open_price <= ref * PRICE_BAND_RATIO:
-                node.wake_up()
-                woke += 1
-                time.sleep(PLACE_THROTTLE_SEC)  # 批量唤醒时复用铺单限流, 防止瞬时请求洪峰
-        if woke:
-            logger.info(f"[WAKE] 现价 {ref} 唤醒 {woke} 个休眠节点铺设开仓买单")
 
     def _route(self, event):
         """按 OID 解析定位目标节点并投喂事件。"""
@@ -685,7 +573,7 @@ class GridStrategy:
 
 
 class ReconcilerThread(threading.Thread):
-    """REST 看门狗线程: 周期性只读对账 + 现价心跳, 异常仅向总线投递事件, 从不直接改动节点状态。"""
+    """REST 看门狗线程: 周期性只读对账, 异常仅向总线投递事件, 从不直接改动节点状态。"""
 
     def __init__(self, engine, nodes, interval_sec=30):
         super().__init__(daemon=True)
@@ -698,8 +586,7 @@ class ReconcilerThread(threading.Thread):
         while True:
             time.sleep(self.interval)
             try:
-                self.engine.publish_market_price()  # 现价心跳: 兜底跳空/单边无成交的唤醒死锁
-                self.engine.repair_runtime(self.nodes)
+                self.engine.repair_runtime(self.nodes, skip_recent=True)
             except Exception as e:
                 logger.error(f"[WATCHDOG] 对账轮次异常: {e}")
 
@@ -732,6 +619,7 @@ def run_single_strategy(config):
 
     strategy.recover()
     strategy.initialize_market_placement()
+    # 建议看门狗周期稍微调大一点(比如5秒)，防止多进程并发请求导致触发交易所频率限制
     ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=1).start()
     strategy.run_main_loop()
 
