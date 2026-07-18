@@ -44,50 +44,50 @@ def predict_follow_back(user_info: dict) -> dict:
 
     # 1. 官方风控与状态过滤 (一票否决)
     if user_info.get('lowQuality', False):
-        return {"is_recommended": False, "probability": "0%", "reason": "官方标记的低质量/降权号"}
+        return {"is_recommended": False, "probability": 0, "reason": "官方标记的低质量/降权号"}
 
     if user_info.get('userStatus', 1) != 1:
-        return {"is_recommended": False, "probability": "0%", "reason": "账号状态异常(封禁或静默)"}
+        return {"is_recommended": False, "probability": 0, "reason": "账号状态异常(封禁或静默)"}
 
     # 2. 僵尸号/机器号过滤
     if user_info.get('totalListedPostCount', 0) == 0 and user_info.get('totalLikeCount', 0) == 0:
         if follow_count > 50:
-            return {"is_recommended": False, "probability": "0%", "reason": "0发帖0点赞的批量机器/僵尸号"}
+            return {"is_recommended": False, "probability": 0, "reason": "0发帖0点赞的批量机器/僵尸号"}
 
     # 3. 活跃度时间过滤 (沉寂号)
     modify_time_ms = user_info.get('modifyTime', 0)
     if modify_time_ms > 0:
         days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
-        if days_inactive > 30:
-            return {"is_recommended": False, "probability": "< 5%",
+        if days_inactive > 7:
+            return {"is_recommended": False, "probability": 10,
                     "reason": f"长达 {int(days_inactive)} 天未活跃的沉寂号"}
 
     # 4. T0 级强意图核武器 (直接保送)
     bio = (user_info.get('biography') or '').lower()
-    if any(k in bio for k in ['互关', '互粉', '必回', 'f4f', 'follow back']):
-        return {"is_recommended": True, "probability": "99%", "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
+    if any(k in bio for k in [
+        "互关", "互粉", "互赞", "互评", "互fo", "涨粉", "粉丝互助", "互关互粉", "关注必回", "必回关",
+        "秒回关", "点赞互关", "赚积分互助", "广场互关", "币安互关", "f4f", "follow for follow",
+        "followback", "mutual follow", "follow me Binance"
+    ]):
+        return {"is_recommended": True, "probability": 99, "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
 
     # 5. 数据比例核心漏斗
-    if follower_count == 0:
-        return {"is_recommended": False, "probability": "< 5%", "reason": "粉丝数为0，绝对的死号或新号。"}
 
-    if not (50 <= follower_count <= 1500):
-        return {"is_recommended": False, "probability": "< 10%", "reason": f"粉丝数({follower_count})不在饥渴区间。"}
+    if not (10 <= follower_count <= 1500):
+        return {"is_recommended": False, "probability": 10, "reason": f"粉丝数({follower_count})不在饥渴区间。"}
 
-    if not (100 <= follow_count <= 1500):
-        return {"is_recommended": False, "probability": "< 10%", "reason": f"关注数({follow_count})不在安全区间。"}
+    if not (10 <= follow_count):
+        return {"is_recommended": False, "probability": 10, "reason": f"关注数({follow_count})不在安全区间。"}
 
     ratio = follow_count / follower_count
-    if not (0.8 <= ratio <= 1.5):
-        return {"is_recommended": False, "probability": "< 20%", "reason": f"比例({ratio:.2f})不在互惠区间。"}
+    if ratio < 0.9:
+        return {"is_recommended": False, "probability":10, "reason": f"比例({ratio:.2f})不在互惠区间。"}
 
     # 优质活跃真人目标
     if ratio >= 1.0:
-        return {"is_recommended": True, "probability": "70% - 90%",
+        score = 100 - (20 / ratio)
+        return {"is_recommended": True, "probability": score,
                 "reason": "强潜目标：活跃真人且关注数大于等于粉丝数，必回关！"}
-    else:
-        return {"is_recommended": False, "probability": "50% - 70%",
-                "reason": "优质目标：健康的社交活跃用户，大概率顺手回关。"}
 
 
 def extract_mutual_follow_users(posts: list, target_time_str: str) -> set:
