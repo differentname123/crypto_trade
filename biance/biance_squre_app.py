@@ -339,6 +339,8 @@ def _sync_single_account_logic(user_key, global_potential_uids):
         f"   - 去重总计最终关注: {len(final_uids_to_follow)} 人"
     )
 
+    # 最多只保留100个
+    final_uids_to_follow = list(final_uids_to_follow)[:100]
     if not final_uids_to_follow:
         logger.info(f"🎉 [账号: {user_key}] 没有需要关注的新用户。")
         return
@@ -390,7 +392,7 @@ def consumer_auto_sync_main(accounts=None):
                     seed_user_names.extend(f_map.keys())
 
             seed_user_names = list(set(seed_user_names))
-            global_worth_uids = get_worth_following_list(initial_user_name_list=seed_user_names, target_count=200)
+            global_worth_uids = get_worth_following_list(initial_user_name_list=seed_user_names, target_count=1000)
 
             # 3. 合成大池子
             global_potential_uids = shared_post_uids.union(set(global_worth_uids))
