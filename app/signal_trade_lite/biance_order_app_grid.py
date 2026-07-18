@@ -375,7 +375,7 @@ class GridNode:
         # WAL: 预写式意向记账, 即使随后进程崩溃也可据此追溯
         self.ctx.ledger.append(self.node_id, self.cycle_count, "INTENT",
                                self.active_client_oid, price, self.quantity, "PENDING", msg="待发送")
-
+        self.last_update_ts = time.time()
         res = self.ctx.broker.place_limit(action, self.quantity, price, self.active_client_oid, self.position_side)
         self.last_update_ts = time.time()
         tag = f"{self.node_id} {action.value}@{price} x{self.quantity} CID:{self.active_client_oid}"
