@@ -17,18 +17,17 @@ import random
 import time
 import threading
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from biance.biance_squre_api import fetch_binance_feed, clean_universal_posts, update_posts_in_place, \
-    toggle_binance_follow, fetch_binance_relations, fetch_binance_user_profile
 from common.common_utils import setup_logger, get_config, read_json, save_json
+logger = setup_logger(app_name="biance_follow")
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from biance.biance_squre_api import fetch_binance_feed,\
+    toggle_binance_follow, fetch_binance_relations, fetch_binance_user_profile
+
+
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
-setup_logger()
 
-# 拿到属于当前文件的专属 logger
-logger = logging.getLogger(__name__)
 
 
 # =====================================================================
