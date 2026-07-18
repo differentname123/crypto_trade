@@ -606,7 +606,19 @@ class ReconcilerThread(threading.Thread):
 def run_single_strategy(config):
     """子进程入口：完全独立的执行环境"""
 
-    # 【新增代码 1】：防极端强杀监控线程 (不侵入 strategy 核心代码)
+    # 【新增代码】：子进程启动的第一件事：强制重置日志，接管全局 logger！
+    # 将 SOL/USDT:USDT 转换成合法的物理文件名 SOL_USDT_USDT
+    safe_symbol = config.symbol.replace('/', '_').replace(':', '_')
+    log_filename = f"{config.strategy_id}_{safe_symbol}"
+
+    # 强制清理父进程遗留的句柄，绑定到如 S01_SOL_USDT_USDT.log 的独立文件
+    setup_logger(app_name=log_filename, force_reset=True)
+
+    # 记录子进程独立启动的日志
+    import logging
+    logging.getLogger().info(f"[PROCESS] 子进程 {config.strategy_id} 初始化独立日志完成, 日志文件: {log_filename}.log")
+
+    # 防极端强杀监控线程 (不侵入 strategy 核心代码)
     import os, sys, time, threading
     def _parent_watchdog():
         while True:
@@ -642,6 +654,10 @@ def main_app():
         GridConfig(
             strategy_id="S01", symbol="SOL/USDT:USDT",
             min_price=50, max_price=80, price_ratio=0.5, quantity=0.1,
+        ),
+        GridConfig(
+            strategy_id="S02", symbol="DOGE/USDT:USDT",
+            min_price=0.05, max_price=0.08, price_ratio=0.5, quantity=100,
         )
     ]
 

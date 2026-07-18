@@ -15,30 +15,35 @@ import pandas as pd
 import os
 import logging
 from logging.handlers import TimedRotatingFileHandler
-def setup_logger(log_dir="logs", app_name="BinanceBot"):
+
+def setup_logger(log_dir="logs", app_name="BinanceBot", force_reset=False):
     """
     初始化全局日志配置。
-    支持在多个文件中重复调用，但实际只会初始化一次。
+    force_reset=True: 专为多进程子进程设计，强制清除从父进程继承的 Handler，重新绑定独立文件。
     """
     os.makedirs(log_dir, exist_ok=True)
 
     # 获取根记录器
     logger = logging.getLogger()
 
-    # 【核心安全阀】：如果已经有 Handler，说明被其他文件初始化过了，直接跳过！
-    # 这一步极其重要，否则你在 10 个文件里调用，一行日志就会被打印 10 次。
+    # 【核心修改】：如果是子进程强制接管，清除原有的 Handler 以免重复打印或写错文件
+    if force_reset:
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+
+    # 【核心安全阀】
     if logger.handlers:
         return logger
 
     logger.setLevel(logging.INFO)
 
-    # 包含 文件名.函数名:行号 的终极溯源格式
     formatter = logging.Formatter(
         '%(asctime)s,%(msecs)03d | %(levelname)s | [%(funcName)s] | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    # 按天切割日志
+    # 按天切割日志 (此时每个进程拥有独立的文件，切割不再冲突)
     log_file_path = os.path.join(log_dir, f"{app_name}.log")
     file_handler = TimedRotatingFileHandler(
         filename=log_file_path,
@@ -49,16 +54,20 @@ def setup_logger(log_dir="logs", app_name="BinanceBot"):
     )
     file_handler.setFormatter(formatter)
 
-    # 控制台输出
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-
     logger.propagate = False
 
+    # 【附加优化】：屏蔽 CCXT / requests 等底层库的烦人调试日志
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("ccxt").setLevel(logging.WARNING)
+
     return logger
+
+
 
 # 提供一个辅助函数，仅用于日志打印时将毫秒时间戳转为人类可读的北京时间
 def format_ts_to_bj(ms_timestamp):
