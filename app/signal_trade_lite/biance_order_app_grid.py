@@ -25,7 +25,7 @@ from datetime import datetime
 import multiprocessing
 from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
 
-logger = setup_logger(app_name="GridTrader")
+logger = setup_logger(app_name="grid_trader")
 from app.signal_trade_lite.biance_order_lite import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
@@ -235,11 +235,15 @@ class GridNode:
         self.last_update_ts = time.time()
 
     # ---------- 对外能力 ----------
-    def open_as_new(self):
+    def open_as_new(self, override_price=None):
         """初始铺位: 进入开仓等待并挂出限价买单。"""
         self.state = NodeState.WAIT_OPEN
         self.active_client_oid = self._new_oid(OrderAction.BUY)
-        self._place_limit_order(OrderAction.BUY, self.target_open_price)
+
+        # 如果传入了覆盖价格（如市价+3%），则使用覆盖价格，否则使用默认网格开仓价
+        price_to_place = override_price if override_price is not None else self.target_open_price
+
+        self._place_limit_order(OrderAction.BUY, price_to_place)
 
     def align(self, cycle, client_oid, exchange_oid, action):
         """依对账真相拨正内存指针 (仅冷启动、单线程环境下调用)。"""
@@ -520,17 +524,29 @@ class GridStrategy:
     def initialize_market_placement(self):
         """
         铺单初始化: 所有新节点统一挂限价买单。
-        现价下方 -> 正常挂盘等待; 现价上方 -> 被撮合引擎作为 Taker 瞬时成交。
+        现价下方 -> 正常挂盘等待;
+        现价上方 -> 采用 min(网格价, 现价*1.03) 作为 Taker 瞬时成交，规避 5% 拒单及极端插针滑点。
         随后即时对账接管越价成交, 闭环驱动挂出对应卖单。
         """
         current_price = self.broker.fetch_last_price()
+        precision = self.broker.fetch_precision()  # 获取当前交易对精度，用于修约修正后的价格
 
         init_count = 0
         for node in self.nodes.values():
             if node.state != NodeState.INIT:
                 continue  # 已由冷启动对账恢复的老节点, 跳过, 杜绝重复铺单
+
             init_count += 1
-            node.open_as_new()
+
+            # 【核心逻辑】：高于现价的网格，开仓价取 (现价+3%) 与 (原网格价) 的较小值
+            if node.target_open_price > current_price:
+                raw_override_price = min(node.target_open_price, current_price * 1.03)
+                # 使用全局已引入的 format_price_amount 进行合规的精度修约
+                execute_price, _ = format_price_amount(raw_override_price, 0, precision)
+                node.open_as_new(override_price=execute_price)
+            else:
+                node.open_as_new()
+
             time.sleep(PLACE_THROTTLE_SEC)
 
         if init_count == 0:
