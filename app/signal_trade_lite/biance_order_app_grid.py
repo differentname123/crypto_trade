@@ -35,13 +35,12 @@ from app.signal_trade_lite.biance_order_lite import (
 # ==========================================
 # 0. 可调参数 (消灭魔术数字)
 # ==========================================
-RECONCILE_SKIP_WINDOW_SEC = 5.0    # 运行时对账跳过"刚动过"的节点, 规避 REST 快照传播延迟造成的误判
 POINT_CHECK_DELAY_COLD = 0.05      # 冷启动点查限流
 POINT_CHECK_DELAY_RUNTIME = 0.1    # 运行时点查限流
 PLACE_THROTTLE_SEC = 0.05          # 批量铺单限流
 INIT_SETTLE_WAIT_SEC = 1.0         # 铺单后等待撮合/网络传播的缓冲
 COLD_START_BACKTRACK = 3           # 冷启动每个节点回溯的历史单号数量
-ORDER_GRACE_PERIOD = 5.0  # 定义 10 秒冷静期
+ORDER_GRACE_PERIOD = 5.0  # 定义 5 秒冷静期
 
 # ==========================================
 # 1. 枚举与值对象 (类型安全 + 去魔法字符串)
@@ -311,6 +310,7 @@ class GridNode:
         self.ctx.ledger.append(self.node_id, self.cycle_count, "INTENT",
                                self.active_client_oid, price, self.quantity, "PENDING", msg="待发送")
 
+        self.last_update_ts = time.time()
         res = self.ctx.broker.place_limit(action, self.quantity, price, self.active_client_oid, self.position_side)
         self.last_update_ts = time.time()
         tag = f"{self.node_id} {action.value}@{price} x{self.quantity} CID:{self.active_client_oid}"
@@ -411,21 +411,17 @@ class ReconciliationEngine:
         logger.info(f"[RECOVER] 冷启动对账完成 | 成功锚定恢复 {aligned} 个节点")
 
     # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
-    def repair_runtime(self, nodes, skip_recent=True):
+    def repair_runtime(self, nodes):
         """只读比对锁定掉单悬挂 -> 点查确认 -> 投递事件; 全程不修改任何节点内存。"""
         active_cids, open_orders = self._snapshot()
         if open_orders is None:
             return
 
-        now = time.time()
         suspects = []  # 检测点固定 (node, cid), 规避与主线程写入的数据竞态
         for node in nodes.values():
             if time.time() - node.last_update_ts < ORDER_GRACE_PERIOD:
                 continue
             if node.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
-                continue
-            # 跳过刚动过的节点, 防止状态机与 REST 快照传播延迟造成误判 (init 场景传 False 以即时接管越价成交)
-            if skip_recent and now - node.last_update_ts < RECONCILE_SKIP_WINDOW_SEC:
                 continue
             cid = node.active_client_oid
             if cid not in active_cids:
@@ -525,7 +521,7 @@ class GridStrategy:
         """
         铺单初始化: 所有新节点统一挂限价买单。
         现价下方 -> 正常挂盘等待; 现价上方 -> 被撮合引擎作为 Taker 瞬时成交。
-        随后即时对账(skip_recent=False)接管越价成交, 闭环驱动挂出对应卖单。
+        随后即时对账接管越价成交, 闭环驱动挂出对应卖单。
         """
         current_price = self.broker.fetch_last_price()
 
@@ -544,7 +540,7 @@ class GridStrategy:
         logger.info(f"[INIT] 铺出 {init_count} 个新节点初始买单 | 参考现价 {current_price}, "
                     f"呼叫对账引擎接管越价成交底仓...")
         time.sleep(INIT_SETTLE_WAIT_SEC)  # 给撮合与网络传播极短缓冲
-        self.engine.repair_runtime(self.nodes, skip_recent=False)
+        self.engine.repair_runtime(self.nodes)
 
     def run_main_loop(self):
         """单线程主循环 (唯一写者): 消费事件 -> 路由到节点 -> 串行推演状态机。"""
@@ -586,7 +582,7 @@ class ReconcilerThread(threading.Thread):
         while True:
             time.sleep(self.interval)
             try:
-                self.engine.repair_runtime(self.nodes, skip_recent=True)
+                self.engine.repair_runtime(self.nodes)
             except Exception as e:
                 logger.error(f"[WATCHDOG] 对账轮次异常: {e}")
 
