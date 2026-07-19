@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
-logger = setup_logger(app_name="cross_momentum")
+logger = setup_logger(app_name="cross_trader")
 
 
 from run_cross_signal_lite import execute_trading_bot_workflow

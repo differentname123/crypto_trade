@@ -23,7 +23,7 @@ import aiohttp
 import threading
 from datetime import datetime, timedelta
 
-from app.signal_trade_lite.common_utils_lite import setup_logger
+from common_utils_lite import setup_logger
 
 # 解除 Pandas 控制台打印限制
 pd.set_option('display.max_columns', None)

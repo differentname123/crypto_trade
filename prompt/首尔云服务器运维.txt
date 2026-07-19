@@ -90,6 +90,7 @@ systemctl reload nginx
 
 * 🟢 **启动/重启:** `systemctl restart binance-trade`
 * 🔴 **紧急停止:** `systemctl stop binance-trade`
+* 🟡 **查看状态:** `systemctl status binance-trade`
 * 🟡 **查看报错:** `journalctl -u binance-trade -f`
 * 🔵 **查看交易日志:** `tail -f app/signal_trade_lite/logs/trading_bot.log`
 
