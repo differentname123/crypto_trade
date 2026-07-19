@@ -21,6 +21,7 @@ import platform
 import threading
 from enum import Enum
 from datetime import datetime
+from collections import defaultdict
 
 import multiprocessing
 from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
@@ -391,28 +392,72 @@ class ReconciliationEngine:
 
     # ---------- 冷启动: 允许直接拨正节点 (单线程安全) ----------
     def recover_on_startup(self, nodes):
-        """多级回溯历史单号锚定真相, 拨正节点并补发事件, 防重启爆铺 / 断电掉单。"""
+        """多级回溯 + 交易所反向认领，保障准确恢复，对孤儿单仅做高密度日志记录。"""
         active_cids, open_orders = self._snapshot()
         if open_orders is None:
             return
-        history = self.ledger.load_node_oid_history()
 
+        history = self.ledger.load_node_oid_history()
         aligned = 0
+
+        # ── 第1层：交易所活单反向认领（不依赖本地账本）──
+        node_live_orders = defaultdict(list)
+        for cid in active_cids:
+            parsed = OidCodec.parse(cid)
+            if parsed and parsed.strategy_id == self.strategy_id and parsed.node_id in nodes:
+                # 提取 cycle 一并保存，用于后续的复合排序防倒退
+                node_live_orders[parsed.node_id].append((parsed.cycle, cid))
+
+        for node_id, orders in node_live_orders.items():
+            node = nodes[node_id]
+            if node.state != NodeState.INIT:
+                continue
+
+            # 复合主键排序 -> 首要按 cycle 降序(解决跨轮次乱序)，次要按 ms后缀 降序
+            orders.sort(key=lambda x: (x[0], x[1].split('_')[-1]), reverse=True)
+            truth_cid = orders[0][1]  # 取出符合条件的最新 CID
+
+            truth_order = next((o for o in open_orders if o.get('clientOrderId') == truth_cid), None)
+            if truth_order:
+                self._align_and_emit(node, truth_cid, truth_order)
+                aligned += 1
+                logger.info(f"[RECOVER] 反向认领 {node_id} ← {truth_cid}")
+
+        # ── 第2层：本地账本回溯（覆盖已成交/已撤销、不在盘口的订单）──
         for node_id, node in nodes.items():
             if node.state != NodeState.INIT:
                 continue
-            candidates = list(reversed(history.get(node_id, [])[-COLD_START_BACKTRACK:]))  # 最新在前
+            candidates = list(reversed(history.get(node_id, [])[-COLD_START_BACKTRACK:]))
             if not candidates:
                 continue
-
-            truth_cid, truth_order = self._resolve_truth(candidates, active_cids, open_orders, POINT_CHECK_DELAY_COLD)
+            truth_cid, truth_order = self._resolve_truth(
+                candidates, active_cids, open_orders, POINT_CHECK_DELAY_COLD)
             if truth_order is not None:
                 self._align_and_emit(node, truth_cid, truth_order)
                 aligned += 1
             else:
-                logger.warning(f"[RECOVER] {node_id} 回溯 {COLD_START_BACKTRACK} 个历史单号均查无此单, "
-                               f"判为未送达的幽灵单, 待重新铺设。")
-        logger.info(f"[RECOVER] 冷启动对账完成 | 成功锚定恢复 {aligned} 个节点")
+                logger.warning(f"[RECOVER] {node_id} 幽灵单，待重铺。")
+
+        # ── 第3层：孤儿单检测与高密度日志（不执行物理撤单，仅打印记录）──
+        managed_cids = {n.active_client_oid for n in nodes.values() if n.active_client_oid}
+        orphan_count = 0
+        for cid in active_cids:
+            if cid not in managed_cids:
+                orphan = next((o for o in open_orders if o.get('clientOrderId') == cid), None)
+                if orphan:
+                    orphan_count += 1
+                    o_id = orphan.get('id', 'N/A')
+                    o_price = orphan.get('price', 0)
+                    o_qty = orphan.get('amount', 0)
+                    o_side = str(orphan.get('side', 'N/A')).upper()
+
+                    # 仅做高密度报警，不侵入交易所状态
+                    logger.warning(f"[RECOVER-ORPHAN] 发现脱管孤儿单 (保留未撤销) | "
+                                   f"CID:{cid} ID:{o_id} {o_side} @{o_price} x{o_qty}")
+
+        logger.info(f"[RECOVER] 冷启动对账完成 | 成功恢复 {aligned}/{len(nodes)} 个节点, "
+                    f"共发现 {orphan_count} 张脱管孤儿单(未干预)")
+
 
     # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
     def repair_runtime(self, nodes):

@@ -552,7 +552,7 @@ def handle_open(exchange, ledger, ledger_df, sig, total_equity, open_order_cache
 
     result = execute_order(
         exchange=exchange, symbol=sig["symbol"], side=sig["action"], amount=amount,
-        client_oid=sig["client_oid"], order_type="limit", price=sig["price"],
+        client_oid=sig["client_oid"], order_type="market",
         reduce_only=False, position_side=sig["direction"]
     )
     status = ST_PENDING if result.status == ExecStatus.OK else ST_FAILED
@@ -606,7 +606,7 @@ def handle_close(exchange, ledger, ledger_df, sig, position_cache, open_order_ca
 
     result = execute_order(
         exchange=exchange, symbol=sig["symbol"], side=sig["action"], amount=amount,
-        client_oid=sig["client_oid"], order_type="limit", price=sig["price"],
+        client_oid=sig["client_oid"], order_type="market",
         reduce_only=False, position_side=sig["direction"]  # reduce_only + 持仓方向, 严格只减仓
     )
     status = ST_PENDING if result.status == ExecStatus.OK else ST_FAILED
