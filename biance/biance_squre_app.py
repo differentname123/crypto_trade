@@ -37,7 +37,7 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 logger = setup_logger(app_name="biance_follow")
 
 # ---------------------------- 全局常量 ----------------------------
-MIN_PROBABILITY = 95  # 严格判定为高价值目标的概率下限(需 > 此值)
+MIN_PROBABILITY = 90  # 严格判定为高价值目标的概率下限(需 > 此值)
 MIN_FISSION_PROBABILITY = 85  # [新增] 裂变中继跳板阈值(需 >= 此值，允许挖掘其关系链)
 PROFILE_CACHE_PATH = "user_profile.json"
 PRODUCER_SWEEP_INTERVAL = 10000  # 生产者两轮全量抓取之间的休眠间隔(秒)
@@ -85,8 +85,8 @@ def _is_high_value_target(predict_info):
 
 
 def _is_worth_fission(predict_info):
-    """[新增] 裂变中继判定：只要达到或超过跳板阈值(T1次优互惠区间及以上)，其关系链就极具挖掘价值。"""
-    return _normalize_probability(predict_info.get('probability', 0)) >= MIN_FISSION_PROBABILITY
+    return bool(predict_info.get('is_recommended', False)) and \
+        _normalize_probability(predict_info.get('probability', 0)) >= MIN_FISSION_PROBABILITY
 
 
 def predict_follow_back(user_info):
@@ -252,13 +252,13 @@ def _get_uids_from_recent_posts(post_manager, days_ago=7, limit=50000):
 # =====================================================================
 
 def _analyze_user_task(user_name, user_info_map, stop_event):
-    """单用户分析闭环：命中缓存直接复用；否则拉画像→纯血预测→高价值号才拉关系链，全流程无嵌套线程。"""
+    """单用户分析闭环：修复历史缓存击穿引发的二次降权Bug"""
     if stop_event.is_set():
         return user_name, None, None, None, None
 
     user_data = user_info_map.get(user_name, {})
 
-    # 命中缓存：复用历史预测，避免重复网络请求
+    # 1. 命中缓存：复用历史预测，避免重复网络请求
     if 'predict_info' in user_data:
         predict_info = user_data['predict_info']
         is_target = _is_high_value_target(predict_info)
@@ -273,7 +273,16 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
             return user_name, user_data.get('squareUid'), predict_info, \
                 user_data['following'], user_data['followers']
 
-    # 网络层：无 UID 缓存则拉画像并瘦身入内存；否则复用本地资料喂给预测引擎
+        # 🟢 【新增修复】：命中目标/跳板，但缺少关系链（通常是历史跑过的 85 分数据被清除了）
+        # 此时只需直接拉关系链即可，千万不可让残缺的 user_data 掉入下方的预测函数被洗成 10 分！
+        if user_data.get('squareUid'):
+            square_uid = user_data.get('squareUid')
+            following_map, follower_map = _get_current_relations(user_name, max_count=1000)
+            user_info_map[user_name]['following'] = following_map
+            user_info_map[user_name]['followers'] = follower_map
+            return user_name, square_uid, predict_info, following_map, follower_map
+
+    # 2. 网络层：完全未评估过的新用户，正常拉画像
     if 'squareUid' not in user_data:
         raw_profile = fetch_binance_user_profile(user_name)
         if not raw_profile:
@@ -281,62 +290,48 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
             user_info_map[user_name] = {'predict_info': predict_info}
             return user_name, None, predict_info, {}, {}
 
-        # 解析并组装供预测引擎使用的 user_info 字典
         user_info = {
             'squareUid': raw_profile.get('squareUid'),
-
-            # --- 基础数量指标 ---
             'totalFollowCount': raw_profile.get('totalFollowCount', 0),
             'totalFollowerCount': raw_profile.get('totalFollowerCount', 0),
             'totalListedPostCount': raw_profile.get('totalListedPostCount', 0),
             'totalLikeCount': raw_profile.get('totalLikeCount', 0),
-
-            # --- 官方风控与状态指标 (第一层漏斗核心) ---
             'lowQuality': raw_profile.get('lowQuality', False),
             'userStatus': raw_profile.get('userStatus', 1),
-            'accountStatus': raw_profile.get('accountStatus', 0),  # [新增] 账号异常状态
-            'blockType': raw_profile.get('blockType', 0),  # [新增] 封禁类型
-
-            # --- 活跃度与意图直判指标 (第二、三层漏斗核心) ---
+            'accountStatus': raw_profile.get('accountStatus', 0),
+            'blockType': raw_profile.get('blockType', 0),
             'modifyTime': raw_profile.get('modifyTime', 0),
             'biography': raw_profile.get('biography', ''),
-
-            # --- 高姿态与KOL拦截指标 (第一层漏斗核心) ---
-            'verificationType': raw_profile.get('verificationType', 0),  # [新增] 官方黄V/金V认证
-            'hasCopyTradingEntrance': raw_profile.get('hasCopyTradingEntrance', False),  # [新增] 带单交易员入口
-
-            # --- 生态深度与活人防伪指标 (第三层路径B核心，没有这三个字段，所有高潜都会被误杀) ---
-            'publicHoldingScope': raw_profile.get('publicHoldingScope', []),  # [新增] 实盘持仓公开数据 (默认空列表)
-            'userTags': raw_profile.get('userTags', []),  # [新增] 官方交易/年限标签 (默认空列表)
-            'tippingControl': raw_profile.get('tippingControl', 0)  # [新增] 打赏开关，代表变现意图
+            'verificationType': raw_profile.get('verificationType', 0),
+            'hasCopyTradingEntrance': raw_profile.get('hasCopyTradingEntrance', False),
+            'publicHoldingScope': raw_profile.get('publicHoldingScope', []),
+            'userTags': raw_profile.get('userTags', []),
+            'tippingControl': raw_profile.get('tippingControl', 0)
         }
         user_info_map.setdefault(user_name, {}).update(user_info)
     else:
         user_info = user_data
 
-    # 纯血引擎预测并落缓存
+    # 3. 纯血引擎预测并落缓存
     predict_info = predict_follow_back(user_info)
     square_uid = user_info.get('squareUid')
     user_info_map[user_name]['predict_info'] = predict_info
 
-    # 【核心修改点】：分离“关注目标”与“裂变跳板”
     is_target = _is_high_value_target(predict_info)
     is_bridge = _is_worth_fission(predict_info)
 
-    # 差号：既不配被关注，也不配做跳板。清理冗余字段防缓存膨胀后直接返回
     if not (is_target or is_bridge):
         preserved = {'predict_info', 'squareUid'}
         for k in [key for key in user_info_map[user_name] if key not in preserved]:
             del user_info_map[user_name][k]
         return user_name, square_uid, predict_info, {}, {}
 
-    # 只要是【高价值号】或【优质跳板】，统一投入网络 I/O 去挖掘其关系链深挖
+    # 4. 高价值或优质跳板，投入网络 I/O 拉取关系链深挖
     following_map, follower_map = _get_current_relations(user_name, max_count=1000)
     user_info_map[user_name]['following'] = following_map
     user_info_map[user_name]['followers'] = follower_map
 
     return user_name, square_uid, predict_info, following_map, follower_map
-
 
 def get_worth_following_list(initial_user_name_list, target_count):
     """广度优先裂变引擎：以种子用户为起点，通过高价值号的关系链逐轮扩散，直至凑够目标数量的优质 UID。"""
