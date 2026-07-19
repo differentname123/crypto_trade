@@ -234,35 +234,46 @@ class StatisticsThread(threading.Thread):
             lines.append(f" ⬆️ 最近卖单: 无 (已空仓，或价格已突破网格上限)")
 
         # ---------------------------------------------------------
-        # 核心改进 2: 计算现价距离网格上下限位置，进行破网预警 (阈值设为 5%)
+        # 核心改进 2: 计算现价距离网格上下限位置，常驻展示并辅助破网预警
         # ---------------------------------------------------------
-        dist_to_min_pct = (current_price - self.config.min_price) / self.config.min_price * 100
-        dist_to_max_pct = (self.config.max_price - current_price) / self.config.max_price * 100
+        drop_to_min_pct = (current_price - self.config.min_price) / current_price * 100
+        rise_to_max_pct = (self.config.max_price - current_price) / current_price * 100
 
+        # 格式化距离文案 (兼容已经破网时的负数显示)
+        min_str = f"距下限跌幅 {drop_to_min_pct:.2f}%" if drop_to_min_pct >= 0 else f"已跌穿下限 {-drop_to_min_pct:.2f}%"
+        max_str = f"距上限涨幅 {rise_to_max_pct:.2f}%" if rise_to_max_pct >= 0 else f"已突破上限 {-rise_to_max_pct:.2f}%"
+
+        status_icon = "🟢"
         warnings = []
-        if dist_to_min_pct <= 5.0:
-            if dist_to_min_pct > 0:
-                warnings.append(
-                    f" ⚠️ 【破网预警】现价距离下限[{self.config.min_price}]仅剩 {dist_to_min_pct:.2f}%, 即将满仓套牢！")
-            else:
-                warnings.append(f" 🚨 【击穿下限】现价已跌破网格下限[{self.config.min_price}]！停止买入，等待反弹。")
 
-        if dist_to_max_pct <= 5.0:
-            if dist_to_max_pct > 0:
-                warnings.append(
-                    f" ⚠️ 【飞天预警】现价距离上限[{self.config.max_price}]仅剩 {dist_to_max_pct:.2f}%, 即将全部踏空！")
-            else:
-                warnings.append(f" 🚨 【突破上限】现价已突破网格上限[{self.config.max_price}]！停止卖出，等待回调。")
+        # 预警阈值判断
+        if 0 <= drop_to_min_pct <= 5.0:
+            warnings.append(f" ⚠️ 【破网预警】即将跌破下限，面临满仓套牢风险！")
+            status_icon = "⚠️"
+        elif drop_to_min_pct < 0:
+            warnings.append(f" 🚨 【击穿下限】已跌穿下限！停止买入，等待反弹。")
+            status_icon = "🚨"
 
+        if 0 <= rise_to_max_pct <= 5.0:
+            warnings.append(f" ⚠️ 【飞天预警】即将突破上限，面临全部踏空风险！")
+            status_icon = "⚠️"
+        elif rise_to_max_pct < 0:
+            warnings.append(f" 🚨 【突破上限】已突破上限！停止卖出，等待回调。")
+            status_icon = "🚨"
+
+        # 常驻输出带有距离的网格区间信息
+        lines.append(
+            f" {status_icon} 网格区间: {self.config.min_price} ~ {self.config.max_price} ({min_str}, {max_str})")
+
+        # 如果触发了预警，追加预警文案
         if warnings:
             lines.extend(warnings)
-        else:
-            lines.append(f" 🟢 网格区间: {self.config.min_price} ~ {self.config.max_price} (当前处于安全腹地)")
 
         lines.append("==========================================================\n")
 
-        # 一次性完整输出，绝不会被其他子进程的日志插队
+        # 一次性完整输出
         logger.info("\n".join(lines))
+
 
 class OidCodec:
     """
@@ -872,7 +883,7 @@ def run_single_strategy(config):
     ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=WATCHDOG_INTERVAL_SEC).start()
 
     # 4. 启动日志统计看板 (默认 60 秒播报一次)  <--- 新增这行！
-    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=60).start()
+    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=120).start()
 
     strategy.run_main_loop()
 
