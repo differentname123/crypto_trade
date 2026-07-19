@@ -1,14 +1,145 @@
 现在我有一个需求如下，需要一个完整的提示词来让大模型来实现这个需求，请帮我把下面的需求转换为一个完整的提示词：
-1.我需要的是简单可靠的网格交易方案，我是为了在biance进行带单，所有我不能够使用现成的网格交易策略，要进行手动实现
-2.整体的架构应该从高到低的设计，先思考这个系统有哪些流程，然后再一步一步的进行相应函数的实现，这样的话就能够保证低耦合，高内聚，可读性可灵活性都会提高
-3.核心就是可靠和高速，而且网格看成一个个的节点，每个节点事实也是独立不影响的，然后只用管理好每个节点，整体系统就会很好，而且很稳定可靠，因为在一开始就知道目标开仓价和目标平仓价，然后再做好监控就行了，保证每个价位都有网格，做到不重复，不遗漏这就是最好的，反应要快避免错过机会
-4.其实最小可运行单位就只用输入币种，以及网格间距百分比，以及每个交易数量，还有就是价格范围，方向默认是只做多，这些信息定好了，其实每个网格的数据就定好了，剩下的就是不断的监控和执行挂单操作，确保每个网格都能被正确执行。而且理论上运行中每个价格上都应该有单子，要么是开仓单要么是平仓单，而且默认是初始化建仓，也就是说假如是做多的网格，当前价格是90，上限是100，下线是50，间隔是1%，那么就应该从50到100都挂上限价单，而不只是50到90，而且就算挂95的成交价是90，但是平仓价仍然要是96
-5.对账的部分应该考虑的传统的rest api可能会限速，而websocket可能又会由于波动导致订单丢失，这个对账是重中之重，这个要设计的高可靠才是一切的基础
-6.我只做合约网格，然后都是双向持仓模式，而且我的资金很小，不用考虑部分成交的情况，相应网格全量成交才进行新网格的挂单操作
-7.我希望交易可追溯和统计，比如我希望能够知道每次交易的时间，以及当前该币网格交易的持仓情况
-8.同一个账户还可能有其它挂单，所以这个网格交易策略尽量不要影响其它人，只要保证自己网格的挂单和执行就行，井水不犯河水
-9.给我相应的方案就行，暂时不用提供代码
+1.我的目标是在biance，获取高概率会回关的用户，probability越高表示回关的概率越高，但是现在回关的概率并不是很高，我希望你能够辩证全面的分析，基于这些已有的信息，打造出一个高回关的筛选方法,都只能基于已有的信息字段，不能够擅自构想其它的信息，暂时不用给我代码只有给我方案，我要求的是宁可漏掉，也不想误判为值得关注，我要的是极高概率会回关的方案
+2.我已有的判断函数如下，返回的示例格式应该保持和已有的一致：
+def predict_follow_back(user_info):
+    """纯血预测引擎：仅凭画像 dict 做逻辑判定，完全剥离网络与存储，可离线复算调优。"""
+    follow_count = user_info.get('totalFollowCount', 0)
+    follower_count = user_info.get('totalFollowerCount', 0)
 
+    # 1. 官方风控与状态过滤(一票否决)
+    if user_info.get('lowQuality', False):
+        return {"is_recommended": False, "probability": 0, "reason": "官方标记的低质量/降权号"}
+    if user_info.get('userStatus', 1) != 1:
+        return {"is_recommended": False, "probability": 0, "reason": "账号状态异常(封禁或静默)"}
+
+    # 2. 僵尸号/机器号过滤(零产出且狂关注)
+    if user_info.get('totalListedPostCount', 0) == 0 and user_info.get('totalLikeCount', 0) == 0:
+        if follow_count > 50:
+            return {"is_recommended": False, "probability": 0, "reason": "0发帖0点赞的批量机器/僵尸号"}
+
+    # 3. 活跃度过滤(超 7 天未活跃视为沉寂号)
+    modify_time_ms = user_info.get('modifyTime', 0)
+    if modify_time_ms > 0:
+        days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
+        if days_inactive > 7:
+            return {"is_recommended": False, "probability": 10,
+                    "reason": f"长达 {int(days_inactive)} 天未活跃的沉寂号"}
+
+    # 4. T0 级强意图直判(简介明写互关，直接保送)
+    bio = (user_info.get('biography') or '').lower()
+    if any(kw in bio for kw in MUTUAL_FOLLOW_KEYWORDS):
+        return {"is_recommended": True, "probability": 101, "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
+
+    # 5. 数据比例核心漏斗(饥渴粉丝区间 + 互惠关注比例)
+    if not (50 <= follower_count <= 1500):
+        return {"is_recommended": False, "probability": 10, "reason": f"粉丝数({follower_count})不在饥渴区间。"}
+    if follow_count < 100:
+        return {"is_recommended": False, "probability": 10, "reason": f"关注数({follow_count})不在安全区间。"}
+
+    ratio = follow_count / follower_count
+    if ratio < 0.9:
+        return {"is_recommended": False, "probability": 10, "reason": f"比例({ratio:.2f})不在互惠区间。"}
+
+    score = 100 - (20 / ratio)
+    return {"is_recommended": True, "probability": score,
+            "reason": "强潜目标：活跃真人且关注数≥粉丝数，必回关！"}
+
+3.能够拉取到的完整信息示例如下，方案都要基于此：
+{
+        "binanceUid": null,
+        "squareUid": "CfexsWwIVYYbr1N5GJXlVQ",
+        "avatar": "https://public.bnbstatic.com/image/pgc/202604/ec2ff6b3261171923014991c9f317f7e.png",
+        "displayName": "静以观复",
+        "biography": "关注必回 做减法。少即是多，慢即是快。用时间的复利，抹平一切短期的随机性。",
+        "role": 11,
+        "profileImage": null,
+        "verificationType": 0,
+        "verificationDescription": null,
+        "totalFollowerCount": 101,
+        "totalListedPostCount": 22,
+        "accountLang": "cn",
+        "badge": null,
+        "totalLikeCount": 21,
+        "totalShareCount": 0,
+        "totalBitCount": 0,
+        "totalArticleCount": 0,
+        "totalFollowCount": 1445,
+        "isFollowed": null,
+        "followsYou": null,
+        "allowPushNotification": null,
+        "liveStatusVO": null,
+        "badgeVO": null,
+        "tippingControl": 1,
+        "tippingNotification": 1,
+        "privateChatEntrance": null,
+        "badgeInfos": null,
+        "totalBadges": 0,
+        "username": "Insights_Anchor",
+        "followersForShow": null,
+        "lastFollowerCount": null,
+        "totalEachFollowerCount": null,
+        "blockType": 0,
+        "createTime": 1770465699000,
+        "modifyTime": 1784409207000,
+        "hasCopyTradingEntrance": false,
+        "copyTradingIosDeepLink": null,
+        "copyTradingType": null,
+        "copyTradingAndroidDeepLink": null,
+        "copyTradingWebDeepLink": null,
+        "userShareLink": "https://app.binance.com/uni-qr/cpro/Insights_Anchor?l=zh-CN&r=I5O5NI6V",
+        "accountStatus": 0,
+        "punishStartTime": null,
+        "punishEndTime": null,
+        "punishReason": null,
+        "resetUsername": null,
+        "resetDisplayName": null,
+        "resetAvatar": null,
+        "userTags": [
+            {
+                "name": "实盘交易",
+                "desc": "该用户已在其币安广场个人资料上启用加密货币投资组合或资产分析共享功能。",
+                "type": 1,
+                "icon": ""
+            },
+            {
+                "name": "高频交易者",
+                "desc": "此徽章反映了用户的交易频次，并根据特定时间范围内（每月）完成的交易笔数分为不同等级。",
+                "type": 3,
+                "icon": ""
+            },
+            {
+                "name": "5.2 年",
+                "desc": "该用户注册于 2021-04，至今已经 5.2 年",
+                "type": 4,
+                "icon": ""
+            }
+        ],
+        "userLabels": null,
+        "holdTokens": null,
+        "tradeTokens": null,
+        "holdingStatus": null,
+        "publicHoldingScope": [
+            "futuresLiveTrading",
+            "assetAllocation",
+            "cumulativePNL",
+            "tags"
+        ],
+        "isChatroomEnabled": false,
+        "chatroomIosDeepLink": null,
+        "chatroomAndroidDeepLink": null,
+        "chatroomWebLink": null,
+        "newChatroomDeepLink": null,
+        "useNewChatroomDeepLink": false,
+        "isChatroomEnabledNew": false,
+        "chatId": null,
+        "chatSource": null,
+        "chatroomDeepLinkNew": null,
+        "previewSpaceLive": null,
+        "lowQuality": false,
+        "topTraderId": "4913659549200171521",
+        "userStatus": 1,
+        "deeplink": null
+    }
 
 
 提示词其它要求如下：
