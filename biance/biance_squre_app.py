@@ -163,8 +163,8 @@ def predict_follow_back(user_info):
                 "reason": f"REJECT: 主动关注基数({follow_count})不足200，缺乏主动互惠习惯"}
 
     # 3. 生态深度防伪 (必须证明是高频打开APP的用户)
-    has_holding = len(user_info.get('publicHoldingScope', [])) > 0
-    has_tags = len(user_info.get('userTags', [])) > 0
+    has_holding = bool(user_info.get('publicHoldingScope'))
+    has_tags = bool(user_info.get('userTags'))
     has_tipping = user_info.get('tippingControl', 0) == 1
 
     if not (has_holding or has_tags or has_tipping):
