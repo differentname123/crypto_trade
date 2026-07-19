@@ -84,6 +84,9 @@ systemctl reload nginx
 
 工作目录均在 `/root/signal_trade_lite`（共用代码与虚拟环境）。
 
+查看服务被kill的记录：  "  dmesg -T | grep -i -E "killed process|oom" -C 10   "
+
+
 **Lite 策略 (主干)：**
 
 * **服务配置:** `/etc/systemd/system/binance-trade.service`

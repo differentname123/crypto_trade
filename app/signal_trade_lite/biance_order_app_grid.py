@@ -102,11 +102,12 @@ class ParsedOid:
 class OrderEvent:
     """事件总线上流转的标准订单事件 (取代原始 dict, 语义收敛)。"""
 
-    def __init__(self, client_oid, status, fill_price=0.0, fill_qty=0.0):
+    def __init__(self, client_oid, status, fill_price=0.0, fill_qty=0.0, update_ts=0):
         self.client_oid = client_oid
         self.status = status
         self.fill_price = fill_price
         self.fill_qty = fill_qty
+        self.update_ts = update_ts  # 新增：事件在交易所发生的真实时间(毫秒)
 
 
 class GridConfig:
@@ -128,6 +129,9 @@ class NodeContext:
         self.broker = broker
         self.ledger = ledger
         self.strategy_id = strategy_id
+        # 新增：全局共享的市场最新价与精度缓存
+        self.latest_price = 0.0
+        self.precision = None
 
 
 class OidCodec:
@@ -259,6 +263,14 @@ class GridNode:
         self.active_exchange_oid = ""
         self.last_update_ts = time.time()
 
+    def _get_safe_buy_price(self):
+        """利用全局缓存的现价，计算防越界/插针的安全买入价"""
+        if self.ctx.latest_price > 0 and self.ctx.precision is not None:
+            raw_price = min(self.target_open_price, self.ctx.latest_price * TAKER_PRICE_MARKUP)
+            price, _ = format_price_amount(raw_price, 0, self.ctx.precision)
+            return price
+        return self.target_open_price
+
     # ---------- 对外能力 ----------
     def open_as_new(self, override_price=None):
         """初始铺位: 进入开仓等待并挂出限价买单; override_price 用于现价上方节点的吃单封顶价。"""
@@ -310,7 +322,10 @@ class GridNode:
         self.cycle_count += 1
         self.state = NodeState.WAIT_OPEN
         self.active_client_oid = self._new_oid(OrderAction.BUY)
-        self._place_limit_order(OrderAction.BUY, self.target_open_price)
+
+        # 修改：利用共享的现价缓存计算安全吃单下限，防极端行情瞬间插针越界
+        safe_buy_price = self._get_safe_buy_price()
+        self._place_limit_order(OrderAction.BUY, safe_buy_price)
 
     def _on_canceled(self):
         """撤销/拒单 -> 保持状态, 换全新单号按网格价原样重挂 (自愈外部干扰)。"""
@@ -320,12 +335,17 @@ class GridNode:
                                self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
         logger.warning(f"[自愈] 【{self.node_id}】第[{self.cycle_count}]轮 在管订单被撤销/拒单"
                        f"(可能被手工撤单或交易所清理), 正换新单号按网格价重挂 | 旧CID:[{self.active_client_oid}]")
+
+        # 修改：买单触发吃单封顶计算，让错误恢复的节点能按现价限制重挂
         if self.state == NodeState.WAIT_OPEN:
-            action, price = OrderAction.BUY, self.target_open_price
+            action = OrderAction.BUY
+            price = self._get_safe_buy_price()
         else:
             action, price = OrderAction.SELL, self.target_close_price
+
         self.active_client_oid = self._new_oid(action)
         self._place_limit_order(action, price)
+
 
     # ---------- 内部工具 ----------
     def _new_oid(self, action):
@@ -551,15 +571,20 @@ class ReconciliationEngine:
     def _emit_from_order(self, cid, order):
         """交易所原始订单状态 -> 标准事件 (仅终结态产出; 在盘 / 部分成交不产出)。"""
         raw = str(order.get('status', '')).upper()
+
+        # 提取交易所时间(毫秒): 优先拿最后成交时间，次选订单更新时间，兜底使用本地当前时间
+        ts = order.get('lastTradeTimestamp') or order.get('lastUpdateTimestamp') or order.get('timestamp') or int(
+            time.time() * 1000)
+
         if raw in ("CLOSED", "FILLED"):
             self.event_queue.put(OrderEvent(
                 cid, OrderStatus.FILLED,
                 fill_price=float(order.get('average') or order.get('price') or 0),
                 fill_qty=float(order.get('filled') or 0),
+                update_ts=ts  # 注入时间戳
             ))
         elif raw in ("CANCELED", "EXPIRED", "REJECTED"):
-            self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
-
+            self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED, update_ts=ts))
 
 # ==========================================
 # 5. 主控与调度 (GridStrategy / Watchdog)
@@ -573,9 +598,12 @@ class GridStrategy:
         self.broker = broker
         self.event_queue = queue.Queue()
 
-        ctx = NodeContext(broker, ledger, config.strategy_id)
-        self.nodes = build_geometric_grid(config, broker, ctx)
+        # 修改：将 ctx 保存为实例属性，以便后续注入实时价格
+        self.ctx = NodeContext(broker, ledger, config.strategy_id)
+        self.nodes = build_geometric_grid(config, broker, self.ctx)
         self.engine = ReconciliationEngine(broker, ledger, config.strategy_id, self.event_queue)
+
+
 
     def recover(self):
         """冷启动对账 (须在主循环/看门狗启动前、单线程执行): 防重启爆铺 / 断电掉单。"""
@@ -590,6 +618,10 @@ class GridStrategy:
         """
         current_price = self.broker.fetch_last_price()
         precision = self.broker.fetch_precision()
+
+        # 新增：将初始化拉取到的价格和精度写入全局上下文
+        self.ctx.latest_price = current_price
+        self.ctx.precision = precision
 
         init_count, taker_count = 0, 0
         for node in self.nodes.values():
@@ -615,6 +647,7 @@ class GridStrategy:
         time.sleep(INIT_SETTLE_WAIT_SEC)  # 给撮合与网络传播极短缓冲
         self.engine.repair_runtime(self.nodes)
 
+
     def run_main_loop(self):
         """单线程主循环 (全系统唯一写者): 消费事件 -> 路由到节点 -> 串行推演状态机。"""
         logger.info("[主循环] 事件主循环启动(全系统唯一写者), 开始监听订单事件...")
@@ -633,15 +666,25 @@ class GridStrategy:
         """按 OID 解析定位目标节点并投喂事件。"""
         parsed = OidCodec.parse(event.client_oid)
         if parsed is None or parsed.strategy_id != self.strategy_id:
-            logger.warning(f"[主循环] 收到无法路由的订单事件(格式非法或不属于本策略), 已忽略 | OID:[{event.client_oid}]")
+            logger.warning(
+                f"[主循环] 收到无法路由的订单事件(格式非法或不属于本策略), 已忽略 | OID:[{event.client_oid}]")
             return
+
+        # 完美落实你的思路：只采纳距离当前时间 5 分钟 (300000毫秒) 内的“新鲜成交价”
+        now_ms = int(time.time() * 1000)
+        if event.status == OrderStatus.FILLED and event.fill_price > 0:
+            if (now_ms - event.update_ts) < 300000:
+                self.ctx.latest_price = event.fill_price
+            else:
+                logger.debug(
+                    f"[主循环] 拦截到历史陈旧成交事件，跳过价格更新 | 滞后时长:{(now_ms - event.update_ts) / 1000:.1f}秒")
+
         node = self.nodes.get(parsed.node_id)
         if node is None:
             logger.warning(f"[主循环] 事件目标节点不存在(网格区间可能已变更), 已忽略 | "
                            f"节点:[{parsed.node_id}] OID:[{event.client_oid}]")
             return
         node.process_event(event)
-
 
 class ReconcilerThread(threading.Thread):
     """REST 看门狗线程: 周期性只读对账; 异常仅向总线投递事件, 从不直接改动节点状态。"""
@@ -729,8 +772,9 @@ def main_app():
             strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
             min_price=25, max_price=85, price_ratio=1.3, quantity=0.2,
         ),  # 消耗  88  u 网格数量 94
-    ]
 
+        # 总共节点和为 419 实际app上是419个节点才行，多了或者少了都要排查
+    ]
     processes = []
     for config in configs:
         p = multiprocessing.Process(target=run_single_strategy, args=(config,))
