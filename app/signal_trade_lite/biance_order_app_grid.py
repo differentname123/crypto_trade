@@ -36,6 +36,7 @@
 """
 import os
 import csv
+import platform
 import time
 import queue
 import logging
@@ -684,8 +685,9 @@ def run_single_strategy(config):
 
     api_key = get_config("nana_biance_api_copy_key")
     secret_key = get_config("nana_biance_api_copy_secret")
-    proxies = None
-
+    proxies = None if platform.system().lower() == "linux" else {
+        "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
+    }
     # 每个进程独享 exchange/broker/ledger/strategy 实例, 账本按 strategy_id 物理隔离
     exchange = safe_init_exchange(api_key, secret_key, proxies)
     broker = ExchangeBroker(exchange, config.symbol)
@@ -721,12 +723,12 @@ def main_app():
         GridConfig(
             strategy_id=f"ETH{current_symbol}", symbol="ETH/USDT:USDT",
             min_price=1000, max_price=2000, price_ratio=1.13, quantity=0.02,
-        ),  # 消耗  237  u 网格数量 60
+        ),  # 消耗  237  u 网格数量 61
 
         GridConfig(
             strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
             min_price=25, max_price=85, price_ratio=1.3, quantity=0.2,
-        ),  # 消耗  88  u 网格数量 93
+        ),  # 消耗  88  u 网格数量 94
     ]
 
     processes = []
