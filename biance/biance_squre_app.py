@@ -37,13 +37,15 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 logger = setup_logger(app_name="biance_follow")
 
 # ---------------------------- 全局常量 ----------------------------
-MIN_PROBABILITY = 95                 # 严格判定为高价值目标的概率下限(需 > 此值)
+MIN_PROBABILITY = 95  # 严格判定为高价值目标的概率下限(需 > 此值)
+MIN_FISSION_PROBABILITY = 85  # [新增] 裂变中继跳板阈值(需 >= 此值，允许挖掘其关系链)
 PROFILE_CACHE_PATH = "user_profile.json"
-PRODUCER_SWEEP_INTERVAL = 10000      # 生产者两轮全量抓取之间的休眠间隔(秒)
+PRODUCER_SWEEP_INTERVAL = 10000  # 生产者两轮全量抓取之间的休眠间隔(秒)
 
 # 帖子/评论区互关线索提取关键词(高覆盖版)
 MUTUAL_FOLLOW_KEYWORDS = [
-    "互关","必回", "互粉", '回关',"互赞", "互评", "互fo", "互助互关", "互关互粉", "互赞互评", "互粉互赞", "互关互赞", "互换关注",
+    "互关", "必回", "互粉", '回关', "互赞", "互评", "互fo", "互助互关", "互关互粉", "互赞互评", "互粉互赞", "互关互赞",
+    "互换关注",
     "关注必回", "点赞必回", "评论必回", "留下评论必回", "必回关", "关必回", "秒回关", "互关秒回", "粉必回",
     "有粉必回", "必须回关",
     "点赞互关", "诚信互关", "关注报数", "赚积分互助", "广场互关", "广场互粉", "币安互关", "币安互粉", "币圈互关",
@@ -77,9 +79,14 @@ def _normalize_probability(prob):
 
 
 def _is_high_value_target(predict_info):
-    """高价值判定：被推荐且概率严格大于阈值，方才值得投入网络 I/O 去挖掘其关系链。"""
+    """高价值判定：被推荐且概率严格大于阈值，判定为最终需要关注的目标。"""
     return bool(predict_info.get('is_recommended', False)) and \
         _normalize_probability(predict_info.get('probability', 0)) > MIN_PROBABILITY
+
+
+def _is_worth_fission(predict_info):
+    """[新增] 裂变中继判定：只要达到或超过跳板阈值(T1次优互惠区间及以上)，其关系链就极具挖掘价值。"""
+    return _normalize_probability(predict_info.get('probability', 0)) >= MIN_FISSION_PROBABILITY
 
 
 def predict_follow_back(user_info):
@@ -179,6 +186,7 @@ def predict_follow_back(user_info):
         return {"is_recommended": True, "probability": 85,
                 "reason": f"PASS(T1): 深度生态活人，关注基数充足({follow_count})，比例({ratio:.1f})处于次优互惠区间。"}
 
+
 def extract_mutual_follow_users(posts, target_time_str):
     """从帖子流中提取互关线索 UID：命中关键词的作者及其评论区用户，并输出结构化统计。"""
     try:
@@ -253,8 +261,14 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
     # 命中缓存：复用历史预测，避免重复网络请求
     if 'predict_info' in user_data:
         predict_info = user_data['predict_info']
-        if not _is_high_value_target(predict_info):
+        is_target = _is_high_value_target(predict_info)
+        is_bridge = _is_worth_fission(predict_info)
+
+        # 既不是关注目标，也不是裂变跳板，直接返回
+        if not (is_target or is_bridge):
             return user_name, user_data.get('squareUid'), predict_info, {}, {}
+
+        # 如果是目标或跳板，且已经拥有完整关系链，直接复用返回
         if 'following' in user_data and 'followers' in user_data:
             return user_name, user_data.get('squareUid'), predict_info, \
                 user_data['following'], user_data['followers']
@@ -305,14 +319,18 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
     square_uid = user_info.get('squareUid')
     user_info_map[user_name]['predict_info'] = predict_info
 
-    # 差号：清理冗余字段防缓存膨胀后直接返回
-    if not _is_high_value_target(predict_info):
+    # 【核心修改点】：分离“关注目标”与“裂变跳板”
+    is_target = _is_high_value_target(predict_info)
+    is_bridge = _is_worth_fission(predict_info)
+
+    # 差号：既不配被关注，也不配做跳板。清理冗余字段防缓存膨胀后直接返回
+    if not (is_target or is_bridge):
         preserved = {'predict_info', 'squareUid'}
         for k in [key for key in user_info_map[user_name] if key not in preserved]:
             del user_info_map[user_name][k]
         return user_name, square_uid, predict_info, {}, {}
 
-    # 高价值号：同一任务内继续拉取关系链，形成单线程闭环
+    # 只要是【高价值号】或【优质跳板】，统一投入网络 I/O 去挖掘其关系链深挖
     following_map, follower_map = _get_current_relations(user_name, max_count=1000)
     user_info_map[user_name]['following'] = following_map
     user_info_map[user_name]['followers'] = follower_map
@@ -356,20 +374,24 @@ def get_worth_following_list(initial_user_name_list, target_count):
                     if predict_info is None:
                         continue  # 任务已被 stop_event 终止
 
-                    if uid and _is_high_value_target(predict_info):
-                        valid_square_uids.add(str(uid))
-                        # 广度优先：把新挖到大V的关系链注入下一轮种子
-                        next_turn_user_names.extend(following_map.keys())
-                        next_turn_user_names.extend(follower_map.keys())
-                        logger.info(
-                            f"🌟 [裂变引擎] 命中高潜:{uname} | "
-                            f"概率:{_normalize_probability(predict_info.get('probability', 0)):.0f} | "
-                            f"累计:{len(valid_square_uids)}/{target_count}"
-                        )
-                        if len(valid_square_uids) >= target_count:
-                            logger.info("🎉 [裂变引擎] 目标达标，广播阻断信号终止本轮剩余任务。")
-                            stop_event.set()
-                            break
+                    if uid:
+                        # 【核心修改点】：无论高价值还是跳板，只要有关系链(前面拦截了无价值的号返回空字典)，就加入下一轮种子池
+                        if following_map or follower_map:
+                            next_turn_user_names.extend(following_map.keys())
+                            next_turn_user_names.extend(follower_map.keys())
+
+                        # 【核心修改点】：只有真正满足 95 分的高价值号，才会被塞入关注池并打印命中日志
+                        if _is_high_value_target(predict_info):
+                            valid_square_uids.add(str(uid))
+                            logger.info(
+                                f"🌟 [裂变引擎] 命中高潜:{uname} | "
+                                f"概率:{_normalize_probability(predict_info.get('probability', 0)):.0f} | "
+                                f"累计:{len(valid_square_uids)}/{target_count}"
+                            )
+                            if len(valid_square_uids) >= target_count:
+                                logger.info("🎉 [裂变引擎] 目标达标，广播阻断信号终止本轮剩余任务。")
+                                stop_event.set()
+                                break
                 except Exception as e:
                     logger.error(f"❌ [裂变引擎] 用户分析任务异常: {e}")
 
@@ -401,8 +423,8 @@ def _sync_single_account_logic(user_key, global_potential_uids):
     following_uids = set(following_map.values())
     followers_uids = set(follower_map.values())
 
-    need_to_follow_from_pool = global_potential_uids - following_uids   # 公共池中本号还没关注的
-    need_to_follow_back = followers_uids - following_uids               # 本号粉丝中还没回关的
+    need_to_follow_from_pool = global_potential_uids - following_uids  # 公共池中本号还没关注的
+    need_to_follow_back = followers_uids - following_uids  # 本号粉丝中还没回关的
     final_uids_to_follow = list(need_to_follow_from_pool.union(need_to_follow_back))[:100]
 
     logger.info(
