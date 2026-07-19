@@ -134,6 +134,136 @@ class NodeContext:
         self.precision = None
 
 
+class StatisticsThread(threading.Thread):
+    """
+    心跳数据看板线程: 周期性统计当前网格的快照信息。
+    特性:
+      1. 原子化多行输出，防并发插队打乱。
+      2. 主动低频拉取现价，反哺全局 NodeContext，保持现价缓存的鲜活性。
+      3. 盘口距离计算 & 网格上下限破网预警。
+    """
+
+    def __init__(self, ctx, nodes, config, interval_sec=60):
+        super().__init__(daemon=True)
+        self.ctx = ctx
+        self.nodes = nodes
+        self.config = config
+        self.interval = interval_sec
+        self.start_time = time.time()  # 记录启动时间，用于计算 Uptime
+
+    def run(self):
+        logger.info(f"[看板] 统计心跳线程启动 | 播报周期:[{self.interval}s]")
+        while True:
+            time.sleep(self.interval)
+            try:
+                self._report()
+            except Exception as e:
+                logger.error(f"[看板] 数据聚合异常 (不影响交易) | 错误:[{e}]")
+
+    def _report(self):
+        # ---------------------------------------------------------
+        # 核心改进 3: 主动拉取最新价格，并反哺给 NodeContext
+        # ---------------------------------------------------------
+        try:
+            latest_price = self.ctx.broker.fetch_last_price()
+            if latest_price > 0:
+                self.ctx.latest_price = latest_price  # 线程安全更新(GIL保障)
+        except Exception as e:
+            logger.warning(f"[看板] 尝试拉取最新价格失败，将使用被动缓存价格 | 错误:[{e}]")
+
+        current_price = self.ctx.latest_price
+        if current_price <= 0:
+            return  # 如果冷启动且接口一直挂掉，没获取到价格，暂不播报
+
+        nodes = list(self.nodes.values())
+        total_nodes = len(nodes)
+        if total_nodes == 0:
+            return
+
+        # 1. 节点构成统计 & 理论持仓与总套利次数
+        state_counts = defaultdict(int)
+        for n in nodes:
+            state_counts[n.state.value] += 1
+
+        wait_open_cnt = state_counts.get(NodeState.WAIT_OPEN.value, 0)
+        wait_close_cnt = state_counts.get(NodeState.WAIT_CLOSE.value, 0)
+        error_cnt = state_counts.get(NodeState.ERROR.value, 0)
+        init_cnt = state_counts.get(NodeState.INIT.value, 0)
+
+        theoretical_pos = wait_close_cnt * self.config.quantity
+        total_cycles = sum(n.cycle_count for n in nodes)
+
+        # 2. 寻找相邻节点 (盘口最近的买卖单)
+        wait_open_nodes = [n for n in nodes if n.state == NodeState.WAIT_OPEN]
+        wait_close_nodes = [n for n in nodes if n.state == NodeState.WAIT_CLOSE]
+
+        closest_buy = max(wait_open_nodes, key=lambda n: n.target_open_price) if wait_open_nodes else None
+        closest_sell = min(wait_close_nodes, key=lambda n: n.target_close_price) if wait_close_nodes else None
+
+        uptime_sec = int(time.time() - self.start_time)
+        hours, remainder = divmod(uptime_sec, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+        base_coin = self.config.symbol.split('/')[0]
+
+        # 3. 构建输出字符串
+        lines = [
+            f"\n========== [网格运行看板] {self.config.strategy_id} ==========",
+            f" 📊 市场现价: {current_price:.6f} | 运行耗时: {uptime_str}",
+            f" 📦 节点总计: {total_nodes} 个 | 构成: 买单(空仓)[{wait_open_cnt}] 卖单(持仓)[{wait_close_cnt}] 异常[{error_cnt}] 初始[{init_cnt}]",
+            f" 💰 理论持仓: {theoretical_pos:.4f} {base_coin} (可用于核对账户真实余额)",
+            f" 🔄 累计套利: {total_cycles} 趟 (代表已赚取利润的网格跨度总和)",
+            " --- 盘口与边界追踪 ---"
+        ]
+
+        # ---------------------------------------------------------
+        # 核心改进 1: 相邻接单节点距离现价的百分比
+        # ---------------------------------------------------------
+        if closest_buy:
+            drop_pct = (current_price - closest_buy.target_open_price) / current_price * 100
+            lines.append(
+                f" ⬇️ 最近买单: 【{closest_buy.node_id}】 挂单价 @[{closest_buy.target_open_price:.6f}] (需下跌 {drop_pct:.2f}%)")
+        else:
+            lines.append(f" ⬇️ 最近买单: 无 (已满仓，或价格已跌穿网格下限)")
+
+        if closest_sell:
+            rise_pct = (closest_sell.target_close_price - current_price) / current_price * 100
+            lines.append(
+                f" ⬆️ 最近卖单: 【{closest_sell.node_id}】 挂单价 @[{closest_sell.target_close_price:.6f}] (需上涨 {rise_pct:.2f}%)")
+        else:
+            lines.append(f" ⬆️ 最近卖单: 无 (已空仓，或价格已突破网格上限)")
+
+        # ---------------------------------------------------------
+        # 核心改进 2: 计算现价距离网格上下限位置，进行破网预警 (阈值设为 5%)
+        # ---------------------------------------------------------
+        dist_to_min_pct = (current_price - self.config.min_price) / self.config.min_price * 100
+        dist_to_max_pct = (self.config.max_price - current_price) / self.config.max_price * 100
+
+        warnings = []
+        if dist_to_min_pct <= 5.0:
+            if dist_to_min_pct > 0:
+                warnings.append(
+                    f" ⚠️ 【破网预警】现价距离下限[{self.config.min_price}]仅剩 {dist_to_min_pct:.2f}%, 即将满仓套牢！")
+            else:
+                warnings.append(f" 🚨 【击穿下限】现价已跌破网格下限[{self.config.min_price}]！停止买入，等待反弹。")
+
+        if dist_to_max_pct <= 5.0:
+            if dist_to_max_pct > 0:
+                warnings.append(
+                    f" ⚠️ 【飞天预警】现价距离上限[{self.config.max_price}]仅剩 {dist_to_max_pct:.2f}%, 即将全部踏空！")
+            else:
+                warnings.append(f" 🚨 【突破上限】现价已突破网格上限[{self.config.max_price}]！停止卖出，等待回调。")
+
+        if warnings:
+            lines.extend(warnings)
+        else:
+            lines.append(f" 🟢 网格区间: {self.config.min_price} ~ {self.config.max_price} (当前处于安全腹地)")
+
+        lines.append("==========================================================\n")
+
+        # 一次性完整输出，绝不会被其他子进程的日志插队
+        logger.info("\n".join(lines))
+
 class OidCodec:
     """
     client_oid 编解码中枢: 全项目不再出现裸 split('_')。
@@ -740,6 +870,10 @@ def run_single_strategy(config):
     strategy.recover()
     strategy.initialize_market_placement()
     ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=WATCHDOG_INTERVAL_SEC).start()
+
+    # 4. 启动日志统计看板 (默认 60 秒播报一次)  <--- 新增这行！
+    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=60).start()
+
     strategy.run_main_loop()
 
 
