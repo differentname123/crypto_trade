@@ -45,11 +45,11 @@ from enum import Enum
 from datetime import datetime
 from collections import defaultdict
 
-from app.signal_trade_lite.common_utils_lite import setup_logger, get_config
+from common_utils_lite import setup_logger, get_config
 
 logger = setup_logger(app_name="grid_trader")
 
-from app.signal_trade_lite.biance_order_lite import (
+from biance_order_lite import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
 )
@@ -700,15 +700,33 @@ def run_single_strategy(config):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
+    current_symbol = "20260719"
+
     configs = [
         GridConfig(
-            strategy_id="SOL", symbol="SOL/USDT:USDT",
-            min_price=70, max_price=80, price_ratio=0.5, quantity=0.1,
-        ),
+            strategy_id=f"PENDLE{current_symbol}", symbol="PENDLE/USDT:USDT",
+            min_price=0.5, max_price=2, price_ratio=1.93, quantity=10,
+        ), # 消耗  71  u 网格数量 72
+
         GridConfig(
-            strategy_id="DOGE", symbol="DOGE/USDT:USDT",
-            min_price=0.07, max_price=0.08, price_ratio=0.5, quantity=100,
-        )
+            strategy_id=f"AAVE{current_symbol}", symbol="AAVE/USDT:USDT",
+            min_price=25, max_price=100, price_ratio=1.54, quantity=0.2,
+        ),  # 消耗  87  u 网格数量 90
+
+        GridConfig(
+            strategy_id=f"DOGE{current_symbol}", symbol="DOGE/USDT:USDT",
+            min_price=0.025, max_price=0.1, price_ratio=1.36, quantity=200,
+        ), # 消耗  99  u 网格数量 102
+
+        GridConfig(
+            strategy_id=f"ETH{current_symbol}", symbol="ETH/USDT:USDT",
+            min_price=1000, max_price=2000, price_ratio=1.13, quantity=0.02,
+        ),  # 消耗  237  u 网格数量 60
+
+        GridConfig(
+            strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
+            min_price=25, max_price=85, price_ratio=1.3, quantity=0.2,
+        ),  # 消耗  88  u 网格数量 93
     ]
 
     processes = []

@@ -77,24 +77,51 @@ systemctl reload nginx
 
 ---
 
-## 三、 自动交易机器人 (Binance Trading Bot)
 
-### 1. 核心文件路径
+### 三、 自动交易机器人双策略运维手册 (Lite & Grid)
 
-| 组件 | 文件路径 | 修改场景说明 |
-| --- | --- | --- |
-| **系统服务配置** | `/etc/systemd/system/binance-trade.service` | 修改机器人的启动参数或环境变量 |
-| **应用业务日志** | `app/signal_trade_lite/logs/trading_bot.log` | 查看机器人输出的详细交易业务日志 |
+#### 1. 核心路径说明
 
-### 2. 常用运维命令
+工作目录均在 `/root/signal_trade_lite`（共用代码与虚拟环境）。
 
-* 🟢 **启动/重启:** `systemctl restart binance-trade`
-* 🔴 **紧急停止:** `systemctl stop binance-trade`
-* 🟡 **查看状态:** `systemctl status binance-trade`
-* 🟡 **查看报错:** `journalctl -u binance-trade -f`
-* 🔵 **查看交易日志:** `tail -f app/signal_trade_lite/logs/trading_bot.log`
+**Lite 策略 (主干)：**
+
+* **服务配置:** `/etc/systemd/system/binance-trade.service`
+* **业务日志:** `/root/signal_trade_lite/app/signal_trade_lite/logs/trading_trader.log`
+
+**Grid 策略 (网格)：**
+
+* **服务配置:** `/etc/systemd/system/binance-trade-grid.service`
+* **业务日志:** `/root/signal_trade_lite/app/signal_trade_lite/logs/grid_trader.log`
 
 ---
+
+#### 2. 常用运维命令（免拼接，直接复制）
+
+**🟢 Lite 策略 (主干) 专用命令**
+
+* **启动/重启:** `systemctl restart binance-trade`
+* **紧急停止:** `systemctl stop binance-trade`
+* **查看状态:** `systemctl status binance-trade`
+* **查看系统报错:** `journalctl -u binance-trade -n 100 -f`
+* **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/trading_trader.log`
+
+**🔵 Grid 策略 (网格) 专用命令**
+
+* **启动/重启:** `systemctl restart binance-trade-grid`
+* **紧急停止:** `systemctl stop binance-trade-grid`
+* **查看状态:** `systemctl status binance-trade-grid`
+* **查看系统报错:** `journalctl -u binance-trade-grid -n 100 -f`
+* **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/grid_trader.log`
+
+---
+
+#### 3. 核心注意事项
+
+* **重载配置:** 每次修改配置后，必须先执行以下重载命令，再执行对应的重启命令：
+`systemctl daemon-reload`
+* **内存保护:** 两套策略均已设定 `MemoryMax=800M`，合计占用不超过 1600M，防止 2GB 服务器内存溢出死机。
+
 
 ## 四、 HTTPS 安全代理节点 (GOST Proxy)
 

@@ -198,7 +198,7 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv"):
         logger.warning("未定位到 BTC 数据，各标的将独立寻找历史极值。")
 
     # 3. 遍历计算特征
-    periods = ['5min', '15min', '30min', '1h', '2h', '4h', '8h', '12h', '24h']
+    periods = ['1h', '2h', '4h', '8h', '12h', '24h']
     results = []
 
     for coin_name, df in data_cache.items():

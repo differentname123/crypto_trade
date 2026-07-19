@@ -589,6 +589,7 @@ const i18n = {
         res_max_qty: "每格最大交易量",
         res_util: "资金利用率",
         res_actual: "实际消耗资金",
+        res_est_grids: "预计网格数量",
 
         // 错误提示
         err_params: "所有数值参数必须 > 0",
@@ -644,6 +645,7 @@ const i18n = {
         res_max_qty: "Max Qty per Grid",
         res_util: "Fund Utilization",
         res_actual: "Actual Funds Consumed",
+        res_est_grids: "Estimated Grids",
 
         // 错误提示
         err_params: "All numeric parameters must be > 0",
@@ -696,6 +698,7 @@ function calculate_multi_group_margin(params) {
 
     let current_price = initial_price;
     let total_margin_all_groups = 0.0;
+    let total_grids = 0;
 
     const is_active = (cp, tp) => direction === 'long' ? cp >= tp : cp <= tp;
 
@@ -716,6 +719,7 @@ function calculate_multi_group_margin(params) {
             group_qty += fixed_qty;
             group_cost += fixed_qty * current_price;
             grids_in_group += 1;
+            total_grids += 1;
 
             let upnl_at_open = sign * (group_qty * current_price - group_cost);
             let required_for_margin = (group_cost / leverage) - upnl_at_open;
@@ -738,7 +742,7 @@ function calculate_multi_group_margin(params) {
         total_margin_all_groups += group_max_margin;
     }
 
-    return { total_margin: total_margin_all_groups };
+    return { total_margin: total_margin_all_groups, total_grids: total_grids };
 }
 
 // ==========================================
@@ -781,7 +785,8 @@ function _universal_margin_solver(target_param_name, available_margin, base_para
         status: "success",
         optimal_value: Number(best_val.toFixed(5)),
         actual_margin_used: Number(best_result.total_margin.toFixed(2)),
-        utilization_rate: ((best_result.total_margin / available_margin) * 100).toFixed(2) + "%"
+        utilization_rate: ((best_result.total_margin / available_margin) * 100).toFixed(2) + "%",
+        total_grids: best_result.total_grids
     };
 }
 
@@ -854,6 +859,12 @@ function executeCalculation() {
                         ${res.total_margin.toFixed(2)} U
                     </p>
                     <p style="margin-top:10px; color: var(--text-sub);">${t.res_margin_desc}${res.total_margin.toFixed(2)} U。</p>
+                </div>
+                <div class="grid-2" style="margin-top:20px;">
+                    <div class="form-group">
+                        <div class="form-label">${t.res_est_grids}</div>
+                        <input type="text" class="input-field" value="${res.total_grids}" readonly>
+                    </div>
                 </div>`;
         } else if (mode === "1") {
             let max_loss_bound = params.direction === 'long' ? 99.9 : 1000.0;
@@ -904,6 +915,10 @@ function renderResultCard(title, value, data, t) {
             <div class="form-group">
                 <div class="form-label">${t.res_actual}</div>
                 <input type="text" class="input-field" value="${data.actual_margin_used} U" readonly>
+            </div>
+            <div class="form-group">
+                <div class="form-label">${t.res_est_grids}</div>
+                <input type="text" class="input-field" value="${data.total_grids}" readonly>
             </div>
         </div>`;
 }
