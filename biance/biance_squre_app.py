@@ -28,6 +28,7 @@ import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from biance.biance_playwright import get_auth_tokens_robust
 from common.common_utils import setup_logger, get_config, read_json, save_json
 from biance.biance_squre_api import fetch_binance_feed, toggle_binance_follow, \
     fetch_binance_relations, fetch_binance_user_profile
@@ -37,10 +38,15 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 logger = setup_logger(app_name="biance_follow")
 
 # ---------------------------- 全局常量 ----------------------------
+COOKIE_UPDATE_INTERVAL_DAYS = 1  # [新增配置] Cookie 更新间隔天数，后续可在此任意调整
+
 MIN_PROBABILITY = 90  # 严格判定为高价值目标的概率下限(需 > 此值)
-MIN_FISSION_PROBABILITY = 85  # [新增] 裂变中继跳板阈值(需 >= 此值，允许挖掘其关系链)
+MIN_FISSION_PROBABILITY = 85  # 裂变中继跳板阈值(需 >= 此值，允许挖掘其关系链)
 PROFILE_CACHE_PATH = "user_profile.json"
 PRODUCER_SWEEP_INTERVAL = 10000  # 生产者两轮全量抓取之间的休眠间隔(秒)
+
+# 账号 Cookie 与 CSRF 全局缓存 (结构: {user_key: {'cookies': ..., 'csrf_token': ..., 'last_update': timestamp}})
+ACCOUNT_AUTH_CACHE = {}
 
 # 帖子/评论区互关线索提取关键词(高覆盖版)
 MUTUAL_FOLLOW_KEYWORDS = [
@@ -273,7 +279,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
             return user_name, user_data.get('squareUid'), predict_info, \
                 user_data['following'], user_data['followers']
 
-        # 🟢 【新增修复】：命中目标/跳板，但缺少关系链（通常是历史跑过的 85 分数据被清除了）
+        # 命中目标/跳板，但缺少关系链（通常是历史跑过的 85 分数据被清除了）
         # 此时只需直接拉关系链即可，千万不可让残缺的 user_data 掉入下方的预测函数被洗成 10 分！
         if user_data.get('squareUid'):
             square_uid = user_data.get('squareUid')
@@ -333,6 +339,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
 
     return user_name, square_uid, predict_info, following_map, follower_map
 
+
 def get_worth_following_list(initial_user_name_list, target_count):
     """广度优先裂变引擎：以种子用户为起点，通过高价值号的关系链逐轮扩散，直至凑够目标数量的优质 UID。"""
     if not initial_user_name_list:
@@ -370,12 +377,12 @@ def get_worth_following_list(initial_user_name_list, target_count):
                         continue  # 任务已被 stop_event 终止
 
                     if uid:
-                        # 【核心修改点】：无论高价值还是跳板，只要有关系链(前面拦截了无价值的号返回空字典)，就加入下一轮种子池
+                        # 无论高价值还是跳板，只要有关系链(前面拦截了无价值的号返回空字典)，就加入下一轮种子池
                         if following_map or follower_map:
                             next_turn_user_names.extend(following_map.keys())
                             next_turn_user_names.extend(follower_map.keys())
 
-                        # 【核心修改点】：只有真正满足 95 分的高价值号，才会被塞入关注池并打印命中日志
+                        # 只有真正满足 95 分的高价值号，才会被塞入关注池并打印命中日志
                         if _is_high_value_target(predict_info):
                             valid_square_uids.add(str(uid))
                             logger.info(
@@ -402,13 +409,35 @@ def get_worth_following_list(initial_user_name_list, target_count):
 # [消费者] 提取公共优质池并多账号并行执行关注
 # =====================================================================
 
-def _sync_single_account_logic(user_key, global_potential_uids):
-    """单账号关注闭环：以自身关系链做差集(公共池待关注 ∪ 未回关粉丝)，限量并带随机休眠地执行关注。"""
-    my_cookies = get_config(f"{user_key}_cookie")
-    csrf_token = get_config(f"{user_key}_csrf")
+def _sync_single_account_logic(user_key, global_potential_uids, all_accounts_followers_uids):
+    """单账号关注闭环：以自身关系链做差集，实行严格的三级梯队优先关注策略，并带随机休眠地执行关注。"""
+    global ACCOUNT_AUTH_CACHE
+
     my_name = get_config(f"{user_key}_name")
+    browser_session_dir = get_config(f"{user_key}_browser_session_dir")
+
+    current_time = time.time()
+    update_interval_seconds = COOKIE_UPDATE_INTERVAL_DAYS * 24 * 3600
+
+    # 按天检查是否需要重新获取 Cookie 缓存
+    if (user_key not in ACCOUNT_AUTH_CACHE) or \
+            (current_time - ACCOUNT_AUTH_CACHE[user_key]['last_update'] > update_interval_seconds):
+        logger.info(f"🔄 [账号:{user_key}] Cookie 缓存为空或已过期(> {COOKIE_UPDATE_INTERVAL_DAYS} 天)，正在重新获取...")
+        my_cookies, csrf_token = get_auth_tokens_robust(browser_session_dir)
+
+        ACCOUNT_AUTH_CACHE[user_key] = {
+            'cookies': my_cookies,
+            'csrf_token': csrf_token,
+            'last_update': current_time
+        }
+    else:
+        logger.info(f"⚡ [账号:{user_key}] 使用缓存的 Cookie 信息 (未超过 {COOKIE_UPDATE_INTERVAL_DAYS} 天)")
+        my_cookies = ACCOUNT_AUTH_CACHE[user_key]['cookies']
+        csrf_token = ACCOUNT_AUTH_CACHE[user_key]['csrf_token']
 
     if not all([my_cookies, csrf_token, my_name]):
+        if user_key in ACCOUNT_AUTH_CACHE:
+            del ACCOUNT_AUTH_CACHE[user_key]  # 如果失败则清除缓存
         logger.error(f"❌ [账号:{user_key}] 缺少配置(cookie/csrf/name)，任务终止。")
         return
 
@@ -418,13 +447,25 @@ def _sync_single_account_logic(user_key, global_potential_uids):
     following_uids = set(following_map.values())
     followers_uids = set(follower_map.values())
 
-    need_to_follow_from_pool = global_potential_uids - following_uids  # 公共池中本号还没关注的
-    need_to_follow_back = followers_uids - following_uids  # 本号粉丝中还没回关的
-    final_uids_to_follow = list(need_to_follow_from_pool.union(need_to_follow_back))[:100]
+    # ================= 核心优先级分层逻辑 =================
+
+    # 梯队 1：自己的粉丝中还没回关的
+    tier_1_own_fans = followers_uids - following_uids
+
+    # 梯队 2：矩阵其他号的粉丝 (所有号粉丝 - 自己的粉丝) 中我还没关注的
+    other_accounts_fans = all_accounts_followers_uids - followers_uids
+    tier_2_other_fans = other_accounts_fans - following_uids
+
+    # 梯队 3：纯粹在外部抓取和裂变的散客用户 (大池 - 所有号粉丝) 中我还没关注的
+    mined_users = global_potential_uids - all_accounts_followers_uids
+    tier_3_mined_users = mined_users - following_uids
+
+    # 严格按照顺序拼接：自己粉丝优先，其他号粉丝其次，最后才是外部挖掘，然后截取前 100 名
+    final_uids_to_follow = (list(tier_1_own_fans) + list(tier_2_other_fans) + list(tier_3_mined_users))[:100]
 
     logger.info(
-        f"📊 [账号:{user_key}] 差集运算 | 公共池待关注:{len(need_to_follow_from_pool)} | "
-        f"自有粉丝补回关:{len(need_to_follow_back)} | 去重限量后实际关注:{len(final_uids_to_follow)}"
+        f"📊 [账号:{user_key}] 差集运算分层 | [梯队1]自己待回关:{len(tier_1_own_fans)} | "
+        f"[梯队2]其它账号粉丝待关注:{len(tier_2_other_fans)} | [梯队3]挖掘的新用户待关注:{len(tier_3_mined_users)} | 截取后实际准备关注:{len(final_uids_to_follow)}"
     )
 
     if not final_uids_to_follow:
@@ -466,20 +507,23 @@ def consumer_auto_sync_main(accounts=None):
             # 2. 聚合各账号关注列表作为裂变种子，产出全网高质量目标池
             logger.info("🌱 [消费者] 聚合各账号初始种子...")
             seed_user_names = set()
+            all_accounts_followers_uids = set()  # 搜集所有账号的粉丝
+
             for acc in accounts:
                 my_name = get_config(f"{acc}_name")
                 if my_name:
-                    f_map, _ = _get_current_relations(my_name, max_count=10000)
+                    f_map, follower_map = _get_current_relations(my_name, max_count=10000)
                     seed_user_names.update(f_map.keys())
+                    all_accounts_followers_uids.update(follower_map.values())  # 汇总各个账户的粉丝UID
 
             global_worth_uids = get_worth_following_list(
                 initial_user_name_list=list(seed_user_names), target_count=1000
             )
 
-            # 3. 合成公共大池(帖子线索 ∪ 裂变高价值)
-            global_potential_uids = shared_post_uids.union(set(global_worth_uids))
+            # 3. 合成公共大池(帖子线索 ∪ 裂变高价值 ∪ 所有账号粉丝)
+            global_potential_uids = shared_post_uids.union(set(global_worth_uids)).union(all_accounts_followers_uids)
             logger.info(f"🧩 [消费者] 公共池合成 | 帖子线索:{len(shared_post_uids)} | "
-                        f"裂变高价值:{len(global_worth_uids)} | 合并去重:{len(global_potential_uids)}")
+                        f"裂变高价值:{len(global_worth_uids)} | 所有粉丝:{len(all_accounts_followers_uids)} | 合并去重:{len(global_potential_uids)}")
 
             if not global_potential_uids:
                 logger.info("🤷 [消费者] 暂无任何潜在线索，休眠 10 分钟后重试...")
@@ -489,8 +533,10 @@ def consumer_auto_sync_main(accounts=None):
             # 4. 多账号并行执行，各自运算差集与休眠
             logger.info(f"🚦 [消费者] 启动多账号并行引擎 | 并发数:{len(accounts)}")
             with ThreadPoolExecutor(max_workers=len(accounts)) as executor:
-                futures = [executor.submit(_sync_single_account_logic, acc, global_potential_uids)
-                           for acc in accounts]
+                # 将 all_accounts_followers_uids 作为参数传递给各个线程
+                futures = [
+                    executor.submit(_sync_single_account_logic, acc, global_potential_uids, all_accounts_followers_uids)
+                    for acc in accounts]
                 for f in as_completed(futures):
                     f.result()  # 显式捕获内部异常
 

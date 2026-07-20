@@ -316,10 +316,80 @@ def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[st
     return error_info, is_success
 
 
+def get_auth_tokens_robust(user_data_dir):
+    """
+    终极健壮版：
+    - CSRF Token: 通过真实 API 拦截动态获取。
+    - Cookie String: 从浏览器底层 Context 强行提取并拼接。
+    """
+    if not os.path.exists(user_data_dir):
+        print(f"[-] 用户数据目录不存在，请先执行登录: {user_data_dir}")
+        return None, None
+
+    visit_url = "https://www.binance.com/zh-CN/square/profile/insights_anchor"
+    target_api_keyword = "pgc/user/client"
+
+    print(f"[*] 启动浏览器，准备执行综合凭证提取...")
+
+    with sync_playwright() as p:
+        try:
+            context = p.chromium.launch_persistent_context(
+                channel="chrome",
+                user_data_dir=user_data_dir,
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--headless=new'
+                ]
+            )
+
+            page = context.pages[0] if context.pages else context.new_page()
+
+            extracted_cookie = None
+            extracted_csrf = None
+
+            print(f"[*] 正在挂载网络监听网兜，目标特征: {target_api_keyword}")
+
+            # 【步骤一】：拦截前端请求，抓取 JS 动态生成的 csrftoken
+            with page.expect_request(lambda request: target_api_keyword in request.url, timeout=15000) as first_request:
+                page.goto(visit_url)
+
+            req = first_request.value
+
+            # Playwright 会将 headers 的 key 全转为小写
+            extracted_csrf = req.headers.get("csrftoken")
+
+            # 【步骤二】：直接绕过请求头，从浏览器上下文中强抽 Cookie 并标准化拼接
+            raw_cookies = context.cookies(urls=["https://www.binance.com"])
+            cookie_parts = [f"{c['name']}={c['value']}" for c in raw_cookies]
+            extracted_cookie = "; ".join(cookie_parts)
+
+            context.close()
+
+            # 校验最终成果
+            if extracted_cookie and extracted_csrf:
+                print(f"[+] 提取成功！CSRF: {extracted_csrf[:8]}... | Cookie 长度: {len(extracted_cookie)}")
+                return extracted_cookie, extracted_csrf
+            else:
+                print(
+                    f"[-] 提取结果异常。Cookie获取状态: {bool(extracted_cookie)}, CSRF获取状态: {bool(extracted_csrf)}")
+                return extracted_cookie, extracted_csrf
+
+        except PlaywrightTimeoutError:
+            print(f"[-] 拦截超时！在 15 秒内未能捕获到包含 '{target_api_keyword}' 的网络请求。")
+            return None, None
+        except Exception as e:
+            print(f"[!] 提取过程发生未知的严重异常: {e}")
+            return None, None
+
 # ==============================================================================
 # 启动入口
 # ==============================================================================
 if __name__ == '__main__':
+
+    # # 获取cookie方便api调用凭证
+    # cookie_str, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)
+
     # login_and_save_session()
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
