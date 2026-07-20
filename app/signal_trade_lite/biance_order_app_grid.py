@@ -890,35 +890,19 @@ def run_single_strategy(config):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
-    current_symbol = "20260719"
+    current_symbol = "20260721"
 
     configs = [
         GridConfig(
-            strategy_id=f"PENDLE{current_symbol}", symbol="PENDLE/USDT:USDT",
-            min_price=0.5, max_price=2, price_ratio=1.93, quantity=10,
-        ), # 消耗  71  u 网格数量 72
-
-        GridConfig(
-            strategy_id=f"AAVE{current_symbol}", symbol="AAVE/USDT:USDT",
-            min_price=25, max_price=100, price_ratio=1.54, quantity=0.2,
-        ),  # 消耗  87  u 网格数量 90
-
-        GridConfig(
-            strategy_id=f"DOGE{current_symbol}", symbol="DOGE/USDT:USDT",
-            min_price=0.025, max_price=0.1, price_ratio=1.36, quantity=200,
-        ), # 消耗  99  u 网格数量 102
-
-        GridConfig(
-            strategy_id=f"ETH{current_symbol}", symbol="ETH/USDT:USDT",
-            min_price=1000, max_price=2000, price_ratio=1.13, quantity=0.02,
-        ),  # 消耗  237  u 网格数量 61
-
+            strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
+            min_price=50000, max_price=78600, price_ratio=0.73, quantity=0.001,
+        ), # 消耗  581  u 网格数量 62
         GridConfig(
             strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
-            min_price=25, max_price=85, price_ratio=1.3, quantity=0.2,
-        ),  # 消耗  88  u 网格数量 94
+            min_price=25, max_price=93, price_ratio=1.3, quantity=1,
+        ),  # 消耗  464  u 网格数量 101
 
-        # 总共节点和为 419 实际app上是419个节点才行，多了或者少了都要排查
+        # 总共节点和为 173 实际app上是 173 个节点才行，多了或者少了都要排查
     ]
     processes = []
     for config in configs:

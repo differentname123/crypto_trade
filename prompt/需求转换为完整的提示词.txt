@@ -1,145 +1,19 @@
 现在我有一个需求如下，需要一个完整的提示词来让大模型来实现这个需求，请帮我把下面的需求转换为一个完整的提示词：
-1.我的目标是在biance，获取高概率会回关的用户，probability越高表示回关的概率越高，但是现在回关的概率并不是很高，我希望你能够辩证全面的分析，基于这些已有的信息，打造出一个高回关的筛选方法,都只能基于已有的信息字段，不能够擅自构想其它的信息，暂时不用给我代码只有给我方案，我要求的是宁可漏掉，也不想误判为值得关注，我要的是极高概率会回关的方案
-2.我已有的判断函数如下，返回的示例格式应该保持和已有的一致：
-def predict_follow_back(user_info):
-    """纯血预测引擎：仅凭画像 dict 做逻辑判定，完全剥离网络与存储，可离线复算调优。"""
-    follow_count = user_info.get('totalFollowCount', 0)
-    follower_count = user_info.get('totalFollowerCount', 0)
+1.我的目标是建立一个合理的大概率正确的加密货币做多的选择，也就是说在已有的加密货币中选择一个或者一些来进行做多的网格交易，我不需要网格的参数，只需要选择出最有价值的标的
+2.因为加密货币btc的特殊性，我会以btc  46000 为底价，也就是说我如果做btc网格的话，我只认为它最多会到46000
+3.而且我有其它加密历史的k线数据，现在我就想知道一个完整的选择方案是什么，，能根据当前的价格够选择到目前最适合的标的，因为这个选择肯定是和当前的价格相关的，比如当btc价格是80000的时候，eth是800，那么如果当前btc是70000，而eth是400，那么明显eth当前更值得做多
+4.不需要哪种吹毛求疵导致很复杂不稳定的方案，需要真正大概率有效的判断方案，不在于复杂和多方面，而在于将真正有效的方面组合起来
+5.比如不用考虑流动性等很细节的问题，我的标的池的流动性都很好，而且我的资金也很小
+6.需要全面并且辩证的进行分析，不能够只看到好的一面，也要考虑到客观上不利的一面，好的选择一定是站在客观的分析上才能够得到。
+7.奥卡姆剃刀原则：如无必要，勿增实体。也就是说，在分析问题的时候，应该尽量避免引入不必要的假设和复杂的解释，而是应该选择最简单、最直接的解释。同样考虑到第一性原理，也就是说在分析问题的时候，应该从最基本的原理和事实出发，逐步推导出结论，而不是依赖于已有的经验和假设。
+8.宁缺毋滥：在分析问题的时候，应该注重质量而不是数量。不要为了凑结论数量而牺牲了结论的质量。应该注重分析的深度和准确性，而不是追求表面的数量。
+9.认识到是没有完美圣杯，如果以完美的标准去衡量观点，那么都通不过。但是只要期望是正的，在长期看来就会有丰厚的收益。
+10.完整的提示词是不应该留有放历史数据的位置的，因为我是要一个方案，并不是要得到一个数据分析的结果，所以不需要提供历史数据的分析结果，而是要提供一个完整的选择方案。
 
-    # 1. 官方风控与状态过滤(一票否决)
-    if user_info.get('lowQuality', False):
-        return {"is_recommended": False, "probability": 0, "reason": "官方标记的低质量/降权号"}
-    if user_info.get('userStatus', 1) != 1:
-        return {"is_recommended": False, "probability": 0, "reason": "账号状态异常(封禁或静默)"}
 
-    # 2. 僵尸号/机器号过滤(零产出且狂关注)
-    if user_info.get('totalListedPostCount', 0) == 0 and user_info.get('totalLikeCount', 0) == 0:
-        if follow_count > 50:
-            return {"is_recommended": False, "probability": 0, "reason": "0发帖0点赞的批量机器/僵尸号"}
 
-    # 3. 活跃度过滤(超 7 天未活跃视为沉寂号)
-    modify_time_ms = user_info.get('modifyTime', 0)
-    if modify_time_ms > 0:
-        days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
-        if days_inactive > 7:
-            return {"is_recommended": False, "probability": 10,
-                    "reason": f"长达 {int(days_inactive)} 天未活跃的沉寂号"}
 
-    # 4. T0 级强意图直判(简介明写互关，直接保送)
-    bio = (user_info.get('biography') or '').lower()
-    if any(kw in bio for kw in MUTUAL_FOLLOW_KEYWORDS):
-        return {"is_recommended": True, "probability": 101, "reason": "T0级 VIP: 个人简介明确写了互关/必回"}
 
-    # 5. 数据比例核心漏斗(饥渴粉丝区间 + 互惠关注比例)
-    if not (50 <= follower_count <= 1500):
-        return {"is_recommended": False, "probability": 10, "reason": f"粉丝数({follower_count})不在饥渴区间。"}
-    if follow_count < 100:
-        return {"is_recommended": False, "probability": 10, "reason": f"关注数({follow_count})不在安全区间。"}
-
-    ratio = follow_count / follower_count
-    if ratio < 0.9:
-        return {"is_recommended": False, "probability": 10, "reason": f"比例({ratio:.2f})不在互惠区间。"}
-
-    score = 100 - (20 / ratio)
-    return {"is_recommended": True, "probability": score,
-            "reason": "强潜目标：活跃真人且关注数≥粉丝数，必回关！"}
-
-3.能够拉取到的完整信息示例如下，方案都要基于此：
-{
-        "binanceUid": null,
-        "squareUid": "CfexsWwIVYYbr1N5GJXlVQ",
-        "avatar": "https://public.bnbstatic.com/image/pgc/202604/ec2ff6b3261171923014991c9f317f7e.png",
-        "displayName": "静以观复",
-        "biography": "关注必回 做减法。少即是多，慢即是快。用时间的复利，抹平一切短期的随机性。",
-        "role": 11,
-        "profileImage": null,
-        "verificationType": 0,
-        "verificationDescription": null,
-        "totalFollowerCount": 101,
-        "totalListedPostCount": 22,
-        "accountLang": "cn",
-        "badge": null,
-        "totalLikeCount": 21,
-        "totalShareCount": 0,
-        "totalBitCount": 0,
-        "totalArticleCount": 0,
-        "totalFollowCount": 1445,
-        "isFollowed": null,
-        "followsYou": null,
-        "allowPushNotification": null,
-        "liveStatusVO": null,
-        "badgeVO": null,
-        "tippingControl": 1,
-        "tippingNotification": 1,
-        "privateChatEntrance": null,
-        "badgeInfos": null,
-        "totalBadges": 0,
-        "username": "Insights_Anchor",
-        "followersForShow": null,
-        "lastFollowerCount": null,
-        "totalEachFollowerCount": null,
-        "blockType": 0,
-        "createTime": 1770465699000,
-        "modifyTime": 1784409207000,
-        "hasCopyTradingEntrance": false,
-        "copyTradingIosDeepLink": null,
-        "copyTradingType": null,
-        "copyTradingAndroidDeepLink": null,
-        "copyTradingWebDeepLink": null,
-        "userShareLink": "https://app.binance.com/uni-qr/cpro/Insights_Anchor?l=zh-CN&r=I5O5NI6V",
-        "accountStatus": 0,
-        "punishStartTime": null,
-        "punishEndTime": null,
-        "punishReason": null,
-        "resetUsername": null,
-        "resetDisplayName": null,
-        "resetAvatar": null,
-        "userTags": [
-            {
-                "name": "实盘交易",
-                "desc": "该用户已在其币安广场个人资料上启用加密货币投资组合或资产分析共享功能。",
-                "type": 1,
-                "icon": ""
-            },
-            {
-                "name": "高频交易者",
-                "desc": "此徽章反映了用户的交易频次，并根据特定时间范围内（每月）完成的交易笔数分为不同等级。",
-                "type": 3,
-                "icon": ""
-            },
-            {
-                "name": "5.2 年",
-                "desc": "该用户注册于 2021-04，至今已经 5.2 年",
-                "type": 4,
-                "icon": ""
-            }
-        ],
-        "userLabels": null,
-        "holdTokens": null,
-        "tradeTokens": null,
-        "holdingStatus": null,
-        "publicHoldingScope": [
-            "futuresLiveTrading",
-            "assetAllocation",
-            "cumulativePNL",
-            "tags"
-        ],
-        "isChatroomEnabled": false,
-        "chatroomIosDeepLink": null,
-        "chatroomAndroidDeepLink": null,
-        "chatroomWebLink": null,
-        "newChatroomDeepLink": null,
-        "useNewChatroomDeepLink": false,
-        "isChatroomEnabledNew": false,
-        "chatId": null,
-        "chatSource": null,
-        "chatroomDeepLinkNew": null,
-        "previewSpaceLive": null,
-        "lowQuality": false,
-        "topTraderId": "4913659549200171521",
-        "userStatus": 1,
-        "deeplink": null
-    }
 
 
 提示词其它要求如下：
