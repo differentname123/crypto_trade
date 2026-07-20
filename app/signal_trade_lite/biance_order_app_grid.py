@@ -902,7 +902,7 @@ def main_app():
             min_price=25, max_price=93, price_ratio=1.3, quantity=1,
         ),  # 消耗  464  u 网格数量 101
 
-        # 总共节点和为 173 实际app上是 173 个节点才行，多了或者少了都要排查
+        # 总共节点和为 163 实际app上是 163 个节点才行，多了或者少了都要排查
     ]
     processes = []
     for config in configs:
