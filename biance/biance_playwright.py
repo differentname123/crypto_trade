@@ -18,7 +18,7 @@ import traceback
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_jie"
+USER_DATA_DIR = r"W:\temp\biance_dahao"
 LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
 
@@ -382,6 +382,53 @@ def get_auth_tokens_robust(user_data_dir):
             print(f"[!] 提取过程发生未知的严重异常: {e}")
             return None, None
 
+
+def open_browser_for_manual_use(user_data_dir: str):
+    """
+    启动并挂起浏览器，将控制权完全交给用户进行任意手动操作。
+    关闭浏览器窗口后，程序才会结束。
+
+    :param user_data_dir: 浏览器用户数据目录路径
+    """
+    print(f"{'=' * 50}")
+    print(f"🚀 正在启动本地浏览器环境...")
+    print(f"📁 配置目录: {user_data_dir}")
+    print(f"{'=' * 50}")
+
+    with sync_playwright() as p:
+        try:
+            # 启动持久化上下文，和你的主脚本保持一致的防风控参数
+            context = p.chromium.launch_persistent_context(
+                channel="chrome",  # 强制使用本地安装的 Chrome (更真实)
+                user_data_dir=user_data_dir,
+                headless=False,  # 必须为 False，显示界面
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--start-maximized'
+                ],
+                ignore_default_args=["--enable-automation"]
+            )
+
+            # 获取当前存在的第一个页面，如果没有则新建
+            page = context.pages[0] if context.pages else context.new_page()
+
+            # 默认打开币安主页（你也可以改成其他任意网址，或直接注释掉这一行）
+            page.goto('https://www.binance.com/zh-CN')
+
+            print("\n✅ 浏览器已成功启动！")
+            print("🕹️  现在你可以任意在浏览器内进行手动操作 (点赞、浏览、交易等)。")
+            print("💡 提示: 你的所有登录状态和操作都会被保存在该目录中。")
+            print("🛑 退出方式: 直接点击右上角关闭浏览器窗口，程序将自动结束运行。")
+
+            # 【核心逻辑】：无限期挂起主线程，直到该页面被用户手动关闭
+            # timeout=0 表示永不超时
+            page.wait_for_event("close", timeout=0)
+
+        except Exception as e:
+            print(f"\n[!] 浏览器运行中出现异常: {e}")
+        finally:
+            print("\n👋 浏览器已关闭，结束接管，释放系统资源。")
+
 # ==============================================================================
 # 启动入口
 # ==============================================================================
@@ -392,15 +439,17 @@ if __name__ == '__main__':
 
     # login_and_save_session()
 
-    test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
-    test_msg = "少即是多，慢即是快。同频共振！🚀"
-
-    # 无图测试设为 None，有图填绝对路径
-    test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
-
-    err, success = comment_on_binance_post(test_url, test_msg, test_img)
-
-    if success:
-        print("\n🎉 ======== 自动评论任务圆满成功 ========")
-    else:
-        print(f"\n❌ ======== 失败记录 ========\n原因: {err}")
+    open_browser_for_manual_use(USER_DATA_DIR)
+    #
+    # test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
+    # test_msg = "少即是多，慢即是快。同频共振！🚀"
+    #
+    # # 无图测试设为 None，有图填绝对路径
+    # test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
+    #
+    # err, success = comment_on_binance_post(test_url, test_msg, test_img)
+    #
+    # if success:
+    #     print("\n🎉 ======== 自动评论任务圆满成功 ========")
+    # else:
+    #     print(f"\n❌ ======== 失败记录 ========\n原因: {err}")
