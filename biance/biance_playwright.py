@@ -8,7 +8,7 @@
     2. 局部锁定：页面加载后，通过模拟按键向下探索，锁定并隔离富文本编辑器的 DOM 作用域。
     3. 数据注入：在隔离作用域内，依次触发[图片上传] -> [文本键入] -> [动态菜单唤醒与超链接拼接]。
     4. 结果校验：触发发送动作后，优先挂载网络监听器捕获 `pgc/content/add` 接口状态；若超时，则降级比对 DOM 渲染前后的元素清空状态。
-[输出数据]：向终端输出标准化的执行进度日志，并最终返回业务执行的布尔结果与具体错误追溯信息。
+[输出数据]：向终端输出标准化的执行进度日志，并最终返回业务执行的布尔结果、具体错误追溯信息与评论ID。
 ===============================================================================
 """
 
@@ -160,12 +160,14 @@ def _submit_comment(
         comment: str,
         image_path: Optional[str] = None,
         url_info_list: Optional[list] = None
-):
+) -> Optional[int]:
     """
     在已锁定的局部作用域内，执行发帖的全链路操作。
     包含：唤醒编辑器、传图、传文本、插链接、点击发送、API/DOM双重校验。
+    返回: comment_id (如果成功且API返回ID，否则返回None)
     """
     comment = "" if comment is None else str(comment)
+    comment_id = None
 
     # --- 内部工具闭包，隔离琐碎的DOM操作逻辑 ---
     def _wait_first(locators, timeout=5000, desc="元素"):
@@ -425,7 +427,13 @@ def _submit_comment(
 
         if str(json_data.get("code", "")) == "000000" or json_data.get("success") is True:
             api_success = True
-            print(f"[Editor/Verify] 底层接口校验通过 | 响应码: 【000000】 | 结果: [Success]")
+
+            # 【新增：提取 comment_id 返回】
+            data_field = json_data.get("data")
+            if isinstance(data_field, dict):
+                comment_id = data_field.get("id")
+
+            print(f"[Editor/Verify] 底层接口校验通过 | 响应码: 【000000】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
         elif json_data:
             err_msg = json_data.get("message") or str(json_data)
             print(f"[Editor/Verify] 底层接口拒绝请求 | 原因: 【{err_msg}】 | 结果: [Failed]")
@@ -467,89 +475,112 @@ def _submit_comment(
         else:
             raise Exception("发送操作已执行，但输入框未清空且 API 无明确成功响应，疑似发送按钮未激活或网络堵塞。")
 
+    return comment_id
+
 
 def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=USER_DATA_DIR, url_info_list=None):
     """
     主控入口：调度浏览器加载帖子并执行评论。
-    返回: (错误信息字符串或 None, 是否成功的布尔值)
+    返回: (错误信息字符串或 None, 是否成功的布尔值, 提取到的评论ID或 None)
     """
     if not os.path.isdir(user_data_dir):
-        return f"缺少用户环境: {user_data_dir}，请先执行登录", False
+        return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
     error_info = None
     is_success = False
+    comment_id = None
     context = None
 
     print(f"\n{'=' * 60}")
     print(f"[Main/Task] 启动自动化发帖任务 | 目标URL: <{post_url}> | 结果: [初始化]")
     print(f"{'=' * 60}")
 
-    with sync_playwright() as p:
-        try:
-            context = p.chromium.launch_persistent_context(
-                channel="chrome",
-                user_data_dir=user_data_dir,
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
-                ignore_default_args=["--enable-automation"]
-            )
-            page = context.pages[0] if context.pages else context.new_page()
-
-            print(f"[Main/Nav] 导航至目标页面 | 动作: [等待 DOM 加载]")
-            page.goto(post_url)
-            page.wait_for_load_state("domcontentloaded")
-
-            # 登录状态探活
+    try:
+        with sync_playwright() as p:
             try:
-                page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
-                raise Exception("页面探测到 Login 按钮，本地 Cookie 可能已过期失效。")
-            except PlaywrightTimeoutError:
-                pass
+                context = p.chromium.launch_persistent_context(
+                    channel="chrome",
+                    user_data_dir=user_data_dir,
+                    headless=False,
+                    args=["--disable-blink-features=AutomationControlled", "--start-maximized"],
+                    ignore_default_args=["--enable-automation"]
+                )
 
-            check_for_crash(page)
+                # 【防护】：设置全局默认超时参数，避免任何潜在的网络阻塞引起无限挂起死机
+                context.set_default_timeout(60000)
+                context.set_default_navigation_timeout(60000)
 
-            # 寻找编辑器
-            editor_container = _smart_scroll_to_editor(page)
-            check_for_crash(page)
+                page = context.pages[0] if context.pages else context.new_page()
 
-            # 执行评论全流
-            _submit_comment(
-                page=page,
-                editor_container=editor_container,
-                comment=comment,
-                image_path=image_path,
-                url_info_list=url_info_list
-            )
-            is_success = True
+                print(f"[Main/Nav] 导航至目标页面 | 动作: [等待 DOM 加载]")
+                # 追加强制 timeout 保护
+                page.goto(post_url, timeout=60000)
+                page.wait_for_load_state("domcontentloaded", timeout=60000)
 
-        except BusinessErrorException as biz_e:
-            error_info = str(biz_e)
-            print(f"[Main/Task] 业务阻断异常 | 原因: 【{error_info}】 | 结果: [Failed]")
-
-        except Exception as e:
-            error_info = str(e)
-            print(f"[Main/Task] 系统执行异常 | 原因: 【{error_info[:200]}...】 | 结果: [Failed]")
-
-            if context and context.pages:
+                # 登录状态探活
                 try:
-                    ts = int(time.time())
-                    context.pages[0].screenshot(path=f"error_screenshot_{ts}.png")
-                    with open(f"error_html_{ts}.html", "w", encoding="utf-8") as f:
-                        f.write(context.pages[0].content())
-                    print(f"[Main/Debug] 现场保留完毕 | 产物: 【截图与HTML源码时间戳: {ts}】 | 结果: [Saved]")
-                except Exception:
+                    page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
+                    raise Exception("页面探测到 Login 按钮，本地 Cookie 可能已过期失效。")
+                except PlaywrightTimeoutError:
                     pass
 
-            human_intervention_pause(error_info)
+                check_for_crash(page)
 
-        finally:
-            if context:
-                try:
-                    context.close()
-                except Exception:
-                    pass
+                # 寻找编辑器
+                editor_container = _smart_scroll_to_editor(page)
+                check_for_crash(page)
 
-    return error_info, is_success
+                # 执行评论全流
+                comment_id = _submit_comment(
+                    page=page,
+                    editor_container=editor_container,
+                    comment=comment,
+                    image_path=image_path,
+                    url_info_list=url_info_list
+                )
+                is_success = True
+
+            except BusinessErrorException as biz_e:
+                error_info = f"[业务拦截错误] {str(biz_e)}"
+                print(f"[Main/Task] 业务阻断异常 | 原因: 【{error_info}】 | 结果: [Failed]")
+
+            except PlaywrightTimeoutError as pt_e:
+                error_info = f"[元素/网络超时异常] {str(pt_e)}"
+                print(f"[Main/Task] 系统执行超时 | 原因: 【{error_info[:200]}...】 | 结果: [Failed]")
+                human_intervention_pause(error_info)
+
+            except Exception as e:
+                # 【改进排查】：捕获完整的 traceback 堆栈信息输出到 err
+                tb_info = traceback.format_exc()
+                error_info = f"[{type(e).__name__}] {str(e)}\n\n[Traceback 追溯栈]:\n{tb_info}"
+                print(f"[Main/Task] 系统执行异常 | 原因: 【{str(e)[:200]}...】 | 结果: [Failed]")
+
+                if context and context.pages:
+                    try:
+                        ts = int(time.time())
+                        context.pages[0].screenshot(path=f"error_screenshot_{ts}.png")
+                        with open(f"error_html_{ts}.html", "w", encoding="utf-8") as f:
+                            f.write(context.pages[0].content())
+                        print(f"[Main/Debug] 现场保留完毕 | 产物: 【截图与HTML源码时间戳: {ts}】 | 结果: [Saved]")
+                    except Exception as s_e:
+                        print(f"[Main/Debug] 现场保留异常 | 原因: 【{s_e}】")
+
+                human_intervention_pause(error_info)
+
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+    except Exception as core_e:
+        # 【最外层绝对防护】：就算 Playwright 引擎自身爆炸/初始化失败，也在此拦截，绝对不让代码物理崩溃
+        tb_info = traceback.format_exc()
+        error_info = f"[CoreEngineCrash] Playwright 底层启动或运行发生系统级崩溃:\n{core_e}\n\n[Traceback]:\n{tb_info}"
+        print(f"[Main/Task] Playwright 核心框架崩溃 | 结果: [Failed]")
+        is_success = False
+
+    return error_info, is_success, comment_id
 
 
 def get_auth_tokens_robust(user_data_dir):
@@ -656,10 +687,15 @@ if __name__ == '__main__':
         {
             "text": "带单",
             "url": "https://www.binance.com/zh-CN/square/post/309692475255842"
+        },
+        {
+            "text": "带单高手",
+            "url": "https://www.binance.com/zh-CN/square/post/309692475255842"
         }
     ]
 
-    err, success = comment_on_binance_post(
+    # 【变更】：拆包增加了第三个元素 c_id 返回
+    err, success, c_id = comment_on_binance_post(
         post_url=test_url,
         comment=test_msg,
         image_path=test_img,
@@ -667,6 +703,6 @@ if __name__ == '__main__':
     )
 
     if success:
-        print("\n[Final/Result] 🎉 ======== 自动评论任务圆满成功 ========")
+        print(f"\n[Final/Result] 🎉 ======== 自动评论任务圆满成功 ======== | 提取到的评论ID: 【{c_id}】")
     else:
-        print(f"\n[Final/Result] ❌ ======== 失败记录 ======== | 最终追溯: 【{err}】")
+        print(f"\n[Final/Result] ❌ ======== 失败记录 ======== | 最终追溯:\n{err}")
