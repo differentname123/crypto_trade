@@ -18,7 +18,7 @@ import traceback
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\dahao"
+USER_DATA_DIR = r"W:\temp\biance_jie"
 LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
 

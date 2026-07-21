@@ -201,9 +201,10 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
     """
     单用户画像评估与关系链扩散任务
     通过锁机制确保高频并发下的全局缓存一致性
+    【修改说明】: 在所有 return 语句末尾追加了 is_new 布尔值，用于区分是否是新请求 (True为新请求，False为读缓存)
     """
     if stop_event.is_set():
-        return user_name, None, None, None, None
+        return user_name, None, None, None, None, False
 
     with profile_cache_lock:
         user_data = user_info_map.get(user_name, {})
@@ -212,10 +213,11 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
     if 'predict_info' in user_data:
         predict_info = user_data['predict_info']
         if not (_is_high_value_target(predict_info) or _is_worth_fission(predict_info)):
-            return user_name, user_data.get('squareUid'), predict_info, {}, {}
+            return user_name, user_data.get('squareUid'), predict_info, {}, {}, False
 
         if 'following' in user_data and 'followers' in user_data:
-            return user_name, user_data.get('squareUid'), predict_info, user_data['following'], user_data['followers']
+            return user_name, user_data.get('squareUid'), predict_info, user_data['following'], user_data[
+                'followers'], False
 
         if user_data.get('squareUid'):
             square_uid = user_data.get('squareUid')
@@ -223,7 +225,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
             with profile_cache_lock:
                 user_info_map[user_name]['following'] = following_map
                 user_info_map[user_name]['followers'] = follower_map
-            return user_name, square_uid, predict_info, following_map, follower_map
+            return user_name, square_uid, predict_info, following_map, follower_map, False
 
     # 2. 网络I/O与漏斗评估
     raw_profile = fetch_binance_user_profile(user_name)
@@ -231,7 +233,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
         predict_info = {"is_recommended": False, "probability": 0, "reason": "接口失效或用户注销"}
         with profile_cache_lock:
             user_info_map[user_name] = {'predict_info': predict_info}
-        return user_name, None, predict_info, {}, {}
+        return user_name, None, predict_info, {}, {}, True
 
     user_info = {
         'squareUid': raw_profile.get('squareUid'),
@@ -268,7 +270,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
                 del user_info_map[user_name][k]
 
     if not (_is_high_value_target(predict_info) or _is_worth_fission(predict_info)):
-        return user_name, square_uid, predict_info, {}, {}
+        return user_name, square_uid, predict_info, {}, {}, True
 
     # 3. 对达标者获取深层关系链供下游使用
     following_map, follower_map = _get_current_relations(user_name, max_count=1000)
@@ -276,7 +278,7 @@ def _analyze_user_task(user_name, user_info_map, stop_event):
         user_info_map[user_name]['following'] = following_map
         user_info_map[user_name]['followers'] = follower_map
 
-    return user_name, square_uid, predict_info, following_map, follower_map
+    return user_name, square_uid, predict_info, following_map, follower_map, True
 
 
 def get_worth_following_list(initial_user_name_list, target_count):
@@ -295,6 +297,10 @@ def get_worth_following_list(initial_user_name_list, target_count):
     pending_user_names = list(initial_user_name_list)
     turn_count = 1
 
+    # 【修改说明】: 新增两个计数器，统计来源数据
+    cached_valid_count = 0
+    new_valid_count = 0
+
     while len(valid_square_uids) < target_count and pending_user_names:
         next_turn_user_names = []
         stop_event = threading.Event()
@@ -309,7 +315,8 @@ def get_worth_following_list(initial_user_name_list, target_count):
 
             for future in as_completed(future_to_user):
                 try:
-                    uname, uid, predict_info, following_map, follower_map = future.result()
+                    # 【修改说明】: 拆包时增加接收 is_new 标识
+                    uname, uid, predict_info, following_map, follower_map, is_new = future.result()
                     if predict_info is None:
                         continue
 
@@ -319,15 +326,23 @@ def get_worth_following_list(initial_user_name_list, target_count):
                             next_turn_user_names.extend(follower_map.keys())
 
                         if _is_high_value_target(predict_info):
-                            valid_square_uids.add(str(uid))
-                            logger.info(
-                                f"[裂变引擎/命中拦截] 挖掘到高潜用户 | 关键参数: 用户【{uname}】, 评分【{_normalize_probability(predict_info.get('probability', 0)):.0f}】 | 结果: 已达标进度【{len(valid_square_uids)}/{target_count}】")
+                            # 【修改说明】: 确保只对首次加入集合的目标进行统计
+                            if str(uid) not in valid_square_uids:
+                                valid_square_uids.add(str(uid))
 
-                            if len(valid_square_uids) >= target_count:
+                                if is_new:
+                                    new_valid_count += 1
+                                else:
+                                    cached_valid_count += 1
+
                                 logger.info(
-                                    "[裂变引擎/边界控制] 已达成获取额度 | 关键参数: 【目标阈值触发】 | 结果: 阻断当前轮次所有剩余并发任务")
-                                stop_event.set()
-                                break
+                                    f"[裂变引擎/命中拦截] 挖掘到高潜用户 | 关键参数: 用户【{uname}】, 评分【{_normalize_probability(predict_info.get('probability', 0)):.0f}】, 来源【{'新提取' if is_new else '本地缓存'}】 | 结果: 已达标进度【{len(valid_square_uids)}/{target_count}】")
+
+                                if len(valid_square_uids) >= target_count:
+                                    logger.info(
+                                        "[裂变引擎/边界控制] 已达成获取额度 | 关键参数: 【目标阈值触发】 | 结果: 阻断当前轮次所有剩余并发任务")
+                                    stop_event.set()
+                                    break
                 except Exception as e:
                     logger.error(
                         f"[裂变引擎/并发流转] 用户画像评估发生雪崩 | 关键参数: 并发任务报错 | 结果: 跳过当前任务 | 可能原因: API风控或内部网络中断 [{e}]")
@@ -338,8 +353,9 @@ def get_worth_following_list(initial_user_name_list, target_count):
         pending_user_names = list(set(next_turn_user_names) - evaluated_users)
         turn_count += 1
 
+    # 【修改说明】: 任务完结的日志中打印出新挖掘与本地缓存的数量对比
     logger.info(
-        f"[裂变引擎/任务完结] 图层扩散搜索完毕 | 关键参数: 产出量【{len(valid_square_uids)}】, 过滤总计【{len(evaluated_users)}】 | 结果: 返回高优UID集合")
+        f"[裂变引擎/任务完结] 图层扩散搜索完毕 | 关键参数: 产出量【{len(valid_square_uids)}】(其中新挖掘: {new_valid_count}个, 本地缓存: {cached_valid_count}个), 过滤总计【{len(evaluated_users)}】 | 结果: 返回高优UID集合")
     return list(valid_square_uids)
 
 
@@ -536,7 +552,7 @@ if __name__ == "__main__":
             "[运行时框架/引导激活] 主程序内存空间分配完毕 | 关键参数: 【生产者挂载/消费者挂载】 | 结果: 双擎并发点火")
 
         t_producer = threading.Thread(target=producer_fetch_content_main, name="ProducerThread", daemon=True)
-        t_consumer = threading.Thread(target=consumer_auto_sync_main, kwargs={"accounts": ["dahao", "nana"]},
+        t_consumer = threading.Thread(target=consumer_auto_sync_main, kwargs={"accounts": ["dahao", "nana", "jie", "mama"]},
                                       name="ConsumerThread", daemon=True)
 
         t_producer.start()
