@@ -343,9 +343,9 @@ def get_worth_following_list(initial_user_name_list, target_count):
     return list(valid_square_uids)
 
 
-def _sync_single_account_logic(user_key, global_potential_uids, all_accounts_followers_uids):
+def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     """
-    单账号闭环：智能比对差异，以阶梯式优先级补齐互关网，执行模拟人手的安全休眠关注机制
+    单账号闭环：提取全局粉丝与专属探路流量，先保证VIP粉丝全覆盖，再执行剩余份额的新客探索。
     """
     my_name = get_config(f"{user_key}_name")
     browser_session_dir = get_config(f"{user_key}_browser_session_dir")
@@ -379,18 +379,23 @@ def _sync_single_account_logic(user_key, global_potential_uids, all_accounts_fol
             f"[业务中断/配置断档] 执行参数不完整 | 关键参数: 账号【{user_key}】 | 结果: 强制退出该账号逻辑 | 可能原因: 环境变量未配置或无头浏览器抓取Cookie失败")
         return
 
-    following_map, follower_map = _get_current_relations(my_name, max_count=10000)
-    following_uids = set(following_map.values())
-    followers_uids = set(follower_map.values())
+    # 拉取当前账号自身最新的关注状态
+    following_map, _ = _get_current_relations(my_name, max_count=10000)
+    my_following_uids = set(following_map.values())
 
-    tier_1_own_fans = followers_uids - following_uids
-    tier_2_other_fans = (all_accounts_followers_uids - followers_uids) - following_uids
-    tier_3_mined_users = (global_potential_uids - all_accounts_followers_uids) - following_uids
+    # ---------------- 核心装填逻辑：绝对优先级排序 ----------------
+    # 1. 提取全矩阵粉丝中的未关注对象作为【优先队列】（保证所有粉丝必须先被关注）
+    vip_queue = global_fans_uids - my_following_uids
 
-    final_uids_to_follow = (list(tier_1_own_fans) + list(tier_2_other_fans) + list(tier_3_mined_users))[:100]
+    # 2. 提取分发给该账号的独有野生线索作为【探索队列】（防撞车双重保险）
+    explore_queue = set(allocated_wild_uids) - my_following_uids
+
+    # 3. 严格按照先后顺序合并列表，截取前 100 个名额，完美实现粉丝绝对优先策略
+    final_uids_to_follow = (list(vip_queue) + list(explore_queue))[:100]
+    # -----------------------------------------------------------
 
     logger.info(
-        f"[聚合调度/差集运算] 单账号待关注分配盘点 | 关键参数: 账号【{user_key}】 梯队1自身漏关【{len(tier_1_own_fans)}】, 梯队2矩阵输血【{len(tier_2_other_fans)}】, 梯队3野生散客【{len(tier_3_mined_users)}】 | 结果: 截取并锁定 【{len(final_uids_to_follow)}】 个指标")
+        f"[聚合调度/队列装填] 单账号待关注分配盘点 | 关键参数: 账号【{user_key}】 VIP必回关粉丝【{len(vip_queue)}】, 专属探索线索【{len(explore_queue)}】 | 结果: 截取并锁定 【{len(final_uids_to_follow)}】 个指标")
 
     if not final_uids_to_follow:
         return
@@ -415,7 +420,7 @@ def _sync_single_account_logic(user_key, global_potential_uids, all_accounts_fol
 
 def consumer_auto_sync_main(accounts=None):
     """
-    消费者总干线：以公共资源池驱动多账号并发执行安全关注。
+    消费者总干线：构建全局去重基座，提取VIP矩阵粉丝流，并隔离切割野生流量下发执行。
     """
     if accounts is None:
         accounts = ["dahao", "nana"]
@@ -425,36 +430,49 @@ def consumer_auto_sync_main(accounts=None):
 
     while True:
         try:
+            # 1. 获取基础野生线索 (发帖+裂变)
             posts_list = post_manager.find_posts_by_source("biance", limit=50000)
             target_time_str = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
             shared_post_uids = extract_mutual_follow_users(posts_list, target_time_str)
 
+            # 2. 初始化全局数据基座
             seed_user_names = set()
-            all_accounts_followers_uids = set()
+            global_following_uids = set() # 矩阵所有账号的已关注池(用于绝对隔离去重)
+            global_fans_uids = set()      # 矩阵所有账号的粉丝大集合(最高优先级VIP)
 
             for acc in accounts:
                 my_name = get_config(f"{acc}_name")
                 if my_name:
                     f_map, follower_map = _get_current_relations(my_name, max_count=10000)
                     seed_user_names.update(f_map.keys())
-                    all_accounts_followers_uids.update(follower_map.values())
+                    global_following_uids.update(f_map.values())
+                    global_fans_uids.update(follower_map.values())
 
+            # 获取裂变池
             global_worth_uids = get_worth_following_list(list(seed_user_names), target_count=1000)
-            global_potential_uids = shared_post_uids.union(set(global_worth_uids)).union(all_accounts_followers_uids)
+            global_wild_uids = shared_post_uids.union(set(global_worth_uids))
+
+            # 3. 核心清洗：野生池 减去 所有账号已关注的 减去 所有粉丝，留下纯净且未开垦的荒地
+            pure_wild_uids = list(global_wild_uids - global_following_uids - global_fans_uids)
 
             logger.info(
-                f"[资源调度/全量统筹] 聚合公网野生线索与裂变流量 | 关键参数: 帖子线索【{len(shared_post_uids)}】, 裂变输血【{len(global_worth_uids)}】, 互联池去重总计【{len(global_potential_uids)}】 | 结果: 下发至各账号隔离执行")
+                f"[资源调度/全量统筹] 聚合公网线索与矩阵资产 | 关键参数: 帖子线索【{len(shared_post_uids)}】, 裂变输血【{len(global_worth_uids)}】, 矩阵全网粉丝池【{len(global_fans_uids)}】, 全局去重后纯净探索池【{len(pure_wild_uids)}】 | 结果: 分发至各节点执行")
 
-            if not global_potential_uids:
+            if not global_fans_uids and not pure_wild_uids:
                 logger.info(
                     "[总控系统/流量干涸] 未嗅探到可用靶点数据 | 关键参数: 【全局池=0】 | 结果: 休眠10分钟后启动补偿机制")
                 time.sleep(600)
                 continue
 
+            # 4. 隔离派发任务
             with ThreadPoolExecutor(max_workers=len(accounts)) as executor:
-                futures = [
-                    executor.submit(_sync_single_account_logic, acc, global_potential_uids, all_accounts_followers_uids)
-                    for acc in accounts]
+                futures = []
+                for i, acc in enumerate(accounts):
+                    # 通过切片法 (slice) 实现流量均分且绝对不重叠
+                    allocated_wild_uids = pure_wild_uids[i::len(accounts)]
+                    futures.append(
+                        executor.submit(_sync_single_account_logic, acc, global_fans_uids, allocated_wild_uids)
+                    )
                 for f in as_completed(futures):
                     f.result()
 
