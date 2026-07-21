@@ -22,6 +22,7 @@ import traceback
 from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 from typing import Tuple, Optional
 from playwright.sync_api import sync_playwright, Page, expect, TimeoutError as PlaywrightTimeoutError
+
 # ==============================================================================
 # 全局配置
 # ==============================================================================
@@ -154,11 +155,11 @@ def _smart_scroll_to_editor(page, max_scrolls=20):
 
 
 def _submit_comment(
-    page: Page,
-    editor_container,
-    comment: str,
-    image_path: Optional[str] = None,
-    url_info_list: Optional[list] = None
+        page: Page,
+        editor_container,
+        comment: str,
+        image_path: Optional[str] = None,
+        url_info_list: Optional[list] = None
 ):
     """
     在已锁定的局部作用域内，执行发帖的全链路操作。
@@ -168,27 +169,37 @@ def _submit_comment(
 
     # --- 内部工具闭包，隔离琐碎的DOM操作逻辑 ---
     def _wait_first(locators, timeout=5000, desc="元素"):
+        start_time = time.time()
+        end_time = start_time + (timeout / 1000.0)
         last_err = None
-        for loc in locators:
-            try:
-                loc.wait_for(state="visible", timeout=timeout)
-                return loc
-            except Exception as e:
-                last_err = e
-                continue
-        raise Exception(f"无法找到可见的 {desc} | 底层原因: {last_err}")
+
+        # 将长阻塞打散为时间片轮询，避免单选择器失效导致的长时间卡顿
+        while time.time() < end_time:
+            for loc in locators:
+                try:
+                    # 使用极短超时探查，如果在 200ms 内出现则命中，否则立即进入下一个候选者
+                    loc.wait_for(state="visible", timeout=200)
+                    return loc
+                except Exception as e:
+                    last_err = e
+                    continue
+        raise Exception(f"无法找到可见的 {desc}，总耗时超限 ({timeout}ms) | 底层原因: {last_err}")
 
     def _click_first(locators, timeout=5000, desc="元素"):
+        start_time = time.time()
+        end_time = start_time + (timeout / 1000.0)
         last_err = None
-        for loc in locators:
-            try:
-                loc.wait_for(state="visible", timeout=timeout)
-                loc.click(timeout=timeout)
-                return loc
-            except Exception as e:
-                last_err = e
-                continue
-        raise Exception(f"无法点击 {desc} | 底层原因: {last_err}")
+
+        while time.time() < end_time:
+            for loc in locators:
+                try:
+                    loc.wait_for(state="visible", timeout=200)
+                    loc.click(timeout=1500)
+                    return loc
+                except Exception as e:
+                    last_err = e
+                    continue
+        raise Exception(f"无法点击 {desc}，总耗时超限 ({timeout}ms) | 底层原因: {last_err}")
 
     def _focus_end(editor_node):
         try:
@@ -251,7 +262,7 @@ def _submit_comment(
         page.wait_for_timeout(500)
 
     # =======================
-    # 步骤 4：注入超链接 (复杂DOM操作) - 已恢复完整兜底器
+    # 步骤 4：注入超链接 (复杂DOM操作) - 极速无卡顿版本
     # =======================
     if url_info_list and isinstance(url_info_list, (list, tuple)):
         print(f"[Editor/Link] 检测到超链接任务 | 数量: <{len(url_info_list)}> | 结果: [启动注入流]")
@@ -275,20 +286,28 @@ def _submit_comment(
                 page.keyboard.press("Space")
                 page.wait_for_timeout(150)
 
-                # 点开“更多”
+                # 点开“更多” - 根据现有HTML结构加入精准首发，配合轮询降维打击卡顿
                 more_cands = [
-                    editor_container.get_by_role("button", name=re.compile(r"更多|More|Options|Expand", re.IGNORECASE)).first,
-                    editor_container.locator('button[aria-label*="更多"], button[aria-label*="More" i]').first,
+                    editor_container.locator('#post-editor-more-icon').first,
                     editor_container.locator("svg").filter(has=page.locator('path[d^="M12 16.5"]')).first,
+                    editor_container.locator("div.icon-box").filter(has=page.locator('svg')).last,
+                    editor_container.get_by_role("button",
+                                                 name=re.compile(r"更多|More|Options|Expand", re.IGNORECASE)).first,
+                    editor_container.locator('button[aria-label*="更多"], button[aria-label*="More" i]').first,
                 ]
                 _click_first(more_cands, timeout=4000, desc="更多按钮")
                 page.wait_for_timeout(350)
 
-                # 点击“添加链接” (恢复第三层防崩溃兜底和完整正则)
+                # 点击“添加链接”
                 add_link_cands = [
-                    page.get_by_role("menuitem", name=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
-                    page.locator("div.menu-item").filter(has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
-                    page.locator('[role="menuitem"], .menu-item, [class*="menu-item"]').filter(has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
+                    page.locator("div.menu-item").filter(
+                        has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
+                    page.locator('.menu-item').filter(
+                        has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
+                    page.get_by_role("menuitem",
+                                     name=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
+                    page.locator('[role="menuitem"], .menu-item, [class*="menu-item"]').filter(
+                        has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)).first,
                 ]
                 _click_first(add_link_cands, timeout=4000, desc="添加链接选项")
 
@@ -301,7 +320,7 @@ def _submit_comment(
                 except Exception:
                     pass
 
-                # 填写正文与地址 (恢复币安专属属性兜底和宽泛正则)
+                # 填写正文与地址
                 name_input = _wait_first([
                     dialog.locator('input[name="name"][data-bn-type="input"]').first,
                     dialog.locator('input[name="name"]').first,
@@ -314,12 +333,15 @@ def _submit_comment(
                     dialog.get_by_placeholder(re.compile(r"链接|地址|link|url|address", re.IGNORECASE)).first
                 ], timeout=6000, desc="链接地址输入框")
 
-                # 确认按钮 (恢复完整 4 层兜底与正则)
+                # 确认按钮
                 confirm_btn = _wait_first([
-                    dialog.locator('button[type="submit"][data-bn-type="button"]').filter(has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
-                    dialog.locator('button[type="submit"]').filter(has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
+                    dialog.locator('button[type="submit"][data-bn-type="button"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
+                    dialog.locator('button[type="submit"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
                     dialog.get_by_role("button", name=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
-                    dialog.locator('button[data-bn-type="button"]').filter(has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
+                    dialog.locator('button[data-bn-type="button"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)).first,
                 ], timeout=6000, desc="链接确认按钮")
 
                 name_input.fill(link_text)
