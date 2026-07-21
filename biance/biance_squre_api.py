@@ -1330,6 +1330,7 @@ def fetch_binance_replies(content_id, sort_by=1, required_count=10, session=None
 
     return clean_all_replies
 
+
 def fetch_binance_relations(target_username, relation_type, required_count, session=None):
     """
     聚合获取币安广场指定用户的关注/粉丝列表 (无需登录鉴权)
@@ -1396,8 +1397,28 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
             json_resp = response.json()
 
             if not json_resp.get("success"):
-                logger.error(f"❌ [{label}] API 业务错误: {json_resp.get('message', '未知错误')}")
+                # ================= 修改区域开始 =================
+                error_code = str(json_resp.get("code", ""))
+                error_msg = json_resp.get('message', '未知错误')
+
+                # 适配健壮性：处理币安 API 官方的最大翻页限制 (通常限制 100 页)
+                if error_code == "10003" and page_index > 100:
+                    logger.info(f"✅ [{label}] 触及币安最大翻页限制 (第 {page_index} 页)，已获取公开允许的最大数据量。")
+                    break
+
+                # 增强日志，打印详尽的请求上下文以便排查真实的"参数错误"或其它异常
+                logger.error(
+                    f"❌ [{label}] API 业务错误: {error_msg}\n"
+                    f"▼▼▼▼▼ 详细排查上下文 ▼▼▼▼▼\n"
+                    f"🔗 请求URL: {url}\n"
+                    f"📦 请求Payload: {payload}\n"
+                    f"📋 请求Headers: {headers}\n"
+                    f"🖨️ HTTP状态码: {response.status_code}\n"
+                    f"📄 服务器完整返回: {response.text}\n"
+                    f"▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲"
+                )
                 break
+                # ================= 修改区域结束 =================
 
             data_obj = json_resp.get("data")
             if not data_obj:
@@ -1439,7 +1460,6 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
             time.sleep(random.uniform(2.0, 4.0))
 
     return all_items[:required_count]
-
 
 def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3):
     """
