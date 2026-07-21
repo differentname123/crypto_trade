@@ -138,10 +138,69 @@ def _smart_scroll_to_editor(page: Page, max_scrolls: int = 20):
     raise Exception("向下滚动了最大次数，依然没有找到评论输入区，疑似死链或被风控滑块拦截。")
 
 
-def _submit_comment(page: Page, editor_container, comment: str, image_path: Optional[str] = None):
-    """在锁定的局部作用域内执行输入、传图、发送、校验全流程"""
+def _submit_comment(
+    page: Page,
+    editor_container,
+    comment: str,
+    image_path: Optional[str] = None,
+    url_info_list: Optional[list] = None
+):
+    """
+    在锁定的局部作用域内执行：
+    唤醒编辑器 -> 上传图片 -> 输入正文 -> 插入超链接 -> 发送 -> API/DOM 校验
+    """
 
-    # --- 第 1 步：点击伪装框唤醒真实编辑器 ---
+    comment = "" if comment is None else str(comment)
+
+    # =======================
+    # 内部小工具
+    # =======================
+
+    def focus_editor_end():
+        """把光标切回编辑器末尾"""
+        try:
+            real_editor.click(timeout=2000)
+        except Exception:
+            pass
+        page.keyboard.press("End")
+        page.wait_for_timeout(120)
+
+    def close_overlay():
+        """尝试关闭弹窗 / 下拉菜单，避免失败后卡住后续流程"""
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+
+    def wait_first_visible(locators, timeout=5000, desc="元素"):
+        """等待第一个可见元素，并返回它"""
+        last_err = None
+        for loc in locators:
+            try:
+                loc.wait_for(state="visible", timeout=timeout)
+                return loc
+            except Exception as e:
+                last_err = e
+                continue
+        raise Exception(f"无法找到可见的{desc}: {last_err}")
+
+    def click_first_visible(locators, timeout=5000, desc="元素"):
+        """点击第一个可见元素"""
+        last_err = None
+        for loc in locators:
+            try:
+                loc.wait_for(state="visible", timeout=timeout)
+                loc.click(timeout=timeout)
+                return loc
+            except Exception as e:
+                last_err = e
+                continue
+        raise Exception(f"无法点击{desc}: {last_err}")
+
+    # =======================
+    # 第 1 步：唤醒真实编辑器
+    # =======================
     print("[*] 正在唤醒编辑器...")
     fake_input = editor_container.locator('input[type="text"], input[placeholder]').first
     fake_input.click()
@@ -149,104 +208,353 @@ def _submit_comment(page: Page, editor_container, comment: str, image_path: Opti
     real_editor = editor_container.locator('div[contenteditable="true"].ProseMirror').first
     expect(real_editor).to_be_editable(timeout=8000)
 
-    # --- 第 2 步：【优化核心】先传图，防抖动，防吞字 ---
-    # 原因：部分现代框架在上传图片后会触发重绘(Re-render)，从而清空之前输入的未绑定文本。先传图可破此局。
+    # =======================
+    # 第 2 步：先上传图片
+    # =======================
     if image_path and os.path.exists(image_path):
         print(f"[*] 准备上传图片: {image_path}")
         try:
             file_input = editor_container.locator('input[type="file"]').first
             file_input.set_input_files(image_path)
             print("[*] 图片已注入，等待前端渲染机制稳定...")
-
-            # 弃用不稳定的死类名(images-box-item)，改用普适缓冲，规避 DOM 改版导致的 30 秒卡死
             page.wait_for_timeout(3500)
             print("[+] 图片加载及页面状态机刷新完成。")
         except Exception as e:
             print(f"[!] 警告: 图片上传环节发生异常，将尝试降级发送纯文本。原因: {e}")
 
-    # --- 第 3 步：模拟真人逐字输入 (二次校验加固) ---
+    # =======================
+    # 第 3 步：输入正文
+    # =======================
     print("[*] 编辑器就绪，开始填入文字...")
-    real_editor.click()
-    page.wait_for_timeout(800)  # 停顿，等待光标彻底聚焦和框架稳定
 
-    # 稍微降速以适应富文本编辑器的监听器
-    real_editor.press_sequentially(comment, delay=60)
-
-    # 【核心防御】：校验文字是否真的存活，如果被吞直接重补
-    page.wait_for_timeout(500)
-    if not real_editor.inner_text().strip():
-        print("[!] 检测到文字被前端框架静默清空，触发重试补录...")
+    if comment.strip():
         real_editor.click()
+        page.wait_for_timeout(800)
+
         real_editor.press_sequentially(comment, delay=60)
 
-    print("[+] 文字填写并校验挂载完毕。")
+        page.wait_for_timeout(500)
+        if not real_editor.inner_text().strip():
+            print("[!] 检测到文字被前端框架静默清空，触发重试补录...")
+            real_editor.click()
+            real_editor.press_sequentially(comment, delay=60)
 
-    # --- 第 4 步：防抖拦截与按钮就绪检查 ---
+        print("[+] 文字填写并校验挂载完毕。")
+    else:
+        real_editor.click()
+        page.wait_for_timeout(500)
+        print("[*] 未提供正文文本，将只处理图片 / 链接等内容。")
+
+    # =======================
+    # 第 3.5 步：插入超链接
+    # =======================
+    if url_info_list and isinstance(url_info_list, (list, tuple)):
+        print(f"[*] 检测到需要插入 {len(url_info_list)} 个超链接，启动注入流...")
+
+        for idx, url_info in enumerate(url_info_list):
+            if not isinstance(url_info, dict):
+                print(f"[!] 警告: 第 {idx + 1} 个链接数据结构不合法，已跳过: {url_info}")
+                continue
+
+            link_text = str(url_info.get("text", "")).strip()
+            link_url = str(url_info.get("url", "")).strip()
+
+            if not link_text or not link_url:
+                print(f"[!] 警告: 第 {idx + 1} 个链接缺少 text 或 url，已跳过。")
+                continue
+
+            # 自动补全协议，避免前端 URL 校验不通过导致确认按钮不激活
+            if not re.match(r"^https?://", link_url, re.IGNORECASE):
+                link_url = "https://" + link_url
+
+            print(f"[*] 正在注入第 {idx + 1} 个超链接: [{link_text}]({link_url})")
+
+            try:
+                # 1. 光标切到编辑器末尾，并补一个空格，隔离正文和链接
+                focus_editor_end()
+                page.keyboard.press("Space")
+                page.wait_for_timeout(150)
+
+                # 2. 点击“三个点 / 更多”
+                # 优先使用语义化选择器，SVG path 作为兜底
+                more_candidates = [
+                    editor_container.get_by_role(
+                        "button",
+                        name=re.compile(r"更多|More|Options|Expand", re.IGNORECASE)
+                    ).first,
+                    editor_container.locator(
+                        'button[aria-label*="更多"], '
+                        'button[aria-label*="More" i], '
+                        'button[title*="更多"], '
+                        'button[title*="More" i]'
+                    ).first,
+                    editor_container.locator("svg").filter(
+                        has=page.locator('path[d^="M12 16.5"]')
+                    ).first,
+                ]
+                click_first_visible(more_candidates, timeout=4000, desc="更多按钮")
+                page.wait_for_timeout(350)
+
+                # 3. 点击“添加链接”
+                add_link_candidates = [
+                    page.get_by_role(
+                        "menuitem",
+                        name=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
+                    ).first,
+                    page.locator("div.menu-item").filter(
+                        has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
+                    ).first,
+                    page.locator('[role="menuitem"], .menu-item, [class*="menu-item"]').filter(
+                        has_text=re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
+                    ).first,
+                ]
+                click_first_visible(add_link_candidates, timeout=4000, desc="添加链接选项")
+
+                # 4. 尽量锁定弹窗作用域
+                dialog = page
+                try:
+                    dlg = page.get_by_role("dialog").last
+                    dlg.wait_for(state="visible", timeout=2000)
+                    dialog = dlg
+                except Exception:
+                    dialog = page
+
+                # 5. 查找链接正文输入框
+                name_candidates = [
+                    dialog.locator('input[name="name"][data-bn-type="input"]').first,
+                    dialog.locator('input[name="name"]').first,
+                    dialog.get_by_placeholder(
+                        re.compile(r"正文|名称|标题|text|name|title", re.IGNORECASE)
+                    ).first,
+                ]
+                name_input = wait_first_visible(
+                    name_candidates,
+                    timeout=6000,
+                    desc="链接正文输入框"
+                )
+
+                # 6. 查找链接地址输入框
+                link_candidates = [
+                    dialog.locator('input[name="link"][data-bn-type="input"]').first,
+                    dialog.locator('input[name="link"]').first,
+                    dialog.get_by_placeholder(
+                        re.compile(r"链接|地址|link|url|address", re.IGNORECASE)
+                    ).first,
+                ]
+                link_input = wait_first_visible(
+                    link_candidates,
+                    timeout=6000,
+                    desc="链接地址输入框"
+                )
+
+                # 7. 查找确认按钮
+                confirm_candidates = [
+                    dialog.locator('button[type="submit"][data-bn-type="button"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
+                    ).first,
+                    dialog.locator('button[type="submit"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
+                    ).first,
+                    dialog.get_by_role(
+                        "button",
+                        name=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
+                    ).first,
+                    dialog.locator('button[data-bn-type="button"]').filter(
+                        has_text=re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
+                    ).first,
+                ]
+                confirm_btn = wait_first_visible(
+                    confirm_candidates,
+                    timeout=6000,
+                    desc="链接确认按钮"
+                )
+
+                # 8. 填写链接信息
+                name_input.fill(link_text)
+                page.wait_for_timeout(200)
+
+                link_input.fill(link_url)
+                page.wait_for_timeout(200)
+
+                # 9. 等待前端校验通过，确认按钮激活
+                expect(confirm_btn).to_be_enabled(timeout=6000)
+
+                # 10. 点击确认
+                confirm_btn.click(timeout=6000)
+
+                # 11. 等待弹窗关闭，而不是固定 sleep
+                expect(name_input).to_be_hidden(timeout=6000)
+
+                # 12. 校验链接是否真的插入到富文本编辑器中
+                link_locator = real_editor.locator("a").filter(
+                    has_text=re.compile(re.escape(link_text), re.IGNORECASE)
+                )
+                expect(link_locator.first).to_be_visible(timeout=5000)
+
+                print(f"[+] 链接 [{link_text}] 插入成功。")
+
+                # 13. 再次把光标移到末尾，并补空格，避免下一个链接粘连
+                focus_editor_end()
+                page.keyboard.press("Space")
+                page.wait_for_timeout(200)
+
+            except Exception as e:
+                print(f"[!] 警告: 注入链接 [{link_text}] 时发生异常，尝试关闭弹层并跳过。原因: {e}")
+                close_overlay()
+
+                # 如果弹层已经彻底卡死，继续执行可能也会失败。
+                # 如果你希望更保守，可以这里直接 break。
+                # break
+
+    # =======================
+    # 第 4 步：检查发送按钮
+    # =======================
     print("[*] 检查发送按钮状态...")
-    send_button = editor_container.locator("button").filter(
-        has_text=re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
-    ).first
 
-    # 【优化核心】：直接使用原生的启用状态断言，替代容易变动的 aria-disabled
+    send_button_candidates = [
+        editor_container.locator("button").filter(
+            has_text=re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
+        ).first,
+        editor_container.get_by_role(
+            "button",
+            name=re.compile(r"回复|发送|Reply|Comment", re.IGNORECASE)
+        ).first,
+    ]
+
+    try:
+        send_button = wait_first_visible(send_button_candidates, timeout=10000, desc="发送按钮")
+    except Exception:
+        print("[!] 警告: 未能稳定定位发送按钮，将使用默认第一个候选按钮继续。")
+        send_button = send_button_candidates[0]
+
     try:
         expect(send_button).to_be_enabled(timeout=10000)
     except Exception:
         print("[!] 警告: 发送按钮预期状态未达标，但将尝试强制执行流...")
 
-    # [拦截数据] 获取点击发送前的真实文本长度，防止假成功
-    text_before_send = real_editor.inner_text().strip()
+    # 发送前记录编辑器状态，用于后续 DOM 兜底校验
+    try:
+        text_before_send = real_editor.inner_text().strip()
+    except Exception:
+        text_before_send = ""
 
-    # --- 第 5 步：API 状态机 + 降级点击 + DOM 兜底 ---
+    try:
+        media_before_send = real_editor.locator("img, a").count()
+    except Exception:
+        media_before_send = 0
+
+    # =======================
+    # 第 5 步：发送 + API 监听 + DOM 兜底
+    # =======================
     print("[*] 执行发送操作 (API网络监听护航中)...")
 
     api_success = False
     api_error_msg = ""
 
     try:
-        # 挂起 API 监听网兜: 盯死 pgc/content/add 接口，限时 10 秒
         with page.expect_response(
-                lambda response: "pgc/content/add" in response.url and response.request.method == "POST",
-                timeout=10000) as response_info:
+            lambda response: "pgc/content/add" in response.url and response.request.method == "POST",
+            timeout=10000
+        ) as response_info:
 
-            # 【三级降级点击策略】
+            # 三级降级点击策略
             try:
-                send_button.click(timeout=1500)  # 1. 模拟真人点
-            except:
+                send_button.click(timeout=1500)
+            except Exception:
                 try:
-                    send_button.click(force=True, timeout=1500)  # 2. 穿透图层挡版点
-                except:
-                    send_button.evaluate("node => node.click()")  # 3. JS 底层强杀点
+                    send_button.click(force=True, timeout=1500)
+                except Exception:
+                    send_button.evaluate("node => node.click()")
 
-        # 捕获到了 API 响应，进行解析
         resp = response_info.value
-        json_data = resp.json()
 
-        if json_data.get("code") == "000000" or json_data.get("success") is True:
+        try:
+            json_data = resp.json()
+            if not isinstance(json_data, dict):
+                json_data = {"raw": str(json_data)}
+        except Exception:
+            json_data = {}
+
+        if str(json_data.get("code", "")) == "000000" or json_data.get("success") is True:
             api_success = True
-            print(f"[+] API 返回底层确认，评论 100% 发送成功！(耗时极短)")
-        else:
+            print("[+] API 返回底层确认，评论 100% 发送成功！")
+        elif json_data:
             api_error_msg = json_data.get("message") or str(json_data)
             print(f"[-] API 抓取到明确报错(风控/频率限制): {api_error_msg}")
             raise BusinessErrorException(f"被币安服务器拒绝: {api_error_msg}")
+        else:
+            print("[*] API 响应无法解析为 JSON，将依赖 DOM 兜底校验。")
 
     except PlaywrightTimeoutError:
-        print("[*] API 监听超时(可能接口改版或网络极卡)，启动老版本 DOM 兜底校验...")
-        pass
+        print("[*] API 监听超时(可能接口改版或网络极卡)，启动 DOM 兜底校验...")
 
-        # 【优化核心：DOM 兜底检验修复】
+    # DOM 兜底校验
     if not api_success:
-        time.sleep(3)  # 给前端一点渲染收起的时间
-        text_after_send = real_editor.inner_text().strip() if real_editor.is_visible() else ""
+        time.sleep(3)
 
-        # 修复逻辑漏洞：必须是发送前确实有字，且发送后字被清空，才能判定为成功
-        if len(text_before_send) > 0 and len(text_after_send) < (len(text_before_send) / 3):
-            print("[+] DOM 兜底校验通过：输入框文字已成功清空，判定为成功！")
+        try:
+            editor_visible = real_editor.is_visible()
+        except Exception:
+            editor_visible = False
+
+        if editor_visible:
+            try:
+                text_after_send = real_editor.inner_text().strip()
+            except Exception:
+                text_after_send = ""
+
+            try:
+                media_after_send = real_editor.locator("img, a").count()
+            except Exception:
+                media_after_send = 0
         else:
-            raise Exception("发送操作已执行，但输入框未清空且API无响应，疑似发送失败 (或者按钮根本没激活)。")
+            text_after_send = ""
+            media_after_send = 0
+
+        text_cleared = (
+            len(text_before_send) > 0 and
+            len(text_after_send) < (len(text_before_send) / 3)
+        )
+
+        media_cleared = (
+            media_before_send > 0 and
+            media_after_send < media_before_send
+        )
+
+        if text_cleared or media_cleared:
+            print("[+] DOM 兜底校验通过：编辑器内容已成功清空，判定为成功！")
+        else:
+            raise Exception(
+                "发送操作已执行，但输入框未清空且 API 无明确成功响应，"
+                "疑似发送失败 (或者按钮根本没激活)。"
+            )
 
 
-def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[str] = None,
-                            user_data_dir=USER_DATA_DIR) -> Tuple[Optional[str], bool]:
+def comment_on_binance_post(
+    post_url: str,
+    comment: str,
+    image_path: Optional[str] = None,
+    user_data_dir=USER_DATA_DIR,
+    url_info_list: Optional[list] = None
+) -> Tuple[Optional[str], bool]:
+    """
+    币安帖子评论入口函数。
+
+    参数:
+        post_url: 帖子 URL
+        comment: 评论正文
+        image_path: 可选，图片路径
+        user_data_dir: 浏览器用户数据目录
+        url_info_list: 可选，超链接列表，格式示例：
+            [
+                {"text": "链接标题", "url": "https://example.com"},
+                {"text": "第二个链接", "url": "https://example.org"}
+            ]
+
+    返回:
+        (error_info, is_success)
+    """
+
     if not os.path.isdir(user_data_dir):
         return f"用户数据目录不存在: {user_data_dir}\n请先运行登录流程获取 Cookie。", False
 
@@ -260,57 +568,81 @@ def comment_on_binance_post(post_url: str, comment: str, image_path: Optional[st
         try:
             # 启动持久化环境
             context = p.chromium.launch_persistent_context(
-                channel="chrome", user_data_dir=user_data_dir, headless=False,
-                args=['--disable-blink-features=AutomationControlled', '--start-maximized'],
+                channel="chrome",
+                user_data_dir=user_data_dir,
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--start-maximized"
+                ],
                 ignore_default_args=["--enable-automation"]
             )
+
             page = context.pages[0] if context.pages else context.new_page()
 
-            # --- 前置校验与加载 ---
+            # =======================
+            # 加载帖子
+            # =======================
             print("[*] 正在加载目标帖子...")
             page.goto(post_url)
             page.wait_for_load_state("domcontentloaded")
 
-            # 【前置探活】：检查是否处于登录状态
-            if page.locator("a[href*='login']").is_visible(timeout=3000):
+            # =======================
+            # 登录状态探活
+            # =======================
+            try:
+                page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
                 raise Exception("检测到登录失效 (页面存在 Login 按钮)，请重新执行 login_and_save_session。")
+            except PlaywrightTimeoutError:
+                pass
 
             check_for_crash(page)
 
-            # --- 智能探索与作用域锁定 ---
+            # =======================
+            # 定位编辑器
+            # =======================
             editor_container = _smart_scroll_to_editor(page)
             check_for_crash(page)
 
-            # --- 执行评论流 ---
-            _submit_comment(page, editor_container, comment, image_path)
+            # =======================
+            # 执行评论流
+            # =======================
+            _submit_comment(
+                page=page,
+                editor_container=editor_container,
+                comment=comment,
+                image_path=image_path,
+                url_info_list=url_info_list
+            )
 
             is_success = True
 
         except BusinessErrorException as biz_e:
-            # 明确的业务报错（如太频繁），不需要人工挂起，直接返回给上层调度记录
             error_info = str(biz_e)
 
         except Exception as e:
             error_info = str(e)
             print(f"\n[!] 执行过程中发生严重异常: {error_info[:500]}")
+
             if context and context.pages:
                 try:
                     ts = int(time.time())
                     context.pages[0].screenshot(path=f"error_screenshot_{ts}.png")
+
                     with open(f"error_html_{ts}.html", "w", encoding="utf-8") as f:
                         f.write(context.pages[0].content())
+
                     print(f"[*] 现场截图和HTML已保存，时间戳: {ts}")
-                except:
+                except Exception:
                     pass
 
-            # 【终极防线】：人工接管替代 sleep(1000)
             human_intervention_pause(error_info)
 
         finally:
             if context:
                 try:
                     context.close()
-                except:
+                except Exception:
                     pass
 
     return error_info, is_success
@@ -435,21 +767,34 @@ def open_browser_for_manual_use(user_data_dir: str):
 if __name__ == '__main__':
 
     # # 获取cookie方便api调用凭证
-    # cookie_str, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)
+    cookie_str, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)
 
-    # login_and_save_session()
+    login_and_save_session()
 
     open_browser_for_manual_use(USER_DATA_DIR)
-    #
-    # test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
-    # test_msg = "少即是多，慢即是快。同频共振！🚀"
-    #
-    # # 无图测试设为 None，有图填绝对路径
-    # test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
-    #
-    # err, success = comment_on_binance_post(test_url, test_msg, test_img)
-    #
-    # if success:
-    #     print("\n🎉 ======== 自动评论任务圆满成功 ========")
-    # else:
-    #     print(f"\n❌ ======== 失败记录 ========\n原因: {err}")
+
+    test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
+    test_msg = "少即是多，慢即是快。同频共振！🚀"
+
+    # 无图测试设为 None，有图填绝对路径
+    test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
+
+    my_urls = [
+        {
+            "text": "带单主页",
+            "url": "https://www.binance.com/zh-CN/square/post/309692475255842"
+        }
+    ]
+
+    # 将 my_urls 传入主控函数
+    err, success = comment_on_binance_post(
+        post_url=test_url,
+        comment=test_msg,
+        image_path=test_img,
+        url_info_list=my_urls  # 传入新增参数
+    )
+
+    if success:
+        print("\n🎉 ======== 自动评论任务圆满成功 ========")
+    else:
+        print(f"\n❌ ======== 失败记录 ========\n原因: {err}")
