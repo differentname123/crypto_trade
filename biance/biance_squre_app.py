@@ -465,7 +465,7 @@ def consumer_auto_sync_main(accounts=None):
                     global_fans_uids.update(follower_map.values())
 
             # 获取裂变池
-            global_worth_uids = get_worth_following_list(list(seed_user_names), target_count=1000)
+            global_worth_uids = get_worth_following_list(list(seed_user_names), target_count=2000)
             global_wild_uids = shared_post_uids.union(set(global_worth_uids))
 
             # 3. 核心清洗：野生池 减去 所有账号已关注的 减去 所有粉丝，留下纯净且未开垦的荒地
