@@ -53,7 +53,7 @@ def format_post_for_promo(raw_data):
 
         # 过滤掉空评论
         if c_content:
-            top_comments.append(f"{c_author}: {c_content}")
+            top_comments.append(f"{c_content}")
 
     # 3. 组装并返回最终结构
     final_data = {
