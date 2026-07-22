@@ -75,6 +75,10 @@ def format_post_for_promo(raw_data):
 if __name__ == "__main__":
     post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
+    count = 0
     for post in existing_posts:
+        count += 1
+        if count > 50:
+            break
         cleaned_post = format_post_for_promo(post)
         print(json.dumps(cleaned_post, ensure_ascii=False, indent=4))
