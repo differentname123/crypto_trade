@@ -8,10 +8,12 @@
 :description:
     
 """
+import ast
 import asyncio
 import hashlib
 import json
 import os
+import re
 import socket
 from pathlib import Path
 from urllib.parse import urlparse
@@ -110,6 +112,115 @@ def save_json(json_path, data):
             json.dump(data, f, ensure_ascii=False, indent=4, default=str)
         os.replace(tmp_path, json_path)
 
+
+def read_file_to_str(filepath,
+                     encoding: str = "utf-8",
+                     errors: str = "strict") -> str:
+    """
+    读取文件并返回整个内容的字符串。
+
+    参数:
+        filepath: 文件路径（str 或 pathlib.Path）。
+        encoding: 文本编码（默认 'utf-8'）。
+        errors: 解码错误处理策略（'strict'|'replace'|'ignore' 等，默认 'strict'）。
+                'strict' 会在遇到无法解码的字节时抛出 UnicodeDecodeError，
+                'replace' 会用替代字符替换无法解码的字节，'ignore' 则忽略它们。
+
+    返回:
+        文件内容（str）。
+
+    抛出:
+        FileNotFoundError 如果文件不存在。
+        UnicodeDecodeError 如果 decoding 失败且 errors='strict'。
+    """
+    p = Path(filepath)
+    with p.open("r", encoding=encoding, errors=errors) as f:
+        return f.read()
+
+
+def string_to_object(input_str: str):
+    """
+    从字符串中提取并解析出 Python 列表或字典对象，设计得更加健壮。
+
+    该函数增强了对不规范格式的容忍度，特别适合处理来自 LLM 的输出。
+
+    核心功能：
+    1.  **智能提取**: 自动在整个字符串中定位 JSON/Python 对象的边界（从第一个 '{' 或 '[' 到最后一个 '}' 或 ']），
+        忽略前导和尾随的无关文本（例如 "当然，这是您要的JSON："）。
+    2.  **兼容 Markdown**: 能够处理被 ```json ... ``` 代码块包裹的内容。
+    3.  **错误修正**:
+        - 自动移除常见的行内 (//) 和块级 (/* */) 注释。
+        - 自动移除导致 JSON 解析失败的尾随逗号 (trailing commas)。
+    4.  **双引擎解析**:
+        - 首先尝试使用 `json.loads`，因为它更符合标准，速度更快。
+        - 如果失败，则回退到 `ast.literal_eval`，以支持 Python 特有的字面量
+          （如 `None`, `True`, `False` 以及单引号字符串）。
+
+    如果无法找到或解析出有效的对象，则抛出 ValueError 异常。
+
+    :param input_str: 包含列表或字典的输入字符串。
+    :return: 解析后的 Python 列表或字典。
+    :raises ValueError: 如果无法从字符串中找到或解析出有效的对象。
+    :raises TypeError: 如果输入不是字符串。
+    """
+    # 0. 输入校验：处理 None 或非字符串输入
+    if not isinstance(input_str, str):
+        # 抛出 TypeError 更符合 Python 语义，但根据您的要求统一为 ValueError 也可以
+        raise TypeError(f"输入必须是字符串，但收到了 {type(input_str).__name__}。")
+
+    # 创建一个统一的错误信息生成器
+    def _create_error_message(reason: str) -> str:
+        # 预览原始输入的前50个字符
+        preview = (input_str[:50] + '...') if len(input_str) > 50 else input_str
+        return f"{reason} | 输入内容预览: '{preview}'"
+
+    # 1. 智能提取：在字符串中寻找对象边界 (重构后，逻辑更清晰)
+    first_bracket = input_str.find('[')
+    first_curly = input_str.find('{')
+
+    # 确定第一个开括号的位置
+    if first_bracket == -1 and first_curly == -1:
+        raise ValueError(_create_error_message("输入字符串中未找到疑似列表或字典的起始符号 '[' 或 '{'"))
+
+    if first_bracket == -1:
+        start_pos = first_curly
+    elif first_curly == -1:
+        start_pos = first_bracket
+    else:
+        start_pos = min(first_bracket, first_curly)
+
+    # 确定最后一个闭括号的位置
+    end_pos = max(input_str.rfind(']'), input_str.rfind('}'))
+
+    if end_pos <= start_pos:
+        raise ValueError(_create_error_message("未找到与起始括号匹配的结束括号 ']' 或 '}'"))
+
+    # 提取出最可能包含对象的子字符串
+    potential_obj_str = input_str[start_pos: end_pos + 1]
+
+    # 2. 错误修正：清理提取出的字符串
+    # 移除 JavaScript/JSONC 风格的注释
+    potential_obj_str = re.sub(r"//.*", "", potential_obj_str)
+    potential_obj_str = re.sub(r"/\*[\s\S]*?\*/", "", potential_obj_str, flags=re.MULTILINE)
+    # 移除尾随逗号 (例如, [1, 2,])
+    potential_obj_str = re.sub(r",\s*([}\]])", r"\1", potential_obj_str)
+    cleaned_str = potential_obj_str.strip()
+
+    # 3. 双引擎解析
+    try:
+        # 首先尝试使用 json.loads (更标准，通常更快)
+        return json.loads(cleaned_str)
+    except json.JSONDecodeError:
+        # 如果 json.loads 失败，回退到 ast.literal_eval (更宽容，支持 Python 语法)
+        try:
+            return ast.literal_eval(cleaned_str)
+        except (ValueError, SyntaxError, MemoryError) as e:
+            # 如果两种方法都失败，则抛出最终的异常，并提供丰富的上下文信息
+            cleaned_preview = (cleaned_str[:150] + '...') if len(cleaned_str) > 150 else cleaned_str
+            error_reason = f"无法将提取的内容解析为列表或字典，解析器错误: {e}"
+            # 最终的错误信息包含：原因，原始输入预览，以及尝试解析的内容预览
+            raise ValueError(f"{_create_error_message(error_reason)}\n"
+                             f"尝试解析的内容 (清理后): '''{cleaned_preview}'''")
 
 
 def get_config(key):
