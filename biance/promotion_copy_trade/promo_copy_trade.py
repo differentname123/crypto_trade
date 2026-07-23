@@ -1,65 +1,56 @@
 # -- coding: utf-8 --
-""":authors:
-    zhuxiaohu
-:create_date:
-    2026/7/22 7:46
-:last_date:
-    2026/7/22 7:46
-:description:
-    
-"""
+# ==========================================
+# [功能摘要]: 批量处理币安广场帖子，利用大模型(Gemini)自动生成并结构化“带单推广”视角的营销评论。
+# [输入数据]: 来源于 MongoDB 的币安广场原始帖子数据 (包含作者、正文、评论及互动数据)。
+# [数据流转/交互]:
+#   1. 从 DB 批量拉取未处理的原始帖子。
+#   2. 清洗帖子多媒体标记，按 点赞/回复/浏览 降序提取 Top5 评论，压缩为精简文本。
+#   3. 结合本地 Prompt 文件，请求 Gemini 大模型生成双视角(交易员/跟单员)推广评论。
+#   4. 严格校验大模型返回的 JSON 结构。
+# [输出数据]: 将合规的推广评论数据 (promo_comment) 追加到原帖子字典中，并回写更新至 MongoDB。
+# ==========================================
+
 import re
 import time
 
 from app.ai_api.gemini_api import get_llm_content
+from app.ai_api.gemini_web import generate_gemini_content_managed
 from common.common_utils import read_file_to_str, string_to_object, setup_logger
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
-logger = setup_logger(app_name="promo_copy")
 
+logger = setup_logger(app_name="promo_copy")
 
 def format_post_for_promo(raw_data):
     """
-    清洗币安广场原始 JSON 数据，提取大模型进行带单推广所需的核心字段。
-    (全面剔除多媒体标记，综合 likes -> replies -> views 降序排序评论)
+    清洗原始 JSON 数据，提取模型推广所需的核心字段。
+    [入参 Shape]: raw_data (dict) 包含 "author", "content" (text_content, mentioned_coins), "comments" 等。
+    [出参 Shape]: dict 包含 "post" (author, text, coins) 和 "top_comments" (list of strings)。
     """
-
-    # 1. 提取作者和正文信息
     author_name = raw_data.get("author", {}).get("author_name", "未知用户")
     content_info = raw_data.get("content", {})
     raw_text = content_info.get("text_content", "")
     mentioned_coins = content_info.get("mentioned_coins", [])
 
-    # 【核心修复点】: 使用正则精准匹配你在爬虫中注入的四种媒体标记并将其删除
-    # (?:长文封面|插图|视频封面|视频) 是非捕获组，用于匹配前缀
+    # 清洗多媒体标记并压缩多余换行
     clean_text = re.sub(r'\[(?:长文封面|插图|视频封面|视频):.*?\]', '', raw_text)
-
-    # 进一步清理：因为你的脚本是往尾部拼接 \n\n，删除标记后可能会留下多个空行
-    # 这里将3个及以上的换行符压缩为最多2个，并去除首尾空格，保持文本整洁
     clean_text = re.sub(r'\n{3,}', '\n\n', clean_text).strip()
 
-    # 2. 提取并筛选高质量评论
+    # 提取评论并依据核心指标进行综合热度降序
     comments = raw_data.get("comments", [])
-
-    # 按照 likes(点赞) -> replies(回复) -> views(浏览) 综合降序排序
     sorted_comments = sorted(
         comments,
         key=lambda x: (x.get("likes", 0), x.get("replies", 0), x.get("views", 0)),
         reverse=True
     )
 
-    # 提取前 5 条，并拼接为 "昵称: 内容" 的纯文本字符串格式
     top_comments = []
     for comment in sorted_comments[:5]:
-        c_author = comment.get("author_name", "匿名")
         c_content = comment.get("content", "").strip()
-
-        # 过滤掉空评论
         if c_content:
-            top_comments.append(f"{c_content}")
+            top_comments.append(c_content)
 
-    # 3. 组装并返回最终结构
-    final_data = {
+    return {
         "post": {
             "author": author_name,
             "text": clean_text,
@@ -68,32 +59,26 @@ def format_post_for_promo(raw_data):
         "top_comments": top_comments
     }
 
-    return final_data
-
-
 def check_comment_info(data):
     """
-    校验生成的字典数据是否符合提示词的验收标准。
-
-    返回两个字段:
-    is_valid (bool): 是否通过校验
-    error_message (str): 具体的错误信息（如果通过则为空字符串）
+    校验模型返回的字典数据是否符合验收标准。
+    [入参 Shape]: data (dict) 需包含 "trader_perspective" 和 "follower_perspective"，
+                 内部包含 comment_text, link_text, combined_preview, score, score_reason。
     """
     if not isinstance(data, dict):
-        return False, "传入的参数必须是一个字典格式"
+        return False, "大模型返回数据不是有效的字典对象"
 
     required_perspectives = ["trader_perspective", "follower_perspective"]
-    for perspective in required_perspectives:
-        if perspective not in data:
-            return False, f"缺失顶层角色字段: {perspective}"
-        if not isinstance(data[perspective], dict):
-            return False, f"{perspective} 必须是一个字典对象"
-
     required_fields = ["comment_text", "link_text", "combined_preview", "score", "score_reason"]
     forbidden_endings = ("。", "！", "？", ".", "!", "?")
 
     for perspective in required_perspectives:
+        if perspective not in data:
+            return False, f"缺失顶层角色字段: {perspective}"
+
         view_data = data[perspective]
+        if not isinstance(view_data, dict):
+            return False, f"{perspective} 必须是字典结构"
 
         for field in required_fields:
             if field not in view_data:
@@ -102,80 +87,141 @@ def check_comment_info(data):
         comment_text = view_data["comment_text"]
         link_text = view_data["link_text"]
         score = view_data["score"]
-        score_reason = view_data["score_reason"]
 
+        # 核心业务潜规则拦截：断句格式及长度强校验
         if not isinstance(comment_text, str):
-            return False, f"{perspective}.comment_text 必须是字符串"
+            return False, f"{perspective}.comment_text 类型非字符串"
         if comment_text.endswith(forbidden_endings):
             return False, f"{perspective}.comment_text 违规：绝对禁止以终止性标点结尾"
 
         if not isinstance(link_text, str):
-            return False, f"{perspective}.link_text 必须是字符串"
+            return False, f"{perspective}.link_text 类型非字符串"
         if not (2 <= len(link_text) <= 6):
-            return False, f"{perspective}.link_text 违规：长度必须严格在 2-6 个汉字之间"
+            return False, f"{perspective}.link_text 违规：引流文案长度必须严格在 2-6 个汉字之间"
 
         if not isinstance(score, (int, float)):
-            return False, f"{perspective}.score 必须是数字"
+            return False, f"{perspective}.score 类型非数字"
         if not (0 <= score <= 10):
-            return False, f"{perspective}.score 违规：评分必须在 0-10 之间"
-
-        # if not isinstance(score_reason, str):
-        #     return False, f"{perspective}.score_reason 必须是字符串"
-        # if len(score_reason) > 30:
-        #     return False, f"{perspective}.score_reason 违规：长度不能超过 30 字"
+            return False, f"{perspective}.score 违规：评分必须介于 0-10 之间"
 
     return True, ""
 
 def gen_promo_comment(post):
     """
-    根据原始post生成推广评论，主要用于带单推广的场景。
-    :return:
+    调度大模型为单个帖子生成推广评论，附带重试与兜底机制。
+    [入参 Shape]: post (dict) 原始帖子数据。
+    [出参 Shape]: dict 生成的合法评论结构（失败则返回空字典 {}）。
     """
     cleaned_post = format_post_for_promo(post)
+
     prompt_file_path = r'W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt'
     prompt = read_file_to_str(prompt_file_path)
-    full_prompt = f'{prompt}'
-    full_prompt += f'\n{cleaned_post}'
-    model_name = "gemini-2.5-flash"
-    # model_name = "gemini-3-pro-preview"
-    comment_info = {}
+    full_prompt = f'{prompt}\n{cleaned_post}'
+
+    model_name = "gemini-flash-latest"
     max_retries = 3
+
     for attempt in range(1, max_retries + 1):
         try:
-            raw = get_llm_content(prompt=full_prompt, model_name=model_name)
-            comment_info = string_to_object(raw)
+
+            # err, raw_response, images = generate_gemini_content_managed(
+            #     prompt=prompt,
+            #     model_name="gemini-3-flash-thinking",
+            #     # files=test_file
+            # )
+
+
+
+            raw_response = get_llm_content(prompt=full_prompt, model_name=model_name)
+            comment_info = string_to_object(raw_response)
+
             is_valid, error_message = check_comment_info(comment_info)
             if not is_valid:
-                raise ValueError(f"第 {attempt} 次尝试: LLM 返回的数据格式或内容无效: {error_message}")
+                raise ValueError(f"校验不通过: {error_message}")
 
             return comment_info
-        except Exception as e:
-            logger.info(f"第 {attempt} 次尝试: 生成视频内容计划时出错: {e}")
-            time.sleep(2 ** attempt)
-    return comment_info
 
+        except Exception as e:
+            if attempt == max_retries:
+                logger.error(f"[大模型/生成评论] 达到最大重试次数，当前帖子生成流程中止 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
+                return {}
+
+            logger.warning(f"[大模型/生成评论] 生成或校验异常，准备休眠重试 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
+            time.sleep(2 ** attempt)
+
+    return {}
 
 def gen_all_promo_comments():
     """
-    批量生成所有推广评论。
-    :param posts: 带单推广的原始帖子列表
-    :return: 包含所有生成的推广评论的列表
+    全局调度入口：拉取存量数据并循环驱动评论生成任务。
     """
     post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
+
+    logger.info(f"[DB/启动任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始逐条处理")
+
     for post in existing_posts:
-        # 检查是否已经生成过推广评论
+        post_id = post.get("_id", "UNKNOWN_ID")
+
+        # 幂等校验：拦截已生成过的数据
         if post.get("promo_comment"):
-            logger.info(f"跳过已生成推广评论的帖子: {post.get('_id')}")
+            logger.info(f"[数据过滤/帖子检测] 该帖子已存在推广评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 跳过处理")
             continue
 
         comment_info = gen_promo_comment(post)
-        post["promo_comment"] = comment_info
+
         if comment_info:
+            post["promo_comment"] = comment_info
             post_manager.upsert_posts([post])
-            logger.info(f"已生成推广评论并更新帖子: {post.get('_id')}")
+            logger.info(f"[DB/帖子落库] 推广评论生成并回写成功 | 关键参数: 【帖子ID: {post_id}】 | 结果: 已更新入库")
         else:
-            logger.info(f"未能生成有效的推广评论，跳过帖子: {post.get('_id')}")
+            logger.warning(f"[业务跳过/帖子落库] 最终未能生成有效评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 放弃更新当前帖子")
+
+
+def get_existing_promo_comments(limit=50000):
+    """
+    提取数据库中已经成功生成了推广评论的帖子集合，并将其原文与生成的评论聚合输出。
+
+    入参限制:
+      limit: 查询数据库的帖子上限阈值。
+
+    出参形貌 (List 中每个元素的字典结构):
+      [
+        {
+          "cleaned_post": {"post": {"author": "...", "text": "...", "coins": [...]}, "top_comments": [...]},
+          "comment_info": {"trader_perspective": {...}, "follower_perspective": {...}}
+        },
+        ...
+      ]
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+
+    try:
+        existing_posts = post_manager.find_posts_by_source("biance", limit=limit)
+    except Exception as e:
+        logger.error(f"[数据提取/失败] 无法从数据库读取帖子数据 | 异常原因: {str(e)}")
+        raise
+
+    result_list = []
+
+    for post in existing_posts:
+        comment_info = post.get("promo_comment")
+
+        # 卫语句：跳过尚未生成推广评论的脏数据
+        if not comment_info:
+            continue
+
+        # 复用已有的清洗函数获取格式化后的干净帖子内容
+        cleaned_post = format_post_for_promo(post)
+
+        result_list.append({
+            "cleaned_post": cleaned_post,
+            "comment_info": comment_info
+        })
+
+    logger.info(f"[数据提取/完成] 成功拉取已聚合推广评论的帖子 | 聚合总数量: [{len(result_list)}] 条")
+
+    return result_list
 
 
 # ==========================================
@@ -183,3 +229,6 @@ def gen_all_promo_comments():
 # ==========================================
 if __name__ == "__main__":
     gen_all_promo_comments()
+
+    data = get_existing_promo_comments()
+    print()
