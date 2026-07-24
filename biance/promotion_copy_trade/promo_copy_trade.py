@@ -21,6 +21,72 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 
 logger = setup_logger(app_name="promo_copy")
 
+FILTER_CONFIG = {
+    # 1. 黑名单机制
+    "blacklist_keywords": [
+        '瓜分', '抽奖', '红包', '空投', '新粉福利', '转发', '留下你的',
+        'giveaway', 'prize pool', 'airdrop', 'split'
+    ],
+    "blacklist_multi_words": ['follow', 'share', 'comment'],  # 这三个词同时出现时触发拦截
+
+    # 2. 结构与时效底线
+    "min_text_length": 20,  # 纯文本（去除链接和标签后）的最短字符数
+    "max_age_hours": 720,  # 帖子的最长有效时间 (超过该时间的旧贴过滤)
+
+    # 3. 绝对值水位线防线
+    "max_comment_count": 100,  # 评论数上限 (超过说明太拥挤，推广无曝光)
+    "cold_post_hours": 20,  # 判定为"死帖"的时间界限(小时)
+    "cold_post_min_views": 20  # 死帖的最低浏览量要求 (发布超过设定小时数但浏览依然低于此值)
+}
+
+
+def is_valid_post_for_promo(post):
+    """
+    判断帖子是否值得生成/展示推广评论 (三步极简过滤法)
+    """
+    content = post.get("content", {})
+    text_content = (content.get("text_content") or "").lower()
+    engagement = post.get("engagement", {})
+    metadata = post.get("metadata", {})
+
+    # --- 第一步：黑名单秒杀 ---
+    if any(keyword in text_content for keyword in FILTER_CONFIG["blacklist_keywords"]):
+        return False
+
+    if all(word in text_content for word in FILTER_CONFIG["blacklist_multi_words"]):
+        return False
+
+    # --- 第二步：结构与时效底线 ---
+    # 剔除文本中的 http 链接和 #标签，防止长度判断被污染
+    text_without_urls = re.sub(r'http[s]?://\S+', '', text_content)
+    text_without_tags = re.sub(r'#\S+', '', text_without_urls).strip()
+    if len(text_without_tags) < FILTER_CONFIG["min_text_length"]:
+        return False
+
+    if metadata.get("is_ai_generated") is True:
+        return False
+
+    # 计算帖子发布距今的时间（兼容10位秒级和13位毫秒级时间戳）
+    publish_time = post.get("publish_time", 0)
+    if publish_time > 1e11:
+        publish_time = publish_time / 1000
+    age_hours = (time.time() - publish_time) / 3600
+
+    if age_hours > FILTER_CONFIG["max_age_hours"]:
+        return False
+
+    # --- 第三步：绝对值水位线过滤 ---
+    comment_count = engagement.get("comment_count", 0)
+    view_count = engagement.get("view_count", 0)
+
+    if comment_count > FILTER_CONFIG["max_comment_count"]:
+        return False
+
+    if age_hours > FILTER_CONFIG["cold_post_hours"] and view_count < FILTER_CONFIG["cold_post_min_views"]:
+        return False
+
+    return True
+
 def format_post_for_promo(raw_data):
     """
     清洗原始 JSON 数据，提取模型推广所需的核心字段。
@@ -161,6 +227,8 @@ def gen_all_promo_comments():
     logger.info(f"[DB/启动任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始逐条处理")
 
     for post in existing_posts:
+        if not is_valid_post_for_promo(post):
+            continue
         post_id = post.get("_id", "UNKNOWN_ID")
 
         # 幂等校验：拦截已生成过的数据
@@ -211,6 +279,13 @@ def get_existing_promo_comments(limit=50000):
         if not comment_info:
             continue
 
+        # ===============================================
+        # 新增拦截：过滤掉没有评论必要的垃圾/抽奖贴
+        # ===============================================
+        if not is_valid_post_for_promo(post):
+            continue
+        # ===============================================
+
         # 复用已有的清洗函数获取格式化后的干净帖子内容
         cleaned_post = format_post_for_promo(post)
 
@@ -224,10 +299,43 @@ def get_existing_promo_comments(limit=50000):
     return result_list
 
 
+def clear_all_promo_comments_batch():
+    """
+    数据清理入口（批量优化版）：拉取存量数据并批量清除 promo_comment 字段。
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+    existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
+
+    logger.info(f"[DB/启动清理任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始处理")
+
+    posts_to_update = []
+
+    for post in existing_posts:
+        if "promo_comment" in post:
+            post.pop("promo_comment", None)
+            posts_to_update.append(post)
+            logger.debug(f"[数据处理/内存更新] 移除推广评论字段 | 关键参数: 【帖子ID: {post.get('_id', 'UNKNOWN_ID')}】 | 结果: 加入待更新队列")
+
+    # 批量落库
+    if posts_to_update:
+        post_manager.upsert_posts(posts_to_update)
+        logger.info(f"[DB/帖子批量落库] 推广评论清除成功 | 关键参数: 【实际更新数量: {len(posts_to_update)}】 | 结果: 批量入库完成")
+    else:
+        logger.info("[DB/帖子批量落库] 暂无需要清理的推广评论 | 关键参数: 【实际更新数量: 0】 | 结果: 任务结束")
+
+
+
 # ==========================================
 # 💡 测试运行代码
 # ==========================================
 if __name__ == "__main__":
+    # clear_all_promo_comments_batch()
+
+
+
+    # data = get_existing_promo_comments()
+
+
     gen_all_promo_comments()
 
     data = get_existing_promo_comments()
