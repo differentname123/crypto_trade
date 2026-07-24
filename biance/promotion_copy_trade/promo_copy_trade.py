@@ -12,9 +12,11 @@
 
 import re
 import time
+import threading
 
 from app.ai_api.gemini_api import get_llm_content
 from app.ai_api.gemini_web import generate_gemini_content_managed
+from biance.biance_playwright import comment_on_binance_post
 from common.common_utils import read_file_to_str, string_to_object, setup_logger
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
@@ -87,6 +89,7 @@ def is_valid_post_for_promo(post):
 
     return True
 
+
 def format_post_for_promo(raw_data):
     """
     清洗原始 JSON 数据，提取模型推广所需的核心字段。
@@ -124,6 +127,7 @@ def format_post_for_promo(raw_data):
         },
         "top_comments": top_comments
     }
+
 
 def check_comment_info(data):
     """
@@ -172,6 +176,7 @@ def check_comment_info(data):
 
     return True, ""
 
+
 def gen_promo_comment(post):
     """
     调度大模型为单个帖子生成推广评论，附带重试与兜底机制。
@@ -196,8 +201,6 @@ def gen_promo_comment(post):
             #     # files=test_file
             # )
 
-
-
             raw_response = get_llm_content(prompt=full_prompt, model_name=model_name)
             comment_info = string_to_object(raw_response)
 
@@ -209,13 +212,16 @@ def gen_promo_comment(post):
 
         except Exception as e:
             if attempt == max_retries:
-                logger.error(f"[大模型/生成评论] 达到最大重试次数，当前帖子生成流程中止 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
+                logger.error(
+                    f"[大模型/生成评论] 达到最大重试次数，当前帖子生成流程中止 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
                 return {}
 
-            logger.warning(f"[大模型/生成评论] 生成或校验异常，准备休眠重试 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
+            logger.warning(
+                f"[大模型/生成评论] 生成或校验异常，准备休眠重试 | 关键参数: 【尝试次数: {attempt}/{max_retries}】 | 结果: {str(e)}")
             time.sleep(2 ** attempt)
 
     return {}
+
 
 def gen_all_promo_comments():
     """
@@ -224,7 +230,8 @@ def gen_all_promo_comments():
     post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
 
-    logger.info(f"[DB/启动任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始逐条处理")
+    logger.info(
+        f"[DB/启动任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始逐条处理")
 
     for post in existing_posts:
         if not is_valid_post_for_promo(post):
@@ -243,7 +250,8 @@ def gen_all_promo_comments():
             post_manager.upsert_posts([post])
             logger.info(f"[DB/帖子落库] 推广评论生成并回写成功 | 关键参数: 【帖子ID: {post_id}】 | 结果: 已更新入库")
         else:
-            logger.warning(f"[业务跳过/帖子落库] 最终未能生成有效评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 放弃更新当前帖子")
+            logger.warning(
+                f"[业务跳过/帖子落库] 最终未能生成有效评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 放弃更新当前帖子")
 
 
 def get_existing_promo_comments(limit=50000):
@@ -306,7 +314,8 @@ def clear_all_promo_comments_batch():
     post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
 
-    logger.info(f"[DB/启动清理任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始处理")
+    logger.info(
+        f"[DB/启动清理任务] 成功获取币安广场待处理帖子 | 关键参数: 【拉取数量: {len(existing_posts)}】 | 结果: 开始处理")
 
     posts_to_update = []
 
@@ -314,29 +323,113 @@ def clear_all_promo_comments_batch():
         if "promo_comment" in post:
             post.pop("promo_comment", None)
             posts_to_update.append(post)
-            logger.debug(f"[数据处理/内存更新] 移除推广评论字段 | 关键参数: 【帖子ID: {post.get('_id', 'UNKNOWN_ID')}】 | 结果: 加入待更新队列")
+            logger.debug(
+                f"[数据处理/内存更新] 移除推广评论字段 | 关键参数: 【帖子ID: {post.get('_id', 'UNKNOWN_ID')}】 | 结果: 加入待更新队列")
 
     # 批量落库
     if posts_to_update:
         post_manager.upsert_posts(posts_to_update)
-        logger.info(f"[DB/帖子批量落库] 推广评论清除成功 | 关键参数: 【实际更新数量: {len(posts_to_update)}】 | 结果: 批量入库完成")
+        logger.info(
+            f"[DB/帖子批量落库] 推广评论清除成功 | 关键参数: 【实际更新数量: {len(posts_to_update)}】 | 结果: 批量入库完成")
     else:
         logger.info("[DB/帖子批量落库] 暂无需要清理的推广评论 | 关键参数: 【实际更新数量: 0】 | 结果: 任务结束")
 
+
+def send_single_promo_comment(post):
+    """
+    为单条帖子组装参数并调用外部接口发布推广评论。
+    【核心入参 Shape】: post (字典)，必须包含 'post_id' 与 'promo_comment' 结构。
+    【核心出参 Shape】: 成功返回注入了 'promo_comment_info' 的 post 字典，跳过/失败则返回 None。
+    """
+
+    # 1. 卫语句：提前拦截不符合条件或已处理过的数据
+    comment_info = post.get("promo_comment")
+    if not comment_info or "promo_comment_info" in post:
+        return None
+
+    post_id = post.get("post_id")
+    if not post_id:
+        return None  # 防御性拦截：避免组装出残缺的无效 URL 发起外部请求
+
+    # 2. 剥离核心参数
+    trader_perspective = comment_info.get("trader_perspective", {})
+    comment_text = trader_perspective.get("comment_text")
+    link_text = trader_perspective.get("link_text")
+
+    # 3. 组装请求上下文
+    post_url = f"https://www.binance.com/zh-CN/square/post/{post_id}"
+    my_urls = [
+        {
+            "text": link_text,
+            "url": "https://www.binance.com/zh-CN/copy-trading/lead-details/5123703650401459968?timeRange=7D"
+        }
+    ]
+    user_data_dir = r"W:\temp\biance_jie"
+
+    # 4. 触发外部交互
+    err, success, c_id = comment_on_binance_post(
+        post_url=post_url,
+        comment=comment_text,
+        url_info_list=my_urls,
+        user_data_dir=user_data_dir
+    )
+
+    # 5. 结果校验与状态闭环
+    if success:
+        logger.info(f"[币安广场/发布评论] 推广评论发布成功 | 关键参数: [帖子ID: {post_id}] | 结果: [评论ID: {c_id}]")
+        post["promo_comment_info"] = {
+            "comment_id": c_id,
+            "comment_time": int(time.time() * 1000)
+        }
+        return post
+    else:
+        # 大白话解释错误场景，降低排障门槛
+        logger.error(
+            f"[币安广场/发布评论] 推广评论发布失败，可能是网络波动或遭遇账号风控 | 关键参数: [帖子ID: {post_id}, 错误详情: {err}] | 结果: [跳过本条]")
+        return None
+
+
+def send_promo_comments():
+    """
+    全局调度入口：拉取存量数据并循环驱动评论生成任务。
+    【无出入参】，直接产生副作用：读取数据库并写回更新。
+    """
+    while True:
+        post_manager = UniversalPostManager(gen_db_object())
+
+        existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
+        logger.info(
+            f"[DB/启动任务] 成功获取币安广场待处理帖子 | 关键参数: [拉取数量: {len(existing_posts)}] | 结果: [开始逐条处理]")
+
+        for post in existing_posts:
+            if not is_valid_post_for_promo(post):
+                continue
+
+            post_result = send_single_promo_comment(post)
+            if post_result:
+                post_manager.upsert_posts([post_result])
+        time.sleep(3600)
 
 
 # ==========================================
 # 💡 测试运行代码
 # ==========================================
 if __name__ == "__main__":
+    # 使用多线程以并行方式运行发送评论和生成评论的方法
+    thread_send = threading.Thread(target=send_promo_comments)
+    thread_gen = threading.Thread(target=gen_all_promo_comments)
+
+    thread_send.start()
+    thread_gen.start()
+
+    thread_send.join()
+    thread_gen.join()
+
     # clear_all_promo_comments_batch()
 
+    # # data = get_existing_promo_comments()
 
-
+    # gen_all_promo_comments()
+    #
     # data = get_existing_promo_comments()
-
-
-    gen_all_promo_comments()
-
-    data = get_existing_promo_comments()
-    print()
+    # print()
