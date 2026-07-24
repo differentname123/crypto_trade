@@ -339,7 +339,7 @@ def send_single_promo_comment(post):
     """
     为单条帖子组装参数并调用外部接口发布推广评论。
     【核心入参 Shape】: post (字典)，必须包含 'post_id' 与 'promo_comment' 结构。
-    【核心出参 Shape】: 成功返回注入了 'promo_comment_info' 的 post 字典，跳过/失败则返回 None。
+    【核心出参 Shape】: 只要触发了评论动作，无论成功失败均返回注入 'promo_comment_info' 的 post 字典；因不符合条件跳过则返回 None。
     """
 
     # 1. 卫语句：提前拦截不符合条件或已处理过的数据
@@ -375,19 +375,23 @@ def send_single_promo_comment(post):
     )
 
     # 5. 结果校验与状态闭环
+    # 无论成功失败，统一记录操作状态到 post 字典中
+    post["promo_comment_info"] = {
+        "comment_id": c_id,
+        "comment_time": int(time.time() * 1000),
+        "status": "success" if success else "failed",
+        "error_info": err if not success else None
+    }
+
     if success:
         logger.info(f"[币安广场/发布评论] 推广评论发布成功 | 关键参数: [帖子ID: {post_id}] | 结果: [评论ID: {c_id}]")
-        post["promo_comment_info"] = {
-            "comment_id": c_id,
-            "comment_time": int(time.time() * 1000)
-        }
-        return post
     else:
         # 大白话解释错误场景，降低排障门槛
         logger.error(
-            f"[币安广场/发布评论] 推广评论发布失败，可能是网络波动或遭遇账号风控 | 关键参数: [帖子ID: {post_id}, 错误详情: {err}] | 结果: [跳过本条]")
-        return None
+            f"[币安广场/发布评论] 推广评论发布失败，可能是网络波动或遭遇账号风控 | 关键参数: [帖子ID: {post_id}, 错误详情: {err}] | 结果: [已记录失败状态]")
 
+    # 【核心修改点】：只要新增了 promo_comment_info，统一返回完整的 post 给上游
+    return post
 
 def send_promo_comments():
     """
