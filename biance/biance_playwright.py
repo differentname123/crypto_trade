@@ -29,7 +29,7 @@ from playwright.sync_api import sync_playwright, expect, TimeoutError as Playwri
 # ==============================================================================
 # 全局配置、正则常量与自定义异常
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_dahao"
+USER_DATA_DIR = r"W:\temp\biance_nana"
 LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
 # 前端文案多语言/多变体的统一匹配规则，避免选择器中重复书写正则
@@ -568,10 +568,10 @@ def open_browser_for_manual_use(user_data_dir):
 # 启动入口
 # ==============================================================================
 if __name__ == '__main__':
-    # 其他可选入口（按需取消注释）:
-    #   get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
-    #   login_and_save_session()                # 初次手动登录并固化 Session
-    #   open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
+    # # 其他可选入口（按需取消注释）:
+    # get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
+    # login_and_save_session()                # 初次手动登录并固化 Session
+    # open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
