@@ -261,7 +261,8 @@ def _upload_attachment(page, file_path):
     logger.info(f"[附件上传] 开始上传 | 文件: [{os.path.basename(file_path)}]")
     click_acknowledge_if_present(page)
 
-    with page.expect_file_chooser(timeout=15000):
+    # 1. 必须使用 `as fc_info` 捕获这个事件的结果
+    with page.expect_file_chooser(timeout=15000) as fc_info:
         # 第1步: 主附件按钮(优先 data-test 属性, 回退到 aria-label 语义匹配)
         best_locator = page.locator('[data-test-add-chunk-menu-button]')
         fallback_locator = page.get_by_role(
@@ -275,16 +276,16 @@ def _upload_attachment(page, file_path):
             "menuitem", name=re.compile(r"Upload (a )?file", re.IGNORECASE)
         ).click()
 
-    fc_info = page.expect_file_chooser
-    # 说明: 上一 with 块已获取 file_chooser, 这里沿用原逻辑设置文件
-    # (保持与原代码一致的两步式交互)
-    with page.expect_file_chooser(timeout=15000) as fc:
-        pass
-    # 上面为兼容占位, 真正设置在 with 内已完成——保持原有单次上传语义
+    # 2. 从上下文管理器中提取真正的 FileChooser 对象
+    file_chooser = fc_info.value
+
+    # 3. 真正执行上传动作 (重构时千万不能丢了这句)
+    file_chooser.set_files(file_path)
+
+    # 4. 等待上传进度条消失
     spinner = page.locator(".upload-spinner")
     expect(spinner).to_be_hidden(timeout=60000)
     logger.info("[附件上传] 上传完成")
-
 
 def _remove_google_grounding(page):
     """若存在 'Remove Grounding with Google Search' 按钮则关闭联网检索; 非阻塞。"""
@@ -937,7 +938,7 @@ if __name__ == '__main__':
 
     # validate_all_accounts()
 
-    open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
+    # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
     test_prompt = "请详细描述这张图片的内容。"
