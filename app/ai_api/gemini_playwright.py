@@ -35,23 +35,22 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, expect
 
 from biance.biance_playwright import open_browser_for_manual_use
-from common.common_utils import read_json, save_json, setup_logger
+from common.common_utils import read_json, save_json, setup_logger, read_file_to_str
 
 logger = setup_logger(app_name="gemini_playwright")
-
 
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\new_taobao1"          # 浏览器登录态(cookies等)持久化目录, 需可写
+USER_DATA_DIR = r"W:\temp\new_taobao1"  # 浏览器登录态(cookies等)持久化目录, 需可写
 TARGET_URL_BASE = 'https://aistudio.google.com/prompts/new_chat'
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CONFIG_FILE = r'W:\project\python_project\crypto_trade\app\ai_api\gemini_auto.json'
 STATS_FILE = CONFIG_FILE.replace(".json", "_stats.json")
 
-DEFAULT_MAX_CONCURRENCY = 2          # 全局默认最大并发(8G内存建议2-3, 16G建议4-6)
-DEFAULT_USAGE_STREAK_LIMIT = 10      # 单账号单模型默认连续使用次数上限
+DEFAULT_MAX_CONCURRENCY = 2  # 全局默认最大并发(8G内存建议2-3, 16G建议4-6)
+DEFAULT_USAGE_STREAK_LIMIT = 10  # 单账号单模型默认连续使用次数上限
 
 
 # ==============================================================================
@@ -159,9 +158,9 @@ def _launch_persistent_browser(p, user_data_dir):
     use_offscreen = 15 <= datetime.now().hour < 15
 
     common = dict(
-        channel="chrome",                       # 强制使用本地安装的 Chrome 正式版
+        channel="chrome",  # 强制使用本地安装的 Chrome 正式版
         user_data_dir=user_data_dir,
-        headless=False,                          # 保持 False 以规避反爬检测
+        headless=False,  # 保持 False 以规避反爬检测
         ignore_default_args=["--enable-automation"],
     )
 
@@ -238,6 +237,67 @@ def login_and_save_session(model_name="gemini-3.1-pro-preview"):
 
 
 # ==============================================================================
+# 安全交互辅助 (核心风控对抗重构区)
+# ==============================================================================
+
+def human_like_click(page, locator):
+    """
+    工业级拟人化安全点击。
+    严格执行：认知停顿 + 非中心落点 + 轨迹平滑 + 物理阻尼。
+    """
+    locator.scroll_into_view_if_needed()
+    box = locator.bounding_box()
+
+    if not box:
+        # 兜底操作，保证流程不中断
+        locator.click(delay=random.randint(50, 150))
+        return
+
+    # ==================== 打破“机器零延迟” ====================
+    # 元素就绪后，点击前的随机认知停顿 (500ms - 1500ms)
+    page.wait_for_timeout(random.randint(500, 1500))
+
+    # ==================== 打破“中心点”特征 ====================
+    # 限制在元素 20% - 80% 的安全区域内随机生成落点
+    target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+    target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+
+    # ==================== 打破“瞬移”特征 ====================
+    # 平滑的鼠标轨迹移动 (10 - 20 步)
+    page.mouse.move(target_x, target_y, steps=random.randint(10, 20))
+    page.wait_for_timeout(random.randint(10, 30))  # 移动结束后的微小屏息感
+
+    # ==================== 模拟硬件级物理阻尼 ====================
+    # 微动开关按下和弹起之间的时差 (50ms - 150ms)
+    page.mouse.down()
+    page.wait_for_timeout(random.randint(50, 150))
+    page.mouse.up()
+
+    # 点击后的自然悬停保护
+    page.wait_for_timeout(random.randint(50, 150))
+
+
+def human_like_input(page, locator, text):
+    """
+    拟人化输入，彻底打破瞬间输入 `.fill()` 特征。
+    """
+    # 1. 模拟真实用户：先进行高拟人化的点击聚焦
+    human_like_click(page, locator)
+
+    # 聚焦后的轻微反应停顿
+    page.wait_for_timeout(random.randint(200, 500))
+
+    if len(text) <= 50:
+        # 2A. 短文本：逐字输入并附加打字按键延迟
+        locator.type(text, delay=random.randint(30, 80))
+    else:
+        # 2B. 长文本：调用底层命令级插入，模拟真实的“快捷键粘贴”动作
+        # 既能绕过瞬间 Fill 检测，又不会让逐字打字耗时数分钟
+        page.keyboard.insert_text(text)
+        page.wait_for_timeout(random.randint(100, 300))
+
+
+# ==============================================================================
 # 页面交互(内部辅助)
 # ==============================================================================
 
@@ -248,7 +308,8 @@ def click_acknowledge_if_present(page):
     try:
         if not acknowledge_button.is_visible(timeout=5000):
             return
-        acknowledge_button.click()
+        # 改用拟人化点击
+        human_like_click(page, acknowledge_button)
         expect(acknowledge_button).to_be_hidden(timeout=5000)
         logger.info("[弹窗处理] 已确认 Acknowledge 版权弹窗")
     except Exception as e:
@@ -269,12 +330,16 @@ def _upload_attachment(page, file_path):
             "button",
             name=re.compile(r"(?=.*images)(?=.*videos)(?=.*audio)(?=.*files)", re.IGNORECASE),
         )
-        best_locator.or_(fallback_locator).click()
+        # 改用拟人化点击
+        target_btn = best_locator.or_(fallback_locator)
+        human_like_click(page, target_btn)
 
         # 第2步: "上传文件"菜单项(兼容 "Upload a file"/"Upload File" 等写法)
-        page.get_by_role(
+        menu_item = page.get_by_role(
             "menuitem", name=re.compile(r"Upload (a )?file", re.IGNORECASE)
-        ).click()
+        )
+        # 改用拟人化点击
+        human_like_click(page, menu_item)
 
     # 2. 从上下文管理器中提取真正的 FileChooser 对象
     file_chooser = fc_info.value
@@ -287,13 +352,15 @@ def _upload_attachment(page, file_path):
     expect(spinner).to_be_hidden(timeout=60000)
     logger.info("[附件上传] 上传完成")
 
+
 def _remove_google_grounding(page):
     """若存在 'Remove Grounding with Google Search' 按钮则关闭联网检索; 非阻塞。"""
     try:
         grounding_close_btn = page.get_by_role("button", name="Remove Grounding with Google Search")
         if grounding_close_btn.is_visible(timeout=2000):
             logger.info("[联网检索] 检测到 Google Grounding 关联, 正在移除")
-            grounding_close_btn.click()
+            # 改用拟人化点击
+            human_like_click(page, grounding_close_btn)
             page.wait_for_timeout(500)
     except Exception as e:
         logger.warning(f"[联网检索] 检查 Grounding 按钮时轻微异常(已忽略) | 原因: [{e}]")
@@ -326,66 +393,6 @@ def _locate_prompt_input(page):
     return lower_half_textboxes[-1]  # 备用策略: 取最后一个
 
 
-def human_like_click(page, locator):
-    """
-    工业级拟人化点击，追求最高行为安全打分。
-    包含：正态分布落点、Fitts定律轨迹、微小修正抖动、真实的物理延迟。
-    """
-    # 1. 确保元素在视口内准备就绪
-    locator.scroll_into_view_if_needed()
-    box = locator.bounding_box()
-
-    if not box:
-        # 极端边缘情况降级
-        locator.click(delay=random.randint(70, 120))
-        return
-
-    # ==================== 特征 1：空间正态分布 (Gaussian Distribution) ====================
-    # 机器用 random.uniform 产生的散点是均匀的（方形）。
-    # 人类点击落点是正态分布的（聚集在中心附近，但绝不在绝对正中心，呈现椭圆云状）。
-
-    # 限制在 15% - 85% 的安全区域内，防止正态分布生成极值点到按钮外面
-    def get_gaussian_coord(size):
-        mu = 0.5  # 期望在 50% 处
-        sigma = 0.15  # 标准差，控制散布范围
-        val = random.gauss(mu, sigma)
-        return min(max(val, 0.15), 0.85) * size
-
-    target_x = box["x"] + get_gaussian_coord(box["width"])
-    target_y = box["y"] + get_gaussian_coord(box["height"])
-
-    # ==================== 特征 2：模拟轨迹与手腕惯性 (Inertia & Trajectory) ====================
-    # 人类把鼠标移向按钮时，往往步数较多，且带有减速感
-    # hover 起手，唤醒 DOM 监听
-    locator.hover()
-    page.wait_for_timeout(random.randint(30, 80))
-
-    # 滑向目标点，设置较多 steps 产生绵密的 mousemove 坐标流
-    page.mouse.move(target_x, target_y, steps=random.randint(20, 35))
-
-    # ==================== 特征 3：人类认知延迟与微修正 (Micro-correction) ====================
-    # 鼠标到达目标后，人类大脑确认按钮状态，会有百毫秒级停顿
-    page.wait_for_timeout(random.randint(150, 300))
-
-    # 真实的手腕在点击前往往有一两像素的无意识抖动 (Jiggle)
-    # 这一步对顶尖风控简直是绝杀，极少有自动化工具会模拟这个
-    jiggle_x = target_x + random.uniform(-1.5, 1.5)
-    jiggle_y = target_y + random.uniform(-1.5, 1.5)
-    page.mouse.move(jiggle_x, jiggle_y, steps=random.randint(2, 4))
-
-    # 极短的屏息停顿
-    page.wait_for_timeout(random.randint(10, 30))
-
-    # ==================== 特征 4：硬件级物理阻尼 (Hardware Mechanics) ====================
-    # 鼠标微动开关的按下和弹起存在物理时差
-    page.mouse.down()
-    page.wait_for_timeout(random.randint(65, 135))  # 65-135ms 是成年人正常的点击滞留时长
-    page.mouse.up()
-
-    # 点击后的自然悬停，避免点击后鼠标瞬间移走(或脚本瞬间关闭)引发的异常数据截断
-    page.wait_for_timeout(random.randint(50, 150))
-
-
 def _submit_prompt(page, prompt):
     """填写并提交 Prompt: 定位输入框 -> 填充 -> 等待运行按钮可用 -> 关联移除后点击。"""
     logger.info("[提交Prompt] 开始定位输入框并提交")
@@ -397,7 +404,9 @@ def _submit_prompt(page, prompt):
         prompt_input = page.get_by_placeholder("Start typing a prompt")
 
     expect(prompt_input).to_be_editable(timeout=15000)
-    prompt_input.fill(prompt)
+
+    # 替换容易触发风控瞬间输入的 `.fill()`
+    human_like_input(page, prompt_input, prompt)
 
     # 精准结构定位运行按钮, 不依赖 "Run"/"Ctrl" 等易变文本
     run_button = page.locator("ms-run-button button[type='submit']")
@@ -406,7 +415,6 @@ def _submit_prompt(page, prompt):
 
     _remove_google_grounding(page)
 
-    # 替换为你原来的 run_button.click()
     logger.info("[提交Prompt] 开始执行高拟人化点击...")
     human_like_click(page, run_button)
     logger.info("[提交Prompt] 高拟人化点击完成")
@@ -997,17 +1005,14 @@ def validate_all_accounts():
 if __name__ == '__main__':
     # login_and_save_session()
 
-
     # validate_all_accounts()
 
     # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    test_prompt = """
-    
-    """
-
-    err, response = query_google_ai_studio(prompt=test_prompt, file_path=None)
+    test_prompt = "你好"
+    # test_prompt = read_file_to_str(r'W:\project\python_project\crypto_trade\temp2.json')
+    err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
     if err:
         logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
     else:
