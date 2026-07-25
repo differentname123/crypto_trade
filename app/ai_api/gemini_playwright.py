@@ -941,7 +941,7 @@ if __name__ == '__main__':
     # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    test_prompt = "请详细描述这张图片的内容。"
+    test_prompt = "你是谁。"
 
     err, response = query_google_ai_studio(prompt=test_prompt, file_path=None)
     if err:
