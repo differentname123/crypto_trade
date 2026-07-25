@@ -46,8 +46,8 @@ USER_DATA_DIR = r"W:\temp\new_taobao1"  # 浏览器登录态(cookies等)持久�
 TARGET_URL_BASE = 'https://aistudio.google.com/prompts/new_chat'
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-CONFIG_FILE = r'W:\project\python_project\crypto_trade\app\ai_api\gemini_auto.json'
-STATS_FILE = CONFIG_FILE.replace(".json", "_stats.json")
+CONFIG_FILE = r'W:\project\python_project\crypto_trade\config\gemini_web.json'
+STATS_FILE = CONFIG_FILE.replace(".json", "_playwright_stats.json")
 
 DEFAULT_MAX_CONCURRENCY = 2  # 全局默认最大并发(8G内存建议2-3, 16G建议4-6)
 DEFAULT_USAGE_STREAK_LIMIT = 10  # 单账号单模型默认连续使用次数上限
@@ -439,17 +439,32 @@ def _scroll_page_to_bottom(page, steps=20, step_px=1500, delay=0.05):
 def _wait_and_get_response(page):
     """等待流式输出结束(Stop 按钮出现再消失), 滚动到底并提取最后一条模型回复正文。"""
     logger.info("[等待响应] 等待模型流式输出中...")
-    stop_btn = page.locator("button").filter(has_text="Stop")
-    expect(stop_btn).to_be_visible(timeout=30000)
-    expect(stop_btn).to_be_hidden(timeout=300000)
+    stop_btn = page.locator("button").filter(has_text=re.compile(r"Stop|停止", re.IGNORECASE))
+    try:
+        expect(stop_btn).to_be_visible(timeout=30000)
+        expect(stop_btn).to_be_hidden(timeout=300000)
+    except Exception:
+        pass
 
     _scroll_page_to_bottom(page, steps=40)
     time.sleep(1)  # 等内容稳定
 
+    # 1. 找到最后一次对话的大容器
     response_container = page.locator('[data-turn-role="Model"]').last
     expect(response_container).to_be_visible()
-    return response_container.inner_text()
 
+    # ====================================================================
+    # 🎯 精准提取优化：跳过底部的 Citations 和其他 UI，只提取正文节点
+    # ====================================================================
+    # 真实的文章内容都包裹在 class 包含 text-chunk 的节点内
+    text_chunk_locator = response_container.locator('.text-chunk')
+
+    if text_chunk_locator.count() > 0:
+        # 如果找到了精准正文节点，只提取它的文字，完美避开 Citation
+        return text_chunk_locator.inner_text()
+    else:
+        # 兜底：万一 Google 改版找不到 .text-chunk，再回退到提取整个容器
+        return response_container.inner_text()
 
 # ==============================================================================
 # 核心: 单次调用 Gemini
@@ -510,7 +525,11 @@ def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
                 _submit_prompt(page, prompt)
                 response_text = _wait_and_get_response(page)
 
-                if "An internal error has occurred." not in response_text:
+                error_keyword = "An internal error has occurred."
+
+                # 条件 1：如果没有报错特征词 -> 成功，跳出循环
+                # 条件 2：如果有报错词，但总文本长度大于 200 字符 -> 误判（模型生成的代码），跳出循环
+                if error_keyword not in response_text or len(response_text) > 200:
                     break
                 logger.warning(f"[任务重试] 检测到页面内部错误, 准备重试 | 第 [{attempt + 1}/3] 次")
                 time.sleep(2)
@@ -1003,15 +1022,14 @@ def validate_all_accounts():
 # ==============================================================================
 
 if __name__ == '__main__':
-    # login_and_save_session()
+    login_and_save_session()
 
     # validate_all_accounts()
 
     # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    test_prompt = "你好"
-    # test_prompt = read_file_to_str(r'W:\project\python_project\crypto_trade\temp2.json')
+    test_prompt = "图片内容是什么"
     err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
     if err:
         logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
