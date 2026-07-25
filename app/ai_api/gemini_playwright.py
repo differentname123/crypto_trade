@@ -386,7 +386,7 @@ def _wait_and_get_response(page):
 # ==============================================================================
 
 def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-3.1-pro-preview"):
+                           model_name="gemini-3.6-flash"):
     """
     用指定登录会话启动浏览器, 完成"(可选上传)-提交-抓取"一次问答。
 
@@ -943,7 +943,7 @@ if __name__ == '__main__':
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
     test_prompt = "请详细描述这张图片的内容。"
 
-    err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
+    err, response = query_google_ai_studio(prompt=test_prompt, file_path=None)
     if err:
         logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
     else:
