@@ -326,6 +326,66 @@ def _locate_prompt_input(page):
     return lower_half_textboxes[-1]  # 备用策略: 取最后一个
 
 
+def human_like_click(page, locator):
+    """
+    工业级拟人化点击，追求最高行为安全打分。
+    包含：正态分布落点、Fitts定律轨迹、微小修正抖动、真实的物理延迟。
+    """
+    # 1. 确保元素在视口内准备就绪
+    locator.scroll_into_view_if_needed()
+    box = locator.bounding_box()
+
+    if not box:
+        # 极端边缘情况降级
+        locator.click(delay=random.randint(70, 120))
+        return
+
+    # ==================== 特征 1：空间正态分布 (Gaussian Distribution) ====================
+    # 机器用 random.uniform 产生的散点是均匀的（方形）。
+    # 人类点击落点是正态分布的（聚集在中心附近，但绝不在绝对正中心，呈现椭圆云状）。
+
+    # 限制在 15% - 85% 的安全区域内，防止正态分布生成极值点到按钮外面
+    def get_gaussian_coord(size):
+        mu = 0.5  # 期望在 50% 处
+        sigma = 0.15  # 标准差，控制散布范围
+        val = random.gauss(mu, sigma)
+        return min(max(val, 0.15), 0.85) * size
+
+    target_x = box["x"] + get_gaussian_coord(box["width"])
+    target_y = box["y"] + get_gaussian_coord(box["height"])
+
+    # ==================== 特征 2：模拟轨迹与手腕惯性 (Inertia & Trajectory) ====================
+    # 人类把鼠标移向按钮时，往往步数较多，且带有减速感
+    # hover 起手，唤醒 DOM 监听
+    locator.hover()
+    page.wait_for_timeout(random.randint(30, 80))
+
+    # 滑向目标点，设置较多 steps 产生绵密的 mousemove 坐标流
+    page.mouse.move(target_x, target_y, steps=random.randint(20, 35))
+
+    # ==================== 特征 3：人类认知延迟与微修正 (Micro-correction) ====================
+    # 鼠标到达目标后，人类大脑确认按钮状态，会有百毫秒级停顿
+    page.wait_for_timeout(random.randint(150, 300))
+
+    # 真实的手腕在点击前往往有一两像素的无意识抖动 (Jiggle)
+    # 这一步对顶尖风控简直是绝杀，极少有自动化工具会模拟这个
+    jiggle_x = target_x + random.uniform(-1.5, 1.5)
+    jiggle_y = target_y + random.uniform(-1.5, 1.5)
+    page.mouse.move(jiggle_x, jiggle_y, steps=random.randint(2, 4))
+
+    # 极短的屏息停顿
+    page.wait_for_timeout(random.randint(10, 30))
+
+    # ==================== 特征 4：硬件级物理阻尼 (Hardware Mechanics) ====================
+    # 鼠标微动开关的按下和弹起存在物理时差
+    page.mouse.down()
+    page.wait_for_timeout(random.randint(65, 135))  # 65-135ms 是成年人正常的点击滞留时长
+    page.mouse.up()
+
+    # 点击后的自然悬停，避免点击后鼠标瞬间移走(或脚本瞬间关闭)引发的异常数据截断
+    page.wait_for_timeout(random.randint(50, 150))
+
+
 def _submit_prompt(page, prompt):
     """填写并提交 Prompt: 定位输入框 -> 填充 -> 等待运行按钮可用 -> 关联移除后点击。"""
     logger.info("[提交Prompt] 开始定位输入框并提交")
@@ -346,8 +406,10 @@ def _submit_prompt(page, prompt):
 
     _remove_google_grounding(page)
 
-    run_button.click()
-    logger.info("[提交Prompt] 已点击运行按钮")
+    # 替换为你原来的 run_button.click()
+    logger.info("[提交Prompt] 开始执行高拟人化点击...")
+    human_like_click(page, run_button)
+    logger.info("[提交Prompt] 高拟人化点击完成")
 
 
 def _scroll_page_to_bottom(page, steps=20, step_px=1500, delay=0.05):
@@ -941,7 +1003,9 @@ if __name__ == '__main__':
     # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    test_prompt = "你是谁。"
+    test_prompt = """
+    
+    """
 
     err, response = query_google_ai_studio(prompt=test_prompt, file_path=None)
     if err:

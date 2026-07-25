@@ -26,10 +26,12 @@ import traceback
 
 from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 
+from biance.biance_squre_api import toggle_binance_follow
+
 # ==============================================================================
 # 全局配置、正则常量与自定义异常
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_nana"
+USER_DATA_DIR = r"W:\temp\biance_jie"
 LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 
 # 前端文案多语言/多变体的统一匹配规则，避免选择器中重复书写正则
@@ -487,46 +489,73 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
 
 
 def get_auth_tokens_robust(user_data_dir):
-    """
-    脱机运行前提取登录凭证（无头拦截接口请求头）。
-    返回: Tuple(Cookie串(str|None), CSRF Token(str|None))。
-    """
     if not os.path.exists(user_data_dir):
-        print(f"[Auth/Extract] 环境不存在，终止提取 | 目录: <{user_data_dir}> | 结果: [Failed]")
+        print(f"[Auth/Extract] 环境不存在，终止提取 | 目录: <{user_data_dir}>")
         return None, None
 
     visit_url = "https://www.binance.com/zh-CN/square/profile/insights_anchor"
     target_api_keyword = "pgc/user/client"
-    print(f"[Auth/Extract] 启动无头浏览器提取凭证 | 拦截目标: <{target_api_keyword}> | 结果: [执行中]")
+    print(f"[Auth/Extract] 启动浏览器提取凭证 (Headed模式) | 拦截目标: <{target_api_keyword}>")
 
     with sync_playwright() as p:
         context = None
         try:
             context = p.chromium.launch_persistent_context(
-                channel="chrome", user_data_dir=user_data_dir, headless=True,
-                args=['--disable-blink-features=AutomationControlled', '--headless=new']
+                channel="chrome",
+                user_data_dir=user_data_dir,
+                headless=False,  # 必须保持 False
+                viewport={'width': 1280, 'height': 720},
+                args=['--disable-blink-features=AutomationControlled']
             )
             page = context.pages[0] if context.pages else context.new_page()
 
-            with page.expect_request(lambda req: target_api_keyword in req.url, timeout=15000) as first_req:
-                page.goto(visit_url)
+            print("[Auth/Extract] 正在等待页面加载及目标接口调用...")
 
-            extracted_csrf = first_req.value.headers.get("csrftoken")
-            raw_cookies = context.cookies(urls=["https://www.binance.com", visit_url])
-            extracted_cookie = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies)
+            # 【核心修改 1】：过滤 OPTIONS 请求，只抓 GET 或 POST 真实请求
+            with page.expect_request(
+                    lambda req: target_api_keyword in req.url and req.method != "OPTIONS",
+                    timeout=20000
+            ) as first_req_info:
+                page.goto(visit_url, wait_until="networkidle")
 
-            if extracted_cookie and extracted_csrf:
-                print(f"[Auth/Extract] 提取成功 | CSRF: 【{extracted_csrf[:8]}...】 | Cookie长度: 【{len(extracted_cookie)}】 | 结果: [Success]")
-                return extracted_cookie, extracted_csrf
+            first_req = first_req_info.value
+            headers = first_req.headers
 
-            print(f"[Auth/Extract] 提取失败 | 原因: 【捕获到的凭据为空，可能未登录】 | 结果: [Failed]")
+            # 打印调试信息，看看到底抓到了什么
+            print(f"--- 调试信息 ---")
+            print(f"拦截到请求: {first_req.method} {first_req.url}")
+            print(f"请求头 Keys: {list(headers.keys())}")
+            print(f"----------------")
+
+            # Playwright 获取的 headers key 默认全是小写
+            extracted_csrf = headers.get("csrftoken")
+            extracted_cookie = headers.get("cookie")
+
+            # 【核心修改 2】：如果 Headers 里没取到，尝试用全局 Cookie 兜底拼装
+            if not extracted_cookie:
+                print("[Auth/Extract] Request headers 中无 Cookie，尝试从浏览器上下文全局提取...")
+                raw_cookies = context.cookies()
+                extracted_cookie = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies)
+
+            if extracted_cookie:
+                has_p20t = "p20t=" in extracted_cookie
+                print(
+                    f"[Auth/Extract] 提取完成 | CSRF: 【{str(extracted_csrf)[:8]}...】 | Cookie长度: {len(extracted_cookie)} | 包含p20t: {has_p20t}")
+
+                if has_p20t and extracted_csrf:
+                    return extracted_cookie, extracted_csrf
+                else:
+                    print("[Auth/Extract] 警告: 提取到了Cookie，但可能缺失核心 p20t 或 CSRF。")
+                    return extracted_cookie, extracted_csrf
+
+            print(f"[Auth/Extract] 提取失败 | 捕获到的请求未携带合法凭据")
             return None, None
 
         except PlaywrightTimeoutError:
-            print(f"[Auth/Extract] 提取失败 | 原因: 【15 秒内未捕获到目标接口请求，疑似登录态失效】 | 结果: [Timeout]")
+            print(f"[Auth/Extract] 提取失败 | 原因: 超时未捕获到目标接口。请检查浏览器打开时是否处于登录状态！")
             return None, None
         except Exception as e:
-            print(f"[Auth/Extract] 提取失败 | 原因: 【未知异常: {e}】 | 结果: [Error]")
+            print(f"[Auth/Extract] 提取失败 | 原因: 【未知异常: {e}】")
             return None, None
         finally:
             if context:
@@ -569,9 +598,15 @@ def open_browser_for_manual_use(user_data_dir, home_url='https://www.binance.com
 # ==============================================================================
 if __name__ == '__main__':
     # # 其他可选入口（按需取消注释）:
-    # get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
+    my_cookies, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
+    my_cookies = """bnc-uuid=f53197d0-e2ad-43bb-b43b-5161cb030a4b; se_gd=1MQFVVQINTKFgcFBQUg4gZZA1CBsDBTVlFXVdVUNlVSUQCVNWWVW1; se_gsd=cDM2ChFxMCknMCstJDI1Uy40BRUNBwpSVl5LUVZXW1VUAlNT1; BNC_FV_KEY=3351d68efd68acd5a71a1ff808d967f0baf26f5a; OptanonAlertBoxClosed=2026-07-21T08:29:53.202Z; r20t=web.1243072957.8E5BB294B939C6C157F67D64CFED42D4; r30t=1; cr00=86336EFE58AD741731FAB162CA606CF1; d1og=web.1243072957.B7AE0C43C84AAEA96A2F1884ACFB1369; r2o1=web.1243072957.1D2CF44FE2130BFEB88A3CD6F538992C; f30l=web.1243072957.42627429D66FA9273C83285996BC3F96; currentAccount=; logined=y; BNC-Location=CN; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221243072957%22%2C%22first_id%22%3A%2219f83cb6c4f1c50-08e14edf337b1e8-26071951-921600-19f83cb6c50290e%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmODNjYjZjNGYxYzUwLTA4ZTE0ZWRmMzM3YjFlOC0yNjA3MTk1MS05MjE2MDAtMTlmODNjYjZjNTAyOTBlIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiMTI0MzA3Mjk1NyJ9%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221243072957%22%7D%7D; userPreferredCurrency=USD_USD; _gcl_au=1.1.755273243.1784622841; _uetvid=ee84368084de11f1bab6f3dd0938120c; aws-waf-token=6957a2c3-542a-4819-8ca4-129a00800b51:AQoAfOpYIn4FAAAA:LMuuHAwfjEqQ5yRaGPYQACZ1SynT2a+FLdwhL1KWA2/CDrCkqMtodWZMV5FGeykwQTu+T/e4mYWHRnQ/WkAcZARZxgPia4u32mC3436686vcRd6WUe25FrouHf4zBi33l15+xab1fPWfX0tuytlDXjK5WwlGsqSv57EwejDvAUakb/SrszZD75C0ff+bkVMpSORew43lZ69wmfbP4PELrhHDg9cwHX1wpqRVULYJwyMv5z5eZz+za1lmtGMjND+sTm6TIDpIdvXj; _gid=GA1.2.168006475.1784896831; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; g_state={"i_l":0,"i_ll":1784930857994,"i_b":"4Jy+KY8TkPWMy29knfYSzbEYQUDgDNehQ12eSiYgTwY","i_e":{"enable_itp_optimization":24},"i_et":1784930857994}; BNC_FV_KEY_T=101-TS2vIZ4AxtwOfheK3b7yo9DXYannOutll1fkjOchOeor7Rriqx6KEoDtOOcNIHqUvgLDU2%2B7RtP5PgBiZEZxTg%3D%3D-1D0GuGjHiIyVSsCJznHMbA%3D%3D-6d; BNC_FV_KEY_EXPIRE=1785025950438; theme=dark; p20t=web.1243072957.14122033BCFA181F144BC572017CF8C7; _ga=GA1.1.2076591487.1784622596; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Jul+26+2026+04%3A50%3A09+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=c6ec02be-dae4-4461-bc5f-344aa724fcd7&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1784622593&intType=1&crTime=1784622596175&geolocation=KR%3B11&AwaitingReconsent=false; _ga_3WP50LGEEC=GS2.1.s1785011798$o6$g1$t1785012610$j57$l0$h0"""
+
+    csrf_token = "8f974eb25ea628f9c9f9bc47dd5bcf8f"
+
+    is_success = toggle_binance_follow("CfexsWwIVYYbr1N5GJXlVQ", "follow", my_cookies, csrf_token)
+
     # login_and_save_session()                # 初次手动登录并固化 Session
-    # open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
+    open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
