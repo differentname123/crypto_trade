@@ -41,12 +41,12 @@ from google import genai
 from google.genai import types
 
 from common.common_utils import read_json
-
+config_path = r'W:\project\python_project\crypto_trade\config\gemini_web.json'
 
 # ========== API Key 读取与管理 ==========
 
 def build_api_key_map():
-    google_config = read_json(r'W:\project\python_project\crypto_trade\config\gemini_web.json')
+    google_config = read_json(config_path)
     cookie_list = google_config.get('cookie_list', [])
 
     api_key_map = {}
@@ -78,8 +78,7 @@ class ApiKeyManager:
 
     def __init__(self, api_key_map):
         self.api_key_map = api_key_map
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        self.stats_file = os.path.join(module_dir, 'api_key_usage.json')
+        self.stats_file = config_path.replace('.json', '_api_key_usage.json')
         self.lock_file = self.stats_file + '.lock'
         # 增加超时以防高并发场景下的锁等待
         self.lock = FileLock(self.lock_file, timeout=20)

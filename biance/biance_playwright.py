@@ -536,7 +536,7 @@ def get_auth_tokens_robust(user_data_dir):
                     pass
 
 
-def open_browser_for_manual_use(user_data_dir):
+def open_browser_for_manual_use(user_data_dir, home_url='https://www.binance.com/zh-CN'):
     """启动可见浏览器交由人工自由操作，关闭窗口后自动收回控制权并释放资源。"""
     print(f"\n{'=' * 50}\n[System/Manual] 启动本地浏览器进行人工接管 | 目录: <{user_data_dir}>\n{'=' * 50}")
     with sync_playwright() as p:
@@ -548,7 +548,7 @@ def open_browser_for_manual_use(user_data_dir):
                 ignore_default_args=["--enable-automation"]
             )
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto('https://www.binance.com/zh-CN')
+            page.goto(home_url)
 
             print("\n[System/Manual] ✅ 浏览器已就绪，控制权已交接。")
             print("[System/Manual] 🛑 退出方式: 直接关闭浏览器窗口，程序将自动结束。")

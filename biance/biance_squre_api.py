@@ -774,7 +774,7 @@ def _enrich_single_post(item, session):
 
         for url in urls_to_download:
             try:
-                local_path = download_web_media(url=url, save_dir="./media_downloads", proxy=proxy_url)
+                local_path = download_web_media(url=url, save_dir=r'W:\project\python_project\crypto_trade\biance\media_downloads', proxy=proxy_url)
                 if local_path:
                     media_info['local_mapping'][url] = local_path
                     stats['total_download_success'] += 1

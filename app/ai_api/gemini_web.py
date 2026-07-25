@@ -336,7 +336,7 @@ if __name__ == "__main__":
     test_file = [r"C:\Users\zxh\Desktop\temp\test.mp4"]
 
     # 明确在 prompt 中包含“生成一张”以触发模型画图工具
-    prompt = "你是谁？并帮我生成一张图片：一只赛博朋克风格的猫咪在喝咖啡，背景是霓虹灯城市。"
+    prompt = "你是谁？"
 
     for i in range(1):  # 测试1次即可验证图片生成
         try:
