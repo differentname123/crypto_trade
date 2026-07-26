@@ -14,6 +14,7 @@ import re
 import time
 import threading
 
+from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.gemini_web import generate_gemini_content_managed
 from biance.biance_playwright import comment_on_binance_post
 from biance.biance_squre_api import fetch_binance_feed
@@ -182,10 +183,13 @@ def gen_promo_comment(post):
 
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            err, raw_response, _images = generate_gemini_content_managed(
-                prompt=full_prompt,
-                model_name=GEMINI_MODEL
-            )
+            # err, raw_response, _images = generate_gemini_content_managed(
+            #     prompt=full_prompt,
+            #     model_name=GEMINI_MODEL
+            # )
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt)
+
+
             comment_info = string_to_object(raw_response)
 
             is_valid, error_message = check_comment_info(comment_info)

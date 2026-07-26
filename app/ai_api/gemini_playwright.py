@@ -6,7 +6,7 @@
 #
 # [输入数据]
 #   - 调用入参: prompt(问题文本) + file_path(可选附件路径) + model_name/fallback_model
-#   - 配置文件 gemini_auto.json:  { account_list:[{name, user_data_dir}], max_concurrency, usage_streak_limit }
+#   - 配置文件 gemini_auto.json:  { cookie_list:[{name, user_data_dir}], max_concurrency, usage_streak_limit }
 #   - 统计文件 gemini_auto_stats.json:
 #       { <account>: {status, account_last_used_time, current_using_model,
 #                     models:{ <model>:{last_used_time,last_error_info,total_usage,current_streak} } },
@@ -42,7 +42,7 @@ logger = setup_logger(app_name="gemini_playwright")
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\new_taobao1"  # 浏览器登录态(cookies等)持久化目录, 需可写
+USER_DATA_DIR = r"W:\temp\new_taobao15"  # 浏览器登录态(cookies等)持久化目录, 需可写
 TARGET_URL_BASE = 'https://aistudio.google.com/prompts/new_chat'
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -195,7 +195,7 @@ def _launch_persistent_browser(p, user_data_dir):
     )
 
 
-def login_and_save_session(model_name="gemini-3.1-pro-preview"):
+def login_and_save_session(model_name="gemini-flash-latest"):
     """打开浏览器供用户手动登录, 登录态自动持久化到 USER_DATA_DIR。"""
     logger.info(f"[手动登录] 启动浏览器等待登录 | 会话保存目录: [{USER_DATA_DIR}]")
     clean_browser_cache(USER_DATA_DIR)
@@ -466,12 +466,13 @@ def _wait_and_get_response(page):
         # 兜底：万一 Google 改版找不到 .text-chunk，再回退到提取整个容器
         return response_container.inner_text()
 
+
 # ==============================================================================
 # 核心: 单次调用 Gemini
 # ==============================================================================
 
 def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-3.6-flash"):
+                           model_name="gemini-flash-latest"):
     """
     用指定登录会话启动浏览器, 完成"(可选上传)-提交-抓取"一次问答。
 
@@ -675,11 +676,14 @@ class PlaywrightAccountManager:
         with SimpleFileLock(self.lock_path):
             raw_config = read_json(self.config_path)
             stats = read_json(self.stats_path)
-            config_list = raw_config.get('account_list', [])
+
+            # 【适配修改点 1】修改读取的配置键名为 cookie_list
+            config_list = raw_config.get('cookie_list', [])
 
             max_concurrency = raw_config.get('max_concurrency', DEFAULT_MAX_CONCURRENCY)
             usage_streak_limit = raw_config.get('usage_streak_limit', DEFAULT_USAGE_STREAK_LIMIT)
 
+            # 【适配说明】这里原本就带有 if item.get('user_data_dir') 判断，完美匹配“有user_data_dir才使用”的规则
             valid_accounts_map = {
                 item['name']: item.get('user_data_dir', '')
                 for item in config_list if item.get('name') and item.get('user_data_dir')
@@ -880,7 +884,7 @@ def _apply_rate_limit_penalty(account_name, model_name):
 
 
 def generate_gemini_content_playwright(prompt, file_path=None, wait_timeout=600,
-                                       model_name="gemini-3.1-pro-preview", fallback_model=None):
+                                       model_name="gemini-flash-latest", fallback_model="gemini-flash-latest"):
     """
     对外总入口: 安全申请账号并调用 Gemini, 支持备用模型(活跃池更大者优先)。
 
@@ -975,23 +979,30 @@ def validate_all_accounts():
         logger.error(f"【账号验证】失败: 配置文件不存在或内容为空/格式错误 | 路径: [{CONFIG_FILE}]")
         return
 
-    account_list = config_data.get("account_list", [])
-    if not account_list:
-        logger.warning("[账号验证] 配置文件中 account_list 为空, 无账号可验证")
+    raw_account_list = config_data.get("cookie_list", [])
+    if not raw_account_list:
+        logger.warning("[账号验证] 配置文件中 cookie_list 为空, 无账号可验证")
         return
+
+    # 【核心修复点】提前在循环外部过滤掉没有 user_data_dir 或 name 的账号
+    account_list = [
+        acc for acc in raw_account_list
+        if acc.get("name") and acc.get("user_data_dir")
+    ]
+
+    total = len(account_list)
+    if total == 0:
+        logger.warning("[账号验证] 过滤后没有发现携带 user_data_dir 的有效账号, 停止验证")
+        return
+
+    logger.info(f"[账号验证] 账号过滤完成 | 准备验证有效账号数: [{total}]")
 
     test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
     valid_accounts, invalid_accounts = [], []
-    total = len(account_list)
 
     for i, account in enumerate(account_list):
         name = account.get("name")
         user_data_dir = account.get("user_data_dir")
-
-        if not name or not user_data_dir:
-            logger.warning(f"[账号验证] 跳过配置不完整条目 | 内容: [{account}]")
-            total -= 1
-            continue
 
         logger.info(f"[账号验证] 正在验证 | 进度: [{i + 1}/{total}] | 账号: [{name}]")
         error, response = query_google_ai_studio(
@@ -1016,22 +1027,21 @@ def validate_all_accounts():
     for item in invalid_accounts:
         logger.warning(f"[账号验证] ❌ 失效 | 账号: [{item['name']}] | 原因: [{item['reason']}]")
 
-
 # ==============================================================================
 # 程序主入口(使用示例)
 # ==============================================================================
 
 if __name__ == '__main__':
-    login_and_save_session()
+    # login_and_save_session()
 
-    # validate_all_accounts()
+    validate_all_accounts()
 
     # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
-
-    test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    test_prompt = "图片内容是什么"
-    err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
-    if err:
-        logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
-    else:
-        logger.info(f"[示例任务] 成功 ✅ | 模型回复: [{response}]")
+    #
+    # test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
+    # test_prompt = "图片内容是什么"
+    # err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
+    # if err:
+    #     logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
+    # else:
+    #     logger.info(f"[示例任务] 成功 ✅ | 模型回复: [{response}]")
