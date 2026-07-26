@@ -517,6 +517,24 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 except PlaywrightTimeoutError:
                     pass
 
+                try:
+                    # 使用 text 模糊匹配核心词，应对前端文案的潜在变更
+                    block_notice = page.locator("text=您无法查看此内容")
+
+                    # 给 2.5 秒的短超时，等待 React/Vue 前端框架完成 DOM 渲染
+                    block_notice.wait_for(state="visible", timeout=2500)
+
+                    error_info = "触发平台软拦截（账号已被该创作者拉黑或设置了权限），安全跳过当前任务。"
+                    logger.info(f"[Main/Nav] 嗅探到拉黑阻断 | 原因: 【{error_info}】 | 结果: [Skip]")
+
+                    # 优雅退出，不抛出系统级异常，让外层循环继续执行下一个 URL
+                    return error_info, False, None
+
+                except PlaywrightTimeoutError:
+                    # 2.5秒内没出现拉黑提示，说明正常，安全放行
+                    pass
+
+
                 check_for_crash(page)
                 editor_container = _smart_scroll_to_editor(page)
                 check_for_crash(page)
