@@ -91,15 +91,6 @@ def check_for_crash(page):
         pass  # 未出现崩溃按钮，属正常情况
 
 
-def human_intervention_pause(error_msg):
-    """挂起程序并蜂鸣，等待人工在浏览器中排查后回车续跑。"""
-    sys.stdout.write('\a')
-    sys.stdout.flush()
-    logger.info(f"\n{'=' * 50}")
-    logger.info(f"[System/Halt] 🚨 触发人工介入机制 | 失败原因: 【{error_msg}】")
-    logger.info(f"[System/Halt] 请在浏览器中排查问题，完成后按 [Enter] 键继续...")
-    logger.info(f"{'=' * 50}")
-    input()
 
 
 def _interact_fallback_locators(locators, action="wait", timeout=5000, desc="目标元素"):
@@ -289,6 +280,17 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
         return False
 
 
+def human_intervention_pause(error_msg):
+    """记录错误并阻断，不再使用 input() 挂起程序，实现全自动化报错退出。"""
+    sys.stdout.write('\a')
+    sys.stdout.flush()
+    logger.info(f"\n{'=' * 50}")
+    logger.info(f"[System/Halt] 🚨 触发异常中断机制 | 失败原因: 【{error_msg}】")
+    logger.info(f"[System/Halt] 已自动保存故障现场，不再阻塞等待人工，程序即将直接返回结果...")
+    logger.info(f"{'=' * 50}")
+    # 🚀 修复核心：已移除 input()，彻底消除程序无期限卡死的问题 🚀
+
+
 def _submit_comment(page, editor_container, comment, image_path=None, url_info_list=None):
     """
     在隔离的局部作用域内完成发帖全链路：唤醒编辑器 -> 图片 -> 正文 -> 超链接 -> 发送校验。
@@ -300,7 +302,8 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
 
     # ---- 步骤 1：唤醒富文本编辑器 ----
     logger.info(f"[Editor/Wakeup] 尝试唤醒富文本框 | 目标: <div.ProseMirror> | 结果: [执行中]")
-    editor_container.locator('input[type="text"], input[placeholder]').first.click()
+    # 🚀 增加 action 级 timeout，防止元素假死导致无限阻塞
+    editor_container.locator('input[type="text"], input[placeholder]').first.click(timeout=10000)
     real_editor = editor_container.locator('div[contenteditable="true"].ProseMirror').first
     expect(real_editor).to_be_editable(timeout=8000)
     logger.info(f"[Editor/Wakeup] 唤醒成功 | 状态: [可编辑]")
@@ -309,28 +312,45 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     if image_path and os.path.exists(image_path):
         logger.info(f"[Editor/Image] 开始上传图片 | 路径: <{image_path}> | 结果: [执行中]")
         try:
-            editor_container.locator('input[type="file"]').first.set_input_files(image_path)
+            # 🚀 增加上传动作超时保护
+            editor_container.locator('input[type="file"]').first.set_input_files(image_path, timeout=15000)
             page.wait_for_timeout(3500)
             logger.info(f"[Editor/Image] 图片挂载完毕 | 状态: [Success]")
         except Exception as e:
-            logger.info(f"[Editor/Image] 图片上传失败，自动降级为纯文本 | 可能原因: 【文件损坏或上传控件不可用: {e}】 | 结果: [Warning]")
+            logger.info(
+                f"[Editor/Image] 图片上传失败，自动降级为纯文本 | 可能原因: 【文件损坏或上传控件不可用: {e}】 | 结果: [Warning]")
 
     # ---- 步骤 3：注入正文（含框架静默清空的补录兜底） ----
     if comment.strip():
         logger.info(f"[Editor/Text] 填入正文内容 | 长度: <{len(comment)}> | 结果: [输入中]")
-        real_editor.click()
+        real_editor.click(timeout=10000)
         page.wait_for_timeout(800)
         real_editor.press_sequentially(comment, delay=60)
         page.wait_for_timeout(500)
 
         if not real_editor.inner_text().strip():  # 防前端框架拦截导致静默清空
             logger.info(f"[Editor/Text] 检测到文本被静默清空，触发重试补录 | 动作: [Retry]")
-            real_editor.click()
+            real_editor.click(timeout=10000)
             real_editor.press_sequentially(comment, delay=60)
         logger.info(f"[Editor/Text] 文本输入完成 | 状态: [Success]")
     else:
-        real_editor.click()
+        real_editor.click(timeout=10000)
         page.wait_for_timeout(500)
+
+    # 🚀🚀🚀 新增核心修复：强制光标置底，防止中心 Click 导致光标乱窜 🚀🚀🚀
+    logger.info(f"[Editor/Focus] 锁定光标到文本绝对末尾 | 结果: [执行中]")
+    page.evaluate("""(element) => {
+        element.focus();
+        if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
+            let range = document.createRange();
+            range.selectNodeContents(element);
+            range.collapse(false); // false 意味着折叠到 Range 的末尾
+            let sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+    }""", real_editor.element_handle())
+    page.wait_for_timeout(300)
 
     # ---- 步骤 4：注入超链接（逐条注入，单条失败自动跳过） ----
     if isinstance(url_info_list, list) and url_info_list:
@@ -356,7 +376,8 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
         send_button = _interact_fallback_locators(send_btn_cands, action="wait", timeout=10000, desc="发送按钮")
         expect(send_button).to_be_enabled(timeout=10000)
     except Exception as e:
-        logger.info(f"[Editor/Submit] 发送按钮定位/状态异常，强制回退首选候选 | 可能原因: 【按钮未渲染或处于禁用态: {e}】 | 状态: [Warning]")
+        logger.info(
+            f"[Editor/Submit] 发送按钮定位/状态异常，强制回退首选候选 | 可能原因: 【按钮未渲染或处于禁用态: {e}】 | 状态: [Warning]")
         send_button = send_btn_cands[0]
 
     # 记录发送前编辑器快照，供 DOM 兜底比对
@@ -381,7 +402,8 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             api_success = True
             data = json_data.get("data")
             comment_id = data.get("id") if isinstance(data, dict) else None
-            logger.info(f"[Editor/Verify] 底层接口校验通过 | 响应码: 【000000】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
+            logger.info(
+                f"[Editor/Verify] 底层接口校验通过 | 响应码: 【000000】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
         elif json_data:
             err_msg = json_data.get("message", "未知业务拦截")
             logger.info(f"[Editor/Verify] 底层接口拒绝请求 | 原因: 【{err_msg}】 | 结果: [Failed]")
@@ -392,7 +414,8 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
 
     # ---- 步骤 6：DOM 兜底校验（编辑器被大幅清空即视为发送成功） ----
     if not api_success:
-        time.sleep(3)
+        # 🚀 替换 time.sleep 为框架原生的超时等待，防线程假死
+        page.wait_for_timeout(3000)
         text_after, media_after = _snapshot_editor(real_editor)
         text_cleared = text_before > 0 and text_after < (text_before / 3)
         media_cleared = media_before > 0 and media_after < media_before
@@ -464,8 +487,15 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 page = context.pages[0] if context.pages else context.new_page()
 
                 logger.info(f"[Main/Nav] 导航至目标页面 | 动作: [等待 DOM 加载]")
-                page.goto(post_url, timeout=60000)
+                # 🚀 捕获 response 对象，用于后续排查 HTTP 层面的 404
+                response = page.goto(post_url, timeout=60000)
                 page.wait_for_load_state("domcontentloaded", timeout=60000)
+
+                # 🚀 新增修复1：帖子已删除的快速拦截机制（如返回 404/403/410 等）
+                if response and response.status >= 400:
+                    error_info = f"页面加载异常或帖子已被删除 (HTTP 状态码: {response.status})"
+                    logger.info(f"[Main/Nav] 嗅探到无效页面 | 原因: 【{error_info}】 | 结果: [Failed]")
+                    return error_info, False, None
 
                 # 登录态嗅探：出现 login 链接即判定 Cookie 过期
                 try:
@@ -489,7 +519,19 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
             except PlaywrightTimeoutError as pt_e:
                 error_info = f"[元素/网络超时] {str(pt_e)}"
                 logger.info(
-                    f"[Main/Task] 元素等待或网络请求超时 | 可能原因: 【页面卡顿/选择器失效/网络抖动】 | 详情: 【{error_info[:200]}...】 | 结果: [Failed]")
+                    f"[Main/Task] 元素等待或网络请求超时 | 可能原因: 【帖子软删除(UI级别不存在)/页面卡顿/网络抖动】 | 详情: 【{error_info[:200]}...】 | 结果: [Failed]")
+
+                # 🚀 新增修复2：超时状态同样留存案发现场，防止由于软404(无编辑器)引发的超时死无对证
+                if context and context.pages:
+                    try:
+                        ts = int(time.time())
+                        context.pages[0].screenshot(path=f"timeout_screenshot_{ts}.png")
+                        with open(f"timeout_html_{ts}.html", "w", encoding="utf-8") as f:
+                            f.write(context.pages[0].content())
+                        logger.info(f"[Main/Debug] 超时现场已保留 | 产物时间戳: 【{ts}】 | 结果: [Saved]")
+                    except Exception as s_e:
+                        logger.info(f"[Main/Debug] 超时现场保留失败 | 可能原因: 【磁盘不可写或页面已销毁: {s_e}】")
+
                 human_intervention_pause(error_info)
                 return error_info, False, None
 
@@ -607,12 +649,17 @@ def open_browser_for_manual_use(user_data_dir, home_url='https://www.binance.com
     with sync_playwright() as p:
         context = None
         try:
+            # 修改点 1：在 args 列表中追加 '--window-position=0,0' 以覆盖之前屏幕外的历史坐标缓存
             context = p.chromium.launch_persistent_context(
                 channel="chrome", user_data_dir=user_data_dir, headless=False,
-                args=['--disable-blink-features=AutomationControlled', '--start-maximized'],
+                args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'],
                 ignore_default_args=["--enable-automation"]
             )
             page = context.pages[0] if context.pages else context.new_page()
+
+            # 修改点 2：显式将该页面/窗口唤醒至操作系统最前端（正面显示）
+            page.bring_to_front()
+
             page.goto(home_url)
 
             logger.info("\n[System/Manual] ✅ 浏览器已就绪，控制权已交接。")
@@ -629,31 +676,29 @@ def open_browser_for_manual_use(user_data_dir, home_url='https://www.binance.com
             logger.info("[System/Manual] 👋 窗口已关闭，控制权收回，系统资源已释放。\n")
 
 
+
 # ==============================================================================
 # 启动入口
 # ==============================================================================
 if __name__ == '__main__':
-    # # 其他可选入口（按需取消注释）:
-    my_cookies, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
-    my_cookies = """bnc-uuid=f53197d0-e2ad-43bb-b43b-5161cb030a4b; se_gd=1MQFVVQINTKFgcFBQUg4gZZA1CBsDBTVlFXVdVUNlVSUQCVNWWVW1; se_gsd=cDM2ChFxMCknMCstJDI1Uy40BRUNBwpSVl5LUVZXW1VUAlNT1; BNC_FV_KEY=3351d68efd68acd5a71a1ff808d967f0baf26f5a; OptanonAlertBoxClosed=2026-07-21T08:29:53.202Z; r20t=web.1243072957.8E5BB294B939C6C157F67D64CFED42D4; r30t=1; cr00=86336EFE58AD741731FAB162CA606CF1; d1og=web.1243072957.B7AE0C43C84AAEA96A2F1884ACFB1369; r2o1=web.1243072957.1D2CF44FE2130BFEB88A3CD6F538992C; f30l=web.1243072957.42627429D66FA9273C83285996BC3F96; currentAccount=; logined=y; BNC-Location=CN; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221243072957%22%2C%22first_id%22%3A%2219f83cb6c4f1c50-08e14edf337b1e8-26071951-921600-19f83cb6c50290e%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmODNjYjZjNGYxYzUwLTA4ZTE0ZWRmMzM3YjFlOC0yNjA3MTk1MS05MjE2MDAtMTlmODNjYjZjNTAyOTBlIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiMTI0MzA3Mjk1NyJ9%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221243072957%22%7D%7D; userPreferredCurrency=USD_USD; _gcl_au=1.1.755273243.1784622841; _uetvid=ee84368084de11f1bab6f3dd0938120c; aws-waf-token=6957a2c3-542a-4819-8ca4-129a00800b51:AQoAfOpYIn4FAAAA:LMuuHAwfjEqQ5yRaGPYQACZ1SynT2a+FLdwhL1KWA2/CDrCkqMtodWZMV5FGeykwQTu+T/e4mYWHRnQ/WkAcZARZxgPia4u32mC3436686vcRd6WUe25FrouHf4zBi33l15+xab1fPWfX0tuytlDXjK5WwlGsqSv57EwejDvAUakb/SrszZD75C0ff+bkVMpSORew43lZ69wmfbP4PELrhHDg9cwHX1wpqRVULYJwyMv5z5eZz+za1lmtGMjND+sTm6TIDpIdvXj; _gid=GA1.2.168006475.1784896831; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; g_state={"i_l":0,"i_ll":1784930857994,"i_b":"4Jy+KY8TkPWMy29knfYSzbEYQUDgDNehQ12eSiYgTwY","i_e":{"enable_itp_optimization":24},"i_et":1784930857994}; BNC_FV_KEY_T=101-TS2vIZ4AxtwOfheK3b7yo9DXYannOutll1fkjOchOeor7Rriqx6KEoDtOOcNIHqUvgLDU2%2B7RtP5PgBiZEZxTg%3D%3D-1D0GuGjHiIyVSsCJznHMbA%3D%3D-6d; BNC_FV_KEY_EXPIRE=1785025950438; theme=dark; p20t=web.1243072957.14122033BCFA181F144BC572017CF8C7; _ga=GA1.1.2076591487.1784622596; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Jul+26+2026+04%3A50%3A09+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=c6ec02be-dae4-4461-bc5f-344aa724fcd7&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1784622593&intType=1&crTime=1784622596175&geolocation=KR%3B11&AwaitingReconsent=false; _ga_3WP50LGEEC=GS2.1.s1785011798$o6$g1$t1785012610$j57$l0$h0"""
-
-    csrf_token = "8f974eb25ea628f9c9f9bc47dd5bcf8f"
-
-    is_success = toggle_binance_follow("CfexsWwIVYYbr1N5GJXlVQ", "follow", my_cookies, csrf_token)
+    # # # 其他可选入口（按需取消注释）:
+    # my_cookies, csrf_token = get_auth_tokens_robust(USER_DATA_DIR)   # 提取脱机 API 凭证
+    # my_cookies = """bnc-uuid=f53197d0-e2ad-43bb-b43b-5161cb030a4b; se_gd=1MQFVVQINTKFgcFBQUg4gZZA1CBsDBTVlFXVdVUNlVSUQCVNWWVW1; se_gsd=cDM2ChFxMCknMCstJDI1Uy40BRUNBwpSVl5LUVZXW1VUAlNT1; BNC_FV_KEY=3351d68efd68acd5a71a1ff808d967f0baf26f5a; OptanonAlertBoxClosed=2026-07-21T08:29:53.202Z; r20t=web.1243072957.8E5BB294B939C6C157F67D64CFED42D4; r30t=1; cr00=86336EFE58AD741731FAB162CA606CF1; d1og=web.1243072957.B7AE0C43C84AAEA96A2F1884ACFB1369; r2o1=web.1243072957.1D2CF44FE2130BFEB88A3CD6F538992C; f30l=web.1243072957.42627429D66FA9273C83285996BC3F96; currentAccount=; logined=y; BNC-Location=CN; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221243072957%22%2C%22first_id%22%3A%2219f83cb6c4f1c50-08e14edf337b1e8-26071951-921600-19f83cb6c50290e%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmODNjYjZjNGYxYzUwLTA4ZTE0ZWRmMzM3YjFlOC0yNjA3MTk1MS05MjE2MDAtMTlmODNjYjZjNTAyOTBlIiwiJGlkZW50aXR5X2xvZ2luX2lkIjoiMTI0MzA3Mjk1NyJ9%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221243072957%22%7D%7D; userPreferredCurrency=USD_USD; _gcl_au=1.1.755273243.1784622841; _uetvid=ee84368084de11f1bab6f3dd0938120c; aws-waf-token=6957a2c3-542a-4819-8ca4-129a00800b51:AQoAfOpYIn4FAAAA:LMuuHAwfjEqQ5yRaGPYQACZ1SynT2a+FLdwhL1KWA2/CDrCkqMtodWZMV5FGeykwQTu+T/e4mYWHRnQ/WkAcZARZxgPia4u32mC3436686vcRd6WUe25FrouHf4zBi33l15+xab1fPWfX0tuytlDXjK5WwlGsqSv57EwejDvAUakb/SrszZD75C0ff+bkVMpSORew43lZ69wmfbP4PELrhHDg9cwHX1wpqRVULYJwyMv5z5eZz+za1lmtGMjND+sTm6TIDpIdvXj; _gid=GA1.2.168006475.1784896831; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; g_state={"i_l":0,"i_ll":1784930857994,"i_b":"4Jy+KY8TkPWMy29knfYSzbEYQUDgDNehQ12eSiYgTwY","i_e":{"enable_itp_optimization":24},"i_et":1784930857994}; BNC_FV_KEY_T=101-TS2vIZ4AxtwOfheK3b7yo9DXYannOutll1fkjOchOeor7Rriqx6KEoDtOOcNIHqUvgLDU2%2B7RtP5PgBiZEZxTg%3D%3D-1D0GuGjHiIyVSsCJznHMbA%3D%3D-6d; BNC_FV_KEY_EXPIRE=1785025950438; theme=dark; p20t=web.1243072957.14122033BCFA181F144BC572017CF8C7; _ga=GA1.1.2076591487.1784622596; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Jul+26+2026+04%3A50%3A09+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=c6ec02be-dae4-4461-bc5f-344aa724fcd7&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1784622593&intType=1&crTime=1784622596175&geolocation=KR%3B11&AwaitingReconsent=false; _ga_3WP50LGEEC=GS2.1.s1785011798$o6$g1$t1785012610$j57$l0$h0"""
+    # csrf_token = "8f974eb25ea628f9c9f9bc47dd5bcf8f"
+    # is_success = toggle_binance_follow("CfexsWwIVYYbr1N5GJXlVQ", "follow", my_cookies, csrf_token)
 
     # login_and_save_session()                # 初次手动登录并固化 Session
     open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
 
-    test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
+    test_url = "https://www.binance.com/zh-CN/square/post/30969247525582"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
     test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
     my_urls = [
         {"text": "带单", "url": "https://www.binance.com/zh-CN/square/post/309692475255842"},
-        {"text": "带单高手", "url": "https://www.binance.com/zh-CN/square/post/309692475255842"},
     ]
 
     err, success, c_id = comment_on_binance_post(
-        post_url=test_url, comment=test_msg, image_path=test_img, url_info_list=my_urls
+        post_url=test_url, comment=test_msg, image_path=test_img, url_info_list=my_urls,debug=True
     )
 
     if success:
