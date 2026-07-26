@@ -221,7 +221,7 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
     """
     if os.path.exists(output_file):
         logger.info(f"统计文件 [{output_file}] 已存在，直接加载跳过重算。")
-        # return pd.read_csv(output_file)
+        return pd.read_csv(output_file)
 
     # 1. 内存级缓存加载，避免多遍读写 CSV
     data_cache = {}
@@ -370,7 +370,8 @@ def get_latest_price(symbol):
     return None
 
 
-def calculate_final_score(df, margin_info):
+
+def calculate_final_score(df, margin_info, up_pct_target=10):
     """
     What & Why:
     融合实时现价生成最终资金分配策略得分。
@@ -378,14 +379,21 @@ def calculate_final_score(df, margin_info):
     采用“不破坏原有 DataFrame”设计模式。
     （新增1：关于 New_Theory_Lowest_Price 的等效回撤、保证金与评分字段）
     （新增2：基于BTC最新价推导出的理论价，以及现价偏离该理论价的百分比）
-    （新增3：基于当前最新价计算上涨20%的价格）
+    （修改3：将上涨目标参数化，默认上涨20%，计算目标价格以及达到目标后的新分数）
+    （新增4：反推计算达到对标 BTC 当前 new_score 所需的理论涨跌幅及具体价格）
+    （新增5：反推计算达到对标 BTC 上涨后 new_score 所需的理论涨跌幅及具体价格）
     """
     result_df = df.copy()
     latest_prices_dict = {}
 
     btc_drop_pct = None
     new_btc_drop_pct = None
-    btc_price = None  # 将 btc_price 提出来供全局计算使用
+    btc_price = None
+    btc_new_score = None  # 存储 BTC 当前的最终分数
+
+    # [新增] 存储 BTC 上涨 up_pct_target 后的状态标杆
+    new_btc_drop_pct_at_target = None
+    btc_up_target_new_score = None
 
     # 1. 批量预取现价，锁定 BTC 实时回撤底线
     for coin in result_df['Coin']:
@@ -398,15 +406,33 @@ def calculate_final_score(df, margin_info):
 
         btc_theory_lowest = btc_row.iloc[0]['Theory_Lowest_Price']
         new_btc_theory_lowest = btc_row.iloc[0]['New_Theory_Lowest_Price']
+        btc_avg_score = btc_row.iloc[0]['Avg_Score']
 
         if btc_price and btc_price > 0:
+            # BTC上涨后目标价
+            btc_up_price = btc_price * (1 + up_pct_target / 100.0)
+
             # 原有逻辑：BTC基于旧理论价格的跌幅
             if pd.notna(btc_theory_lowest):
                 btc_drop_pct = max(0.0, (btc_price - btc_theory_lowest) / btc_price * 100)
 
-            # 之前新增：BTC基于新理论价格的跌幅
+            # 基于新理论价格的跌幅及分数推导
             if pd.notna(new_btc_theory_lowest):
+                # 【当前状态】BTC现价跌幅与分数
                 new_btc_drop_pct = max(0.0, (btc_price - new_btc_theory_lowest) / btc_price * 100)
+                btc_new_margin_key = min(margin_info.keys(),
+                                         key=lambda k: abs(k - new_btc_drop_pct)) if margin_info else 0.0
+                btc_new_req_margin = margin_info.get(btc_new_margin_key, 0.0)
+                if btc_new_req_margin > 0:
+                    btc_new_score = (btc_avg_score / btc_new_req_margin * 10000)
+
+                # 【未来状态】BTC上涨 up_pct_target 后的跌幅与分数
+                new_btc_drop_pct_at_target = max(0.0, (btc_up_price - new_btc_theory_lowest) / btc_up_price * 100)
+                btc_up_margin_key = min(margin_info.keys(),
+                                        key=lambda k: abs(k - new_btc_drop_pct_at_target)) if margin_info else 0.0
+                btc_up_req_margin = margin_info.get(btc_up_margin_key, 0.0)
+                if btc_up_req_margin > 0:
+                    btc_up_target_new_score = (btc_avg_score / btc_up_req_margin * 10000)
 
     # 2. 动态计分评估 (扩充了字典以存储新分数及计算字段)
     metrics = {
@@ -414,7 +440,9 @@ def calculate_final_score(df, margin_info):
         'drop_pct': [], 'margin': [], 'score': [],
         'new_drop_pct': [], 'new_margin': [], 'new_score': [],
         'latest_theory_price': [], 'deviation_pct': [],
-        'up_20pct_price': []  # [最新增量字段3]
+        'req_pct_for_btc_score': [], 'target_price_for_btc_score': [],
+        'up_target_price': [], 'up_target_new_score': [],  # [修改/新增字段3：参数化上涨价格及该价格下的新分数]
+        'req_pct_for_btc_up_score': [], 'target_price_for_btc_up_score': []  # [新增字段5：对标BTC上涨后分数所需的具体目标价及跌幅]
     }
 
     for _, row in result_df.iterrows():
@@ -422,27 +450,42 @@ def calculate_final_score(df, margin_info):
         avg_score = row['Avg_Score']
         theory_lowest = row['Theory_Lowest_Price']
         new_theory_lowest = row['New_Theory_Lowest_Price']
-        max_ratio = row.get('Max_Ratio_vs_BTC', None)  # 获取历史计算的最大比例
+        max_ratio = row.get('Max_Ratio_vs_BTC', None)
 
         price = latest_prices_dict.get(coin)
         metrics['price'].append(price)
 
-        # -------------------- [新增逻辑3] 计算上涨20%的价格 --------------------
+        # ==================== [修改/新增逻辑3] 计算上涨 up_pct_target 后的价格及其分数 ====================
+        up_price = None
+        up_target_score = None
+
         if price and price > 0:
-            metrics['up_20pct_price'].append(price * 1.20)
-        else:
-            metrics['up_20pct_price'].append(None)
+            up_price = price * (1 + up_pct_target / 100.0)
+
+            # 计算如果在 up_price 时，该币的 new_score 会是多少
+            if pd.notna(new_theory_lowest):
+                drop_at_up = max(0.0, (up_price - new_theory_lowest) / up_price * 100)
+                # 依然需要严格遵守不得小于（对应状态下）BTC跌幅的约束
+                if new_btc_drop_pct_at_target is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
+                    drop_at_up = max(drop_at_up, new_btc_drop_pct_at_target)
+
+                up_req_margin_key = min(margin_info.keys(), key=lambda k: abs(k - drop_at_up)) if margin_info else 0.0
+                up_req_margin = margin_info.get(up_req_margin_key, 0.0)
+
+                if up_req_margin > 0:
+                    up_target_score = (avg_score / up_req_margin * 10000)
+
+        metrics['up_target_price'].append(up_price)
+        metrics['up_target_new_score'].append(up_target_score)
 
         # ==================== [原有逻辑] 基于 Theory_Lowest_Price ====================
         if price and pd.notna(theory_lowest) and price > 0:
             drop_pct = max(0.0, (price - theory_lowest) / price * 100)
 
-            # 严格约束：山寨币距离理论低点的回撤跌幅不得小于 BTC 的现有跌幅
             if btc_drop_pct is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
                 drop_pct = max(drop_pct, btc_drop_pct)
             metrics['drop_pct'].append(drop_pct)
 
-            # 就近匹配保证金档位
             req_margin = min(margin_info.keys(), key=lambda k: abs(k - drop_pct)) if margin_info else 0.0
             req_margin = margin_info.get(req_margin, 0.0)
             metrics['margin'].append(req_margin)
@@ -458,7 +501,6 @@ def calculate_final_score(df, margin_info):
         if price and pd.notna(new_theory_lowest) and price > 0:
             new_drop_pct = max(0.0, (price - new_theory_lowest) / price * 100)
 
-            # 新维度的严格约束：山寨币距离新理论低点的回撤不得小于 BTC 基于新理论的现有跌幅
             if new_btc_drop_pct is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
                 new_drop_pct = max(new_drop_pct, new_btc_drop_pct)
             metrics['new_drop_pct'].append(new_drop_pct)
@@ -478,16 +520,57 @@ def calculate_final_score(df, margin_info):
         ltp = None
         dev_pct = None
 
-        # 只要目前拿到BTC价格，并且当前币种算出了最大比例
         if btc_price and pd.notna(max_ratio) and max_ratio > 0:
-            ltp = btc_price / max_ratio  # 计算：基于BTC最新价的理论价格
+            ltp = btc_price / max_ratio
 
             if price and pd.notna(ltp) and ltp > 0:
-                # 计算偏差百分比： (现价 - 理论价) / 理论价 * 100
                 dev_pct = (price - ltp) / ltp * 100
 
         metrics['latest_theory_price'].append(ltp)
         metrics['deviation_pct'].append(dev_pct)
+
+        # ==================== [新增逻辑4] 反推同等 BTC 当前分数所需的理论涨跌幅及具体价格 ====================
+        req_pct = None
+        req_target_price = None
+
+        if btc_new_score is not None and btc_new_score > 0 and price and price > 0 and pd.notna(
+                new_theory_lowest) and margin_info:
+            if coin.upper() in ['BTC', 'BTCUSDT']:
+                req_pct = 0.0
+                req_target_price = price
+            else:
+                target_margin = (avg_score / btc_new_score) * 10000
+                best_k = min(margin_info.keys(), key=lambda k: abs(margin_info[k] - target_margin))
+
+                if best_k < 100:
+                    p_target = new_theory_lowest / (1 - best_k / 100.0)
+                    req_target_price = p_target
+                    req_pct = (p_target - price) / price * 100
+
+        metrics['req_pct_for_btc_score'].append(req_pct)
+        metrics['target_price_for_btc_score'].append(req_target_price)
+
+        # ==================== [新增逻辑5] 反推同等 BTC 上涨后分数所需的理论涨跌幅及具体价格 ====================
+        req_up_pct = None
+        req_up_target_price = None
+
+        if btc_up_target_new_score is not None and btc_up_target_new_score > 0 and price and price > 0 and pd.notna(
+                new_theory_lowest) and margin_info:
+            if coin.upper() in ['BTC', 'BTCUSDT']:
+                req_up_pct = up_pct_target  # BTC自身对标未来状态所需涨幅就是参数设定的涨幅
+                req_up_target_price = up_price
+            else:
+                # 反推所需的保证金数值，目标是BTC上涨后的新分数
+                target_margin_up = (avg_score / btc_up_target_new_score) * 10000
+                best_k_up = min(margin_info.keys(), key=lambda k: abs(margin_info[k] - target_margin_up))
+
+                if best_k_up < 100:
+                    p_target_up = new_theory_lowest / (1 - best_k_up / 100.0)
+                    req_up_target_price = p_target_up
+                    req_up_pct = (p_target_up - price) / price * 100
+
+        metrics['req_pct_for_btc_up_score'].append(req_up_pct)
+        metrics['target_price_for_btc_up_score'].append(req_up_target_price)
 
     # 3. 数据融合与输出整理
     result_df['最新价格'] = metrics['price']
@@ -506,15 +589,21 @@ def calculate_final_score(df, margin_info):
     result_df['基于当前BTC的理论价格'] = metrics['latest_theory_price']
     result_df['现价偏离理论价(%)'] = metrics['deviation_pct']
 
-    # 填充新增逻辑3字段（上涨20%目标价）
-    result_df['上涨20%目标价'] = metrics['up_20pct_price']
+    # 填充新增逻辑4字段（对标BTC当前分数所需目标价及涨跌幅）
+    result_df['对标BTC分数所需目标价'] = metrics['target_price_for_btc_score']
+    result_df['对标BTC分数所需涨跌幅(%)'] = metrics['req_pct_for_btc_score']
+
+    # 填充修改/新增的逻辑3和5字段（动态字段名，体现参数变量）
+    result_df[f'上涨{up_pct_target}%目标价'] = metrics['up_target_price']
+    result_df[f'上涨{up_pct_target}%后新分数'] = metrics['up_target_new_score']
+    result_df[f'对标BTC上涨{up_pct_target}%分数所需目标价'] = metrics['target_price_for_btc_up_score']
+    result_df[f'对标BTC上涨{up_pct_target}%分数所需涨跌幅(%)'] = metrics['req_pct_for_btc_up_score']
 
     # 保持对原有排序逻辑不干扰，依旧采用旧的最终分数进行主要排序
     result_df.sort_values(by='最终分数', ascending=False, inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
     return result_df
-
 
 def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0.05):
     """
