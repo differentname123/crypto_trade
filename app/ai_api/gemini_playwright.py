@@ -472,7 +472,7 @@ def _wait_and_get_response(page):
 # ==============================================================================
 
 def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-flash-latest"):
+                           model_name="gemini-flash-latest", debug=False):
     """
     用指定登录会话启动浏览器, 完成"(可选上传)-提交-抓取"一次问答。
 
@@ -501,7 +501,37 @@ def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
 
         with sync_playwright() as p:
             try:
-                context = _launch_persistent_browser(p, user_data_dir)
+                # 【修改点】: 引入 debug 控制，替换原先的 _launch_persistent_browser
+                if debug:
+                    # 能够看到窗口的模式
+                    context = p.chromium.launch_persistent_context(
+                        channel="chrome",
+                        user_data_dir=user_data_dir,
+                        headless=False,
+                        args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--disable-gpu', '--window-position=0,0'],
+                        ignore_default_args=["--enable-automation"]
+                    )
+                else:
+                    # 将窗口位置移动到屏幕显示范围之外
+                    context = p.chromium.launch_persistent_context(
+                        channel="chrome",
+                        user_data_dir=user_data_dir,
+                        headless=False,
+                        viewport={'width': 1920, 'height': 1080},
+                        args=[
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-gpu',
+                            '--window-position=-10000,-10000',
+                            '--no-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-renderer-backgrounding',
+                            '--disable-background-timer-throttling',
+                            '--disable-backgrounding-occluded-windows',
+                            '--disable-features=CalculateNativeWinOcclusion',
+                            '--disable-breakpad',
+                        ],
+                        ignore_default_args=["--enable-automation"]
+                    )
             except Exception as e:
                 raise Exception(f"启动浏览器失败, 请确认 Chrome 是否已安装/已关闭占用: {e}")
 
