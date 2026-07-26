@@ -902,7 +902,12 @@ def main_app():
             min_price=25, max_price=93, price_ratio=1.3, quantity=1,
         ),  # 消耗  464  u 网格数量 101
 
-        # 总共节点和为 163 实际app上是 163 个节点才行，多了或者少了都要排查
+        GridConfig(
+            strategy_id=f"STX{current_symbol}", symbol="STX/USDT:USDT",
+            min_price=0.05, max_price=0.163, price_ratio=0.92, quantity=100,
+        ),  # 消耗  132  u 网格数量 129
+
+        # 总共节点和为 62+101+129=292 个节点, 资金消耗约 581+464+132=1177 u
     ]
     processes = []
     for config in configs:

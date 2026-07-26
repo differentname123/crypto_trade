@@ -18,6 +18,8 @@
 """
 
 import os
+
+import numpy as np
 import pandas as pd
 import requests
 
@@ -219,7 +221,7 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
     """
     if os.path.exists(output_file):
         logger.info(f"统计文件 [{output_file}] 已存在，直接加载跳过重算。")
-        return pd.read_csv(output_file)
+        # return pd.read_csv(output_file)
 
     # 1. 内存级缓存加载，避免多遍读写 CSV
     data_cache = {}
@@ -262,6 +264,36 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
             ratio_resample_rule=ratio_resample_rule,
             ratio_window_days=ratio_window_days
         )
+
+        # ================== 新增：计算最优网格间距并集成结果 ==================
+        # 考虑到 df 的 'open_time' 已经被 _prepare_dataframe 转化为了 index (DatetimeIndex)
+        # 为兼容 optimize_grid_interval 内部基于毫秒时间戳的 365 天截取逻辑，我们将其还原为整数类型的 open_time 列
+        temp_df = df.copy()
+        if 'open_time' not in temp_df.columns and temp_df.index.name == 'open_time':
+            temp_df['open_time'] = temp_df.index.astype('int64') // 10**6
+
+        optimal_results = optimize_grid_interval(
+            temp_df,
+            step_pct=0.01,
+            min_pct=0.2,
+            max_pct=2.0,
+            fee_pct=0.04
+        )
+        # 过滤得到optimal_results中Trades大于 365
+        optimal_results = optimal_results[optimal_results['Trades'] > 365*5]
+        if not optimal_results.empty:
+            best_grid = optimal_results.iloc[0]
+            coin_result['Best_Grid_Interval_Pct'] = best_grid['Grid_Interval_Pct']
+            coin_result['Best_Grid_Interval_Float'] = best_grid['Interval_Float']
+            coin_result['Best_Grid_Trades'] = best_grid['Trades']
+            coin_result['Best_Grid_Score'] = best_grid['Score']
+        else:
+            coin_result['Best_Grid_Interval_Pct'] = None
+            coin_result['Best_Grid_Interval_Float'] = None
+            coin_result['Best_Grid_Trades'] = None
+            coin_result['Best_Grid_Score'] = None
+        # ======================================================================
+
         results.append(coin_result)
         logger.info(f"[{coin_name}] 静态特征提取完成")
 
@@ -304,7 +336,8 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
         'Avg_Score', 'Max_Price', 'Max_Price_Time', 'Max_DD(%)', 'Theory_DD(%)', 'Theory_Lowest_Price',
         'Max_DD_Start_Time', 'Max_DD_Start_Price', 'Max_DD_End_Time', 'Max_DD_End_Price',
         'Max_Ratio_vs_BTC', 'Max_Ratio_Time', 'BTC_Price_At_Max_Ratio', 'Coin_Price_At_Max_Ratio',
-        'New_Theory_Lowest_Price'
+        'New_Theory_Lowest_Price',
+        'Best_Grid_Interval_Pct', 'Best_Grid_Interval_Float', 'Best_Grid_Trades', 'Best_Grid_Score'
     ])
 
     final_df = final_df[[col for col in ordered_columns if col in final_df.columns]]
@@ -482,6 +515,149 @@ def calculate_final_score(df, margin_info):
 
     return result_df
 
+
+def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0.05):
+    """
+    寻找最优网格间距 (支持多种时间格式与DatetimeIndex自适应，并加入全链路日志)
+
+    参数:
+    df: 包含K线数据的DataFrame，需包含 'open', 'high', 'low', 'close' 列。
+        时间列支持 DatetimeIndex 或名为 'open_time' 的列(格式可以是datetime或时间戳)。
+    step_pct: 步长(%)，默认 0.1 (即0.1%)
+    min_pct: 最小间距(%)，默认 0.2 (即0.2%)
+    max_pct: 最大间距(%)，默认 3.0 (即3.0%)
+    fee_pct: 手续费率(%)，默认 0.05 (即0.05%)
+
+    返回:
+    包含不同网格间距统计数据的结果表格，按分数降序排列
+    """
+    logger.info(f"开始进行网格间距寻优 | 区间: {min_pct}% ~ {max_pct}% | 步长: {step_pct}%")
+    original_len = len(df)
+
+    # ---------------- 优化：自适应时间截取逻辑 ----------------
+    # 目标：截取最近 365 天的数据，兼容 DatetimeIndex 和 open_time (时间戳或datetime) 列
+    try:
+        if isinstance(df.index, pd.DatetimeIndex):
+            # 场景 1: 索引已经是 DatetimeIndex (如经 _prepare_dataframe 处理后)
+            max_time = df.index.max()
+            cutoff_time = max_time - pd.Timedelta(days=365)
+            df = df[df.index >= cutoff_time].copy()
+
+        elif 'open_time' in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df['open_time']):
+                # 场景 2: open_time 列是 datetime 对象
+                max_time = df['open_time'].max()
+                cutoff_time = max_time - pd.Timedelta(days=365)
+                df = df[df['open_time'] >= cutoff_time].copy()
+            else:
+                # 场景 3: open_time 是数值型时间戳 (需动态判断是毫秒还是秒)
+                max_time = df['open_time'].max()
+                # 如果最大时间戳大于 10^12，说明通常是毫秒 (2001-09-09 之后的毫秒都大于 10^12)
+                if max_time > 1e12:
+                    offset = 365 * 24 * 60 * 60 * 1000
+                else:
+                    offset = 365 * 24 * 60 * 60
+                cutoff_time = max_time - offset
+                df = df[df['open_time'] >= cutoff_time].copy()
+        else:
+            logger.warning("未检测到有效的时间轴 (DatetimeIndex 或 open_time)，将使用全量数据进行网格寻优。")
+
+        filtered_len = len(df)
+        if filtered_len < original_len:
+            logger.info(f"时间范围截取完成: 截取最近 365 天数据 | 记录数: {original_len} -> {filtered_len}")
+
+    except Exception as e:
+        logger.error(f"时间过滤逻辑发生异常，将使用全量数据进行寻优: {e}")
+
+    if df.empty:
+        logger.warning("截取最近365天后，数据量为空，退出寻优。")
+        return pd.DataFrame()
+    # ---------------------------------------------------
+
+    # 1. 确保核心列的数据类型为浮点数
+    cols = ['open', 'high', 'low', 'close']
+    for col in cols:
+        if df[col].dtype != np.float64:
+            df[col] = df[col].astype(float)
+
+    # 2. 将百分比参数转换为实际小数
+    step = step_pct / 100.0
+    fee = fee_pct / 100.0
+    min_interval = min_pct / 100.0
+    max_interval = max_pct / 100.0
+
+    # 3. 获取DF中的最高价作为网格基准点 (锚点)
+    max_price = df['high'].max()
+
+    # 4. 生成需要遍历的间距列表 (使用 round 避免浮点数精度问题)
+    num_steps = int(round((max_interval - min_interval) / step)) + 1
+    intervals = [round(min_interval + i * step, 5) for i in range(num_steps)]
+
+    # ================= 核心提速区：数据向量化准备 =================
+    o_vals = df['open'].values
+    h_vals = df['high'].values
+    l_vals = df['low'].values
+    c_vals = df['close'].values
+
+    is_bull = c_vals > o_vals
+    p1 = np.where(is_bull, l_vals, h_vals)
+    p2 = np.where(is_bull, h_vals, l_vals)
+    p3 = c_vals
+
+    n = len(df)
+    all_prices = np.empty(n * 3 + 1, dtype=np.float64)
+    all_prices[0] = o_vals[0]
+    all_prices[1::3] = p1
+    all_prices[2::3] = p2
+    all_prices[3::3] = p3
+    # ==============================================================
+
+    results = []
+
+    # 5. 遍历每个间距进行回测
+    for interval in intervals:
+        spacing_abs = max_price * interval
+        if spacing_abs == 0:
+            continue
+
+        # ================= 核心提速区：真实网格状态机模拟 =================
+        zones = np.floor((max_price - all_prices) / spacing_abs).astype(np.int32)
+        diffs = np.diff(zones)
+        change_idx = np.where(diffs != 0)[0]
+
+        if len(change_idx) > 0:
+            lines_crossed = np.maximum(zones[change_idx], zones[change_idx + 1])
+            valid_mask = np.concatenate(([True], np.diff(lines_crossed) != 0))
+            valid_lines = lines_crossed[valid_mask]
+
+            trades = len(valid_lines) - 1
+            trades = max(0, trades)
+        else:
+            trades = 0
+        # ================================================================
+
+        # 6. 计算分数: (单次网格利润 - 手续费) * 交易次数 * 资金复用率权重(interval)
+        score = (interval - fee) * trades * interval
+
+        results.append({
+            'Grid_Interval_Pct': f"{interval * 100:.1f}%",
+            'Interval_Float': interval,
+            'Trades': int(trades),
+            'Score': score
+        })
+
+    # 7. 汇总结果并按得分降序排序
+    result_df = pd.DataFrame(results)
+    if not result_df.empty:
+        result_df = result_df.sort_values(by='Score', ascending=False).reset_index(drop=True)
+        best_cfg = result_df.iloc[0]
+        logger.info(
+            f"寻优完成 | 测试组合数: {len(intervals)} | 最优间距: {best_cfg['Grid_Interval_Pct']} | 模拟成交: {best_cfg['Trades']} 次 | 得分: {best_cfg['Score']:.4f}")
+    else:
+        logger.warning("未能计算出任何有效的网格间距。")
+
+    return result_df
+
 if __name__ == "__main__":
     temp_path = "test.json"
     read_json(temp_path)
@@ -504,7 +680,6 @@ if __name__ == "__main__":
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2021-01-01_merged.csv"},
         {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2021-01-01_merged.csv"}
     ]
-
     raw_margin_info = read_json("margin_info.json")
     margin_info = {float(k): v for k, v in raw_margin_info.items()} if raw_margin_info else {}
 
