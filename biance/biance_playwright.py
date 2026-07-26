@@ -491,10 +491,23 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 response = page.goto(post_url, timeout=60000)
                 page.wait_for_load_state("domcontentloaded", timeout=60000)
 
-                # 🚀 新增修复1：帖子已删除的快速拦截机制（如返回 404/403/410 等）
+                # 🚀 新增修复1：帖子已删除的快速拦截机制（增强版：涵盖 4xx/5xx 及 301/302 URL漂移）
+                # 1. 拦截标准 HTTP 错误
                 if response and response.status >= 400:
                     error_info = f"页面加载异常或帖子已被删除 (HTTP 状态码: {response.status})"
                     logger.info(f"[Main/Nav] 嗅探到无效页面 | 原因: 【{error_info}】 | 结果: [Failed]")
+                    return error_info, False, None
+
+                # 2. 拦截 301/302 导致的 URL 漂移 (核心修复：解决 301 Moved Permanently 导致的页面假死)
+                import urllib.parse
+                # 健壮提取帖子ID，剔除可能存在的 query 参数和尾随斜杠
+                post_id = str(post_url).split('?')[0].strip('/').split('/')[-1]
+                current_url_decoded = urllib.parse.unquote(page.url)
+
+                # 如果当前最终落地的 URL 中不包含目标帖子 ID，判定为被重定向到了广场首页或 404 页
+                if post_id and post_id not in current_url_decoded:
+                    error_info = f"页面发生重定向，目标帖子已被删除或失效 | 原帖子ID: {post_id} | 现落地URL: {current_url_decoded}"
+                    logger.info(f"[Main/Nav] 拦截到重定向漂移 | 原因: 【{error_info}】 | 结果: [Failed]")
                     return error_info, False, None
 
                 # 登录态嗅探：出现 login 链接即判定 Cookie 过期

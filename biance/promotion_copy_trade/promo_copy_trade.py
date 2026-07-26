@@ -9,7 +9,7 @@
 #   3. [发布] DB 拉带评论帖 -> 组装带引流链接的评论 -> comment_on_binance_post 发帖 -> 回写 promo_comment_info。
 # [输出数据]: 副作用为主 —— 向 MongoDB 帖子文档追加 promo_comment(生成结果) 与 promo_comment_info(发布状态)。
 # ==========================================
-
+import datetime
 import re
 import time
 import threading
@@ -276,34 +276,41 @@ def gen_all_promo_comments():
         time.sleep(SCHEDULE_INTERVAL_SEC)
 
 
-def get_existing_promo_comments(limit=POST_QUERY_LIMIT):
+def get_existing_promo_comments(limit=POST_QUERY_LIMIT, hours_ago=12):
     """
     导出已生成推广评论的合规帖子，聚合"清洗后原文 + 评论结果"供离线分析。
-    [入参 Shape]: limit(int) DB 查询上限。
-    [出参 Shape]: [{"cleaned_post": format_post_for_promo 结构, "comment_info": promo_comment 结构}, ...]。
     """
     post_manager = UniversalPostManager(gen_db_object())
+
+    # 1. 定义时间阈值
+    time_threshold = datetime.datetime.now() - datetime.timedelta(hours=hours_ago)
 
     try:
         existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=limit)
     except Exception as e:
-        logger.error(f"[数据导出/失败] 无法从数据库读取帖子，可能是 DB 连接异常 | 结果: 【失败原因: {e}】")
+        logger.error(f"[数据导出/失败] 无法从数据库读取帖子 | 结果: 【失败原因: {e}】")
         raise
 
     result_list = []
     for post in existing_posts:
+        # 2. 提取帖子的更新时间
+        db_update_time = post.get("db_update_time")
+
+        # 3. 时间过滤：如果帖子没有更新时间，或者更新时间早于阈值，则跳过
+        if not db_update_time or db_update_time < time_threshold:
+            continue
+
         comment_info = post.get("promo_comment")
-        # 卫语句：跳过尚未生成评论 / 已不符合推广条件的脏数据
         if not comment_info or not is_valid_post_for_promo(post):
             continue
+
         result_list.append({
             "cleaned_post": format_post_for_promo(post),
             "comment_info": comment_info
         })
 
-    logger.info(f"[数据导出/完成] 聚合已生成评论的合规帖子 | 结果: 【聚合总数: {len(result_list)} 条】")
+    logger.info(f"[数据导出/完成] 聚合最近 {hours_ago} 小时内合规帖子 | 结果: 【聚合总数: {len(result_list)} 条】")
     return result_list
-
 
 def clear_all_promo_comments_batch():
     """
