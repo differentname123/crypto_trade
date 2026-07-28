@@ -23,7 +23,7 @@ import shutil
 import sys
 import time
 import traceback
-
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, expect, TimeoutError as PlaywrightTimeoutError
 
 from biance.biance_squre_api import toggle_binance_follow
@@ -41,8 +41,8 @@ LOGIN_URL = 'https://www.binance.com/zh-CN/login'
 RE_MORE = re.compile(r"更多|More|Options|Expand", re.IGNORECASE)
 RE_ADD_LINK = re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
 RE_CONFIRM = re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
-RE_SEND = re.compile(r"回复|发送|Reply|Comment", re.IGNORECASE)
-RE_SEND_EXACT = re.compile(r"^回复$|^发送$|^Reply$|^Comment$", re.IGNORECASE)
+RE_SEND = re.compile(r"回复|发送|评论|Reply|Comment|Send|Post", re.IGNORECASE)
+RE_SEND_EXACT = re.compile(r"^(回复|发送|评论|Reply|Comment|Send|Post)$", re.IGNORECASE)
 
 
 class PageCrashedException(Exception):
@@ -436,6 +436,26 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     return comment_id
 
 
+def extract_binance_post_id(url):
+    if not url or not isinstance(url, str):
+        return None
+
+    try:
+        url = url.strip()
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+
+        parsed = urlparse(url)
+
+        if parsed.hostname not in ('www.binance.com', 'binance.com'):
+            return None
+
+        match = re.search(r'/square/post/(\d+)', parsed.path)
+        return match.group(1) if match else None
+
+    except Exception:
+        return None
+
 def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=USER_DATA_DIR, url_info_list=None,
                             debug=False):
     """
@@ -448,6 +468,8 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
     logger.info(f"\n{'=' * 60}")
     logger.info(f"[Main/Task] 启动自动化发帖任务 | 目标URL: <{post_url}> | 结果: [初始化]")
     logger.info(f"{'=' * 60}")
+    # 解析出post_id 也就是最后的内容
+    post_id = extract_binance_post_id(post_url)
 
     # sync_playwright 提到最外层，确保底层引擎崩溃与业务异常分层捕获、上下文不被误销毁
     try:
@@ -565,7 +587,7 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                     try:
                         ts = int(time.time())
                         context.pages[0].screenshot(path=f"timeout_screenshot_{ts}.png")
-                        with open(f"timeout_html_{ts}.html", "w", encoding="utf-8") as f:
+                        with open(f"timeout_html_{ts}_{post_id}.html", "w", encoding="utf-8") as f:
                             f.write(context.pages[0].content())
                         logger.info(f"[Main/Debug] 超时现场已保留 | 产物时间戳: 【{ts}】 | 结果: [Saved]")
                     except Exception as s_e:
@@ -583,7 +605,7 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                     try:
                         ts = int(time.time())
                         context.pages[0].screenshot(path=f"error_screenshot_{ts}.png")
-                        with open(f"error_html_{ts}.html", "w", encoding="utf-8") as f:
+                        with open(f"error_html_{ts}_{post_id}.html", "w", encoding="utf-8") as f:
                             f.write(context.pages[0].content())
                         logger.info(f"[Main/Debug] 故障现场已保留 | 产物时间戳: 【{ts}】 | 结果: [Saved]")
                     except Exception as s_e:
