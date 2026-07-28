@@ -320,39 +320,7 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             logger.info(
                 f"[Editor/Image] 图片上传失败，自动降级为纯文本 | 可能原因: 【文件损坏或上传控件不可用: {e}】 | 结果: [Warning]")
 
-    # ---- 步骤 3：注入正文（含框架静默清空的补录兜底） ----
-    if comment.strip():
-        logger.info(f"[Editor/Text] 填入正文内容 | 长度: <{len(comment)}> | 结果: [输入中]")
-        real_editor.click(timeout=10000)
-        page.wait_for_timeout(800)
-        real_editor.press_sequentially(comment, delay=60)
-        page.wait_for_timeout(500)
-
-        if not real_editor.inner_text().strip():  # 防前端框架拦截导致静默清空
-            logger.info(f"[Editor/Text] 检测到文本被静默清空，触发重试补录 | 动作: [Retry]")
-            real_editor.click(timeout=10000)
-            real_editor.press_sequentially(comment, delay=60)
-        logger.info(f"[Editor/Text] 文本输入完成 | 状态: [Success]")
-    else:
-        real_editor.click(timeout=10000)
-        page.wait_for_timeout(500)
-
-    # 🚀🚀🚀 新增核心修复：强制光标置底，防止中心 Click 导致光标乱窜 🚀🚀🚀
-    logger.info(f"[Editor/Focus] 锁定光标到文本绝对末尾 | 结果: [执行中]")
-    page.evaluate("""(element) => {
-        element.focus();
-        if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
-            let range = document.createRange();
-            range.selectNodeContents(element);
-            range.collapse(false); // false 意味着折叠到 Range 的末尾
-            let sel = window.getSelection();
-            sel.removeAllRanges();
-            sel.addRange(range);
-        }
-    }""", real_editor.element_handle())
-    page.wait_for_timeout(300)
-
-    # ---- 步骤 4：注入超链接（逐条注入，单条失败自动跳过） ----
+    # ---- 步骤 3：注入超链接（调整为先注入，让超链接垫底） ----
     if isinstance(url_info_list, list) and url_info_list:
         logger.info(f"[Editor/Link] 检测到超链接任务 | 数量: <{len(url_info_list)}> | 结果: [启动注入流]")
         for idx, url_info in enumerate(url_info_list):
@@ -365,6 +333,46 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             if not re.match(r"^https?://", link_url, re.IGNORECASE):
                 link_url = "https://" + link_url
             _inject_single_link(page, editor_container, real_editor, link_text, link_url, idx)
+
+    # 🚀🚀🚀 新增核心修复：强制光标往前（置顶），防止在超链接后输入 🚀🚀🚀
+    logger.info(f"[Editor/Focus] 锁定光标到文本绝对头部 | 结果: [执行中]")
+    page.evaluate("""(element) => {
+        element.focus();
+        if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
+            let range = document.createRange();
+            range.selectNodeContents(element);
+            range.collapse(true); // true 意味着折叠到 Range 的头部 (前端/开头)
+            let sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+    }""", real_editor.element_handle())
+    page.wait_for_timeout(300)
+
+    # ---- 步骤 4：注入正文（光标已前置，输入的文本会顶在超链接前面） ----
+    if comment.strip():
+        logger.info(f"[Editor/Text] 填入正文内容 | 长度: <{len(comment)}> | 结果: [输入中]")
+        # ⚠️ 此处移除原版的 real_editor.click()。因为 click 默认点击元素中心，极易导致光标重新跳回已注入的超链接中。
+        page.wait_for_timeout(800)
+        real_editor.press_sequentially(comment, delay=60)
+        page.wait_for_timeout(500)
+
+        if not real_editor.inner_text().strip():  # 防前端框架拦截导致静默清空
+            logger.info(f"[Editor/Text] 检测到文本被静默清空，触发重试补录 | 动作: [Retry]")
+            # 重试前再次保证光标绝对置顶
+            page.evaluate("""(element) => {
+                element.focus();
+                if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
+                    let range = document.createRange();
+                    range.selectNodeContents(element);
+                    range.collapse(true);
+                    let sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }
+            }""", real_editor.element_handle())
+            real_editor.press_sequentially(comment, delay=60)
+        logger.info(f"[Editor/Text] 文本输入完成 | 状态: [Success]")
 
     # ---- 步骤 5：发送 + API 监听校验 ----
     logger.info(f"[Editor/Submit] 定位发送按钮 | 结果: [执行中]")
@@ -596,7 +604,6 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
         logger.info(f"[Main/Task] Playwright 核心框架崩溃，无法启动浏览器引擎 | 结果: [Failed]")
         return error_info, False, None
 
-
 def get_auth_tokens_robust(user_data_dir):
     if not os.path.exists(user_data_dir):
         logger.info(f"[Auth/Extract] 环境不存在，终止提取 | 目录: <{user_data_dir}>")
@@ -719,9 +726,9 @@ if __name__ == '__main__':
     # is_success = toggle_binance_follow("CfexsWwIVYYbr1N5GJXlVQ", "follow", my_cookies, csrf_token)
 
     # login_and_save_session()                # 初次手动登录并固化 Session
-    open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
+    # open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
 
-    test_url = "https://www.binance.com/zh-CN/square/post/30969247525582"
+    test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
     test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
     my_urls = [
