@@ -367,7 +367,7 @@ def _upload_attachment(page, file_path):
         logger.info(f"[附件上传] 文件上传完成 | [{os.path.basename(f_path)}]")
 
 def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-flash-latest", debug=True):
+                           model_name="gemini-flash-latest", debug=False):
     """
     用指定登录会话启动浏览器, 完成"(可选依次上传多文件)-提交-抓取"一次问答。
 
