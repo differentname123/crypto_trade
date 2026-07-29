@@ -12,7 +12,7 @@
 import re
 import time
 from common.common_utils import setup_logger, read_file_to_str, string_to_object
-from common.vector_utils import VectorSearchEngine
+# from common.vector_utils import VectorSearchEngine
 
 logger = setup_logger(app_name="media_format")
 
@@ -27,107 +27,107 @@ LLM_MAX_RETRIES = 3
 
 
 # 全局初始化向量引擎（单例调用，避免重复加载）
-VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
+# VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
 
 
-def build_search_text(post):
-    """
-    数据降维与高密度提纯：将复杂的帖子格式化字典，提取拼装为高浓度的“超级搜索文本”
-    [入参]: post 帖子全量字典
-    [出参]: 纯字符串 (String)
-    """
-    # 1. 提取并清理正文（利用正则去除无语义的 [插图: url] 占位符噪音）
-    raw_text = post.get("content", {}).get("text_content", "")
-    cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
-
-    # 2. 提取关联币种
-    coins = post.get("content", {}).get("mentioned_coins", [])
-    coins_str = ", ".join(coins) if coins else "无"
-
-    # 3. 基础正文拼装
-    search_text = f"【文章正文】\n{cleaned_text}\n关联币种：{coins_str}\n"
-
-    # 4. 遍历提取媒体特征 (核心维度)
-    media_format = post.get("media_format", [])
-    for i, media in enumerate(media_format):
-        visual_fact = media.get("visual_fact", {})
-        semantic_core = media.get("semantic_core", {})
-        narrative = media.get("narrative_role", {})
-
-        # 合并实体与概念，形成高密度标签
-        concepts = semantic_core.get("concepts", [])
-        entities = visual_fact.get("entities", [])
-        all_concepts_str = ", ".join(concepts + entities)
-
-        desc = visual_fact.get("description", "")
-        ocr = visual_fact.get("ocr_text", "")
-
-        # 合并叙事意图与逻辑桥梁
-        msg = semantic_core.get("message", "")
-        logic = narrative.get("logic_bridge", "")
-        logic_str = f"{msg} {logic}".strip()
-
-        # 拼装单张图片的语义块
-        search_text += f"\n【配图{i + 1}语义解析】\n"
-        search_text += f"核心概念：{all_concepts_str}\n"
-        search_text += f"画面描述：{desc}\n"
-        search_text += f"图文逻辑：{logic_str}\n"
-        # OCR 数据作为最硬核的过滤依据，放在最后
-        search_text += f"关键数据(OCR)：{ocr}\n"
-
-    return search_text.strip()
-
-
-def sync_posts_to_vector_db():
-    """
-    批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
-    由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
-    [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
-    [出参]: 执行状态字典
-    """
-    data_to_add = []
-    post_manager = UniversalPostManager(gen_db_object())
-    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-    # 保留media_format存在的posts
-    filter_posts = [post for post in existing_posts if post.get("media_format")]
-    logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
-
-
-    for post in filter_posts:
-        post_id = post.get("post_id")
-        media_format = post.get("media_format")
-
-        # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
-        if not post_id or not media_format:
-            continue
-
-        search_text = build_search_text(post)
-        data_to_add.append({
-            "id": post_id,
-            "search_text": search_text
-        })
-
-    if data_to_add:
-        logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
-        return VECTOR_ENGINE.add_data(data_to_add)
-
-    return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
-
-
-def search_posts_by_semantics(keywords, top_n=5):
-    """
-    语义搜索函数：根据自然语言关键词，搜索匹配的帖子ID。
-    [入参]: keywords(单个字符串或列表均可，如 "200倍杠杆"), top_n(返回数量)
-    [出参]: 列表，元素结构为 {"id": "xxx", "similarity": 0.85, "matched_keyword": "xxx"}
-    """
-    logger.info(f"[向量库/查询] 正在通过语义搜索匹配：{keywords}")
-    results = VECTOR_ENGINE.search(keywords, top_n=top_n)
-
-    # 打印简要日志以便调试
-    for r in results:
-        logger.info(f" -> 命中 PostID: {r['id']} | 相似度: {r['similarity']:.4f}")
-
-    return results
+# def build_search_text(post):
+#     """
+#     数据降维与高密度提纯：将复杂的帖子格式化字典，提取拼装为高浓度的“超级搜索文本”
+#     [入参]: post 帖子全量字典
+#     [出参]: 纯字符串 (String)
+#     """
+#     # 1. 提取并清理正文（利用正则去除无语义的 [插图: url] 占位符噪音）
+#     raw_text = post.get("content", {}).get("text_content", "")
+#     cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
+#
+#     # 2. 提取关联币种
+#     coins = post.get("content", {}).get("mentioned_coins", [])
+#     coins_str = ", ".join(coins) if coins else "无"
+#
+#     # 3. 基础正文拼装
+#     search_text = f"【文章正文】\n{cleaned_text}\n关联币种：{coins_str}\n"
+#
+#     # 4. 遍历提取媒体特征 (核心维度)
+#     media_format = post.get("media_format", [])
+#     for i, media in enumerate(media_format):
+#         visual_fact = media.get("visual_fact", {})
+#         semantic_core = media.get("semantic_core", {})
+#         narrative = media.get("narrative_role", {})
+#
+#         # 合并实体与概念，形成高密度标签
+#         concepts = semantic_core.get("concepts", [])
+#         entities = visual_fact.get("entities", [])
+#         all_concepts_str = ", ".join(concepts + entities)
+#
+#         desc = visual_fact.get("description", "")
+#         ocr = visual_fact.get("ocr_text", "")
+#
+#         # 合并叙事意图与逻辑桥梁
+#         msg = semantic_core.get("message", "")
+#         logic = narrative.get("logic_bridge", "")
+#         logic_str = f"{msg} {logic}".strip()
+#
+#         # 拼装单张图片的语义块
+#         search_text += f"\n【配图{i + 1}语义解析】\n"
+#         search_text += f"核心概念：{all_concepts_str}\n"
+#         search_text += f"画面描述：{desc}\n"
+#         search_text += f"图文逻辑：{logic_str}\n"
+#         # OCR 数据作为最硬核的过滤依据，放在最后
+#         search_text += f"关键数据(OCR)：{ocr}\n"
+#
+#     return search_text.strip()
+#
+#
+# def sync_posts_to_vector_db():
+#     """
+#     批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
+#     由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
+#     [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
+#     [出参]: 执行状态字典
+#     """
+#     data_to_add = []
+#     post_manager = UniversalPostManager(gen_db_object())
+#     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+#     # 保留media_format存在的posts
+#     filter_posts = [post for post in existing_posts if post.get("media_format")]
+#     logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
+#
+#
+#     for post in filter_posts:
+#         post_id = post.get("post_id")
+#         media_format = post.get("media_format")
+#
+#         # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
+#         if not post_id or not media_format:
+#             continue
+#
+#         search_text = build_search_text(post)
+#         data_to_add.append({
+#             "id": post_id,
+#             "search_text": search_text
+#         })
+#
+#     if data_to_add:
+#         logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
+#         return VECTOR_ENGINE.add_data(data_to_add)
+#
+#     return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
+#
+#
+# def search_posts_by_semantics(keywords, top_n=5):
+#     """
+#     语义搜索函数：根据自然语言关键词，搜索匹配的帖子ID。
+#     [入参]: keywords(单个字符串或列表均可，如 "200倍杠杆"), top_n(返回数量)
+#     [出参]: 列表，元素结构为 {"id": "xxx", "similarity": 0.85, "matched_keyword": "xxx"}
+#     """
+#     logger.info(f"[向量库/查询] 正在通过语义搜索匹配：{keywords}")
+#     results = VECTOR_ENGINE.search(keywords, top_n=top_n)
+#
+#     # 打印简要日志以便调试
+#     for r in results:
+#         logger.info(f" -> 命中 PostID: {r['id']} | 相似度: {r['similarity']:.4f}")
+#
+#     return results
 
 def is_need_formatting(post):
     """
