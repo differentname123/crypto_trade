@@ -238,7 +238,7 @@ def normalize_post_media(post_data):
 
     def replace_match(match):
         prefix = "VIDEO" if match.group(1) == "视频" else "IMAGE"
-        placeholder = f"[{prefix}_{counters[prefix]:02d}]"
+        placeholder = f"[{prefix}_{counters[prefix]}]"
         counters[prefix] += 1
 
         local_path = local_mapping.get(match.group(2), "")
@@ -258,43 +258,75 @@ def normalize_post_media(post_data):
 
 def check_format_info(json_data, placeholders):
     """
-    防御性校验大模型返回的 JSON 数据结构，确保业务字段完整且映射无误。
-    [入参 Shape]: json_data 解析出的外部数据结构, placeholders 生成的占位符键名列表
+    防御性校验大模型返回的双层 JSON 数据结构，确保核心业务字段完整且映射无误。
+    [入参 Shape]: json_data 解析出的外部数据结构 (Dict), placeholders 文章中的占位符列表
     [出参 Shape]: 元组 (是否合法校验布尔值, 错误详情文本)
     """
-    if not isinstance(json_data, list):
-        return False, "最外层返回结构必须是列表(List)"
+    # 1. 最外层结构校验
+    if not isinstance(json_data, dict):
+        return False, "最外层返回结构必须是字典(Dict)"
 
-    if len(json_data) != len(placeholders):
-        return False, f"返回的图片节点数量【{len(json_data)}】与所需占位符总数【{len(placeholders)}】不一致"
+    if 'doc' not in json_data or 'images' not in json_data:
+        return False, "最外层缺失核心节点 'doc' 或 'images'"
 
-    valid_image_types = {'photo', 'chart', 'screenshot', 'meme', 'illustration', 'diagram'}
-    valid_roles = {'cover', 'evidence', 'data_chart', 'tutorial', 'atmosphere', 'meme', 'decorative'}
-    expected_keys = {'image_id', 'image_type', 'visual_fact', 'semantic_core', 'narrative_role'}
+    doc = json_data['doc']
+    images = json_data['images']
 
-    for i, item in enumerate(json_data):
+    if not isinstance(doc, dict):
+        return False, "'doc' 节点必须是字典(Dict)"
+    if not isinstance(images, list):
+        return False, "'images' 节点必须是列表(List)"
+
+    # --- 2. 校验文章级(doc)核心字段（下游统计与路由的基石） ---
+    doc_expected_keys = {'kind', 'stance', 'horizon', 'claim'}
+    missing_doc_keys = doc_expected_keys - doc.keys()
+    if missing_doc_keys:
+        return False, f"doc 节点缺失核心业务字段: 【{', '.join(missing_doc_keys)}】"
+
+    # 核心枚举校验：必须严格卡死
+    valid_stances = {'看多', '看空', '中性', '不适用'}
+    valid_horizons = {'超短', '日内', '短线', '中长', '未说明'}
+
+    if doc.get('stance') not in valid_stances:
+        return False, f"doc.stance【{doc.get('stance')}】不在允许枚举值内"
+    if doc.get('horizon') not in valid_horizons:
+        return False, f"doc.horizon【{doc.get('horizon')}】不在允许枚举值内"
+
+    # --- 3. 校验图片级(images)数量与严格映射 ---
+    # 【严格校验】：图片输出数量必须和占位符数量完全相等，不能多也不能少
+    if len(images) != len(placeholders):
+        return False, f"返回的图片节点数量【{len(images)}】与所需占位符总数【{len(placeholders)}】不一致！"
+
+    image_expected_keys = {'image_id', 'image_type', 'visual_fact', 'narrative_role'}
+    valid_image_types = {'盘面截图', '链上数据', '数据图表', '新闻截图', '聊天截图', '收益截图', '表情包梗图', '实拍照片', '插画示意图', '其他'}
+    valid_strengths = {'直接', '间接', '不支撑'}
+
+    for i, item in enumerate(images):
         if not isinstance(item, dict):
-            return False, f"序列第【{i + 1}】项数据异常，不是标准的字典对象"
+            return False, f"images 序列第【{i + 1}】项数据异常，不是标准的字典对象"
 
-        missing_keys = expected_keys - item.keys()
-        if missing_keys:
-            return False, f"序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_keys)}】"
+        missing_img_keys = image_expected_keys - item.keys()
+        if missing_img_keys:
+            return False, f"images 序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_img_keys)}】"
 
+        # 校验占位符严格映射对齐
         expected_id = str(placeholders[i]).strip('[]')
         actual_id = item.get('image_id')
         if actual_id != expected_id:
-            return False, f"上下文映射错位：序列第【{i + 1}】项的 image_id【{actual_id}】与要求占位符【{expected_id}】未对齐"
+            return False, f"上下文映射错位：images 序列第【{i + 1}】项 image_id【{actual_id}】与要求占位符【{expected_id}】未对齐"
 
+        # 校验图片类型枚举
         if item.get('image_type') not in valid_image_types:
-            return False, f"序列第【{i + 1}】项 image_type【{item.get('image_type')}】不在允许枚举值内"
+            return False, f"images 序列第【{i + 1}】项 image_type【{item.get('image_type')}】不在允许枚举值内"
 
+        # 校验核心证据强度（影响下游应用 A 采纳度）
         narrative_role = item.get('narrative_role', {})
-        # 遵循原业务兼容逻辑：仅在它是字典类型时检查枚举（存在不为字典也能逃逸通过的可能）
-        if isinstance(narrative_role, dict) and narrative_role.get('role') not in valid_roles:
-            return False, f"序列第【{i + 1}】项 narrative_role.role【{narrative_role.get('role')}】不在允许枚举值内"
+        if isinstance(narrative_role, dict):
+            strength = narrative_role.get('evidence_strength')
+            if strength not in valid_strengths:
+                return False, f"images 序列第【{i + 1}】项 evidence_strength【{strength}】不在允许枚举值内"
 
     return True, ""
-
 
 def gen_media_format_info(post):
     """
@@ -309,7 +341,7 @@ def gen_media_format_info(post):
     raw_response = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, file_path=local_media_list, model_name="gemini-3.1-pro-preview")
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, file_path=local_media_list)
 
             format_info = string_to_object(raw_response)
             is_valid, error_message = check_format_info(format_info, placeholders)
@@ -415,7 +447,31 @@ def format_image_article():
             time.sleep(60)
 
 
+def clear_all_media_format_batch():
+    """
+    数据清理入口：批量把存量帖子的 promo_comment 字段置空并回写。
+    【无出入参】，直接产生副作用：读写 MongoDB。
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    logger.info(
+        f"[数据清理/启动] 拉取待清理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始扫描待清理项】")
+
+    posts_to_update = []
+    for post in existing_posts:
+        if "media_format" in post and post["media_format"] is not None:
+            post["media_format"] = None
+            posts_to_update.append(post)
+
+    if posts_to_update:
+        post_manager.upsert_posts(posts_to_update)
+        logger.info(f"[数据清理/批量落库] 推广评论字段清空完成 | 结果: 【实际更新: {len(posts_to_update)} 条】")
+    else:
+        logger.info("[数据清理/批量落库] 无需清理 | 结果: 【实际更新: 0 条】")
+
 if __name__ == "__main__":
+    # clear_all_media_format_batch()
+
     # post_manager = UniversalPostManager(gen_db_object())
 
     # sync_posts_to_vector_db(post_manager)

@@ -14,6 +14,7 @@ import re
 import time
 import threading
 
+from app.ai_api.gemini_api import get_llm_content, get_llm_content_gemini_flash_video
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.gemini_web import generate_gemini_content_managed
 from biance.biance_playwright import comment_on_binance_post
@@ -187,9 +188,9 @@ def gen_promo_comment(post):
             #     prompt=full_prompt,
             #     model_name=GEMINI_MODEL
             # )
-            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.5-flash")
+            # error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.5-flash")
 
-
+            raw_response = get_llm_content(prompt=full_prompt)
             comment_info = string_to_object(raw_response)
 
             is_valid, error_message = check_comment_info(comment_info)
