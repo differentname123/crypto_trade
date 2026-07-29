@@ -671,12 +671,23 @@ def get_auth_tokens_robust(user_data_dir):
 
             # 【核心修改 2】：如果 Headers 里没取到，尝试用全局 Cookie 兜底拼装
             if not extracted_cookie:
-                logger.info("[Auth/Extract] Request headers 中无 Cookie，尝试从浏览器上下文全局提取...")
-                raw_cookies = context.cookies()
+                logger.info("[Auth/Extract] Request headers 中无 Cookie，尝试从浏览器上下文中提取指定域名 Cookie...")
+
+                # 修复核心点：强制指定域名 URL，防止获取到 Google/YouTube 等全站庞大 Cookie 导致 400 报错
+                binance_url = "https://www.binance.com"
+                raw_cookies = context.cookies(binance_url)
+
+                # 拼接指定域名的干净 Cookie
                 extracted_cookie = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies)
 
             if extracted_cookie:
                 has_p20t = "p20t=" in extracted_cookie
+
+                # 清理一下两端可能的空白符或换行符，增加健壮性
+                extracted_cookie = extracted_cookie.strip()
+                if extracted_csrf:
+                    extracted_csrf = extracted_csrf.strip()
+
                 logger.info(
                     f"[Auth/Extract] 提取完成 | CSRF: 【{str(extracted_csrf)[:8]}...】 | Cookie长度: {len(extracted_cookie)} | 包含p20t: {has_p20t}")
 
@@ -701,7 +712,6 @@ def get_auth_tokens_robust(user_data_dir):
                     context.close()
                 except Exception:
                     pass
-
 
 def open_browser_for_manual_use(user_data_dir, home_url='https://www.binance.com/zh-CN'):
     """启动可见浏览器交由人工自由操作，关闭窗口后自动收回控制权并释放资源。"""
