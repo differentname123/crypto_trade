@@ -1,0 +1,219 @@
+"""
+[功能摘要] 定时扫描币安数据源的图文帖子，利用大模型将帖子内嵌的媒体元素（图片/视频）进行语义化解析与格式化重构。
+[输入数据] 从 MongoDB 提取的帖子源数据 (post)，核心依赖 `content.text_content` 及其附属的 `media.local_mapping` (占位符到本地文件路径的映射)。
+[数据流转/交互]
+1. 轮询读取 MongoDB 中未格式化的帖子数据。
+2. 文本清洗：将帖子原有的不规则占位符（如 `[插图:http...]`）统一替换为标准占位符（如 `[IMAGE_01]`），并聚合对应的本地媒体文件路径。
+3. AI 交互：携带清洗后的文本和物理媒体路径，调用 Gemini/Playwright 接口进行视觉与文本的联合语义解析。
+4. 校验拦截：严格校验大模型返回的 JSON 元数据结构，确保返回的 image_id 与解析的占位符数量及名称做到 1:1 绝对映射。
+[输出数据] 将解析并严格校验通过的格式化元数据赋值给 post['media_format']，随后持久化更新至 MongoDB 数据库。
+"""
+
+import re
+import time
+
+from app.ai_api.gemini_playwright import generate_gemini_content_playwright
+from common.common_utils import setup_logger, read_file_to_str, string_to_object
+from common.mongo_db.mongo_base import gen_db_object
+from common.mongo_db.mongo_manager import UniversalPostManager
+
+BINANCE_SOURCE = "biance"
+POST_QUERY_LIMIT = 50000
+PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_图片文字化.txt'
+LLM_MAX_RETRIES = 3
+
+logger = setup_logger(app_name="media_format")
+
+
+def is_need_formatting(post):
+    """
+    判断帖子是否满足格式化前置条件：未被格式化且本地媒体文件已全部就绪。
+    [入参 Shape]: post 字典
+    [出参 Shape]: bool (是否需要处理)
+    """
+    # 此处遵循保真红线，不擅自修改业务边界。
+    if post.get("media_format"):
+        return False
+
+    local_mapping = post.get("media", {}).get("local_mapping", {})
+    if not local_mapping:
+        return False
+
+    video_duration = post.get("media", {}).get("video_duration")
+    if video_duration and video_duration > 0:
+        return False
+    local_paths = list(local_mapping.values())
+    valid_paths_count = sum(bool(path) for path in local_paths)
+
+    # 必须保证帖子包含媒体，且所有媒体映射到的本地物理路径都不为空
+    return valid_paths_count > 0 and valid_paths_count == len(local_paths)
+
+
+def normalize_post_media(post_data):
+    """
+    清洗帖子文本中的媒体占位符，统一格式并提取映射清单。
+    [入参 Shape]: post_data 字典
+    [出参 Shape]: 元组 (清洗后文本内容字符串, 本地媒体路径列表, 新占位符到物理路径的映射字典)
+    """
+    text_content = post_data.get("content", {}).get("text_content") or ""
+    local_mapping = post_data.get("media", {}).get("local_mapping", {})
+
+    local_media_list = []
+    new_placeholder_mapping = {}
+    counters = {"IMAGE": 1, "VIDEO": 1}
+
+    def replace_match(match):
+        prefix = "VIDEO" if match.group(1) == "视频" else "IMAGE"
+        placeholder = f"[{prefix}_{counters[prefix]:02d}]"
+        counters[prefix] += 1
+
+        local_path = local_mapping.get(match.group(2), "")
+        local_media_list.append(local_path)
+        new_placeholder_mapping[placeholder] = local_path
+
+        return placeholder
+
+    cleaned_text_content = re.sub(
+        r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]",
+        replace_match,
+        text_content
+    )
+
+    return cleaned_text_content, local_media_list, new_placeholder_mapping
+
+
+def check_format_info(json_data, placeholders):
+    """
+    防御性校验大模型返回的 JSON 数据结构，确保业务字段完整且映射无误。
+    [入参 Shape]: json_data 解析出的外部数据结构, placeholders 生成的占位符键名列表
+    [出参 Shape]: 元组 (是否合法校验布尔值, 错误详情文本)
+    """
+    if not isinstance(json_data, list):
+        return False, "最外层返回结构必须是列表(List)"
+
+    if len(json_data) != len(placeholders):
+        return False, f"返回的图片节点数量【{len(json_data)}】与所需占位符总数【{len(placeholders)}】不一致"
+
+    valid_image_types = {'photo', 'chart', 'screenshot', 'meme', 'illustration', 'diagram'}
+    valid_roles = {'cover', 'evidence', 'data_chart', 'tutorial', 'atmosphere', 'meme', 'decorative'}
+    expected_keys = {'image_id', 'image_type', 'visual_fact', 'semantic_core', 'narrative_role'}
+
+    for i, item in enumerate(json_data):
+        if not isinstance(item, dict):
+            return False, f"序列第【{i + 1}】项数据异常，不是标准的字典对象"
+
+        missing_keys = expected_keys - item.keys()
+        if missing_keys:
+            return False, f"序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_keys)}】"
+
+        expected_id = str(placeholders[i]).strip('[]')
+        actual_id = item.get('image_id')
+        if actual_id != expected_id:
+            return False, f"上下文映射错位：序列第【{i + 1}】项的 image_id【{actual_id}】与要求占位符【{expected_id}】未对齐"
+
+        if item.get('image_type') not in valid_image_types:
+            return False, f"序列第【{i + 1}】项 image_type【{item.get('image_type')}】不在允许枚举值内"
+
+        narrative_role = item.get('narrative_role', {})
+        # 遵循原业务兼容逻辑：仅在它是字典类型时检查枚举（存在不为字典也能逃逸通过的可能）
+        if isinstance(narrative_role, dict) and narrative_role.get('role') not in valid_roles:
+            return False, f"序列第【{i + 1}】项 narrative_role.role【{narrative_role.get('role')}】不在允许枚举值内"
+
+    return True, ""
+
+
+def gen_media_format_info(post):
+    """
+    调度外部大模型根据图文内容提取格式化元数据，支持有限重试与降级返回。
+    [入参 Shape]: post 帖子全量字典
+    [出参 Shape]: 校验无误的媒体格式化列表(List[Dict])，在彻底失败后降级返回空字典 {} 
+    """
+    cleaned_text_content, local_media_list, new_placeholder_mapping = normalize_post_media(post)
+    prompt = read_file_to_str(PROMPT_FILE_PATH)
+    full_prompt = f'{prompt}\n{cleaned_text_content}'
+    placeholders = list(new_placeholder_mapping.keys())
+    raw_response = ""
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        try:
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, file_path=local_media_list)
+
+            format_info = string_to_object(raw_response)
+            is_valid, error_message = check_format_info(format_info, placeholders)
+
+            if not is_valid:
+                raise ValueError(f"返回数据结构未通过防御性校验 -> {error_message}")
+
+            return format_info
+
+        except Exception as e:
+            if attempt == LLM_MAX_RETRIES:
+                logger.error(
+                    f"[大模型/元数据生成] 重试策略耗尽，彻底放弃当前帖子的格式化 "
+                    f"| 关键参数: 【当前重试:{attempt}/{LLM_MAX_RETRIES}】 "
+                    f"| 结果: 【触发降级机制，返回空数据】 "
+                    f"| 原因: 极大概率是大模型持续吐出无法解析或不符合严格结构的数据 ({e}) \n{raw_response}\n"
+                )
+                return {}
+
+            logger.warning(
+                f"[大模型/元数据生成] 接口生成或数据校验发生意外异常，准备进行指数退避重试 "
+                f"| 关键参数: 【当前重试:{attempt}/{LLM_MAX_RETRIES}】 "
+                f"| 结果: 【休眠 {2 ** attempt} 秒后重试】 "
+                f"| 原因: {e} \n{raw_response}\n"
+            )
+            time.sleep(2 ** attempt)
+
+    return {}
+
+
+def format_image_article():
+    """
+    后台守护主流程：持续从数据库拉取待格式化帖子，驱动大模型处理元数据后回写覆盖。
+    """
+    while True:
+        try:
+            post_manager = UniversalPostManager(gen_db_object())
+            existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+
+            for post in existing_posts:
+                post_id = post.get('post_id', 'UNKNOWN_ID')
+
+                # 卫语句：拦截无需处理的帖子
+                if not is_need_formatting(post):
+                    continue
+
+                media_format_info = gen_media_format_info(post)
+
+                if media_format_info:
+                    post['media_format'] = media_format_info
+                    post_manager.upsert_posts([post])
+                    logger.info(
+                        f"[DB/帖子格式化] 帖子解析校验全量通过并完成回写更新 "
+                        f"| 关键参数: 【PostID: {post_id}】 "
+                        f"| 结果: 【成功入库】"
+                    )
+                else:
+                    logger.warning(
+                        f"[DB/帖子格式化] 无法获取有效解析数据，主动跳过该贴数据库落盘 "
+                        f"| 关键参数: 【PostID: {post_id}】 "
+                        f"| 结果: 【被丢弃，未入库】 "
+                        f"| 排查建议: 可能是帖子包含不支持的媒体结构，或检查上方大模型 API 响应日志"
+                    )
+
+            # 常规扫描间隔，避免频繁压测数据库
+            time.sleep(3600)
+
+        except Exception as e:
+            # 使用 exc_info=True 妥善留存堆栈信息，替代原有低效的 traceback 导入
+            logger.error(
+                f"[系统/守护主循环] 格式化核心链路遭遇未捕获全局异常，挂起后重连 "
+                f"| 关键参数: 【无】 "
+                f"| 结果: 【当前轮次中断，休眠 60 秒后重建 DB 对象重试】 "
+                f"| 原因: {e}",
+                exc_info=True
+            )
+            time.sleep(60)
+
+
+if __name__ == "__main__":
+    format_image_article()

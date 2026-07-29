@@ -318,40 +318,257 @@ def click_acknowledge_if_present(page):
 
 
 def _upload_attachment(page, file_path):
-    """上传附件: 两步点击(主附件按钮 -> 上传文件菜单项), 均带高兼容性回退定位。"""
-    logger.info(f"[附件上传] 开始上传 | 文件: [{os.path.basename(file_path)}]")
-    click_acknowledge_if_present(page)
+    """上传附件: 兼容单文件与多文件列表，多文件时按照顺序一一上传。"""
+    # 统一归一化为列表进行遍历处理
+    if isinstance(file_path, str):
+        files_to_upload = [file_path]
+    elif isinstance(file_path, list):
+        files_to_upload = file_path
+    else:
+        return
 
-    # 1. 必须使用 `as fc_info` 捕获这个事件的结果
-    with page.expect_file_chooser(timeout=15000) as fc_info:
-        # 第1步: 主附件按钮(优先 data-test 属性, 回退到 aria-label 语义匹配)
-        best_locator = page.locator('[data-test-add-chunk-menu-button]')
-        fallback_locator = page.get_by_role(
-            "button",
-            name=re.compile(r"(?=.*images)(?=.*videos)(?=.*audio)(?=.*files)", re.IGNORECASE),
+    for f_path in files_to_upload:
+        logger.info(f"[附件上传] 开始上传 | 文件: [{os.path.basename(f_path)}]")
+        click_acknowledge_if_present(page)
+
+        # 1. 必须使用 `as fc_info` 捕获这个事件的结果
+        with page.expect_file_chooser(timeout=15000) as fc_info:
+            # 第1步: 主附件按钮(优先 data-test 属性, 回退到 aria-label 语义匹配)
+            best_locator = page.locator('[data-test-add-chunk-menu-button]')
+            fallback_locator = page.get_by_role(
+                "button",
+                name=re.compile(r"(?=.*images)(?=.*videos)(?=.*audio)(?=.*files)", re.IGNORECASE),
+            )
+            # 改用拟人化点击
+            target_btn = best_locator.or_(fallback_locator)
+            human_like_click(page, target_btn)
+
+            # 第2步: "上传文件"菜单项(兼容 "Upload a file"/"Upload File" 等写法)
+            menu_item = page.get_by_role(
+                "menuitem", name=re.compile(r"Upload (a )?file", re.IGNORECASE)
+            )
+            # 改用拟人化点击
+            human_like_click(page, menu_item)
+
+        # 2. 从上下文管理器中提取真正的 FileChooser 对象
+        file_chooser = fc_info.value
+
+        # 3. 真正执行上传动作
+        file_chooser.set_files(f_path)
+
+        # 4. 等待上传进度条消失，确保当前文件彻底上传完毕再处理下一个
+        spinner = page.locator(".upload-spinner")
+        expect(spinner).to_be_hidden(timeout=60000)
+        logger.info(f"[附件上传] 文件上传完成 | [{os.path.basename(f_path)}]")
+
+
+def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
+                           model_name="gemini-flash-latest", debug=False):
+    """
+    用指定登录会话启动浏览器, 完成"(可选依次上传多文件)-提交-抓取"一次问答。
+
+    核心出参形貌: (error_info, response_text)
+      - error_info:   失败时为错误描述字符串, 成功为 None
+      - response_text: 成功时为模型回答字符串, 失败为 None
+    注意: 本函数按契约返回错误元组, 不向外抛异常(资源在 finally 中释放)。
+    """
+    # 卫语句: 登录会话目录缺失直接返回
+    if not os.path.isdir(user_data_dir):
+        error_msg = (
+            f"用户数据目录不存在: {user_data_dir}\n"
+            f"请先运行 'python {os.path.basename(__file__)} login --user-data-dir <你的目录>' 进行登录。"
         )
-        # 改用拟人化点击
-        target_btn = best_locator.or_(fallback_locator)
-        human_like_click(page, target_btn)
+        return error_msg, None
 
-        # 第2步: "上传文件"菜单项(兼容 "Upload a file"/"Upload File" 等写法)
-        menu_item = page.get_by_role(
-            "menuitem", name=re.compile(r"Upload (a )?file", re.IGNORECASE)
+    error_info, response_text, context = None, None, None
+    logger.info(
+        f"[任务启动] 提交 Gemini 请求 | 模型: [{model_name}] | 附件: [{file_path}] | "
+        f"Prompt预览: [{prompt[:20]}...] | 时间: [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
+    )
+
+    try:
+        # 支持对多文件列表的循环存在性校验
+        if file_path:
+            if isinstance(file_path, str) and not os.path.exists(file_path):
+                raise FileNotFoundError(f"附件文件不存在: {file_path}")
+            elif isinstance(file_path, list):
+                for fp in file_path:
+                    if not os.path.exists(fp):
+                        raise FileNotFoundError(f"附件文件不存在: {fp}")
+
+        with sync_playwright() as p:
+            try:
+                # 【修改点】: 引入 debug 控制，替换原先的 _launch_persistent_browser
+                if debug:
+                    # 能够看到窗口的模式
+                    context = p.chromium.launch_persistent_context(
+                        channel="chrome",
+                        user_data_dir=user_data_dir,
+                        headless=False,
+                        args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--disable-gpu', '--window-position=0,0'],
+                        ignore_default_args=["--enable-automation"]
+                    )
+                else:
+                    # 将窗口位置移动到屏幕显示范围之外
+                    context = p.chromium.launch_persistent_context(
+                        channel="chrome",
+                        user_data_dir=user_data_dir,
+                        headless=False,
+                        viewport={'width': 1920, 'height': 1080},
+                        args=[
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-gpu',
+                            '--window-position=-10000,-10000',
+                            '--no-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-renderer-backgrounding',
+                            '--disable-background-timer-throttling',
+                            '--disable-backgrounding-occluded-windows',
+                            '--disable-features=CalculateNativeWinOcclusion',
+                            '--disable-breakpad',
+                        ],
+                        ignore_default_args=["--enable-automation"]
+                    )
+            except Exception as e:
+                raise Exception(f"启动浏览器失败, 请确认 Chrome 是否已安装/已关闭占用: {e}")
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_default_timeout(60000)
+
+            logger.info(f"[任务执行] 正在加载页面 | 模型: [{model_name}]")
+            page.goto(f"{TARGET_URL_BASE}?model={model_name}")
+            check_for_crash_and_abort(page)
+
+            click_acknowledge_if_present(page)
+
+            if file_path:
+                check_for_crash_and_abort(page)
+                _upload_attachment(page, file_path)
+
+            check_for_crash_and_abort(page)
+
+            # 提交 + 抓取, 命中内部错误最多重试 3 次
+            for attempt in range(3):
+                click_acknowledge_if_present(page)
+                _submit_prompt(page, prompt)
+                response_text = _wait_and_get_response(page)
+
+                error_keyword = "An internal error has occurred."
+
+                # 条件 1：如果没有报错特征词 -> 成功，跳出循环
+                # 条件 2：如果有报错词，但总文本长度大于 200 字符 -> 误判（模型生成的代码），跳出循环
+                if error_keyword not in response_text or len(response_text) > 200:
+                    break
+                logger.warning(f"[任务重试] 检测到页面内部错误, 准备重试 | 第 [{attempt + 1}/3] 次")
+                time.sleep(2)
+
+            logger.info(
+                f"[任务完成] Gemini 响应获取成功 | 附件: [{file_path}] | "
+                f"响应预览: [{response_text[:100]}...]"
+            )
+
+    except PageCrashedException as crash_e:
+        error_info = str(crash_e)
+        _save_screenshot(context, prefix="crash", scene="页面崩溃")
+
+    except Exception as e:
+        error_info = str(e)
+        logger.error(
+            f"【任务失败】执行 Gemini 问答时出错 | 附件: [{file_path}] | "
+            f"错误: [{error_info[:1000]}] | 排查线索: 检查登录态是否失效/页面结构是否变更/网络代理是否正常"
         )
-        # 改用拟人化点击
-        human_like_click(page, menu_item)
+        _save_screenshot(context, prefix="error", scene="执行错误")
 
-    # 2. 从上下文管理器中提取真正的 FileChooser 对象
-    file_chooser = fc_info.value
+    finally:
+        if context:
+            try:
+                context.close()
+                logger.info("[资源回收] 浏览器环境已关闭")
+            except Exception:
+                pass
 
-    # 3. 真正执行上传动作 (重构时千万不能丢了这句)
-    file_chooser.set_files(file_path)
+    return error_info, response_text
 
-    # 4. 等待上传进度条消失
-    spinner = page.locator(".upload-spinner")
-    expect(spinner).to_be_hidden(timeout=60000)
-    logger.info("[附件上传] 上传完成")
 
+def generate_gemini_content_playwright(prompt, file_path=None, wait_timeout=600,
+                                       model_name="gemini-flash-latest", fallback_model="gemini-flash-latest"):
+    """
+    对外总入口: 安全申请账号并调用 Gemini, 支持备用模型(活跃池更大者优先)。
+
+    出参形貌: (error_detail, result_text) —— 语义同 query_google_ai_studio。
+    """
+    pid, tid = os.getpid(), threading.get_ident()
+    start_time = time.time()
+    account_name, user_data_dir, actual_model_name = None, None, model_name
+
+    no_file_account_dirs = ['new_taobao6']
+
+    # 1. 循环申请账号(带超时)
+    while time.time() - start_time < wait_timeout:
+        account_name, user_data_dir, actual_model_name = manager.allocate_account(
+            model_name=model_name, fallback_model=fallback_model
+        )
+
+        if file_path and user_data_dir and any(x in user_data_dir for x in no_file_account_dirs):
+            account_name, user_data_dir = None, None
+
+        if account_name:
+            break
+
+        elapsed = int(time.time() - start_time)
+        if elapsed % 10 == 0:
+            logger.info(
+                f"[System][PID:{pid},TID:{tid}] 资源繁忙, 等待可用账号 | 模型: [{actual_model_name}] | "
+                f"附件: [{file_path}] | 已等待: [{elapsed}s/{wait_timeout}s]"
+            )
+        time.sleep(random.uniform(5, 15))
+
+    if not account_name:
+        return f"System Busy: 等待 {wait_timeout} 秒后仍无可用资源。", None
+
+    log_prefix = f"[System][PID:{pid},TID:{tid}]"
+    logger.info(
+        f"{log_prefix} 分配账号成功 | 账号: [{account_name}] | 目录: [{os.path.basename(user_data_dir)}] | "
+        f"模型: [{actual_model_name}] | 附件: [{file_path}]"
+    )
+
+    error_detail, result_text = None, None
+    try:
+        # 直接透传 file_path，底层 _upload_attachment 已经支持字符串或列表的兼容处理
+        error_detail, result_text = query_google_ai_studio(
+            prompt=prompt,
+            file_path=file_path,
+            user_data_dir=user_data_dir,
+            model_name=actual_model_name,
+        )
+    except Exception as e:
+        error_detail = f"管理器外部发生严重错误: {str(e)}\n\n{traceback.format_exc()}"
+    finally:
+        # 3. 释放账号: 命中 rate limit 走专门惩罚, 否则常规释放
+        try:
+            hit_rate_limit = bool(
+                result_text and "You've reached your rate limit. Please try again later" in result_text
+            )
+            if hit_rate_limit:
+                _apply_rate_limit_penalty(account_name, actual_model_name)
+                logger.warning(
+                    f"{log_prefix} 命中远端 Rate Limit | 账号: [{account_name}] | "
+                    f"模型: [{actual_model_name}] | 处理: streak 置满并移出活跃池"
+                )
+            else:
+                manager.release_account(account_name, error_detail)
+                logger.info(f"{log_prefix} 释放账号 | 账号: [{account_name}] | 模型: [{actual_model_name}]")
+        except Exception as e:
+            # 释放异常兜底: 再尝试一次常规释放, 避免上层受影响
+            logger.error(
+                f"{log_prefix} 处理释放/rate-limit 时异常, 尝试兜底释放 | 账号: [{account_name}] | 原因: [{e}]"
+            )
+            try:
+                manager.release_account(account_name, error_detail)
+            except Exception as e2:
+                logger.error(f"{log_prefix} 兜底释放再次失败 | 账号: [{account_name}] | 原因: [{e2}]")
+
+    return error_detail, result_text
 
 def _remove_google_grounding(page):
     """若存在 'Remove Grounding with Google Search' 按钮则关闭联网检索; 非阻塞。"""
@@ -470,127 +687,6 @@ def _wait_and_get_response(page):
 # ==============================================================================
 # 核心: 单次调用 Gemini
 # ==============================================================================
-
-def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-flash-latest", debug=False):
-    """
-    用指定登录会话启动浏览器, 完成"(可选上传)-提交-抓取"一次问答。
-
-    核心出参形貌: (error_info, response_text)
-      - error_info:   失败时为错误描述字符串, 成功为 None
-      - response_text: 成功时为模型回答字符串, 失败为 None
-    注意: 本函数按契约返回错误元组, 不向外抛异常(资源在 finally 中释放)。
-    """
-    # 卫语句: 登录会话目录缺失直接返回
-    if not os.path.isdir(user_data_dir):
-        error_msg = (
-            f"用户数据目录不存在: {user_data_dir}\n"
-            f"请先运行 'python {os.path.basename(__file__)} login --user-data-dir <你的目录>' 进行登录。"
-        )
-        return error_msg, None
-
-    error_info, response_text, context = None, None, None
-    logger.info(
-        f"[任务启动] 提交 Gemini 请求 | 模型: [{model_name}] | 附件: [{file_path}] | "
-        f"Prompt预览: [{prompt[:20]}...] | 时间: [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
-    )
-
-    try:
-        if file_path and not os.path.exists(file_path):
-            raise FileNotFoundError(f"附件文件不存在: {file_path}")
-
-        with sync_playwright() as p:
-            try:
-                # 【修改点】: 引入 debug 控制，替换原先的 _launch_persistent_browser
-                if debug:
-                    # 能够看到窗口的模式
-                    context = p.chromium.launch_persistent_context(
-                        channel="chrome",
-                        user_data_dir=user_data_dir,
-                        headless=False,
-                        args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--disable-gpu', '--window-position=0,0'],
-                        ignore_default_args=["--enable-automation"]
-                    )
-                else:
-                    # 将窗口位置移动到屏幕显示范围之外
-                    context = p.chromium.launch_persistent_context(
-                        channel="chrome",
-                        user_data_dir=user_data_dir,
-                        headless=False,
-                        viewport={'width': 1920, 'height': 1080},
-                        args=[
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-gpu',
-                            '--window-position=-10000,-10000',
-                            '--no-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-renderer-backgrounding',
-                            '--disable-background-timer-throttling',
-                            '--disable-backgrounding-occluded-windows',
-                            '--disable-features=CalculateNativeWinOcclusion',
-                            '--disable-breakpad',
-                        ],
-                        ignore_default_args=["--enable-automation"]
-                    )
-            except Exception as e:
-                raise Exception(f"启动浏览器失败, 请确认 Chrome 是否已安装/已关闭占用: {e}")
-
-            page = context.pages[0] if context.pages else context.new_page()
-            page.set_default_timeout(60000)
-
-            logger.info(f"[任务执行] 正在加载页面 | 模型: [{model_name}]")
-            page.goto(f"{TARGET_URL_BASE}?model={model_name}")
-            check_for_crash_and_abort(page)
-
-            click_acknowledge_if_present(page)
-
-            if file_path:
-                check_for_crash_and_abort(page)
-                _upload_attachment(page, file_path)
-
-            check_for_crash_and_abort(page)
-
-            # 提交 + 抓取, 命中内部错误最多重试 3 次
-            for attempt in range(3):
-                click_acknowledge_if_present(page)
-                _submit_prompt(page, prompt)
-                response_text = _wait_and_get_response(page)
-
-                error_keyword = "An internal error has occurred."
-
-                # 条件 1：如果没有报错特征词 -> 成功，跳出循环
-                # 条件 2：如果有报错词，但总文本长度大于 200 字符 -> 误判（模型生成的代码），跳出循环
-                if error_keyword not in response_text or len(response_text) > 200:
-                    break
-                logger.warning(f"[任务重试] 检测到页面内部错误, 准备重试 | 第 [{attempt + 1}/3] 次")
-                time.sleep(2)
-
-            logger.info(
-                f"[任务完成] Gemini 响应获取成功 | 附件: [{file_path}] | "
-                f"响应预览: [{response_text[:100]}...]"
-            )
-
-    except PageCrashedException as crash_e:
-        error_info = str(crash_e)
-        _save_screenshot(context, prefix="crash", scene="页面崩溃")
-
-    except Exception as e:
-        error_info = str(e)
-        logger.error(
-            f"【任务失败】执行 Gemini 问答时出错 | 附件: [{file_path}] | "
-            f"错误: [{error_info[:1000]}] | 排查线索: 检查登录态是否失效/页面结构是否变更/网络代理是否正常"
-        )
-        _save_screenshot(context, prefix="error", scene="执行错误")
-
-    finally:
-        if context:
-            try:
-                context.close()
-                logger.info("[资源回收] 浏览器环境已关闭")
-            except Exception:
-                pass
-
-    return error_info, response_text
 
 
 def _save_screenshot(context, prefix, scene):
@@ -912,92 +1008,6 @@ def _apply_rate_limit_penalty(account_name, model_name):
 
         save_json(manager.stats_path, stats)
 
-
-def generate_gemini_content_playwright(prompt, file_path=None, wait_timeout=600,
-                                       model_name="gemini-flash-latest", fallback_model="gemini-flash-latest"):
-    """
-    对外总入口: 安全申请账号并调用 Gemini, 支持备用模型(活跃池更大者优先)。
-
-    出参形貌: (error_detail, result_text) —— 语义同 query_google_ai_studio。
-    """
-    pid, tid = os.getpid(), threading.get_ident()
-    start_time = time.time()
-    account_name, user_data_dir, actual_model_name = None, None, model_name
-
-    no_file_account_dirs = ['new_taobao6']
-
-    # 1. 循环申请账号(带超时)
-    while time.time() - start_time < wait_timeout:
-        account_name, user_data_dir, actual_model_name = manager.allocate_account(
-            model_name=model_name, fallback_model=fallback_model
-        )
-
-        if file_path and user_data_dir and any(x in user_data_dir for x in no_file_account_dirs):
-            account_name, user_data_dir = None, None
-
-        if account_name:
-            break
-
-        elapsed = int(time.time() - start_time)
-        if elapsed % 10 == 0:
-            logger.info(
-                f"[System][PID:{pid},TID:{tid}] 资源繁忙, 等待可用账号 | 模型: [{actual_model_name}] | "
-                f"附件: [{file_path}] | 已等待: [{elapsed}s/{wait_timeout}s]"
-            )
-        time.sleep(random.uniform(5, 15))
-
-    if not account_name:
-        return f"System Busy: 等待 {wait_timeout} 秒后仍无可用资源。", None
-
-    log_prefix = f"[System][PID:{pid},TID:{tid}]"
-    logger.info(
-        f"{log_prefix} 分配账号成功 | 账号: [{account_name}] | 目录: [{os.path.basename(user_data_dir)}] | "
-        f"模型: [{actual_model_name}] | 附件: [{file_path}]"
-    )
-
-    error_detail, result_text = None, None
-    try:
-        # 附件参数归一化: list 取首个, str 直接用
-        file_to_upload = None
-        if isinstance(file_path, list) and file_path:
-            file_to_upload = file_path[0]
-        elif isinstance(file_path, str):
-            file_to_upload = file_path
-
-        error_detail, result_text = query_google_ai_studio(
-            prompt=prompt,
-            file_path=file_to_upload,
-            user_data_dir=user_data_dir,
-            model_name=actual_model_name,
-        )
-    except Exception as e:
-        error_detail = f"管理器外部发生严重错误: {str(e)}\n\n{traceback.format_exc()}"
-    finally:
-        # 3. 释放账号: 命中 rate limit 走专门惩罚, 否则常规释放
-        try:
-            hit_rate_limit = bool(
-                result_text and "You've reached your rate limit. Please try again later" in result_text
-            )
-            if hit_rate_limit:
-                _apply_rate_limit_penalty(account_name, actual_model_name)
-                logger.warning(
-                    f"{log_prefix} 命中远端 Rate Limit | 账号: [{account_name}] | "
-                    f"模型: [{actual_model_name}] | 处理: streak 置满并移出活跃池"
-                )
-            else:
-                manager.release_account(account_name, error_detail)
-                logger.info(f"{log_prefix} 释放账号 | 账号: [{account_name}] | 模型: [{actual_model_name}]")
-        except Exception as e:
-            # 释放异常兜底: 再尝试一次常规释放, 避免上层受影响
-            logger.error(
-                f"{log_prefix} 处理释放/rate-limit 时异常, 尝试兜底释放 | 账号: [{account_name}] | 原因: [{e}]"
-            )
-            try:
-                manager.release_account(account_name, error_detail)
-            except Exception as e2:
-                logger.error(f"{log_prefix} 兜底释放再次失败 | 账号: [{account_name}] | 原因: [{e2}]")
-
-    return error_detail, result_text
 
 
 def validate_all_accounts():
