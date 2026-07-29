@@ -30,7 +30,7 @@ import os
 from logging.handlers import TimedRotatingFileHandler
 
 
-def setup_logger(log_dir="logs", app_name="BinanceBot"):
+def setup_logger(log_dir=r"W:\project\python_project\crypto_trade\logs", app_name="BinanceBot"):
     """
     初始化全局日志配置。
     支持在多个文件中重复调用，但实际只会初始化一次。

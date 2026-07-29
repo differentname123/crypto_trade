@@ -327,12 +327,17 @@ def _upload_attachment(page, file_path):
     else:
         return
 
+    # 【新增逻辑】根据文件列表长度动态计算 timeout
+    # 基础时间 15000ms (15秒) + 每个文件额外增加 5000ms (5秒)
+    # 用以应对文件增多导致的页面响应变慢，以及两次 human_like_click 的耗时累加
+    dynamic_timeout = 15000 + (len(files_to_upload) * 5000)
+
     for f_path in files_to_upload:
         logger.info(f"[附件上传] 开始上传 | 文件: [{os.path.basename(f_path)}]")
         click_acknowledge_if_present(page)
 
-        # 1. 必须使用 `as fc_info` 捕获这个事件的结果
-        with page.expect_file_chooser(timeout=15000) as fc_info:
+        # 1. 必须使用 `as fc_info` 捕获这个事件的结果 (替换为动态 timeout)
+        with page.expect_file_chooser(timeout=dynamic_timeout) as fc_info:
             # 第1步: 主附件按钮(优先 data-test 属性, 回退到 aria-label 语义匹配)
             best_locator = page.locator('[data-test-add-chunk-menu-button]')
             fallback_locator = page.get_by_role(
@@ -361,9 +366,8 @@ def _upload_attachment(page, file_path):
         expect(spinner).to_be_hidden(timeout=60000)
         logger.info(f"[附件上传] 文件上传完成 | [{os.path.basename(f_path)}]")
 
-
 def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
-                           model_name="gemini-flash-latest", debug=False):
+                           model_name="gemini-flash-latest", debug=True):
     """
     用指定登录会话启动浏览器, 完成"(可选依次上传多文件)-提交-抓取"一次问答。
 
@@ -457,6 +461,10 @@ def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
 
                 # 条件 1：如果没有报错特征词 -> 成功，跳出循环
                 # 条件 2：如果有报错词，但总文本长度大于 200 字符 -> 误判（模型生成的代码），跳出循环
+                if error_keyword in response_text:
+                    logger.warning(f"[任务重试] 检测到页面内部错误, 响应长度 {len(response_text)} 完整响应：{response_text}")
+                    time.sleep(2)
+
                 if error_keyword not in response_text or len(response_text) > 200:
                     break
                 logger.warning(f"[任务重试] 检测到页面内部错误, 准备重试 | 第 [{attempt + 1}/3] 次")
