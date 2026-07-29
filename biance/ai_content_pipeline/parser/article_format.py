@@ -341,7 +341,7 @@ def gen_media_format_info(post):
     raw_response = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, file_path=local_media_list)
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, file_path=local_media_list, model_name="gemini-3.5-flash")
 
             format_info = string_to_object(raw_response)
             is_valid, error_message = check_format_info(format_info, placeholders)
