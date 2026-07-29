@@ -12,14 +12,14 @@
 import re
 import time
 from common.common_utils import setup_logger, read_file_to_str, string_to_object
-# from common.vector_utils import VectorSearchEngine
+from common.vector_utils import VectorSearchEngine
 
 logger = setup_logger(app_name="media_format")
 
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_图片文字化.txt'
@@ -27,107 +27,107 @@ LLM_MAX_RETRIES = 3
 
 
 # 全局初始化向量引擎（单例调用，避免重复加载）
-# VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
+VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
 
 
-# def build_search_text(post):
-#     """
-#     数据降维与高密度提纯：将复杂的帖子格式化字典，提取拼装为高浓度的“超级搜索文本”
-#     [入参]: post 帖子全量字典
-#     [出参]: 纯字符串 (String)
-#     """
-#     # 1. 提取并清理正文（利用正则去除无语义的 [插图: url] 占位符噪音）
-#     raw_text = post.get("content", {}).get("text_content", "")
-#     cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
-#
-#     # 2. 提取关联币种
-#     coins = post.get("content", {}).get("mentioned_coins", [])
-#     coins_str = ", ".join(coins) if coins else "无"
-#
-#     # 3. 基础正文拼装
-#     search_text = f"【文章正文】\n{cleaned_text}\n关联币种：{coins_str}\n"
-#
-#     # 4. 遍历提取媒体特征 (核心维度)
-#     media_format = post.get("media_format", [])
-#     for i, media in enumerate(media_format):
-#         visual_fact = media.get("visual_fact", {})
-#         semantic_core = media.get("semantic_core", {})
-#         narrative = media.get("narrative_role", {})
-#
-#         # 合并实体与概念，形成高密度标签
-#         concepts = semantic_core.get("concepts", [])
-#         entities = visual_fact.get("entities", [])
-#         all_concepts_str = ", ".join(concepts + entities)
-#
-#         desc = visual_fact.get("description", "")
-#         ocr = visual_fact.get("ocr_text", "")
-#
-#         # 合并叙事意图与逻辑桥梁
-#         msg = semantic_core.get("message", "")
-#         logic = narrative.get("logic_bridge", "")
-#         logic_str = f"{msg} {logic}".strip()
-#
-#         # 拼装单张图片的语义块
-#         search_text += f"\n【配图{i + 1}语义解析】\n"
-#         search_text += f"核心概念：{all_concepts_str}\n"
-#         search_text += f"画面描述：{desc}\n"
-#         search_text += f"图文逻辑：{logic_str}\n"
-#         # OCR 数据作为最硬核的过滤依据，放在最后
-#         search_text += f"关键数据(OCR)：{ocr}\n"
-#
-#     return search_text.strip()
-#
-#
-# def sync_posts_to_vector_db():
-#     """
-#     批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
-#     由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
-#     [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
-#     [出参]: 执行状态字典
-#     """
-#     data_to_add = []
-#     post_manager = UniversalPostManager(gen_db_object())
-#     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-#     # 保留media_format存在的posts
-#     filter_posts = [post for post in existing_posts if post.get("media_format")]
-#     logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
-#
-#
-#     for post in filter_posts:
-#         post_id = post.get("post_id")
-#         media_format = post.get("media_format")
-#
-#         # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
-#         if not post_id or not media_format:
-#             continue
-#
-#         search_text = build_search_text(post)
-#         data_to_add.append({
-#             "id": post_id,
-#             "search_text": search_text
-#         })
-#
-#     if data_to_add:
-#         logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
-#         return VECTOR_ENGINE.add_data(data_to_add)
-#
-#     return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
-#
-#
-# def search_posts_by_semantics(keywords, top_n=5):
-#     """
-#     语义搜索函数：根据自然语言关键词，搜索匹配的帖子ID。
-#     [入参]: keywords(单个字符串或列表均可，如 "200倍杠杆"), top_n(返回数量)
-#     [出参]: 列表，元素结构为 {"id": "xxx", "similarity": 0.85, "matched_keyword": "xxx"}
-#     """
-#     logger.info(f"[向量库/查询] 正在通过语义搜索匹配：{keywords}")
-#     results = VECTOR_ENGINE.search(keywords, top_n=top_n)
-#
-#     # 打印简要日志以便调试
-#     for r in results:
-#         logger.info(f" -> 命中 PostID: {r['id']} | 相似度: {r['similarity']:.4f}")
-#
-#     return results
+def build_search_text(post):
+    """
+    数据降维与高密度提纯：将复杂的帖子格式化字典，提取拼装为高浓度的“超级搜索文本”
+    [入参]: post 帖子全量字典
+    [出参]: 纯字符串 (String)
+    """
+    # 1. 提取并清理正文（利用正则去除无语义的 [插图: url] 占位符噪音）
+    raw_text = post.get("content", {}).get("text_content", "")
+    cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
+
+    # 2. 提取关联币种
+    coins = post.get("content", {}).get("mentioned_coins", [])
+    coins_str = ", ".join(coins) if coins else "无"
+
+    # 3. 基础正文拼装
+    search_text = f"【文章正文】\n{cleaned_text}\n关联币种：{coins_str}\n"
+
+    # 4. 遍历提取媒体特征 (核心维度)
+    media_format = post.get("media_format", [])
+    for i, media in enumerate(media_format):
+        visual_fact = media.get("visual_fact", {})
+        semantic_core = media.get("semantic_core", {})
+        narrative = media.get("narrative_role", {})
+
+        # 合并实体与概念，形成高密度标签
+        concepts = semantic_core.get("concepts", [])
+        entities = visual_fact.get("entities", [])
+        all_concepts_str = ", ".join(concepts + entities)
+
+        desc = visual_fact.get("description", "")
+        ocr = visual_fact.get("ocr_text", "")
+
+        # 合并叙事意图与逻辑桥梁
+        msg = semantic_core.get("message", "")
+        logic = narrative.get("logic_bridge", "")
+        logic_str = f"{msg} {logic}".strip()
+
+        # 拼装单张图片的语义块
+        search_text += f"\n【配图{i + 1}语义解析】\n"
+        search_text += f"核心概念：{all_concepts_str}\n"
+        search_text += f"画面描述：{desc}\n"
+        search_text += f"图文逻辑：{logic_str}\n"
+        # OCR 数据作为最硬核的过滤依据，放在最后
+        search_text += f"关键数据(OCR)：{ocr}\n"
+
+    return search_text.strip()
+
+
+def sync_posts_to_vector_db():
+    """
+    批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
+    由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
+    [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
+    [出参]: 执行状态字典
+    """
+    data_to_add = []
+    post_manager = UniversalPostManager(gen_db_object())
+    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    # 保留media_format存在的posts
+    filter_posts = [post for post in existing_posts if post.get("media_format")]
+    logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
+
+
+    for post in filter_posts:
+        post_id = post.get("post_id")
+        media_format = post.get("media_format")
+
+        # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
+        if not post_id or not media_format:
+            continue
+
+        search_text = build_search_text(post)
+        data_to_add.append({
+            "id": post_id,
+            "search_text": search_text
+        })
+
+    if data_to_add:
+        logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
+        return VECTOR_ENGINE.add_data(data_to_add)
+
+    return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
+
+
+def search_posts_by_semantics(keywords, top_n=5):
+    """
+    语义搜索函数：根据自然语言关键词，搜索匹配的帖子ID。
+    [入参]: keywords(单个字符串或列表均可，如 "200倍杠杆"), top_n(返回数量)
+    [出参]: 列表，元素结构为 {"id": "xxx", "similarity": 0.85, "matched_keyword": "xxx"}
+    """
+    logger.info(f"[向量库/查询] 正在通过语义搜索匹配：{keywords}")
+    results = VECTOR_ENGINE.search(keywords, top_n=top_n)
+
+    # 打印简要日志以便调试
+    for r in results:
+        logger.info(f" -> 命中 PostID: {r['id']} | 相似度: {r['similarity']:.4f}")
+
+    return results
 
 def is_need_formatting(post):
     """
@@ -230,7 +230,7 @@ def gen_media_format_info(post):
     """
     调度外部大模型根据图文内容提取格式化元数据，支持有限重试与降级返回。
     [入参 Shape]: post 帖子全量字典
-    [出参 Shape]: 校验无误的媒体格式化列表(List[Dict])，在彻底失败后降级返回空字典 {} 
+    [出参 Shape]: 校验无误的媒体格式化列表(List[Dict])，在彻底失败后降级返回空字典 {}
     """
     cleaned_text_content, local_media_list, new_placeholder_mapping = normalize_post_media(post)
     prompt = read_file_to_str(PROMPT_FILE_PATH)
@@ -270,54 +270,98 @@ def gen_media_format_info(post):
     return {}
 
 
+def process_single_post(post):
+    """
+    单条帖子的处理任务（工作线程执行）。
+    仅处理网络/CPU耗时操作，不直接操作数据库。
+    """
+    post_id = post.get('post_id', 'UNKNOWN_ID')
+
+    # 卫语句：拦截无需处理的帖子
+    if not is_need_formatting(post):
+        return None, "SKIPPED", post_id
+
+    try:
+        # 耗时的 I/O 操作 (如大模型 API 调用)
+        media_format_info = gen_media_format_info(post)
+
+        if media_format_info:
+            post['media_format'] = media_format_info
+            return post, "SUCCESS", post_id
+        else:
+            return None, "NO_DATA", post_id
+
+    except Exception as e:
+        logger.error(f"[单任务执行] 处理帖子 {post_id} 发生异常: {e}", exc_info=True)
+        return None, "ERROR", post_id
+
+
 def format_image_article():
     """
-    后台守护主流程：持续从数据库拉取待格式化帖子，驱动大模型处理元数据后回写覆盖。
+    后台守护主流程：持续从数据库拉取待格式化帖子，多线程驱动大模型处理元数据后，批量回写。
     """
+    MAX_CONCURRENCY = 5  # 设定并发数量为 5
+
     while True:
         try:
+            # 每次循环获取最新的 DB 实例，确保连接有效性
             post_manager = UniversalPostManager(gen_db_object())
             existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
 
-            for post in existing_posts:
-                post_id = post.get('post_id', 'UNKNOWN_ID')
+            if not existing_posts:
+                logger.info("[DB/帖子格式化] 当前无待处理帖子，休眠 60 秒...")
+                time.sleep(60)
+                continue
 
-                # 卫语句：拦截无需处理的帖子
-                if not is_need_formatting(post):
-                    continue
+            posts_to_upsert = []
 
-                media_format_info = gen_media_format_info(post)
+            # 开启线程池进行并发处理
+            with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+                # 提交所有任务
+                future_to_post = {executor.submit(process_single_post, post): post for post in existing_posts}
 
-                if media_format_info:
-                    post['media_format'] = media_format_info
-                    post_manager.upsert_posts([post])
-                    logger.info(
-                        f"[DB/帖子格式化] 帖子解析校验全量通过并完成回写更新 "
-                        f"| 关键参数: 【PostID: {post_id}】 "
-                        f"| 结果: 【成功入库】"
-                    )
-                else:
-                    logger.warning(
-                        f"[DB/帖子格式化] 无法获取有效解析数据，主动跳过该贴数据库落盘 "
-                        f"| 关键参数: 【PostID: {post_id}】 "
-                        f"| 结果: 【被丢弃，未入库】 "
-                        f"| 排查建议: 可能是帖子包含不支持的媒体结构，或检查上方大模型 API 响应日志"
-                    )
+                # as_completed 会在任务完成后立即返回，方便实时捕获状态
+                for future in as_completed(future_to_post):
+                    result_post, status, post_id = future.result()
 
-            # 常规扫描间隔，避免频繁压测数据库
-            time.sleep(3600)
+                    if status == "SUCCESS":
+                        posts_to_upsert.append(result_post)
+                        # 降低日志级别或精简日志，避免高并发下刷屏
+                        logger.debug(f"[并发/解析] 解析成功 | PostID: {post_id}")
+                    elif status == "NO_DATA":
+                        logger.warning(
+                            f"[并发/解析] 无法获取有效解析数据 | PostID: {post_id} "
+                            f"| 排查建议: 可能是帖子包含不支持的媒体结构，或检查 API 响应"
+                        )
+                    # SKIPPED 和 ERROR 状态无需在此处额外处理，ERROR已在子线程记录
+
+            # 并发结束后，主线程进行批量统一入库 (极大提升性能且保证DB线程安全)
+            if posts_to_upsert:
+                post_manager.upsert_posts(posts_to_upsert)
+                logger.info(
+                    f"[DB/帖子格式化] 批次处理完成，成功回写落盘 "
+                    f"| 成功数量: {len(posts_to_upsert)} / 总拉取数量: {len(existing_posts)}"
+                )
+
+            # 动态休眠策略：如果拉取数量达到 limit，说明可能有积压，缩短休眠；否则常规休眠
+            if len(existing_posts) >= POST_QUERY_LIMIT:
+                logger.info("本批次达到 Limit 上限，说明可能存在积压，仅休眠 5 秒后继续...")
+                time.sleep(5)
+            else:
+                logger.info("本批次处理完毕，进入常规休眠 (3600秒).")
+                time.sleep(3600)
 
         except Exception as e:
-            # 使用 exc_info=True 妥善留存堆栈信息，替代原有低效的 traceback 导入
             logger.error(
                 f"[系统/守护主循环] 格式化核心链路遭遇未捕获全局异常，挂起后重连 "
-                f"| 关键参数: 【无】 "
                 f"| 结果: 【当前轮次中断，休眠 60 秒后重建 DB 对象重试】 "
                 f"| 原因: {e}",
                 exc_info=True
             )
             time.sleep(60)
 
-
 if __name__ == "__main__":
+    # sync_posts_to_vector_db()
+    # search_posts_by_semantics("200倍杠杆", top_n=5)
+
     format_image_article()

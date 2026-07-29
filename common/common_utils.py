@@ -18,10 +18,6 @@ import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
-import aiohttp
-import aiofiles
-import httpx
-
 from filelock import FileLock, Timeout
 
 # common/log_config.py
@@ -251,8 +247,14 @@ def get_config(key):
 
     return config_data[key]
 
+
 async def _download_media_async(url: str, save_dir: str, proxy: str = None) -> str:
     """异步核心：使用 MD5 作为安全文件名下载文件，返回绝对路径。"""
+
+    # 【核心修复】：将重量级网络库移到函数内部局部导入，彻底杜绝全局 DLL 冲突
+    import aiohttp
+    import aiofiles
+    import httpx
 
     # 提取后缀名 (例如 .jpg, .mp4)
     suffix = Path(urlparse(url).path).suffix
