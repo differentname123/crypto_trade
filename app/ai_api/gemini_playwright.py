@@ -559,7 +559,7 @@ def generate_gemini_content_playwright(prompt, file_path=None, wait_timeout=600,
             )
             if hit_rate_limit:
                 _apply_rate_limit_penalty(account_name, actual_model_name)
-                logger.warning(
+                logger.error(
                     f"{log_prefix} 命中远端 Rate Limit | 账号: [{account_name}] | "
                     f"模型: [{actual_model_name}] | 处理: streak 置满并移出活跃池"
                 )

@@ -241,7 +241,7 @@ def gen_all_promo_comments():
     post_manager = UniversalPostManager(gen_db_object())
 
     while True:
-        # fetch_post(post_manager)
+        fetch_post(post_manager)
 
         existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
         logger.info(
@@ -417,7 +417,7 @@ def send_promo_comments():
 # ==========================================
 if __name__ == "__main__":
     tasks = [
-        # send_promo_comments,
+        send_promo_comments,
         gen_all_promo_comments,  # 注释本行即可停用"评论生成"链路
     ]
 
