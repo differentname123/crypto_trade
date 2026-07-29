@@ -679,18 +679,26 @@ def _wait_and_get_response(page):
     expect(response_container).to_be_visible()
 
     # ====================================================================
-    # 🎯 精准提取优化：跳过底部的 Citations 和其他 UI，只提取正文节点
+    # 🎯 精准提取优化 V2：优先检测官方的报错节点，再提取正文
     # ====================================================================
-    # 真实的文章内容都包裹在 class 包含 text-chunk 的节点内
+    # 特判 1: 检测是否存在模型报错提示 (如 Rate Limit, Internal Error 等)
+    error_locator = response_container.locator('.model-error')
+    if error_locator.count() > 0:
+        error_text = error_locator.inner_text().strip()
+        if error_text:
+            logger.warning(f"[等待响应] 抓取到页面内嵌错误信息: {error_text}")
+            return error_text  # 提前返回错误文本，供外层识别 Rate Limit
+
+    # 特判 2: 提取真实的模型正文，跳过底部的 Citations 和其他 UI
     text_chunk_locator = response_container.locator('.text-chunk')
-
     if text_chunk_locator.count() > 0:
-        # 如果找到了精准正文节点，只提取它的文字，完美避开 Citation
-        return text_chunk_locator.inner_text()
-    else:
-        # 兜底：万一 Google 改版找不到 .text-chunk，再回退到提取整个容器
-        return response_container.inner_text()
+        content_text = text_chunk_locator.inner_text().strip()
+        # 必须确保内容不为空才返回，如果是空的说明有异常(避免空 div 吞没真实错误)
+        if content_text:
+            return content_text
 
+    # 兜底：万一 Google 改版找不到 .text-chunk，或者抓取为空，再回退到提取整个容器
+    return response_container.inner_text()
 
 # ==============================================================================
 # 核心: 单次调用 Gemini
@@ -1082,9 +1090,9 @@ def validate_all_accounts():
 if __name__ == '__main__':
     # login_and_save_session()
 
-    validate_all_accounts()
+    # validate_all_accounts()
 
-    # open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
+    open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
     #
     # test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
     # test_prompt = "图片内容是什么"
