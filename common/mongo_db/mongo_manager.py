@@ -30,16 +30,20 @@ class UniversalPostManager:
     def _ensure_indexes(self):
         """
         初始化核心索引，保障查询速度与数据隔离。
-        - source + post_id : 联合唯一，防止跨平台 ID 冲突与重复写入
+        - source + post_id : 联合唯一，防止跨平台 ID 冲突与重复写入 (遵循最左前缀)
         - publish_time     : 时间线拉取
         - source + card_type : 平台 / 帖子类型维度统计
+        - post_id          : 新增普通索引，用于脱离 source 纯按 ID 检索的场景
         """
         self.db.create_index(self.collection_name, [('source', 1), ('post_id', 1)], unique=True)
         self.db.create_index(self.collection_name, [('publish_time', -1)], unique=False)
         self.db.create_index(self.collection_name, [('source', 1), ('card_type', 1)], unique=False)
 
+        # 【新增索引】：为了支持单纯按 post_id 列表查询而不引起全表扫描
+        self.db.create_index(self.collection_name, [('post_id', 1)], unique=False)
+
         logger.info(
-            "索引就绪 | collection=%s | indexes=[uniq(source,post_id), publish_time(-1), (source,card_type)]",
+            "索引就绪 | collection=%s | indexes=[uniq(source,post_id), publish_time(-1), (source,card_type), post_id]",
             self.collection_name
         )
 
@@ -91,6 +95,39 @@ class UniversalPostManager:
         logger.info(
             "查询完成 | source=%s | limit=%s | matched=%s",
             source, limit, len(posts) if posts else 0
+        )
+        return posts
+
+    def find_posts_by_ids(self, post_ids, source=None):
+        """
+        根据 post_id 列表批量拉取帖子数据。
+
+        :param post_ids: list[str], 帖子 ID 列表 (例如: ["binance_1001", "xhs_6688"])
+        :param source: str (可选), 指定平台来源。
+                       强烈建议传入此参数！不仅能防止不同平台间偶然的 ID 冲突，
+                       还能直接命中 (source, post_id) 的联合唯一索引，查询最快。
+        :return: list[dict], 匹配的帖子列表
+        """
+        if not post_ids:
+            return []
+
+        # 核心语法：使用 MongoDB 的 $in 操作符
+        query = {"post_id": {"$in": post_ids}}
+
+        # 如果提供了 source，追加到查询条件中
+        if source:
+            query["source"] = source
+
+        start = datetime.now(timezone.utc)
+        posts = self.db.find_many(
+            self.collection_name,
+            query=query
+        )
+        cost_ms = (datetime.now(timezone.utc) - start).total_seconds() * 1000
+
+        logger.info(
+            "按ID列表查询完成 | source=%s | id_count=%s | matched=%s | cost=%.1fms",
+            source or "ALL_PLATFORMS", len(post_ids), len(posts) if posts else 0, cost_ms
         )
         return posts
 

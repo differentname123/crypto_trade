@@ -78,7 +78,7 @@ def build_search_text(post):
     return search_text.strip()
 
 
-def sync_posts_to_vector_db():
+def sync_posts_to_vector_db(post_manager):
     """
     批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
     由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
@@ -86,7 +86,6 @@ def sync_posts_to_vector_db():
     [出参]: 执行状态字典
     """
     data_to_add = []
-    post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
     # 保留media_format存在的posts
     filter_posts = [post for post in existing_posts if post.get("media_format")]
@@ -114,20 +113,91 @@ def sync_posts_to_vector_db():
     return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
 
 
-def search_posts_by_semantics(keywords, top_n=5):
+def search_recent_posts_by_semantics(keywords, post_manager, top_n=5, recent_hours=24):
     """
-    语义搜索函数：根据自然语言关键词，搜索匹配的帖子ID。
-    [入参]: keywords(单个字符串或列表均可，如 "200倍杠杆"), top_n(返回数量)
-    [出参]: 列表，元素结构为 {"id": "xxx", "similarity": 0.85, "matched_keyword": "xxx"}
+    语义搜索 + 数据库回表聚合查询：
+    根据自然语言搜索帖子，拉取 MongoDB 中的完整记录，并强制过滤近期时间。
+
+    :param keywords: 搜索关键词 (str 或 list)
+    :param post_manager: UniversalPostManager 实例，用于操作数据库
+    :param top_n: 最终需要返回的记录数量
+    :param recent_hours: 最近时间范围，单位：小时 (默认 24h)
+    :return: list[dict], 包含完整数据库信息与向量相似度的结果列表
     """
-    logger.info(f"[向量库/查询] 正在通过语义搜索匹配：{keywords}")
-    results = VECTOR_ENGINE.search(keywords, top_n=top_n)
+    # ---------------------------------------------------------
+    # 1. 计算时间阈值 (转换为与 publish_time 匹配的 Unix 时间戳/秒)
+    # ---------------------------------------------------------
+    current_time_s = int(time.time())
+    time_threshold_s = current_time_s - (recent_hours * 3600)
 
-    # 打印简要日志以便调试
-    for r in results:
-        logger.info(f" -> 命中 PostID: {r['id']} | 相似度: {r['similarity']:.4f}")
+    # ---------------------------------------------------------
+    # 2. 向量库初步召回 (放大召回数，防止被时间过滤后数据不够)
+    # ---------------------------------------------------------
+    # 假设放大系数为 3 (可根据你的实际数据产生频率调整)
+    recall_size = top_n * 3
+    logger.info(f"[语义检索] 开始匹配关键词: {keywords} | 目标返回数: {top_n} | 实际召回数: {recall_size}")
 
-    return results
+    # 假设 VECTOR_ENGINE 是全局变量或已经初始化的客户端
+    vector_results = VECTOR_ENGINE.search(keywords, top_n=recall_size)
+
+    if not vector_results:
+        logger.info("[语义检索] 未命中任何候选数据。")
+        return []
+
+    # 提取 post_id 列表，并建立 ID -> 相似度信息的映射字典，用于后续组装
+    candidate_ids = []
+    similarity_map = {}
+    for r in vector_results:
+        pid = r['id']
+        candidate_ids.append(pid)
+        similarity_map[pid] = {
+            "similarity": r.get('similarity', 0),
+            "matched_keyword": r.get('matched_keyword', '')
+        }
+
+    # ---------------------------------------------------------
+    # 3. MongoDB 回表查询与时间过滤
+    # ---------------------------------------------------------
+    # 构造复合查询条件：ID 必须在召回列表中，且发布时间 >= 时间阈值
+    query = {
+        "post_id": {"$in": candidate_ids},
+        "publish_time": {"$gte": time_threshold_s}
+    }
+
+    # 直接使用 post_manager 底层的 db 实例执行查询
+    db_records = post_manager.db.find_many(
+        post_manager.collection_name,
+        query=query
+    )
+
+    if not db_records:
+        logger.warning(
+            f"[语义检索] 向量库命中了 {len(candidate_ids)} 条，但在 {recent_hours}h 内的 MongoDB 记录为 0 条。")
+        return []
+
+    # ---------------------------------------------------------
+    # 4. 数据合并与重新排序
+    # ---------------------------------------------------------
+    final_results = []
+    for record in db_records:
+        pid = record.get("post_id")
+        if pid in similarity_map:
+            # 将向量库的“相似度”等衍生数据，无缝贴回到数据库的原始记录中
+            record["_semantic_info"] = similarity_map[pid]
+            final_results.append(record)
+
+    # 关键点：MongoDB 使用 $in 查询返回的数据通常是无序的！
+    # 必须根据向量库赋予的相似度分值 (similarity) 重新从高到低排序
+    final_results.sort(
+        key=lambda x: x.get("_semantic_info", {}).get("similarity", 0),
+        reverse=True
+    )
+
+    # 截取最终用户需要的 top_n
+    final_results = final_results[:top_n]
+
+    logger.info(f"[语义检索] 流程结束 | 最终返回 {len(final_results)} 条，满足 {recent_hours}h 内的时间约束。")
+    return final_results
 
 def is_need_formatting(post):
     """
@@ -346,7 +416,10 @@ def format_image_article():
 
 
 if __name__ == "__main__":
-    # sync_posts_to_vector_db()
-    # search_posts_by_semantics("200倍杠杆", top_n=5)
+    # post_manager = UniversalPostManager(gen_db_object())
+
+    # sync_posts_to_vector_db(post_manager)
+
+    # data = search_recent_posts_by_semantics("200倍杠杆", post_manager, top_n=5)
 
     format_image_article()
