@@ -270,95 +270,80 @@ def gen_media_format_info(post):
     return {}
 
 
-def process_single_post(post):
+
+def process_and_save_single_post(post, post_manager):
     """
-    单条帖子的处理任务（工作线程执行）。
-    仅处理网络/CPU耗时操作，不直接操作数据库。
+    工作线程：负责单条帖子的请求与立即落盘（全异步/并发无锁版）
     """
     post_id = post.get('post_id', 'UNKNOWN_ID')
 
-    # 卫语句：拦截无需处理的帖子
     if not is_need_formatting(post):
-        return None, "SKIPPED", post_id
+        return
 
     try:
-        # 耗时的 I/O 操作 (如大模型 API 调用)
+        # 1. 耗时操作：并发调用大模型
         media_format_info = gen_media_format_info(post)
 
         if media_format_info:
             post['media_format'] = media_format_info
-            return post, "SUCCESS", post_id
+
+            # 2. 马上保存：直接调用 upsert_posts！无需加锁！
+            # 因为 post_manager 底层的 PyMongo 自带连接池和线程安全保障
+            post_manager.upsert_posts([post])
+
+            logger.info(
+                f"[DB/帖子格式化] 解析校验全量通过并完成回写 "
+                f"| PostID: {post_id} | 结果: 【成功入库】"
+            )
         else:
-            return None, "NO_DATA", post_id
+            logger.warning(
+                f"[DB/帖子格式化] 无效解析数据，跳过落盘 "
+                f"| PostID: {post_id} | 结果: 【被丢弃】"
+            )
 
     except Exception as e:
         logger.error(f"[单任务执行] 处理帖子 {post_id} 发生异常: {e}", exc_info=True)
-        return None, "ERROR", post_id
 
 
 def format_image_article():
     """
-    后台守护主流程：持续从数据库拉取待格式化帖子，多线程驱动大模型处理元数据后，批量回写。
+    后台守护主流程：持续从数据库拉取待格式化帖子，驱动大模型处理元数据后立即回写。
     """
-    MAX_CONCURRENCY = 5  # 设定并发数量为 5
+    MAX_CONCURRENCY = 5  # 并发数量为 5
 
     while True:
         try:
-            # 每次循环获取最新的 DB 实例，确保连接有效性
             post_manager = UniversalPostManager(gen_db_object())
             existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
 
             if not existing_posts:
-                logger.info("[DB/帖子格式化] 当前无待处理帖子，休眠 60 秒...")
                 time.sleep(60)
                 continue
 
-            posts_to_upsert = []
-
             # 开启线程池进行并发处理
             with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
-                # 提交所有任务
-                future_to_post = {executor.submit(process_single_post, post): post for post in existing_posts}
-
-                # as_completed 会在任务完成后立即返回，方便实时捕获状态
-                for future in as_completed(future_to_post):
-                    result_post, status, post_id = future.result()
-
-                    if status == "SUCCESS":
-                        posts_to_upsert.append(result_post)
-                        # 降低日志级别或精简日志，避免高并发下刷屏
-                        logger.debug(f"[并发/解析] 解析成功 | PostID: {post_id}")
-                    elif status == "NO_DATA":
-                        logger.warning(
-                            f"[并发/解析] 无法获取有效解析数据 | PostID: {post_id} "
-                            f"| 排查建议: 可能是帖子包含不支持的媒体结构，或检查 API 响应"
-                        )
-                    # SKIPPED 和 ERROR 状态无需在此处额外处理，ERROR已在子线程记录
-
-            # 并发结束后，主线程进行批量统一入库 (极大提升性能且保证DB线程安全)
-            if posts_to_upsert:
-                post_manager.upsert_posts(posts_to_upsert)
-                logger.info(
-                    f"[DB/帖子格式化] 批次处理完成，成功回写落盘 "
-                    f"| 成功数量: {len(posts_to_upsert)} / 总拉取数量: {len(existing_posts)}"
-                )
+                # 遍历帖子，将 帖子数据 和 数据库管理器 传递给子线程
+                for post in existing_posts:
+                    executor.submit(process_and_save_single_post, post, post_manager)
 
             # 动态休眠策略：如果拉取数量达到 limit，说明可能有积压，缩短休眠；否则常规休眠
             if len(existing_posts) >= POST_QUERY_LIMIT:
                 logger.info("本批次达到 Limit 上限，说明可能存在积压，仅休眠 5 秒后继续...")
                 time.sleep(5)
             else:
-                logger.info("本批次处理完毕，进入常规休眠 (3600秒).")
+                logger.info("本批次所有任务处理完毕，进入常规休眠 (3600秒).")
                 time.sleep(3600)
 
         except Exception as e:
             logger.error(
                 f"[系统/守护主循环] 格式化核心链路遭遇未捕获全局异常，挂起后重连 "
+                f"| 关键参数: 【无】 "
                 f"| 结果: 【当前轮次中断，休眠 60 秒后重建 DB 对象重试】 "
                 f"| 原因: {e}",
                 exc_info=True
             )
             time.sleep(60)
+
 
 if __name__ == "__main__":
     # sync_posts_to_vector_db()

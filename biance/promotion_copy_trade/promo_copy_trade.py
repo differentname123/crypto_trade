@@ -417,7 +417,7 @@ def send_promo_comments():
 # ==========================================
 if __name__ == "__main__":
     tasks = [
-        send_promo_comments,
+        # send_promo_comments,
         gen_all_promo_comments,  # 注释本行即可停用"评论生成"链路
     ]
 
