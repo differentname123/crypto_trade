@@ -11,6 +11,8 @@
 
 import re
 import time
+from collections import defaultdict
+
 from common.common_utils import setup_logger, read_file_to_str, string_to_object
 from common.vector_utils import VectorSearchEngine
 
@@ -469,6 +471,140 @@ def clear_all_media_format_batch():
     else:
         logger.info("[数据清理/批量落库] 无需清理 | 结果: 【实际更新: 0 条】")
 
+
+def process_posts(post_list):
+    result = []
+    # 匹配各类多媒体占位符的正则
+    pattern = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
+
+    for idx, post in enumerate(post_list, 1):
+        # 1. 生成更加简洁的 doc_id，例如 "d_01", "d_02"
+        doc_id = f"d_{idx}"
+
+        # 提取原文内容和图片详细数据
+        text_content = post.get("content", {}).get("text_content", "")
+        media_images = post.get("media_format", {}).get("images", [])
+
+        content_list = []
+        last_end = 0  # 记录上一段匹配结束的索引
+        image_idx = 0  # 追踪当前使用到的图片索引
+        video_idx = 0  # 如果有视频的话，单独追踪视频索引
+
+        # 2. 遍历文本中所有匹配到的图片/视频占位符
+        for match in pattern.finditer(text_content):
+            media_type_str = match.group(1)
+
+            # 截取匹配项之前的纯文本内容
+            text_part = text_content[last_end:match.start()].strip()
+            if text_part:  # 如果文本不为空，加入到 content 中
+                content_list.append({
+                    "type": "text",
+                    "text": text_part
+                })
+
+            # 判断当前是图片还是视频，并生成对应的新占位符
+            is_video = (media_type_str == "视频")
+
+            # 获取对应的描述数据
+            desc, ocr, logic = "", "", ""
+
+            if not is_video and image_idx < len(media_images):
+                # 提取对应图片的结构化信息
+                img_data = media_images[image_idx]
+                desc = img_data.get("visual_fact", {}).get("fact", "")
+                ocr = img_data.get("visual_fact", {}).get("ocr_text", "")
+                logic = img_data.get("semantic_core", {}).get("message", "")
+
+                image_idx += 1
+                placeholder = f"[IMG_{doc_id}_IMAGE_{image_idx:02d}]"
+            elif is_video:
+                video_idx += 1
+                placeholder = f"[VID_{doc_id}_VIDEO_{video_idx:02d}]"
+            else:
+                # 兜底：如果原文里的 [插图] 数量多于 json 解析的 images 数组长度
+                image_idx += 1
+                placeholder = f"[IMG_{doc_id}_IMAGE_{image_idx:02d}]"
+
+            # 添加图片/视频对象到 content
+            content_list.append({
+                "type": "image" if not is_video else "video",
+                "desc": desc,
+                "ocr": ocr,
+                "logic": logic,
+                "placeholder": placeholder
+            })
+
+            # 更新游标
+            last_end = match.end()
+
+        # 3. 处理最后剩余的文本（末尾最后一张图片后面的文本）
+        remaining_text = text_content[last_end:].strip()
+        if remaining_text:
+            content_list.append({
+                "type": "text",
+                "text": remaining_text
+            })
+
+        # 将当前文档对象追加到总结果
+        result.append({
+            "doc_id": doc_id,
+            "content": content_list
+        })
+
+    return result
+
+
+
+def build_analysis_content():
+    post_manager = UniversalPostManager(gen_db_object())
+    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    logger.info(
+        f"[数据清理/启动] 拉取待清理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始扫描待清理项】")
+
+    current_time = time.time()
+    one_day_seconds = 24 * 60 * 60
+    filtered_posts = []
+
+    # 1 & 2. 找到 media_format 存在的 posts，并过滤 publish_time 在 1 天内的数据
+    for post in existing_posts:
+        # 检查 media_format 是否存在
+        if not post.get('media_format'):
+            continue
+
+        publish_time = post.get('publish_time')
+        if publish_time is not None:
+            try:
+                # 转换为 float 防御性编程，处理 publish_time 可能是字符串的情况
+                # 判断条件：当前时间减去 1天前的时间 <= 发布时间
+                if (current_time - one_day_seconds) <= float(publish_time) <= (current_time + 3600):
+                    # 注: 加 3600 秒是为了兼容服务器间可能存在的轻微时间误差（如未来时间戳）
+                    filtered_posts.append(post)
+            except (ValueError, TypeError):
+                # 如果 publish_time 格式异常无法转换，则跳过
+                continue
+
+    # 3. 按照 main 和 stance 进行双重分组
+    # 使用 defaultdict(lambda: defaultdict(list)) 可以自动初始化缺失的嵌套字典
+    grouped_results = defaultdict(lambda: defaultdict(list))
+
+    for post in filtered_posts:
+        # 安全获取嵌套字典的值，防止因为数据结构不完整抛出 KeyError
+        media_format = post.get('media_format', {})
+        doc = media_format.get('doc', {})
+
+        main_topic = doc.get('main')
+        stance = doc.get('stance')
+
+        # 确保这两个分组键存在才将其加入结果字典
+        if main_topic is not None and stance is not None:
+            grouped_results[main_topic][stance].append(post)
+
+    # 如果后续需要标准的 dict 格式，可以直接将 grouped_results 当作普通字典返回或转换
+    # 打印一下处理结果（可选）
+    logger.info(f"[数据清理/分组] 分组处理完成 | 关键参数: 【符合条件的帖子量: {len(filtered_posts)}】")
+    clean_data = process_posts(grouped_results['BTC']['看多'])
+    return grouped_results
+
 if __name__ == "__main__":
     # clear_all_media_format_batch()
 
@@ -477,5 +613,6 @@ if __name__ == "__main__":
     # sync_posts_to_vector_db(post_manager)
 
     # data = search_recent_posts_by_semantics("200倍杠杆", post_manager, top_n=5)
+    build_analysis_content()
 
-    format_image_article()
+    # format_image_article()
