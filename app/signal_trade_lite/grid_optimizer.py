@@ -371,7 +371,7 @@ def get_latest_price(symbol):
 
 
 
-def calculate_final_score(df, margin_info, up_pct_target=10):
+def calculate_final_score(df, margin_info, up_pct_target=5):
     """
     What & Why:
     融合实时现价生成最终资金分配策略得分。
