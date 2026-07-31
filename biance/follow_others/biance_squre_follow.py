@@ -552,7 +552,7 @@ if __name__ == "__main__":
             "[运行时框架/引导激活] 主程序内存空间分配完毕 | 关键参数: 【生产者挂载/消费者挂载】 | 结果: 双擎并发点火")
 
         t_producer = threading.Thread(target=producer_fetch_content_main, name="ProducerThread", daemon=True)
-        t_consumer = threading.Thread(target=consumer_auto_sync_main, kwargs={"accounts": ["dahao", "nana", "jie", "mama"]},
+        t_consumer = threading.Thread(target=consumer_auto_sync_main, kwargs={"accounts": ["dahao", "nana", "jie", "mama", "ruru"]},
                                       name="ConsumerThread", daemon=True)
 
         t_producer.start()
