@@ -1156,6 +1156,32 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
             raise Exception("发送按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
 
+        # ==============================================================================
+        # 🚀 [新增加固]: 嗅探并处理「关注以回复」权限拦截弹窗
+        # ==============================================================================
+        try:
+            # 宽泛正则：兼容中英文环境下的“关注并回复”按钮
+            RE_FOLLOW_AND_REPLY = re.compile(r"关注并回复|Follow and [R|r]eply", re.IGNORECASE)
+            follow_reply_btn = page.locator("div[role='dialog'], [class*='modal']").get_by_role(
+                "button", name=RE_FOLLOW_AND_REPLY
+            ).first
+
+            # 给弹窗 1.5 秒的渲染时间，如果没有弹窗会平滑超时 pass
+            if follow_reply_btn.is_visible(timeout=1500):
+                logger.info("[发送/权限] 触发了「仅限关注者评论」限制，正在自动点击【关注并回复】")
+
+                # ⚠️ 核心细节：清空 Watcher 之前捕获的 70007 失败响应，防止 _read_api_verdict 误判
+                watcher.primary.clear()
+                watcher.secondary.clear()
+
+                # 点击关注并回复，这会触发真正的发帖请求
+                follow_reply_btn.click(timeout=3000)
+                page.wait_for_timeout(500)  # 给予接口一点缓冲时间
+        except Exception as bypass_e:
+            # 没找到弹窗或点击失败都不阻塞，交由后续的 API 判据来决定生死
+            pass
+        # ==============================================================================
+
         api_success, comment_id = _read_api_verdict(page, watcher)
     except PlaywrightTimeoutError as e:
         logger.warning(f"[发送/校验] 等待接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
@@ -1181,6 +1207,7 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     })
     raise Exception(f"发送已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
                     f"媒体 {media_before}→{media_after}），疑似发送按钮失效、内容被前端校验拦下或网络堵塞。")
+
 
 # ==============================================================================
 #                              URL / 帖子ID 解析
