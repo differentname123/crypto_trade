@@ -231,7 +231,16 @@ def _forensics(page, tag, extra=None):
     统一存证：截图 + HTML + JSON（自动附带"视口中心是谁挡住的"诊断与看门狗战果）。
     所有降级 / 失败路径都应调用，杜绝"死无对证"。extra 形貌: 任意可 JSON 序列化的 dict。
     """
-    base = f"forensic_{tag}_{int(time.time() * 1000)}"
+    # 统一存证目录名称，可根据需要修改
+    save_dir = "forensics_logs"
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    base_name = f"forensic_{tag}_{int(time.time() * 1000)}"
+    base_path = os.path.join(save_dir, base_name)
+
     payload = dict(extra or {})
     try:
         payload["page_diag"] = page.evaluate(_PAGE_DIAG_JS)
@@ -239,23 +248,22 @@ def _forensics(page, tag, extra=None):
         payload["page_diag"] = f"unavailable:{str(e)[:80]}"
 
     try:
-        page.screenshot(path=f"{base}.png", full_page=False)
+        page.screenshot(path=f"{base_path}.png", full_page=False)
     except Exception:
         pass
     try:
-        with open(f"{base}.html", "w", encoding="utf-8") as f:
+        with open(f"{base_path}.html", "w", encoding="utf-8") as f:
             f.write(page.content())
     except Exception:
         pass
     try:
-        with open(f"{base}.json", "w", encoding="utf-8") as f:
+        with open(f"{base_path}.json", "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
     except Exception:
         pass
 
-    logger.warning(f"[存证/Forensic] 故障现场已落盘 | 文件前缀: <{base}> | 页面诊断: 【{payload.get('page_diag')}】")
-    return base
-
+    logger.warning(f"[存证/Forensic] 故障现场已落盘 | 文件前缀: <{base_path}> | 页面诊断: 【{payload.get('page_diag')}】")
+    return base_path
 
 _HIT_TEST_JS = r"""
 (el) => {
@@ -1024,8 +1032,9 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
                 ).first).to_be_visible(timeout=12000)
                 mounted = True
             except Exception:
-                page.wait_for_timeout(3500)   # 等不到缩略图则退回固定等待
-            logger.info(f"[编辑器/图片] 图片挂载完毕 | 路径: <{image_path}> | 缩略图可见: 【{mounted}】 | 结果: [Success]")
+                page.wait_for_timeout(3500)  # 等不到缩略图则退回固定等待
+            logger.info(
+                f"[编辑器/图片] 图片挂载完毕 | 路径: <{image_path}> | 缩略图可见: 【{mounted}】 | 结果: [Success]")
         except Exception as e:
             logger.warning(f"[编辑器/图片] 图片上传失败，本条评论自动降级为纯文本 | 路径: <{image_path}> "
                            f"| 可能原因: 【文件损坏/格式不支持/上传控件未渲染: {str(e)[:150]}】")
@@ -1071,7 +1080,22 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             _type_body(page, real_editor, comment)
             page.wait_for_timeout(500)
 
-        logger.info("[编辑器/正文] 正文输入完成 | 结果: [Success]")
+        # ==============================================================================
+        # 🚀 [核心修复]: 强制状态同步 (State Resync)
+        # 应对 ProseMirror + React 状态脱帧导致“发送按钮置灰”的终极杀招。
+        # 将光标切到末尾，模拟一次真实的交互触发 onChange。
+        # ==============================================================================
+        logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
+        try:
+            _focus_editor_end(page, real_editor)
+            real_editor.press("Space")
+            page.wait_for_timeout(100)
+            real_editor.press("Backspace")
+            page.wait_for_timeout(300)
+        except Exception as sync_e:
+            logger.warning(f"[编辑器/同步] 状态唤醒动作异常，但继续主流程: {str(sync_e)[:100]}")
+
+        logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
 
     # ---- 步骤 5：定位并点击发送 ----
     _dismiss_overlays(page, aggressive=False, desc="pre-send")
@@ -1079,13 +1103,27 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
         editor_container.locator("button").filter(has_text=RE_SEND_EXACT).first,
         editor_container.get_by_role("button", name=RE_SEND).first,
     ]
+
+    # ==============================================================================
+    # 🚀 [核心修复]: 严格的按钮状态断言
+    # 绝不用 JS 原生去点一个 Disabled 的按钮，那会制造假希望并导致幽灵超时。
+    # ==============================================================================
     try:
         send_button = _pick_trusted_send_button(send_btn_cands) or _interact_fallback_locators(
-            send_btn_cands, action="wait", timeout=10000, desc="发送按钮")
-        expect(send_button).to_be_enabled(timeout=10000)
+            send_btn_cands, action="wait", timeout=5000, desc="发送按钮")
+
+        # 必须等待它变成 enable（亮黄色）
+        expect(send_button).to_be_enabled(timeout=8000)
+    except PlaywrightTimeoutError:
+        # 如果依然是 disabled，立即存证并终止，不要去点
+        _forensics(page, "btn_disabled_fatal", {
+            "btn_html": send_button.evaluate("el => el.outerHTML") if send_button else "none",
+            "editor_text": real_editor.inner_text() if real_editor else "none"
+        })
+        raise Exception(
+            "发送按钮被找到，但持续处于禁用(Disabled)状态。前端组件未能识别输入内容。已阻断强制点击，防止死等接口。")
     except Exception as e:
-        logger.warning(f"[发送/按钮] 发送按钮定位或就绪校验失败，强制回退首选候选继续尝试 "
-                       f"| 可能原因: 【按钮未渲染 / 内容为空导致禁用态: {str(e)[:150]}】")
+        logger.warning(f"[发送/按钮] 发生意外的定位错误: {str(e)[:150]}")
         send_button = send_btn_cands[0]
 
     text_before, media_before = _snapshot_editor(real_editor)
@@ -1099,7 +1137,8 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
         for attempt in range(3):
             hit = _hit_test(page, send_button)
             if not hit.get("ok"):
-                logger.warning(f"[发送/提交] 发送按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】")
+                logger.warning(
+                    f"[发送/提交] 发送按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】")
                 _dismiss_overlays(page, aggressive=(attempt >= 1), desc=f"send-blocked-{attempt}")
             try:
                 if attempt == 0:
@@ -1142,7 +1181,6 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     })
     raise Exception(f"发送已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
                     f"媒体 {media_before}→{media_after}），疑似发送按钮失效、内容被前端校验拦下或网络堵塞。")
-
 
 # ==============================================================================
 #                              URL / 帖子ID 解析
