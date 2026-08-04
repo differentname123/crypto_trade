@@ -260,7 +260,7 @@ def normalize_post_media(post_data):
 
 def check_format_info(json_data, placeholders):
     """
-    防御性校验大模型返回的双层 JSON 数据结构，确保核心业务字段完整、枚举正确且图片映射无误。
+    防御性校验大模型返回的 JSON 数据结构，确保核心业务字段完整、枚举正确且图片映射无误。
     [入参 Shape]: json_data 解析出的外部数据结构 (Dict), placeholders 文章中真实的图片占位符列表 (如 ['[IMAGE_1]', '[IMAGE_2]'])
     [出参 Shape]: 元组 (是否合法校验布尔值, 错误详情文本)
     """
@@ -268,20 +268,22 @@ def check_format_info(json_data, placeholders):
     if not isinstance(json_data, dict):
         return False, "最外层返回结构必须是字典(Dict)"
 
-    if 'evidences' not in json_data or 'vibes' not in json_data:
-        return False, "最外层缺失核心节点 'evidences' 或 'vibes'"
+    if 'evidences' not in json_data:
+        return False, "最外层缺失核心节点 'evidences'"
 
     evidences = json_data['evidences']
-    vibes = json_data['vibes']
 
     if not isinstance(evidences, list):
         return False, "'evidences' 节点必须是列表(List)"
-    if not isinstance(vibes, list):
-        return False, "'vibes' 节点必须是列表(List)"
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
-    evidence_expected_keys = {'claim', 'support', 'support_type', 'dimension', 'coins', 'stance', 'shelf_life',
-                              'images'}
+    # 【修改点】：加入了新增的 'raw_golden_quote'
+    evidence_expected_keys = {
+        'claim', 'support', 'raw_golden_quote', 'support_type',
+        'dimension', 'coins', 'stance', 'shelf_life', 'images'
+    }
+
+    # 【注意】：严格按照上一版 Prompt，保留了 '泛泛而谈'
     valid_support_types = {'具体数据', '具体事件', '图表形态', '泛泛而谈'}
     valid_dimensions = {'K线形态', '技术指标', '链上数据', '资金流', '消息面', '基本面', '情绪判断'}
     valid_evidence_stances = {'看多', '看空', '震荡'}
@@ -300,6 +302,10 @@ def check_format_info(json_data, placeholders):
         missing_ev_keys = evidence_expected_keys - ev.keys()
         if missing_ev_keys:
             return False, f"evidences 序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_ev_keys)}】"
+
+        # 数据类型检查（针对新增金句字段的防御）
+        if not isinstance(ev.get('raw_golden_quote'), str):
+            return False, f"evidences 序列第【{i + 1}】项的 raw_golden_quote 必须是字符串(String)"
 
         # 枚举值检查
         if ev.get('support_type') not in valid_support_types:
@@ -349,36 +355,8 @@ def check_format_info(json_data, placeholders):
                 if risk not in valid_risks:
                     return False, f"evidences 第【{i + 1}】项的 risk 包含了非法枚举值【{risk}】"
 
-    # ================= 3. 校验 vibes (情绪金句单元) =================
-    vibe_expected_keys = {'original', 'coins', 'stance', 'emotion', 'function'}
-    valid_vibe_stances = {'看多', '看空', '通用'}
-    valid_emotions = {'FOMO', '贪婪', '恐惧', '焦虑', '愤怒', '嘲讽', '信念', '庆祝', '其他'}
-    valid_functions = {'钩子', '立场宣言', '打脸反驳', '暴击金句', '行动号召'}
-
-    for i, vb in enumerate(vibes):
-        if not isinstance(vb, dict):
-            return False, f"vibes 序列第【{i + 1}】项数据异常，不是标准的字典对象"
-
-        missing_vb_keys = vibe_expected_keys - vb.keys()
-        if missing_vb_keys:
-            return False, f"vibes 序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_vb_keys)}】"
-
-        # 校验标的数组 (按规则未涉及具体标的且可复用时可填空数组，所以只校验是否为List)
-        if not isinstance(vb.get('coins'), list):
-            return False, f"vibes 第【{i + 1}】项 coins 必须是列表(List)"
-
-        if vb.get('stance') not in valid_vibe_stances:
-            return False, f"vibes 第【{i + 1}】项 stance【{vb.get('stance')}】不在允许枚举值内"
-
-        if vb.get('emotion') not in valid_emotions:
-            return False, f"vibes 第【{i + 1}】项 emotion【{vb.get('emotion')}】不在允许枚举值内"
-
-        if vb.get('function') not in valid_functions:
-            return False, f"vibes 第【{i + 1}】项 function【{vb.get('function')}】不在允许枚举值内"
-
     # 全部校验通过
     return True, ""
-
 
 
 def gen_media_format_info(post):
