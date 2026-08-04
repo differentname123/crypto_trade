@@ -14,7 +14,7 @@ import time
 from collections import defaultdict
 
 from common.common_utils import setup_logger, read_file_to_str, string_to_object
-from common.vector_utils import VectorSearchEngine
+# from common.vector_utils import VectorSearchEngine
 
 logger = setup_logger(app_name="media_format")
 
@@ -29,7 +29,7 @@ LLM_MAX_RETRIES = 3
 
 
 # 全局初始化向量引擎（单例调用，避免重复加载）
-VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
+# VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
 
 
 def build_search_text(post):
@@ -80,126 +80,126 @@ def build_search_text(post):
     return search_text.strip()
 
 
-def sync_posts_to_vector_db(post_manager):
-    """
-    批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
-    由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
-    [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
-    [出参]: 执行状态字典
-    """
-    data_to_add = []
-    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-    # 保留logic_mul存在的posts
-    filter_posts = [post for post in existing_posts if post.get("logic_mul")]
-    logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
+# def sync_posts_to_vector_db(post_manager):
+#     """
+#     批量入库函数：将格式化完毕的帖子列表，提取ID和超级文本后，灌入 ChromaDB。
+#     由于底层的 VectorSearchEngine 已做好防重复校验，可放心重复传入历史数据。
+#     [入参]: post_list (从 MongoDB 查询出的 post 字典列表)
+#     [出参]: 执行状态字典
+#     """
+#     data_to_add = []
+#     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+#     # 保留logic_mul存在的posts
+#     filter_posts = [post for post in existing_posts if post.get("logic_mul")]
+#     logger.info(f"[向量库/同步] 查询到 {len(existing_posts)} 条帖子，其中 {len(filter_posts)} 条已完成格式化，准备入库...")
+#
+#
+#     for post in filter_posts:
+#         post_id = post.get("post_id")
+#         logic_mul = post.get("logic_mul")
+#
+#         # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
+#         if not post_id or not logic_mul:
+#             continue
+#
+#         search_text = build_search_text(post)
+#         data_to_add.append({
+#             "id": post_id,
+#             "search_text": search_text
+#         })
+#
+#     if data_to_add:
+#         logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
+#         return VECTOR_ENGINE.add_data(data_to_add)
+#
+#     return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
 
 
-    for post in filter_posts:
-        post_id = post.get("post_id")
-        logic_mul = post.get("logic_mul")
-
-        # 拦截校验：只有存在 post_id 且已经过大模型格式化的帖子才允许入库
-        if not post_id or not logic_mul:
-            continue
-
-        search_text = build_search_text(post)
-        data_to_add.append({
-            "id": post_id,
-            "search_text": search_text
-        })
-
-    if data_to_add:
-        logger.info(f"[向量库/同步] 准备将 {len(data_to_add)} 条解析完毕的数据送入向量库提取特征...")
-        return VECTOR_ENGINE.add_data(data_to_add)
-
-    return {"status": "success", "msg": "没有符合条件的帖子需要入库", "added_count": 0}
-
-
-def search_recent_posts_by_semantics(keywords, post_manager, top_n=5, recent_hours=24):
-    """
-    语义搜索 + 数据库回表聚合查询：
-    根据自然语言搜索帖子，拉取 MongoDB 中的完整记录，并强制过滤近期时间。
-
-    :param keywords: 搜索关键词 (str 或 list)
-    :param post_manager: UniversalPostManager 实例，用于操作数据库
-    :param top_n: 最终需要返回的记录数量
-    :param recent_hours: 最近时间范围，单位：小时 (默认 24h)
-    :return: list[dict], 包含完整数据库信息与向量相似度的结果列表
-    """
-    # ---------------------------------------------------------
-    # 1. 计算时间阈值 (转换为与 publish_time 匹配的 Unix 时间戳/秒)
-    # ---------------------------------------------------------
-    current_time_s = int(time.time())
-    time_threshold_s = current_time_s - (recent_hours * 3600)
-
-    # ---------------------------------------------------------
-    # 2. 向量库初步召回 (放大召回数，防止被时间过滤后数据不够)
-    # ---------------------------------------------------------
-    # 假设放大系数为 3 (可根据你的实际数据产生频率调整)
-    recall_size = top_n * 3
-    logger.info(f"[语义检索] 开始匹配关键词: {keywords} | 目标返回数: {top_n} | 实际召回数: {recall_size}")
-
-    # 假设 VECTOR_ENGINE 是全局变量或已经初始化的客户端
-    vector_results = VECTOR_ENGINE.search(keywords, top_n=recall_size)
-
-    if not vector_results:
-        logger.info("[语义检索] 未命中任何候选数据。")
-        return []
-
-    # 提取 post_id 列表，并建立 ID -> 相似度信息的映射字典，用于后续组装
-    candidate_ids = []
-    similarity_map = {}
-    for r in vector_results:
-        pid = r['id']
-        candidate_ids.append(pid)
-        similarity_map[pid] = {
-            "similarity": r.get('similarity', 0),
-            "matched_keyword": r.get('matched_keyword', '')
-        }
-
-    # ---------------------------------------------------------
-    # 3. MongoDB 回表查询与时间过滤
-    # ---------------------------------------------------------
-    # 构造复合查询条件：ID 必须在召回列表中，且发布时间 >= 时间阈值
-    query = {
-        "post_id": {"$in": candidate_ids},
-        "publish_time": {"$gte": time_threshold_s}
-    }
-
-    # 直接使用 post_manager 底层的 db 实例执行查询
-    db_records = post_manager.db.find_many(
-        post_manager.collection_name,
-        query=query
-    )
-
-    if not db_records:
-        logger.warning(
-            f"[语义检索] 向量库命中了 {len(candidate_ids)} 条，但在 {recent_hours}h 内的 MongoDB 记录为 0 条。")
-        return []
-
-    # ---------------------------------------------------------
-    # 4. 数据合并与重新排序
-    # ---------------------------------------------------------
-    final_results = []
-    for record in db_records:
-        pid = record.get("post_id")
-        if pid in similarity_map:
-            # 将向量库的"相似度"等衍生数据，无缝贴回到数据库的原始记录中
-            record["_semantic_info"] = similarity_map[pid]
-            final_results.append(record)
-
-    # 关键点：MongoDB 使用 $in 查询返回的数据通常是无序的！
-    # 必须根据向量库赋予的相似度分值 (similarity) 重新从高到低排序
-    final_results.sort(
-        key=lambda x: x.get("_semantic_info", {}).get("similarity", 0),
-        reverse=True
-    )
-
-    # 截取最终用户需要的 top_n
-    final_results = final_results[:top_n]
-
-    logger.info(f"[语义检索] 流程结束 | 最终返回 {len(final_results)} 条，满足 {recent_hours}h 内的时间约束。")
-    return final_results
+# def search_recent_posts_by_semantics(keywords, post_manager, top_n=5, recent_hours=24):
+#     """
+#     语义搜索 + 数据库回表聚合查询：
+#     根据自然语言搜索帖子，拉取 MongoDB 中的完整记录，并强制过滤近期时间。
+#
+#     :param keywords: 搜索关键词 (str 或 list)
+#     :param post_manager: UniversalPostManager 实例，用于操作数据库
+#     :param top_n: 最终需要返回的记录数量
+#     :param recent_hours: 最近时间范围，单位：小时 (默认 24h)
+#     :return: list[dict], 包含完整数据库信息与向量相似度的结果列表
+#     """
+#     # ---------------------------------------------------------
+#     # 1. 计算时间阈值 (转换为与 publish_time 匹配的 Unix 时间戳/秒)
+#     # ---------------------------------------------------------
+#     current_time_s = int(time.time())
+#     time_threshold_s = current_time_s - (recent_hours * 3600)
+#
+#     # ---------------------------------------------------------
+#     # 2. 向量库初步召回 (放大召回数，防止被时间过滤后数据不够)
+#     # ---------------------------------------------------------
+#     # 假设放大系数为 3 (可根据你的实际数据产生频率调整)
+#     recall_size = top_n * 3
+#     logger.info(f"[语义检索] 开始匹配关键词: {keywords} | 目标返回数: {top_n} | 实际召回数: {recall_size}")
+#
+#     # 假设 VECTOR_ENGINE 是全局变量或已经初始化的客户端
+#     vector_results = VECTOR_ENGINE.search(keywords, top_n=recall_size)
+#
+#     if not vector_results:
+#         logger.info("[语义检索] 未命中任何候选数据。")
+#         return []
+#
+#     # 提取 post_id 列表，并建立 ID -> 相似度信息的映射字典，用于后续组装
+#     candidate_ids = []
+#     similarity_map = {}
+#     for r in vector_results:
+#         pid = r['id']
+#         candidate_ids.append(pid)
+#         similarity_map[pid] = {
+#             "similarity": r.get('similarity', 0),
+#             "matched_keyword": r.get('matched_keyword', '')
+#         }
+#
+#     # ---------------------------------------------------------
+#     # 3. MongoDB 回表查询与时间过滤
+#     # ---------------------------------------------------------
+#     # 构造复合查询条件：ID 必须在召回列表中，且发布时间 >= 时间阈值
+#     query = {
+#         "post_id": {"$in": candidate_ids},
+#         "publish_time": {"$gte": time_threshold_s}
+#     }
+#
+#     # 直接使用 post_manager 底层的 db 实例执行查询
+#     db_records = post_manager.db.find_many(
+#         post_manager.collection_name,
+#         query=query
+#     )
+#
+#     if not db_records:
+#         logger.warning(
+#             f"[语义检索] 向量库命中了 {len(candidate_ids)} 条，但在 {recent_hours}h 内的 MongoDB 记录为 0 条。")
+#         return []
+#
+#     # ---------------------------------------------------------
+#     # 4. 数据合并与重新排序
+#     # ---------------------------------------------------------
+#     final_results = []
+#     for record in db_records:
+#         pid = record.get("post_id")
+#         if pid in similarity_map:
+#             # 将向量库的"相似度"等衍生数据，无缝贴回到数据库的原始记录中
+#             record["_semantic_info"] = similarity_map[pid]
+#             final_results.append(record)
+#
+#     # 关键点：MongoDB 使用 $in 查询返回的数据通常是无序的！
+#     # 必须根据向量库赋予的相似度分值 (similarity) 重新从高到低排序
+#     final_results.sort(
+#         key=lambda x: x.get("_semantic_info", {}).get("similarity", 0),
+#         reverse=True
+#     )
+#
+#     # 截取最终用户需要的 top_n
+#     final_results = final_results[:top_n]
+#
+#     logger.info(f"[语义检索] 流程结束 | 最终返回 {len(final_results)} 条，满足 {recent_hours}h 内的时间约束。")
+#     return final_results
 
 def is_need_formatting(post):
     """
@@ -656,7 +656,56 @@ def build_analysis_content():
     clean_data = process_posts(grouped_results['BTC']['看多'])
     return grouped_results
 
+
+def get_all_non_empty_logic_mul_with_clean_text():
+    """
+    数据查询：获取数据库中所有不为空的 logic_mul 字段，并打包带有清洗后（无图片、视频占位符）的原始文本。
+    [出参 Shape]: List[Dict]，数据结构形如：
+                  [
+                      {
+                          "text_content": "清洗后的纯净文本...",
+                          "logic_mul": { 具体的逻辑块数据... }
+                      },
+                      ...
+                  ]
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+
+    # 沿用原代码的批量拉取规范
+    existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+
+    valid_data_list = []
+
+    for post in existing_posts:
+        logic_mul = post.get("logic_mul")
+
+        # 只要 logic_mul 有效，就提取并清洗对应的文本字段
+        if logic_mul:
+            # 1. 按照既有数据结构，安全地获取原始正文文本
+            raw_text = post.get("content", {}).get("text_content", "")
+
+            # 2. 文本清洗：利用项目原生正则，去除 [插图: http...] / [视频: http...] 等占位符
+            cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
+
+            # 3. 将清洗后的文本和 logic_mul 组合存入列表
+            valid_data_list.append({
+                "text_content": cleaned_text,
+                "logic_mul": logic_mul
+            })
+
+    logger.info(
+        f"[数据提取/logic_mul及纯文本] 提取完毕 | "
+        f"关键参数: 【扫描帖子总量: {len(existing_posts)}】 | "
+        f"结果: 【提取到有效数据组数: {len(valid_data_list)}】"
+    )
+
+    return valid_data_list
+
+
+
 if __name__ == "__main__":
+    valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
+
     # clear_all_media_format_batch()
 
     # post_manager = UniversalPostManager(gen_db_object())
