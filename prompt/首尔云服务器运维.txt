@@ -106,7 +106,7 @@ systemctl reload nginx
 * **启动/重启:** `systemctl restart binance-trade`
 * **紧急停止:** `systemctl stop binance-trade`
 * **查看状态:** `systemctl status binance-trade`
-* **查看系统报错:** `journalctl -u binance-trade -n 100 -f`
+* **查看系统报错:** `    journalctl -u binance-trade -n 100 -f      `
 * **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/trading_trader.log`
 
 **🔵 Grid 策略 (网格) 专用命令**
@@ -114,7 +114,7 @@ systemctl reload nginx
 * **启动/重启:** `systemctl restart binance-trade-grid`
 * **紧急停止:** `systemctl stop binance-trade-grid`
 * **查看状态:** `systemctl status binance-trade-grid`
-* **查看系统报错:** `journalctl -u binance-trade-grid -n 100 -f`
+* **查看系统报错:** `  journalctl -u binance-trade-grid -n 100 -f    `
 * **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/grid_trader.log`
 
 ---
