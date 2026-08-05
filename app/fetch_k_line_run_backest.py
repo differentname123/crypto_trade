@@ -1,3 +1,5 @@
+import traceback
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -57,8 +59,7 @@ def load_and_prepare_data(df_5m_path, df_1m_path):
     df_5m['condition_B'] = df_5m['is_negative_fr'].rolling(window=FR_CONSEC_PERIODS).sum() >= FR_CONSEC_PERIODS
 
     # 燃料池锁定状态 (火药桶已就绪)
-    df_5m['powder_keg_ready'] = df_5m['condition_A'] & df_5m['condition_B']
-
+    df_5m['powder_keg_ready'] = (df_5m['condition_A'] & df_5m['condition_B']).shift(1)
     # ------------------ 降维合并到 1分钟 K线 ------------------
     df_1m.set_index('timestamp', inplace=True)
     df_5m.set_index('timestamp', inplace=True)
@@ -173,15 +174,17 @@ def run_backtest(df_1m):
 # 4. 执行入口
 # ==========================================
 if __name__ == "__main__":
+
+    target_symbol = "BLESS"  # 目标交易对
+
     # 文件路径替换为你本地真实的路径
-    file_5m = './data/ADA_USDT_USDT_5m_ler_data.csv'
-    file_1m = r"W:\project\python_project\oke_auto_trade\kline_data\ADAUSDT_1m_2025-01-01_merged.csv"
-
-
+    file_5m = f'./data/{target_symbol}_USDT_USDT_5m_ler_data.csv'
+    file_1m = rf"W:\project\python_project\oke_auto_trade\kline_data\{target_symbol}USDT_1m_2025-01-01_merged.csv"
 
     # 为了防止你没上传完整CSV报错，这里用 try-except 保护一下
     try:
         merged_1m_df = load_and_prepare_data(file_5m, file_1m)
         history = run_backtest(merged_1m_df)
     except FileNotFoundError:
+        traceback.print_exc()
         print("未找到指定CSV文件，请确保文件路径正确并与脚本在同一目录下。")
