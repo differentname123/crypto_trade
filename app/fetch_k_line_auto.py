@@ -559,7 +559,7 @@ if __name__ == "__main__":
     while True:
         try:
             # 获取头部热门标的
-            top_symbols = get_top_volume_symbols('binance', 1, 'USDT')
+            top_symbols = get_top_volume_symbols('binance', 100, 'USDT')
         except Exception as e:
             print(f"[引擎调度] 无法嗅探标的列表，暂停重试中... | 错误: 【{e}】")
             time.sleep(60)
