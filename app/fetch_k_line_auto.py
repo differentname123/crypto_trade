@@ -439,5 +439,5 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[任务异常] 标的管线未捕获的致命错误 | 标的: 【{sym}】 | 错误详情: 【{e}】")
 
-        print(f"\n✅ [引擎调度] 本轮池化数据更新完毕 | 即将休眠: 【{LOOP_INTERVAL} 秒】")
+        print(f"\n✅ [引擎调度] 本轮池化数据更新完毕 |  即将休眠: 【{LOOP_INTERVAL} 秒】")
         time.sleep(LOOP_INTERVAL)
