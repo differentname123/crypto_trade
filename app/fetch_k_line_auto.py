@@ -268,13 +268,15 @@ def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
     # 业务逻辑计算：衍生 CVD
     df['taker_sell_base_vol'] = df['volume'] - df['taker_buy_base_vol']
     df['volume_delta'] = df['taker_buy_base_vol'] - df['taker_sell_base_vol']
-    df['cvd'] = df['volume_delta'].cumsum()
+
+    # 【修复1代码层】：删去局部的 cumsum 计算，防止增量拼接产生孤儿基准断层
+    # 原代码 df['cvd'] = df['volume_delta'].cumsum() 已移除
 
     df = convert_to_beijing_time(df)
 
     print(f"[CVD数据] 衍生计算完成 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条数据】")
-    return df[['timestamp', 'cvd']]
-
+    # 【修改返回值】：向管线传递 volume_delta，由主控管线做全局重建
+    return df[['timestamp', 'volume_delta']]
 
 def fetch_premium_index_klines(symbol, timeframe='5m', days=30):
     exchange = init_exchange('binance')
@@ -321,6 +323,11 @@ def fetch_premium_index_klines(symbol, timeframe='5m', days=30):
 
 def prepare_ler_backtest_data(symbol, timeframe='5m', days=29.5, save_dir='./data'):
     """
+    聚合管线：每一行的时间戳（如 17:45:00）代表一个 5 分钟切片的起点。
+
+    严格的时间语义对齐如下：1. 期初可见特征：oi_amount 是 17:45:00 瞬间的持仓快照；oi_amount_change_pct 是过去 5 分钟（17:40~17:45）的持仓变化率。2. 随后演化标签：K线/CVD/预测费率 记录了随后 5 分钟（17:45~17:50）内的交易演化过程。
+
+    此结构直接支持“用期初可见特征预测随后5分钟走势”的无未来函数回测。
     聚合引擎：执行各维度数据的抓取，并通过 Inner Join 确保时序对齐，落地为最终特征宽表。
     基于本地已存在的数据时间戳，智能计算增量请求天数，避免重复拉取。
     """
@@ -368,23 +375,39 @@ def prepare_ler_backtest_data(symbol, timeframe='5m', days=29.5, save_dir='./dat
     df_merged = (
         df_klines
         .merge(df_oi[['timestamp', 'oi_amount', 'oi_amount_change_pct']], on='timestamp', how='inner')
-        .merge(df_cvd[['timestamp', 'cvd']], on='timestamp', how='inner')
+        .merge(df_cvd[['timestamp', 'volume_delta']], on='timestamp', how='inner')  # 【修改处】：此处改为接收 volume_delta
         .merge(df_premium[['timestamp', 'premium_close', 'predicted_funding_rate']], on='timestamp', how='inner')
     )
 
     # 4. 增量整合与去重写入
     if not local_df.empty:
         df_merged['timestamp'] = pd.to_datetime(df_merged['timestamp'])
+
+        # 【防御性向后兼容】：如果你本地的历史 CSV 已经被污染，只有 cvd 没有 volume_delta，这里通过差分无损反推还原，救活历史资产。
+        if 'cvd' in local_df.columns and 'volume_delta' not in local_df.columns:
+            local_df['volume_delta'] = local_df['cvd'].diff().fillna(local_df['cvd'])
+        if 'cvd' in local_df.columns:
+            local_df.drop(columns=['cvd'], inplace=True)
+
         df_merged = pd.concat([local_df, df_merged])
         df_merged = df_merged.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
         print(f"[管线合并] 增量数据拼装完毕 | 标的: 【{symbol}】 | 总量扩容至: 【{len(df_merged)} 条】")
+
+    # 【修复1执行】：基于去重、排序完备的底层全量数据，执行全局 CVD 重建。最终落盘时保留 CVD 字段，但再无拼接断层！
+    df_merged['cvd'] = df_merged['volume_delta'].cumsum()
+
+    # 【修复2代码层】：强行对齐时间网格。将交易所缺失或由于 join 蒸发的行显式还原为 NaN，保护回测模型的空间距离语义。
+    freq_str = timeframe.replace('m', 'min').replace('h', 'h')  # 兼容 pandas offset alias (e.g. '5m' -> '5min')
+    df_merged = df_merged.set_index('timestamp')
+    df_merged = df_merged[~df_merged.index.duplicated(keep='last')]
+    df_merged = df_merged.resample(freq_str).asfreq()
+    df_merged = df_merged.reset_index()
 
     os.makedirs(save_dir, exist_ok=True)
     df_merged.to_csv(file_path, index=False)
     print(f"[持久化] 数据已安全落盘 | 路径: 【{file_path}】\n")
 
     return df_merged
-
 
 def get_top_volume_symbols(exchange_name='binance', top_n=100, quote_currency='USDT'):
     """
