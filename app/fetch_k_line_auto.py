@@ -206,7 +206,8 @@ def fetch_long_history(exchange_name, symbol, timeframe='5m', days=365):
     print(f"[历史K线] 拉取成功 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条对齐数据】")
     return df
 
-def auto_download_and_merge_daily(symbol, days=365, save_dir=VISION_DATA_DIR):
+
+def auto_download_and_merge_daily(symbol, days=365, save_dir=VISION_DATA_DIR, max_retries=3):
     """
     本地优先的 Binance Vision 历史指标归档拉取引擎
     出参: DataFrame. 核心Shape: ['timestamp', 'oi_amount']
@@ -240,29 +241,39 @@ def auto_download_and_merge_daily(symbol, days=365, save_dir=VISION_DATA_DIR):
                 print(f"[Vision引擎] 本地缓存异常 | 日期: 【{ymd_str}】 | 文件可能损坏，建议手动删除 | 报错: 【{e}】")
         else:
             daily_url = f"https://data.binance.vision/data/futures/um/daily/metrics/{clean_symbol}/{zip_filename}"
-            try:
-                resp = requests.get(daily_url, proxies=GLOBAL_PROXY, timeout=10)
-                if resp.status_code == 200:
-                    with open(zip_path, 'wb') as f:
-                        f.write(resp.content)
-                    with zipfile.ZipFile(zip_path) as z:
-                        csv_name = [n for n in z.namelist() if n.endswith('.csv')][0]
-                        df = pd.read_csv(z.open(csv_name), low_memory=False)
-                        df['_source_date'] = ymd_str
-                        all_dfs.append(df)
-                    print(f"[Vision引擎] 网络下载 | 日期: 【{ymd_str}】 | 结果: 【落地缓存并解析成功】")
-                    time.sleep(0.1)
-                elif resp.status_code == 404:
-                    print(f"[Vision引擎] 网络异常 | 日期: 【{ymd_str}】 | 结果: 【HTTP 404 远端尚未生成此日数据】")
-                else:
-                    print(f"[Vision引擎] 网络异常 | 日期: 【{ymd_str}】 | 结果: 【HTTP {resp.status_code}】")
-            except Exception as e:
-                print(f"[Vision引擎] 网络下载崩溃 | 日期: 【{ymd_str}】 | 报错: 【{e}】")
+            # 引入重试机制包裹网络请求层
+            for attempt in range(max_retries):
+                try:
+                    resp = requests.get(daily_url, proxies=GLOBAL_PROXY, timeout=10)
+                    if resp.status_code == 200:
+                        with open(zip_path, 'wb') as f:
+                            f.write(resp.content)
+                        with zipfile.ZipFile(zip_path) as z:
+                            csv_name = [n for n in z.namelist() if n.endswith('.csv')][0]
+                            df = pd.read_csv(z.open(csv_name), low_memory=False)
+                            df['_source_date'] = ymd_str
+                            all_dfs.append(df)
+                        print(f"[Vision引擎] 网络下载 | 日期: 【{ymd_str}】 | 结果: 【落地缓存并解析成功】")
+                        time.sleep(0.1)
+                        break  # 下载成功，跳出重试循环
+                    elif resp.status_code == 404:
+                        print(f"[Vision引擎] 网络异常 | 日期: 【{ymd_str}】 | 结果: 【HTTP 404 远端尚未生成此日数据】")
+                        break  # 确定远端无数据，无需重试，跳出
+                    else:
+                        print(f"[Vision引擎] 网络异常 | 日期: 【{ymd_str}】 | 结果: 【HTTP {resp.status_code}】")
+                        if attempt < max_retries - 1:
+                            time.sleep(1) # 非200/404的异常状态码，稍作等待重试
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        print(f"[Vision引擎] 网络下载崩溃 | 日期: 【{ymd_str}】 | 报错: 【{e}】 | 状态: 【等待触发第 {attempt + 1} 次重试】")
+                        time.sleep(2)  # 给网络层释放和重置的缓冲时间
+                    else:
+                        print(f"[Vision引擎] 网络下载崩溃 | 日期: 【{ymd_str}】 | 报错: 【{e}】 | 结果: 【已达到最大重试次数 {max_retries}，彻底跳过】")
 
         current_date += pd.Timedelta(days=1)
 
     if not all_dfs:
-        print("[Vision引擎] 警告 | 标的: 【{clean_symbol}】 | 结果: 【未获取任何历史归档，将完全退化为 API 实时抓取模式】")
+        print(f"[Vision引擎] 警告 | 标的: 【{clean_symbol}】 | 结果: 【未获取任何历史归档，将完全退化为 API 实时抓取模式】")
         return pd.DataFrame()
 
     merged_df = pd.concat(all_dfs, ignore_index=True)
@@ -297,6 +308,7 @@ def auto_download_and_merge_daily(symbol, days=365, save_dir=VISION_DATA_DIR):
         return merged_df
 
     return pd.DataFrame()
+
 
 def fetch_historical_oi(exchange, symbol, timeframe='5m', days=365):
     """
