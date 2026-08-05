@@ -388,3 +388,158 @@ def get_open_interest(symbol, exchange_name='binance'):
     except Exception as e:
         print(f"[实时OI] 数据拉取失败 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 异常: [{e}] | 结果: [网络中断或标的已下架]")
         return None
+
+
+# ============================================================================
+# 新增：溢价指数与预测费率重构模块 (支撑 LER 方案 Step 0 数据规格)
+# ============================================================================
+
+def fetch_premium_index_klines(symbol, timeframe='5m', days=30):
+    """
+    通过币安私有API分页拉取U本位合约的 历史溢价指数(Premium Index) K线。
+    这是 LER 策略回测中计算“无未来函数的预测资金费率”的唯一正确数据源。
+
+    [入参形貌]
+    - symbol: 交易对 (str, 必须是 ccxt 标准格式，如 'BTC/USDT:USDT')
+    - timeframe: K线周期 (str, 如 '5m')
+    - days: 回溯天数 (int)
+
+    [出参形貌]
+    - DataFrame: 包含 timestamp, premium_open, premium_high, premium_low, premium_close
+    """
+    exchange = init_exchange('binance')
+
+    try:
+        # 将 ccxt 标准 symbol (BTC/USDT:USDT) 转换为币安原生 symbol (BTCUSDT)
+        exchange.load_markets()
+        market = exchange.market(symbol)
+        raw_symbol = market['id']
+    except Exception as e:
+        print(f"[溢价指数] 交易对解析失败 | 标的: [{symbol}] | 异常: [{e}]")
+        return pd.DataFrame()
+
+    timeframe_id = exchange.timeframes.get(timeframe, timeframe)
+    since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
+
+    all_klines = []
+    current_since = since
+
+    print(f"[溢价指数] 开始拉取 | 标的: [{symbol}] | 周期: [{timeframe}] | 天数: [{days}]")
+
+    while True:
+        try:
+            # 调用币安 U本位合约专有接口：拉取溢价指数 K线
+            params = {
+                'symbol': raw_symbol,
+                'interval': timeframe_id,
+                'startTime': current_since,
+                'limit': 1000
+            }
+            # ccxt 隐式 API 调用
+            curr_klines = exchange.fapiPublicGetPremiumIndexKlines(params)
+
+            if not curr_klines:
+                break
+
+            all_klines.extend(curr_klines)
+            last_timestamp = int(curr_klines[-1][0])
+            current_since = last_timestamp + 1
+
+            if last_timestamp >= exchange.milliseconds() - 60000:
+                break
+
+        except Exception as e:
+            print(f"[溢价指数] 请求异常中断 | 游标: [{current_since}] | 异常: [{e}]")
+            break
+
+    if not all_klines:
+        print(f"[溢价指数] 拉取失败: 空数据")
+        return pd.DataFrame()
+
+    # 提取有用的列：时间戳与OHLC，忽略成交量（溢价指数没有成交量）
+    columns = ['timestamp', 'premium_open', 'premium_high', 'premium_low', 'premium_close',
+               'ignore1', 'close_time', 'ignore2', 'ignore3', 'ignore4', 'ignore5', 'ignore6']
+    df = pd.DataFrame(all_klines, columns=columns)
+
+    # 数据类型转换与清洗
+    df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+    for col in ['premium_open', 'premium_high', 'premium_low', 'premium_close']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # 丢弃无用列并复用你的时间清洗管道
+    df = df[['timestamp', 'premium_open', 'premium_high', 'premium_low', 'premium_close']].dropna()
+    df = convert_to_beijing_time(df)
+
+    print(f"[溢价指数] 数据拉取完成 | 标的: [{symbol}] | 结果: [成功获取 {len(df)} 条]")
+    return df
+
+
+def main():
+    """
+    全管线拉取测试：模拟回测系统启动时的数据准备阶段 (Step 0)
+    """
+    print("=" * 80)
+    print(" LER (Liquidation Exhaustion Reversal) 强平耗竭回归系统 - 数据流测试启动")
+    print("=" * 80)
+
+    # ---------------------------
+    # 1. 设定测试参数
+    # ---------------------------
+    test_symbol = 'BTC/USDT:USDT'
+    test_timeframe = '5m'  # LER方案核心基于 5分钟级别 残段
+    test_days = 2  # 为了测试速度，只拉取最近 2 天的数据
+    exchange = 'binance'
+
+    print(f"--> 测试标的: {test_symbol}")
+    print(f"--> 测试周期: {test_timeframe}")
+    print(f"--> 回溯天数: {test_days} 天\n")
+
+    # ---------------------------
+    # 2. 并行/串行拉取各项核心数据
+    # ---------------------------
+
+    # [模块 A] 价格K线数据 (用于Gate B 跌幅校验、系统止盈止损计算)
+    df_klines = fetch_long_history(exchange, test_symbol, timeframe=test_timeframe, days=test_days)
+
+    # [模块 B] 历史持仓量 OI (用于物理燃料湮灭确认)
+    df_oi = fetch_historical_oi(exchange, test_symbol, timeframe=test_timeframe, days=test_days)
+
+    # [模块 C] CVD 数据 (用于Gate B 纯粹抛压诊断)
+    df_cvd = fetch_binance_cvd_history(test_symbol, timeframe=test_timeframe, days=test_days)
+
+    # [模块 D] 溢价指数 (新加：用于历史预测费率重构，防止未来函数)
+    df_premium = fetch_premium_index_klines(test_symbol, timeframe=test_timeframe, days=test_days)
+
+    print("\n" + "=" * 80)
+    print(" 数据拉取汇总质量检查")
+    print("=" * 80)
+
+    # ---------------------------
+    # 3. 数据校验与合并演示
+    # ---------------------------
+    if not df_klines.empty and not df_oi.empty and not df_cvd.empty and not df_premium.empty:
+        # 将所有数据按 timestamp (对齐到北京时间) 进行合并 (Merge)
+        # 实际回测中，必须确保时间戳严格对齐
+        df_merged = df_klines.merge(df_oi[['timestamp', 'oi_amount', 'oi_amount_change_pct']], on='timestamp',
+                                    how='inner')
+        df_merged = df_merged.merge(df_cvd[['timestamp', 'cvd']], on='timestamp', how='inner')
+        df_merged = df_merged.merge(df_premium[['timestamp', 'premium_close']], on='timestamp', how='inner')
+
+        print("\n[成功] 核心数据集已全部合并完成！")
+        print(f"合并后总数据条数: {len(df_merged)}")
+
+        # 打印最新3条数据，审查字段规格
+        print("\n[数据切片预览 (最新3条)]: ")
+        # 挑选LER核心字段展示
+        preview_cols = ['timestamp', 'close', 'oi_amount', 'oi_amount_change_pct', 'cvd', 'premium_close']
+        print(df_merged[preview_cols].tail(3).to_markdown(index=False))
+
+        print("\n--> LER 数据管线 (Step 0) 测试通过，可开始后续特征工程计算 (如滚动分位数、ATR等)。")
+    else:
+        print("\n[警告] 部分数据拉取失败，请检查网络代理或交易所接口限速！")
+
+
+
+if __name__ == "__main__":
+    # 确保本地已启动代理，端口与 DEFAULT_PROXY 匹配
+    main()
