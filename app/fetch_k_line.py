@@ -3,19 +3,23 @@
 核心数据流摘要
 ================================================================================
 [功能摘要]
-加密货币合约市场数据获取模块 (fetch_data)。
-支持多交易所(Binance/OKX)的历史数据、资金费率、持仓量及CVD数据的标准化拉取。
+加密货币合约市场数据获取模块。支持多交易所(Binance/OKX)的历史K线、资金费率、持仓量(OI)及CVD数据的标准化拉取与清洗。
 
 [输入数据]
-- 交易所API: 通过ccxt库连接Binance/OKX，获取OHLCV、OI、Funding Rate、Ticker等数据
-- 配置参数: 交易对、时间周期、历史天数等
+- 交易所API: 通过 ccxt 库连接 Binance/OKX，配置全局代理与限速。
+- 业务参数: 交易对(如 'BTC/USDT:USDT')、时间周期(如 '1h')、历史回溯天数。
+
+[数据流转/交互]
+1. 请求构建: 根据交易所特性(Binance 1000条/次, OKX 100条/次)自动适配分页游标。
+2. 数据拉取: 循环调用 ccxt 标准接口或币安私有接口(fapiPublicGetKlines)获取原始 JSON。
+3. 标准化清洗: 统一转换为 DataFrame，抹平毫秒时间戳，转换为无时区标记的北京时间(Asia/Shanghai)。
+4. 衍生计算: 自动计算资金费率变化率、OI涨跌幅、以及基于主买/主卖量推导的 CVD(累计成交量Delta)。
 
 [输出数据]
-- 标准化的 DataFrame (包含统一的北京时间转换)
+- 标准化 Pandas DataFrame: 包含统一时间索引及业务衍生指标，直接供下游量化分析使用。
 ================================================================================
 """
 
-from pathlib import Path
 import ccxt
 import pandas as pd
 
@@ -27,8 +31,11 @@ DEFAULT_PROXY = {
     'https': 'http://127.0.0.1:7890',
 }
 
-DATA_DIR = Path(r"W:\project\python_project\crypto_trade\data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+# 交易所单次分页拉取上限配置
+EXCHANGE_LIMITS = {
+    'binance': 1000,
+    'okx': 100
+}
 
 
 # ============================================================================
@@ -37,9 +44,14 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 def init_exchange(exchange_name, default_type='swap'):
     """
-    初始化交易所实例，统一配置代理和速率限制。
+    初始化交易所实例，统一注入代理与限速配置。
 
-    核心作用: 避免在每个函数中重复配置交易所参数
+    [入参形貌]
+    - exchange_name: 交易所标识 (str, 如 'binance')
+    - default_type: 市场类型 (str, 默认 'swap' 合约)
+
+    [出参形貌]
+    - object: ccxt 交易所实例对象
     """
     exchange_class = getattr(ccxt, exchange_name)
     config = {
@@ -54,15 +66,20 @@ def init_exchange(exchange_name, default_type='swap'):
 
 def convert_to_beijing_time(df, timestamp_col='timestamp'):
     """
-    统一的时间转换函数：毫秒时间戳 → UTC → 北京时间(无时区标记)
+    统一的时间标准化管道：毫秒时间戳 → UTC → 北京时间(剥离时区标记)。
 
-    核心作用: 消除各函数中重复的时间转换逻辑
+    [入参形貌]
+    - df: 包含数值型毫秒时间戳的 DataFrame
+    - timestamp_col: 时间列名 (str)
+
+    [出参形貌]
+    - DataFrame: 时间列已转换为无时区 datetime64[ns] 格式的副本
     """
     if df.empty or timestamp_col not in df.columns:
         return df
 
     df = df.copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], unit='ms')
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], unit='ms', errors='coerce')
     df[timestamp_col] = df[timestamp_col].dt.tz_localize('UTC')
     df[timestamp_col] = df[timestamp_col].dt.tz_convert('Asia/Shanghai')
     df[timestamp_col] = df[timestamp_col].dt.tz_localize(None)
@@ -72,16 +89,14 @@ def convert_to_beijing_time(df, timestamp_col='timestamp'):
 
 def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_per_request):
     """
-    通用分页拉取函数，支持重试机制。
+    通用分页拉取与游标推进引擎，内置容错与熔断机制。
 
-    核心作用: 统一处理分页逻辑，避免代码重复
+    [入参形貌]
+    - fetch_func: 交易所拉取方法引用 (如 exchange.fetch_ohlcv)
+    - limit_per_request: 单次请求最大条数 (int)
 
-    入参形貌:
-    - fetch_func: 交易所的拉取方法(如 fetch_ohlcv, fetch_open_interest_history)
-    - limit_per_request: 单次请求的最大条数
-
-    出参形貌:
-    - list: 所有拉取到的原始数据列表
+    [出参形貌]
+    - list: 原始数据列表，元素为 list(如K线) 或 dict(如资金费率)
     """
     all_data = []
     current_since = since
@@ -98,20 +113,22 @@ def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_
 
             all_data.extend(data)
 
-            # 更新游标 - 兼容dict和list两种数据格式
-            if isinstance(data[0], dict):
-                last_timestamp = data[-1].get('timestamp', 0)
-            else:
-                last_timestamp = data[-1][0]
+            # 兼容 dict(资金费率) 和 list(K线) 两种底层数据格式
+            last_timestamp = data[-1].get('timestamp', 0) if isinstance(data[0], dict) else data[-1][0]
+
+            # 防御性拦截：防止脏数据导致游标重置引发死循环
+            if not last_timestamp:
+                print(f"[分页拉取] 游标更新异常熔断 | 标的: [{symbol}] | 结果: [返回数据缺失时间戳，强制终止以防死循环]")
+                break
 
             current_since = last_timestamp + 1
 
-            # 终止条件：已拉取到最新数据
+            # 触达最新数据边界，正常终止
             if last_timestamp >= exchange.milliseconds() - 60000:
                 break
 
         except Exception as e:
-            print(f"[分页拉取] 出错 | 标的: [{symbol}] | 错误: [{e}]")
+            print(f"[分页拉取] 接口请求异常中断 | 标的: [{symbol}] | 游标: [{current_since}] | 异常: [{e}] | 结果: [已熔断并返回部分成功数据，可能原因为网络波动或触发限速]")
             break
 
     return all_data
@@ -123,77 +140,54 @@ def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_
 
 def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
     """
-    分页拉取长历史K线数据并转换为北京时间。
+    分页拉取长历史K线数据并完成时间标准化。
 
-    [功能摘要]
-    从指定交易所拉取过去N天的OHLCV数据，自动处理分页和时间转换。
+    [入参形貌]
+    - exchange_name: 交易所标识 (str)
+    - symbol: 交易对 (str, 如 'BTC/USDT:USDT')
+    - timeframe: K线周期 (str, 如 '1h')
+    - days: 回溯天数 (int)
 
-    [输入数据]
-    - exchange_name: 交易所名称(如 'binance', 'okx')
-    - symbol: 交易对(如 'BTC/USDT:USDT')
-    - timeframe: K线周期
-    - days: 拉取的历史天数
-
-    [数据流转]
-    API分页拉取 → 原始时间戳 → UTC → 北京时间
-
-    [输出数据]
-    DataFrame: 包含 timestamp, open, high, low, close, volume 列
+    [出参形貌]
+    - DataFrame: 包含 timestamp, open, high, low, close, volume 列
     """
     exchange = init_exchange(exchange_name, default_type=None)
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
+    limit = EXCHANGE_LIMITS.get(exchange_name, 100)
 
-    print(f"[历史K线] 开始拉取 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}]")
-
-    # 币安 limit 最大 1000，欧易 limit 最大 100
-    limit = 1000 if exchange_name == 'binance' else 100
-
-    all_ohlcv = fetch_with_pagination(
-        exchange, exchange.fetch_ohlcv, symbol, timeframe, since, limit
-    )
+    all_ohlcv = fetch_with_pagination(exchange, exchange.fetch_ohlcv, symbol, timeframe, since, limit)
 
     if not all_ohlcv:
-        print(f"[历史K线] 拉取失败或无数据 | 标的: [{symbol}]")
+        print(f"[历史K线] 数据拉取失败 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [空数据或API异常]")
         return pd.DataFrame()
 
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = convert_to_beijing_time(df)
 
-    print(f"[历史K线] 拉取完成 | 标的: [{symbol}] | 数据量: [{len(df)}] 条")
+    print(f"[历史K线] 数据拉取完成 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [成功获取 {len(df)} 条]")
     return df
 
 
 def fetch_long_funding_history(exchange_name, symbol, days=30):
     """
-    分页拉取资金费率历史并转换为北京时间。
+    分页拉取资金费率历史，计算费率变化百分比。
 
-    [功能摘要]
-    拉取指定合约的资金费率历史数据，计算费率变化百分比。
+    [入参形貌]
+    - exchange_name: 交易所标识 (str)
+    - symbol: 交易对 (str)
+    - days: 回溯天数 (int)
 
-    [输入数据]
-    - exchange_name: 交易所名称
-    - symbol: 交易对
-    - days: 拉取的历史天数
-
-    [数据流转]
-    API分页拉取 → 费率提取 → 时间转换 → 变化率计算
-
-    [输出数据]
-    DataFrame: 包含 timestamp, funding_rate, funding_rate_pct 列
+    [出参形貌]
+    - DataFrame: 包含 timestamp, funding_rate, funding_rate_pct 列
     """
     exchange = init_exchange(exchange_name, default_type=None)
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
+    limit = EXCHANGE_LIMITS.get(exchange_name, 100)
 
-    print(f"[资金费率] 开始拉取 | 交易所: [{exchange_name}] | 标的: [{symbol}]")
-
-    limit = 1000 if exchange_name == 'binance' else 100
-
-    all_funding = fetch_with_pagination(
-        exchange, exchange.fetch_funding_rate_history, symbol, None, since, limit
-    )
+    all_funding = fetch_with_pagination(exchange, exchange.fetch_funding_rate_history, symbol, None, since, limit)
 
     if not all_funding:
-        print(f"[资金费率] 拉取失败或无数据 | 标的: [{symbol}]")
+        print(f"[资金费率] 数据拉取失败 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [空数据或API异常]")
         return pd.DataFrame(columns=['timestamp', 'funding_rate', 'funding_rate_pct'])
 
     df = pd.DataFrame([{
@@ -201,55 +195,44 @@ def fetch_long_funding_history(exchange_name, symbol, days=30):
         'funding_rate': item.get('fundingRate', 0.0) * 100
     } for item in all_funding])
 
-    # 时间转换并抹平毫秒级误差
     df = convert_to_beijing_time(df)
-    df['timestamp'] = df['timestamp'].dt.round('s')
+    df['timestamp'] = df['timestamp'].dt.round('s')  # 抹平毫秒级误差以对齐其他周期数据
 
-    # 计算费率变化百分比
     df['funding_rate_pct'] = df['funding_rate'].pct_change() * 100
+    df['funding_rate_pct'] = df['funding_rate_pct'].fillna(0.0)
+
     df = df.sort_values('timestamp').reset_index(drop=True)
 
-    print(f"[资金费率] 拉取完成 | 标的: [{symbol}] | 数据量: [{len(df)}] 条")
+    print(f"[资金费率] 数据拉取完成 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [成功获取 {len(df)} 条]")
     return df
 
 
 def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
     """
-    分页拉取历史持仓量(OI)数据，计算涨跌幅。
+    分页拉取历史持仓量(OI)数据，计算数量与价值的涨跌幅。
 
-    [功能摘要]
-    拉取历史OI数据，计算数量和价值的变化百分比。
+    [入参形貌]
+    - exchange_name: 交易所标识 (str)
+    - symbol: 交易对 (str)
+    - timeframe: 时间周期 (str)
+    - days: 回溯天数 (int)
 
-    [输入数据]
-    - exchange_name: 交易所名称
-    - symbol: 交易对
-    - timeframe: 时间周期
-    - days: 拉取的历史天数
-
-    [数据流转]
-    API分页拉取 → 时间转换 → 去重 → 涨跌幅计算
-
-    [输出数据]
-    DataFrame: 包含 timestamp, oi_amount, oi_value, oi_amount_change_pct, oi_value_change_pct 列
+    [出参形貌]
+    - DataFrame: 包含 timestamp, oi_amount, oi_value 及对应变化率列
     """
     exchange = init_exchange(exchange_name, default_type=None)
 
     if not exchange.has.get('fetchOpenInterestHistory'):
-        print(f"[历史OI] 不支持 | 交易所: [{exchange_name}] 不支持历史OI查询")
+        print(f"[历史OI] 接口不支持 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 结果: [该交易所未实现 fetchOpenInterestHistory 方法]")
         return pd.DataFrame()
 
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
-
-    print(f"[历史OI] 开始拉取 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}]")
-
     limit = 500 if exchange_name == 'binance' else 100
 
-    all_oi = fetch_with_pagination(
-        exchange, exchange.fetch_open_interest_history, symbol, timeframe, since, limit
-    )
+    all_oi = fetch_with_pagination(exchange, exchange.fetch_open_interest_history, symbol, timeframe, since, limit)
 
     if not all_oi:
-        print(f"[历史OI] 拉取失败或无数据 | 标的: [{symbol}]")
+        print(f"[历史OI] 数据拉取失败 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [空数据或API异常]")
         return pd.DataFrame()
 
     df = pd.DataFrame([{
@@ -258,49 +241,42 @@ def fetch_historical_oi(exchange_name, symbol, timeframe='1h', days=30):
         'oi_value': item.get('openInterestValue', 0)
     } for item in all_oi])
 
-    # 时间转换
     df = convert_to_beijing_time(df)
 
-    # 去重
+    # 去重与排序
     df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
     df.sort_values(by='timestamp', ascending=True, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # 计算涨跌幅
+    # 衍生指标计算
     df['oi_amount_change_pct'] = df['oi_amount'].pct_change() * 100
 
-    # 防御性编程：处理 oi_value 全为0的情况
+    # 防御性编程：处理 oi_value 全为0导致 pct_change 崩溃的情况
     if df['oi_value'].sum() > 0:
         df['oi_value_change_pct'] = df['oi_value'].pct_change() * 100
     else:
         df['oi_value_change_pct'] = 0.0
 
-    # 填充NaN并格式化
+    # 清洗 NaN 并格式化
     df.fillna({'oi_amount_change_pct': 0, 'oi_value_change_pct': 0}, inplace=True)
     df['oi_amount_change_pct'] = df['oi_amount_change_pct'].round(4)
     df['oi_value_change_pct'] = df['oi_value_change_pct'].round(4)
 
-    print(f"[历史OI] 拉取完成 | 标的: [{symbol}] | 数据量: [{len(df)}] 条")
+    print(f"[历史OI] 数据拉取完成 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 天数: [{days}] | 结果: [成功获取 {len(df)} 条]")
     return df
 
 
 def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
     """
-    分页拉取币安U本位合约的CVD数据。
+    通过币安私有API分页拉取U本位合约K线，推导计算CVD(累计成交量Delta)。
 
-    [功能摘要]
-    通过币安私有API拉取K线数据，计算CVD(累计成交量Delta)。
+    [入参形貌]
+    - symbol: 交易对 (str)
+    - timeframe: K线周期 (str)
+    - days: 回溯天数 (int)
 
-    [输入数据]
-    - symbol: 交易对
-    - timeframe: K线周期
-    - days: 拉取的历史天数
-
-    [数据流转]
-    解析Symbol → API分页拉取 → 数值清洗 → CVD计算 → 时间转换
-
-    [输出数据]
-    DataFrame: 包含 timestamp, OHLCV, taker买卖量, volume_delta, cvd 列
+    [出参形貌]
+    - DataFrame: 包含 timestamp, OHLCV, taker买卖量, volume_delta, cvd 列
     """
     exchange = init_exchange('binance')
 
@@ -309,17 +285,16 @@ def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
         market = exchange.market(symbol)
         raw_symbol = market['id']
     except Exception as e:
-        print(f"[CVD数据] Symbol解析失败 | 标的: [{symbol}] | 错误: [{e}]")
+        print(f"[CVD数据] 交易对解析失败 | 标的: [{symbol}] | 异常: [{e}] | 结果: [交易对名称拼写错误或该合约已下架]")
         return pd.DataFrame()
 
     timeframe_id = exchange.timeframes.get(timeframe, timeframe)
     since = exchange.milliseconds() - days * 24 * 60 * 60 * 1000
 
-    print(f"[CVD数据] 开始拉取 | 标的: [{symbol}] | 天数: [{days}]")
-
     all_klines = []
     current_since = since
 
+    # 币安私有接口分页逻辑
     while True:
         try:
             params = {
@@ -341,11 +316,11 @@ def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
                 break
 
         except Exception as e:
-            print(f"[CVD数据] 拉取出错 | 标的: [{symbol}] | 错误: [{e}]")
+            print(f"[CVD数据] 接口请求异常中断 | 标的: [{symbol}] | 游标: [{current_since}] | 异常: [{e}] | 结果: [已熔断并返回部分成功数据]")
             break
 
     if not all_klines:
-        print(f"[CVD数据] 拉取失败或无数据 | 标的: [{symbol}]")
+        print(f"[CVD数据] 数据拉取失败 | 标的: [{symbol}] | 天数: [{days}] | 结果: [空数据或API异常]")
         return pd.DataFrame()
 
     columns = [
@@ -355,72 +330,61 @@ def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
     ]
     df = pd.DataFrame(all_klines, columns=columns)
 
-    # 数据清洗
+    # 数值类型清洗
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol', 'taker_buy_quote_vol']
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     df = df.dropna(subset=['timestamp'] + numeric_cols)
 
-    # CVD核心计算
+    # CVD 核心推导
     df['taker_sell_base_vol'] = df['volume'] - df['taker_buy_base_vol']
     df['volume_delta'] = df['taker_buy_base_vol'] - df['taker_sell_base_vol']
     df['cvd'] = df['volume_delta'].cumsum()
 
-    # 时间转换
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
+    # 复用统一时间转换管道
+    df = convert_to_beijing_time(df)
     df = df.dropna(subset=['timestamp'])
-
-    # 调用统一的时间转换函数
-    df['timestamp'] = df['timestamp'].dt.tz_localize('UTC')
-    df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Shanghai')
-    df['timestamp'] = df['timestamp'].dt.tz_localize(None)
 
     result_df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume',
                     'taker_buy_base_vol', 'taker_sell_base_vol', 'volume_delta', 'cvd']]
 
-    print(f"[CVD数据] 拉取完成 | 标的: [{symbol}] | 数据量: [{len(result_df)}] 条")
+    print(f"[CVD数据] 数据拉取完成 | 标的: [{symbol}] | 天数: [{days}] | 结果: [成功获取 {len(result_df)} 条]")
     return result_df
 
 
 def get_open_interest(symbol, exchange_name='binance'):
     """
-    获取指定合约的实时持仓量(OI)。
+    获取指定合约的实时持仓量(OI)快照。
 
-    [功能摘要]
-    通过统一API获取实时OI数据。
+    [入参形貌]
+    - symbol: 交易对 (str)
+    - exchange_name: 交易所标识 (str)
 
-    [输入数据]
-    - symbol: 交易对
-    - exchange_name: 交易所名称
-
-    [输出数据]
-    dict: 包含OI信息，失败返回None
+    [出参形貌]
+    - dict: 包含 OI 数量、价值及时间戳的字典，失败返回 None
     """
     exchange = init_exchange(exchange_name, default_type=None)
 
-    print(f"[实时OI] 开始拉取 | 交易所: [{exchange_name}] | 标的: [{symbol}]")
-
     try:
-        if exchange.has.get('fetchOpenInterest'):
-            oi_data = exchange.fetch_open_interest(symbol)
-
-            base_volume = oi_data.get('openInterestAmount')
-            quote_value = oi_data.get('openInterestValue')
-
-            print(f"[实时OI] 拉取成功 | 标的: [{symbol}] | 数量: [{base_volume}] | 价值: [{quote_value}] USDT")
-
-            return {
-                'Symbol': symbol,
-                'Exchange': exchange_name.upper(),
-                'OI (Base Coin)': base_volume,
-                'OI Value (USDT)': quote_value,
-                'Timestamp': oi_data.get('timestamp'),
-                'Datetime': oi_data.get('datetime')
-            }
-        else:
-            print(f"[实时OI] 不支持 | 交易所: [{exchange_name}] 不支持OI查询")
+        if not exchange.has.get('fetchOpenInterest'):
+            print(f"[实时OI] 接口不支持 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 结果: [该交易所未实现 fetchOpenInterest 方法]")
             return None
 
+        oi_data = exchange.fetch_open_interest(symbol)
+        base_volume = oi_data.get('openInterestAmount')
+        quote_value = oi_data.get('openInterestValue')
+
+        print(f"[实时OI] 数据拉取完成 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 结果: [数量 {base_volume} | 价值 {quote_value} USDT]")
+
+        return {
+            'Symbol': symbol,
+            'Exchange': exchange_name.upper(),
+            'OI (Base Coin)': base_volume,
+            'OI Value (USDT)': quote_value,
+            'Timestamp': oi_data.get('timestamp'),
+            'Datetime': oi_data.get('datetime')
+        }
+
     except Exception as e:
-        print(f"[实时OI] 拉取失败 | 标的: [{symbol}] | 错误: [{e}]")
+        print(f"[实时OI] 数据拉取失败 | 交易所: [{exchange_name}] | 标的: [{symbol}] | 异常: [{e}] | 结果: [网络中断或标的已下架]")
         return None
