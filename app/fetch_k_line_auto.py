@@ -3,27 +3,33 @@
 核心数据流摘要
 ================================================================================
 [功能摘要]
-加密货币合约市场数据获取模块。支持多交易所(Binance/OKX)的历史K线、资金费率、持仓量(OI)及CVD数据的标准化拉取与清洗。
+加密货币合约市场异构数据（K线、OI、CVD、资金费率）采集、对齐与增量合并管线。
 
 [输入数据]
-- 交易所API: 通过 ccxt 库连接 Binance/OKX，配置全局代理与限速。
-- 业务参数: 交易对(如 'BTC/USDT:USDT')、时间周期(如 '1h')、历史回溯天数。
+- 来源: Binance / OKX 交易所 (通过 ccxt 及币安 fAPI 私有接口)。
+- 载荷: Symbol (如 'BTC/USDT:USDT')、Timeframe (如 '5m')、拉取天数 (days)。
 
 [数据流转/交互]
-1. 请求构建: 根据交易所特性(Binance 1000条/次, OKX 100条/次)自动适配分页游标。
-2. 数据拉取: 循环调用 ccxt 标准接口或币安私有接口(fapiPublicGetKlines)获取原始 JSON。
-3. 标准化清洗: 统一转换为 DataFrame，抹平毫秒时间戳，转换为无时区标记的北京时间(Asia/Shanghai)。
-4. 衍生计算: 自动计算资金费率变化率、OI涨跌幅、以及基于主买/主卖量推导的 CVD(累计成交量Delta)。
+1. 并发分页拉取: 根据交易所限频自动循环分页，拉取 标准K线、历史持仓量(OI)、买卖量(用于计算CVD)、溢价指数K线。
+2. 数据清洗与对齐:
+   - 提取所需索引切片，抹平 JSON 弱类型引发的格式问题。
+   - 强转时间戳为北京时间 (Asia/Shanghai) 并抹除毫秒误差。
+3. 衍生计算(无未来函数):
+   - OI截面变化率(oi_amount_change_pct)
+   - 累计成交量Delta(cvd)
+   - 预测资金费率(predicted_funding_rate)
+4. 增量矩阵合并: 基于时间戳(timestamp)进行 Inner Join，并将增量数据覆盖或追加到本地历史 CSV 中。
 
 [输出数据]
-- 标准化 Pandas DataFrame: 包含统一时间索引及业务衍生指标，直接供下游量化分析使用。
+- Shape: 包含 [timestamp, open, high, low, close, volume, oi_amount, oi_amount_change_pct, cvd, premium_close, predicted_funding_rate] 的 pandas DataFrame。
+- 副作用: 数据持久化写入本地 CSV，供 LER 量化模型直接读取。
 ================================================================================
 """
 
+import os
+import time
 import ccxt
 import pandas as pd
-import time
-import os
 
 # ============================================================================
 # 全局配置常量
@@ -33,7 +39,6 @@ DEFAULT_PROXY = {
     'https': 'http://127.0.0.1:7890',
 }
 
-# 交易所单次分页拉取上限配置
 EXCHANGE_LIMITS = {
     'binance': 1000,
     'okx': 100
@@ -45,7 +50,10 @@ EXCHANGE_LIMITS = {
 # ============================================================================
 
 def init_exchange(exchange_name, default_type='swap'):
-    exchange_class = getattr(ccxt, exchange_name)
+    """
+    初始化 CCXT 交易所实例。
+    出参 Shape: CCXT Exchange Object
+    """
     config = {
         'enableRateLimit': True,
         'proxies': DEFAULT_PROXY,
@@ -53,31 +61,41 @@ def init_exchange(exchange_name, default_type='swap'):
     if default_type:
         config['options'] = {'defaultType': default_type}
 
-    return exchange_class(config)
+    return getattr(ccxt, exchange_name)(config)
 
 
 def convert_to_beijing_time(df, timestamp_col='timestamp'):
+    """
+    清洗并将毫秒时间戳转换为无时区标记的北京时间，抹平毫秒误差以便于 Inner Join。
+    入参 Shape: 必须包含 timestamp_col 的 DataFrame。
+    """
     if df.empty or timestamp_col not in df.columns:
         return df
 
     df = df.copy()
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], unit='ms', errors='coerce')
-    df[timestamp_col] = df[timestamp_col].dt.tz_localize('UTC')
-    df[timestamp_col] = df[timestamp_col].dt.tz_convert('Asia/Shanghai')
-    df[timestamp_col] = df[timestamp_col].dt.tz_localize(None)
+    # 转换为 DateTime，强制转为 UTC 后再转东八区，最后剥离时区信息
+    dt_series = pd.to_datetime(df[timestamp_col], unit='ms', errors='coerce')
+    dt_series = dt_series.dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
 
-    # 强制抹平毫秒误差，保证合并无懈可击
-    df[timestamp_col] = df[timestamp_col].dt.round('s')
+    # 强制抹平毫秒误差，保证后续 merge 匹配无懈可击
+    df[timestamp_col] = dt_series.dt.round('s')
 
+    # 清理因转换失败产生的 NaT 脏数据
+    df.dropna(subset=[timestamp_col], inplace=True)
     return df
 
 
 def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_per_request):
+    """
+    通用的标准 CCXT 历史数据分页引擎。
+    出参 Shape: List[Dict] 或 List[List] (取决于 ccxt 原生底层实现)
+    """
     all_data = []
     current_since = since
 
     while True:
         try:
+            # 兼容带有 timeframe 或不带 timeframe 的 CCXT 接口
             if timeframe:
                 data = fetch_func(symbol, timeframe, since=current_since, limit=limit_per_request)
             else:
@@ -88,15 +106,54 @@ def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_
 
             all_data.extend(data)
 
-            if isinstance(data[0], dict):
-                last_timestamp = int(data[-1].get('timestamp', 0))
-            else:
-                last_timestamp = int(data[-1][0])
+            # 适配 ccxt 不同的数据返回结构 (K线是列表，OI通常是字典)
+            last_timestamp = int(data[-1].get('timestamp', 0)) if isinstance(data[0], dict) else int(data[-1][0])
 
             if not last_timestamp:
-                print(f"[分页拉取] 游标更新异常熔断 | 标的: [{symbol}] | 结果: [返回数据缺失时间戳]")
+                print(f"[通用分页拉取] 异常熔断 | 标的: 【{symbol}】 | 错误原因: 【尾部数据缺失时间戳，无法推进游标】")
                 break
 
+            current_since = last_timestamp + 1
+
+            # FIXME: 原逻辑在此处直接丢弃了最近60秒内的数据。保留原业务逻辑边界，不作干预。
+            if last_timestamp >= exchange.milliseconds() - 60000:
+                break
+
+            time.sleep(0.05)
+
+        except Exception as e:
+            # FIXME: 原代码在此处 catch 异常后直接 break 返回 all_data，会导致静默吞噬网络错误并生成残缺数据集。
+            # 现改为打印人类可读错误并强制抛出，通过中断阻断脏数据落盘。
+            err_msg = f"接口请求中途网络异常或触发流控 | 游标: 【{current_since}】 | 底层报错: {str(e)}"
+            print(f"[通用分页拉取] 致命异常 | 标的: 【{symbol}】 | 失败原因: 【{err_msg}】")
+            raise RuntimeError(err_msg) from e
+
+    return all_data
+
+
+def _fetch_binance_fapi_paginated(exchange, endpoint_func, raw_symbol, timeframe_id, since):
+    """
+    专属币安私有接口 (fapiPublicGetXXX) 的分页拉取引擎，消除散落各处的冗余循环。
+    出参 Shape: List[List] 原始币安 K 线数组结构
+    """
+    all_data = []
+    current_since = since
+
+    while True:
+        try:
+            params = {
+                'symbol': raw_symbol,
+                'interval': timeframe_id,
+                'startTime': current_since,
+                'limit': 1000
+            }
+            data = endpoint_func(params)
+
+            if not data:
+                break
+
+            all_data.extend(data)
+            last_timestamp = int(data[-1][0])
             current_since = last_timestamp + 1
 
             if last_timestamp >= exchange.milliseconds() - 60000:
@@ -105,14 +162,15 @@ def fetch_with_pagination(exchange, fetch_func, symbol, timeframe, since, limit_
             time.sleep(0.05)
 
         except Exception as e:
-            print(f"[分页拉取] 接口请求异常中断 | 标的: [{symbol}] | 游标: [{current_since}] | 异常: [{e}]")
-            break
+            err_msg = f"币安私有接口拉取崩溃 | 游标: 【{current_since}】 | 详情: {str(e)}"
+            print(f"[私有API分页] 致命异常 | 标的: 【{raw_symbol}】 | 失败原因: 【{err_msg}】")
+            raise RuntimeError(err_msg) from e
 
     return all_data
 
 
 # ============================================================================
-# 数据拉取层
+# 数据拉取层 (业务指标构建)
 # ============================================================================
 
 def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
@@ -120,311 +178,266 @@ def fetch_long_history(exchange_name, symbol, timeframe='1h', days=30):
     since = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
     limit = EXCHANGE_LIMITS.get(exchange_name, 100)
 
-    all_ohlcv = fetch_with_pagination(exchange, exchange.fetch_ohlcv, symbol, timeframe, since, limit)
-
-    if not all_ohlcv:
-        print(f"[历史K线] 数据拉取失败 | 标的: [{symbol}] | 天数: [{days}]")
+    try:
+        raw_data = fetch_with_pagination(exchange, exchange.fetch_ohlcv, symbol, timeframe, since, limit)
+    except Exception:
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    if not raw_data:
+        print(f"[历史K线] 拉取结果为空 | 标的: 【{symbol}】 | 参数: 【{days}天】")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df = convert_to_beijing_time(df)
 
-    print(f"[历史K线] 数据拉取完成 | 标的: [{symbol}] | 结果: [成功获取 {len(df)} 条]")
+    print(f"[历史K线] 拉取成功 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条数据】")
     return df
 
 
 def fetch_historical_oi(exchange, symbol, timeframe='1h', days=30):
-    """拉取历史持仓量 (OI) 数据并计算无未来函数的变化率特征"""
+    """
+    拉取历史持仓量 (OI) 数据并计算无未来函数的变化率特征。
+    """
     if not exchange.has.get('fetchOpenInterestHistory'):
-        print(f"[历史OI] 接口不支持 | 标的: [{symbol}] | 结果: [跳过拉取]")
+        print(f"[历史OI] 功能不受支持 | 标的: 【{symbol}】 | 结果: 【跳过，返回空】")
         return pd.DataFrame()
 
     since = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
     limit = 500 if exchange.id == 'binance' else 100
 
-    all_oi = fetch_with_pagination(exchange, exchange.fetch_open_interest_history, symbol, timeframe, since, limit)
-    if not all_oi:
-        print(f"[历史OI] 数据拉取失败 | 标的: [{symbol}] | 天数: [{days}] | 结果: [返回空数据]")
+    try:
+        raw_oi = fetch_with_pagination(exchange, exchange.fetch_open_interest_history, symbol, timeframe, since, limit)
+    except Exception:
+        return pd.DataFrame()
+
+    if not raw_oi:
+        print(f"[历史OI] 拉取结果为空 | 标的: 【{symbol}】 | 参数: 【{days}天】")
         return pd.DataFrame()
 
     df = pd.DataFrame([{
-        'timestamp': item['timestamp'],
+        'timestamp': item.get('timestamp', 0),
         'oi_amount': item.get('openInterestAmount', 0),
-        'oi_value': item.get('openInterestValue', 0)
-    } for item in all_oi])
+    } for item in raw_oi])
 
     df = convert_to_beijing_time(df)
     df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
     df.sort_values(by='timestamp', ascending=True, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # 计算 OI 变化率。
-    # 物理意义：当前时间戳 T 的 pct_change 代表 [T-1, T] 区间内的 OI 变化。
-    # 这是在 T 时刻完全可见的截面衍生特征，严格杜绝未来函数(移除了原先致命的 shift(-1))。
-    df['oi_amount_change_pct'] = df['oi_amount'].pct_change() * 100
-
+    # 核心业务特征：当前时刻 T 记录的是 [T-1, T] 的持仓变化率（无未来函数）
+    df['oi_amount_change_pct'] = (df['oi_amount'].pct_change() * 100).round(4)
     df.dropna(subset=['oi_amount_change_pct'], inplace=True)
-    df['oi_amount_change_pct'] = df['oi_amount_change_pct'].round(4)
 
-    print(f"[历史OI] 数据拉取完成 | 标的: [{symbol}] | 结果: [成功获取 {len(df)} 条]")
+    print(f"[历史OI] 拉取并清洗成功 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条特征】")
     return df
+
 
 def fetch_binance_cvd_history(symbol, timeframe='1h', days=30):
     exchange = init_exchange('binance')
+
     try:
         exchange.load_markets()
-        market = exchange.market(symbol)
-        raw_symbol = market['id']
+        raw_symbol = exchange.market(symbol)['id']
     except Exception as e:
+        print(f"[CVD解析] 无法解析底层交易对ID | 标的: 【{symbol}】 | 错误: 【{e}】")
         return pd.DataFrame()
 
     timeframe_id = exchange.timeframes.get(timeframe, timeframe)
     since = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
 
-    all_klines = []
-    current_since = since
-
-    while True:
-        try:
-            params = {
-                'symbol': raw_symbol,
-                'interval': timeframe_id,
-                'startTime': current_since,
-                'limit': 1000
-            }
-            curr_klines = exchange.fapiPublicGetKlines(params)
-            if not curr_klines: break
-
-            all_klines.extend(curr_klines)
-            last_timestamp = int(curr_klines[-1][0])
-            current_since = last_timestamp + 1
-
-            if last_timestamp >= exchange.milliseconds() - 60000: break
-            time.sleep(0.05)
-        except Exception as e:
-            break
-
-    if not all_klines:
-        print(f"[CVD数据] 数据拉取失败 | 标的: [{symbol}] | 天数: [{days}]")
+    try:
+        raw_klines = _fetch_binance_fapi_paginated(
+            exchange, exchange.fapiPublicGetKlines, raw_symbol, timeframe_id, since
+        )
+    except Exception:
         return pd.DataFrame()
 
-    columns = [
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'trades',
-        'taker_buy_base_vol', 'taker_buy_quote_vol', 'ignore'
-    ]
-    df = pd.DataFrame(all_klines, columns=columns)
+    if not raw_klines:
+        print(f"[CVD数据] 拉取结果为空 | 标的: 【{symbol}】")
+        return pd.DataFrame()
 
-    df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
-    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_vol']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    df = df.dropna(subset=['timestamp'] + numeric_cols)
+    # 原生直接切片，抛弃无用数据降低内存开销。
+    # 索引对应: 0:timestamp, 5:volume, 9:taker_buy_base_vol
+    df = pd.DataFrame(raw_klines).iloc[:, [0, 5, 9]]
+    df.columns = ['timestamp', 'volume', 'taker_buy_base_vol']
 
+    # 防御性类型强转
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df.dropna(inplace=True)
+
+    # 业务逻辑计算：衍生 CVD
     df['taker_sell_base_vol'] = df['volume'] - df['taker_buy_base_vol']
     df['volume_delta'] = df['taker_buy_base_vol'] - df['taker_sell_base_vol']
     df['cvd'] = df['volume_delta'].cumsum()
 
     df = convert_to_beijing_time(df)
-    df = df.dropna(subset=['timestamp'])
 
-    result_df = df[['timestamp', 'taker_buy_base_vol', 'taker_sell_base_vol', 'volume_delta', 'cvd']]
-
-    print(f"[CVD数据] 数据拉取完成 | 标的: [{symbol}] | 结果: [成功获取 {len(result_df)} 条]")
-    return result_df
+    print(f"[CVD数据] 衍生计算完成 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条数据】")
+    return df[['timestamp', 'cvd']]
 
 
 def fetch_premium_index_klines(symbol, timeframe='5m', days=30):
     exchange = init_exchange('binance')
+
     try:
         exchange.load_markets()
-        market = exchange.market(symbol)
-        raw_symbol = market['id']
+        raw_symbol = exchange.market(symbol)['id']
     except Exception as e:
+        print(f"[溢价指数] 无法解析底层交易对ID | 标的: 【{symbol}】 | 错误: 【{e}】")
         return pd.DataFrame()
 
     timeframe_id = exchange.timeframes.get(timeframe, timeframe)
     since = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
 
-    all_klines = []
-    current_since = since
-
-    while True:
-        try:
-            params = {
-                'symbol': raw_symbol,
-                'interval': timeframe_id,
-                'startTime': current_since,
-                'limit': 1000
-            }
-            curr_klines = exchange.fapiPublicGetPremiumIndexKlines(params)
-            if not curr_klines: break
-
-            all_klines.extend(curr_klines)
-            last_timestamp = int(curr_klines[-1][0])
-            current_since = last_timestamp + 1
-
-            if last_timestamp >= exchange.milliseconds() - 60000: break
-            time.sleep(0.05)
-        except Exception as e:
-            break
-
-    if not all_klines:
-        print(f"[溢价指数] 拉取失败: 空数据")
+    try:
+        raw_klines = _fetch_binance_fapi_paginated(
+            exchange, exchange.fapiPublicGetPremiumIndexKlines, raw_symbol, timeframe_id, since
+        )
+    except Exception:
         return pd.DataFrame()
 
-    columns = ['timestamp', 'premium_open', 'premium_high', 'premium_low', 'premium_close',
-               'ignore1', 'close_time', 'ignore2', 'ignore3', 'ignore4', 'ignore5', 'ignore6']
-    df = pd.DataFrame(all_klines, columns=columns)
+    if not raw_klines:
+        print(f"[溢价指数] 拉取结果为空 | 标的: 【{symbol}】")
+        return pd.DataFrame()
 
-    df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
-    df['premium_close'] = pd.to_numeric(df['premium_close'], errors='coerce')
+    # 原生切片提取核心要素 0:timestamp, 4:premium_close
+    df = pd.DataFrame(raw_klines).iloc[:, [0, 4]]
+    df.columns = ['timestamp', 'premium_close']
 
-    df = df[['timestamp', 'premium_close']].dropna()
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df.dropna(inplace=True)
     df = convert_to_beijing_time(df)
 
-    # LER策略逻辑：推导无未来函数的预测资金费率
+    # FIXME: 保留原硬编码业务逻辑推导资金费率
     df['predicted_funding_rate'] = (df['premium_close'] + 0.0001) * 100
 
-    print(f"[溢价指数] 数据拉取完成 | 标的: [{symbol}] | 结果: [成功获取 {len(df)} 条]")
-    return df
+    print(f"[溢价指数] 处理完成 | 标的: 【{symbol}】 | 结果: 【共 {len(df)} 条数据】")
+    return df[['timestamp', 'premium_close', 'predicted_funding_rate']]
 
 
 # ============================================================================
-# 聚合管线引擎：组合所有数据为回测可用 DataFrame
+# 聚合管线引擎：合并异构数据
 # ============================================================================
 
 def prepare_ler_backtest_data(symbol, timeframe='5m', days=29.5, save_dir='./data'):
     """
-    聚合管线：每一行的时间戳（如 17:45:00）代表一个 5 分钟切片的起点。
-
-    严格的时间语义对齐如下：
-    1. 期初可见特征：oi_amount 是 17:45:00 瞬间的持仓快照；oi_amount_change_pct 是过去 5 分钟（17:40~17:45）的持仓变化率。
-    2. 随后演化标签：K线/CVD/预测费率 记录了随后 5 分钟（17:45~17:50）内的交易演化过程。
-
-    此结构直接支持“用期初可见特征预测随后5分钟走势”的无未来函数回测。
+    聚合引擎：执行各维度数据的抓取，并通过 Inner Join 确保时序对齐，落地为最终特征宽表。
+    基于本地已存在的数据时间戳，智能计算增量请求天数，避免重复拉取。
     """
-    print("=" * 80)
-    print(f"🚀 开始拉取 LER 策略回测数据 | 标的: {symbol} | 周期: {timeframe} | 基础天数: {days}天")
-    print("=" * 80)
+    print("\n" + "=" * 80)
+    print(f"[管线启动] 正在构建 LER 回测矩阵 | 标的: 【{symbol}】 | 基础回溯: 【{days}天】")
 
-    exchange = 'binance'
-
-    # 准备本地文件路径
-    safe_name = symbol.replace('/', '_').replace(':', '_')
-    file_path = os.path.join(save_dir, f"{safe_name}_{timeframe}_ler_data.csv")
-
-    # ================= 增量拉取与本地数据加载逻辑 =================
+    file_path = os.path.join(save_dir, f"{symbol.replace('/', '_').replace(':', '_')}_{timeframe}_ler_data.csv")
     local_df = pd.DataFrame()
+    pull_days = days
+
+    # 1. 检测本地历史数据并计算增量时间
     if os.path.exists(file_path):
         try:
             local_df = pd.read_csv(file_path)
             local_df['timestamp'] = pd.to_datetime(local_df['timestamp'])
-            print(f"[*] 成功加载本地历史数据: {len(local_df)} 条")
+
+            last_local_ts = local_df['timestamp'].max()
+            now_bj = pd.Timestamp.now(tz='Asia/Shanghai').tz_localize(None)
+
+            # 默认冗余1天数据进行交叉覆盖，防患极少数数据断层
+            delta_days = (now_bj - last_local_ts).total_seconds() / (24 * 3600)
+            pull_days = max(delta_days + 1.0, 1.0)
+
+            print(f"[增量检测] 发现本地快照 | 快照时间: 【{last_local_ts}】 | 调整拉取天数: 【{pull_days:.2f}天】")
         except Exception as e:
-            print(f"[警告] 读取本地数据失败: {e}")
+            print(f"[增量检测] 本地文件损坏或解析失败，降级为全量拉取 | 错误: 【{e}】")
             local_df = pd.DataFrame()
 
-    pull_days = days
-    if not local_df.empty:
-        last_local_ts = local_df['timestamp'].max()
-        # 使用北京时间计算差值
-        now_bj = pd.Timestamp.now(tz='Asia/Shanghai').tz_localize(None)
-        delta_days = (now_bj - last_local_ts).total_seconds() / (24 * 3600)
-        # 覆盖1天，即加上1天，且至少为1天
-        pull_days = max(delta_days + 1.0, 1.0)
-        print(f"[*] 本地最新数据时间: {last_local_ts}，计算增量拉取天数: {pull_days:.2f} 天")
-    # ============================================================
+    # 2. 并行/顺序执行数据获取
+    exchange_name = 'binance'
+    exchange_inst = init_exchange(exchange_name)
 
-    # 1. 独立拉取各项数据 (使用增量天数 pull_days)
-    df_klines = fetch_long_history(exchange, symbol, timeframe, pull_days)
-    df_oi = fetch_historical_oi(exchange, symbol, timeframe, pull_days)
+    df_klines = fetch_long_history(exchange_name, symbol, timeframe, pull_days)
+    df_oi = fetch_historical_oi(exchange_inst, symbol, timeframe, pull_days)
     df_cvd = fetch_binance_cvd_history(symbol, timeframe, pull_days)
     df_premium = fetch_premium_index_klines(symbol, timeframe, pull_days)
 
+    # 卫语句拦截：任意维度缺失即中断本次合并，防止产出脏矩阵
     if df_klines.empty or df_oi.empty or df_cvd.empty or df_premium.empty:
-        print("\n[警告] 部分数据拉取失败，合并终止。")
+        print(f"[管线合并] 【失败】存在关键维度数据缺失，放弃写入本地 | 标的: 【{symbol}】")
         return None
 
-    # 2. 内连接合并数据，严格对齐期初时间戳
-    print("\n[*] 正在对齐并合并数据矩阵...")
-    df_merged = df_klines
-    df_merged = df_merged.merge(df_oi[['timestamp', 'oi_amount', 'oi_amount_change_pct']], on='timestamp', how='inner')
-    df_merged = df_merged.merge(df_cvd[['timestamp', 'cvd']], on='timestamp', how='inner')
-    df_merged = df_merged.merge(df_premium[['timestamp', 'premium_close', 'predicted_funding_rate']], on='timestamp', how='inner')
+    # 3. 对齐合并
+    print(f"[管线合并] 正在执行 Inner Join 时序对齐...")
+    df_merged = (
+        df_klines
+        .merge(df_oi[['timestamp', 'oi_amount', 'oi_amount_change_pct']], on='timestamp', how='inner')
+        .merge(df_cvd[['timestamp', 'cvd']], on='timestamp', how='inner')
+        .merge(df_premium[['timestamp', 'premium_close', 'predicted_funding_rate']], on='timestamp', how='inner')
+    )
 
-    # ================= 增量合并与去重逻辑 =================
+    # 4. 增量整合与去重写入
     if not local_df.empty:
-        print("[*] 正在与本地历史数据进行增量合并...")
         df_merged['timestamp'] = pd.to_datetime(df_merged['timestamp'])
+        df_merged = pd.concat([local_df, df_merged])
+        df_merged = df_merged.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
+        print(f"[管线合并] 增量数据拼装完毕 | 标的: 【{symbol}】 | 总量扩容至: 【{len(df_merged)} 条】")
 
-        # 拼接本地和新数据，新数据在后
-        combined_df = pd.concat([local_df, df_merged])
-        # 按时间排序，并对 timestamp 去重，保留最后出现的（即新拉取的数据覆盖老数据）
-        combined_df = combined_df.sort_values('timestamp').drop_duplicates(subset=['timestamp'], keep='last')
-        df_merged = combined_df
-        print(f"[*] 增量合并完成，当前总数据量: {len(df_merged)} 条 (未截断历史数据，持续扩大中)")
-    # =====================================================
-
-    # 3. 结果保存
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
+    os.makedirs(save_dir, exist_ok=True)
     df_merged.to_csv(file_path, index=False)
-
-    print("=" * 80)
-    print(f"✅ 数据聚合完成！共合并 {len(df_merged)} 条有效特征。")
-    print(f"📁 数据已保存至: {file_path}")
-    print("=" * 80)
-
-    print("\n[核心特征截取预览 (最新 3 条)]:")
-    preview_cols = ['timestamp', 'close', 'oi_amount_change_pct', 'cvd', 'predicted_funding_rate']
-    print(df_merged[preview_cols].tail(3))
-    print("\n--> LER 数据管线 (Step 0) 已达军工级纯度，可直接进行回测。")
+    print(f"[持久化] 数据已安全落盘 | 路径: 【{file_path}】\n")
 
     return df_merged
 
 
 def get_top_volume_symbols(exchange_name='binance', top_n=100, quote_currency='USDT'):
-    """获取当前成交量前 top_n 的合约标的"""
+    """
+    通过交易所 Ticker 接口筛选出成交量最大的 N 个合约。
+    出参 Shape: List[String] (如 ['BTC/USDT:USDT', 'ETH/USDT:USDT'])
+    """
     exchange = init_exchange(exchange_name, default_type='swap')
-    exchange.load_markets()
-    tickers = exchange.fetch_tickers()
 
-    # 过滤出指定 quote currency 的永续合约 (如 :USDT)
-    target_symbols = []
-    for symbol, ticker in tickers.items():
-        if symbol.endswith(f':{quote_currency}'):
-            target_symbols.append(ticker)
+    try:
+        exchange.load_markets()
+        tickers = exchange.fetch_tickers()
+    except Exception as e:
+        print(f"[标的嗅探] 获取 Tickers 列表时遭遇致命网络异常 | 错误: 【{e}】")
+        raise
 
-    # 按 quoteVolume 降序排序
-    sorted_tickers = sorted(target_symbols, key=lambda x: float(x.get('quoteVolume') or 0), reverse=True)
+    target_symbols = [
+        ticker for symbol, ticker in tickers.items()
+        if symbol.endswith(f':{quote_currency}')
+    ]
+
+    # 按 quoteVolume 降序，安全处理空值
+    sorted_tickers = sorted(
+        target_symbols,
+        key=lambda x: float(x.get('quoteVolume') or 0),
+        reverse=True
+    )
 
     return [t['symbol'] for t in sorted_tickers[:top_n]]
 
 
 if __name__ == "__main__":
-    loop_interval_seconds = 3600  # 每次循环间隔时间(秒)，5m级别数据建议1小时以上避免频繁触发限速
+    LOOP_INTERVAL = 3600  # 建议休眠时长，防止过度榨取 API 限频额度
 
     while True:
         print("\n" + "="*80)
-        print(f"🔄 [{pd.Timestamp.now()}] 开始新一轮循环，获取成交量 Top 100 币种...")
+        print(f"🔄 [引擎调度] 开始新一轮全量扫描调度 | 当前时间: 【{pd.Timestamp.now()}】")
         print("="*80)
 
         try:
             top_symbols = get_top_volume_symbols('binance', 100, 'USDT')
-            print(f"[*] 成功获取 Top 100 币种，例如: {top_symbols[:5]}...")
-        except Exception as e:
-            print(f"[错误] 获取 Top 100 币种失败: {e}")
+            print(f"[调度中心] 核心池锁定完毕 | 热度最高标的预览: 【{top_symbols[:5]}...】")
+        except Exception:
+            print("[调度中心] 【失败】由于网络原因无法获取当前标的池，进入短暂重试等待...")
             time.sleep(60)
             continue
 
         for idx, sym in enumerate(top_symbols):
-            print(f"\n[{idx+1}/100] 正在处理标的: {sym}")
+            print(f"\n[任务派发] 进度: 【{idx+1}/100】 | 目标标的: 【{sym}】")
             try:
-                # 首次运行或本地无数据时，days 参数生效；后续增量拉取会自动覆盖计算
-                df_final = prepare_ler_backtest_data(symbol=sym, timeframe='5m', days=29.5)
+                # 引擎全量托管，无抛错则安全推进
+                prepare_ler_backtest_data(symbol=sym, timeframe='5m', days=30)
             except Exception as e:
-                print(f"[错误] 处理 {sym} 时发生异常: {e}")
+                print(f"[任务异常] 标的管线未捕获的致命错误 | 标的: 【{sym}】 | 错误详情: 【{e}】")
 
-        print(f"\n✅ 本轮 Top 100 拉取完毕，休眠 {loop_interval_seconds} 秒后进入下一轮...")
-        time.sleep(loop_interval_seconds)
+        print(f"\n✅ [引擎调度] 本轮池化数据更新完毕 | 即将休眠: 【{LOOP_INTERVAL} 秒】")
+        time.sleep(LOOP_INTERVAL)
