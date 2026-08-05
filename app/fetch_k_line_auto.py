@@ -454,6 +454,9 @@ def fetch_premium_index_klines(symbol, timeframe='5m', days=365):
 
 def prepare_ler_backtest_data(symbol, timeframe='5m', days=365, save_dir=BACKTEST_DATA_DIR):
     """
+    聚合管线：每一行的时间戳（如 17:45:00）代表一个 5 分钟切片的起点。
+    严格的时间语义对齐如下：1. 期初可见特征：oi_amount 是 17:45:00 瞬间的持仓快照；oi_amount_change_pct 是过去 5 分钟（17:40~17:45）的持仓变化率。2. 随后演化标签：K线/CVD/预测费率 记录了随后 5 分钟（17:45~17:50）内的交易演化过程。
+    此结构直接支持“用期初可见特征预测随后5分钟走势”的无未来函数回测。
     主控管线：调度各大子模块拉取数据并执行 Inner Join，最终落地回测所需特征矩阵
     出参: DataFrame 或 None (当合并失败时)
     """
@@ -529,23 +532,147 @@ def prepare_ler_backtest_data(symbol, timeframe='5m', days=365, save_dir=BACKTES
 
     return df_merged
 
-def get_top_volume_symbols(exchange_name='binance', top_n=10, quote_currency='USDT'):
+def get_top_gainers_losers(
+        exchange_name='binance',
+        top_n=20,
+        quote_currency='USDT'
+):
     """
-    动态嗅探全网交易量最高的交易对
-    出参: List[str]. 核心Shape: 标的字符串列表 ['BTC/USDT:USDT', ...]
+    获取涨幅榜 + 跌幅榜
+    返回去重后的symbol列表
+
+    示例:
+    [
+        'WIF/USDT:USDT',
+        'PEPE/USDT:USDT',
+        'TIA/USDT:USDT'
+    ]
     """
-    exchange = init_exchange(exchange_name, default_type='swap')
+
+    exchange = init_exchange(
+        exchange_name,
+        default_type='swap'
+    )
+
     try:
         exchange.load_markets()
         tickers = exchange.fetch_tickers()
+
     except Exception as e:
-        print(f"[标的嗅探] 核心市场 Tickers 拉取崩溃 | 报错: 【{e}】")
+        print(f"[涨跌幅扫描失败] {e}")
         raise
 
-    target_symbols = [t for s, t in tickers.items() if s.endswith(f':{quote_currency}')]
-    sorted_tickers = sorted(target_symbols, key=lambda x: float(x.get('quoteVolume') or 0), reverse=True)
-    return [t['symbol'] for t in sorted_tickers[:top_n]]
 
+    # 排除非Crypto合约
+    blacklist = {
+        # 商品
+        'XAU',
+        'XAG',
+        'CL',
+        'NG',
+
+        # 股票映射
+        'NVDA',
+        'AMD',
+        'TSLA',
+        'AAPL',
+        'MSFT',
+        'META',
+        'GOOG',
+        'GOOGL',
+        'AMZN',
+        'COIN',
+
+        # 指数
+        'SPX',
+        'QQQ'
+    }
+
+
+    candidates = []
+
+
+    for symbol, ticker in tickers.items():
+
+        # 只要USDT永续
+        if not symbol.endswith(
+            f':{quote_currency}'
+        ):
+            continue
+
+
+        base = symbol.split('/')[0]
+
+
+        if base in blacklist:
+            continue
+
+
+        # 没有涨跌幅跳过
+        pct = ticker.get('percentage')
+
+        if pct is None:
+            continue
+
+
+        try:
+            pct = float(pct)
+
+        except:
+            continue
+
+
+        volume = float(
+            ticker.get('quoteVolume') or 0
+        )
+
+
+        # 过滤垃圾流动性
+        if volume < 1_000_000:
+            continue
+
+
+        candidates.append(
+            {
+                "symbol": symbol,
+                "percentage": pct,
+                "volume": volume
+            }
+        )
+
+
+    # 涨幅榜
+    gainers = sorted(
+        candidates,
+        key=lambda x:x['percentage'],
+        reverse=True
+    )[:top_n]
+
+
+    # 跌幅榜
+    losers = sorted(
+        candidates,
+        key=lambda x:x['percentage']
+    )[:top_n]
+
+
+    # 合并去重
+    result = []
+
+    seen=set()
+
+
+    for item in gainers + losers:
+
+        symbol=item['symbol']
+
+        if symbol not in seen:
+
+            seen.add(symbol)
+            result.append(symbol)
+
+
+    return result
 
 if __name__ == "__main__":
     LOOP_INTERVAL = 14400
@@ -559,7 +686,7 @@ if __name__ == "__main__":
     while True:
         try:
             # 获取头部热门标的
-            top_symbols = get_top_volume_symbols('binance', 100, 'USDT')
+            top_symbols = get_top_gainers_losers('binance', 50, 'USDT')
         except Exception as e:
             print(f"[引擎调度] 无法嗅探标的列表，暂停重试中... | 错误: 【{e}】")
             time.sleep(60)
