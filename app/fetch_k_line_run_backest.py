@@ -25,9 +25,9 @@ import pandas as pd
 OI_LOOKBACK_DAYS = 30  # OI 历史分位数回溯天数
 OI_PERCENTILE = 0.90  # OI 极端分位数阈值 (90%)
 FR_THRESHOLD = -0.0005  # 资金费率极值阈值 (-0.05%)
-FR_CONSEC_PERIODS = 3  # 资金费率连续满足条件的周期数
+FR_CONSEC_PERIODS = 5  # 资金费率连续满足条件的周期数
 
-RANGE_LOOKBACK_HOURS = 12  # 1m数据：震荡区间回溯时间 (12小时)
+RANGE_LOOKBACK_HOURS = 6  # 1m数据：震荡区间回溯时间 (12小时)
 FEE_RATE = 0.001  # 单边手续费/滑点成本 (0.1%)
 
 
@@ -37,13 +37,6 @@ FEE_RATE = 0.001  # 单边手续费/滑点成本 (0.1%)
 def load_and_prepare_data(df_5m_path, df_1m_path):
     """
     加载并融合双时间周期数据，生成底层交易信号。
-
-    [输入 Shape 约束]:
-      df_5m_path (str): CSV需含列 ['timestamp', 'oi_amount', 'predicted_funding_rate']
-      df_1m_path (str): CSV需含列 ['timestamp' 或 'open_time', 'open', 'high', 'low', 'close']
-
-    [输出 Shape 约束]:
-      返回 DataFrame 需包含列 ['timestamp', 'open', 'close', 'high', 'low', 'long_trigger', 'exit_trigger', 'range_high', 'range_low']
     """
     print(
         f"[数据加载/初始化] 准备解析多周期K线数据 | 关键参数: 5m路径=【{df_5m_path}】, 1m路径=【{df_1m_path}】 | 结果: 【开始读取】")
@@ -75,6 +68,14 @@ def load_and_prepare_data(df_5m_path, df_1m_path):
     # 燃料池锁定状态 (核心防御：shift(1) 防止当前周期信号使用当前周期收盘才知晓的特征)
     df_5m['powder_keg_ready'] = (df_5m['condition_A'] & df_5m['condition_B']).shift(1)
 
+    # 【新增高密度探针】：5分钟因子漏斗分析
+    print(f"[数据加载/5m因子探针] 5分钟级别因子触发漏斗 | 关键参数: 总行数=【{len(df_5m)}】, OI阈值=【{OI_PERCENTILE}】, FR阈值=【{FR_THRESHOLD}】 | 结果: \n"
+          f"  > 条件A (OI突破90%): 【{df_5m['condition_A'].sum()} 次】\n"
+          f"  > 条件B (资金费率连跌): 【{df_5m['condition_B'].sum()} 次】\n"
+          f"  > 跨周期共振点 (火药桶就绪): 【{df_5m['powder_keg_ready'].sum()} 次】")
+    if df_5m['powder_keg_ready'].sum() == 0:
+        print("  ! 警告: 5分钟火药桶状态产生次数为0，请检查上述条件A或条件B是否阈值过于严苛。")
+
     # --- 阶段 3：降维合并到 1分钟 K线 ---
     df_1m.set_index('timestamp', inplace=True)
     df_5m.set_index('timestamp', inplace=True)
@@ -87,8 +88,19 @@ def load_and_prepare_data(df_5m_path, df_1m_path):
     df_1m['range_high'] = df_1m['high'].rolling(window=range_window, min_periods=range_window).max().shift(1)
     df_1m['range_low'] = df_1m['low'].rolling(window=range_window, min_periods=range_window).min().shift(1)
 
+    # 【新增高密度探针】：滚动窗口有效性检查 (排查NaN导致无法触发)
+    valid_range_calc = df_1m['range_high'].notna().sum()
+    print(f"[数据加载/1m结构探针] 滚动窗口计算完整度校验 | 关键参数: 回溯窗口=【{range_window}分钟】 | 结果: 【有效计算基准数量: {valid_range_calc} / {len(df_1m)}】")
+
     df_1m['long_trigger'] = (df_1m['close'] > df_1m['range_high']) & df_1m['powder_keg_ready']
     df_1m['exit_trigger'] = df_1m['close'] < df_1m['range_low']
+
+    # 【新增高密度探针】：最终1分钟信号触发漏斗分析
+    pure_breakout = (df_1m['close'] > df_1m['range_high']).sum()
+    print(f"[数据加载/1m信号探针] 1分钟级别最终信号触发漏斗 | 结果: \n"
+          f"  > 纯价格区间突破 (不看因子): 【{pure_breakout} 次】\n"
+          f"  > 继承自5m的火药桶状态持续时间: 【{df_1m['powder_keg_ready'].sum()} 分钟】\n"
+          f"  > ★ 最终做多信号生成 (突破且火药桶): 【{df_1m['long_trigger'].sum()} 次】")
 
     print(
         f"[数据加载/特征融合] 跨周期因子计算完毕 | 关键参数: 产出K线总数=【{len(df_1m)}条】 | 结果: 【成功对齐，准备回测】")
@@ -101,12 +113,6 @@ def load_and_prepare_data(df_5m_path, df_1m_path):
 def run_backtest(df_1m):
     """
     遍历行情进行状态机推演并埋点日志。
-
-    [输入 Shape 约束]:
-      df_1m (DataFrame): 需包含 load_and_prepare_data 产出的所有信号列
-
-    [输出 Shape 约束]:
-      trade_history (List[Dict]): 包含单笔交易明细的字典列表。核心 Key 包含 ['entry_time', 'exit_time', 'entry_price', 'exit_price', 'pnl_pct']
     """
     print("\n" + "=" * 50)
     print(f"[回测引擎/启动] 开始逐线推演 | 关键参数: 初始状态=【空仓等待】 | 结果: 【引擎运行中】")
@@ -182,7 +188,7 @@ def run_backtest(df_1m):
         print(f"  > 均笔盈亏: 【{trades_df['pnl_pct'].mean() * 100:.2f}%】")
     else:
         print(
-            "  > 结果判定: 【无任何交易触发】\n  > 排查建议: 行情过分平淡或阈值(90% OI)设置过高，请调整基础配置参数重试。")
+            "  > 结果判定: 【无任何交易触发】\n  > 排查建议: 请向上查看[因子探针]和[信号探针]日志，定位是哪个阈值条件产生的信号为0，适当调低该阈值（如降低OI的90%要求，或放宽-0.05%资金费率要求）。")
     print("=" * 50)
 
     return trade_history
@@ -192,7 +198,7 @@ def run_backtest(df_1m):
 # 4. 执行入口
 # ==========================================
 if __name__ == "__main__":
-    target_symbol = "BLESS"
+    target_symbol = "HEI"
 
     file_5m = f'./data/{target_symbol}_USDT_USDT_5m_ler_data.csv'
     file_1m = rf"W:\project\python_project\oke_auto_trade\kline_data\{target_symbol}USDT_1m_2025-01-01_merged.csv"
