@@ -498,27 +498,66 @@ def send_promo_posts():
     while True:
         post_manager = UniversalPostManager(gen_db_object())
         existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-        logger.info(
-            f"[发布链路/启动] 拉取待发布帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始逐条发布】")
 
-        sent = skipped = 0
+        # ==========================================
+        # [新增] 发帖前置预检漏斗：计算大概率会进入发帖环节的帖子
+        # ==========================================
+        target_posts = []
         for post in existing_posts:
+            # 1. 基础时效、黑名单、水位线过滤
             if not is_valid_post_for_promo(post):
-                skipped += 1
                 continue
 
+            # 2. 必须有大模型生成的评论
+            comment_info = post.get("promo_post")
+            if not comment_info:
+                continue
+
+            # 3. 必须尚未发布过（幂等防重）
+            if "promo_post_info" in post:
+                continue
+
+            # 4. 必须拥有有效的 post_id 才能拼接 URL
+            if not post.get("post_id"):
+                continue
+
+            # 5. 必须满足业务潜规则：评分 >= 8 才准许发帖
+            try:
+                score = comment_info.get("rational_user", {}).get("score", 0)
+            except Exception:
+                score = 0
+            if score < 8:
+                continue
+
+            # 通过所有漏斗，大概率会调用外部接口发帖
+            target_posts.append(post)
+
+        # 此时 len(target_posts) 就是你想要的“大概率发帖数量”
+        logger.info(
+            f"[发布链路/预检] 数据库拉取总量: {len(existing_posts)} | "
+            f"预估实际触发发帖数: {len(target_posts)} | "
+            f"结果: 【开始逐条发布】"
+        )
+        # ==========================================
+
+        sent = skipped = 0
+
+        # 注意这里：直接遍历我们预检好的 target_posts，极大提升效率
+        for post in target_posts:
             post_result = send_single_promo_post(post)
             if post_result:
                 post_manager.upsert_posts([post_result])
                 sent += 1
             else:
+                # 这里的 skipped 代表在真正调用 request 时发生的意外失败（如网络中断）
                 skipped += 1
 
         logger.info(
             f"[发布链路/本轮小结] 发布完毕，进入休眠 "
-            f"| 关键参数: 【已发布: {sent} | 跳过: {skipped}】 | 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】")
+            f"| 关键参数: 【成功发布: {sent} | 发帖失败: {skipped}】 "
+            f"| 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】"
+        )
         time.sleep(SCHEDULE_INTERVAL_SEC)
-
 
 
 
@@ -577,7 +616,7 @@ def like_and_bookmark_loop():
 if __name__ == "__main__":
     tasks = [
         send_promo_posts,
-        gen_all_promo_posts,  # 注释本行即可停用"评论生成"链路
+        # gen_all_promo_posts,  # 注释本行即可停用"评论生成"链路
     ]
 
     threads = []
