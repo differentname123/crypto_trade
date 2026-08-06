@@ -14,6 +14,7 @@
 """
 
 import pandas as pd
+import os
 
 # ==========================================
 # 1. 策略核心参数区
@@ -25,25 +26,20 @@ BREAKOUT_WINDOW_H = 12  # 进场突破计算周期（小时）
 STOPLOSS_WINDOW_H = 1  # 出场止损计算周期（小时）
 FEE_RATE = 0.001  # 单边交易成本（0.1%）
 
-TARGET_COIN = 'CAP'
-OI_FILE = f'./data/{TARGET_COIN}_USDT_USDT_5m_oi.csv'
-FR_FILE = f'./data/{TARGET_COIN}_USDT_USDT_funding_rates.csv'
-KLINE_FILE = f'./data/{TARGET_COIN}_USDT_USDT_1m_kline.csv'
 
-
-def run_backtest():
-    print(">>> [系统初始化] 正在加载并预处理底层数据源...")
+def run_backtest(target_coin, oi_file, fr_file, kline_file):
+    print(f">>> [系统初始化] 正在加载并预处理 【{target_coin}】 底层数据源...")
 
     # ------------------------------------------
     # 2. 数据读取与防御性拦截
     # ------------------------------------------
     try:
-        df_oi = pd.read_csv(OI_FILE)
-        df_fr = pd.read_csv(FR_FILE)
-        df_klines = pd.read_csv(KLINE_FILE)
+        df_oi = pd.read_csv(oi_file)
+        df_fr = pd.read_csv(fr_file)
+        df_klines = pd.read_csv(kline_file)
     except FileNotFoundError as e:
         # 异常不被静默吞噬，通过大白话指引排查方向后直接终止流转
-        print(f"❌ [数据加载失败] 找不到底层数据文件，请检查 data 目录下是否备齐所有 CSV 文件。详细原因: {e}")
+        print(f"❌ [数据加载失败] 找不到底层数据文件，详细原因: {e}")
         return
 
     # ------------------------------------------
@@ -96,7 +92,7 @@ def run_backtest():
     print(f">>> [数据清洗完毕] 已剔除预热期，实际用于回测的有效 K 线数量: 【{len(df_master)}】 行")
 
     if len(df_master) > 0:
-        # 新增：全局信号探查统计，直接暴露条件卡点，极大降低无交易时的排查成本
+        # 全局信号探查统计，直接暴露条件卡点，极大降低无交易时的排查成本
         time_start = df_master['datetime'].iloc[0].strftime('%Y-%m-%d')
         time_end = df_master['datetime'].iloc[-1].strftime('%Y-%m-%d')
 
@@ -169,12 +165,12 @@ def run_backtest():
     # 6. 回测报告产出
     # ------------------------------------------
     print("\n==================================================")
-    print("📊 [绩效看板] Pure Squeeze Catcher")
+    print(f"📊 [绩效看板] Pure Squeeze Catcher - 标的: 【{target_coin}】")
     print("==================================================")
 
     if not trades:
         print("💡 回测结论: 期间未触发任何符合所有前置条件的交易信号，建议检查数据时间跨度或适当放宽参数阈值。")
-        print("==================================================")
+        print("==================================================\n")
         return
 
     trades_df = pd.DataFrame(trades)
@@ -191,8 +187,41 @@ def run_backtest():
     print(f"总净收益率       : 【{total_return_pct * 100:.2f}%】")
     print(f"区间最大回撤     : 【{max_drawdown * 100:.2f}%】")
     print(f"平均每笔净收益   : 【{trades_df['net_return'].mean() * 100:.2f}%】")
-    print("==================================================")
+    print("==================================================\n")
+
+
+def scan_and_run_batch(data_dir='./data'):
+    """扫描指定目录下的数据文件，并自动拼装参数执行批量回测"""
+    if not os.path.exists(data_dir):
+        print(f"❌ [严重错误] 找不到数据目录 【{data_dir}】，请确保当前执行路径下存在该文件夹。")
+        return
+
+    # 通过嗅探 kline 文件提取所有潜在币种名称
+    file_list = os.listdir(data_dir)
+    kline_files = [f for f in file_list if f.endswith('_USDT_USDT_1m_kline.csv')]
+
+    if not kline_files:
+        print(f"⚠️ [无数据] 在 【{data_dir}】 目录下未发现任何符合 '*_USDT_USDT_1m_kline.csv' 格式的文件。")
+        return
+
+    print(f"🔍 [自动嗅探] 共发现 【{len(kline_files)}】 个待测币种，开始批量执行回测...")
+    print("=" * 60)
+
+    # 遍历每一个提取出来的币种，拼装文件路径进行回测
+    for kf in kline_files:
+        target_coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+        oi_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_5m_oi.csv')
+        fr_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_funding_rates.csv')
+        kline_file = os.path.join(data_dir, kf)
+
+        # 防呆：必须确保三份数据同时存在才能回测
+        if os.path.exists(oi_file) and os.path.exists(fr_file):
+            print(f"\n🚀 正在启动针对标的 【{target_coin}】 的策略实例")
+            print("-" * 60)
+            run_backtest(target_coin, oi_file, fr_file, kline_file)
+        else:
+            print(f"⚠️ [跳过标的] 币种 【{target_coin}】 缺乏完整的底层数据(需要同时具备 oi, funding_rates, kline)，已自动跳过。")
 
 
 if __name__ == "__main__":
-    run_backtest()
+    scan_and_run_batch('./data')
