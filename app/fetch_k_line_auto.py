@@ -2,25 +2,6 @@
 ================================================================================
 [核心数据流与功能摘要] 加密货币独立特征拉取引擎 (无聚合/无合并/保留原始时间)
 ================================================================================
-[功能摘要]
-本模块突破了单一 API 的物理限流，独立拉取三大核心数据，并分别存储为独立文件：
-1. 1m K线数据 (保留原始毫秒时间戳)
-2. 5m 持仓量(OI)数据 (结合 Vision 底座 + API 增量，保留原始时间戳)
-3. 历史已结算资金费率 (保留原始时间戳)
-
-[输入数据]
-- 动态嗅探的高优标的列表 (Symbol List)
-- 本地现存的 CSV 历史数据 (用于推断断点续传的 since 时间戳)
-- Binance Vision 历史每日 ZIP 数据压缩包 (OI 底座)
-
-[数据流转/交互]
-1. 调度器 -> 获取活跃标的 -> 循环下发任务。
-2. 独立管线 -> 探活本地 CSV -> 获取最后一条记录的时间戳 -> 向 CCXT / Binance 发起增量拉取。
-3. Pandas 管道 -> 拼接(旧数据 + 增量) -> 按时间戳去重 -> 排序 -> 追加易读北京时间。
-
-[输出数据]
-- 针对每个标的独立输出 3 份增量更新的 CSV 文件，不执行重采样，数据严格保真。
-================================================================================
 """
 
 import os
@@ -55,7 +36,6 @@ os.makedirs(BACKTEST_DATA_DIR, exist_ok=True)
 # ============================================================================
 
 def init_exchange(exchange_name, default_type='swap'):
-    """初始化 CCXT 交易所实例 (持有网络代理与默认合约类型)"""
     config = {
         'enableRateLimit': True,
         'proxies': GLOBAL_PROXY,
@@ -66,14 +46,9 @@ def init_exchange(exchange_name, default_type='swap'):
 
 
 def fetch_with_pagination(exchange, fetch_func, symbol, since, limit_per_request, timeframe=None):
-    """
-    [分页增量拉取引擎] 增加了重试与详细的起止预期日志
-    入参形貌: symbol, since(毫秒时间戳), limit_per_request(单次拉取量)
-    出参形貌: list[dict/list] (CCXT 的原始响应结构，未解析)
-    """
     all_data = []
     current_since = since
-    max_retries = 5 # 增强重试次数保证完整性
+    max_retries = 5
 
     print(f"  [API分页/准备] 标的: [{symbol}] | 预期拉取起点: {pd.to_datetime(since, unit='ms')} (TS: {since})")
 
@@ -83,7 +58,6 @@ def fetch_with_pagination(exchange, fetch_func, symbol, since, limit_per_request
 
         while retry_count < max_retries and not success:
             try:
-                # 兼容带有 timeframe (K线/OI) 和不带 timeframe (资金费率) 的 API
                 kwargs = {'since': current_since, 'limit': limit_per_request}
                 if timeframe:
                     data = fetch_func(symbol, timeframe, **kwargs)
@@ -95,25 +69,21 @@ def fetch_with_pagination(exchange, fetch_func, symbol, since, limit_per_request
                 if retry_count >= max_retries:
                     raise RuntimeError(f"[API分页/致命异常] 超过最大重试次数 | 标的: [{symbol}] | 报错: {e}") from e
                 print(f"  ⚠️ [API分页/重试] 拉取异常 | 标的: [{symbol}] | 等待重试: ({retry_count}/{max_retries}) | 错误: {e}")
-                time.sleep(3 * retry_count) # 退避重试策略
+                time.sleep(3 * retry_count)
 
-        # 卫语句：查无增量，直接结束
         if not data:
             break
 
         all_data.extend(data)
 
-        # 兼容 CCXT 两种常见返回格式 (字典列表 or 数组列表)
         last_item = data[-1]
         last_timestamp = int(last_item.get('timestamp', 0)) if isinstance(last_item, dict) else int(last_item[0])
 
         if not last_timestamp:
             break
 
-        # 推进游标 (避免毫秒级重复抓取)
         current_since = last_timestamp + 1
 
-        # 触达当前时间 (预留 1 分钟安全冗余)，结束拉取
         if last_timestamp >= exchange.milliseconds() - 60000:
             break
 
@@ -130,22 +100,16 @@ def fetch_with_pagination(exchange, fetch_func, symbol, since, limit_per_request
 
 
 def _get_resume_timestamp(out_path, exchange, days):
-    """提取本地旧文件的最新时间戳，推断增量拉取起点"""
     if os.path.exists(out_path):
         old_df = pd.read_csv(out_path)
         if not old_df.empty and 'timestamp' in old_df.columns:
             return old_df, int(old_df['timestamp'].max()) + 1
 
-    # 无有效旧文件，返回全量拉取起点
     start_ms = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
     return pd.DataFrame(), start_ms
 
 
 def _merge_and_save(out_path, old_df, new_df, symbol, data_type, expected_interval_ms=None):
-    """
-    [数据落地引擎] 执行去重、排序、人性化时间追加与文件覆写
-    【修改点】加入了极度严格的数据完整性校验（查重排缺失）
-    """
     if new_df.empty:
         return 0
 
@@ -155,12 +119,10 @@ def _merge_and_save(out_path, old_df, new_df, symbol, data_type, expected_interv
 
     original_len = len(df)
 
-    # 核心转换：剔除无效时间戳 -> 去重 -> 排序
     df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
     df.dropna(subset=['timestamp'], inplace=True)
     df['timestamp'] = df['timestamp'].astype(int)
 
-    # 去重并记录重复数量
     df.drop_duplicates(subset=['timestamp'], keep='last', inplace=True)
     dedup_len = len(df)
     if original_len > dedup_len:
@@ -169,27 +131,23 @@ def _merge_and_save(out_path, old_df, new_df, symbol, data_type, expected_interv
     df.sort_values('timestamp', ascending=True, inplace=True)
     df.reset_index(drop=True, inplace=True)
 
-    # 【完整性检测】检测时间断层（缺失数据）
     if expected_interval_ms and len(df) > 1:
         time_diffs = df['timestamp'].diff().dropna()
-        # 容忍 1 秒的误差(主要针对某些奇怪的API毫秒偏离)，大于预期区间则视为断层
-        gaps = time_diffs[time_diffs > (expected_interval_ms + 1000)]
+        gaps = time_diffs[time_diffs > (expected_interval_ms + 10000)]
 
         if not gaps.empty:
             print(f"  🚨🚨🚨 [完整性警告/数据缺失] 标的: [{symbol}-{data_type}] | 严重警告: 发现 {len(gaps)} 处时间断层！")
             gap_indices = gaps.index
-            # 打印最明显的几处断层供人工核对
             for idx in gap_indices[:5]:
                 gap_start = df.loc[idx-1, 'timestamp']
                 gap_end = df.loc[idx, 'timestamp']
-                missing_duration = (gap_end - gap_start) / 1000 / 60 # 转换为分钟
+                missing_duration = (gap_end - gap_start) / 1000 / 60
                 print(f"    🆘 缺失区间: {pd.to_datetime(gap_start, unit='ms')} -> {pd.to_datetime(gap_end, unit='ms')} (跨度: {missing_duration:.1f} 分钟)")
             if len(gaps) > 5:
                 print(f"    🆘 ... (省略剩余 {len(gaps)-5} 处缺失日志，请重点检查)")
         else:
             print(f"  ✅ [完整性/连续] 标的: [{symbol}-{data_type}] | 时间序列连续，未发现数据缺失。")
 
-    # 追加人性化北京时间列 (不影响原 timestamp 数据流)
     dt_series = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
     df['datetime_bj'] = dt_series.dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
 
@@ -207,7 +165,6 @@ def _merge_and_save(out_path, old_df, new_df, symbol, data_type, expected_interv
 # ============================================================================
 
 def sync_1m_klines(exchange, symbol, days=365):
-    """独立管线 1：拉取并保存 1 分钟级别 K 线"""
     clean_symbol = symbol.replace('/', '_').replace(':', '_')
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_1m_kline.csv")
 
@@ -219,19 +176,12 @@ def sync_1m_klines(exchange, symbol, days=365):
         print(f"  [1m K线/跳过] 当前已是最新状态 | 标的: [{symbol}] | 模式: [{mode_str}]")
         return
 
-    # K线标准 Shape
     new_df = pd.DataFrame(raw_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-    # 1分钟 = 60 * 1000 ms = 60000
     total = _merge_and_save(out_path, old_df, new_df, symbol, "1m K线", expected_interval_ms=60000)
     print(f"  [1m K线/完结] 文件已更新 | 标的: [{symbol}] | 模式: [{mode_str}]")
 
 
 def auto_download_vision_daily_oi(symbol, days=365):
-    """
-    底层依赖：从 Binance Vision 逐日拉取历史 OI 底座
-    【修改点】增加了丰富的本地缓存与网络请求日志，并对单日下载增加了稳健的重试机制
-    """
     clean_symbol = symbol.split(':')[0].replace('/', '')
     end_date = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
     start_date = (pd.Timestamp.utcnow() - pd.Timedelta(days=days)).floor('D')
@@ -248,19 +198,16 @@ def auto_download_vision_daily_oi(symbol, days=365):
         zip_path = os.path.join(VISION_DATA_DIR, zip_filename)
 
         df = None
-        # 1. 尝试读取本地缓存
         if os.path.exists(zip_path):
             try:
                 with zipfile.ZipFile(zip_path) as z:
                     csv_name = [n for n in z.namelist() if n.endswith('.csv')][0]
                     df = pd.read_csv(z.open(csv_name), low_memory=False)
-                    # 避免日志刷屏，仅以小标记形式输出
                     cache_hit_count += 1
             except zipfile.BadZipFile:
                 print(f"    ⚠️ [Vision底座/损坏] {ymd_str} 本地缓存破损，执行清理并重新拉取...")
-                os.remove(zip_path)  # 破损文件直接清理
+                os.remove(zip_path)
 
-        # 2. 本地无缓存，尝试远端拉取并固化 (带重试)
         if df is None:
             daily_url = f"https://data.binance.vision/data/futures/um/daily/metrics/{clean_symbol}/{zip_filename}"
             retries = 3
@@ -277,10 +224,9 @@ def auto_download_vision_daily_oi(symbol, days=365):
 
                         print(f"    ⬇️ [Vision底座/下载成功] 标的: {clean_symbol} | 日期: {ymd_str}")
                         success_count += 1
-                        time.sleep(0.2)  # 简易限流防御
+                        time.sleep(0.2)
                         break
                     elif resp.status_code == 404:
-                        # 404 代表当天交易所确实没生成数据，直接跳出重试
                         fail_count += 1
                         break
                     else:
@@ -305,32 +251,40 @@ def auto_download_vision_daily_oi(symbol, days=365):
     merged_df = pd.concat(all_dfs, ignore_index=True)
     if 'create_time' in merged_df.columns and 'sum_open_interest' in merged_df.columns:
         merged_df.rename(columns={'create_time': 'timestamp', 'sum_open_interest': 'oi_amount'}, inplace=True)
-        # 清洗可能存在的字符串时间戳格式为毫秒级 int
+
+        # [核心修复1]: 彻底解决 Pandas 2.0+ 将 string 转换导致除以 10**6 漂移到 1970 年的 BUG
         if pd.api.types.is_string_dtype(merged_df['timestamp']):
-            merged_df['timestamp'] = pd.to_datetime(merged_df['timestamp']).astype('int64') // 10 ** 6
+            # 强制按毫秒格式处理并直接生成正确的 int64
+            merged_df['timestamp'] = pd.to_datetime(merged_df['timestamp']).astype('datetime64[ms]').astype('int64')
+
         return merged_df[['timestamp', 'oi_amount']]
 
     return pd.DataFrame()
 
 
 def sync_5m_oi(exchange, symbol, days=365):
-    """独立管线 2：拉取并保存 5 分钟级别 持仓量(OI)"""
     clean_symbol = symbol.replace('/', '_').replace(':', '_')
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_5m_oi.csv")
     old_df = pd.read_csv(out_path) if os.path.exists(out_path) else pd.DataFrame()
 
-    # 第一阶段：Vision 历史底座加载
     df_vision = auto_download_vision_daily_oi(symbol, days)
 
-    # 第二阶段：推算 API 增量起点
+    # [核心修复2]: 增加币安 API 限制逻辑的防御
+    now_ms = exchange.milliseconds()
     if not df_vision.empty:
         api_since = int(df_vision['timestamp'].max()) + 1
         print(f"  [5m OI/阶段1] Vision 底座加载成功 | 标的: [{symbol}] | 准备接力 API 增量...")
     else:
-        api_since = exchange.milliseconds() - int(days * 24 * 60 * 60 * 1000)
+        api_since = now_ms - int(days * 24 * 60 * 60 * 1000)
         print(f"  [5m OI/阶段1] 无 Vision 底座支撑 | 标的: [{symbol}] | 退化为全量 API 拉取...")
 
-    # 第三阶段：API 增量抓取
+    # 安全钳制：币安 openInterestHist 接口强制最多只能回溯 30 天
+    max_api_history_ms = now_ms - int(29.5 * 24 * 60 * 60 * 1000)
+    if api_since < max_api_history_ms:
+        print(f"  ⚠️ [5m OI/安全限制] 预期起点 {pd.to_datetime(api_since, unit='ms')} 超出币安 API 的30天限制！")
+        api_since = max_api_history_ms
+        print(f"  ⚠️ [5m OI/安全限制] 强制重置 API 起点为: {pd.to_datetime(api_since, unit='ms')}")
+
     raw_oi = fetch_with_pagination(exchange, exchange.fetch_open_interest_history, symbol, api_since, 500,
                                    timeframe='5m')
     df_api = pd.DataFrame([{
@@ -338,19 +292,16 @@ def sync_5m_oi(exchange, symbol, days=365):
         'oi_amount': float(item.get('openInterestAmount', 0)),
     } for item in raw_oi]) if raw_oi else pd.DataFrame()
 
-    # 第四阶段：三方数据 (本地旧库 + Vision底层 + API增量) 融合洗牌并固化
     df_combined_new = pd.concat([df_vision, df_api], ignore_index=True)
     if df_combined_new.empty:
         print(f"  [5m OI/跳过] 无任何有效底层或增量数据 | 标的: [{symbol}]")
         return
 
-    # 5分钟 = 5 * 60 * 1000 ms = 300000
     total = _merge_and_save(out_path, old_df, df_combined_new, symbol, "5m OI", expected_interval_ms=300000)
     print(f"  [5m OI/完结] 数据已落地 | 标的: [{symbol}]")
 
 
 def sync_funding_rates(exchange, symbol, days=365):
-    """独立管线 3：拉取并保存历史已结算资金费率"""
     clean_symbol = symbol.replace('/', '_').replace(':', '_')
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_funding_rates.csv")
 
@@ -368,16 +319,11 @@ def sync_funding_rates(exchange, symbol, days=365):
         'funding_rate': item.get('fundingRate', 0),
     } for item in raw_data])
 
-    # 资金费率一般为 8小时 (28800000 ms) 或 4小时。这里用 8h 校验，如遇到非标合约控制台也会正常打印缺失。
     total = _merge_and_save(out_path, old_df, new_df, symbol, "资金费率", expected_interval_ms=28800000)
     print(f"  [资金费率/完结] 数据已落地 | 标的: [{symbol}] | 模式: [{mode_str}]")
 
 
 def fetch_independent_datasets(symbol, days=365):
-    """
-    [任务总控] 针对单一标的，依次驱动 3 个独立的特征抓取管线。
-    采用严格的防雪崩隔离：单一管线失败不阻塞其他管线。
-    """
     print("\n" + "=" * 80)
     print(f"🚀 [引擎触发] 开始执行独立特征抓取管线 | 标的: 【{symbol}】 | 回溯范围: 【{days}天】")
 
@@ -394,7 +340,6 @@ def fetch_independent_datasets(symbol, days=365):
             print(f"\n---> 启动子管线: {name}")
             func(exchange, symbol, days)
         except Exception as e:
-            # 捕获并直白化输出错误，确保异常被拦截，管线继续流转
             print(f"  ❌ [{name}/异常] 管线崩溃中止 | 标的: [{symbol}] | 错误明细: {e}")
 
     print(f"\n✅ [引擎流转] 【{symbol}】 所有可用管线执行完毕。")
@@ -405,7 +350,6 @@ def fetch_independent_datasets(symbol, days=365):
 # ============================================================================
 
 def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='USDT'):
-    """获取高波动且高流通量的过滤版目标列表"""
     exchange = init_exchange(exchange_name, default_type='swap')
     try:
         exchange.load_markets()
@@ -438,7 +382,6 @@ def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='US
         if volume >= 1_000_000:
             candidates.append({"symbol": symbol, "percentage": pct})
 
-    # 按涨跌幅分别截取两端，再聚合去重
     sorted_cands = sorted(candidates, key=lambda x: x['percentage'])
     gainers = sorted_cands[-top_n:]
     losers = sorted_cands[:top_n]
@@ -460,8 +403,7 @@ if __name__ == "__main__":
             print("\n🔍 [全局调度] 开始执行新一轮标的嗅探...")
             top_symbols = get_top_gainers_losers('binance', 20, 'USDT')
         except Exception as e:
-            print(
-                f"❌ [全局调度/异常] 无法获取最新市场标的 | 可能原因: 网络断开或 API 熔断 | 等待 60 秒后重试... | 错误明细: 【{e}】")
+            print(f"❌ [全局调度/异常] 无法获取最新市场标的 | 可能原因: 网络断开或 API 熔断 | 等待 60 秒后重试... | 错误明细: 【{e}】")
             time.sleep(60)
             continue
 
@@ -472,6 +414,5 @@ if __name__ == "__main__":
                 print(f"❌ [任务总线/严重崩溃] 标的 {sym} 主进程崩溃已被跳过 | 错误明细: {e}")
                 traceback.print_exc()
 
-        print(
-            f"\n💤 [全局调度] ✅ 当前轮次所有 {len(top_symbols)} 个标的处理完毕 | 进入休眠倒计时: 【{LOOP_INTERVAL} 秒】...")
+        print(f"\n💤 [全局调度] ✅ 当前轮次所有 {len(top_symbols)} 个标的处理完毕 | 进入休眠倒计时: 【{LOOP_INTERVAL} 秒】...")
         time.sleep(LOOP_INTERVAL)

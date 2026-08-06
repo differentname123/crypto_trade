@@ -13,17 +13,16 @@ import datetime
 import re
 import time
 import threading
-
-from app.ai_api.gemini_api import get_llm_content, get_llm_content_gemini_flash_video
+from common.common_utils import read_file_to_str, string_to_object, setup_logger
+logger = setup_logger(app_name="promo_copy")
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
-from app.ai_api.gemini_web import generate_gemini_content_managed
 from biance.biance_playwright import comment_on_binance_post
 from biance.biance_squre_api import fetch_binance_feed
-from common.common_utils import read_file_to_str, string_to_object, setup_logger
+
+
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
-logger = setup_logger(app_name="promo_copy")
 
 # ---------------- 全局配置常量（集中管理硬编码，便于维护）----------------
 BINANCE_SOURCE = "biance"
