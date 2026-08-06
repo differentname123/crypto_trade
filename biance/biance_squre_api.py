@@ -17,6 +17,7 @@ import uuid
 
 import requests
 
+from biance.biance_playwright import get_auth_tokens_robust
 from common.common_utils import get_config, setup_logger, save_json, read_json, download_web_media
 from urllib.parse import quote
 setup_logger()
@@ -190,6 +191,151 @@ def toggle_binance_follow(target_uid, action, cookies, csrf_token, session=None)
             json=payload,
             proxies=PROXIES,
             timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+
+        json_resp = response.json()
+
+        if json_resp.get("success"):
+            logger.info(f"✅ [{label}] 操作成功！")
+            return True
+        else:
+            code = json_resp.get("code")
+            msg = json_resp.get("message", "未知错误")
+            logger.error(f"❌ [{label}] API 业务错误 | Code: {code} | Msg: {msg}")
+            return False
+
+    except Exception as e:
+        detail = ""
+        if 'response' in locals() and response is not None:
+            detail = f" | HTTP {response.status_code} | 返回数据: {response.text[:200]}"
+
+        logger.error(f"🚨 [{label}] 网络或请求异常{detail} | 报错: {e}")
+        return False
+
+
+def toggle_binance_like(post_id, action, cookies, csrf_token, card_type="BUZZ_SHORT", session=None):
+    """
+    操作币安广场帖子的点赞状态，单次请求不重试
+
+    :param post_id: 帖子ID (如: 352727546639281)
+    :param action: 操作类型，"like" (点赞) 或 "unlike" (取消点赞)
+    :param cookies: 登录态 Cookie
+    :param csrf_token: CSRF Token
+    :param card_type: 卡片类型，默认为 "BUZZ_SHORT"
+    :param session: requests.Session 对象 (可选)
+    """
+    if action not in ["like", "unlike"]:
+        logger.error("❌ 无效的操作类型，只能是 'like' 或 'unlike'")
+        return False
+
+    # 动态拼接是 /like 还是 /unlike
+    url = f"https://www.binance.com/bapi/composite/v1/private/pgc/content/{action}"
+    label = f"{'点赞' if action == 'like' else '取消点赞'}帖子: {post_id}"
+
+    # 基础 Headers
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "cookie": cookies,
+        "csrftoken": csrf_token,
+        "origin": "https://www.binance.com",
+        # 动态生成 Referer
+        "referer": f"https://www.binance.com/zh-CN/square/post/{post_id}",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    }
+
+    # 请求体 Payload (like 和 unlike 的 payload 是完全相同的)
+    payload = {
+        "id": int(post_id),
+        "cardType": card_type  # 对应 curl 中的 "BUZZ_SHORT"
+    }
+
+    req_client = session if session else requests
+
+    try:
+        # 直接发起单次请求，带上代理
+        response = req_client.post(
+            url,
+            headers=headers,
+            json=payload,
+            proxies=PROXIES,  # 假定全局已定义
+            timeout=REQUEST_TIMEOUT  # 假定全局已定义
+        )
+        response.raise_for_status()
+
+        json_resp = response.json()
+
+        if json_resp.get("success"):
+            logger.info(f"✅ [{label}] 操作成功！")
+            return True
+        else:
+            code = json_resp.get("code")
+            msg = json_resp.get("message", "未知错误")
+            logger.error(f"❌ [{label}] API 业务错误 | Code: {code} | Msg: {msg}")
+            return False
+
+    except Exception as e:
+        detail = ""
+        if 'response' in locals() and response is not None:
+            detail = f" | HTTP {response.status_code} | 返回数据: {response.text[:200]}"
+
+        logger.error(f"🚨 [{label}] 网络或请求异常{detail} | 报错: {e}")
+        return False
+
+
+def toggle_binance_bookmark(post_id, action, cookies, csrf_token, session=None):
+    """
+    操作币安广场帖子的收藏状态，单次请求不重试
+
+    :param post_id: 帖子ID (如: 352727546639281)
+    :param action: 操作类型，"add" (收藏) 或 "cancel" (取消收藏)
+    :param cookies: 登录态 Cookie
+    :param csrf_token: CSRF Token
+    :param session: requests.Session 对象 (可选)
+    """
+    # 根据你提供的 curl，取消收藏对应的是 cancel
+    if action not in ["add", "cancel"]:
+        logger.error("❌ 无效的操作类型，只能是 'add' 或 'cancel'")
+        return False
+
+    # 动态拼接是 /add/bookmark 还是 /cancel/bookmark
+    url = f"https://www.binance.com/bapi/composite/v1/private/pgc/content/{action}/bookmark"
+    label = f"{'收藏' if action == 'add' else '取消收藏'}帖子: {post_id}"
+
+    # 基础 Headers
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "cookie": cookies,
+        "csrftoken": csrf_token,
+        "origin": "https://www.binance.com",
+        # 动态生成 Referer
+        "referer": f"https://www.binance.com/zh-CN/square/post/{post_id}",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+    }
+
+    # 请求体 Payload
+    payload = {
+        "contentId": int(post_id)
+    }
+
+    req_client = session if session else requests
+
+    try:
+        # 直接发起单次请求，带上代理
+        response = req_client.post(
+            url,
+            headers=headers,
+            json=payload,
+            proxies=PROXIES,  # 假定全局已定义
+            timeout=REQUEST_TIMEOUT  # 假定全局已定义
         )
         response.raise_for_status()
 
@@ -1566,3 +1712,18 @@ if __name__ == "__main__":
     master_feed_list.extend(token_data)
 
     logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
+
+
+
+    USER_DATA_DIR = r"W:\temp\biance_nana"
+    my_cookies, my_csrf_token = get_auth_tokens_robust(USER_DATA_DIR)  # 提取脱机 API 凭证
+
+    while True:
+        # 添加收藏
+        toggle_binance_bookmark(352727546639281, "add", my_cookies, my_csrf_token)
+        # 取消收藏
+        toggle_binance_bookmark(352727546639281, "cancel", my_cookies, my_csrf_token)
+        # 点赞
+        toggle_binance_like(352727546639281, "like", my_cookies, my_csrf_token)
+        # 取消点赞
+        toggle_binance_like(352727546639281, "unlike", my_cookies, my_csrf_token)

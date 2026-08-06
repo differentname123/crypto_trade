@@ -13,16 +13,17 @@ import datetime
 import re
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed  # [新增引入] 用于支持并发执行
+
 from common.common_utils import read_file_to_str, string_to_object, setup_logger
+
 logger = setup_logger(app_name="promo_copy")
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from biance.biance_playwright import comment_on_binance_post
 from biance.biance_squre_api import fetch_binance_feed
 
-
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
-
 
 # ---------------- 全局配置常量（集中管理硬编码，便于维护）----------------
 BINANCE_SOURCE = "biance"
@@ -46,13 +47,13 @@ FILTER_CONFIG = {
     "blacklist_multi_words": ['follow', 'share', 'comment'],  # 三词同时出现才触发拦截
 
     # 2. 结构与时效底线
-    "min_text_length": 20,   # 去链接/标签后的纯文本最短字符数
-    "max_age_hours": 720,    # 帖子最长有效时间(小时)
+    "min_text_length": 20,  # 去链接/标签后的纯文本最短字符数
+    "max_age_hours": 720,  # 帖子最长有效时间(小时)
 
     # 3. 绝对值水位线防线
-    "max_comment_count": 100,   # 评论数上限(过高说明太拥挤,推广无曝光)
-    "cold_post_hours": 20,      # 判定"死帖"的时间界限(小时)
-    "cold_post_min_views": 20   # 死帖最低浏览量要求(超时且低于此值即淘汰)
+    "max_comment_count": 100,  # 评论数上限(过高说明太拥挤,推广无曝光)
+    "cold_post_hours": 20,  # 判定"死帖"的时间界限(小时)
+    "cold_post_min_views": 20  # 死帖最低浏览量要求(超时且低于此值即淘汰)
 }
 
 
@@ -90,7 +91,8 @@ def is_valid_post_for_promo(post):
     # --- 第三步：绝对值水位线过滤 ---
     if engagement.get("comment_count", 0) > FILTER_CONFIG["max_comment_count"]:
         return False
-    if age_hours > FILTER_CONFIG["cold_post_hours"] and engagement.get("view_count", 0) < FILTER_CONFIG["cold_post_min_views"]:
+    if age_hours > FILTER_CONFIG["cold_post_hours"] and engagement.get("view_count", 0) < FILTER_CONFIG[
+        "cold_post_min_views"]:
         return False
 
     return True
@@ -99,8 +101,6 @@ def is_valid_post_for_promo(post):
 def format_post_for_promo(raw_data):
     """
     清洗原始帖子，提炼大模型推广所需的最小上下文。
-    [入参 Shape]: raw_data(dict) 含 author.author_name / content.(text_content, mentioned_coins) / comments[].(content, likes, replies, views)。
-    [出参 Shape]: {"post": {"author", "text", "coins"}, "top_comments": [str, ...]}。
     """
     author_name = raw_data.get("author", {}).get("author_name", "未知用户")
     content_info = raw_data.get("content", {})
@@ -127,9 +127,6 @@ def format_post_for_promo(raw_data):
 def check_comment_info(data):
     """
     校验大模型返回结构是否达标（含断句/长度/评分等业务潜规则）。
-    [入参 Shape]: data(dict) 必含 post_analysis, empathetic_user, rational_user，
-                 每个视角内含 comment_text / link_text / combined_preview / score / score_tier 等。
-    [出参 Shape]: (is_valid(bool), error_message(str))。
     """
     if not isinstance(data, dict):
         return False, "大模型返回数据不是有效的字典对象"
@@ -207,11 +204,10 @@ def check_comment_info(data):
 
     return True, ""
 
+
 def gen_promo_post(post):
     """
     为单帖调度大模型生成推广评论，含指数退避重试与有限降级兜底。
-    [入参 Shape]: post(dict) 原始帖子。
-    [出参 Shape]: 合法评论结构(dict)；重试耗尽仍失败则按原设计降级返回空字典 {}。
     """
     cleaned_post = format_post_for_promo(post)
     prompt = read_file_to_str(PROMPT_FILE_PATH)
@@ -219,13 +215,8 @@ def gen_promo_post(post):
 
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            # err, raw_response, _images = generate_gemini_content_managed(
-            #     prompt=full_prompt,
-            #     model_name=GEMINI_MODEL
-            # )
-            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.5-flash")
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.1-pro-preview")
 
-            # raw_response = get_llm_content(prompt=full_prompt)
             comment_info = string_to_object(raw_response)
 
             is_valid, error_message = check_comment_info(comment_info)
@@ -235,7 +226,6 @@ def gen_promo_post(post):
             return comment_info
 
         except Exception as e:
-            # 达到上限：按原设计有限降级(返回空), 但完整记录终止原因供人工排查
             if attempt == LLM_MAX_RETRIES:
                 logger.error(
                     f"[大模型/生成评论] 重试耗尽，放弃当前帖子生成，可能是模型响应格式异常或服务不稳定 "
@@ -253,7 +243,6 @@ def gen_promo_post(post):
 def fetch_post(post_manager):
     """
     按币种打捞币安广场推荐流并批量落库。
-    [入参 Shape]: post_manager 提供 upsert_posts(list) 能力的 DB 管理器实例。
     """
     all_post_data = []
     for token in FEED_TOKENS:
@@ -269,47 +258,76 @@ def fetch_post(post_manager):
         f"| 关键参数: 【币种数: {len(FEED_TOKENS)}】 | 结果: 【本轮采集入库: {len(all_post_data)} 条】")
 
 
+# =========================================================================
+# [核心修改区域]: 修改后的 gen_all_promo_posts 函数，并行度为 5
+# =========================================================================
 def gen_all_promo_posts():
     """
-    生成链路总入口：周期性采集新帖并逐条驱动大模型生成推广评论，回写入库。
-    【无出入参】，直接产生副作用：读写 MongoDB。
+    生成链路总入口：周期性采集新帖并逐条并发(并行度5)驱动大模型生成推广评论，回写入库。
     """
     post_manager = UniversalPostManager(gen_db_object())
+
+    # 内部处理函数：处理单个 post 的逻辑，以便放进线程池
+    def _process_single_post(post):
+        if not is_valid_post_for_promo(post):
+            return "skipped_invalid"
+
+        # 幂等：已有推广评论直接跳过
+        if post.get("promo_post"):
+            return "skipped_exists"
+
+        post_id = post.get("_id", "UNKNOWN_ID")
+        comment_info = gen_promo_post(post)
+
+        if comment_info:
+            post["promo_post"] = comment_info
+            post_manager.upsert_posts([post])  # MongoDB 的 upsert 通常是线程安全的
+            logger.info(f"[生成链路/回写] 推广评论生成并落库 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【已入库】")
+            return "generated"
+        else:
+            logger.warning(f"[生成链路/放弃] 未能生成有效评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【本帖跳过】")
+            return "failed"
 
     while True:
         # fetch_post(post_manager)
 
         existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
         logger.info(
-            f"[生成链路/启动] 拉取待处理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始逐条筛选生成】")
+            f"[生成链路/启动] 拉取待处理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始并发(度数5)筛选生成】")
 
         skipped_invalid = skipped_exists = generated = failed = 0
-        for post in existing_posts:
-            if not is_valid_post_for_promo(post):
-                skipped_invalid += 1
-                continue
 
-            # 幂等：已有推广评论直接跳过
-            if post.get("promo_post"):
-                skipped_exists += 1
-                continue
+        # 使用线程池并发执行单贴处理逻辑，并行度为 5
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # 提交所有任务到线程池
+            future_to_post = {executor.submit(_process_single_post, post): post for post in existing_posts}
 
-            post_id = post.get("_id", "UNKNOWN_ID")
-            comment_info = gen_promo_post(post)
-            if comment_info:
-                post["promo_post"] = comment_info
-                post_manager.upsert_posts([post])
-                generated += 1
-                logger.info(f"[生成链路/回写] 推广评论生成并落库 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【已入库】")
-            else:
-                failed += 1
-                logger.warning(f"[生成链路/放弃] 未能生成有效评论 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【本帖跳过】")
+            # 使用 as_completed 随着任务完成收集结果并统计
+            for future in as_completed(future_to_post):
+                try:
+                    result_status = future.result()
+                    if result_status == "skipped_invalid":
+                        skipped_invalid += 1
+                    elif result_status == "skipped_exists":
+                        skipped_exists += 1
+                    elif result_status == "generated":
+                        generated += 1
+                    elif result_status == "failed":
+                        failed += 1
+                except Exception as exc:
+                    # 捕获未知异常防止主线程崩溃
+                    post_id = future_to_post[future].get("_id", "UNKNOWN_ID")
+                    logger.error(f"[生成链路/并发异常] 帖子ID: {post_id} 发生未捕获异常: {exc}")
+                    failed += 1
 
         logger.info(
             f"[生成链路/本轮小结] 处理完毕，进入休眠 "
             f"| 关键参数: 【新增生成: {generated} | 失败: {failed} | 已存在跳过: {skipped_exists} | 过滤淘汰: {skipped_invalid}】 "
             f"| 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】")
         time.sleep(SCHEDULE_INTERVAL_SEC)
+
+
+# =========================================================================
 
 
 def get_existing_promo_posts(limit=POST_QUERY_LIMIT, hours_ago=12):
@@ -348,10 +366,60 @@ def get_existing_promo_posts(limit=POST_QUERY_LIMIT, hours_ago=12):
     logger.info(f"[数据导出/完成] 聚合最近 {hours_ago} 小时内合规帖子 | 结果: 【聚合总数: {len(result_list)} 条】")
     return result_list
 
+
+def analyze_promo_results():
+    """
+    根据帖子列表中的 promo_post_info 字段，统计发布结果，并分离出成功与失败的帖子列表。
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+    try:
+        post_list = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=500000)
+    except Exception as e:
+        logger.error(f"[数据导出/失败] 无法从数据库读取帖子 | 结果: 【失败原因: {e}】")
+        raise
+
+    success_posts = []
+    failed_posts = []
+
+    # 统计指标
+    stats = {
+        "total_scanned": len(post_list),
+        "total_processed": 0,  # 实际执行过发布动作的帖子数
+        "success_count": 0,
+        "failed_count": 0,
+        "unprocessed_count": 0,  # 未处理（没有 promo_post_info）的帖子数
+        "success_rate": "0.00%"
+    }
+
+    for post in post_list:
+        promo_info = post.get("promo_post_info")
+
+        # 如果没有 promo_post_info，说明尚未进入发布阶段或被跳过
+        if not promo_info:
+            stats["unprocessed_count"] += 1
+            continue
+
+        stats["total_processed"] += 1
+        status = promo_info.get("status")
+
+        if status == "success":
+            success_posts.append(post)
+            stats["success_count"] += 1
+        elif status == "failed":
+            failed_posts.append(post)
+            stats["failed_count"] += 1
+
+    # 计算成功率 (避免除以 0 的错误)
+    if stats["total_processed"] > 0:
+        rate = (stats["success_count"] / stats["total_processed"]) * 100
+        stats["success_rate"] = f"{rate:.2f}%"
+
+    return stats, success_posts, failed_posts
+
+
 def clear_all_promo_posts_batch():
     """
     数据清理入口：批量把存量帖子的 promo_post 字段置空并回写。
-    【无出入参】，直接产生副作用：读写 MongoDB。
     """
     post_manager = UniversalPostManager(gen_db_object())
     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
@@ -374,8 +442,6 @@ def clear_all_promo_posts_batch():
 def send_single_promo_post(post):
     """
     为单帖组装引流参数并调用外部接口发帖，无论成败都把发布状态闭环写回 post。
-    [入参 Shape]: post(dict) 必须含 post_id 与 promo_post.trader_perspective.(comment_text, link_text)。
-    [出参 Shape]: 触发过发帖动作则返回注入了 promo_post_info 的 post；因不符合条件被跳过则返回 None。
     """
     # 卫语句：无评论 / 已处理过 直接跳过
     comment_info = post.get("promo_post")
@@ -389,7 +455,14 @@ def send_single_promo_post(post):
     trader_perspective = comment_info.get("rational_user", {})
     comment_text = trader_perspective.get("comment_text")
     link_text = trader_perspective.get("link_text")
-
+    try:
+        score = trader_perspective.get("score")
+    except Exception:
+        score = 0
+    if score < 8:
+        logger.warning(
+            f"[发布链路/发帖] 评论评分过低，跳过发帖 | 关键参数: 【帖子ID: {post_id} | 评论评分: {score}】 | 结果: 【本帖跳过】")
+        return None
     post_url = f"https://www.binance.com/zh-CN/square/post/{post_id}"
     my_urls = [{"text": link_text, "url": LEAD_DETAIL_URL}]
 
@@ -421,7 +494,6 @@ def send_single_promo_post(post):
 def send_promo_posts():
     """
     发布链路总入口：周期性拉取带评论的帖子并逐条发布，回写发布状态。
-    【无出入参】，直接产生副作用：读写 MongoDB 与调用外部发帖接口。
     """
     while True:
         post_manager = UniversalPostManager(gen_db_object())
@@ -469,3 +541,4 @@ if __name__ == "__main__":
     # ---- 一次性运维/离线分析工具（按需手动启用）----
     # clear_all_promo_posts_batch()
     # data = get_existing_promo_posts()
+    # stats, success_posts, failed_posts = analyze_promo_results()
