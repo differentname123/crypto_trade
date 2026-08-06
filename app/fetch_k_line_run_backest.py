@@ -30,7 +30,7 @@ FEE_RATE = 0.001  # 单边交易成本（0.1%）
 def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end_time='2026-08-01'):
     """
     [功能摘要] 基于 Plotly 渲染基于 WebGL 加速的高性能交互图表。
-    [核心变更] 多维数据共处一图，价格轴做隐形化处理，着重突显资金费率、持仓量、价格走势三者叠加的“相对形态与趋势共振”。
+    [核心变更] 移除 90% 基准线，保留 OI持仓数量(左轴) + 新增 持仓名义价值(隐形轴)，与价格、资金费率共振。
     """
     try:
         import plotly.graph_objects as go
@@ -55,11 +55,13 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
         print(f"⚠️ [绘图跳过] 标的 【{target_coin}】 在指定的区间 {start_time} 至 {end_time} 内无任何有效 K 线数据。")
         return
 
-    # 建立底层容器 (不再使用子图，全部重叠绘制)
+    # 计算持仓实际名义价值 (OI Amount * Price)
+    chart_df['oi_value'] = chart_df['oi_amount'] * chart_df['close']
+
+    # 建立底层容器 (单图重叠绘制)
     fig = go.Figure()
 
-    # 1. 价格曲线 (挂载在 y3 轴)
-    # y3 轴会在 Layout 中被完全隐藏，以实现“仅看相对趋势，不看具体价格”的需求
+    # 1. 价格曲线 (挂载在 y3 轴 - 隐藏坐标轴刻度，只保留形态)
     fig.add_trace(go.Scattergl(
         x=chart_df['local_time'],
         y=chart_df['close'],
@@ -83,28 +85,28 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
         hovertemplate="费率: %{y:.4%}<extra></extra>"
     ))
 
-    # 3. OI实际持仓量 (挂载在 y1 轴，显示于图表左侧)
+    # 3. OI持仓数量 (挂载在 y1 轴，显示于图表左侧)
     oi_status = chart_df['cond_A'].apply(lambda x: '🚨极度拥挤' if x else '⚪正常水位')
     fig.add_trace(go.Scattergl(
         x=chart_df['local_time'],
         y=chart_df['oi_amount'],
-        name="实际持仓量(OI)",
+        name="持仓数量(OI Amount)",
         yaxis="y1",
         mode='lines',
         line=dict(color='#8c564b', width=1.5),
         customdata=oi_status,
-        hovertemplate="OI总量: %{y:.2f} [%{customdata}]<extra></extra>"
+        hovertemplate="OI数量: %{y:.2f} [%{customdata}]<extra></extra>"
     ))
 
-    # 4. OI 90%水位线 (挂载在 y1 轴，与实际持仓量同轴比对)
+    # 4. OI持仓名义价值 (挂载在 y4 轴 - 隐藏坐标轴刻度，只保留形态，用紫色虚线区分)
     fig.add_trace(go.Scattergl(
         x=chart_df['local_time'],
-        y=chart_df['oi_90pct'],
-        name="OI 90%基准线",
-        yaxis="y1",
+        y=chart_df['oi_value'],
+        name="持仓名义价值(OI Value)",
+        yaxis="y4",
         mode='lines',
-        line=dict(color='red', width=1.5, dash='dash'),
-        hovertemplate="90%水位: %{y:.2f}<extra></extra>"
+        line=dict(color='#9467bd', width=1.5, dash='dashdot'),
+        hovertemplate="OI名义价值: $%{y:,.2f}<extra></extra>"
     ))
 
     # 5. 交易记录散点 (必须挂载在 y3 轴，与价格保持同等映射比例)
@@ -141,17 +143,17 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
             ))
 
     # ------------------------------------------
-    # 核心布局与多重坐标轴管理 (已修复新版 plotly 的 titlefont 写法)
+    # 核心布局与多重坐标轴管理
     # ------------------------------------------
     fig.update_layout(
         title=f"📈 Pure Squeeze Catcher - 【{target_coin}】 趋势与形态共振面板",
         xaxis=dict(title="时间"),
-        # 左侧坐标轴：负责持仓量 OI
+        # 左侧坐标轴：负责持仓数量 (OI Amount)
         yaxis=dict(
-            title=dict(text="持仓量 (OI)", font=dict(color="#8c564b")),
+            title=dict(text="持仓数量 (OI Amount)", font=dict(color="#8c564b")),
             tickfont=dict(color="#8c564b")
         ),
-        # 右侧坐标轴：负责资金费率 FR (叠加在原图上)
+        # 右侧坐标轴：负责资金费率 FR
         yaxis2=dict(
             title=dict(text="资金费率 (FR)", font=dict(color="#ff7f0e")),
             tickfont=dict(color="#ff7f0e"),
@@ -160,10 +162,19 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
             overlaying="y",
             side="right"
         ),
-        # 第三坐标轴(隐形)：负责标的价格 (叠加在原图上，但隐藏所有刻度与网格)
+        # 第三坐标轴(隐形)：负责标的价格 (不显示刻度网格，仅展示形态趋势)
         yaxis3=dict(
             showticklabels=False,  # 不显示具体价格数字
             showgrid=False,        # 不显示网格线避免图面杂乱
+            zeroline=False,
+            anchor="x",
+            overlaying="y",
+            side="right"
+        ),
+        # 第四坐标轴(隐形)：负责持仓名义价值 (OI Value) (不显示刻度网格，仅展示形态趋势)
+        yaxis4=dict(
+            showticklabels=False,
+            showgrid=False,
             zeroline=False,
             anchor="x",
             overlaying="y",
@@ -370,8 +381,8 @@ def scan_and_run_batch(data_dir='./data'):
 
     # 遍历每一个提取出来的币种，拼装文件路径进行回测
     for kf in kline_files:
-        if "LAB" not in kf:
-            continue
+        # if "BEAT" not in kf:
+        #     continue
 
         target_coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         oi_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_5m_oi.csv')
