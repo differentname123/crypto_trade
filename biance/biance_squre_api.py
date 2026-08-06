@@ -1688,6 +1688,74 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
 
 
 
+def like_and_bookmark(target_post_id_list):
+    """
+    执行核心点赞与收藏交互。
+    [数据形貌] target_post_id_list: 包含目标帖子或评论 ID (字符串/数字) 的列表。
+    """
+    if not target_post_id_list:
+        return
+
+    processed_posts_id_file = "processed_posts_id.json"
+    # 假设 read_json 在文件不存在时返回空列表或 None，兜底为 []
+    processed_ids_list = read_json(processed_posts_id_file) or []
+    processed_ids_set = set(processed_ids_list)
+
+    # 提前计算差集，获取真正需要处理的新 ID
+    pending_ids = [pid for pid in target_post_id_list if pid not in processed_ids_set]
+
+    if not pending_ids:
+        logger.info(
+            f"[互动任务/过滤] 目标全命中缓存，无新数据 | 关键参数: [输入数量: {len(target_post_id_list)}] | 结果: [流程提前终止]")
+        return
+
+    # 加载账号凭证信息 (仅在有增量任务时才执行，减少无效读取)
+    account_list = ["dahao", "nana", "jie", "mama", "ruru", "yang", "daniang"]
+    cookie_map_info = {}
+    for acc in account_list:
+        try:
+            browser_session_dir = get_config(f"{acc}_browser_session_dir")
+            my_cookies, my_csrf_token = get_auth_tokens_robust(browser_session_dir)
+            if my_cookies and my_csrf_token:
+                cookie_map_info[acc] = {
+                    "cookies": my_cookies,
+                    "csrf_token": my_csrf_token
+                }
+        except Exception as e:
+            logger.warning(
+                f"[互动任务/鉴权] 获取账号脱机凭证失败，该账号将被跳过 | 关键参数: [账号: {acc}] | 结果: [跳过] - 原因: {e}")
+
+    if not cookie_map_info:
+        logger.error("[互动任务/鉴权] 所有预设账号均无法提取有效凭证 | 结果: [当前批次互动任务中止]")
+        return
+
+    for post_id in pending_ids:
+        for acc, info in cookie_map_info.items():
+            try:
+                cookies = info["cookies"]
+                csrf_token = info["csrf_token"]
+
+                toggle_binance_bookmark(post_id, "add", cookies, csrf_token)
+                toggle_binance_like(post_id, "like", cookies, csrf_token)
+
+                logger.info(
+                    f"[互动任务/执行] 单账号互动API调用成功 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [执行完毕]")
+            except Exception as e:
+
+                logger.error(
+                    f"[互动任务/执行] 调用收藏或点赞API失败，可能是网络超时或鉴权失效 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [操作未达预期] - 详情: {e}")
+
+        processed_ids_list.append(post_id)
+
+    try:
+        save_json(processed_posts_id_file, processed_ids_list)
+        logger.info(
+            f"[互动任务/收尾] 批次处理状态已持久化 | 关键参数: [本次新增处理数: {len(pending_ids)}, 总量: {len(processed_ids_list)}] | 结果: [游标更新成功]")
+    except Exception as e:
+        logger.error(
+            f"[互动任务/收尾] 持久化状态文件失败，可能导致下次重复点赞 | 关键参数: [文件路径: {processed_posts_id_file}] | 结果: [抛出异常] - 详情: {e}")
+        raise
+
 if __name__ == "__main__":
 
 
@@ -1715,15 +1783,3 @@ if __name__ == "__main__":
 
 
 
-    USER_DATA_DIR = r"W:\temp\biance_nana"
-    my_cookies, my_csrf_token = get_auth_tokens_robust(USER_DATA_DIR)  # 提取脱机 API 凭证
-
-    while True:
-        # 添加收藏
-        toggle_binance_bookmark(352727546639281, "add", my_cookies, my_csrf_token)
-        # 取消收藏
-        toggle_binance_bookmark(352727546639281, "cancel", my_cookies, my_csrf_token)
-        # 点赞
-        toggle_binance_like(352727546639281, "like", my_cookies, my_csrf_token)
-        # 取消点赞
-        toggle_binance_like(352727546639281, "unlike", my_cookies, my_csrf_token)

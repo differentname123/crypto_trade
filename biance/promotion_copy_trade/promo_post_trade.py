@@ -20,7 +20,7 @@ from common.common_utils import read_file_to_str, string_to_object, setup_logger
 logger = setup_logger(app_name="promo_copy")
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from biance.biance_playwright import comment_on_binance_post
-from biance.biance_squre_api import fetch_binance_feed
+from biance.biance_squre_api import fetch_binance_feed, like_and_bookmark
 
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
@@ -520,6 +520,57 @@ def send_promo_posts():
         time.sleep(SCHEDULE_INTERVAL_SEC)
 
 
+
+
+def like_and_bookmark_loop():
+    """
+    常驻守护方法，负责定时拉取并派发任务。
+    [数据形貌] 从 db 中 fetch 出的 posts 是一组包含深层嵌套字典的列表，如:
+               {"promo_post_info": {"comment_id": "xxx"}, "promo_comment_info": {"comment_id": "yyy"}}
+    """
+    CYCLE_INTERVAL = 3600  # 设定的轮询周期时间（秒）
+    logger.info(f"[互动链路/启动] 常驻轮询线程已建立 | 关键参数: [轮询周期: {CYCLE_INTERVAL}秒]")
+
+    while True:
+        start_time = time.time()  # 记录本轮执行的开始时间
+
+        try:
+            post_manager = UniversalPostManager(gen_db_object())
+            existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+
+            # 使用 set 直接聚合，代替原有的 list.append + set 去重操作
+            all_comment_ids = set()
+
+            for post in existing_posts:
+                # 防御性读取，防止上游返回 None 导致 .get() 崩溃
+                promo_post = post.get("promo_post_info") or {}
+                promo_comment = post.get("promo_comment_info") or {}
+
+                if promo_post.get("comment_id"):
+                    all_comment_ids.add(promo_post.get("comment_id"))
+                if promo_comment.get("comment_id"):
+                    all_comment_ids.add(promo_comment.get("comment_id"))
+
+            target_ids = list(all_comment_ids)
+            logger.info(
+                f"[互动链路/抓取] 拉取待发布数据完毕 | 关键参数: [拉取记录数: {len(existing_posts)}, 解析出唯一目标ID数: {len(target_ids)}]")
+
+            if target_ids:
+                like_and_bookmark(target_ids)
+
+        except Exception as e:
+            logger.error(
+                f"[互动链路/致命异常] 轮询周期内发生未预期的崩溃，可能是数据库连接断开或结构畸变 | 结果: [放弃本轮，尝试在下周期恢复] - 详情: {e}")
+
+        # --- 耗时与休眠计算逻辑 ---
+        elapsed_time = time.time() - start_time
+        # 计算剩余需要休眠的时间，如果执行时间超过 CYCLE_INTERVAL，则 sleep_time 为 0
+        sleep_time = max(0.0, CYCLE_INTERVAL - elapsed_time)
+
+        logger.info(f"[互动链路/耗时监控] 本轮执行耗时: {elapsed_time:.2f}秒 | 准备休眠: {sleep_time:.2f}秒")
+        time.sleep(sleep_time)
+
+
 # ==========================================
 # 运行入口：生成链路与发布链路各起一个守护线程并行运行
 # ==========================================
@@ -542,3 +593,4 @@ if __name__ == "__main__":
     # clear_all_promo_posts_batch()
     # data = get_existing_promo_posts()
     # stats, success_posts, failed_posts = analyze_promo_results()
+    # like_and_bookmark_loop()
