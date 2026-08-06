@@ -94,7 +94,25 @@ def run_backtest():
     df_master = df_master.dropna(subset=['next_open', 'next_datetime']).reset_index(drop=True)
 
     print(f">>> [数据清洗完毕] 已剔除预热期，实际用于回测的有效 K 线数量: 【{len(df_master)}】 行")
-    print(">>> [启动引擎] 核心状态机开始遍历回测...\n")
+
+    if len(df_master) > 0:
+        # 新增：全局信号探查统计，直接暴露条件卡点，极大降低无交易时的排查成本
+        time_start = df_master['datetime'].iloc[0].strftime('%Y-%m-%d')
+        time_end = df_master['datetime'].iloc[-1].strftime('%Y-%m-%d')
+
+        count_cond_a = df_master['cond_A'].sum()
+        count_cond_b = df_master['cond_B'].sum()
+        count_ab_sync = (df_master['cond_A'] & df_master['cond_B']).sum()
+        count_all_sync = (df_master['cond_A'] & df_master['cond_B'] & (df_master['close'] > df_master['resist_12h'])).sum()
+
+        print(f">>> [回测时间轴] 数据起止区间: 【{time_start}】 至 【{time_end}】")
+        print(f">>> [信号探查器] 核心条件命中分布统计 (用于诊断零交易卡点):")
+        print(f"    ┣━ 条件A: 燃料池充足 (OI > {OI_PERCENTILE*100:.0f}%分位数) : 命中 【{count_cond_a}】 行")
+        print(f"    ┣━ 条件B: 空头正流血 (FR <= {FR_THRESHOLD*100:.2f}%)       : 命中 【{count_cond_b}】 行")
+        print(f"    ┣━ 共振1: OI 与 FR [两者同时满足]          : 命中 【{count_ab_sync}】 行")
+        print(f"    ┗━ 共振2: 三大条件完全共振 (外加价格突破前高) : 命中 【{count_all_sync}】 行 (即潜在点火次数)")
+
+    print("\n>>> [启动引擎] 核心状态机开始遍历回测...\n")
 
     # ------------------------------------------
     # 5. 核心交易状态机 (扁平化遍历)
