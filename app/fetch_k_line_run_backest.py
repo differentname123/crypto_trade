@@ -29,30 +29,22 @@ FEE_RATE = 0.001  # 单边交易成本（0.1%）
 
 def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end_time='2026-08-01'):
     """
-    [功能摘要] 基于 Plotly 渲染基于 WebGL 加速的高性能交互图表，支持指定时间区间以避免浏览器卡顿。
-    [输入数据 Shape]
-        df: 必须包含 ['datetime', 'close', 'funding_rate'] 字段
-        trades: 列表，每个元素字典需包含 ['entry_time', 'entry_price', 'exit_time', 'exit_price']
-        start_time, end_time: 字符串格式的时间区间，默认 2026-05-01 到 2026-08-01
+    [功能摘要] 基于 Plotly 渲染基于 WebGL 加速的高性能交互图表。
+    [核心变更] 多维数据共处一图，价格轴做隐形化处理，着重突显资金费率、持仓量、价格走势三者叠加的“相对形态与趋势共振”。
     """
     try:
-        from plotly.subplots import make_subplots
         import plotly.graph_objects as go
         from zoneinfo import ZoneInfo
     except ImportError:
         print("⚠️ [绘图跳过] 检测到未安装 plotly 库，无法生成可视化图表。如需看图，请执行: pip install plotly")
         return
 
-    print(
-        f">>> [可视化渲染] 正在生成 【{target_coin}】 的交互式行情复盘图 (截取区间: {start_time} 至 {end_time})，请稍候...")
+    print(f">>> [可视化渲染] 正在生成 【{target_coin}】 的趋势洞察面板 (截取区间: {start_time} 至 {end_time})，请稍候...")
 
     # 为了与日志对齐，将图表的 X 轴时间也统一转为上海时间（东八区）
     chart_df = df.copy()
     chart_df['local_time'] = chart_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
-    # ------------------------------------------
-    # 核心变更：时间区间硬截取
-    # ------------------------------------------
     start_dt = pd.to_datetime(start_time).tz_localize('Asia/Shanghai')
     end_dt = pd.to_datetime(end_time).tz_localize('Asia/Shanghai')
 
@@ -63,43 +55,59 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
         print(f"⚠️ [绘图跳过] 标的 【{target_coin}】 在指定的区间 {start_time} 至 {end_time} 内无任何有效 K 线数据。")
         return
 
-    # 创建双 Y 轴图表
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # 建立底层容器 (不再使用子图，全部重叠绘制)
+    fig = go.Figure()
 
-    # 1. 主轴：价格走势 (使用 WebGL 加速)
-    fig.add_trace(
-        go.Scattergl(
-            x=chart_df['local_time'],
-            y=chart_df['close'],
-            name="1m收盘价",
-            mode='lines',
-            line=dict(color='#1f77b4', width=1.5),
-            customdata=chart_df['funding_rate'],  # 将 FR 塞入自定义数据区用于悬停显示
-            # 极简高密度的鼠标悬浮模板
-            hovertemplate=(
-                "【时间】: %{x|%Y-%m-%d %H:%M:%S}<br>"
-                "【收盘价】: %{y:.4f}<br>"
-                "【资金费率】: %{customdata:.4%}<extra></extra>"
-            )
-        ),
-        secondary_y=False,
-    )
+    # 1. 价格曲线 (挂载在 y3 轴)
+    # y3 轴会在 Layout 中被完全隐藏，以实现“仅看相对趋势，不看具体价格”的需求
+    fig.add_trace(go.Scattergl(
+        x=chart_df['local_time'],
+        y=chart_df['close'],
+        name="价格(趋势)",
+        yaxis="y3",
+        mode='lines',
+        line=dict(color='#1f77b4', width=2),
+        opacity=0.75, # 略微透明，充当背景趋势
+        hovertemplate="收盘价: %{y:.4f}<extra></extra>"
+    ))
 
-    # 2. 副轴：资金费率走势
-    fig.add_trace(
-        go.Scattergl(
-            x=chart_df['local_time'],
-            y=chart_df['funding_rate'],
-            name="资金费率(FR)",
-            mode='lines',
-            line=dict(color='#ff7f0e', width=1, dash='dot'),
-            opacity=0.6,
-            hovertemplate="费率: %{y:.4%}<extra></extra>"
-        ),
-        secondary_y=True,
-    )
+    # 2. 资金费率 (挂载在 y2 轴，显示于图表右侧)
+    fig.add_trace(go.Scattergl(
+        x=chart_df['local_time'],
+        y=chart_df['funding_rate'],
+        name="资金费率(FR)",
+        yaxis="y2",
+        mode='lines',
+        line=dict(color='#ff7f0e', width=1.5, dash='dot'),
+        opacity=0.8,
+        hovertemplate="费率: %{y:.4%}<extra></extra>"
+    ))
 
-    # 3. 将区间内的交易记录（开仓/平仓）以散点形式高亮打在图上
+    # 3. OI实际持仓量 (挂载在 y1 轴，显示于图表左侧)
+    oi_status = chart_df['cond_A'].apply(lambda x: '🚨极度拥挤' if x else '⚪正常水位')
+    fig.add_trace(go.Scattergl(
+        x=chart_df['local_time'],
+        y=chart_df['oi_amount'],
+        name="实际持仓量(OI)",
+        yaxis="y1",
+        mode='lines',
+        line=dict(color='#8c564b', width=1.5),
+        customdata=oi_status,
+        hovertemplate="OI总量: %{y:.2f} [%{customdata}]<extra></extra>"
+    ))
+
+    # 4. OI 90%水位线 (挂载在 y1 轴，与实际持仓量同轴比对)
+    fig.add_trace(go.Scattergl(
+        x=chart_df['local_time'],
+        y=chart_df['oi_90pct'],
+        name="OI 90%基准线",
+        yaxis="y1",
+        mode='lines',
+        line=dict(color='red', width=1.5, dash='dash'),
+        hovertemplate="90%水位: %{y:.2f}<extra></extra>"
+    ))
+
+    # 5. 交易记录散点 (必须挂载在 y3 轴，与价格保持同等映射比例)
     if trades:
         entry_times, entry_prices = [], []
         exit_times, exit_prices = [], []
@@ -108,7 +116,6 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
             t_entry = t['entry_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
             t_exit = t['exit_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
 
-            # 仅把落在当前可视化时间区间内的标记点挑出来
             if start_dt <= t_entry <= end_dt:
                 entry_times.append(t_entry)
                 entry_prices.append(t['entry_price'])
@@ -118,43 +125,54 @@ def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end
                 exit_prices.append(t['exit_price'])
 
         if entry_times:
-            fig.add_trace(
-                go.Scatter(
-                    x=entry_times,
-                    y=entry_prices,
-                    mode='markers',
-                    name='点火入场(买)',
-                    marker=dict(symbol='triangle-up', size=12, color='green', line=dict(width=1, color='darkgreen')),
-                    hovertemplate="进场价: %{y:.4f}<extra></extra>"
-                ),
-                secondary_y=False
-            )
+            fig.add_trace(go.Scatter(
+                x=entry_times, y=entry_prices,
+                name='点火入场(买)', yaxis="y3", mode='markers',
+                marker=dict(symbol='triangle-up', size=14, color='green', line=dict(width=1, color='darkgreen')),
+                hovertemplate="进场价: %{y:.4f}<extra></extra>"
+            ))
 
         if exit_times:
-            fig.add_trace(
-                go.Scatter(
-                    x=exit_times,
-                    y=exit_prices,
-                    mode='markers',
-                    name='破位出场(卖)',
-                    marker=dict(symbol='triangle-down', size=12, color='red', line=dict(width=1, color='darkred')),
-                    hovertemplate="出场价: %{y:.4f}<extra></extra>"
-                ),
-                secondary_y=False
-            )
+            fig.add_trace(go.Scatter(
+                x=exit_times, y=exit_prices,
+                name='破位出场(卖)', yaxis="y3", mode='markers',
+                marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=1, color='darkred')),
+                hovertemplate="出场价: %{y:.4f}<extra></extra>"
+            ))
 
-    # 布局设置：启用 X 轴动态滑动和缩放轴
+    # ------------------------------------------
+    # 核心布局与多重坐标轴管理 (已修复新版 plotly 的 titlefont 写法)
+    # ------------------------------------------
     fig.update_layout(
-        title=f"📈 Pure Squeeze Catcher - 【{target_coin}】 动态复盘看板 ({start_time} 至 {end_time})",
-        xaxis_title="时间",
-        yaxis_title="标的价格 (USDT)",
-        hovermode="x unified",  # 鼠标放上去时，统一展示该垂直线上的所有信息
+        title=f"📈 Pure Squeeze Catcher - 【{target_coin}】 趋势与形态共振面板",
+        xaxis=dict(title="时间"),
+        # 左侧坐标轴：负责持仓量 OI
+        yaxis=dict(
+            title=dict(text="持仓量 (OI)", font=dict(color="#8c564b")),
+            tickfont=dict(color="#8c564b")
+        ),
+        # 右侧坐标轴：负责资金费率 FR (叠加在原图上)
+        yaxis2=dict(
+            title=dict(text="资金费率 (FR)", font=dict(color="#ff7f0e")),
+            tickfont=dict(color="#ff7f0e"),
+            tickformat=".3%",
+            anchor="x",
+            overlaying="y",
+            side="right"
+        ),
+        # 第三坐标轴(隐形)：负责标的价格 (叠加在原图上，但隐藏所有刻度与网格)
+        yaxis3=dict(
+            showticklabels=False,  # 不显示具体价格数字
+            showgrid=False,        # 不显示网格线避免图面杂乱
+            zeroline=False,
+            anchor="x",
+            overlaying="y",
+            side="right"
+        ),
+        hovermode="x unified",     # 鼠标悬停时，所有指标在同一个框内直观对齐
         template="plotly_white",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
-
-    # 强制让费率轴以百分比格式显示，增强可读性
-    fig.update_yaxes(title_text="资金费率 (%)", tickformat=".3%", secondary_y=True)
 
     # 渲染并在默认浏览器中弹出
     fig.show()
