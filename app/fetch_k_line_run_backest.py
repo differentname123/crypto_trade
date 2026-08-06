@@ -212,6 +212,9 @@ def scan_and_run_batch(data_dir='./data'):
 
     # 遍历每一个提取出来的币种，拼装文件路径进行回测
     for kf in kline_files:
+        if "LAB" not in kf:
+            continue
+
         target_coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         oi_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_5m_oi.csv')
         fr_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_funding_rates.csv')
