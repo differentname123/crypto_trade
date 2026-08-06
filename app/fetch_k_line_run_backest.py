@@ -123,8 +123,11 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
 
     # 使用 itertuples 替代 iloc，大幅提升遍历效率与代码可读性
     for row in df_master.itertuples():
-        curr_time_str = row.datetime.strftime('%Y-%m-%d %H:%M:%S')
+        from zoneinfo import ZoneInfo
 
+        curr_time_str = row.datetime.replace(tzinfo=ZoneInfo("UTC")) \
+            .astimezone(ZoneInfo("Asia/Shanghai")) \
+            .strftime('%Y-%m-%d %H:%M:%S')
         if not in_position:
             # 状态判定：等待三大共振信号
             if row.cond_A and row.cond_B and (row.close > row.resist_12h):
