@@ -1,6 +1,6 @@
 """
 ================================================================================
-[功能摘要] 纯粹逼空捕获系统 (Pure Squeeze Catcher)：寻找极度拥挤且空头失血的行情进行突破做多。
+[功能摘要] 纯粹逼空捕获系统 (Pure Squeeze Catcher)：寻找极度拥挤且空头失血的行情进行突破做多。带可视化交互看板。
 [输入数据]
   - df_oi (DataFrame): 必须包含 ['timestamp', 'oi_amount'] 毫秒级快照。
   - df_fr (DataFrame): 必须包含 ['timestamp', 'funding_rate'] 毫秒级快照。
@@ -9,7 +9,7 @@
   1. 计算衍生指标：对 OI 计算 30天滚动 90% 分位数；对 K线 分别计算 12h滚动前高与 1h滚动前低。
   2. 跨周期降维：以 1分钟 K线时间轴为基准，利用向下合并 (backward merge) 吸纳最近的 OI 与 FR 数据。
   3. 状态机流转：基于清洗后的主表迭代，通过信号布尔值判断进出场，并模拟成交资金变化。
-[输出数据] 输出格式化的大白话业务执行日志，并在内存中产出最终的回测绩效统计面板。
+[输出数据] 输出格式化大白话日志、回测绩效看板，并在浏览器中自动弹出基于 WebGL 加速的交互式可缩放分析图表。
 ================================================================================
 """
 
@@ -26,6 +26,138 @@ BREAKOUT_WINDOW_H = 12  # 进场突破计算周期（小时）
 STOPLOSS_WINDOW_H = 1  # 出场止损计算周期（小时）
 FEE_RATE = 0.001  # 单边交易成本（0.1%）
 
+
+def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end_time='2026-08-01'):
+    """
+    [功能摘要] 基于 Plotly 渲染基于 WebGL 加速的高性能交互图表，支持指定时间区间以避免浏览器卡顿。
+    [输入数据 Shape]
+        df: 必须包含 ['datetime', 'close', 'funding_rate'] 字段
+        trades: 列表，每个元素字典需包含 ['entry_time', 'entry_price', 'exit_time', 'exit_price']
+        start_time, end_time: 字符串格式的时间区间，默认 2026-05-01 到 2026-08-01
+    """
+    try:
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        print("⚠️ [绘图跳过] 检测到未安装 plotly 库，无法生成可视化图表。如需看图，请执行: pip install plotly")
+        return
+
+    print(
+        f">>> [可视化渲染] 正在生成 【{target_coin}】 的交互式行情复盘图 (截取区间: {start_time} 至 {end_time})，请稍候...")
+
+    # 为了与日志对齐，将图表的 X 轴时间也统一转为上海时间（东八区）
+    chart_df = df.copy()
+    chart_df['local_time'] = chart_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+
+    # ------------------------------------------
+    # 核心变更：时间区间硬截取
+    # ------------------------------------------
+    start_dt = pd.to_datetime(start_time).tz_localize('Asia/Shanghai')
+    end_dt = pd.to_datetime(end_time).tz_localize('Asia/Shanghai')
+
+    mask = (chart_df['local_time'] >= start_dt) & (chart_df['local_time'] <= end_dt)
+    chart_df = chart_df.loc[mask].copy()
+
+    if chart_df.empty:
+        print(f"⚠️ [绘图跳过] 标的 【{target_coin}】 在指定的区间 {start_time} 至 {end_time} 内无任何有效 K 线数据。")
+        return
+
+    # 创建双 Y 轴图表
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # 1. 主轴：价格走势 (使用 WebGL 加速)
+    fig.add_trace(
+        go.Scattergl(
+            x=chart_df['local_time'],
+            y=chart_df['close'],
+            name="1m收盘价",
+            mode='lines',
+            line=dict(color='#1f77b4', width=1.5),
+            customdata=chart_df['funding_rate'],  # 将 FR 塞入自定义数据区用于悬停显示
+            # 极简高密度的鼠标悬浮模板
+            hovertemplate=(
+                "【时间】: %{x|%Y-%m-%d %H:%M:%S}<br>"
+                "【收盘价】: %{y:.4f}<br>"
+                "【资金费率】: %{customdata:.4%}<extra></extra>"
+            )
+        ),
+        secondary_y=False,
+    )
+
+    # 2. 副轴：资金费率走势
+    fig.add_trace(
+        go.Scattergl(
+            x=chart_df['local_time'],
+            y=chart_df['funding_rate'],
+            name="资金费率(FR)",
+            mode='lines',
+            line=dict(color='#ff7f0e', width=1, dash='dot'),
+            opacity=0.6,
+            hovertemplate="费率: %{y:.4%}<extra></extra>"
+        ),
+        secondary_y=True,
+    )
+
+    # 3. 将区间内的交易记录（开仓/平仓）以散点形式高亮打在图上
+    if trades:
+        entry_times, entry_prices = [], []
+        exit_times, exit_prices = [], []
+
+        for t in trades:
+            t_entry = t['entry_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
+            t_exit = t['exit_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
+
+            # 仅把落在当前可视化时间区间内的标记点挑出来
+            if start_dt <= t_entry <= end_dt:
+                entry_times.append(t_entry)
+                entry_prices.append(t['entry_price'])
+
+            if start_dt <= t_exit <= end_dt:
+                exit_times.append(t_exit)
+                exit_prices.append(t['exit_price'])
+
+        if entry_times:
+            fig.add_trace(
+                go.Scatter(
+                    x=entry_times,
+                    y=entry_prices,
+                    mode='markers',
+                    name='点火入场(买)',
+                    marker=dict(symbol='triangle-up', size=12, color='green', line=dict(width=1, color='darkgreen')),
+                    hovertemplate="进场价: %{y:.4f}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+        if exit_times:
+            fig.add_trace(
+                go.Scatter(
+                    x=exit_times,
+                    y=exit_prices,
+                    mode='markers',
+                    name='破位出场(卖)',
+                    marker=dict(symbol='triangle-down', size=12, color='red', line=dict(width=1, color='darkred')),
+                    hovertemplate="出场价: %{y:.4f}<extra></extra>"
+                ),
+                secondary_y=False
+            )
+
+    # 布局设置：启用 X 轴动态滑动和缩放轴
+    fig.update_layout(
+        title=f"📈 Pure Squeeze Catcher - 【{target_coin}】 动态复盘看板 ({start_time} 至 {end_time})",
+        xaxis_title="时间",
+        yaxis_title="标的价格 (USDT)",
+        hovermode="x unified",  # 鼠标放上去时，统一展示该垂直线上的所有信息
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    )
+
+    # 强制让费率轴以百分比格式显示，增强可读性
+    fig.update_yaxes(title_text="资金费率 (%)", tickformat=".3%", secondary_y=True)
+
+    # 渲染并在默认浏览器中弹出
+    fig.show()
 
 def run_backtest(target_coin, oi_file, fr_file, kline_file):
     print(f">>> [系统初始化] 正在加载并预处理 【{target_coin}】 底层数据源...")
@@ -165,7 +297,7 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
                     f"[交易/破位出场] 跌破1h支撑 | 触发: [{curr_time_str}] | 执行价: [{exit_price:.4f}] | 单笔净收益: [{net_color_sign}{net_return * 100:.2f}%] | 当前净值: [{capital:.2f}]")
 
     # ------------------------------------------
-    # 6. 回测报告产出
+    # 6. 回测报告产出与绘图驱动
     # ------------------------------------------
     print("\n==================================================")
     print(f"📊 [绩效看板] Pure Squeeze Catcher - 标的: 【{target_coin}】")
@@ -174,6 +306,10 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
     if not trades:
         print("💡 回测结论: 期间未触发任何符合所有前置条件的交易信号，建议检查数据时间跨度或适当放宽参数阈值。")
         print("==================================================\n")
+
+        # 即使没有交易也强制渲染图表，方便用户通过鼠标滑动找寻放宽参数的灵感
+        if len(df_master) > 0:
+            plot_interactive_chart(df_master, trades, target_coin)
         return
 
     trades_df = pd.DataFrame(trades)
@@ -191,6 +327,10 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
     print(f"区间最大回撤     : 【{max_drawdown * 100:.2f}%】")
     print(f"平均每笔净收益   : 【{trades_df['net_return'].mean() * 100:.2f}%】")
     print("==================================================\n")
+
+    # 驱动画图引擎
+    if len(df_master) > 0:
+        plot_interactive_chart(df_master, trades, target_coin)
 
 
 def scan_and_run_batch(data_dir='./data'):
