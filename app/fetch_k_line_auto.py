@@ -391,7 +391,7 @@ def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='US
 
 
 if __name__ == "__main__":
-    LOOP_INTERVAL = 14400
+    LOOP_INTERVAL = 10
 
     print("=" * 80)
     print(f"🔧 [系统初始] 数据将被独立存储于: 【{os.path.abspath(BACKTEST_DATA_DIR)}】")
@@ -401,7 +401,7 @@ if __name__ == "__main__":
     while True:
         try:
             print("\n🔍 [全局调度] 开始执行新一轮标的嗅探...")
-            top_symbols = get_top_gainers_losers('binance', 20, 'USDT')
+            top_symbols = get_top_gainers_losers('binance', 50, 'USDT')
         except Exception as e:
             print(f"❌ [全局调度/异常] 无法获取最新市场标的 | 可能原因: 网络断开或 API 熔断 | 等待 60 秒后重试... | 错误明细: 【{e}】")
             time.sleep(60)
