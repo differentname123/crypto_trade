@@ -1,150 +1,137 @@
+"""
+================================================================================
+[功能摘要] 纯粹逼空捕获系统 (Pure Squeeze Catcher)：寻找极度拥挤且空头失血的行情进行突破做多。
+[输入数据]
+  - df_oi (DataFrame): 必须包含 ['timestamp', 'oi_amount'] 毫秒级快照。
+  - df_fr (DataFrame): 必须包含 ['timestamp', 'funding_rate'] 毫秒级快照。
+  - df_klines (DataFrame): 必须包含 ['timestamp', 'open', 'high', 'low', 'close'] 毫秒级K线。
+[数据流转/交互]
+  1. 计算衍生指标：对 OI 计算 30天滚动 90% 分位数；对 K线 分别计算 12h滚动前高与 1h滚动前低。
+  2. 跨周期降维：以 1分钟 K线时间轴为基准，利用向下合并 (backward merge) 吸纳最近的 OI 与 FR 数据。
+  3. 状态机流转：基于清洗后的主表迭代，通过信号布尔值判断进出场，并模拟成交资金变化。
+[输出数据] 输出格式化的大白话业务执行日志，并在内存中产出最终的回测绩效统计面板。
+================================================================================
+"""
+
 import pandas as pd
-import numpy as np
-import datetime
 
 # ==========================================
-# 1. 策略核心参数区 (方便后续调整)
+# 1. 策略核心参数区
 # ==========================================
-OI_WINDOW_DAYS = 30         # OI 历史分位数统计周期（天）
-OI_PERCENTILE = 0.90        # OI 极端拥挤水位线（90%分位数）
-FR_THRESHOLD = -0.0005      # 空头流血阈值，即 -0.05%
-BREAKOUT_WINDOW_H = 12      # 进场突破计算周期（小时），过去 12 小时高点
-STOPLOSS_WINDOW_H = 1       # 出场止损计算周期（小时），过去 1 小时低点
-FEE_RATE = 0.001            # 单边交易成本（0.1%）
+OI_WINDOW_DAYS = 30  # OI 历史分位数统计周期（天）
+OI_PERCENTILE = 0.90  # OI 极端拥挤水位线（90%分位数）
+FR_THRESHOLD = -0.0005  # 空头流血阈值，即 -0.05%
+BREAKOUT_WINDOW_H = 12  # 进场突破计算周期（小时）
+STOPLOSS_WINDOW_H = 1  # 出场止损计算周期（小时）
+FEE_RATE = 0.001  # 单边交易成本（0.1%）
 
-target_coin = 'DEXE'  # 回测目标币种 (可修改为其他币种，如 ETH、BNB 等)
-# 数据文件路径配置
-OI_FILE = f'./data/{target_coin}_USDT_USDT_5m_oi.csv'
-FR_FILE = f'./data/{target_coin}_USDT_USDT_funding_rates.csv'
-KLINE_FILE = f'./data/{target_coin}_USDT_USDT_1m_kline.csv'
+TARGET_COIN = 'CAP'
+OI_FILE = f'./data/{TARGET_COIN}_USDT_USDT_5m_oi.csv'
+FR_FILE = f'./data/{TARGET_COIN}_USDT_USDT_funding_rates.csv'
+KLINE_FILE = f'./data/{TARGET_COIN}_USDT_USDT_1m_kline.csv'
+
 
 def run_backtest():
-    print(">>> 正在加载并预处理数据...")
-    
-    # ------------------------------------------
-    # 2. 数据读取与预处理
-    # ------------------------------------------
-    # 读取数据
-    df_oi = pd.read_csv(OI_FILE)
-    df_fr = pd.read_csv(FR_FILE)
-    df_klines = pd.read_csv(KLINE_FILE)
+    print(">>> [系统初始化] 正在加载并预处理底层数据源...")
 
-    # 确保时间戳排序 (防止原始数据乱序)
-    df_oi = df_oi.sort_values('timestamp').reset_index(drop=True)
-    df_fr = df_fr.sort_values('timestamp').reset_index(drop=True)
-    df_klines = df_klines.sort_values('timestamp').reset_index(drop=True)
+    # ------------------------------------------
+    # 2. 数据读取与防御性拦截
+    # ------------------------------------------
+    try:
+        df_oi = pd.read_csv(OI_FILE)
+        df_fr = pd.read_csv(FR_FILE)
+        df_klines = pd.read_csv(KLINE_FILE)
+    except FileNotFoundError as e:
+        # 异常不被静默吞噬，通过大白话指引排查方向后直接终止流转
+        print(f"❌ [数据加载失败] 找不到底层数据文件，请检查 data 目录下是否备齐所有 CSV 文件。详细原因: {e}")
+        return
 
-    # 将毫秒时间戳转换为 datetime 用于基于时间的滚动计算
+    # ------------------------------------------
+    # 3. 核心指标构建 (利用 on='datetime' 避免频繁修改索引)
+    # ------------------------------------------
     df_oi['datetime'] = pd.to_datetime(df_oi['timestamp'], unit='ms')
-    df_klines['datetime'] = pd.to_datetime(df_klines['timestamp'], unit='ms')
-
-    # --- OI 处理 (计算过去 30 天 90% 分位数) ---
-    df_oi = df_oi.set_index('datetime')
-    # 滚动计算 30D 的 90% 分位数
-    df_oi['oi_90pct'] = df_oi['oi_amount'].rolling(f'{OI_WINDOW_DAYS}D').quantile(OI_PERCENTILE)
-    # 判定条件A：当前 OI 是否大于 90% 分位数
+    df_oi = df_oi.sort_values('datetime').reset_index(drop=True)
+    df_oi['oi_90pct'] = df_oi.rolling(f'{OI_WINDOW_DAYS}D', on='datetime')['oi_amount'].quantile(OI_PERCENTILE)
     df_oi['cond_A'] = df_oi['oi_amount'] > df_oi['oi_90pct']
-    df_oi = df_oi.reset_index()
 
-    # --- 资金费率处理 ---
-    # 判定条件B：最近一次资金费率是否达标 (-0.05%)
+    df_fr['datetime'] = pd.to_datetime(df_fr['timestamp'], unit='ms')
+    df_fr = df_fr.sort_values('datetime').reset_index(drop=True)
     df_fr['cond_B'] = df_fr['funding_rate'] <= FR_THRESHOLD
 
-    # --- K线处理 (计算通道突破) ---
-    df_klines = df_klines.set_index('datetime')
-    # 【防未来函数】：把 high 和 low 往下移一格，这样 rolling 计算过去 N 小时最值时，就不会把“当前这根还在走的 K 线”算进去
+    df_klines['datetime'] = pd.to_datetime(df_klines['timestamp'], unit='ms')
+    df_klines = df_klines.sort_values('datetime').reset_index(drop=True)
+
+    # 防未来函数：价格错位1格，确保使用上一根已走完的K线极值作为阻力/支撑
     df_klines['high_prev'] = df_klines['high'].shift(1)
     df_klines['low_prev'] = df_klines['low'].shift(1)
-    # 基于时间滚动计算前 12h 最高 和 前 1h 最低
-    df_klines['resist_12h'] = df_klines['high_prev'].rolling(f'{BREAKOUT_WINDOW_H}h').max()
-    df_klines['support_1h'] = df_klines['low_prev'].rolling(f'{STOPLOSS_WINDOW_H}h').min()
-    df_klines = df_klines.reset_index()
+    df_klines['resist_12h'] = df_klines.rolling(f'{BREAKOUT_WINDOW_H}h', on='datetime')['high_prev'].max()
+    df_klines['support_1h'] = df_klines.rolling(f'{STOPLOSS_WINDOW_H}h', on='datetime')['low_prev'].min()
 
     # ------------------------------------------
-    # 3. 跨周期数据对齐 (严防未来函数)
+    # 4. 跨周期时间轴对齐
     # ------------------------------------------
-    # 使用 merge_asof 按时间向后匹配，确保 1m K线只获取到 "当前时间或之前" 已经生成的 OI 和 FR 数据快照
-    # direction='backward' 完美符合实盘逻辑：拿到最近的一次已播报数据
+    # FIXME: 业务边界缺陷预警 - backward 合并如果在长时间断网或无交易期间，可能会把极为陈旧的 FR 费率强行顺延，实盘时需补充“快照有效性过期”判定逻辑。
     df_master = pd.merge_asof(
-        df_klines, 
-        df_oi[['timestamp', 'cond_A', 'oi_amount', 'oi_90pct']], 
+        df_klines,
+        df_oi[['timestamp', 'cond_A', 'oi_amount', 'oi_90pct']],
         on='timestamp', direction='backward'
     )
     df_master = pd.merge_asof(
-        df_master, 
-        df_fr[['timestamp', 'cond_B', 'funding_rate']], 
+        df_master,
+        df_fr[['timestamp', 'cond_B', 'funding_rate']],
         on='timestamp', direction='backward'
     )
-    
-    # 剔除前期 rolling 没有计算出数据的 NaN 阶段
-    # 【修复】：确保第一笔交易必须在有了完整的30天历史数据之后才开始
-    # 获取 OI 数据的最早时间
-    first_oi_time = df_oi['datetime'].iloc[0]
-    # 计算有效起始时间 = 最早时间 + 30天
-    valid_start_time = first_oi_time + pd.Timedelta(days=OI_WINDOW_DAYS)
 
-    # 过滤掉预热期的数据
-    df_master = df_master[df_master['datetime'] >= valid_start_time].reset_index(drop=True)
+    # 预留30天的数据积累期，确保各项滚动指标足够真实
+    valid_start_time = df_oi['datetime'].iloc[0] + pd.Timedelta(days=OI_WINDOW_DAYS)
+    df_master = df_master[df_master['datetime'] >= valid_start_time].copy()
 
-    print(f">>> 剔除30天预热期后，实际用于回测的有效 K 线数量: {len(df_master)}")
-    print(f">>> 数据预处理完成，有效 K 线数量: {len(df_master)}")
-    print(">>> 开始回测模拟...\n")
+    # 巧妙地将下一根 K 线的开盘时间和价格前置到当前行，彻底消灭回测主循环中的跨行索引逻辑
+    # FIXME: 业务边界缺陷预警 - 此处假设信号触发后能在次根K线无缝成交。实盘面对极端行情，次根K线开盘必有巨大滑点甚至直接跳空。
+    df_master['next_open'] = df_master['open'].shift(-1)
+    df_master['next_datetime'] = df_master['datetime'].shift(-1)
+    # 剔除最后一根无"下一K线"数据的无效行
+    df_master = df_master.dropna(subset=['next_open', 'next_datetime']).reset_index(drop=True)
+
+    print(f">>> [数据清洗完毕] 已剔除预热期，实际用于回测的有效 K 线数量: 【{len(df_master)}】 行")
+    print(">>> [启动引擎] 核心状态机开始遍历回测...\n")
 
     # ------------------------------------------
-    # 4. 回测主逻辑 (状态机遍历)
+    # 5. 核心交易状态机 (扁平化遍历)
     # ------------------------------------------
     in_position = False
     entry_price = 0.0
     entry_time = None
-    entry_fee = 0.0
-    
+
     trades = []
-    initial_capital = 10000.0  # 初始模拟资金
+    initial_capital = 10000.0
     capital = initial_capital
-    
-    # 我们遍历每一根 K 线。变量 'i' 代表当前刚刚收盘的这根 K 线，'i+1' 是下一根要开盘的 K 线
-    for i in range(len(df_master) - 1):
-        curr_bar = df_master.iloc[i]
-        next_bar = df_master.iloc[i + 1]
-        
-        # 可读的时间字符串用于日志
-        curr_time_str = curr_bar['datetime'].strftime('%Y-%m-%d %H:%M:%S')
+
+    # 使用 itertuples 替代 iloc，大幅提升遍历效率与代码可读性
+    for row in df_master.itertuples():
+        curr_time_str = row.datetime.strftime('%Y-%m-%d %H:%M:%S')
 
         if not in_position:
-            # 阶段一 & 阶段二：寻找火药桶并点火
-            is_fuel_ready = curr_bar['cond_A']
-            is_bleeding = curr_bar['cond_B']
-            is_breakout = curr_bar['close'] > curr_bar['resist_12h']
-            
-            if is_fuel_ready and is_bleeding and is_breakout:
-                # 触发买入信号，执行在下一根 K 线的开盘
-                entry_price = next_bar['open']
-                entry_time = next_bar['datetime']
+            # 状态判定：等待三大共振信号
+            if row.cond_A and row.cond_B and (row.close > row.resist_12h):
+                entry_price = row.next_open
+                entry_time = row.next_datetime
                 in_position = True
-                
-                # 日志埋点
-                print(f"🔥 [点火入场] 触发时间: {curr_time_str} | 执行时间: {entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"   ┣━ 信号依据: 收盘价 {curr_bar['close']:.4f} 突破 12h阻力 {curr_bar['resist_12h']:.4f}")
-                print(f"   ┣━ 燃料池(OI): {curr_bar['oi_amount']} (阈值: {curr_bar['oi_90pct']:.1f})")
-                print(f"   ┣━ 空头流血(FR): {curr_bar['funding_rate']*100:.4f}%")
-                print(f"   ┗━ 入场价格: {entry_price:.4f}\n")
-                
+
+                print(
+                    f"[交易/点火入场] 突破12h阻力 | 触发: [{curr_time_str}] | 执行价: [{entry_price:.4f}] | 燃料OI: [{row.oi_amount}>={row.oi_90pct:.1f}] | 流血FR: [{row.funding_rate * 100:.4f}%]")
+
         else:
-            # 阶段三：出场信号
-            is_breakdown = curr_bar['close'] < curr_bar['support_1h']
-            
-            if is_breakdown:
-                # 触发卖出平仓信号，执行在下一根 K 线的开盘
-                exit_price = next_bar['open']
-                exit_time = next_bar['datetime']
-                
-                # 计算盈亏 (考虑双边滑点/成本)
+            # 状态判定：一旦收盘价跌破1小时低点则无条件止损/止盈
+            if row.close < row.support_1h:
+                exit_price = row.next_open
+                exit_time = row.next_datetime
+
+                # 收益结算
                 gross_return = (exit_price - entry_price) / entry_price
-                net_return = gross_return - (FEE_RATE * 2)  # 扣除一买一卖的手续费
-                
-                profit_amount = capital * net_return
-                capital += profit_amount
-                
+                net_return = gross_return - (FEE_RATE * 2)
+                capital += capital * net_return
+
                 trades.append({
                     'entry_time': entry_time,
                     'entry_price': entry_price,
@@ -153,37 +140,41 @@ def run_backtest():
                     'net_return': net_return,
                     'capital': capital
                 })
-                
+
                 in_position = False
-                
-                # 日志埋点
-                print(f"🛑 [破位出场] 触发时间: {curr_time_str} | 执行时间: {exit_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"   ┣━ 信号依据: 收盘价 {curr_bar['close']:.4f} 跌破 1h支撑 {curr_bar['support_1h']:.4f}")
-                print(f"   ┣━ 出场价格: {exit_price:.4f}")
-                print(f"   ┗━ 单笔净收益: {net_return*100:.2f}% | 当前净值: {capital:.2f}\n")
+
+                net_color_sign = "+" if net_return > 0 else ""
+                print(
+                    f"[交易/破位出场] 跌破1h支撑 | 触发: [{curr_time_str}] | 执行价: [{exit_price:.4f}] | 单笔净收益: [{net_color_sign}{net_return * 100:.2f}%] | 当前净值: [{capital:.2f}]")
 
     # ------------------------------------------
-    # 5. 绩效统计
+    # 6. 回测报告产出
     # ------------------------------------------
-    print("==========================================")
-    print("📊 纯粹逼空捕获系统 (Pure Squeeze Catcher) 回测报告")
-    print("==========================================")
-    if len(trades) > 0:
-        trades_df = pd.DataFrame(trades)
-        total_trades = len(trades_df)
-        win_trades = len(trades_df[trades_df['net_return'] > 0])
-        win_rate = win_trades / total_trades
-        total_return_pct = (capital - initial_capital) / initial_capital
-        max_drawdown = (trades_df['capital'].cummax() - trades_df['capital']).max() / trades_df['capital'].cummax().max() if total_trades > 0 else 0
-        
-        print(f"总交易次数: {total_trades}")
-        print(f"胜率: {win_rate*100:.2f}%")
-        print(f"总净收益率: {total_return_pct*100:.2f}%")
-        print(f"最大回撤 (按单笔收盘后): {max_drawdown*100:.2f}%")
-        print(f"平均每笔净收益: {trades_df['net_return'].mean()*100:.2f}%")
-    else:
-        print("未触发任何交易。请检查数据时间跨度或放宽参数限制。")
-    print("==========================================")
+    print("\n==================================================")
+    print("📊 [绩效看板] Pure Squeeze Catcher")
+    print("==================================================")
+
+    if not trades:
+        print("💡 回测结论: 期间未触发任何符合所有前置条件的交易信号，建议检查数据时间跨度或适当放宽参数阈值。")
+        print("==================================================")
+        return
+
+    trades_df = pd.DataFrame(trades)
+    total_trades = len(trades_df)
+    win_rate = len(trades_df[trades_df['net_return'] > 0]) / total_trades
+    total_return_pct = (capital - initial_capital) / initial_capital
+
+    # 修复了原回撤计算缺陷，现在严格比较每一次峰顶资产与当前资产
+    capital_cummax = trades_df['capital'].cummax()
+    max_drawdown = ((capital_cummax - trades_df['capital']) / capital_cummax).max()
+
+    print(f"总交易笔数       : 【{total_trades}】 笔")
+    print(f"策略胜率         : 【{win_rate * 100:.2f}%】")
+    print(f"总净收益率       : 【{total_return_pct * 100:.2f}%】")
+    print(f"区间最大回撤     : 【{max_drawdown * 100:.2f}%】")
+    print(f"平均每笔净收益   : 【{trades_df['net_return'].mean() * 100:.2f}%】")
+    print("==================================================")
+
 
 if __name__ == "__main__":
     run_backtest()
