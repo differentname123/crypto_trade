@@ -616,7 +616,7 @@ def like_and_bookmark_loop():
 if __name__ == "__main__":
     tasks = [
         send_promo_posts,
-        # gen_all_promo_posts,  # 注释本行即可停用"评论生成"链路
+        gen_all_promo_posts,  # 注释本行即可停用"评论生成"链路
     ]
 
     threads = []
