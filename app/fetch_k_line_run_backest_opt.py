@@ -4,7 +4,7 @@
   进场 = 方案B：价格台阶上行 + OI新钱同步爬升 + FR温和不拥挤；
   出场 = 方案A 高潮后破位：抛物线加速 + (FR极端[正负皆可] 或 OI价值爆量) 后，
          价格跌破关键摆动低点（右侧确认）。
-  纯多头、全程只使用这两个信号，无其他进出场路径。带可视化交互看板。
+  纯多头、全程只使用这两个信号，无其他进出场路径。
 [输入数据]
   - df_oi: ['timestamp','oi_amount'] 毫秒级快照
   - df_fr: ['timestamp','funding_rate'] 毫秒级快照
@@ -14,7 +14,7 @@
   2. OI(5m): 吸纳最新价计算 oi_value，算 快/慢MA(新钱) 与 30d 90%分位(价值爆量)；
   3. FR: 30d [10%,90%] 分位带 → 温和/极端 判定；
   4. merge_asof 对齐到1m主轴；状态机仅两信号迭代模拟。
-[输出] 大白话日志、绩效看板、Plotly 交互图。
+[输出] 大白话日志、单币种看板、多标的最终汇总看板。
 ================================================================================
 """
 
@@ -44,12 +44,6 @@ SWING_LOW_WINDOW_H = 72    # 关键摆动低周期（小时）
 FEE_RATE = 0.001           # 单边交易成本（0.1%）
 
 
-def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end_time='2026-08-01'):
-    """[功能摘要] Plotly WebGL 交互图表：价格+趋势线+FR+OI数量+OI价值+买卖标记。"""
-
-    pass
-
-
 def run_backtest(target_coin, oi_file, fr_file, kline_file):
     print(f">>> [系统初始化] 正在加载并预处理 【{target_coin}】 底层数据源...")
 
@@ -59,7 +53,7 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
         df_klines = pd.read_csv(kline_file)
     except FileNotFoundError as e:
         print(f"❌ [数据加载失败] 找不到底层数据文件，详细原因: {e}")
-        return
+        return None
 
     # ------------------------------------------
     # 3. 核心指标构建
@@ -209,7 +203,7 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
         print(f"[强制结算] 回测结束仍持仓，按 [{exit_price:.4f}] 平仓 | 单笔净收益: [{net_return * 100:+.2f}%]")
 
     # ------------------------------------------
-    # 6. 绩效报告与绘图
+    # 6. 绩效报告
     # ------------------------------------------
     print("\n==================================================")
     print(f"📊 [绩效看板] B进A出 Trend Rider - 【{target_coin}】")
@@ -218,9 +212,7 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
     if not trades:
         print("💡 回测结论: 未触发交易。方案B进场本就'条件不齐不做'，零交易=该币没有健康趋势段。")
         print("==================================================\n")
-        if len(df_master) > 0:
-            plot_interactive_chart(df_master, trades, target_coin)
-        return
+        return None
 
     trades_df = pd.DataFrame(trades)
     total_trades = len(trades_df)
@@ -228,21 +220,31 @@ def run_backtest(target_coin, oi_file, fr_file, kline_file):
     total_return_pct = (capital - initial_capital) / initial_capital
     capital_cummax = trades_df['capital'].cummax()
     max_drawdown = ((capital_cummax - trades_df['capital']) / capital_cummax).max()
+    avg_net_return = trades_df['net_return'].mean()
+    avg_duration_h = (trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds().mean() / 3600
 
     print(f"总交易笔数       : 【{total_trades}】 笔")
     print(f"策略胜率         : 【{win_rate * 100:.2f}%】")
     print(f"总净收益率       : 【{total_return_pct * 100:.2f}%】")
     print(f"区间最大回撤     : 【{max_drawdown * 100:.2f}%】")
-    print(f"平均每笔净收益   : 【{trades_df['net_return'].mean() * 100:.2f}%】")
-    print(f"平均持仓时间     : 【{(trades_df['exit_time'] - trades_df['entry_time']).dt.total_seconds().mean() / 3600:.1f}】 小时")
+    print(f"平均每笔净收益   : 【{avg_net_return * 100:.2f}%】")
+    print(f"平均持仓时间     : 【{avg_duration_h:.1f}】 小时")
     print("==================================================\n")
 
-    if len(df_master) > 0:
-        plot_interactive_chart(df_master, trades, target_coin)
+    # 返回结果字典供最终汇总使用
+    return {
+        '币种': target_coin,
+        '交易笔数': total_trades,
+        '胜率(%)': win_rate * 100,
+        '总收益率(%)': total_return_pct * 100,
+        '最大回撤(%)': max_drawdown * 100,
+        '均笔收益(%)': avg_net_return * 100,
+        '均持仓(小时)': avg_duration_h
+    }
 
 
 def scan_and_run_batch(data_dir='./data'):
-    """扫描数据目录，自动拼装参数批量回测"""
+    """扫描数据目录，自动拼装参数批量回测，并输出全局汇总报告"""
     if not os.path.exists(data_dir):
         print(f"❌ [严重错误] 找不到数据目录 【{data_dir}】")
         return
@@ -255,6 +257,9 @@ def scan_and_run_batch(data_dir='./data'):
     print(f"🔍 [自动嗅探] 共发现 【{len(kline_files)}】 个待测币种...")
     print("=" * 60)
 
+    # 用来存储所有币种的回测结果
+    all_results = []
+
     for kf in kline_files:
         target_coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         oi_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_5m_oi.csv')
@@ -264,9 +269,44 @@ def scan_and_run_batch(data_dir='./data'):
         if os.path.exists(oi_file) and os.path.exists(fr_file):
             print(f"\n🚀 启动标的 【{target_coin}】 策略实例")
             print("-" * 60)
-            run_backtest(target_coin, oi_file, fr_file, kline_file)
+            res = run_backtest(target_coin, oi_file, fr_file, kline_file)
+            if res is not None:
+                all_results.append(res)
         else:
             print(f"⚠️ [跳过标的] 【{target_coin}】 数据不完整。")
+
+    # ------------------------------------------
+    # 7. 全局最终汇总报告
+    # ------------------------------------------
+    if all_results:
+        summary_df = pd.DataFrame(all_results)
+
+        # 优化 Pandas 打印对齐
+        pd.set_option('display.max_rows', None)
+        pd.set_option('display.width', 1000)
+        pd.set_option('display.unicode.ambiguous_as_wide', True)
+        pd.set_option('display.unicode.east_asian_width', True)
+
+        print("\n\n" + "🌟" * 40)
+        print("🏆 [多标的批量回测 - 最终结果大汇总] 🏆")
+        print("🌟" * 40)
+
+        # 为了展示美观，进行字符串格式化拷贝
+        display_df = summary_df.copy()
+        for col in ['胜率(%)', '总收益率(%)', '最大回撤(%)', '均笔收益(%)']:
+            display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}%")
+        display_df['均持仓(小时)'] = display_df['均持仓(小时)'].apply(lambda x: f"{x:.1f}")
+
+        print(display_df.to_string(index=False))
+        print("-" * 80)
+        print(f"💡 综合统计:")
+        print(f"   ┣━ 参与产生交易的币种总数 : 【{len(summary_df)}】 个")
+        print(f"   ┣━ 所有币种平均胜率       : 【{summary_df['胜率(%)'].mean():.2f}%】")
+        print(f"   ┣━ 所有币种平均总收益率   : 【{summary_df['总收益率(%)'].mean():.2f}%】")
+        print(f"   ┗━ 所有币种平均最大回撤   : 【{summary_df['最大回撤(%)'].mean():.2f}%】")
+        print("=" * 80 + "\n")
+    else:
+        print("\n⚠️ 跑完了，但是没有任何币种触发有效交易，无最终统计可展示。\n")
 
 
 if __name__ == "__main__":
