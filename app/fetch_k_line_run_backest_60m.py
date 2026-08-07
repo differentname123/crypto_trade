@@ -31,7 +31,7 @@ OPTIMAL_PARAMS = {
 def init_exchange(exchange_name, default_type='swap'):
     config = {
         'enableRateLimit': True,
-        'proxies': GLOBAL_PROXY, # 视你的网络环境决定是否取消注释
+        'proxies': GLOBAL_PROXY,  # 视你的网络环境决定是否取消注释
     }
     if default_type:
         config['options'] = {'defaultType': default_type}
@@ -146,9 +146,7 @@ def scan_signals_and_trades(df, params):
     open_trade = None
     symbol = df.attrs.get('symbol', 'UNKNOWN')
 
-    cutoff_time = df['datetime_bj'].max() - pd.Timedelta(days=300000)
-
-    # 🎯 新增：计算预热期结束的时间点（与原回测逻辑对齐）
+    # 🎯 计算预热期结束的时间点
     warmup_bars = W  # 720根K线作为预热期
     warmup_end_time = df['datetime_bj'].iloc[warmup_bars] if len(df) > warmup_bars else df['datetime_bj'].iloc[0]
 
@@ -157,23 +155,22 @@ def scan_signals_and_trades(df, params):
         is_entry = entry_signal.iloc[i]
         is_exit = exit_signal.iloc[i]
 
-        # 🎯 新增：跳过预热期内的所有信号（与原回测代码对齐）
+        # 🎯 跳过预热期内的所有信号
         if dt < warmup_end_time:
             continue
 
-        # 1. 收集近3天的信号
-        if dt >= cutoff_time:
-            if is_entry:
-                signals.append({
-                    'symbol': symbol, 'signal_type': '🟢 ENTRY (接针做多)', 'datetime_bj': dt,
-                    'price': c.iloc[i],
-                    'reason': f"高位长上影({uw.iloc[i]:.2f}) + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
-                })
-            if is_exit:
-                signals.append({
-                    'symbol': symbol, 'signal_type': '🔴 EXIT (突破止盈)', 'datetime_bj': dt,
-                    'price': c.iloc[i], 'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
-                })
+        # 1. 收集信号
+        if is_entry:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🟢 ENTRY (接针做多)', 'datetime_bj': dt,
+                'price': c.iloc[i],
+                'reason': f"高位长上影({uw.iloc[i]:.2f}) + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
+            })
+        if is_exit:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🔴 EXIT (突破止盈)', 'datetime_bj': dt,
+                'price': c.iloc[i], 'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
+            })
 
         # 2. 状态机配对交易（只在预热期结束后才开始）
         if is_entry and open_trade is None:
@@ -194,8 +191,8 @@ def scan_signals_and_trades(df, params):
             })
             open_trade = None
 
-    # 3. 过滤出近3天内平仓或开仓的交易
-    recent_trades = [t for t in trades if t['exit_time'] >= cutoff_time or t['entry_time'] >= cutoff_time]
+    # 3. 交易排序（已取消cutoff限制，保留所有预热期后的交易）
+    recent_trades = trades.copy()
     recent_trades.sort(key=lambda x: x['entry_time'])
 
     # 4. 当前未平仓持仓
@@ -213,6 +210,7 @@ def scan_signals_and_trades(df, params):
         }
 
     return signals, recent_trades, current_holding
+
 
 # ============================================================================
 # 4. 主流程
@@ -254,7 +252,7 @@ def main():
     print("-" * 50)
 
     if not all_signals and not all_recent_trades:
-        print("⚠️ 最近 3 天内，涨跌幅榜前10的币种均未触发任何信号或交易。")
+        print("⚠️ 涨跌幅榜前10的币种均未触发任何信号或交易。")
         return
 
     # ==========================
@@ -286,7 +284,6 @@ def main():
                 print(
                     f"   {row['signal_type']} | {row['datetime_str']} | 价格: {row['price']:<12.8g} | {row['reason']}")
 
-
             print("-" * 100)
 
     # ==========================
@@ -294,20 +291,13 @@ def main():
     # ==========================
     if all_recent_trades or any(data['holding'] for data in symbol_trade_data.values()):
         print("\n" + "=" * 100)
-        print("📊 交易复盘与统计 (仅展示近3天内平仓或开仓的交易)")
+        print("📊 交易复盘与统计")
         print("=" * 100)
 
-        # 全局统计
-        if all_recent_trades:
-            total_t = len(all_recent_trades)
-            wins = sum(1 for t in all_recent_trades if t['pnl_pct'] > 0)
-            win_rate = (wins / total_t) * 100 if total_t > 0 else 0
-            total_pnl = sum(t['pnl_pct'] for t in all_recent_trades)
-            print(
-                f"🌍 全局汇总: 闭环 {total_t} 笔 | 胜率 {win_rate:.1f}% ({wins}胜 {total_t - wins}负) | 累计毛收益 {total_pnl:+.2f}% (未扣手续费/滑点) 平均收益 {total_pnl / total_t:+.2f}%")
-            print("-" * 100)
+        # 提取全局的未闭环持仓
+        all_holdings = [data['holding'] for data in symbol_trade_data.values() if data['holding']]
 
-        # 单币种明细
+        # ========================== 单币种明细 ==========================
         for symbol, data in symbol_trade_data.items():
             trades = data['trades']
             holding = data['holding']
@@ -329,7 +319,7 @@ def main():
                     print(
                         f"   [{idx}] 🟢 {e_str} ({t['entry_price']:.6g}) ➔ 🔴 {x_str} ({t['exit_price']:.6g}) | 收益: {t['pnl_pct']:+.2f}% | 持仓: {dur}")
             else:
-                print("📈 统计摘要: 近3天内无已闭环交易。")
+                print("📈 统计摘要: 无已闭环交易。")
 
             if holding:
                 e_str = holding['entry_time'].strftime('%m-%d %H:%M')
@@ -337,6 +327,50 @@ def main():
                 print(
                     f"⏳ 当前持仓: 🟢 {e_str} ({holding['entry_price']:.6g}) | 现价: {holding['current_price']:.6g} | 浮盈: {holding['float_pnl']:+.2f}% | 持仓: {dur}")
             print("-" * 100)
+
+        # ========================== 全局统计汇总 (已移至末尾) ==========================
+        if all_recent_trades or all_holdings:
+            print("\n🌍 全局汇总:")
+
+            # 初始化汇总变量
+            closed_wins = closed_total_pnl = total_closed = 0
+            open_wins = open_total_pnl = total_open = 0
+
+            # 1. 闭环交易统计
+            total_closed = len(all_recent_trades)
+            if total_closed > 0:
+                closed_wins = sum(1 for t in all_recent_trades if t['pnl_pct'] > 0)
+                closed_total_pnl = sum(t['pnl_pct'] for t in all_recent_trades)
+                closed_win_rate = (closed_wins / total_closed) * 100
+                closed_avg_pnl = closed_total_pnl / total_closed
+                print(
+                    f"   [闭 环 交 易] {total_closed} 笔 | 胜率 {closed_win_rate:.1f}% ({closed_wins}胜 {total_closed - closed_wins}负) | 累计毛收益 {closed_total_pnl:+.2f}% | 平均收益 {closed_avg_pnl:+.2f}%")
+            else:
+                print(f"   [闭 环 交 易] 0 笔")
+
+            # 2. 未闭环(持仓)统计
+            total_open = len(all_holdings)
+            if total_open > 0:
+                open_wins = sum(1 for h in all_holdings if h['float_pnl'] > 0)
+                open_total_pnl = sum(h['float_pnl'] for h in all_holdings)
+                open_win_rate = (open_wins / total_open) * 100
+                open_avg_pnl = open_total_pnl / total_open
+                print(
+                    f"   [未闭环/持仓] {total_open} 笔 | 浮盈胜率 {open_win_rate:.1f}% ({open_wins}胜 {total_open - open_wins}负) | 累计总浮盈 {open_total_pnl:+.2f}% | 平均浮盈 {open_avg_pnl:+.2f}%")
+            else:
+                print(f"   [未闭环/持仓] 0 笔")
+
+            # 3. 总体统计 (闭环 + 未闭环)
+            total_all = total_closed + total_open
+            if total_all > 0:
+                all_wins = closed_wins + open_wins
+                all_total_pnl = closed_total_pnl + open_total_pnl
+                all_win_rate = (all_wins / total_all) * 100
+                all_avg_pnl = all_total_pnl / total_all
+                print(
+                    f"   [总 体 汇 总] {total_all} 笔 | 综合胜率 {all_win_rate:.1f}% ({all_wins}胜 {total_all - all_wins}负) | 综合总收益 {all_total_pnl:+.2f}% (未扣手续费) | 综合均收益 {all_avg_pnl:+.2f}%")
+
+            print("=" * 100)
 
         # 导出交易明细 CSV
         if all_recent_trades:
