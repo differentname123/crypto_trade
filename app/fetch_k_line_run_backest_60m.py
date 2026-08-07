@@ -23,7 +23,7 @@ OPTIMAL_PARAMS = {
     'HIGH_CLOSE_THRESH': 0.90,
     'WARMUP_DAYS': 30  # 因子计算必须的30天历史窗口
 }
-
+BEST_TOP_N = 20
 
 # ============================================================================
 # 1. 交易所初始化与数据拉取
@@ -99,23 +99,27 @@ def get_klines_df(exchange, symbol, days=35, timeframe='1h'):
 # ============================================================================
 # 2. 获取涨跌幅榜前10
 # ============================================================================
+# ============================================================================
+# 2. 获取涨幅榜前10 (已修改：移除跌幅榜)
+# ============================================================================
 def get_top_movers(exchange, top_n=10):
     print("📡 正在获取全市场 USDT 永续合约 Tickers...")
     tickers = exchange.fetch_tickers(params={'type': 'swap'})
 
+    # 过滤出USDT本位合约，并排除没有涨跌幅数据的异常币种
     usdt_swaps = {k: v for k, v in tickers.items() if k.endswith(':USDT') and v.get('percentage') is not None}
     df = pd.DataFrame(usdt_swaps).T
+
+    # 按涨跌幅降序排列（涨得最多的在前面）
     df = df.sort_values('percentage', ascending=False)
 
+    # 只取涨幅榜前 N 名
     gainers = df.head(top_n).index.tolist()
-    losers = df.tail(top_n).index.tolist()
+    targets = gainers
 
-    targets = list(set(gainers + losers))
     print(f"🔥 涨幅榜前{top_n}: {gainers}")
-    print(f"💧 跌幅榜前{top_n}: {losers}")
     print(f"🎯 最终监控列表 ({len(targets)}个): {targets}\n")
     return targets
-
 
 # ============================================================================
 # 3. 核心信号计算与交易配对逻辑
@@ -217,7 +221,7 @@ def scan_signals_and_trades(df, params):
 # ============================================================================
 def main():
     exchange = init_exchange('binance', default_type='swap')
-    targets = get_top_movers(exchange, top_n=10)
+    targets = get_top_movers(exchange, top_n=BEST_TOP_N)
     # targets = ['BTC/USDT:USDT']
     all_signals = []
     symbol_trade_data = {}  # 存储每个币的交易复盘数据
