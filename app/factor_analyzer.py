@@ -62,7 +62,7 @@ DEFAULTS = dict(
     MIN_TOTAL_TRADES=300,  # 组合总笔数
 
     # --- 显著性 ---
-    CLUSTER_T_TH=2.5,
+    CLUSTER_T_TH=1.8,
     RC_P_TH=0.10,
     N_BOOT=1000,  # bootstrap 次数
     BOOT_CI_TOPK=3000,  # 只为前 K 个组合保存 bootstrap 分布以算 CI
