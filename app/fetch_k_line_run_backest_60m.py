@@ -217,7 +217,7 @@ def scan_signals_and_trades(df, params):
 # ============================================================================
 def main():
     exchange = init_exchange('binance', default_type='swap')
-    targets = get_top_movers(exchange, top_n=10)
+    targets = get_top_movers(exchange, top_n=20)
     # targets = ['BTC/USDT:USDT']
     all_signals = []
     symbol_trade_data = {}  # 存储每个币的交易复盘数据
