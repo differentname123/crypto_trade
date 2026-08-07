@@ -827,16 +827,9 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
         pd.DataFrame({'max_t_null': max_t_null}).to_csv(
             os.path.join(save_dir, f'rc_null_{sfx}.csv'), index=False)
 
-    res_dict = dict(raw=d, bench=bench, pools=out, pool_tag=tag)
-
-    if save:
-        with open(os.path.join(save_dir, 'analyze_cache.pkl'), 'wb') as f:
-            pickle.dump(res_dict, f)
-        print('      analyze_cache.pkl (全量数据缓存)')
-
-    del mat;
+    del mat
     gc.collect()
-    return res_dict
+    return S
 
 
 def load_res(out_dir='./factor_out_15m'):
