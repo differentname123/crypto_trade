@@ -118,11 +118,11 @@ def get_top_movers(exchange, top_n=10):
 
 
 # ============================================================================
-# 3. 核心信号计算逻辑
+# 3. 核心信号计算与交易配对逻辑
 # ============================================================================
-def scan_signals(df, params):
+def scan_signals_and_trades(df, params):
     if len(df) < 720:
-        return []
+        return [], [], None
 
     o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
     W = 24 * params['WARMUP_DAYS']
@@ -142,32 +142,70 @@ def scan_signals(df, params):
     exit_signal = inside.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
 
     signals = []
+    trades = []
+    open_trade = None
     symbol = df.attrs.get('symbol', 'UNKNOWN')
 
-    cutoff_time = df['datetime_bj'].max() - pd.Timedelta(days=3)
+    cutoff_time = df['datetime_bj'].max() - pd.Timedelta(days=3000)
 
+    # 遍历全量数据以保证交易配对的正确性
     for i in range(len(df)):
-        if df.loc[i, 'datetime_bj'] < cutoff_time:
-            continue
+        dt = df.loc[i, 'datetime_bj']
+        is_entry = entry_signal.iloc[i]
+        is_exit = exit_signal.iloc[i]
 
-        if entry_signal.iloc[i]:
-            signals.append({
-                'symbol': symbol,
-                'signal_type': '🟢 ENTRY (接针做多)',
-                'datetime_bj': df.loc[i, 'datetime_bj'],
-                'price': c.iloc[i],
-                'reason': f"高位长上影({uw.iloc[i]:.2f}) + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
-            })
-        if exit_signal.iloc[i]:
-            signals.append({
-                'symbol': symbol,
-                'signal_type': '🔴 EXIT (突破止盈)',
-                'datetime_bj': df.loc[i, 'datetime_bj'],
-                'price': c.iloc[i],
-                'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
-            })
+        # 1. 收集近3天的信号 (用于列表展示)
+        if dt >= cutoff_time:
+            if is_entry:
+                signals.append({
+                    'symbol': symbol, 'signal_type': '🟢 ENTRY (接针做多)', 'datetime_bj': dt,
+                    'price': c.iloc[i],
+                    'reason': f"高位长上影({uw.iloc[i]:.2f}) + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
+                })
+            if is_exit:
+                signals.append({
+                    'symbol': symbol, 'signal_type': '🔴 EXIT (突破止盈)', 'datetime_bj': dt,
+                    'price': c.iloc[i], 'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
+                })
 
-    return signals
+        # 2. 状态机配对交易
+        if is_entry and open_trade is None:
+            open_trade = {'entry_time': dt, 'entry_price': c.iloc[i]}
+        elif is_exit and open_trade is not None:
+            exit_price = c.iloc[i]
+            entry_price = open_trade['entry_price']
+            pnl_pct = (exit_price / entry_price - 1.0) * 100
+
+            trades.append({
+                'symbol': symbol,
+                'entry_time': open_trade['entry_time'],
+                'entry_price': entry_price,
+                'exit_time': dt,
+                'exit_price': exit_price,
+                'pnl_pct': pnl_pct,
+                'hold_duration': dt - open_trade['entry_time']
+            })
+            open_trade = None
+
+    # 3. 过滤出近3天内平仓或开仓的交易
+    recent_trades = [t for t in trades if t['exit_time'] >= cutoff_time or t['entry_time'] >= cutoff_time]
+    recent_trades.sort(key=lambda x: x['entry_time'])
+
+    # 4. 检查当前是否有未平仓的持仓
+    current_holding = None
+    if open_trade is not None:
+        current_price = c.iloc[-1]
+        float_pnl = (current_price / open_trade['entry_price'] - 1.0) * 100
+        current_holding = {
+            'symbol': symbol,
+            'entry_time': open_trade['entry_time'],
+            'entry_price': open_trade['entry_price'],
+            'current_price': current_price,
+            'float_pnl': float_pnl,
+            'hold_duration': df['datetime_bj'].iloc[-1] - open_trade['entry_time']
+        }
+
+    return signals, recent_trades, current_holding
 
 
 # ============================================================================
@@ -176,8 +214,11 @@ def scan_signals(df, params):
 def main():
     exchange = init_exchange('binance', default_type='swap')
     targets = get_top_movers(exchange, top_n=10)
-
+    # targets = ['BTC/USDT:USDT']
     all_signals = []
+    symbol_trade_data = {}  # 存储每个币的交易复盘数据
+    all_recent_trades = []  # 存储全局近期交易
+
     print(f"🚀 开始扫描 {len(targets)} 个币种的 1h K线信号 (包含30天Warmup)...\n" + "-" * 50)
 
     for idx, symbol in enumerate(targets):
@@ -188,64 +229,121 @@ def main():
             print("❌ 无数据")
             continue
 
-        signals = scan_signals(df, OPTIMAL_PARAMS)
+        signals, recent_trades, current_holding = scan_signals_and_trades(df, OPTIMAL_PARAMS)
+
         if signals:
             all_signals.extend(signals)
-            print(f"✅ 发现 {len(signals)} 个信号!")
+            print(f"✅ 发现 {len(signals)} 个信号!", end="")
+            if recent_trades or current_holding:
+                print(f" (含 {len(recent_trades)} 笔闭环, {1 if current_holding else 0} 笔持仓)")
+            else:
+                print()
         else:
             print("⚪ 无信号")
 
+        if recent_trades or current_holding:
+            symbol_trade_data[symbol] = {'trades': recent_trades, 'holding': current_holding}
+            all_recent_trades.extend(recent_trades)
+
     print("-" * 50)
 
-    if not all_signals:
-        print("⚠️ 最近 3 天内，涨跌幅榜前10的币种均未触发任何信号。")
+    if not all_signals and not all_recent_trades:
+        print("⚠️ 最近 3 天内，涨跌幅榜前10的币种均未触发任何信号或交易。")
         return
 
-    # 整理为 DataFrame
-    df_res = pd.DataFrame(all_signals)
+    # ==========================
+    # 1. 打印信号汇总表 (保持原有逻辑)
+    # ==========================
+    if all_signals:
+        df_res = pd.DataFrame(all_signals)
+        latest_times = df_res.groupby('symbol')['datetime_bj'].max().reset_index()
+        latest_times.rename(columns={'datetime_bj': 'latest_time'}, inplace=True)
+        df_res = df_res.merge(latest_times, on='symbol', how='left')
+        df_res.sort_values(['latest_time', 'symbol', 'datetime_bj'], ascending=[True, True, True], inplace=True)
+        df_res.drop(columns=['latest_time'], inplace=True)
 
-    # 🎯 核心排序优化：按“每个币种的最新信号时间”升序排列，同币种内按时间正序
-    # 1. 计算每个币种的最新(最大)信号时间
-    latest_times = df_res.groupby('symbol')['datetime_bj'].max().reset_index()
-    latest_times.rename(columns={'datetime_bj': 'latest_time'}, inplace=True)
+        df_res['datetime_str'] = df_res['datetime_bj'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        df_save = df_res[['symbol', 'signal_type', 'datetime_str', 'price', 'reason']]
 
-    # 2. 合并回原表
-    df_res = df_res.merge(latest_times, on='symbol', how='left')
+        filename = f"signal_scan_latest.csv"
+        df_save.to_csv(filename, index=False, encoding='utf-8-sig')
 
-    # 3. 排序：先按最新信号时间升序(Ascending)，再按币种名，最后按信号时间升序
-    df_res.sort_values(['latest_time', 'symbol', 'datetime_bj'], ascending=[True, True, True], inplace=True)
+        print(f"\n🎉 信号扫描完成！共发现 {len(df_res)} 个信号。 💾 保存至: {filename}")
+        print("\n📊 信号汇总表 (按币种最新信号时间升序, 币内时间正序):")
+        print("=" * 100)
 
-    # 4. 移除辅助列
-    df_res.drop(columns=['latest_time'], inplace=True)
+        grouped = df_res.groupby('symbol', sort=False)
+        for symbol, group in grouped:
+            latest_dt = group['datetime_bj'].max().strftime('%m-%d %H:%M')
+            print(f"🪙 【{symbol}】 (最新信号: {latest_dt} | 共 {len(group)} 个信号)")
+            for _, row in group.iterrows():
+                print(
+                    f"   {row['signal_type']} | {row['datetime_str']} | 价格: {row['price']:<12.8g} | {row['reason']}")
 
-    # 格式化时间字符串
-    df_res['datetime_str'] = df_res['datetime_bj'].dt.strftime('%Y-%m-%d %H:%M:%S')
 
-    # 保存 CSV (CSV中也是按此规则排列)
-    df_save = df_res[['symbol', 'signal_type', 'datetime_str', 'price', 'reason']]
-    filename = f"signal_scan_latest.csv"
-    df_save.to_csv(filename, index=False, encoding='utf-8-sig')
+            print("-" * 100)
 
-    print(f"\n🎉 扫描完成！共发现 {len(df_res)} 个信号。")
-    print(f"💾 结果已保存至: {filename}")
+    # ==========================
+    # 2. 打印交易复盘与统计 (新增核心功能)
+    # ==========================
+    if all_recent_trades or any(data['holding'] for data in symbol_trade_data.values()):
+        print("\n" + "=" * 100)
+        print("📊 交易复盘与统计 (仅展示近3天内平仓或开仓的交易)")
+        print("=" * 100)
 
-    # 🎯 终端打印重构
-    print("\n📊 信号汇总表 (按币种最新信号时间升序, 币内时间正序):")
-    print("=" * 100)
+        # 全局统计
+        if all_recent_trades:
+            total_t = len(all_recent_trades)
+            wins = sum(1 for t in all_recent_trades if t['pnl_pct'] > 0)
+            win_rate = (wins / total_t) * 100 if total_t > 0 else 0
+            total_pnl = sum(t['pnl_pct'] for t in all_recent_trades)
+            print(
+                f"🌍 全局汇总: 闭环 {total_t} 笔 | 胜率 {win_rate:.1f}% ({wins}胜 {total_t - wins}负) | 累计毛收益 {total_pnl:+.2f}% (未扣手续费/滑点)")
+            print("-" * 100)
 
-    # 注意：必须使用 sort=False，否则 groupby 会强行按字母顺序重新打乱排序
-    grouped = df_res.groupby('symbol', sort=False)
-    for symbol, group in grouped:
-        # 获取该币种的最新信号时间用于标题显示
-        latest_dt = group['datetime_bj'].max().strftime('%m-%d %H:%M')
-        print(f"🪙 【{symbol}】 (最新信号: {latest_dt} | 共 {len(group)} 个信号)")
-        for _, row in group.iterrows():
-            sig = row['signal_type']
-            dt = row['datetime_str']
-            px = f"{row['price']:.8g}"
-            reason = row['reason']
-            print(f"   {sig} | {dt} | 价格: {px:<12} | {reason}")
-        print("-" * 100)
+        # 单币种明细
+        for symbol, data in symbol_trade_data.items():
+            trades = data['trades']
+            holding = data['holding']
+
+            print(f"\n🪙 【{symbol}】")
+            if trades:
+                wins = [t for t in trades if t['pnl_pct'] > 0]
+                losses = [t for t in trades if t['pnl_pct'] <= 0]
+                total_pnl = sum(t['pnl_pct'] for t in trades)
+                win_rate = (len(wins) / len(trades)) * 100
+
+                print(
+                    f"📈 统计摘要: 闭环 {len(trades)} 笔 | 胜率 {win_rate:.1f}% ({len(wins)}胜 {len(losses)}负) | 累计收益 {total_pnl:+.2f}%")
+                print("📜 交易明细:")
+                for idx, t in enumerate(trades, 1):
+                    e_str = t['entry_time'].strftime('%m-%d %H:%M')
+                    x_str = t['exit_time'].strftime('%m-%d %H:%M')
+                    dur = str(t['hold_duration']).split('.')[0]
+                    print(
+                        f"   [{idx}] 🟢 {e_str} ({t['entry_price']:.6g}) ➔ 🔴 {x_str} ({t['exit_price']:.6g}) | 收益: {t['pnl_pct']:+.2f}% | 持仓: {dur}")
+            else:
+                print("📈 统计摘要: 近3天内无已闭环交易。")
+
+            if holding:
+                e_str = holding['entry_time'].strftime('%m-%d %H:%M')
+                dur = str(holding['hold_duration']).split('.')[0]
+                print(
+                    f"⏳ 当前持仓: 🟢 {e_str} ({holding['entry_price']:.6g}) | 现价: {holding['current_price']:.6g} | 浮盈: {holding['float_pnl']:+.2f}% | 持仓: {dur}")
+            print("-" * 100)
+
+        # 导出交易明细 CSV
+        if all_recent_trades:
+            df_trades = pd.DataFrame(all_recent_trades)
+            df_trades['entry_time'] = df_trades['entry_time'].dt.strftime('%Y-%m-%d %H:%M')
+            df_trades['exit_time'] = df_trades['exit_time'].dt.strftime('%Y-%m-%d %H:%M')
+            df_trades['hold_duration'] = df_trades['hold_duration'].astype(str).str.split('.').str[0]
+
+            df_trades_save = df_trades[
+                ['symbol', 'entry_time', 'entry_price', 'exit_time', 'exit_price', 'pnl_pct', 'hold_duration']]
+            trade_filename = f"trades_scan_latest.csv"
+            df_trades_save.to_csv(trade_filename, index=False, encoding='utf-8-sig')
+            print(f"\n💾 交易明细已保存至: {trade_filename}")
 
 
 if __name__ == "__main__":
