@@ -20,9 +20,12 @@
    保留 v2 的: 真实BH基准(修drift污染) / 时间归一化 / 标的池拆分
 --------------------------------------------------------------------------------
  用法:
-     python factor_analyzer_v3.py ./factor_out_15m ./data
-     from factor_analyzer_v3 import analyze, combo_detail
-     res = analyze('./factor_out_15m', './data')
+     # 第一次执行生成结果与缓存
+     from factor_analyzer_v3 import analyze, combo_detail, load_res
+     analyze('./factor_out_15m', './data')
+
+     # 后续任意时间只需加载缓存即可秒级查询，无需重新分析
+     res = load_res('./factor_out_15m')
      combo_detail(res, 'ENTRY_X', 'EXIT_Y')
 ================================================================================
 """
@@ -33,6 +36,7 @@ import gc
 import glob
 import math
 import time
+import pickle
 import warnings
 
 import numpy as np
@@ -46,36 +50,36 @@ W = 120
 # 0. 配置
 # ==============================================================================
 DEFAULTS = dict(
-    COST_PCT          = 0.20,   # 单次往返成本(%) = 2*(FEE+SLIP)*100，必须与挖掘脚本一致
+    COST_PCT=0.20,  # 单次往返成本(%) = 2*(FEE+SLIP)*100，必须与挖掘脚本一致
 
     # --- 实例级硬过滤（关于"策略身份"，不是关于"广度"）---
-    MIN_TRADES_INST   = 20,     # 单币单组合最少笔数
-    MAX_EXPOSURE      = 70.0,   # 持仓占比上限(%)，超过=伪买入持有
-    MIN_HOLD_H        = 0.5,    # 持仓下限(h)，太短成本敏感
+    MIN_TRADES_INST=20,  # 单币单组合最少笔数
+    MAX_EXPOSURE=70.0,  # 持仓占比上限(%)，超过=伪买入持有
+    MIN_HOLD_H=0.5,  # 持仓下限(h)，太短成本敏感
 
     # --- 组合级门槛（数据广度，不是盈利广度）---
-    MIN_COINS_DATA    = 20,     # 至少要在多少个币上有合格实例
-    MIN_TOTAL_TRADES  = 300,    # 组合总笔数
+    MIN_COINS_DATA=20,  # 至少要在多少个币上有合格实例
+    MIN_TOTAL_TRADES=300,  # 组合总笔数
 
     # --- 显著性 ---
-    CLUSTER_T_TH      = 2.5,
-    RC_P_TH           = 0.10,
-    N_BOOT            = 1000,   # bootstrap 次数
-    BOOT_CI_TOPK      = 3000,   # 只为前 K 个组合保存 bootstrap 分布以算 CI
-    SEED              = 20240601,
+    CLUSTER_T_TH=2.5,
+    RC_P_TH=0.10,
+    N_BOOT=1000,  # bootstrap 次数
+    BOOT_CI_TOPK=3000,  # 只为前 K 个组合保存 bootstrap 分布以算 CI
+    SEED=20240601,
 
     # --- 集中度 ---
-    MAX_TOP1_COIN     = 0.50,   # 单币贡献占总盈亏上限
-    MAX_TOP1_TRADE    = 0.35,   # 单笔贡献占总盈亏上限
+    MAX_TOP1_COIN=0.50,  # 单币贡献占总盈亏上限
+    MAX_TOP1_TRADE=0.35,  # 单笔贡献占总盈亏上限
 
     # --- 稳健性 ---
-    WINSOR_P          = 0.01,   # 对 avg_ret 做双侧 winsor 的分位
+    WINSOR_P=0.01,  # 对 avg_ret 做双侧 winsor 的分位
 
-    TOP_N             = 25,
-    STOCK_MIN_SPAN_D  = 150,
-    STOCK_HINT        = ('AAOI','ALAB','APP','NBIS','DELL','WDC','SNDK','FLNC','AXTI',
-                         'SAMSUNG','MINIMAX','GENIUS','OPG','BSP','MUU','MVLL','KORU',
-                         'RE','SNXX','BTW','CAP','SHAZ','GRVT'),
+    TOP_N=25,
+    STOCK_MIN_SPAN_D=150,
+    STOCK_HINT=('AAOI', 'ALAB', 'APP', 'NBIS', 'DELL', 'WDC', 'SNDK', 'FLNC', 'AXTI',
+                'SAMSUNG', 'MINIMAX', 'GENIUS', 'OPG', 'BSP', 'MUU', 'MVLL', 'KORU',
+                'RE', 'SNXX', 'BTW', 'CAP', 'SHAZ', 'GRVT'),
 )
 
 
@@ -83,7 +87,9 @@ DEFAULTS = dict(
 # 1. 打印
 # ==============================================================================
 def _h(t, ch='='):
-    print('\n' + ch * W); print(f'  {t}'); print(ch * W)
+    print('\n' + ch * W);
+    print(f'  {t}');
+    print(ch * W)
 
 
 def _kv(k, v, note=''):
@@ -92,7 +98,8 @@ def _kv(k, v, note=''):
 
 def _tbl(d, cols=None, n=None, fmt='{:.4f}'):
     if d is None or len(d) == 0:
-        print('      (无数据)'); return
+        print('      (无数据)');
+        return
     x = d if cols is None else d[[c for c in cols if c in d.columns]]
     if n: x = x.head(n)
     with pd.option_context('display.width', 460, 'display.max_columns', 100,
@@ -109,10 +116,11 @@ def _bar(n, n0, width=44):
 # 2. 统计工具
 # ==============================================================================
 def _erf(x):
-    x = np.asarray(x, float); s, x = np.sign(x), np.abs(x)
+    x = np.asarray(x, float);
+    s, x = np.sign(x), np.abs(x)
     a = (0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429)
     t = 1.0 / (1.0 + 0.3275911 * x)
-    y = 1.0 - (((((a[4]*t + a[3])*t) + a[2])*t + a[1])*t + a[0]) * t * np.exp(-x*x)
+    y = 1.0 - (((((a[4] * t + a[3]) * t) + a[2]) * t + a[1]) * t + a[0]) * t * np.exp(-x * x)
     return s * y
 
 
@@ -122,13 +130,18 @@ def _p2(z):
 
 
 def _bh(p):
-    p = np.asarray(p, float); out = np.full(p.shape, np.nan)
+    p = np.asarray(p, float);
+    out = np.full(p.shape, np.nan)
     ok = np.flatnonzero(np.isfinite(p))
     if ok.size == 0: return out
-    pv = p[ok]; o = np.argsort(pv); m = pv.size
+    pv = p[ok];
+    o = np.argsort(pv);
+    m = pv.size
     q = pv[o] * m / (np.arange(m) + 1)
     q = np.minimum.accumulate(q[::-1])[::-1]
-    r = np.empty(m); r[o] = np.clip(q, 0, 1); out[ok] = r
+    r = np.empty(m);
+    r[o] = np.clip(q, 0, 1);
+    out[ok] = r
     return out
 
 
@@ -140,8 +153,8 @@ def _spearman(a, b):
 
 def _q(s, ps=(0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99)):
     s = pd.Series(s).replace([np.inf, -np.inf], np.nan).dropna()
-    if s.empty: return {f'p{int(p*100)}': np.nan for p in ps}
-    return {f'p{int(p*100)}': float(s.quantile(p)) for p in ps}
+    if s.empty: return {f'p{int(p * 100)}': np.nan for p in ps}
+    return {f'p{int(p * 100)}': float(s.quantile(p)) for p in ps}
 
 
 # ==============================================================================
@@ -185,7 +198,8 @@ def _bh_kline(coin, data_dir):
         return None
     tc = next((c for c in ['timestamp', 'open_time', 'time', 'ts'] if c in df.columns), None)
     if tc is None or 'close' not in df.columns or len(df) < 200: return None
-    df = df[[tc, 'close']].dropna(); df = df[df['close'] > 0].sort_values(tc)
+    df = df[[tc, 'close']].dropna();
+    df = df[df['close'] > 0].sort_values(tc)
     if len(df) < 200: return None
     c0, c1 = float(df['close'].iloc[0]), float(df['close'].iloc[-1])
     t0 = pd.to_datetime(df[tc].iloc[0], unit='ms', utc=True)
@@ -201,7 +215,8 @@ def _bh_regress(sub, cost):
     s = s[(s['avg_hold_h'] > 1) & (s['trades'] >= 10)]
     if len(s) < 50: return np.nan
     y = (s['avg_ret'] + cost).to_numpy(float)
-    x = s['avg_hold_h'].to_numpy(float); w = s['trades'].to_numpy(float)
+    x = s['avg_hold_h'].to_numpy(float);
+    w = s['trades'].to_numpy(float)
     ok = np.isfinite(y) & np.isfinite(x) & (x > 0)
     y, x, w = y[ok], x[ok], w[ok]
     if x.size < 50: return np.nan
@@ -240,7 +255,9 @@ def build_benchmark(df, data_dir, cost):
 # 5. 池拆分 + 实例级指标
 # ==============================================================================
 def split_pools(df, bench, cfg):
-    info = bench.set_index('coin'); hint = set(cfg['STOCK_HINT']); tag = {}
+    info = bench.set_index('coin');
+    hint = set(cfg['STOCK_HINT']);
+    tag = {}
     for coin in df['coin'].astype(str).unique():
         span = info['span_days'].get(coin, np.nan)
         short = np.isfinite(span) and span < cfg['STOCK_MIN_SPAN_D']
@@ -261,7 +278,7 @@ def enrich(df, bench, cfg, tag):
     d['gross_ret'] = d['avg_ret'] + cost
     d['bench_ret'] = d['bh_per_h'] * d['avg_hold_h']
     d['excess'] = d['avg_ret'] - d['bench_ret']
-    d['ret_2x'] = d['avg_ret'] - cost                    # 成本翻倍
+    d['ret_2x'] = d['avg_ret'] - cost  # 成本翻倍
     d['edge_100h'] = d['excess'] / d['avg_hold_h'] * 100
     d['ret_100h'] = d['avg_ret'] / d['avg_hold_h'] * 100
 
@@ -273,7 +290,8 @@ def enrich(df, bench, cfg, tag):
     if 'max_win' in d.columns:
         d['sum_ex_max'] = d['sum_ret'] - d['max_win']
     else:
-        d['max_win'] = np.nan; d['sum_ex_max'] = np.nan
+        d['max_win'] = np.nan;
+        d['sum_ex_max'] = np.nan
 
     bad = d['trades'] < cfg['MIN_TRADES_INST']
     if 'exposure' in d.columns:
@@ -293,7 +311,8 @@ def build_matrices(q, value_col='avg_ret'):
     """
     q = q.copy()
     q['_j'] = (q['entry_factor'].astype(str) + '\x01' + q['exit_factor'].astype(str))
-    jcat = pd.Categorical(q['_j']); icat = pd.Categorical(q['coin'])
+    jcat = pd.Categorical(q['_j']);
+    icat = pd.Categorical(q['coin'])
     J, I = len(jcat.categories), len(icat.categories)
     jj, ii = jcat.codes.astype(np.int64), icat.codes.astype(np.int64)
     flat = jj * I + ii
@@ -314,6 +333,17 @@ def build_matrices(q, value_col='avg_ret'):
     np.maximum.at(MW.reshape(-1), flat, np.nan_to_num(q['max_win'].to_numpy(float)))
     EXPO = acc(q['exposure'] * q['trades']) if 'exposure' in q.columns else np.zeros((J, I))
     HOLD = acc(q['avg_hold_h'].fillna(0) * q['trades'])
+
+    # 新增: 构建胜率与最大回撤矩阵用于风险评估
+    WR = np.full(J * I, np.nan, dtype=np.float32)
+    if 'win_rate' in q.columns:
+        WR[flat] = q['win_rate'].to_numpy(float)
+    WR = WR.reshape(J, I)
+
+    MDD = np.full(J * I, np.nan, dtype=np.float32)
+    if 'max_dd' in q.columns:
+        MDD[flat] = q['max_dd'].to_numpy(float)
+    MDD = MDD.reshape(J, I)
 
     with np.errstate(invalid='ignore', divide='ignore'):
         M = np.where(N > 0, SUM / np.maximum(N, 1e-12), 0.0)
@@ -339,7 +369,7 @@ def build_matrices(q, value_col='avg_ret'):
                 N=N.astype(np.float32), M=M.astype(np.float32),
                 MWIN=MW_.astype(np.float32), MX=MX.astype(np.float32),
                 ME=ME.astype(np.float32), SS=SS, PNL=PNL,
-                MAXW=MW, EXPO=MEX, HOLD=MH,
+                MAXW=MW, EXPO=MEX, HOLD=MH, WR=WR, MDD=MDD,
                 OOS_N=None if OOS_N is None else OOS_N.astype(np.float32),
                 OOS_M=None if OOS_M is None else OOS_M.astype(np.float32))
 
@@ -373,7 +403,8 @@ def pooled_stats(mat, span_years):
     loo_min = np.where(np.isfinite(loo_min), loo_min, np.nan)
 
     # --- 集中度 ---
-    PNL = mat['PNL']; tot_pnl = PNL.sum(1)
+    PNL = mat['PNL'];
+    tot_pnl = PNL.sum(1)
     best_coin = PNL.max(1)
     with np.errstate(invalid='ignore', divide='ignore'):
         top1_coin = np.where(tot_pnl > 0, best_coin / tot_pnl, np.nan)
@@ -388,7 +419,7 @@ def pooled_stats(mat, span_years):
         pooled_excess=np.where(ok, (N * mat['MX']).sum(1) / np.maximum(T, 1e-12), np.nan),
         pooled_edge100h=np.where(ok, (N * mat['ME']).sum(1) / np.maximum(T, 1e-12), np.nan),
         mean_coin_ret=np.where(N > 0, M, np.nan).mean(1) if False else
-                      np.nansum(np.where(N > 0, M, np.nan), 1) / np.maximum((N > 0).sum(1), 1),
+        np.nansum(np.where(N > 0, M, np.nan), 1) / np.maximum((N > 0).sum(1), 1),
         med_coin_ret=np.nanmedian(np.where(N > 0, M, np.nan), axis=1),
         frac_pos=np.where(N > 0, (M > 0), np.nan).sum(1) / np.maximum((N > 0).sum(1), 1),
         min_coin_ret=np.nanmin(np.where(N > 0, M, np.inf), axis=1),
@@ -397,6 +428,8 @@ def pooled_stats(mat, span_years):
         t_naive=mu / np.maximum(se_naive, 1e-12),
         cluster_t=mu / np.maximum(se_cluster, 1e-12),
         loo_min_ret=loo_min,
+        med_win_rate=np.nanmedian(mat['WR'], axis=1),
+        med_max_dd=np.nanmedian(mat['MDD'], axis=1),
         total_pnl=tot_pnl, top1_coin_share=top1_coin, top1_trade_share=top1_trade,
         pnl_ex_best_coin=pnl_ex_coin, pnl_ex_top_trade=pnl_ex_trade,
         med_expo=np.nanmedian(np.where(N > 0, mat['EXPO'], np.nan), axis=1),
@@ -425,6 +458,7 @@ def pooled_stats(mat, span_years):
         seo = np.sqrt(np.maximum(bo * np.where(Go > 1, Go / np.maximum(Go - 1, 1), 1.0), 1e-24))
         d['oos_cluster_t'] = d['oos_pooled_ret'] / np.maximum(seo, 1e-12)
         d['oos_frac_pos'] = np.where(on > 0, (om > 0), np.nan).sum(1) / np.maximum((on > 0).sum(1), 1)
+        d['oos_retention'] = np.where(mu > 0, d['oos_pooled_ret'] / np.maximum(mu, 1e-12), np.nan)
 
     return pd.concat([mat['combos'].reset_index(drop=True), d.reset_index(drop=True)], axis=1)
 
@@ -469,7 +503,7 @@ def reality_check(mat, stats, cfg):
         boot_keep[b] = mu_b[keep].astype(np.float32)
         if (b + 1) % 200 == 0:
             el = time.time() - t0
-            print(f'      bootstrap {b+1}/{B}  {el:.0f}s  预计剩余 {el/(b+1)*(B-b-1):.0f}s')
+            print(f'      bootstrap {b + 1}/{B}  {el:.0f}s  预计剩余 {el / (b + 1) * (B - b - 1):.0f}s')
 
     # 单步 RC p 值
     rc_p = np.full(J, np.nan)
@@ -518,10 +552,11 @@ def marginal_pooled(q, col):
 # 9. 单池分析
 # ==============================================================================
 def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
-    coins = sorted(d['coin'].unique()); NC = len(coins)
+    coins = sorted(d['coin'].unique());
+    NC = len(coins)
     span_years = float(bench[bench['coin'].isin(coins)]['span_days'].median() / 365.25)
 
-    _h(f'【{name}】 币种 {NC} | 实例 {len(d):,} | 样本跨度中位 {span_years*12:.1f} 个月')
+    _h(f'【{name}】 币种 {NC} | 实例 {len(d):,} | 样本跨度中位 {span_years * 12:.1f} 个月')
 
     # ---------- 基准 ----------
     print('  [基准] 买入持有 每100h涨幅(%)  —— 判断样本期市况')
@@ -530,7 +565,7 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
     bt = bt.merge(d.groupby('coin')['avg_ret'].median().rename('中位单笔').reset_index(), on='coin')
     bt = bt.sort_values('bench_100h', ascending=False)
     _tbl(bt[['coin', 'src', 'span_days', 'bench_100h', '中位单笔']], n=200, fmt='{:.3f}')
-    _kv('\n  BH 为正的币', f"{int((bt['bench_100h']>0).sum())} / {NC}",
+    _kv('\n  BH 为正的币', f"{int((bt['bench_100h'] > 0).sum())} / {NC}",
         f"中位 {bt['bench_100h'].median():+.4f}%/100h")
 
     # ---------- 分布 ----------
@@ -542,7 +577,8 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
                    ('avg_hold_h', '持仓(h)'), ('exposure', 'exposure(%)'),
                    ('max_win', '最大单笔盈利(%)')]:
         if c in d.columns:
-            r = {'指标': lab}; r.update(_q(d[c]))
+            r = {'指标': lab};
+            r.update(_q(d[c]))
             r['mean'] = float(pd.Series(d[c]).replace([np.inf, -np.inf], np.nan).mean())
             rows.append(r)
     _tbl(pd.DataFrame(rows), fmt='{:.3f}')
@@ -551,7 +587,8 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
 
     # ---------- 过滤 ----------
     _h('实例级过滤（关于策略身份，不涉及盈利广度）', '-')
-    n0 = len(d); steps = [('① 全部实例', n0)]
+    n0 = len(d);
+    steps = [('① 全部实例', n0)]
     m = d['trades'] >= cfg['MIN_TRADES_INST']
     steps.append((f"② 笔数 ≥{cfg['MIN_TRADES_INST']}", int(m.sum())))
     if 'exposure' in d.columns:
@@ -561,11 +598,12 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
     steps.append((f"④ 持仓 ≥{cfg['MIN_HOLD_H']}h", int(m.sum())))
     prev = None
     for nm, n in steps:
-        print(f"    {nm:<26} {n:>9,}  {_bar(n, n0)}" + ('' if prev is None else f'  (-{prev-n:,})'))
+        print(f"    {nm:<26} {n:>9,}  {_bar(n, n0)}" + ('' if prev is None else f'  (-{prev - n:,})'))
         prev = n
     q = d[m].copy()
     if len(q) < 2000:
-        print('\n    ⚠ 过滤后样本不足'); return None
+        print('\n    ⚠ 过滤后样本不足');
+        return None
 
     # ---------- 矩阵 + 池化统计 ----------
     _h('组合级池化统计（聚类稳健）', '-')
@@ -578,8 +616,9 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
     key_all = mat['combos']['entry_factor'] + '\x01' + mat['combos']['exit_factor']
     key_keep = S['entry_factor'] + '\x01' + S['exit_factor']
     sel = key_all.isin(set(key_keep))
-    for k in ['N', 'M', 'MWIN', 'MX', 'ME', 'SS', 'PNL', 'MAXW', 'EXPO', 'HOLD']:
-        mat[k] = mat[k][sel.to_numpy()]
+    for k in ['N', 'M', 'MWIN', 'MX', 'ME', 'SS', 'PNL', 'MAXW', 'EXPO', 'HOLD', 'WR', 'MDD']:
+        if k in mat and mat[k] is not None:
+            mat[k] = mat[k][sel.to_numpy()]
     for k in ['OOS_N', 'OOS_M']:
         if mat[k] is not None: mat[k] = mat[k][sel.to_numpy()]
     mat['combos'] = mat['combos'][sel.to_numpy()].reset_index(drop=True)
@@ -587,8 +626,8 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
 
     _kv('参与统计的组合数', f'{len(S):,}',
         f"(门槛: 币数≥{cfg['MIN_COINS_DATA']}, 总笔数≥{cfg['MIN_TOTAL_TRADES']})")
-    _kv('构建耗时', f'{time.time()-t0:.1f}s')
-    _kv('pooled_ret > 0 的组合占比', f"{(S['pooled_ret']>0).mean()*100:.1f}%",
+    _kv('构建耗时', f'{time.time() - t0:.1f}s')
+    _kv('pooled_ret > 0 的组合占比', f"{(S['pooled_ret'] > 0).mean() * 100:.1f}%",
         '← 应≈50%，显著偏离说明样本有系统性方向')
     _kv('t 值虚高倍数 中位', f"{S['t_inflation'].median():.2f}x",
         '← naive_t / cluster_t。这就是 v1/v2 高估显著性的倍数')
@@ -620,35 +659,44 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
 
     # ---------- 漏斗 ----------
     _h('决策漏斗（面向"整体正期望 + 非偶然"）', '-')
-    f = S.copy(); n0 = len(f); fun = [('① 通过基础门槛的组合', n0)]
-    f = f[f['pooled_ret'] > 0];                       fun.append(('② 池化单笔期望 > 0', len(f)))
-    f = f[f['pooled_excess'] > 0];                    fun.append(('③ 超额(扣BH基准) > 0', len(f)))
-    f = f[f['pooled_ret_w'] > 0];                     fun.append(('④ winsor后仍 > 0（抗极值）', len(f)))
-    f = f[f['cluster_t'] > cfg['CLUSTER_T_TH']];      fun.append((f"⑤ cluster_t > {cfg['CLUSTER_T_TH']}", len(f)))
-    f = f[f['loo_min_ret'] > 0];                      fun.append(('⑥ 剔除任一币后仍 > 0', len(f)))
+    f = S.copy();
+    n0 = len(f);
+    fun = [('① 通过基础门槛的组合', n0)]
+    f = f[f['pooled_ret'] > 0];
+    fun.append(('② 池化单笔期望 > 0', len(f)))
+    f = f[f['pooled_excess'] > 0];
+    fun.append(('③ 超额(扣BH基准) > 0', len(f)))
+    f = f[f['pooled_ret_w'] > 0];
+    fun.append(('④ winsor后仍 > 0（抗极值）', len(f)))
+    f = f[f['cluster_t'] > cfg['CLUSTER_T_TH']];
+    fun.append((f"⑤ cluster_t > {cfg['CLUSTER_T_TH']}", len(f)))
+    f = f[f['loo_min_ret'] > 0];
+    fun.append(('⑥ 剔除任一币后仍 > 0', len(f)))
     f = f[(f['top1_coin_share'] < cfg['MAX_TOP1_COIN']) | f['top1_coin_share'].isna()]
     fun.append((f"⑦ 单币贡献 <{cfg['MAX_TOP1_COIN']:.0%}", len(f)))
     f = f[(f['top1_trade_share'] < cfg['MAX_TOP1_TRADE']) | f['top1_trade_share'].isna()]
     fun.append((f"⑧ 单笔贡献 <{cfg['MAX_TOP1_TRADE']:.0%}", len(f)))
-    f = f[f['pnl_ex_top_trade'] > 0];                 fun.append(('⑨ 去掉最大一笔仍盈利', len(f)))
+    f = f[f['pnl_ex_top_trade'] > 0];
+    fun.append(('⑨ 去掉最大一笔仍盈利', len(f)))
     if 'oos_pooled_ret' in f.columns:
         f = f[(f['oos_pooled_ret'] > 0) | f['oos_pooled_ret'].isna()]
         fun.append(('⑩ 样本外池化期望 > 0', len(f)))
-    f = f[f['rc_p'] < cfg['RC_P_TH']];                fun.append((f"⑪ RC p < {cfg['RC_P_TH']}", len(f)))
+    f = f[f['rc_p'] < cfg['RC_P_TH']];
+    fun.append((f"⑪ RC p < {cfg['RC_P_TH']}", len(f)))
     prev = None
     for nm, n in fun:
-        print(f"    {nm:<32} {n:>7,}  {_bar(n, n0, 40)}" + ('' if prev is None else f'  (-{prev-n:,})'))
+        print(f"    {nm:<32} {n:>7,}  {_bar(n, n0, 40)}" + ('' if prev is None else f'  (-{prev - n:,})'))
         prev = n
     shortlist = f.sort_values('cluster_t', ascending=False).copy()
 
     # ---------- 排行 ----------
     show = ['entry_factor', 'exit_factor', 'n_coins', 'total_trades',
-            'pooled_ret', 'pooled_excess', 'pooled_ret_w', 'cluster_t', 't_naive',
-            'rc_p', 'fdr_q', 'boot_lo5', 'boot_frac_pos', 'loo_min_ret',
-            'frac_pos', 'med_coin_ret', 'top1_coin_share', 'top1_trade_share',
-            'med_hold', 'med_expo', 'total_pnl', 'ann_ret_per_slot', 'avg_concurrent']
+            'pooled_ret', 'pooled_excess', 'cluster_t', 'rc_p',
+            'med_win_rate', 'med_max_dd', 'med_hold', 'avg_concurrent',
+            'boot_lo5', 'loo_min_ret', 'top1_coin_share', 'top1_trade_share',
+            'ann_ret_per_slot']
     if 'oos_pooled_ret' in S.columns:
-        show += ['oos_pooled_ret', 'oos_cluster_t', 'oos_frac_pos']
+        show += ['oos_pooled_ret', 'oos_retention', 'oos_cluster_t']
 
     for k, desc, asc in [
         ('cluster_t', 'K1 · 聚类稳健 t —— 主排序键（整体期望的显著性）', False),
@@ -657,7 +705,9 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
         ('rc_p', 'K4 · Reality Check p 值 —— 多重检验后的可信度', True),
     ]:
         if k not in S.columns: continue
-        print('\n' + '-' * W); print(f'  {desc}'); print('-' * W)
+        print('\n' + '-' * W);
+        print(f'  {desc}');
+        print('-' * W)
         _tbl(S.sort_values(k, ascending=asc), show, n=cfg['TOP_N'])
 
     # ---------- shortlist ----------
@@ -674,7 +724,7 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
         print('\n  [按进场因子去重后的独立想法]')
         _tbl(shortlist.drop_duplicates('entry_factor'),
              ['entry_factor', 'exit_factor', 'pooled_ret', 'cluster_t', 'rc_p',
-              'boot_lo5', 'frac_pos', 'total_trades', 'med_hold', 'ann_ret_per_slot'], n=15)
+              'boot_lo5', 'med_win_rate', 'med_max_dd', 'total_trades', 'med_hold', 'ann_ret_per_slot'], n=15)
         _h('候选决策卡', '-')
         for _, r in shortlist.head(8).iterrows():
             tags = []
@@ -684,14 +734,20 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
             if r['top1_coin_share'] < 0.2: tags.append('分散')
             if np.isfinite(r.get('oos_cluster_t', np.nan)) and r['oos_cluster_t'] > 1.5:
                 tags.append('OOS确认')
-            if r['med_hold'] > 120: tags.append('长持')
-            elif r['med_hold'] < 8: tags.append('短打·成本敏感')
+            if r.get('oos_retention', 0) > 0.5:
+                tags.append(f"OOS留存{r['oos_retention'] * 100:.0f}%")
+            if r['med_hold'] > 120:
+                tags.append('长持')
+            elif r['med_hold'] < 8:
+                tags.append('短打·成本敏感')
             print(f"\n    ▸ {r['entry_factor']}  ➜  {r['exit_factor']}")
             print(f"        单笔期望={r['pooled_ret']:+.4f}%  超额={r['pooled_excess']:+.4f}%  "
                   f"winsor={r['pooled_ret_w']:+.4f}%")
             print(f"        cluster_t={r['cluster_t']:.2f} (naive={r['t_naive']:.1f}, "
                   f"虚高{r['t_inflation']:.1f}x)  RC_p={r['rc_p']:.4f}  "
                   f"boot[5%,95%]=[{r['boot_lo5']:+.4f}, {r['boot_hi95']:+.4f}]")
+            print(
+                f"        胜率={r['med_win_rate']:.1f}% 中位回撤={r['med_max_dd']:.1f}% OOS留存={r.get('oos_retention', np.nan) * 100:.1f}%")
             print(f"        币数={int(r['n_coins'])} 笔数={int(r['total_trades'])} "
                   f"盈利币={r['frac_pos']:.0%} LOO最差={r['loo_min_ret']:+.4f} "
                   f"单币占比={r['top1_coin_share']:.0%} 单笔占比={r['top1_trade_share']:.0%}")
@@ -750,12 +806,12 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
             s2 = s2.copy()
             s2['档'] = pd.qcut(s2['pooled_ret'].rank(method='first'), 10, labels=range(1, 11))
             dc = s2.groupby('档').agg(n=('oos_pooled_ret', 'size'),
-                                     IS池化=('pooled_ret', 'mean'),
-                                     OOS池化=('oos_pooled_ret', 'mean'),
-                                     OOS为正=('oos_pooled_ret', lambda x: (x > 0).mean())).reset_index()
+                                      IS池化=('pooled_ret', 'mean'),
+                                      OOS池化=('oos_pooled_ret', 'mean'),
+                                      OOS为正=('oos_pooled_ret', lambda x: (x > 0).mean())).reset_index()
             _tbl(dc, fmt='{:.4f}')
             _kv('全体 OOS 池化均值', f"{s2['oos_pooled_ret'].mean():.4f}")
-            _kv('IS第10档 OOS 池化均值', f"{dc.loc[dc['档']==10,'OOS池化'].values[0]:.4f}")
+            _kv('IS第10档 OOS 池化均值', f"{dc.loc[dc['档'] == 10, 'OOS池化'].values[0]:.4f}")
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -771,16 +827,34 @@ def analyze_pool(name, d, diag, cfg, bench, save_dir=None):
         pd.DataFrame({'max_t_null': max_t_null}).to_csv(
             os.path.join(save_dir, f'rc_null_{sfx}.csv'), index=False)
 
-    del mat; gc.collect()
-    return dict(stats=S, shortlist=shortlist, entry=ent, exit=ext,
-                max_t_null=max_t_null, q=q)
+    res_dict = dict(raw=d, bench=bench, pools=out, pool_tag=tag)
+
+    if save:
+        with open(os.path.join(save_dir, 'analyze_cache.pkl'), 'wb') as f:
+            pickle.dump(res_dict, f)
+        print('      analyze_cache.pkl (全量数据缓存)')
+
+    del mat;
+    gc.collect()
+    return res_dict
+
+
+def load_res(out_dir='./factor_out_15m'):
+    """读取已保存的分析缓存文件，直接复用以查看 combo_detail"""
+    pkl_path = os.path.join(out_dir, 'analysis_v3', 'analyze_cache.pkl')
+    if not os.path.exists(pkl_path):
+        print(f"❌ 找不到缓存文件 {pkl_path}，请先完整运行一次 analyze()。")
+        return None
+    with open(pkl_path, 'rb') as f:
+        return pickle.load(f)
 
 
 # ==============================================================================
 # 10. 主入口
 # ==============================================================================
-def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
-    cfg = dict(DEFAULTS); cfg.update(kw)
+def analyze_main(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
+    cfg = dict(DEFAULTS);
+    cfg.update(kw)
     pd.set_option('display.unicode.east_asian_width', True)
 
     print('\n' + '#' * W)
@@ -796,7 +870,7 @@ def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
     _kv('来源', ', '.join(src)[:90])
     _kv('记录数', f'{len(pairs):,}')
     _kv('币种数', f"{pairs['coin'].nunique()}")
-    _kv('唯一组合数', f"{pairs.groupby(['entry_factor','exit_factor'], observed=True).ngroups:,}")
+    _kv('唯一组合数', f"{pairs.groupby(['entry_factor', 'exit_factor'], observed=True).ngroups:,}")
     _kv('假定往返成本', f"{cfg['COST_PCT']:.3f}%", '← 必须与挖掘脚本一致')
     _kv('全样本单笔净收益中位', f"{pairs['avg_ret'].median():+.4f}%",
         '← 若≈ -成本，说明随机组合收敛到理论值（框架健全）')
@@ -804,12 +878,13 @@ def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
     _h('§2  买入持有基准估计')
     bench = build_benchmark(pairs, data_dir, cfg['COST_PCT'])
     nk = int((bench['src'] == 'kline').sum())
-    _kv('K线首尾直算 / 回归兜底', f'{nk} / {len(bench)-nk}')
-    _kv('基准中位', f"{bench['bh_per_h'].median()*100:+.4f} %/100h")
+    _kv('K线首尾直算 / 回归兜底', f'{nk} / {len(bench) - nk}')
+    _kv('基准中位', f"{bench['bh_per_h'].median() * 100:+.4f} %/100h")
 
     tag = split_pools(pairs, bench, cfg)
     d = enrich(pairs, bench, cfg, tag)
-    del pairs; gc.collect()
+    del pairs;
+    gc.collect()
 
     _h('§3  标的池拆分')
     cnt = pd.Series(tag).value_counts()
@@ -817,7 +892,7 @@ def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
         mem = sorted([c for c, t in tag.items() if t == k])
         print(f'    {k:<16} {v:>3} 个')
         for i in range(0, len(mem), 12):
-            print('        ' + ', '.join(mem[i:i+12]))
+            print('        ' + ', '.join(mem[i:i + 12]))
 
     save_dir = os.path.join(out_dir, 'analysis_v3') if save else None
     out = {}
@@ -841,6 +916,9 @@ def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
         ('boot_lo5/hi95', 'bootstrap 重采样币种后，池化期望的 5%/95% 分位（置信区间）'),
         ('boot_frac_pos', 'bootstrap 中池化期望为正的比例，越接近 1 越稳'),
         ('loo_min_ret', '逐一剔除每个币后，池化期望的最小值。>0 = 不依赖任何单一币'),
+        ('med_win_rate', '单币中位胜率(%) —— 反映策略的胜率特征'),
+        ('med_max_dd', '单币中位最大回撤(%) —— 粗略评估单点风险水平'),
+        ('oos_retention', 'OOS收益留存率 (oos_pooled_ret / pooled_ret) —— 衡量抗过拟合能力(>50%较好)'),
         ('top1_coin_share', '贡献最大的币占总盈亏比例。>50% = 伪装成策略的单币行情'),
         ('top1_trade_share', '最大单笔占总盈亏比例。>35% = 彩票'),
         ('frac_pos', '盈利币种占比（诊断用，不作硬门槛 —— 这是你新目标下的降级项）'),
@@ -858,14 +936,29 @@ def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
             print(f'      {fn}')
 
     print('\n' + '#' * W + '\n')
+
+    # 修复：原函数名analyze在前面已经被定义，为了保持向后兼容和包装
     return dict(raw=d, bench=bench, pools=out, pool_tag=tag)
+
+
+# 修复顶层调用，防止递归或覆盖
+def analyze(out_dir='./factor_out_15m', data_dir='./data', save=True, **kw):
+    res_dict = analyze_main(out_dir, data_dir, save, **kw)
+    if save:
+        save_dir = os.path.join(out_dir, 'analysis_v3')
+        os.makedirs(save_dir, exist_ok=True)
+        with open(os.path.join(save_dir, 'analyze_cache.pkl'), 'wb') as f:
+            pickle.dump(res_dict, f)
+        print('      analyze_cache.pkl (全量数据缓存)')
+    return res_dict
 
 
 def combo_detail(res, entry_factor, exit_factor):
     df = res['raw']
     s = df[(df['entry_factor'] == entry_factor) & (df['exit_factor'] == exit_factor)]
     if s.empty:
-        print('未找到该组合'); return
+        print('未找到该组合');
+        return
     _h(f'{entry_factor}  >  {exit_factor}')
     cols = [c for c in ['coin', 'pool', 'trades', 'win_rate', 'avg_ret', 'bench_ret',
                         'excess', 'edge_100h', 'sum_ret', 'max_dd', 'avg_hold_h',
@@ -874,22 +967,31 @@ def combo_detail(res, entry_factor, exit_factor):
     _tbl(s.sort_values('sum_ret', ascending=False), cols, fmt='{:.4f}')
     T = s['trades'].sum()
     mu = float((s['avg_ret'] * s['trades']).sum() / max(T, 1))
-    cm = s.groupby('coin').apply(lambda x: float((x['avg_ret']*x['trades']).sum()/max(x['trades'].sum(),1)))
+    cm = s.groupby('coin').apply(lambda x: float((x['avg_ret'] * x['trades']).sum() / max(x['trades'].sum(), 1)))
     se = cm.std(ddof=1) / math.sqrt(max(len(cm), 1)) if len(cm) > 1 else np.nan
     print()
     _kv('覆盖币种 / 通过过滤', f"{s['coin'].nunique()} / {int((~s['filtered_out']).sum())}")
     _kv('总笔数', f'{int(T):,}')
     _kv('池化单笔期望', f'{mu:+.4f}%')
-    _kv('cluster_t', f"{mu/se:.2f}" if se and np.isfinite(se) and se > 0 else 'n/a')
-    _kv('盈利币 / 总币', f"{int((cm>0).sum())} / {len(cm)}")
+    _kv('cluster_t', f"{mu / se:.2f}" if se and np.isfinite(se) and se > 0 else 'n/a')
+
+    if 'oos_trades' in s.columns and 'oos_avg_ret' in s.columns:
+        OOS_T = s['oos_trades'].sum()
+        if OOS_T > 0:
+            oos_mu = float((s['oos_avg_ret'] * s['oos_trades']).sum() / OOS_T)
+            _kv('OOS 总笔数 / 池化期望', f'{int(OOS_T):,} / {oos_mu:+.4f}%')
+            _kv('OOS 收益留存率', f'{oos_mu / mu * 100:.1f}%' if mu > 0 else 'N/A')
+
+    _kv('盈利币 / 总币', f"{int((cm > 0).sum())} / {len(cm)}")
     _kv('总盈亏', f"{s['sum_ret'].sum():.1f}%",
-        f"去掉最好的币 {s['sum_ret'].sum()-s['sum_ret'].max():.1f}%")
-    _kv('最大贡献币', f"{s.loc[s['sum_ret'].idxmax(),'coin']} "
-                     f"({s['sum_ret'].max()/max(s['sum_ret'].sum(),1e-9)*100:.0f}%)")
+        f"去掉最好的币 {s['sum_ret'].sum() - s['sum_ret'].max():.1f}%")
+    _kv('最大贡献币', f"{s.loc[s['sum_ret'].idxmax(), 'coin']} "
+                      f"({s['sum_ret'].max() / max(s['sum_ret'].sum(), 1e-9) * 100:.0f}%)")
 
 
 if __name__ == '__main__':
     import sys
+
     o = sys.argv[1] if len(sys.argv) > 1 else './factor_out_15m'
     dd = sys.argv[2] if len(sys.argv) > 2 else './data'
     analyze(o, dd)
