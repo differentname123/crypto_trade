@@ -376,9 +376,14 @@ def main(cfg=CFG):
         print("❌ 未发现 K线数据文件。")
         return
 
-    print("=" * 70)
-    print(f" 🚀 定制策略回测启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
-    print("=" * 70)
+    # 【本次修改的核心部分】: 让控制台输出完整的参数组合，排查进度一目了然
+    print("=" * 100)
+    if 'SEARCH_PARAMS' in cfg:
+        p_str = " | ".join(f"{k}={v}" for k, v in cfg['SEARCH_PARAMS'].items())
+        print(f" 🚀 正在执行参数组合: {p_str} | numba={'ON' if HAS_NUMBA else 'OFF'}")
+    else:
+        print(f" 🚀 定制策略回测启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
+    print("=" * 100)
 
     results = []
     all_rets = []
