@@ -125,7 +125,7 @@ def scan_signals_and_trades(df, params):
         return [], [], None
 
     o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
-    W = 24 * params['WARMUP_DAYS']
+    W = 24 * params['WARMUP_DAYS']  # 720
     N = 24
 
     EPS = 1e-12
@@ -146,15 +146,22 @@ def scan_signals_and_trades(df, params):
     open_trade = None
     symbol = df.attrs.get('symbol', 'UNKNOWN')
 
-    cutoff_time = df['datetime_bj'].max() - pd.Timedelta(days=3000)
+    cutoff_time = df['datetime_bj'].max() - pd.Timedelta(days=300000)
 
-    # 遍历全量数据以保证交易配对的正确性
+    # 🎯 新增：计算预热期结束的时间点（与原回测逻辑对齐）
+    warmup_bars = W  # 720根K线作为预热期
+    warmup_end_time = df['datetime_bj'].iloc[warmup_bars] if len(df) > warmup_bars else df['datetime_bj'].iloc[0]
+
     for i in range(len(df)):
         dt = df.loc[i, 'datetime_bj']
         is_entry = entry_signal.iloc[i]
         is_exit = exit_signal.iloc[i]
 
-        # 1. 收集近3天的信号 (用于列表展示)
+        # 🎯 新增：跳过预热期内的所有信号（与原回测代码对齐）
+        if dt < warmup_end_time:
+            continue
+
+        # 1. 收集近3天的信号
         if dt >= cutoff_time:
             if is_entry:
                 signals.append({
@@ -168,7 +175,7 @@ def scan_signals_and_trades(df, params):
                     'price': c.iloc[i], 'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})"
                 })
 
-        # 2. 状态机配对交易
+        # 2. 状态机配对交易（只在预热期结束后才开始）
         if is_entry and open_trade is None:
             open_trade = {'entry_time': dt, 'entry_price': c.iloc[i]}
         elif is_exit and open_trade is not None:
@@ -191,7 +198,7 @@ def scan_signals_and_trades(df, params):
     recent_trades = [t for t in trades if t['exit_time'] >= cutoff_time or t['entry_time'] >= cutoff_time]
     recent_trades.sort(key=lambda x: x['entry_time'])
 
-    # 4. 检查当前是否有未平仓的持仓
+    # 4. 当前未平仓持仓
     current_holding = None
     if open_trade is not None:
         current_price = c.iloc[-1]
@@ -206,7 +213,6 @@ def scan_signals_and_trades(df, params):
         }
 
     return signals, recent_trades, current_holding
-
 
 # ============================================================================
 # 4. 主流程
@@ -298,7 +304,7 @@ def main():
             win_rate = (wins / total_t) * 100 if total_t > 0 else 0
             total_pnl = sum(t['pnl_pct'] for t in all_recent_trades)
             print(
-                f"🌍 全局汇总: 闭环 {total_t} 笔 | 胜率 {win_rate:.1f}% ({wins}胜 {total_t - wins}负) | 累计毛收益 {total_pnl:+.2f}% (未扣手续费/滑点)")
+                f"🌍 全局汇总: 闭环 {total_t} 笔 | 胜率 {win_rate:.1f}% ({wins}胜 {total_t - wins}负) | 累计毛收益 {total_pnl:+.2f}% (未扣手续费/滑点) 平均收益 {total_pnl / total_t:+.2f}%")
             print("-" * 100)
 
         # 单币种明细
