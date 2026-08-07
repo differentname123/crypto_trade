@@ -34,6 +34,10 @@ CFG = dict(
 EPS = 1e-12
 GLOBAL_PLATEAU_RESULTS = []
 
+# 全局内存缓存，用于极大地加速数据读取和指标计算
+_DF_CACHE = {}
+_FACTOR_CACHE = {}
+
 # ======================================================================
 # 1. numba 可选加速
 # ======================================================================
@@ -93,7 +97,7 @@ def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
 
 
 # ======================================================================
-# 2. 数据加载与对齐
+# 2. 数据加载与对齐 (加入内存缓存机制)
 # ======================================================================
 def _pick(df, cands, what):
     for c in cands:
@@ -153,8 +157,16 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     return df
 
 
+def _load_symbol_cached(kline_file, oi_file, fr_file, bar_minutes):
+    """带全局缓存的数据加载包装器，大幅度降低跨参数回测I/O时间"""
+    cache_key = (kline_file, bar_minutes)
+    if cache_key not in _DF_CACHE:
+        _DF_CACHE[cache_key] = load_symbol(kline_file, oi_file, fr_file, bar_minutes)
+    return _DF_CACHE[cache_key]
+
+
 # ======================================================================
-# 3. 极简因子计算
+# 3. 极简因子计算 (加入滚动指标复用缓存)
 # ======================================================================
 def make_params(bar_minutes, n_rows):
     bph = 60.0 / bar_minutes
@@ -174,23 +186,43 @@ def build_factors(df, P):
     o, h, l, c = df['open'], df['high'], df['low'], df['close']
     v = df['volume']
 
+    # 唯一标识同一份DataFrame，用于缓存耗时的因子运算
+    df_id = id(df)
+
     # 提取搜索参数
     upper_wick_thresh = P.get('UPPER_WICK_THRESH', 0.50)
     vol_quantile = P.get('VOL_QUANTILE', 0.95)
     high_close_thresh = P.get('HIGH_CLOSE_THRESH', 0.95)
 
-    def QT(s, p): return s.rolling(W, min_periods=mp).quantile(p).shift(1)
+    def QT(s, p):
+        key = (df_id, 'QT', W, mp, p)
+        if key not in _FACTOR_CACHE:
+            _FACTOR_CACHE[key] = s.rolling(W, min_periods=mp).quantile(p).shift(1)
+        return _FACTOR_CACHE[key]
 
-    def bs(s, k=1): return s.shift(k, fill_value=False)
+    def bs(s, k=1):
+        return s.shift(k, fill_value=False)
 
-    maxH_N = h.rolling(N, min_periods=max(2, N // 2)).max()
-    rng = (h - l) + EPS
-    uw = (h - np.maximum(o, c)) / rng
+    # 缓存最耗时的 rolling 算子操作
+    key_maxH = (df_id, 'maxH', N)
+    if key_maxH not in _FACTOR_CACHE:
+        _FACTOR_CACHE[key_maxH] = h.rolling(N, min_periods=max(2, N // 2)).max()
+    maxH_N = _FACTOR_CACHE[key_maxH]
+
+    key_uw = (df_id, 'uw')
+    if key_uw not in _FACTOR_CACHE:
+        rng = (h - l) + EPS
+        _FACTOR_CACHE[key_uw] = (h - np.maximum(o, c)) / rng
+    uw = _FACTOR_CACHE[key_uw]
+
+    key_inside = (df_id, 'inside')
+    if key_inside not in _FACTOR_CACHE:
+        _FACTOR_CACHE[key_inside] = (h < h.shift(1)) & (l > l.shift(1))
 
     F = {}
     F['KLINE_LONG_UPPER_WICK'] = uw > upper_wick_thresh
     F['VOLUME_SPIKE'] = v > QT(v, vol_quantile)
-    F['KLINE_INSIDE_BAR'] = (h < h.shift(1)) & (l > l.shift(1))
+    F['KLINE_INSIDE_BAR'] = _FACTOR_CACHE[key_inside]
 
     # 入场信号: 高位长上影且放量
     F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > high_close_thresh) & F['KLINE_LONG_UPPER_WICK'] & F[
@@ -294,14 +326,14 @@ def mine_symbol(coin, df, cfg):
     if ent.size < 1:
         return None, [], []
 
-    # 计算真实的资金费率扣除 (基于实际结算时间点)
+    # 优化点：基于向量化累加 (cumsum) 彻底消灭计算资金费率扣除的 for 循环
     fr_arr = df['funding_settlement'].to_numpy(float)
-    funding_costs = np.zeros(len(ent))
-    for i in range(len(ent)):
-        start_idx = ent[i] + 1
-        end_idx = ext[i] + 1
-        if start_idx < n:
-            funding_costs[i] = np.sum(fr_arr[start_idx:end_idx])
+    fr_cumsum = np.zeros(n + 1, dtype=float)
+    np.cumsum(fr_arr, out=fr_cumsum[1:])
+
+    start_idx = np.minimum(ent + 1, n)
+    end_idx = np.minimum(ext + 1, n)
+    funding_costs = fr_cumsum[end_idx] - fr_cumsum[start_idx]
 
     # 扣除手续费、滑点和资金费率 (做多时，资金费率为正扣除，为负增加利润)
     rets = exec_px[ext] / exec_px[ent] - 1.0 - cost - funding_costs
@@ -364,7 +396,8 @@ def main(cfg=CFG):
             continue
 
         try:
-            df = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+            # 采用内存读取缓存方式
+            df = _load_symbol_cached(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
             if len(df) < 800:
                 continue
 
@@ -385,21 +418,6 @@ def main(cfg=CFG):
     df_res = pd.DataFrame(results)
     df_res.sort_values('sum_ret', ascending=False, inplace=True)
     df_res['oos_trades'] = df_res['oos_trades'].fillna(0).astype(int)
-
-    # # ==========================
-    # # 打印特定排版的交易日志表
-    # # ==========================
-    # cols_to_show = [
-    #     'coin', 'pool', 'trades', 'win_rate', 'pl_ratio', 'max_consec_loss',
-    #     'avg_ret', 'sum_ret', 'max_dd', 'avg_hold_h', 'total_fr_cost',
-    #     'oos_trades', 'oos_avg_ret'
-    # ]
-    #
-    # print("\n" + "=" * 120)
-    #
-    # # 临时设定 pandas 格式输出以完全匹配目标对齐效果
-    # pd.set_option('display.float_format', lambda x: f'{x:.4f}')
-    # print(df_res[cols_to_show].to_string(index=False))
 
     # ==========================
     # 打印底部全局统计摘要
@@ -485,7 +503,7 @@ if __name__ == '__main__':
         'UPPER_WICK_THRESH': [0.40, 0.50, 0.60],  # 上影线占比阈值
         'VOL_QUANTILE': [0.90, 0.95, 0.98],  # 成交量分位数
         'HIGH_CLOSE_THRESH': [0.90, 0.95, 0.98],  # 高位收盘价阈值
-        'BAR_MINUTES': [5,15,30,60,120]
+        'BAR_MINUTES': [5, 15, 30, 60, 120]
     }
 
     keys = list(param_grid.keys())
@@ -496,6 +514,8 @@ if __name__ == '__main__':
     for combo in combinations:
         params = dict(zip(keys, combo))
         CFG['SEARCH_PARAMS'] = params
+        # 修正: 保证字典里传入了新的 BAR_MINUTES 时覆盖回主流程中，以便不同周期重采样生效并缓存命中
+        CFG['BAR_MINUTES'] = params.get('BAR_MINUTES', CFG['BAR_MINUTES'])
         main(CFG)
 
     # ==========================
