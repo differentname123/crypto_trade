@@ -29,6 +29,7 @@ CFG = dict(
     COOLDOWN_BARS=0,  # 冷却K线数
     OOS_SPLIT=0.70,  # 样本内外切分比例
     COINS=None,  # 填入指定的币种列表如 ['PEPE', 'WIF']，None表示全跑
+    RANK_MODE='both',  # 排行榜过滤模式：'both', 'top', 'bottom'
 )
 
 EPS = 1e-12
@@ -225,20 +226,24 @@ def build_factors(df, P, cross_mask=None):
     F['VOLUME_SPIKE'] = v > QT(v, vol_quantile)
     F['KLINE_INSIDE_BAR'] = _FACTOR_CACHE[key_inside]
 
-    # 入场信号: 高位长上影且放量
-    F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > high_close_thresh) & F['KLINE_LONG_UPPER_WICK'] & F[
+    # 原生入场信号: 高位长上影且放量 (未经过滤器)
+    F['EXIT_UPPER_WICK_REJECTION_RAW'] = (c / (maxH_N + EPS) > high_close_thresh) & F['KLINE_LONG_UPPER_WICK'] & F[
         'VOLUME_SPIKE']
 
-    # 动态应用截面排名前/后 50 过滤 (避免未来函数)
+    # 动态应用截面排名前/后 50 过滤，同时保留被过滤掉的信号用于排雷计算
     if cross_mask is not None:
-        F['EXIT_UPPER_WICK_REJECTION'] = F['EXIT_UPPER_WICK_REJECTION'] & cross_mask
+        F['EXIT_UPPER_WICK_REJECTION'] = F['EXIT_UPPER_WICK_REJECTION_RAW'] & cross_mask
+        F['EXIT_REJECTED'] = F['EXIT_UPPER_WICK_REJECTION_RAW'] & (~cross_mask)
+    else:
+        F['EXIT_UPPER_WICK_REJECTION'] = F['EXIT_UPPER_WICK_REJECTION_RAW']
+        F['EXIT_REJECTED'] = pd.Series(False, index=df.index)
 
     # 出场信号: 孕线之后突破且放量
     F['ENTRY_INSIDE_BREAK_VOLUME'] = bs(F['KLINE_INSIDE_BAR']) & (c > h.shift(1)) & F['VOLUME_SPIKE']
 
     out = {}
-    for k_ in ['EXIT_UPPER_WICK_REJECTION', 'ENTRY_INSIDE_BREAK_VOLUME']:
-        out[k_] = np.ascontiguousarray(F[k_].fillna(False).to_numpy(dtype=bool))
+    for k_ in ['EXIT_UPPER_WICK_REJECTION', 'ENTRY_INSIDE_BREAK_VOLUME', 'EXIT_REJECTED']:
+        out[k_] = np.ascontiguousarray(F.get(k_, pd.Series(False, index=df.index)).fillna(False).to_numpy(dtype=bool))
     return out
 
 
@@ -303,7 +308,7 @@ def mine_symbol(coin, df, cfg, cross_mask=None):
 
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
-        return None, [], []
+        return None, [], [], [], []
 
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
@@ -320,37 +325,39 @@ def mine_symbol(coin, df, cfg, cross_mask=None):
     bench_ret = float((cl[-1] / cl[0] - 1.0) * 100)
     bt_days = float(n * bm / 1440.0)  # 1440分钟 = 1天
 
-    # 核心匹配
-    entry_arr = F['EXIT_UPPER_WICK_REJECTION']
-    exit_arr = F['ENTRY_INSIDE_BREAK_VOLUME']
-
-    max_tr = n // 2 + 2
-    if HAS_NUMBA:
-        ent, ext = _core_static(entry_arr, exit_arr, n, cfg['COOLDOWN_BARS'], max_tr)
-    else:
-        eidx = np.flatnonzero(entry_arr).astype(np.int64)
-        xidx = np.flatnonzero(exit_arr).astype(np.int64)
-        ent, ext = _match_static_ss(eidx, xidx, n, cfg['COOLDOWN_BARS'], max_tr)
-
-    if ent.size < 1:
-        return None, [], []
-
-    # 优化点：基于向量化累加 (cumsum) 彻底消灭计算资金费率扣除的 for 循环
+    # 优化点：基于向量化累加彻底消灭计算资金费率扣除的 for 循环
     fr_arr = df['funding_settlement'].to_numpy(float)
     fr_cumsum = np.zeros(n + 1, dtype=float)
     np.cumsum(fr_arr, out=fr_cumsum[1:])
+    max_tr = n // 2 + 2
 
-    start_idx = np.minimum(ent + 1, n)
-    end_idx = np.minimum(ext + 1, n)
-    funding_costs = fr_cumsum[end_idx] - fr_cumsum[start_idx]
+    def _calc_rets(entry_arr, exit_arr):
+        if HAS_NUMBA:
+            ent_, ext_ = _core_static(entry_arr, exit_arr, n, cfg['COOLDOWN_BARS'], max_tr)
+        else:
+            eidx = np.flatnonzero(entry_arr).astype(np.int64)
+            xidx = np.flatnonzero(exit_arr).astype(np.int64)
+            ent_, ext_ = _match_static_ss(eidx, xidx, n, cfg['COOLDOWN_BARS'], max_tr)
 
-    # 扣除手续费、滑点和资金费率 (做多时，资金费率为正扣除，为负增加利润)
-    rets = exec_px[ext] / exec_px[ent] - 1.0 - cost - funding_costs
-    ok = np.isfinite(rets)
-    ent, ext, rets, funding_costs = ent[ok], ext[ok], rets[ok], funding_costs[ok]
+        if ent_.size < 1:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=float), np.array([],
+                                                                                                                   dtype=float)
+
+        start_idx = np.minimum(ent_ + 1, n)
+        end_idx = np.minimum(ext_ + 1, n)
+        fc_ = fr_cumsum[end_idx] - fr_cumsum[start_idx]
+
+        # 扣除手续费、滑点和资金费率
+        r_ = exec_px[ext_] / exec_px[ent_] - 1.0 - cost - fc_
+        ok = np.isfinite(r_)
+        return ent_[ok], ext_[ok], r_[ok], fc_[ok]
+
+    # 分别计算通过过滤器的交易 和 被拦截的废弃交易
+    ent, ext, rets, funding_costs = _calc_rets(F['EXIT_UPPER_WICK_REJECTION'], F['ENTRY_INSIDE_BREAK_VOLUME'])
+    _, _, rets_rej, _ = _calc_rets(F['EXIT_REJECTED'], F['ENTRY_INSIDE_BREAK_VOLUME'])
 
     if ent.size < 1:
-        return None, [], []
+        return None, [], [], [], []
 
     split_bar = int(n * cfg['OOS_SPLIT'])
     # 将基准收益和时长存入行数据
@@ -369,7 +376,7 @@ def mine_symbol(coin, df, cfg, cross_mask=None):
     row['edge_100h'] = (row['excess'] / row['avg_hold_h'] * 100) if row.get('avg_hold_h', 0) > 0 else np.nan
     row['filtered_out'] = True
 
-    return row, rets.tolist(), rets[~m_is].tolist()
+    return row, rets.tolist(), rets[m_is].tolist(), rets[~m_is].tolist(), rets_rej.tolist()
 
 
 # ======================================================================
@@ -420,6 +427,7 @@ def main(cfg=CFG):
 
     bm = cfg['BAR_MINUTES']
     top_k = cfg.get('SEARCH_PARAMS', {}).get('CROSS_RANK_K', 9999)
+    rank_mode = cfg.get('SEARCH_PARAMS', {}).get('RANK_MODE', cfg.get('RANK_MODE', 'both'))
 
     # 极速计算并缓存全局 24H 涨跌幅截面，消除由于周期带来的多次运算
     if bm not in _CROSS_CACHE:
@@ -446,13 +454,20 @@ def main(cfg=CFG):
     # 使用 subtract 防止 reshape/broadcasting 产生的异常报错
     is_bottom_k = rank_24h.subtract(valid_count, axis=0).gt(-top_k)
 
-    # 构建包含所有币种布尔状态的统一掩码池
-    cross_mask_df = is_top_k | is_bottom_k
+    # 根据动态 RANK_MODE 构建掩码池
+    if rank_mode == 'top':
+        cross_mask_df = is_top_k
+    elif rank_mode == 'bottom':
+        cross_mask_df = is_bottom_k
+    else:
+        cross_mask_df = is_top_k | is_bottom_k
     # ------------------------------------------------------------------
 
     results = []
     all_rets = []
+    all_is_rets = []
     all_oos_rets = []
+    all_rej_rets = []
 
     for kf, coin, oi_f, fr_f in valid_coins_info:
         try:
@@ -465,12 +480,15 @@ def main(cfg=CFG):
             else:
                 coin_mask_series = pd.Series(True, index=df.index)
 
-            res_dict, rets_list, oos_rets_list = mine_symbol(coin, df, cfg, coin_mask_series)
+            res = mine_symbol(coin, df, cfg, coin_mask_series)
 
-            if res_dict is not None:
+            if res is not None and res[0] is not None:
+                res_dict, rets_list, is_rets_list, oos_rets_list, rej_rets_list = res
                 results.append(res_dict)
                 all_rets.extend(rets_list)
+                all_is_rets.extend(is_rets_list)
                 all_oos_rets.extend(oos_rets_list)
+                all_rej_rets.extend(rej_rets_list)
 
         except Exception as e:
             pass
@@ -487,12 +505,20 @@ def main(cfg=CFG):
     # 打印底部全局统计摘要
     # ==========================
     all_rets_arr = np.array(all_rets) * 100
+    all_is_rets_arr = np.array(all_is_rets) * 100
     all_oos_rets_arr = np.array(all_oos_rets) * 100
+    all_rej_rets_arr = np.array(all_rej_rets) * 100
 
     total_trades = len(all_rets_arr)
     pooled_expected = all_rets_arr.mean() if total_trades > 0 else 0
     std_ret = all_rets_arr.std(ddof=1) if total_trades > 1 else 0
     cluster_t = pooled_expected / (std_ret / np.sqrt(total_trades)) if std_ret > 0 else float('nan')
+
+    # IS 期望 与 排雷期望 计算
+    is_pooled_expected = all_is_rets_arr.mean() if len(all_is_rets_arr) > 0 else 0.0
+    rej_pooled_expected = all_rej_rets_arr.mean() if len(all_rej_rets_arr) > 0 else 0.0
+    # 排雷指标：池化期望 - 被拦截信号期望（大于0证明成功拦截垃圾信号，小于0证明错杀了优质信号）
+    mine_sweeper_metric = pooled_expected - rej_pooled_expected if len(all_rej_rets_arr) > 0 else 0.0
 
     # 全局新增指标计算
     global_win_rate = float((all_rets_arr > 0).mean() * 100) if total_trades > 0 else 0.0
@@ -547,20 +573,23 @@ def main(cfg=CFG):
     print(f"    平均回测时长                                    : {avg_bt_days:.1f} 天")
     print(f"    总笔数                                         : {total_trades}")
     print(f"    全局胜率                                        : {global_win_rate:.2f}%")
-    print(f"    池化单笔期望                                    : +{pooled_expected:.4f}%")
+    print(f"    池化单笔期望 (总体)                              : +{pooled_expected:.4f}%")
+    print(f"    IS (前半段) 池化期望                             : +{is_pooled_expected:.4f}%")
+    print(f"    OOS (后半段) 总笔数 / 池化期望                   : {oos_trades} / +{oos_pooled_expected:.4f}%")
+    print(f"    OOS 收益留存率                                 : {oos_retention:.1f}%")
+    print(f"    被拦截/过滤废弃的信号期望                        : {rej_pooled_expected:.4f}%")
+    print(f"    排雷指标 (大于0证明拦截了差交易,小于0证明误杀)      : {mine_sweeper_metric:.4f}%")
     print(f"    cluster_t                                    : {cluster_t:.2f}")
     print(f"    全局盈亏比 (P/L Ratio)                         : {global_pl_ratio:.2f}")
     print(
         f"    单币最大回撤 (均值 / 最劣)                       : {global_max_dd_mean:.2f}% / {global_max_dd_worst:.2f}%")
     print(f"    全局最大连续亏损                                : {global_max_consec_loss}")
-    print(f"    OOS 总笔数 / 池化期望                           : {oos_trades} / +{oos_pooled_expected:.4f}%")
-    print(f"    OOS 收益留存率                                 : {oos_retention:.1f}%")
     print(f"    盈利币 / 总币                                  : {profitable_coins} / {total_coins}")
-    print(f"    策略总盈亏                                      : {total_pnl:.1f}%    去掉最好的币 {pnl_ex_best:.1f}%")
+    print(f"    策略总盈亏                                      : {total_pnl:.1f}%")
+    print(f"    剔除妖币 [{max_coin}] 后剩余盈亏                 : {pnl_ex_best:.1f}%")
     print(f"    同期基准总收益 (Buy&Hold)                       : {total_bench_ret:.1f}%")
     print(f"    策略Alpha (总盈亏 - 基准)                        : {alpha_ret:.1f}%")
     print(f"    总资金费率扣除                                  : {total_fr_cost_sum:.2f}%")
-    print(f"    最大贡献币                                      : {max_coin} ({max_contrib_pct:.0f}%)")
 
     # 收集参数平原数据 (新增胜率和最大回撤)
     if 'SEARCH_PARAMS' in cfg:
@@ -568,13 +597,17 @@ def main(cfg=CFG):
             'params': cfg['SEARCH_PARAMS'],
             'total_trades': total_trades,
             'global_win_rate': global_win_rate,
+            'is_expected': is_pooled_expected,
+            'oos_expected': oos_pooled_expected,
             'pooled_expected': pooled_expected,
+            'mine_sweeper': mine_sweeper_metric,
             'cluster_t': cluster_t,
             'oos_retention': oos_retention,
             'global_pl_ratio': global_pl_ratio,
             'max_dd_worst': global_max_dd_worst,
             'global_max_consec_loss': global_max_consec_loss,
             'total_pnl': total_pnl,
+            'pnl_ex_best': pnl_ex_best,
             'total_bench_ret': total_bench_ret,
             'alpha': alpha_ret
         })
@@ -584,13 +617,14 @@ if __name__ == '__main__':
     # 固定使用表现最好的 15分钟 周期进行参数平原搜索
     CFG['BAR_MINUTES'] = 15
 
-    # 划定核心参数的搜索空间
+    # 划定核心参数的搜索空间 (新增了 RANK_MODE)
     param_grid = {
         'UPPER_WICK_THRESH': [0.60],  # 上影线占比阈值
         'VOL_QUANTILE': [0.95],  # 成交量分位数
         'HIGH_CLOSE_THRESH': [0.90],  # 高位收盘价阈值
         'CROSS_RANK_K': [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100],
-        'BAR_MINUTES': [15,30,60]
+        'BAR_MINUTES': [15, 30, 60],
+        'RANK_MODE': ['both', 'top', 'bottom']  # <--- 新增搜索空间
     }
 
     keys = list(param_grid.keys())
@@ -627,6 +661,10 @@ if __name__ == '__main__':
 
         print("\n💡 稳健性建议: 不要盲目选择排名第一的参数！请观察表格，寻找那些在参数微调时，")
         print("   OOS留存率、Cluster T 和 池化期望 依然保持高位的'平原'区域（即相邻参数组合表现都很稳定的区域）。")
-        print("   ※ 重点观察新增的 [alpha] 列，若总盈亏很高但 alpha 为负，说明策略仅仅是吃到了大盘红利。")
+        print("   ※ 重点观察新增防过拟合指标：")
+        print("     [is_expected] vs [oos_expected]: 谨防只是前半段行情有效，后半段亏损。")
+        print("     [mine_sweeper]: 大于 0 说明横截面过滤算法拦截了无效交易，小于 0 则说明误杀了优质收益。")
+        print("     [pnl_ex_best]: 与 total_pnl 对比，如果该值大幅缩水甚至为负，说明完全靠一个妖币硬顶！")
+        print("     [alpha]: 若总盈亏很高但 alpha 为负，说明策略仅仅是吃到了大盘红利。")
     else:
         print("⚠️ 未收集到任何回测结果。")
