@@ -29,34 +29,34 @@ warnings.filterwarnings("ignore")
 # 0. 全局配置
 # ======================================================================
 CFG = dict(
-    DATA_DIR              = './data',
-    OUT_DIR               = './factor_out_15m',
+    DATA_DIR='./data',
+    OUT_DIR='./factor_out_15m',
 
     # --- 采样与执行 ---
-    BAR_MINUTES           = 15,      # 1 也能跑，但组合数×数据量会非常重；建议 5/15
-    FEE_RATE              = 0.0005,  # 单边手续费
-    SLIPPAGE              = 0.0005,  # 单边滑点(山寨务必给足)
-    COOLDOWN_BARS         = 0,       # 平仓后冷却多少根才允许再入场
-    FORCE_CLOSE_AT_END    = True,
+    BAR_MINUTES=15,  # 1 也能跑，但组合数×数据量会非常重；建议 5/15
+    FEE_RATE=0.0005,  # 单边手续费
+    SLIPPAGE=0.0005,  # 单边滑点(山寨务必给足)
+    COOLDOWN_BARS=0,  # 平仓后冷却多少根才允许再入场
+    FORCE_CLOSE_AT_END=True,
 
     # --- 因子行为 ---
-    RANK_SHIFT            = 0,       # rank_W 是否 shift(1)。0=不shift(推荐) 1=按你原方案
-    DEDUPE_IDENTICAL      = True,    # 自动合并完全相同的因子(别名)
-    MIN_SIGNALS           = 20,      # 信号数少于此的因子丢弃
-    MAX_DENSITY           = 0.995,   # 信号密度高于此的因子丢弃(退化为常真)
-    INCLUDE_PATH_EXITS    = True,    # 是否纳入路径依赖出场因子
+    RANK_SHIFT=0,  # rank_W 是否 shift(1)。0=不shift(推荐) 1=按你原方案
+    DEDUPE_IDENTICAL=True,  # 自动合并完全相同的因子(别名)
+    MIN_SIGNALS=20,  # 信号数少于此的因子丢弃
+    MAX_DENSITY=0.995,  # 信号密度高于此的因子丢弃(退化为常真)
+    INCLUDE_PATH_EXITS=True,  # 是否纳入路径依赖出场因子
 
     # --- 组合与输出 ---
-    ALLOW_SAME_FACTOR     = False,   # 是否允许 A进A出
-    MAX_TRADES_PER_COMBO  = 100000,
-    MIN_TRADES_REPORT     = 3,       # 少于此笔数不写入结果(设0=全写)
-    OOS_SPLIT             = 0.70,    # 前70%样本内 后30%样本外
-    ENTRY_PREFIX_FILTER   = None,    # 例: ('ENTRY_','PRICE_','OI_') 只用这些前缀当进场
-    EXIT_PREFIX_FILTER    = None,    # 例: ('EXIT_','BREAKDOWN_','KLINE_')
-    COINS                 = None,    # None=全部；或 ['PEPE','WIF']
+    ALLOW_SAME_FACTOR=False,  # 是否允许 A进A出
+    MAX_TRADES_PER_COMBO=100000,
+    MIN_TRADES_REPORT=3,  # 少于此笔数不写入结果(设0=全写)
+    OOS_SPLIT=0.70,  # 前70%样本内 后30%样本外
+    ENTRY_PREFIX_FILTER=None,  # 例: ('ENTRY_','PRICE_','OI_') 只用这些前缀当进场
+    EXIT_PREFIX_FILTER=None,  # 例: ('EXIT_','BREAKDOWN_','KLINE_')
+    COINS=None,  # None=全部；或 ['PEPE','WIF']
 
     # --- 因子体检 ---
-    FWD_HORIZONS_H        = (4, 12, 24, 72),
+    FWD_HORIZONS_H=(4, 12, 24, 72),
 )
 
 EPS = 1e-12
@@ -66,6 +66,7 @@ EPS = 1e-12
 # ======================================================================
 try:
     from numba import njit
+
     HAS_NUMBA = True
 except Exception:
     HAS_NUMBA = False
@@ -133,7 +134,7 @@ def _core_path(entry_flag, static_exit, close, low, atr, n, cooldown, max_trades
                     trig = True
                 if (not trig) and use_atr:
                     a = atr[j]
-                    if a == a and cj < peak - atr_k * a:   # a==a 过滤 NaN
+                    if a == a and cj < peak - atr_k * a:  # a==a 过滤 NaN
                         trig = True
                 if (not trig) and use_time and (j - e) > time_n and prof < time_th:
                     trig = True
@@ -301,9 +302,9 @@ def make_params(bar_minutes, n_rows):
     B = lambda hours: max(1, int(round(hours * bph)))
     P = {}
     P['BPH'] = B(1)
-    P['N'] = B(24)          # 主回看周期 24h
-    P['M'] = B(4)           # 辅助短周期 4h
-    P['W'] = B(24 * 30)     # 滚动统计窗 30d
+    P['N'] = B(24)  # 主回看周期 24h
+    P['M'] = B(4)  # 辅助短周期 4h
+    P['W'] = B(24 * 30)  # 滚动统计窗 30d
     P['H12'], P['H24'], P['H48'] = B(12), B(24), B(48)
     P['H72'], P['H168'] = B(72), B(168)
     P['D2'], P['D7'] = B(48), B(168)
@@ -315,29 +316,29 @@ def make_params(bar_minutes, n_rows):
 
     N, M = P['N'], P['M']
     P.update(
-        K_UP_BARS      = max(2, int(0.60 * N)),
-        K_NEWHIGH      = max(2, int(0.15 * N)),
-        K_SMALL_GREEN  = max(3, int(0.50 * N)),
-        K_STRONG_CLOSE = max(3, int(0.50 * N)),
-        K_OI_UP        = max(2, int(0.70 * N)),
-        K_WEAK_CLOSE   = max(3, int(0.60 * N)),
-        VOL_BREAK_MULT = 2.0,
-        ATR_K          = 3.0,
-        ADX_TH         = 25.0,
-        GAP_TH         = 0.003,
-        EXHAUST_TH     = 0.002,
-        FLAT_TH        = 0.010,
-        SILENT_TH      = 0.010,
-        OI_ROC_TH      = 0.020,
-        OI_HOT_TH      = 0.050,
-        CORR_TH        = 0.20,
+        K_UP_BARS=max(2, int(0.60 * N)),
+        K_NEWHIGH=max(2, int(0.15 * N)),
+        K_SMALL_GREEN=max(3, int(0.50 * N)),
+        K_STRONG_CLOSE=max(3, int(0.50 * N)),
+        K_OI_UP=max(2, int(0.70 * N)),
+        K_WEAK_CLOSE=max(3, int(0.60 * N)),
+        VOL_BREAK_MULT=2.0,
+        ATR_K=3.0,
+        ADX_TH=25.0,
+        GAP_TH=0.003,
+        EXHAUST_TH=0.002,
+        FLAT_TH=0.010,
+        SILENT_TH=0.010,
+        OI_ROC_TH=0.020,
+        OI_HOT_TH=0.050,
+        CORR_TH=0.20,
         # --- 路径依赖出场参数 ---
-        STOP_PCT       = 0.05,
-        TIME_STOP_BARS = B(72),
-        TIME_STOP_TH   = 0.00,
-        GIVEBACK_TH    = 0.05,
-        LOCK_TH        = 0.10,
-        LOCK_TRAIL     = 0.05,
+        STOP_PCT=0.05,
+        TIME_STOP_BARS=B(72),
+        TIME_STOP_TH=0.00,
+        GIVEBACK_TH=0.05,
+        LOCK_TH=0.10,
+        LOCK_TRAIL=0.05,
     )
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
@@ -353,7 +354,7 @@ def build_factors(df, P, rank_shift=0):
     o, h, l, c = df['open'], df['high'], df['low'], df['close']
     v, oi, fr = df['volume'], df['oi_amount'], df['funding_rate']
 
-    def RK(s):   # rank_W —— 含当前值(因果安全)，可选 shift
+    def RK(s):  # rank_W —— 含当前值(因果安全)，可选 shift
         r = s.rolling(W, min_periods=mp).rank(pct=True)
         return r.shift(rank_shift) if rank_shift else r
 
@@ -371,7 +372,7 @@ def build_factors(df, P, rank_shift=0):
     def CD(a, b):
         return (a < b) & (a.shift(1) >= b.shift(1))
 
-    def bs(s, k=1):   # bool shift
+    def bs(s, k=1):  # bool shift
         return s.shift(k, fill_value=False)
 
     def pctc(s, n):
@@ -384,10 +385,10 @@ def build_factors(df, P, rank_shift=0):
         return c.rolling(n, min_periods=max(2, n // 2)).mean()
 
     # ---------- 基础量 ----------
-    ret_1  = c.pct_change()
+    ret_1 = c.pct_change()
     ret_1h = c.pct_change(P['BPH'])
-    ret_N  = c.pct_change(N)
-    ret_M  = c.pct_change(M)
+    ret_N = c.pct_change(N)
+    ret_M = c.pct_change(M)
 
     ma_N, ma_M = MA(N), MA(M)
     ma_fast, ma_slow = MA(P['H48']), MA(P['H168'])
@@ -442,9 +443,9 @@ def build_factors(df, P, rank_shift=0):
 
     # ===== 一、通用过滤 =====
     F['FILTER_LIQUIDITY_OI_VALUE'] = oi_value > QT(oi_value, 0.30)
-    F['FILTER_LIQUIDITY_VOLUME']   = v > QT(v, 0.30)
-    F['FILTER_NOT_OVERCROWDED']    = (fr_rank < 0.95) & (oi_value_rank < 0.95) & (rk_ret_N < 0.98)
-    F['FILTER_TREND_REGIME_UP']    = (c > ma_slow) & (ma_slow > ma_slow.shift(M))
+    F['FILTER_LIQUIDITY_VOLUME'] = v > QT(v, 0.30)
+    F['FILTER_NOT_OVERCROWDED'] = (fr_rank < 0.95) & (oi_value_rank < 0.95) & (rk_ret_N < 0.98)
+    F['FILTER_TREND_REGIME_UP'] = (c > ma_slow) & (ma_slow > ma_slow.shift(M))
 
     # ===== 二、价格趋势与结构 =====
     F['PRICE_MA_STACK'] = (c > ma_fast) & (ma_fast > ma_slow)
@@ -468,7 +469,7 @@ def build_factors(df, P, rank_shift=0):
     up_move, down_move = h.diff(), -l.diff()
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
-    plus_di = 100 * RSUM(plus_dm, N) / (tr_sum + EPS)      # 注: 原式用 atr_N(均值)量纲不对，此处修正为 TR 求和
+    plus_di = 100 * RSUM(plus_dm, N) / (tr_sum + EPS)  # 注: 原式用 atr_N(均值)量纲不对，此处修正为 TR 求和
     minus_di = 100 * RSUM(minus_dm, N) / (tr_sum + EPS)
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di + EPS)) * 100
     adx = dx.rolling(N, min_periods=max(2, N // 2)).mean()
@@ -512,7 +513,8 @@ def build_factors(df, P, rank_shift=0):
     F['BREAK_MEANINGFUL_DISTANCE'] = _bd > QT(_bd, 0.80)
     F['BREAK_FLAT_THEN_BREAK'] = bs(F['VOL_RANGE_COMPRESSION_REAL']) & (c > maxH_N.shift(1))
     F['BREAK_RETEST_HOLD_REAL'] = (c.shift(1) > maxH_N.shift(2)) & (l <= maxH_N.shift(2) * 1.01) & (c > maxH_N.shift(2))
-    F['BREAK_SECOND_WAVE_REBREAK'] = (c.shift(M) > maxH_N.shift(M + 1)) & (c.shift(1) < maxH_N.shift(M + 1)) & (c > maxH_N.shift(M + 1))
+    F['BREAK_SECOND_WAVE_REBREAK'] = (c.shift(M) > maxH_N.shift(M + 1)) & (c.shift(1) < maxH_N.shift(M + 1)) & (
+                c > maxH_N.shift(M + 1))
     F['BREAK_INSIDE_BREAK_UP'] = (h.shift(1) < h.shift(2)) & (l.shift(1) > l.shift(2)) & (c > h.shift(1))
     _rpos = (c - minL_N) / ((maxH_N - minL_N) + EPS)
     F['STRUCT_RANGE_POSITION_STRONG'] = _rpos > 0.80
@@ -671,7 +673,8 @@ def build_factors(df, P, rank_shift=0):
     F['ENTRY_OI_LEAD_SQUEEZE'] = F['OI_LEADS_PRICE'] & F['VOL_RANGE_COMPRESSION_REAL']
     F['ENTRY_FUNDING_COLD_START_TREND'] = F['FR_COLD_START'] & F['PRICE_MA_STACK'] & F['OI_MA_UP']
     F['ENTRY_PRICE_UP_OI_DOWN_SPOT_PUSH'] = F['PRICE_MA_STACK'] & F['OI_PRICE_UP_OI_DOWN'] & F['FR_LOW_NEG']
-    F['ENTRY_LONG_CONSOL_OI_VOLUME_CONFIRM'] = F['BREAK_LONG_CONSOLIDATION_REAL'] & F['OI_SURGE_RANK'] & F['VOLUME_SPIKE']
+    F['ENTRY_LONG_CONSOL_OI_VOLUME_CONFIRM'] = F['BREAK_LONG_CONSOLIDATION_REAL'] & F['OI_SURGE_RANK'] & F[
+        'VOLUME_SPIKE']
     F['ENTRY_OI_LOW_RECOVERY_BREAK'] = bs(F['OI_LOW_TO_UP']) & F['BREAK_N_HIGH_REAL']
     F['ENTRY_BOTTOM_STABILIZE'] = F['OI_BOTTOM_DIVERGENCE'] & F['FR_LOW_NEG'] & F['PRICE_HIGHER_LOWS']
     F['ENTRY_VWAP_RECLAIM_OI'] = F['VWAP_RECLAIM'] & F['OI_SLOPE_UP'] & F['FR_MILD']
@@ -743,20 +746,20 @@ def path_exit_specs(P):
              use_gb=False, gb_th=0.0, use_lock=False, lock_th=0.0, lock_trail=0.0,
              static=None)
     S = {}
-    S['EXIT_FIXED_STOP']          = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT']}
-    S['EXIT_ATR_TRAILING']        = {**z, 'use_atr': True, 'atr_k': P['ATR_K']}
+    S['EXIT_FIXED_STOP'] = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT']}
+    S['EXIT_ATR_TRAILING'] = {**z, 'use_atr': True, 'atr_k': P['ATR_K']}
     S['EXIT_ENTRY_BAR_LOW_BREAK'] = {**z, 'use_barlow': True}
-    S['EXIT_TIME_STOP']           = {**z, 'use_time': True, 'time_n': P['TIME_STOP_BARS'],
-                                     'time_th': P['TIME_STOP_TH']}
-    S['EXIT_PROFIT_GIVEBACK']     = {**z, 'use_gb': True, 'gb_th': P['GIVEBACK_TH']}
-    S['EXIT_PROFIT_LOCK_TRAIL']   = {**z, 'use_lock': True, 'lock_th': P['LOCK_TH'],
-                                     'lock_trail': P['LOCK_TRAIL']}
-    S['EXIT_FULL_PROTECTION']     = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT'],
-                                     'use_atr': True, 'atr_k': P['ATR_K'],
-                                     'use_time': True, 'time_n': P['TIME_STOP_BARS'],
-                                     'time_th': P['TIME_STOP_TH'],
-                                     'use_gb': True, 'gb_th': P['GIVEBACK_TH'],
-                                     'static': 'EXIT_HIGH_VOLUME_BREAKDOWN'}
+    S['EXIT_TIME_STOP'] = {**z, 'use_time': True, 'time_n': P['TIME_STOP_BARS'],
+                           'time_th': P['TIME_STOP_TH']}
+    S['EXIT_PROFIT_GIVEBACK'] = {**z, 'use_gb': True, 'gb_th': P['GIVEBACK_TH']}
+    S['EXIT_PROFIT_LOCK_TRAIL'] = {**z, 'use_lock': True, 'lock_th': P['LOCK_TH'],
+                                   'lock_trail': P['LOCK_TRAIL']}
+    S['EXIT_FULL_PROTECTION'] = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT'],
+                                 'use_atr': True, 'atr_k': P['ATR_K'],
+                                 'use_time': True, 'time_n': P['TIME_STOP_BARS'],
+                                 'time_th': P['TIME_STOP_TH'],
+                                 'use_gb': True, 'gb_th': P['GIVEBACK_TH'],
+                                 'static': 'EXIT_HIGH_VOLUME_BREAKDOWN'}
     return S
 
 
@@ -803,7 +806,7 @@ def mine_symbol(coin, df, cfg):
     F, aux = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
-        print(f"    ! 数据过短(有效 {len(df)-max(warm,0)} 根)，跳过")
+        print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
         return None, None
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
@@ -952,44 +955,49 @@ def main(cfg=CFG):
 
     all_pairs, all_diag = [], []
     for kf in kfiles:
-        coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-        if cfg['COINS'] and coin not in cfg['COINS']:
-            continue
-        oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
-        fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
-        if not (os.path.exists(oi_f) and os.path.exists(fr_f)):
-            print(f"⚠️  {coin} 数据不完整，跳过")
-            continue
-
-        print(f"\n🚀 [{coin}]")
         try:
-            df = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+            coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+            if cfg['COINS'] and coin not in cfg['COINS']:
+                continue
+            oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
+            fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
+            if not (os.path.exists(oi_f) and os.path.exists(fr_f)):
+                print(f"⚠️  {coin} 数据不完整，跳过")
+                continue
+
+            print(f"\n🚀 [{coin}]")
+            try:
+                df = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+            except Exception as e:
+                print(f"    ! 加载失败: {e}")
+                continue
+            if len(df) < 800:
+                print(f"    ! bar 数不足 ({len(df)})，跳过")
+                continue
+            print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
+
+            pairs, diag = mine_symbol(coin, df, cfg)
+            if pairs is None or pairs.empty:
+                continue
+            pairs.sort_values('sum_ret', ascending=False, inplace=True)
+            pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'),
+                         index=False, encoding='utf-8-sig')
+            diag.to_csv(os.path.join(cfg['OUT_DIR'], f'factor_diag_{coin}.csv'),
+                        index=False, encoding='utf-8-sig')
+            all_pairs.append(pairs)
+            all_diag.append(diag)
+
+            top = pairs.head(10)
+            print("    ── TOP10 (按累加总收益) ──")
+            for _, r in top.iterrows():
+                print(f"      {r['entry_factor'][:34]:<34} -> {r['exit_factor'][:30]:<30} "
+                      f"| N={int(r['trades']):>5} | Σ={r['sum_ret']:>9.1f}% "
+                      f"| 胜率={r['win_rate']:>5.1f}% | 均={r['avg_ret']:>6.2f}% "
+                      f"| OOSΣ={r['oos_sum_ret'] if pd.notna(r['oos_sum_ret']) else float('nan'):>8.1f}%")
         except Exception as e:
-            print(f"    ! 加载失败: {e}")
+            traceback.print_exc()
+            print(f"❌ [{coin}] 处理失败: {e}")
             continue
-        if len(df) < 800:
-            print(f"    ! bar 数不足 ({len(df)})，跳过")
-            continue
-        print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
-
-        pairs, diag = mine_symbol(coin, df, cfg)
-        if pairs is None or pairs.empty:
-            continue
-        pairs.sort_values('sum_ret', ascending=False, inplace=True)
-        pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'),
-                     index=False, encoding='utf-8-sig')
-        diag.to_csv(os.path.join(cfg['OUT_DIR'], f'factor_diag_{coin}.csv'),
-                    index=False, encoding='utf-8-sig')
-        all_pairs.append(pairs)
-        all_diag.append(diag)
-
-        top = pairs.head(10)
-        print("    ── TOP10 (按累加总收益) ──")
-        for _, r in top.iterrows():
-            print(f"      {r['entry_factor'][:34]:<34} -> {r['exit_factor'][:30]:<30} "
-                  f"| N={int(r['trades']):>5} | Σ={r['sum_ret']:>9.1f}% "
-                  f"| 胜率={r['win_rate']:>5.1f}% | 均={r['avg_ret']:>6.2f}% "
-                  f"| OOSΣ={r['oos_sum_ret'] if pd.notna(r['oos_sum_ret']) else float('nan'):>8.1f}%")
 
     if not all_pairs:
         print("\n⚠️ 没有任何有效结果。")
