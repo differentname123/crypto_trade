@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import math
 import warnings
+import itertools
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,7 @@ CFG = dict(
 )
 
 EPS = 1e-12
+GLOBAL_PLATEAU_RESULTS = []
 
 # ======================================================================
 # 1. numba 可选加速
@@ -172,6 +174,11 @@ def build_factors(df, P):
     o, h, l, c = df['open'], df['high'], df['low'], df['close']
     v = df['volume']
 
+    # 提取搜索参数
+    upper_wick_thresh = P.get('UPPER_WICK_THRESH', 0.50)
+    vol_quantile = P.get('VOL_QUANTILE', 0.95)
+    high_close_thresh = P.get('HIGH_CLOSE_THRESH', 0.95)
+
     def QT(s, p): return s.rolling(W, min_periods=mp).quantile(p).shift(1)
 
     def bs(s, k=1): return s.shift(k, fill_value=False)
@@ -181,12 +188,13 @@ def build_factors(df, P):
     uw = (h - np.maximum(o, c)) / rng
 
     F = {}
-    F['KLINE_LONG_UPPER_WICK'] = uw > 0.50
-    F['VOLUME_SPIKE'] = v > QT(v, 0.95)
+    F['KLINE_LONG_UPPER_WICK'] = uw > upper_wick_thresh
+    F['VOLUME_SPIKE'] = v > QT(v, vol_quantile)
     F['KLINE_INSIDE_BAR'] = (h < h.shift(1)) & (l > l.shift(1))
 
     # 入场信号: 高位长上影且放量
-    F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > 0.95) & F['KLINE_LONG_UPPER_WICK'] & F['VOLUME_SPIKE']
+    F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > high_close_thresh) & F['KLINE_LONG_UPPER_WICK'] & F[
+        'VOLUME_SPIKE']
     # 出场信号: 孕线之后突破且放量
     F['ENTRY_INSIDE_BREAK_VOLUME'] = bs(F['KLINE_INSIDE_BAR']) & (c > h.shift(1)) & F['VOLUME_SPIKE']
 
@@ -251,6 +259,8 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
 def mine_symbol(coin, df, cfg):
     bm = cfg['BAR_MINUTES']
     P = make_params(bm, len(df))
+    if 'SEARCH_PARAMS' in cfg:
+        P.update(cfg['SEARCH_PARAMS'])
     F = build_factors(df, P)
 
     warm = min(P['WARMUP'], len(df) - 100)
@@ -376,20 +386,20 @@ def main(cfg=CFG):
     df_res.sort_values('sum_ret', ascending=False, inplace=True)
     df_res['oos_trades'] = df_res['oos_trades'].fillna(0).astype(int)
 
-    # ==========================
-    # 打印特定排版的交易日志表
-    # ==========================
-    cols_to_show = [
-        'coin', 'pool', 'trades', 'win_rate', 'pl_ratio', 'max_consec_loss',
-        'avg_ret', 'sum_ret', 'max_dd', 'avg_hold_h', 'total_fr_cost',
-        'oos_trades', 'oos_avg_ret'
-    ]
-
-    print("\n" + "=" * 120)
-
-    # 临时设定 pandas 格式输出以完全匹配目标对齐效果
-    pd.set_option('display.float_format', lambda x: f'{x:.4f}')
-    print(df_res[cols_to_show].to_string(index=False))
+    # # ==========================
+    # # 打印特定排版的交易日志表
+    # # ==========================
+    # cols_to_show = [
+    #     'coin', 'pool', 'trades', 'win_rate', 'pl_ratio', 'max_consec_loss',
+    #     'avg_ret', 'sum_ret', 'max_dd', 'avg_hold_h', 'total_fr_cost',
+    #     'oos_trades', 'oos_avg_ret'
+    # ]
+    #
+    # print("\n" + "=" * 120)
+    #
+    # # 临时设定 pandas 格式输出以完全匹配目标对齐效果
+    # pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+    # print(df_res[cols_to_show].to_string(index=False))
 
     # ==========================
     # 打印底部全局统计摘要
@@ -452,6 +462,63 @@ def main(cfg=CFG):
     print(f"    总资金费率扣除                                   : {total_fr_cost_sum:.2f}%")
     print(f"    最大贡献币                                     : {max_coin} ({max_contrib_pct:.0f}%)")
 
+    # 收集参数平原数据
+    if 'SEARCH_PARAMS' in cfg:
+        GLOBAL_PLATEAU_RESULTS.append({
+            'params': cfg['SEARCH_PARAMS'],
+            'total_trades': total_trades,
+            'pooled_expected': pooled_expected,
+            'cluster_t': cluster_t,
+            'oos_retention': oos_retention,
+            'global_pl_ratio': global_pl_ratio,
+            'global_max_consec_loss': global_max_consec_loss,
+            'total_pnl': total_pnl
+        })
+
 
 if __name__ == '__main__':
-    main(CFG)
+    # 固定使用表现最好的 15分钟 周期进行参数平原搜索
+    CFG['BAR_MINUTES'] = 15
+
+    # 划定核心参数的搜索空间
+    param_grid = {
+        'UPPER_WICK_THRESH': [0.40, 0.50, 0.60],  # 上影线占比阈值
+        'VOL_QUANTILE': [0.90, 0.95, 0.98],  # 成交量分位数
+        'HIGH_CLOSE_THRESH': [0.90, 0.95, 0.98],  # 高位收盘价阈值
+        'BAR_MINUTES': [5,15,30,60,120]
+    }
+
+    keys = list(param_grid.keys())
+    combinations = list(itertools.product(*param_grid.values()))
+
+    print(f"🚀 启动参数平原搜索 | 周期: {CFG['BAR_MINUTES']}min | 组合数: {len(combinations)}")
+
+    for combo in combinations:
+        params = dict(zip(keys, combo))
+        CFG['SEARCH_PARAMS'] = params
+        main(CFG)
+
+    # ==========================
+    # 最终分析：寻找参数平原
+    # ==========================
+    print("\n\n" + "=" * 100)
+    print(" 🏆 参数平原分析结果 (Parameter Plateau Analysis)")
+    print("=" * 100)
+
+    if GLOBAL_PLATEAU_RESULTS:
+        df_plateau = pd.DataFrame(GLOBAL_PLATEAU_RESULTS)
+        # 将 params 字典展开为列，方便查看
+        params_df = pd.DataFrame(df_plateau['params'].tolist())
+        df_final = pd.concat([params_df, df_plateau.drop(columns=['params'])], axis=1)
+
+        # 排序：优先看 OOS 留存率、Cluster T、池化期望
+        df_final.sort_values(by=['oos_retention', 'cluster_t', 'pooled_expected'], ascending=False, inplace=True)
+
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', 1000)
+        print(df_final.to_string(index=False))
+
+        print("\n💡 稳健性建议: 不要盲目选择排名第一的参数！请观察表格，寻找那些在参数微调时，")
+        print("   OOS留存率、Cluster T 和 池化期望 依然保持高位的'平原'区域（即相邻参数组合表现都很稳定的区域）。")
+    else:
+        print("⚠️ 未收集到任何回测结果。")
