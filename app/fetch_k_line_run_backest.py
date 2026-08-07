@@ -309,7 +309,10 @@ def mine_symbol(coin, df, cfg):
     exec_px[:-1] = op[1:]
     exec_px[-1] = cl[-1]
     cost = 2.0 * (cfg['FEE_RATE'] + cfg['SLIPPAGE'])
+
+    # 精确截取到回测时间段的基准收益和回测天数
     bench_ret = float((cl[-1] / cl[0] - 1.0) * 100)
+    bt_days = float(n * bm / 1440.0)  # 1440分钟 = 1天
 
     # 核心匹配
     entry_arr = F['EXIT_UPPER_WICK_REJECTION']
@@ -344,7 +347,8 @@ def mine_symbol(coin, df, cfg):
         return None, [], []
 
     split_bar = int(n * cfg['OOS_SPLIT'])
-    row = dict(coin=coin, pool='A_山寨永续', bench_ret=bench_ret)
+    # 将基准收益和时长存入行数据
+    row = dict(coin=coin, pool='A_山寨永续', bench_ret=bench_ret, bt_days=bt_days)
 
     row.update(trade_stats(rets, ent, ext, bm, n))
     m_is = ent < split_bar
@@ -465,6 +469,11 @@ def main(cfg=CFG):
     total_coins = len(df_res)
     total_pnl = df_res['sum_ret'].sum()
 
+    # 提取全局基准统计
+    total_bench_ret = df_res['bench_ret'].sum() if 'bench_ret' in df_res.columns else 0.0
+    avg_bt_days = df_res['bt_days'].mean() if 'bt_days' in df_res.columns else 0.0
+    alpha_ret = total_pnl - total_bench_ret
+
     max_coin_idx = df_res['sum_ret'].idxmax()
     max_coin = df_res.loc[max_coin_idx, 'coin']
     max_coin_pnl = df_res.loc[max_coin_idx, 'sum_ret']
@@ -472,20 +481,23 @@ def main(cfg=CFG):
     max_contrib_pct = (max_coin_pnl / total_pnl * 100) if total_pnl > 0 else 0
 
     print("\n")
-    print(f"    覆盖币种 / 通过过滤                               : {total_coins} / 0")
-    print(f"    总笔数                                       : {total_trades}")
+    print(f"    覆盖币种 / 通过过滤                              : {total_coins} / 0")
+    print(f"    平均回测时长                                    : {avg_bt_days:.1f} 天")
+    print(f"    总笔数                                         : {total_trades}")
     print(f"    池化单笔期望                                    : +{pooled_expected:.4f}%")
-    print(f"    cluster_t                                 : {cluster_t:.2f}")
+    print(f"    cluster_t                                    : {cluster_t:.2f}")
     print(f"    全局盈亏比 (P/L Ratio)                         : {global_pl_ratio:.2f}")
-    print(f"    全局最大连续亏损                                 : {global_max_consec_loss}")
-    print(f"    OOS 总笔数 / 池化期望                            : {oos_trades} / +{oos_pooled_expected:.4f}%")
+    print(f"    全局最大连续亏损                                : {global_max_consec_loss}")
+    print(f"    OOS 总笔数 / 池化期望                           : {oos_trades} / +{oos_pooled_expected:.4f}%")
     print(f"    OOS 收益留存率                                 : {oos_retention:.1f}%")
     print(f"    盈利币 / 总币                                  : {profitable_coins} / {total_coins}")
-    print(f"    总盈亏                                       : {total_pnl:.1f}%    去掉最好的币 {pnl_ex_best:.1f}%")
-    print(f"    总资金费率扣除                                   : {total_fr_cost_sum:.2f}%")
-    print(f"    最大贡献币                                     : {max_coin} ({max_contrib_pct:.0f}%)")
+    print(f"    策略总盈亏                                      : {total_pnl:.1f}%    去掉最好的币 {pnl_ex_best:.1f}%")
+    print(f"    同期基准总收益 (Buy&Hold)                       : {total_bench_ret:.1f}%")
+    print(f"    策略Alpha (总盈亏 - 基准)                        : {alpha_ret:.1f}%")
+    print(f"    总资金费率扣除                                  : {total_fr_cost_sum:.2f}%")
+    print(f"    最大贡献币                                      : {max_coin} ({max_contrib_pct:.0f}%)")
 
-    # 收集参数平原数据
+    # 收集参数平原数据 (已新增 total_bench_ret 和 alpha)
     if 'SEARCH_PARAMS' in cfg:
         GLOBAL_PLATEAU_RESULTS.append({
             'params': cfg['SEARCH_PARAMS'],
@@ -495,7 +507,9 @@ def main(cfg=CFG):
             'oos_retention': oos_retention,
             'global_pl_ratio': global_pl_ratio,
             'global_max_consec_loss': global_max_consec_loss,
-            'total_pnl': total_pnl
+            'total_pnl': total_pnl,
+            'total_bench_ret': total_bench_ret,
+            'alpha': alpha_ret
         })
 
 
@@ -545,5 +559,6 @@ if __name__ == '__main__':
 
         print("\n💡 稳健性建议: 不要盲目选择排名第一的参数！请观察表格，寻找那些在参数微调时，")
         print("   OOS留存率、Cluster T 和 池化期望 依然保持高位的'平原'区域（即相邻参数组合表现都很稳定的区域）。")
+        print("   ※ 重点观察新增的 [alpha] 列，若总盈亏很高但 alpha 为负，说明策略仅仅是吃到了大盘红利。")
     else:
         print("⚠️ 未收集到任何回测结果。")
