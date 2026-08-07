@@ -519,10 +519,10 @@ if __name__ == '__main__':
 
     # 划定核心参数的搜索空间
     param_grid = {
-        'UPPER_WICK_THRESH': [0.40, 0.50, 0.60],  # 上影线占比阈值
-        'VOL_QUANTILE': [0.90, 0.95, 0.98],  # 成交量分位数
-        'HIGH_CLOSE_THRESH': [0.90, 0.95, 0.98],  # 高位收盘价阈值
-        'BAR_MINUTES': [15, 30, 60]
+        'UPPER_WICK_THRESH': [0.60],  # 上影线占比阈值
+        'VOL_QUANTILE': [0.95],  # 成交量分位数
+        'HIGH_CLOSE_THRESH': [0.90],  # 高位收盘价阈值
+        'BAR_MINUTES': [15]
     }
 
     keys = list(param_grid.keys())
