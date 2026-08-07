@@ -127,12 +127,20 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
     fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
     fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    fr_s = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc]
-            .astype(float).resample(bar, label='left', closed='left').last())
+
+    # 提取精确的 funding rate 及其发生时间
+    fr_exact = fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float)
+
+    # 1. 用于 ffill 的 funding rate (保持原有逻辑)
+    fr_s = fr_exact.resample(bar, label='left', closed='left').last()
+
+    # 2. 用于计算实际结算的 funding rate (只在结算bar有值，其他为0，避免重复计算)
+    fr_settlement = fr_exact.resample(bar, label='left', closed='left').last().fillna(0.0)
 
     df = agg.copy()
     df['oi_amount'] = oi_s.reindex(df.index).ffill()
     df['funding_rate'] = fr_s.reindex(df.index).ffill()
+    df['funding_settlement'] = fr_settlement.reindex(df.index).fillna(0.0)
 
     fv = df[['oi_amount', 'funding_rate']].apply(lambda s: s.first_valid_index())
     start = max([x for x in fv.tolist() if x is not None], default=df.index[0])
@@ -196,7 +204,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     d = {prefix + 'trades': T}
     if T == 0:
         for k in ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'profit_factor', 'max_dd', 'avg_hold_h', 'exposure',
-                  'max_win', 'max_loss']:
+                  'max_win', 'max_loss', 'pl_ratio', 'max_consec_loss']:
             d[prefix + k] = np.nan
         return d
 
@@ -213,6 +221,29 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     d[prefix + 'exposure'] = float(hold.sum() / max(n_bars, 1) * 100)
     d[prefix + 'max_win'] = float(rets.max() * 100)
     d[prefix + 'max_loss'] = float(rets.min() * 100)
+
+    # 新增指标: 盈亏比 (Profit/Loss Ratio)
+    avg_win = rets[rets > 0].mean() if (rets > 0).any() else 0
+    avg_loss = abs(rets[rets < 0].mean()) if (rets < 0).any() else 1e-9
+    d[prefix + 'pl_ratio'] = float(avg_win / avg_loss)
+
+    # 新增指标: 最大连续亏损次数
+    is_loss = rets < 0
+    if is_loss.any():
+        loss_runs = []
+        current_run = 0
+        for l in is_loss:
+            if l:
+                current_run += 1
+            else:
+                if current_run > 0:
+                    loss_runs.append(current_run)
+                current_run = 0
+        if current_run > 0:
+            loss_runs.append(current_run)
+        d[prefix + 'max_consec_loss'] = int(max(loss_runs)) if loss_runs else 0
+    else:
+        d[prefix + 'max_consec_loss'] = 0
 
     return d
 
@@ -253,9 +284,19 @@ def mine_symbol(coin, df, cfg):
     if ent.size < 1:
         return None, [], []
 
-    rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
+    # 计算真实的资金费率扣除 (基于实际结算时间点)
+    fr_arr = df['funding_settlement'].to_numpy(float)
+    funding_costs = np.zeros(len(ent))
+    for i in range(len(ent)):
+        start_idx = ent[i] + 1
+        end_idx = ext[i] + 1
+        if start_idx < n:
+            funding_costs[i] = np.sum(fr_arr[start_idx:end_idx])
+
+    # 扣除手续费、滑点和资金费率 (做多时，资金费率为正扣除，为负增加利润)
+    rets = exec_px[ext] / exec_px[ent] - 1.0 - cost - funding_costs
     ok = np.isfinite(rets)
-    ent, ext, rets = ent[ok], ext[ok], rets[ok]
+    ent, ext, rets, funding_costs = ent[ok], ext[ok], rets[ok], funding_costs[ok]
 
     if ent.size < 1:
         return None, [], []
@@ -266,6 +307,10 @@ def mine_symbol(coin, df, cfg):
     row.update(trade_stats(rets, ent, ext, bm, n))
     m_is = ent < split_bar
     row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
+
+    # 资金费率统计
+    row['total_fr_cost'] = float(funding_costs.sum() * 100)
+    row['avg_fr_cost'] = float(funding_costs.mean() * 100) if len(funding_costs) > 0 else 0.0
 
     # 计算复合指标
     row['excess'] = row['avg_ret'] - row['bench_ret']
@@ -335,9 +380,9 @@ def main(cfg=CFG):
     # 打印特定排版的交易日志表
     # ==========================
     cols_to_show = [
-        'coin', 'pool', 'trades', 'win_rate', 'avg_ret', 'bench_ret', 'excess', 'edge_100h',
-        'sum_ret', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss',
-        'oos_trades', 'oos_avg_ret', 'filtered_out'
+        'coin', 'pool', 'trades', 'win_rate', 'pl_ratio', 'max_consec_loss',
+        'avg_ret', 'sum_ret', 'max_dd', 'avg_hold_h', 'total_fr_cost',
+        'oos_trades', 'oos_avg_ret'
     ]
 
     print("\n" + "=" * 120)
@@ -356,6 +401,28 @@ def main(cfg=CFG):
     pooled_expected = all_rets_arr.mean() if total_trades > 0 else 0
     std_ret = all_rets_arr.std(ddof=1) if total_trades > 1 else 0
     cluster_t = pooled_expected / (std_ret / np.sqrt(total_trades)) if std_ret > 0 else float('nan')
+
+    # 全局新增指标计算
+    global_avg_win = all_rets_arr[all_rets_arr > 0].mean() if (all_rets_arr > 0).any() else 0
+    global_avg_loss = abs(all_rets_arr[all_rets_arr < 0].mean()) if (all_rets_arr < 0).any() else 1e-9
+    global_pl_ratio = global_avg_win / global_avg_loss
+
+    is_loss_global = all_rets_arr < 0
+    if is_loss_global.any():
+        loss_runs_g = []
+        curr_g = 0
+        for l in is_loss_global:
+            if l:
+                curr_g += 1
+            else:
+                if curr_g > 0: loss_runs_g.append(curr_g)
+                curr_g = 0
+        if curr_g > 0: loss_runs_g.append(curr_g)
+        global_max_consec_loss = max(loss_runs_g) if loss_runs_g else 0
+    else:
+        global_max_consec_loss = 0
+
+    total_fr_cost_sum = df_res['total_fr_cost'].sum() if 'total_fr_cost' in df_res.columns else 0.0
 
     oos_trades = len(all_oos_rets_arr)
     oos_pooled_expected = all_oos_rets_arr.mean() if oos_trades > 0 else 0
@@ -376,10 +443,13 @@ def main(cfg=CFG):
     print(f"    总笔数                                       : {total_trades}")
     print(f"    池化单笔期望                                    : +{pooled_expected:.4f}%")
     print(f"    cluster_t                                 : {cluster_t:.2f}")
+    print(f"    全局盈亏比 (P/L Ratio)                         : {global_pl_ratio:.2f}")
+    print(f"    全局最大连续亏损                                 : {global_max_consec_loss}")
     print(f"    OOS 总笔数 / 池化期望                            : {oos_trades} / +{oos_pooled_expected:.4f}%")
     print(f"    OOS 收益留存率                                 : {oos_retention:.1f}%")
     print(f"    盈利币 / 总币                                  : {profitable_coins} / {total_coins}")
     print(f"    总盈亏                                       : {total_pnl:.1f}%    去掉最好的币 {pnl_ex_best:.1f}%")
+    print(f"    总资金费率扣除                                   : {total_fr_cost_sum:.2f}%")
     print(f"    最大贡献币                                     : {max_coin} ({max_contrib_pct:.0f}%)")
 
 
