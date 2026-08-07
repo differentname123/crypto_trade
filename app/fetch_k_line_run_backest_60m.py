@@ -217,7 +217,7 @@ def scan_signals_and_trades(df, params):
 # ============================================================================
 def main():
     exchange = init_exchange('binance', default_type='swap')
-    targets = get_top_movers(exchange, top_n=20)
+    targets = get_top_movers(exchange, top_n=10)
     # targets = ['BTC/USDT:USDT']
     all_signals = []
     symbol_trade_data = {}  # 存储每个币的交易复盘数据
@@ -298,7 +298,14 @@ def main():
         all_holdings = [data['holding'] for data in symbol_trade_data.values() if data['holding']]
 
         # ========================== 单币种明细 ==========================
-        for symbol, data in symbol_trade_data.items():
+        # 按照浮盈降序排序，当前浮亏越多的越在下面，无持仓的放在最底下
+        sorted_trade_data = sorted(
+            symbol_trade_data.items(),
+            key=lambda x: x[1]['holding']['float_pnl'] if x[1]['holding'] else float('inf'),
+            reverse=True
+        )
+
+        for symbol, data in sorted_trade_data:
             trades = data['trades']
             holding = data['holding']
 
