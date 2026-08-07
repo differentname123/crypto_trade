@@ -1,402 +1,387 @@
+# -*- coding: utf-8 -*-
 """
 ================================================================================
-[功能摘要] 纯粹逼空捕获系统 (Pure Squeeze Catcher)：寻找极度拥挤且空头失血的行情进行突破做多。带可视化交互看板。
-[输入数据]
-  - df_oi (DataFrame): 必须包含 ['timestamp', 'oi_amount'] 毫秒级快照。
-  - df_fr (DataFrame): 必须包含 ['timestamp', 'funding_rate'] 毫秒级快照。
-  - df_klines (DataFrame): 必须包含 ['timestamp', 'open', 'high', 'low', 'close'] 毫秒级K线。
-[数据流转/交互]
-  1. 计算衍生指标：对 OI 计算 30天滚动 90% 分位数；对 K线 分别计算 12h滚动前高与 1h滚动前低。
-  2. 跨周期降维：以 1分钟 K线时间轴为基准，利用向下合并 (backward merge) 吸纳最近的 OI 与 FR 数据。
-  3. 状态机流转：基于清洗后的主表迭代，通过信号布尔值判断进出场，并模拟成交资金变化。
-[输出数据] 输出格式化大白话日志、回测绩效看板，并在浏览器中自动弹出基于 WebGL 加速的交互式可缩放分析图表。
+ ALT-COIN LAUNCH FACTOR MINER (固定组合回测 - 统计日志精排版)
+ 策略逻辑:
+   - 入场: EXIT_UPPER_WICK_REJECTION (高位长上影线+放量拒接)
+   - 出场: ENTRY_INSIDE_BREAK_VOLUME (孕线上破+放量)
 ================================================================================
 """
-
-import pandas as pd
+from __future__ import annotations
 import os
+import math
+import warnings
 
-# ==========================================
-# 1. 策略核心参数区
-# ==========================================
-OI_WINDOW_DAYS = 30  # OI 历史分位数统计周期（天）
-OI_PERCENTILE = 0.90  # OI 极端拥挤水位线（90%分位数）
-FR_THRESHOLD = -0.0005  # 空头流血阈值，即 -0.05%
-BREAKOUT_WINDOW_H = 12  # 进场突破计算周期（小时）
-STOPLOSS_WINDOW_H = 1  # 出场止损计算周期（小时）
-FEE_RATE = 0.001  # 单边交易成本（0.1%）
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+# ======================================================================
+# 0. 全局配置
+# ======================================================================
+CFG = dict(
+    DATA_DIR='./data',  # 数据目录
+    BAR_MINUTES=15,  # 周期时长
+    FEE_RATE=0.0005,  # 单边手续费
+    SLIPPAGE=0.0005,  # 单边滑点
+    COOLDOWN_BARS=0,  # 冷却K线数
+    OOS_SPLIT=0.70,  # 样本内外切分比例
+    COINS=None,  # 填入指定的币种列表如 ['PEPE', 'WIF']，None表示全跑
+)
+
+EPS = 1e-12
+
+# ======================================================================
+# 1. numba 可选加速
+# ======================================================================
+try:
+    from numba import njit
+
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
 
 
-def plot_interactive_chart(df, trades, target_coin, start_time='2026-05-01', end_time='2026-08-01'):
-    """
-    [功能摘要] 基于 Plotly 渲染基于 WebGL 加速的高性能交互图表。
-    [核心变更] 移除 90% 基准线，保留 OI持仓数量(左轴) + 新增 持仓名义价值(隐形轴)，与价格、资金费率共振。
-    """
-    try:
-        import plotly.graph_objects as go
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        print("⚠️ [绘图跳过] 检测到未安装 plotly 库，无法生成可视化图表。如需看图，请执行: pip install plotly")
-        return
-
-    print(f">>> [可视化渲染] 正在生成 【{target_coin}】 的趋势洞察面板 (截取区间: {start_time} 至 {end_time})，请稍候...")
-
-    # 为了与日志对齐，将图表的 X 轴时间也统一转为上海时间（东八区）
-    chart_df = df.copy()
-    chart_df['local_time'] = chart_df['datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
-
-    start_dt = pd.to_datetime(start_time).tz_localize('Asia/Shanghai')
-    end_dt = pd.to_datetime(end_time).tz_localize('Asia/Shanghai')
-
-    mask = (chart_df['local_time'] >= start_dt) & (chart_df['local_time'] <= end_dt)
-    chart_df = chart_df.loc[mask].copy()
-
-    if chart_df.empty:
-        print(f"⚠️ [绘图跳过] 标的 【{target_coin}】 在指定的区间 {start_time} 至 {end_time} 内无任何有效 K 线数据。")
-        return
-
-    # 计算持仓实际名义价值 (OI Amount * Price)
-    chart_df['oi_value'] = chart_df['oi_amount'] * chart_df['close']
-
-    # 建立底层容器 (单图重叠绘制)
-    fig = go.Figure()
-
-    # 1. 价格曲线 (挂载在 y3 轴 - 隐藏坐标轴刻度，只保留形态)
-    fig.add_trace(go.Scattergl(
-        x=chart_df['local_time'],
-        y=chart_df['close'],
-        name="价格(趋势)",
-        yaxis="y3",
-        mode='lines',
-        line=dict(color='#1f77b4', width=2),
-        opacity=0.75, # 略微透明，充当背景趋势
-        hovertemplate="收盘价: %{y:.4f}<extra></extra>"
-    ))
-
-    # 2. 资金费率 (挂载在 y2 轴，显示于图表右侧)
-    fig.add_trace(go.Scattergl(
-        x=chart_df['local_time'],
-        y=chart_df['funding_rate'],
-        name="资金费率(FR)",
-        yaxis="y2",
-        mode='lines',
-        line=dict(color='#ff7f0e', width=1.5, dash='dot'),
-        opacity=0.8,
-        hovertemplate="费率: %{y:.4%}<extra></extra>"
-    ))
-
-    # 3. OI持仓数量 (挂载在 y1 轴，显示于图表左侧)
-    oi_status = chart_df['cond_A'].apply(lambda x: '🚨极度拥挤' if x else '⚪正常水位')
-    fig.add_trace(go.Scattergl(
-        x=chart_df['local_time'],
-        y=chart_df['oi_amount'],
-        name="持仓数量(OI Amount)",
-        yaxis="y1",
-        mode='lines',
-        line=dict(color='#8c564b', width=1.5),
-        customdata=oi_status,
-        hovertemplate="OI数量: %{y:.2f} [%{customdata}]<extra></extra>"
-    ))
-
-    # 4. OI持仓名义价值 (挂载在 y4 轴 - 隐藏坐标轴刻度，只保留形态，用紫色虚线区分)
-    fig.add_trace(go.Scattergl(
-        x=chart_df['local_time'],
-        y=chart_df['oi_value'],
-        name="持仓名义价值(OI Value)",
-        yaxis="y4",
-        mode='lines',
-        line=dict(color='#9467bd', width=1.5, dash='dashdot'),
-        hovertemplate="OI名义价值: $%{y:,.2f}<extra></extra>"
-    ))
-
-    # 5. 交易记录散点 (必须挂载在 y3 轴，与价格保持同等映射比例)
-    if trades:
-        entry_times, entry_prices = [], []
-        exit_times, exit_prices = [], []
-
-        for t in trades:
-            t_entry = t['entry_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
-            t_exit = t['exit_time'].replace(tzinfo=ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Shanghai"))
-
-            if start_dt <= t_entry <= end_dt:
-                entry_times.append(t_entry)
-                entry_prices.append(t['entry_price'])
-
-            if start_dt <= t_exit <= end_dt:
-                exit_times.append(t_exit)
-                exit_prices.append(t['exit_price'])
-
-        if entry_times:
-            fig.add_trace(go.Scatter(
-                x=entry_times, y=entry_prices,
-                name='点火入场(买)', yaxis="y3", mode='markers',
-                marker=dict(symbol='triangle-up', size=14, color='green', line=dict(width=1, color='darkgreen')),
-                hovertemplate="进场价: %{y:.4f}<extra></extra>"
-            ))
-
-        if exit_times:
-            fig.add_trace(go.Scatter(
-                x=exit_times, y=exit_prices,
-                name='破位出场(卖)', yaxis="y3", mode='markers',
-                marker=dict(symbol='triangle-down', size=14, color='red', line=dict(width=1, color='darkred')),
-                hovertemplate="出场价: %{y:.4f}<extra></extra>"
-            ))
-
-    # ------------------------------------------
-    # 核心布局与多重坐标轴管理
-    # ------------------------------------------
-    fig.update_layout(
-        title=f"📈 Pure Squeeze Catcher - 【{target_coin}】 趋势与形态共振面板",
-        xaxis=dict(title="时间"),
-        # 左侧坐标轴：负责持仓数量 (OI Amount)
-        yaxis=dict(
-            title=dict(text="持仓数量 (OI Amount)", font=dict(color="#8c564b")),
-            tickfont=dict(color="#8c564b")
-        ),
-        # 右侧坐标轴：负责资金费率 FR
-        yaxis2=dict(
-            title=dict(text="资金费率 (FR)", font=dict(color="#ff7f0e")),
-            tickfont=dict(color="#ff7f0e"),
-            tickformat=".3%",
-            anchor="x",
-            overlaying="y",
-            side="right"
-        ),
-        # 第三坐标轴(隐形)：负责标的价格 (不显示刻度网格，仅展示形态趋势)
-        yaxis3=dict(
-            showticklabels=False,  # 不显示具体价格数字
-            showgrid=False,        # 不显示网格线避免图面杂乱
-            zeroline=False,
-            anchor="x",
-            overlaying="y",
-            side="right"
-        ),
-        # 第四坐标轴(隐形)：负责持仓名义价值 (OI Value) (不显示刻度网格，仅展示形态趋势)
-        yaxis4=dict(
-            showticklabels=False,
-            showgrid=False,
-            zeroline=False,
-            anchor="x",
-            overlaying="y",
-            side="right"
-        ),
-        hovermode="x unified",     # 鼠标悬停时，所有指标在同一个框内直观对齐
-        template="plotly_white",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-    )
-
-    # 渲染并在默认浏览器中弹出
-    fig.show()
-
-def run_backtest(target_coin, oi_file, fr_file, kline_file):
-    print(f">>> [系统初始化] 正在加载并预处理 【{target_coin}】 底层数据源...")
-
-    # ------------------------------------------
-    # 2. 数据读取与防御性拦截
-    # ------------------------------------------
-    try:
-        df_oi = pd.read_csv(oi_file)
-        df_fr = pd.read_csv(fr_file)
-        df_klines = pd.read_csv(kline_file)
-    except FileNotFoundError as e:
-        # 异常不被静默吞噬，通过大白话指引排查方向后直接终止流转
-        print(f"❌ [数据加载失败] 找不到底层数据文件，详细原因: {e}")
-        return
-
-    # ------------------------------------------
-    # 3. 核心指标构建 (利用 on='datetime' 避免频繁修改索引)
-    # ------------------------------------------
-    df_oi['datetime'] = pd.to_datetime(df_oi['timestamp'], unit='ms')
-    df_oi = df_oi.sort_values('datetime').reset_index(drop=True)
-    df_oi['oi_90pct'] = df_oi.rolling(f'{OI_WINDOW_DAYS}D', on='datetime')['oi_amount'].quantile(OI_PERCENTILE)
-    df_oi['cond_A'] = df_oi['oi_amount'] > df_oi['oi_90pct']
-
-    df_fr['datetime'] = pd.to_datetime(df_fr['timestamp'], unit='ms')
-    df_fr = df_fr.sort_values('datetime').reset_index(drop=True)
-    df_fr['cond_B'] = df_fr['funding_rate'] <= FR_THRESHOLD
-
-    df_klines['datetime'] = pd.to_datetime(df_klines['timestamp'], unit='ms')
-    df_klines = df_klines.sort_values('datetime').reset_index(drop=True)
-
-    # 防未来函数：价格错位1格，确保使用上一根已走完的K线极值作为阻力/支撑
-    df_klines['high_prev'] = df_klines['high'].shift(1)
-    df_klines['low_prev'] = df_klines['low'].shift(1)
-    df_klines['resist_12h'] = df_klines.rolling(f'{BREAKOUT_WINDOW_H}h', on='datetime')['high_prev'].max()
-    df_klines['support_1h'] = df_klines.rolling(f'{STOPLOSS_WINDOW_H}h', on='datetime')['low_prev'].min()
-
-    # ------------------------------------------
-    # 4. 跨周期时间轴对齐
-    # ------------------------------------------
-    # FIXME: 业务边界缺陷预警 - backward 合并如果在长时间断网或无交易期间，可能会把极为陈旧的 FR 费率强行顺延，实盘时需补充“快照有效性过期”判定逻辑。
-    df_master = pd.merge_asof(
-        df_klines,
-        df_oi[['timestamp', 'cond_A', 'oi_amount', 'oi_90pct']],
-        on='timestamp', direction='backward'
-    )
-    df_master = pd.merge_asof(
-        df_master,
-        df_fr[['timestamp', 'cond_B', 'funding_rate']],
-        on='timestamp', direction='backward'
-    )
-
-    # 预留30天的数据积累期，确保各项滚动指标足够真实
-    valid_start_time = df_oi['datetime'].iloc[0] + pd.Timedelta(days=OI_WINDOW_DAYS)
-    df_master = df_master[df_master['datetime'] >= valid_start_time].copy()
-
-    # 巧妙地将下一根 K 线的开盘时间和价格前置到当前行，彻底消灭回测主循环中的跨行索引逻辑
-    # FIXME: 业务边界缺陷预警 - 此处假设信号触发后能在次根K线无缝成交。实盘面对极端行情，次根K线开盘必有巨大滑点甚至直接跳空。
-    df_master['next_open'] = df_master['open'].shift(-1)
-    df_master['next_datetime'] = df_master['datetime'].shift(-1)
-    # 剔除最后一根无"下一K线"数据的无效行
-    df_master = df_master.dropna(subset=['next_open', 'next_datetime']).reset_index(drop=True)
-
-    print(f">>> [数据清洗完毕] 已剔除预热期，实际用于回测的有效 K 线数量: 【{len(df_master)}】 行")
-
-    if len(df_master) > 0:
-        # 全局信号探查统计，直接暴露条件卡点，极大降低无交易时的排查成本
-        time_start = df_master['datetime'].iloc[0].strftime('%Y-%m-%d')
-        time_end = df_master['datetime'].iloc[-1].strftime('%Y-%m-%d')
-
-        count_cond_a = df_master['cond_A'].sum()
-        count_cond_b = df_master['cond_B'].sum()
-        count_ab_sync = (df_master['cond_A'] & df_master['cond_B']).sum()
-        count_all_sync = (df_master['cond_A'] & df_master['cond_B'] & (df_master['close'] > df_master['resist_12h'])).sum()
-
-        print(f">>> [回测时间轴] 数据起止区间: 【{time_start}】 至 【{time_end}】")
-        print(f">>> [信号探查器] 核心条件命中分布统计 (用于诊断零交易卡点):")
-        print(f"    ┣━ 条件A: 燃料池充足 (OI > {OI_PERCENTILE*100:.0f}%分位数) : 命中 【{count_cond_a}】 行")
-        print(f"    ┣━ 条件B: 空头正流血 (FR <= {FR_THRESHOLD*100:.2f}%)       : 命中 【{count_cond_b}】 行")
-        print(f"    ┣━ 共振1: OI 与 FR [两者同时满足]          : 命中 【{count_ab_sync}】 行")
-        print(f"    ┗━ 共振2: 三大条件完全共振 (外加价格突破前高) : 命中 【{count_all_sync}】 行 (即潜在点火次数)")
-
-    print("\n>>> [启动引擎] 核心状态机开始遍历回测...\n")
-
-    # ------------------------------------------
-    # 5. 核心交易状态机 (扁平化遍历)
-    # ------------------------------------------
-    in_position = False
-    entry_price = 0.0
-    entry_time = None
-
-    trades = []
-    initial_capital = 10000.0
-    capital = initial_capital
-
-    # 使用 itertuples 替代 iloc，大幅提升遍历效率与代码可读性
-    for row in df_master.itertuples():
-        from zoneinfo import ZoneInfo
-
-        curr_time_str = row.datetime.replace(tzinfo=ZoneInfo("UTC")) \
-            .astimezone(ZoneInfo("Asia/Shanghai")) \
-            .strftime('%Y-%m-%d %H:%M:%S')
-        if not in_position:
-            # 状态判定：等待三大共振信号
-            if row.cond_A and row.cond_B and (row.close > row.resist_12h):
-                entry_price = row.next_open
-                entry_time = row.next_datetime
-                in_position = True
-
-                print(
-                    f"[交易/点火入场] 突破12h阻力 | 触发: [{curr_time_str}] | 执行价: [{entry_price:.4f}] | 燃料OI: [{row.oi_amount}>={row.oi_90pct:.1f}] | 流血FR: [{row.funding_rate * 100:.4f}%]")
-
+def _core_static(entry_flag, exit_flag, n, cooldown, max_trades):
+    ent = np.empty(max_trades, dtype=np.int64)
+    ext = np.empty(max_trades, dtype=np.int64)
+    k = 0
+    i = 0
+    while i < n - 1 and k < max_trades:
+        if entry_flag[i]:
+            j = i + 1
+            found = -1
+            while j < n:
+                if exit_flag[j]:
+                    found = j
+                    break
+                j += 1
+            if found < 0:
+                found = n - 1
+            ent[k] = i
+            ext[k] = found
+            k += 1
+            i = found + 1 + cooldown
         else:
-            # 状态判定：一旦收盘价跌破1小时低点则无条件止损/止盈
-            if row.close < row.support_1h:
-                exit_price = row.next_open
-                exit_time = row.next_datetime
+            i += 1
+    return ent[:k], ext[:k]
 
-                # 收益结算
-                gross_return = (exit_price - entry_price) / entry_price
-                net_return = gross_return - (FEE_RATE * 2)
-                capital += capital * net_return
 
-                trades.append({
-                    'entry_time': entry_time,
-                    'entry_price': entry_price,
-                    'exit_time': exit_time,
-                    'exit_price': exit_price,
-                    'net_return': net_return,
-                    'capital': capital
-                })
+if HAS_NUMBA:
+    _core_static = njit(cache=True, nogil=True)(_core_static)
 
-                in_position = False
 
-                net_color_sign = "+" if net_return > 0 else ""
-                print(
-                    f"[交易/破位出场] 跌破1h支撑 | 触发: [{curr_time_str}] | 执行价: [{exit_price:.4f}] | 单笔净收益: [{net_color_sign}{net_return * 100:.2f}%] | 当前净值: [{capital:.2f}]")
+def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
+    """无 numba 时的跳跃匹配"""
+    ent, ext = [], []
+    ne, nx = entry_idx.size, exit_idx.size
+    pos = 0
+    while pos < n - 1 and len(ent) < max_trades:
+        a = np.searchsorted(entry_idx, pos, side='left')
+        if a >= ne: break
+        e = int(entry_idx[a])
+        if e >= n - 1: break
+        b = np.searchsorted(exit_idx, e + 1, side='left')
+        x = int(exit_idx[b]) if b < nx else n - 1
+        ent.append(e)
+        ext.append(x)
+        pos = x + 1 + cooldown
+    return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
 
-    # ------------------------------------------
-    # 6. 回测报告产出与绘图驱动
-    # ------------------------------------------
-    print("\n==================================================")
-    print(f"📊 [绩效看板] Pure Squeeze Catcher - 标的: 【{target_coin}】")
-    print("==================================================")
 
-    if not trades:
-        print("💡 回测结论: 期间未触发任何符合所有前置条件的交易信号，建议检查数据时间跨度或适当放宽参数阈值。")
-        print("==================================================\n")
+# ======================================================================
+# 2. 数据加载与对齐
+# ======================================================================
+def _pick(df, cands, what):
+    for c in cands:
+        if c in df.columns: return c
+    raise KeyError(f"[{what}] 找不到列 {cands}")
 
-        # 即使没有交易也强制渲染图表，方便用户通过鼠标滑动找寻放宽参数的灵感
-        if len(df_master) > 0:
-            plot_interactive_chart(df_master, trades, target_coin)
+
+def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
+    bar = f"{bar_minutes}min"
+
+    k = pd.read_csv(kline_file)
+    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+    agg = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'), volume=('volume', 'sum'))
+    agg['close'] = agg['close'].ffill()
+    agg = agg[agg['close'].notna()]
+    agg['open'] = agg['open'].fillna(agg['close'])
+    agg['high'] = agg['high'].fillna(agg['close'])
+    agg['low'] = agg['low'].fillna(agg['close'])
+    agg['volume'] = agg['volume'].fillna(0.0)
+
+    oi = pd.read_csv(oi_file)
+    ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
+    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
+    oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
+    oi_s = (oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc]
+            .astype(float).resample(bar, label='left', closed='left').last())
+
+    fr = pd.read_csv(fr_file)
+    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
+    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
+    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
+    fr_s = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc]
+            .astype(float).resample(bar, label='left', closed='left').last())
+
+    df = agg.copy()
+    df['oi_amount'] = oi_s.reindex(df.index).ffill()
+    df['funding_rate'] = fr_s.reindex(df.index).ffill()
+
+    fv = df[['oi_amount', 'funding_rate']].apply(lambda s: s.first_valid_index())
+    start = max([x for x in fv.tolist() if x is not None], default=df.index[0])
+    df = df.loc[start:].copy()
+    df[['oi_amount', 'funding_rate']] = df[['oi_amount', 'funding_rate']].ffill()
+    df = df.dropna(subset=['oi_amount', 'funding_rate'])
+    for c in ['open', 'high', 'low', 'close']: df = df[df[c] > 0]
+    return df
+
+
+# ======================================================================
+# 3. 极简因子计算
+# ======================================================================
+def make_params(bar_minutes, n_rows):
+    bph = 60.0 / bar_minutes
+    B = lambda hours: max(1, int(round(hours * bph)))
+    P = {}
+    P['N'] = B(24)
+    P['W'] = B(24 * 30)
+    if n_rows < P['W'] * 2: P['W'] = max(200, n_rows // 3)
+    P['MINP_W'] = max(50, P['W'] // 5)
+    P['WARMUP'] = int(P['W'] + B(168) + 3 * P['N'])
+    return P
+
+
+def build_factors(df, P):
+    W, N = P['W'], P['N']
+    mp = P['MINP_W']
+    o, h, l, c = df['open'], df['high'], df['low'], df['close']
+    v = df['volume']
+
+    def QT(s, p): return s.rolling(W, min_periods=mp).quantile(p).shift(1)
+
+    def bs(s, k=1): return s.shift(k, fill_value=False)
+
+    maxH_N = h.rolling(N, min_periods=max(2, N // 2)).max()
+    rng = (h - l) + EPS
+    uw = (h - np.maximum(o, c)) / rng
+
+    F = {}
+    F['KLINE_LONG_UPPER_WICK'] = uw > 0.50
+    F['VOLUME_SPIKE'] = v > QT(v, 0.95)
+    F['KLINE_INSIDE_BAR'] = (h < h.shift(1)) & (l > l.shift(1))
+
+    # 入场信号: 高位长上影且放量
+    F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > 0.95) & F['KLINE_LONG_UPPER_WICK'] & F['VOLUME_SPIKE']
+    # 出场信号: 孕线之后突破且放量
+    F['ENTRY_INSIDE_BREAK_VOLUME'] = bs(F['KLINE_INSIDE_BAR']) & (c > h.shift(1)) & F['VOLUME_SPIKE']
+
+    out = {}
+    for k_ in ['EXIT_UPPER_WICK_REJECTION', 'ENTRY_INSIDE_BREAK_VOLUME']:
+        out[k_] = np.ascontiguousarray(F[k_].fillna(False).to_numpy(dtype=bool))
+    return out
+
+
+# ======================================================================
+# 4. 绩效计算与匹配回测
+# ======================================================================
+def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
+    T = int(len(rets))
+    d = {prefix + 'trades': T}
+    if T == 0:
+        for k in ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'profit_factor', 'max_dd', 'avg_hold_h', 'exposure',
+                  'max_win', 'max_loss']:
+            d[prefix + k] = np.nan
+        return d
+
+    d[prefix + 'win_rate'] = float((rets > 0).mean() * 100)
+    d[prefix + 'sum_ret'] = float(rets.sum() * 100)
+    d[prefix + 'avg_ret'] = float(rets.mean() * 100)
+    d[prefix + 'med_ret'] = float(np.median(rets) * 100)
+
+    eq = np.concatenate(([0.0], np.cumsum(rets)))
+    d[prefix + 'max_dd'] = float((np.maximum.accumulate(eq) - eq).max() * 100)
+
+    hold = (ext - ent).astype(float)
+    d[prefix + 'avg_hold_h'] = float(hold.mean() * bar_minutes / 60.0)
+    d[prefix + 'exposure'] = float(hold.sum() / max(n_bars, 1) * 100)
+    d[prefix + 'max_win'] = float(rets.max() * 100)
+    d[prefix + 'max_loss'] = float(rets.min() * 100)
+
+    return d
+
+
+def mine_symbol(coin, df, cfg):
+    bm = cfg['BAR_MINUTES']
+    P = make_params(bm, len(df))
+    F = build_factors(df, P)
+
+    warm = min(P['WARMUP'], len(df) - 100)
+    if warm < 0 or len(df) - warm < 200:
+        return None, [], []
+
+    df = df.iloc[warm:].copy()
+    F = {k: v[warm:] for k, v in F.items()}
+
+    n = len(df)
+    op, cl = df['open'].to_numpy(float), df['close'].to_numpy(float)
+
+    exec_px = np.empty(n, float)
+    exec_px[:-1] = op[1:]
+    exec_px[-1] = cl[-1]
+    cost = 2.0 * (cfg['FEE_RATE'] + cfg['SLIPPAGE'])
+    bench_ret = float((cl[-1] / cl[0] - 1.0) * 100)
+
+    # 核心匹配
+    entry_arr = F['EXIT_UPPER_WICK_REJECTION']
+    exit_arr = F['ENTRY_INSIDE_BREAK_VOLUME']
+
+    max_tr = n // 2 + 2
+    if HAS_NUMBA:
+        ent, ext = _core_static(entry_arr, exit_arr, n, cfg['COOLDOWN_BARS'], max_tr)
+    else:
+        eidx = np.flatnonzero(entry_arr).astype(np.int64)
+        xidx = np.flatnonzero(exit_arr).astype(np.int64)
+        ent, ext = _match_static_ss(eidx, xidx, n, cfg['COOLDOWN_BARS'], max_tr)
+
+    if ent.size < 1:
+        return None, [], []
+
+    rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
+    ok = np.isfinite(rets)
+    ent, ext, rets = ent[ok], ext[ok], rets[ok]
+
+    if ent.size < 1:
+        return None, [], []
+
+    split_bar = int(n * cfg['OOS_SPLIT'])
+    row = dict(coin=coin, pool='A_山寨永续', bench_ret=bench_ret)
+
+    row.update(trade_stats(rets, ent, ext, bm, n))
+    m_is = ent < split_bar
+    row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
+
+    # 计算复合指标
+    row['excess'] = row['avg_ret'] - row['bench_ret']
+    row['edge_100h'] = (row['excess'] / row['avg_hold_h'] * 100) if row.get('avg_hold_h', 0) > 0 else np.nan
+    row['filtered_out'] = True
+
+    return row, rets.tolist(), rets[~m_is].tolist()
+
+
+# ======================================================================
+# 5. 主流程
+# ======================================================================
+def main(cfg=CFG):
+    data_dir = cfg['DATA_DIR']
+    if not os.path.isdir(data_dir):
+        print(f"❌ 数据目录不存在: {data_dir}")
         return
 
-    trades_df = pd.DataFrame(trades)
-    total_trades = len(trades_df)
-    win_rate = len(trades_df[trades_df['net_return'] > 0]) / total_trades
-    total_return_pct = (capital - initial_capital) / initial_capital
-
-    # 修复了原回撤计算缺陷，现在严格比较每一次峰顶资产与当前资产
-    capital_cummax = trades_df['capital'].cummax()
-    max_drawdown = ((capital_cummax - trades_df['capital']) / capital_cummax).max()
-
-    print(f"总交易笔数       : 【{total_trades}】 笔")
-    print(f"策略胜率         : 【{win_rate * 100:.2f}%】")
-    print(f"总净收益率       : 【{total_return_pct * 100:.2f}%】")
-    print(f"区间最大回撤     : 【{max_drawdown * 100:.2f}%】")
-    print(f"平均每笔净收益   : 【{trades_df['net_return'].mean() * 100:.2f}%】")
-    print("==================================================\n")
-
-    # 驱动画图引擎
-    if len(df_master) > 0:
-        plot_interactive_chart(df_master, trades, target_coin)
-
-
-def scan_and_run_batch(data_dir='./data'):
-    """扫描指定目录下的数据文件，并自动拼装参数执行批量回测"""
-    if not os.path.exists(data_dir):
-        print(f"❌ [严重错误] 找不到数据目录 【{data_dir}】，请确保当前执行路径下存在该文件夹。")
+    kfiles = sorted(f for f in os.listdir(data_dir) if f.endswith('_USDT_USDT_1m_kline.csv'))
+    if not kfiles:
+        print("❌ 未发现 K线数据文件。")
         return
 
-    # 通过嗅探 kline 文件提取所有潜在币种名称
-    file_list = os.listdir(data_dir)
-    kline_files = [f for f in file_list if f.endswith('_USDT_USDT_1m_kline.csv')]
+    print("=" * 70)
+    print(f" 🚀 定制策略回测启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
+    print("=" * 70)
 
-    if not kline_files:
-        print(f"⚠️ [无数据] 在 【{data_dir}】 目录下未发现任何符合 '*_USDT_USDT_1m_kline.csv' 格式的文件。")
+    results = []
+    all_rets = []
+    all_oos_rets = []
+
+    for kf in kfiles:
+        coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+        if cfg['COINS'] and coin not in cfg['COINS']:
+            continue
+
+        oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
+        fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
+
+        if not (os.path.exists(oi_f) and os.path.exists(fr_f)):
+            continue
+
+        try:
+            df = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+            if len(df) < 800:
+                continue
+
+            res_dict, rets_list, oos_rets_list = mine_symbol(coin, df, cfg)
+
+            if res_dict is not None:
+                results.append(res_dict)
+                all_rets.extend(rets_list)
+                all_oos_rets.extend(oos_rets_list)
+
+        except Exception as e:
+            pass
+
+    if not results:
+        print("\n⚠️ 所有币种均未产生交易信号。")
         return
 
-    print(f"🔍 [自动嗅探] 共发现 【{len(kline_files)}】 个待测币种，开始批量执行回测...")
-    print("=" * 60)
+    df_res = pd.DataFrame(results)
+    df_res.sort_values('sum_ret', ascending=False, inplace=True)
+    df_res['oos_trades'] = df_res['oos_trades'].fillna(0).astype(int)
 
-    # 遍历每一个提取出来的币种，拼装文件路径进行回测
-    for kf in kline_files:
-        # if "BEAT" not in kf:
-        #     continue
+    # ==========================
+    # 打印特定排版的交易日志表
+    # ==========================
+    cols_to_show = [
+        'coin', 'pool', 'trades', 'win_rate', 'avg_ret', 'bench_ret', 'excess', 'edge_100h',
+        'sum_ret', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss',
+        'oos_trades', 'oos_avg_ret', 'filtered_out'
+    ]
 
-        target_coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-        oi_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_5m_oi.csv')
-        fr_file = os.path.join(data_dir, f'{target_coin}_USDT_USDT_funding_rates.csv')
-        kline_file = os.path.join(data_dir, kf)
+    print("\n" + "=" * 120)
 
-        # 防呆：必须确保三份数据同时存在才能回测
-        if os.path.exists(oi_file) and os.path.exists(fr_file):
-            print(f"\n🚀 正在启动针对标的 【{target_coin}】 的策略实例")
-            print("-" * 60)
-            run_backtest(target_coin, oi_file, fr_file, kline_file)
-        else:
-            print(f"⚠️ [跳过标的] 币种 【{target_coin}】 缺乏完整的底层数据(需要同时具备 oi, funding_rates, kline)，已自动跳过。")
+    # 临时设定 pandas 格式输出以完全匹配目标对齐效果
+    pd.set_option('display.float_format', lambda x: f'{x:.4f}')
+    print(df_res[cols_to_show].to_string(index=False))
+
+    # ==========================
+    # 打印底部全局统计摘要
+    # ==========================
+    all_rets_arr = np.array(all_rets) * 100
+    all_oos_rets_arr = np.array(all_oos_rets) * 100
+
+    total_trades = len(all_rets_arr)
+    pooled_expected = all_rets_arr.mean() if total_trades > 0 else 0
+    std_ret = all_rets_arr.std(ddof=1) if total_trades > 1 else 0
+    cluster_t = pooled_expected / (std_ret / np.sqrt(total_trades)) if std_ret > 0 else float('nan')
+
+    oos_trades = len(all_oos_rets_arr)
+    oos_pooled_expected = all_oos_rets_arr.mean() if oos_trades > 0 else 0
+    oos_retention = (oos_pooled_expected / pooled_expected * 100) if pooled_expected != 0 else 0
+
+    profitable_coins = (df_res['sum_ret'] > 0).sum()
+    total_coins = len(df_res)
+    total_pnl = df_res['sum_ret'].sum()
+
+    max_coin_idx = df_res['sum_ret'].idxmax()
+    max_coin = df_res.loc[max_coin_idx, 'coin']
+    max_coin_pnl = df_res.loc[max_coin_idx, 'sum_ret']
+    pnl_ex_best = total_pnl - max_coin_pnl
+    max_contrib_pct = (max_coin_pnl / total_pnl * 100) if total_pnl > 0 else 0
+
+    print("\n")
+    print(f"    覆盖币种 / 通过过滤                               : {total_coins} / 0")
+    print(f"    总笔数                                       : {total_trades}")
+    print(f"    池化单笔期望                                    : +{pooled_expected:.4f}%")
+    print(f"    cluster_t                                 : {cluster_t:.2f}")
+    print(f"    OOS 总笔数 / 池化期望                            : {oos_trades} / +{oos_pooled_expected:.4f}%")
+    print(f"    OOS 收益留存率                                 : {oos_retention:.1f}%")
+    print(f"    盈利币 / 总币                                  : {profitable_coins} / {total_coins}")
+    print(f"    总盈亏                                       : {total_pnl:.1f}%    去掉最好的币 {pnl_ex_best:.1f}%")
+    print(f"    最大贡献币                                     : {max_coin} ({max_contrib_pct:.0f}%)")
 
 
-if __name__ == "__main__":
-    scan_and_run_batch('./data')
+if __name__ == '__main__':
+    main(CFG)
