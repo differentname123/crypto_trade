@@ -530,7 +530,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
 # ==========================================
 # 4. 程序入口点
 # ==========================================
-def execute_trading_bot_workflow(target_time, proxy_url=None):
+def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
@@ -762,7 +762,7 @@ def generate_top_long_signals(df):
             actual_signals_list.append({
                 'time': dt_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
-                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 2.6,
+                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.0001,
                 'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
             })
 
@@ -772,7 +772,7 @@ def generate_top_long_signals(df):
             actual_signals_list.append({
                 'time': dt_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'CLOSE', 'price': cur_c, 'reason': exit_reason,
-                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 2.6,
+                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 0.0001,
                 'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
             })
 
@@ -921,5 +921,5 @@ if __name__ == "__main__":
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['SPCX/USDT:USDT']
+    symbol_list = ['BLESS/USDT:USDT']
     execute_trading_bot_workflow_top_long(target_time, symbol_list,'http://127.0.0.1:7890')

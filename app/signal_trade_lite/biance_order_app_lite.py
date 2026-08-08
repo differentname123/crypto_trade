@@ -27,10 +27,11 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
+CURRENT_SYMBOL = "top_long" # 另一个选项是 "cross"
 
-logger = setup_logger(app_name="cross_trader")
+logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
-from run_cross_signal_lite import execute_trading_bot_workflow, execute_trading_bot_workflow_top_long
+from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long
 from biance_order_lite import (execute_order, get_total_equity,
                                ExecStatus, safe_init_exchange
                                )
@@ -39,11 +40,13 @@ from biance_order_lite import (execute_order, get_total_equity,
 # L0. 配置与常量
 # ==========================================
 BEST_TOP_N = 20
-CURRENT_SYMBOL = "top_long" # 另一个选项是 "cross"
 LEDGER_FILE = f"trade_records_{CURRENT_SYMBOL}.csv"  # 本策略专属账本, 与其它策略物理隔离
 LEVERAGE = 1
 MIN_ORDER_VALUE = 51
 MAX_ORDER_VALUE = 2000.0
+if CURRENT_SYMBOL == "top_long":
+    MIN_ORDER_VALUE = 6
+    MAX_ORDER_VALUE = 100
 
 PRELOAD_AHEAD_MIN = 3  # 整点前 N 分钟预对账
 SIGNAL_WINDOW_MIN = 1  # 信号有效窗口 (±N 分钟), 过期信号直接丢弃
@@ -772,9 +775,13 @@ def run_scheduler():
 
 
             # 拉取信号 → 窗口内执行 (透传需要包含的已有持仓信号)
-            # signal_df = execute_trading_bot_workflow(target_time_str, proxy_url=proxy_url)
-
-            signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url, position_cache=position_cache, ledger=ledger)
+            if CURRENT_SYMBOL == "cross":
+                signal_df = execute_trading_bot_workflow_cross(target_time_str, proxy_url=proxy_url)
+            elif CURRENT_SYMBOL == "top_long":
+                signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url, position_cache=position_cache, ledger=ledger)
+            else:
+                logger.error(f"[SIGNAL] 未知的 CURRENT_SYMBOL 配置: {CURRENT_SYMBOL}")
+                signal_df = None
 
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
