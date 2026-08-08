@@ -674,11 +674,13 @@ def execute_signals(exchange, target_time, total_equity, position_cache, open_or
 # L6. 高可用调度器 (顶层流程编排)
 # ==========================================
 
-def print_position_summary(exchange, ledger):
+def print_position_summary(exchange, ledger, open_order_cache=None):
     """
     输出理论当前持仓的币种, 实际成交价格, 理论持仓的数量, 以及实际的数量.
     在每轮调度最后调用，为确保实际数量准确反映本轮刚发生的新交易，会在内部安全拉取一次最新持仓。
     """
+    reconcile_ledger(exchange, ledger, open_order_cache)
+
     # 尝试重新拉取最新持仓以反映本轮可能的发单变更
     position_cache = _retry_fetch("汇总持仓", lambda: _fetch_positions(exchange))
     if position_cache is None:
@@ -841,12 +843,10 @@ def run_scheduler():
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
                 logger.info("[SCHED] 信号执行完毕，触发盘后对账以回填最新成交状态...")
-                # 等待 1~2 秒，确保交易所撮合引擎已经更新了订单终态（尤其是市价单）
-                time.sleep(2)
-                reconcile_ledger(exchange, ledger, open_order_cache)
+
 
             # 新增：每次运行一轮的最后就调用一次输出汇总信息
-            print_position_summary(exchange, ledger)
+            print_position_summary(exchange, ledger, open_order_cache)
 
         except Exception:
             logger.error(f"[SCHED] 致命异常, 30s 后恢复\n{traceback.format_exc()}")
