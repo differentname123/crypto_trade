@@ -834,7 +834,7 @@ def print_top_long_latest_signals(final_signals_df, logger):
                 target_weight = row.get('target_weight', 0.0)
 
                 logger.info(
-                    f"   🟢 开仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 目标权重: {target_weight * 100:.1f}% | 原因: {reason}"
+                    f"   🔴 开仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 目标权重: {target_weight * 100:.1f}% | 原因: {reason}"
                 )
 
     logger.info("-" * 70)
