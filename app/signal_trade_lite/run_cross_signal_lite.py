@@ -783,6 +783,63 @@ def generate_top_long_signals(df):
     return signals, df_actual_signals
 
 
+def print_top_long_latest_signals(final_signals_df, logger):
+    """
+    打印策略的最新截面操作指令。
+    自动获取当前的北京时间（对齐到整点小时），去账本中匹配当下是否触发了交易信号。
+    """
+    # 1. 空数据校验
+    if final_signals_df is None or final_signals_df.empty:
+        logger.info("🎯 [当前截面无信号 | 实盘发单指令]")
+        logger.info("   ► 全量账本为空，当前无平仓或开仓信号，继续保持现有仓位。")
+        logger.info("-" * 70)
+        return
+
+    # 2. 动态提取策略名称 (优先从数据列中取，读不到则兜底)
+    strategy_name = final_signals_df['STRATEGY_NAME'].iloc[
+        0] if 'STRATEGY_NAME' in final_signals_df.columns else "top_coin_long"
+
+    # 3. 核心修改：获取当前的北京时间，并将分、秒、微秒抹零，对齐到整点小时
+    current_bjt = pd.Timestamp.now(tz='Asia/Shanghai').replace(minute=0, second=0, microsecond=0)
+    latest_time_str = current_bjt.strftime('%Y-%m-%d %H:%M:%S')
+
+    # 4. 根据当前整点截面时间，过滤出此时此刻应该执行的信号
+    latest_trade_signals = final_signals_df[final_signals_df['time'] == latest_time_str]
+
+    # 5. 格式化日志输出
+    logger.info(f"🎯 [当前截面时刻: {latest_time_str} (北京时间) | 策略: {strategy_name} 实盘发单指令]")
+
+    if latest_trade_signals.empty:
+        logger.info("   ► 当前时刻无平仓或开仓信号，继续保持现有仓位。")
+    else:
+        for _, row in latest_trade_signals.iterrows():
+            # 安全提取字段，防止某些意外缺失导致的报错
+            action = row.get('action', 'UNKNOWN')
+            coin = row.get('coin', 'UNKNOWN')
+            direction = row.get('direction', 'LONG')
+            price = row.get('price', 0.0)
+            reason = row.get('reason', '')
+
+            if row['event'] == 'CLOSE':
+                # 提取盈亏百分比
+                pnl = row.get('pnl', None)
+                pnl_str = f"{pnl:.2f}%" if pd.notna(pnl) else "N/A"
+
+                logger.info(
+                    f"   🔴 平仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 本次盈亏: {pnl_str} | 原因: {reason}"
+                )
+
+            elif row['event'] == 'OPEN':
+                # 提取目标仓位权重
+                target_weight = row.get('target_weight', 0.0)
+
+                logger.info(
+                    f"   🟢 开仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 目标权重: {target_weight * 100:.1f}% | 原因: {reason}"
+                )
+
+    logger.info("-" * 70)
+
+
 def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
@@ -846,6 +903,7 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
     # 将df_actual_signals_df_list合并为一个DataFrame
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        print_top_long_latest_signals(final_signals_df, run_logger)
         output_path = "top_long_signals.csv"
         final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
         run_logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
