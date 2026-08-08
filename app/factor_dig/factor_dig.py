@@ -808,7 +808,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
-        return None, None, None, 0
+        return None, None, None, 0, 0
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
@@ -823,6 +823,9 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         btc_c = None
 
     n = len(df)
+    kline_days = n * bm / 1440.0
+    max_allowed_trades = kline_days * 24.0
+
     op = df['open'].to_numpy(float)
     cl = df['close'].to_numpy(float)
     lo = df['low'].to_numpy(float)
@@ -927,7 +930,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
             rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
             ok = np.isfinite(rets)
             ent, ext, rets = ent[ok], ext[ok], rets[ok]
-            if ent.size < cfg['MIN_TRADES_REPORT']:
+            if ent.size < cfg['MIN_TRADES_REPORT'] or ent.size > max_allowed_trades:
                 continue
 
             # ================= 构建逐笔交易明细 =================
@@ -963,7 +966,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
             rows.append(row)
 
     all_trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
-    return pd.DataFrame(rows), diag_df, all_trades_df, total
+    return pd.DataFrame(rows), diag_df, all_trades_df, total, kline_days
 
 
 # ======================================================================
@@ -1027,8 +1030,8 @@ def main(cfg=CFG):
                 continue
             print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
 
-            # 传递 btc_close 以便对齐数据
-            pairs, diag, trades_df, trials = mine_symbol(coin, df, cfg, btc_close)
+            # 传递 btc_close 以便对齐数据，并接收返回的天数
+            pairs, diag, trades_df, trials, kline_days = mine_symbol(coin, df, cfg, btc_close)
 
             # 搜索空间取最大组合数（不随币种翻倍）
             total_trials_tested = max(total_trials_tested, trials)
@@ -1044,6 +1047,22 @@ def main(cfg=CFG):
                         index=False, encoding='utf-8-sig')
             all_pairs.append(pairs)
             all_diag.append(diag)
+
+            # ================= 增加的回测统计信息打印 =================
+            valid_combos = len(pairs)
+            retention_rate = valid_combos / trials if trials > 0 else 0
+            total_saved_trades = int(pairs['trades'].sum())
+            avg_trades_per_day = (total_saved_trades / valid_combos / kline_days) if (valid_combos > 0 and kline_days > 0) else 0
+
+            print(
+                f"── 回测统计信息 ── | "
+                f"有效K线天数: {kline_days:.2f}天 | "
+                f"理论组合数量: {trials} | "
+                f"实际回测组合数: {valid_combos} | "
+                f"保留率: {retention_rate * 100:.2f}% | "
+                f"最终保存交易数量: {total_saved_trades} | "
+                f"平均交易频率: {avg_trades_per_day:.2f}次/天/组合"
+            )
 
             top = pairs.head(10)
             print("    ── TOP10 (按累加总收益) ──")
