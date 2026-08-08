@@ -41,7 +41,7 @@ def _format_bj_time(ts_ms):
 # =====================================================================
 # 🗄️ 模块一：缓存与存储引擎 (Cache & Storage Manager) [已修复]
 # =====================================================================
-def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data", log_prefix=""):
+def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_dir="data", log_prefix=""):
     """
     智能加载本地缓存数据。
     如果本地缓存涵盖了所需历史的起点，且目标区间无断层，则只需拉取缺失的增量数据；
@@ -55,7 +55,7 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data",
 
     for sym in symbol_list:
         safe_symbol = sym.replace("/", "_").replace(":", "_")
-        path = os.path.join(cache_dir, f"{safe_symbol}_latest.csv")
+        path = os.path.join(cache_dir, f"{safe_symbol}_{timeframe}_latest.csv")
 
         if os.path.exists(path):
             try:
@@ -111,7 +111,7 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, cache_dir="data",
     return memory_pool, fetch_since_map
 
 
-def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
+def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, timeframe, log_prefix=""):
     """
     （后台线程专用）直接将内存池中的全量最新数据覆写落盘，避免二次读取
     """
@@ -120,7 +120,7 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
     os.makedirs(cache_dir, exist_ok=True)
     for symbol, df in full_dfs_for_cache.items():
         safe_symbol = symbol.replace("/", "_").replace(":", "_")
-        path = os.path.join(cache_dir, f"{safe_symbol}_latest.csv")
+        path = os.path.join(cache_dir, f"{safe_symbol}_{timeframe}_latest.csv")
         temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
         try:
             # 原子性写入保护：先写临时文件，完成后系统级瞬间覆盖，防止程序被强杀导致数月缓存归零损坏
@@ -140,7 +140,7 @@ def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix=""):
         f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
 
 
-def _background_pipeline_task(memory_pool_copy, cache_dir, log_prefix):
+def _background_pipeline_task(memory_pool_copy, cache_dir, timeframe, log_prefix):
     """
     （被后台线程调用）承接主线程丢过来的全量脏活累活：巨量数据排序、构建 DataFrame、落盘
     """
@@ -158,18 +158,18 @@ def _background_pipeline_task(memory_pool_copy, cache_dir, log_prefix):
                 all_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
             )
 
-        _save_csv_sync_fast(full_dfs_for_cache, cache_dir, log_prefix)
+        _save_csv_sync_fast(full_dfs_for_cache, cache_dir, timeframe, log_prefix)
     except Exception as e:
         logger.error(f"{log_prefix} [BACKGROUND_PIPE] ❌ 后台数据落盘流水线异常: {e}")
 
 
-def dispatch_background_save(memory_pool_copy, cache_dir="data", log_prefix=""):
+def dispatch_background_save(memory_pool_copy, timeframe, cache_dir="data", log_prefix=""):
     """
     启动独立守护线程进行全量覆盖覆写，彻底解放主线程 CPU
     """
     save_thread = threading.Thread(
         target=_background_pipeline_task,
-        args=(memory_pool_copy, cache_dir, log_prefix),
+        args=(memory_pool_copy, cache_dir, timeframe, log_prefix),
         daemon=False
     )
     save_thread.start()
@@ -329,10 +329,39 @@ async def fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue):
 # 🧠 模块四：中央大脑与流程编排 (Task Orchestrator) [引入极致时间调度]
 # =====================================================================
 def parse_time_params(exchange, timeframe, days, target_time_str):
+    # 1. 计算 K 线周期的绝对毫秒数
     timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
-    target_time_ms = int(pd.to_datetime(target_time_str).tz_localize('Asia/Shanghai').timestamp() * 1000)
+
+    # 2. 将传入的字符串时间转化为原始时间戳
+    raw_target_time_ms = int(pd.to_datetime(target_time_str).tz_localize('Asia/Shanghai').timestamp() * 1000)
+
+    # 3. 【核心修正】数学级向下对齐，算出多余的“零头”时间
+    remainder = raw_target_time_ms % timeframe_ms
+
+    if remainder != 0:
+        # 如果有余数，说明时间没对齐，强行减去余数抹平
+        target_time_ms = raw_target_time_ms - remainder
+
+        # 将毫秒转换回北京时间字符串，用于友好打印告警
+        raw_str = pd.to_datetime(raw_target_time_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+        aligned_str = pd.to_datetime(target_time_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+
+        logger.info("\n" + "=" * 60)
+        logger.info(f"🛡️ [时间防弹装甲] 触发时间边界对齐干预！")
+        logger.info(f"   ⚠️ 原始请求时间 : {raw_str} (不符合 {timeframe} 切片标准)")
+        logger.info(f"   ✂️ 抹除多余零头 : 减去 {remainder} 毫秒")
+        logger.info(f"   ✅ 强制向下对齐 : {aligned_str}")
+        logger.info("=" * 60 + "\n")
+    else:
+        # 本身已经完美对齐，不需要修正
+        target_time_ms = raw_target_time_ms
+
+    # 4. 基于对齐后的时间，计算起点和收盘点
     start_time_ms = target_time_ms - (days * 24 * 60 * 60 * 1000)
     target_close_time_ms = target_time_ms + timeframe_ms
+
     return timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms
 
 
@@ -397,7 +426,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={len(symbol_list)} days={days}")
 
         # 2. 智能缓存装载 & 内存池初始化
-        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, log_prefix=log_prefix)
+        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, log_prefix=log_prefix)
 
         queue = asyncio.Queue()
         completion_event = asyncio.Event()
@@ -515,7 +544,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         # 🤝 8. 后台交接：把沉重的 50+ 万条全量清洗与落盘，扔给子线程慢慢跑
         # =====================================================================
         memory_pool_copy = {sym: pool.copy() for sym, pool in memory_pool.items()}
-        dispatch_background_save(memory_pool_copy, cache_dir="data", log_prefix=log_prefix)
+        dispatch_background_save(memory_pool_copy, timeframe, cache_dir="data", log_prefix=log_prefix)
 
         total_pts = sum(len(df) for df in final_dfs.values())
         total_runtime = time.time() - orchestrator_start_t
@@ -575,7 +604,7 @@ if __name__ == "__main__":
 
         target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
-        print(">>> 准备调用数据引擎...")
+        logger.info(">>> 准备调用数据引擎...")
 
         result_map = snipe_kline_data(
             symbol_list=symbol_list,
@@ -595,7 +624,7 @@ if __name__ == "__main__":
         # ]
         # target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
         #
-        # print(">>> 准备调用数据引擎...")
+        # logger.info(">>> 准备调用数据引擎...")
         #
         # result_map = snipe_kline_data(
         #     symbol_list=symbol_list,

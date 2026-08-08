@@ -282,13 +282,144 @@ def scan_signals_and_trades(df, params):
     return signals, recent_trades, current_holding, df_actual_signals
 
 
+def generate_top_long_signals(df):
+    """
+    深度精简版：仅生成并返回 理论信号(signals) 与 实际操作信号(df_actual_signals)
+    重构亮点：跳过无效遍历，采用事件驱动型状态机，大幅提升性能与可读性。
+    """
+    # ====================================================
+    # 0. 内置最优参数与常量定义
+    # ====================================================
+    OPTIMAL_PARAMS = {
+        'BAR_MINUTES': 60,
+        'UPPER_WICK_THRESH': 0.60,
+        'VOL_QUANTILE': 0.95,
+        'HIGH_CLOSE_THRESH': 0.90,
+        'WARMUP_DAYS': 30  # 因子计算必须的30天历史窗口
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    W = 24 * OPTIMAL_PARAMS['WARMUP_DAYS']  # 720 (默认30天1h K线)
+    N = 24
+    EPS = 1e-12
+
+    if len(df) < W:
+        return [], pd.DataFrame(columns=cols)
+
+    symbol = df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = symbol.split('/')[0] if '/' in symbol else symbol
+
+    # ====================================================
+    # 1. 核心指标与信号布尔序列计算 (完全保留原逻辑，向量化计算)
+    # ====================================================
+    o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
+
+    maxH_N = h.rolling(N, min_periods=max(2, N // 2)).max()
+    rng = (h - l) + EPS
+    uw = (h - np.maximum(o, c)) / rng
+    inside = (h < h.shift(1)) & (l > l.shift(1))
+    vol_q = v.rolling(W, min_periods=50).quantile(OPTIMAL_PARAMS['VOL_QUANTILE']).shift(1)
+
+    kline_long_upper_wick = uw > OPTIMAL_PARAMS['UPPER_WICK_THRESH']
+    volume_spike = v > vol_q
+
+    entry_signal = (c / (maxH_N + EPS) > OPTIMAL_PARAMS['HIGH_CLOSE_THRESH']) & kline_long_upper_wick & volume_spike
+    exit_signal = inside.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
+
+    # ====================================================
+    # 2. 核心优化：事件驱动状态机 (跳过无效K线，仅遍历有信号的时刻)
+    # ====================================================
+    signals = []
+    actual_signals_list = []
+
+    # 剔除预热期的信号 (替代原先在 for 循环中逐行判断 if dt < warmup_end_time)
+    entry_signal.iloc[:W] = False
+    exit_signal.iloc[:W] = False
+
+    # 提取所有触发了开仓或平仓信号的行索引 (只遍历这些行，速度提升百倍)
+    event_indices = df.index[entry_signal | exit_signal]
+
+    seen_first_exit = False
+    actual_pos = 0  # 0代表空仓，1代表持有多单
+    actual_entry_price = 0.0
+
+    # 仅遍历触发了信号的事件点
+    for idx in event_indices:
+        dt = df.at[idx, 'datetime_bj']
+        is_entry = entry_signal.at[idx]
+        is_exit = exit_signal.at[idx]
+
+        # 预先提取当前行的常用数值，避免代码中反复出现冗长的定位取值
+        cur_c = c.at[idx]
+        cur_v = v.at[idx]
+        cur_vol_q = vol_q.at[idx]
+        cur_uw = uw.at[idx]
+
+        # 预格式化原因字符串
+        entry_reason = f"高位长上影({cur_uw:.2f}) + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
+        exit_reason = f"孕线突破 + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
+
+        # --- A. 记录所有的理论信号 (signals) ---
+        if is_entry:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🟢 ENTRY (接针做多)', 'datetime_bj': dt,
+                'price': cur_c, 'reason': entry_reason
+            })
+        if is_exit:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🔴 EXIT (突破止盈)', 'datetime_bj': dt,
+                'price': cur_c, 'reason': exit_reason
+            })
+
+        # --- B. 记录受持仓状态控制的实际交易信号 (df_actual_signals) ---
+        if not seen_first_exit:
+            # 必须先等待第一个平仓信号触发后，后续的开仓才算数
+            if is_exit:
+                seen_first_exit = True
+            continue  # 未经历首次平仓前，直接跳过后续的实际操作判断
+
+        # 计算复用的时间戳与格式化时间 (仅在发生真实交易时才计算，极大节省性能)
+        if (actual_pos == 0 and is_entry) or (actual_pos == 1 and is_exit):
+            dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+            ts_ms = int(pd.Timestamp(dt).tz_localize('Asia/Shanghai').timestamp() * 1000)
+
+        # 状态机流转
+        if actual_pos == 0 and is_entry:
+            actual_pos = 1
+            actual_entry_price = cur_c
+            actual_signals_list.append({
+                'time': dt_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
+                'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
+                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 2.6,
+                'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
+            })
+
+        elif actual_pos == 1 and is_exit:
+            actual_pos = 0
+            pnl_pct_actual = (cur_c / actual_entry_price - 1.0) * 100
+            actual_signals_list.append({
+                'time': dt_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
+                'event': 'CLOSE', 'price': cur_c, 'reason': exit_reason,
+                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 2.6,
+                'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
+            })
+
+    # ====================================================
+    # 3. 构造并返回 DataFrame
+    # ====================================================
+    df_actual_signals = pd.DataFrame(actual_signals_list, columns=cols)
+    return signals, df_actual_signals
+
 # ============================================================================
 # 4. 主流程
 # ============================================================================
 def main():
     exchange = init_exchange('binance', default_type='swap')
-    targets = get_top_movers(exchange, top_n=BEST_TOP_N)
-    # targets = ['SIREN/USDT:USDT']
+    # targets = get_top_movers(exchange, top_n=BEST_TOP_N)
+    targets = ['SIREN/USDT:USDT']
     all_signals = []
     symbol_trade_data = {}  # 存储每个币的交易复盘数据
     all_recent_trades = []  # 存储全局近期交易
@@ -301,7 +432,7 @@ def main():
 
     for idx, symbol in enumerate(targets):
         print(f"[{idx + 1}/{len(targets)}] 扫描: {symbol} ...", end=" ")
-        df = get_klines_df(exchange, symbol, days=35, timeframe='1h')
+        df = get_klines_df(exchange, symbol, days=100, timeframe='1h')
 
         if df.empty:
             print("❌ 无数据")
@@ -309,6 +440,8 @@ def main():
 
         # --- 修改：增加接收 df_actual_signals ---
         signals, recent_trades, current_holding, df_actual_signals = scan_signals_and_trades(df, OPTIMAL_PARAMS)
+
+        signals1, df_actual_signals1 = generate_top_long_signals(df)  # 仅生成信号，不返回交易数据
 
         if not df_actual_signals.empty:
             all_actual_dfs.append(df_actual_signals)
