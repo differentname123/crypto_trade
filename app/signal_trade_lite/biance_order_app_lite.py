@@ -840,6 +840,10 @@ def run_scheduler():
 
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
+                logger.info("[SCHED] 信号执行完毕，触发盘后对账以回填最新成交状态...")
+                # 等待 1~2 秒，确保交易所撮合引擎已经更新了订单终态（尤其是市价单）
+                time.sleep(2)
+                reconcile_ledger(exchange, ledger, open_order_cache)
 
             # 新增：每次运行一轮的最后就调用一次输出汇总信息
             print_position_summary(exchange, ledger)
