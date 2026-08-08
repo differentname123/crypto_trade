@@ -802,6 +802,7 @@ def run_scheduler():
     exchange = safe_init_exchange(api_key, secret_key, proxies)
     ledger = LedgerManager(LEDGER_FILE)
     logger.info("[SCHED] 调度系统就绪, 进入整点循环")
+    print_position_summary(exchange, ledger)
 
     while True:
         try:
