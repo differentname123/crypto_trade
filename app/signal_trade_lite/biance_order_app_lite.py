@@ -734,7 +734,6 @@ def print_position_summary(exchange, ledger):
 
 
 def get_top_movers(exchange, top_n=10):
-    print("📡 正在获取全市场 USDT 永续合约 Tickers...")
     tickers = exchange.fetch_tickers(params={'type': 'swap'})
 
     # 过滤出USDT本位合约，并排除没有涨跌幅数据的异常币种
@@ -747,9 +746,6 @@ def get_top_movers(exchange, top_n=10):
     # 只取涨幅榜前 N 名
     gainers = df.head(top_n).index.tolist()
     targets = gainers
-
-    print(f"🔥 涨幅榜前{top_n}: {gainers}")
-    print(f"🎯 涨幅榜原始监控列表 ({len(targets)}个): {targets}\n")
     return targets
 
 
