@@ -8,8 +8,6 @@
  · 纯做多、每笔等名义仓位、收益率【加总不复利】
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
  · [终极定稿] 2张底层长表 + 1张宏观看板，支撑 DSR/True N/Beta剥离 证伪
---------------------------------------------------------------------------------
- 依赖: pandas>=1.4, numpy   (numba 可选，装了快 5-20 倍)
 ================================================================================
 """
 from __future__ import annotations
@@ -801,7 +799,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
 # ======================================================================
 # 6. 单币种全组合挖掘
 # ======================================================================
-def mine_symbol(coin, df, cfg):
+def mine_symbol(coin, df, cfg, btc_close=None):
     bm = cfg['BAR_MINUTES']
     P = make_params(bm, len(df))
 
@@ -817,6 +815,12 @@ def mine_symbol(coin, df, cfg):
 
     # 获取时间戳用于逐笔流水表
     timestamps = df.index.to_numpy()
+
+    # 对齐 BTC 价格序列
+    if btc_close is not None:
+        btc_c = btc_close.reindex(df.index).ffill().to_numpy(float)
+    else:
+        btc_c = None
 
     n = len(df)
     op = df['open'].to_numpy(float)
@@ -927,18 +931,26 @@ def mine_symbol(coin, df, cfg):
                 continue
 
             # ================= 构建逐笔交易明细 =================
-            bh_rets = cl[ext] / cl[ent] - 1.0  # 标的自身买入持有收益 (基准)
+            if btc_c is not None:
+                bh_rets = btc_c[ext] / btc_c[ent] - 1.0
+            else:
+                bh_rets = cl[ext] / cl[ent] - 1.0
+
             ent_dt = timestamps[ent]
             ext_dt = timestamps[ext]
 
+            # [完美规避Pandas Series广播报错：先用标量构建DataFrame，再转Category降维内存]
             trades_df = pd.DataFrame({
                 'combo_id': f"{en}|{xn}",
                 'coin': coin,
                 'entry_time': ent_dt,
                 'exit_time': ext_dt,
-                'net_return': rets,
-                'benchmark_return': bh_rets
+                'net_return': rets.astype(np.float32),
+                'benchmark_return': bh_rets.astype(np.float32)
             })
+            trades_df['combo_id'] = trades_df['combo_id'].astype('category')
+            trades_df['coin'] = trades_df['coin'].astype('category')
+
             trades_list.append(trades_df)
             # ==========================================================
 
@@ -973,6 +985,23 @@ def main(cfg=CFG):
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
     print("=" * 78)
 
+    # ---- 加载全局 BTC 基准数据作 Beta 剥离 ----
+    btc_file = os.path.join(data_dir, 'BTC_USDT_USDT_1m_kline.csv')
+    btc_close = None
+    if os.path.exists(btc_file):
+        print(f"📈 发现基准数据: {btc_file}，正在加载作 Beta 剥离...")
+        try:
+            btc_df = pd.read_csv(btc_file)
+            btc_t = _pick(btc_df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+            btc_df['dt'] = pd.to_datetime(btc_df[btc_t], unit='ms', utc=True)
+            btc_df = btc_df.drop_duplicates(subset=[btc_t]).sort_values('dt').set_index('dt')
+            btc_close = btc_df.resample(f"{cfg['BAR_MINUTES']}min", label='left', closed='left')['close'].last().ffill()
+        except Exception as e:
+            print(f"⚠️ BTC基准数据加载失败: {e}")
+    else:
+        print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
+    # ----------------------------------------------------
+
     all_pairs, all_diag, all_trades = [], [], []
     total_trials_tested = 0  # 记录全局测试总次数
 
@@ -998,8 +1027,11 @@ def main(cfg=CFG):
                 continue
             print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
 
-            pairs, diag, trades_df, trials = mine_symbol(coin, df, cfg)
-            total_trials_tested += trials  # 累加测试次数
+            # 传递 btc_close 以便对齐数据
+            pairs, diag, trades_df, trials = mine_symbol(coin, df, cfg, btc_close)
+
+            # 搜索空间取最大组合数（不随币种翻倍）
+            total_trials_tested = max(total_trials_tested, trials)
 
             if pairs is None or pairs.empty:
                 continue
@@ -1038,9 +1070,10 @@ def main(cfg=CFG):
     all_trades = [t for t in all_trades if t is not None and not t.empty]
     if all_trades:
         all_trades_big = pd.concat(all_trades, ignore_index=True)
-        # 计算全局并发数 (同一 entry_time 触发的信号总数)
-        concurrent_counts = all_trades_big.groupby('entry_time').size().rename('concurrent_signals')
-        all_trades_big = all_trades_big.merge(concurrent_counts, left_on='entry_time', right_index=True, how='left')
+        # 精准计算并发数：同一 combo 在同一 entry_time 触发的币种数量
+        concurrent_counts = all_trades_big.groupby(['combo_id', 'entry_time']).size().rename('concurrent_signals')
+        all_trades_big = all_trades_big.merge(concurrent_counts, left_on=['combo_id', 'entry_time'], right_index=True,
+                                              how='left')
 
         cols_t1 = ['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return',
                    'concurrent_signals']
@@ -1154,7 +1187,7 @@ def main(cfg=CFG):
     print("   · pairs_ALL.csv                 全部币种全组合明细")
     print("   · pairs_CROSS_COIN_SUMMARY.csv  跨币种稳健性汇总")
     print("   · factor_diag_<COIN>.csv        单因子体检(信号数/密度/前瞻收益t值)")
-    print("   · trades_ALL.csv                [表1] 全局逐笔交易流水(含并发与基准)")
+    print("   · trades_ALL.csv                [表1] 全局逐笔交易流水(含并发与BTC基准)")
     print("   · combo_timeseries_ALL.csv      [表2] 组合时序切片长表(按日聚合)")
     print("   · Combo_Profile_ALL.csv         [表3] 宏观统计档案看板(含DSR与True N)")
 
@@ -1177,7 +1210,6 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键】动态修改输出目录，防止不同周期的文件互相覆盖
-        # 例如会分别生成 ./factor_out_1m, ./factor_out_5m, ./factor_out_15m
         run_cfg['OUT_DIR'] = f'./factor_out_{bm}m'
 
         # 调用主函数执行
