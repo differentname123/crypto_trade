@@ -25,6 +25,7 @@ OPTIMAL_PARAMS = {
 }
 BEST_TOP_N = 20
 
+
 # ============================================================================
 # 1. 交易所初始化与数据拉取
 # ============================================================================
@@ -115,12 +116,18 @@ def get_top_movers(exchange, top_n=10):
     print(f"🎯 最终监控列表 ({len(targets)}个): {targets}\n")
     return targets
 
+
 # ============================================================================
 # 3. 核心信号计算与交易配对逻辑
 # ============================================================================
 def scan_signals_and_trades(df, params):
+    # --- 统一新增 DataFrame 字段定义 ---
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
     if len(df) < 720:
-        return [], [], None
+        return [], [], None, pd.DataFrame(columns=cols)
 
     o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
     W = 24 * params['WARMUP_DAYS']  # 720
@@ -143,6 +150,14 @@ def scan_signals_and_trades(df, params):
     trades = []
     open_trade = None
     symbol = df.attrs.get('symbol', 'UNKNOWN')
+
+    # --- 新增：理论实际开平仓信号状态变量 ---
+    coin_name = symbol.split('/')[0] if '/' in symbol else symbol
+    seen_first_exit = False
+    actual_pos = 0  # 0代表空仓，1代表持有多单
+    actual_signals_list = []
+    actual_entry_price = None
+    # ----------------------------------------
 
     # 🎯 计算预热期结束的时间点
     warmup_bars = W  # 720根K线作为预热期
@@ -189,6 +204,56 @@ def scan_signals_and_trades(df, params):
             })
             open_trade = None
 
+        # --- 新增：实际理论开平仓信号记录与校验 ---
+        if not seen_first_exit:
+            # 必须先等待第一个平仓信号触发后，后续的开仓才算数
+            if is_exit:
+                seen_first_exit = True
+        else:
+            if actual_pos == 0 and is_entry:
+                # 记录真实的第一次开仓信号
+                actual_pos = 1
+                actual_entry_price = c.iloc[i]
+                ts_ms = int(pd.Timestamp(dt).tz_localize('Asia/Shanghai').timestamp() * 1000)
+                actual_signals_list.append({
+                    'time': dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    'action': 'BUY',
+                    'coin': coin_name,
+                    'direction': 'LONG',
+                    'event': 'OPEN',
+                    'price': actual_entry_price,
+                    'reason': f"高位长上影({uw.iloc[i]:.2f}) + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})",
+                    'target_weight': 1.0,
+                    'pnl': None,
+                    'top_k': 1,
+                    'max_weight': 2.6,
+                    'signal_timestamp_ms': ts_ms,
+                    'STRATEGY_NAME': 'top_coin_long',
+                    'symbol': symbol
+                })
+            elif actual_pos == 1 and is_exit:
+                # 记录真实的第一次平仓信号
+                actual_pos = 0
+                pnl_pct_actual = (c.iloc[i] / actual_entry_price - 1.0) * 100
+                ts_ms = int(pd.Timestamp(dt).tz_localize('Asia/Shanghai').timestamp() * 1000)
+                actual_signals_list.append({
+                    'time': dt.strftime('%Y-%m-%d %H:%M:%S'),
+                    'action': 'SELL',
+                    'coin': coin_name,
+                    'direction': 'LONG',
+                    'event': 'CLOSE',
+                    'price': c.iloc[i],
+                    'reason': f"孕线突破 + 爆量({v.iloc[i]:.0f} > {vol_q.iloc[i]:.0f})",
+                    'target_weight': 0.0,
+                    'pnl': pnl_pct_actual,
+                    'top_k': 1,
+                    'max_weight': 2.6,
+                    'signal_timestamp_ms': ts_ms,
+                    'STRATEGY_NAME': 'top_coin_long',
+                    'symbol': symbol
+                })
+        # ------------------------------------------
+
     # 3. 交易排序（已取消cutoff限制，保留所有预热期后的交易）
     recent_trades = trades.copy()
     recent_trades.sort(key=lambda x: x['entry_time'])
@@ -207,7 +272,14 @@ def scan_signals_and_trades(df, params):
             'hold_duration': df['datetime_bj'].iloc[-1] - open_trade['entry_time']
         }
 
-    return signals, recent_trades, current_holding
+    # --- 新增：构造返回的实际信号 DataFrame ---
+    if actual_signals_list:
+        df_actual_signals = pd.DataFrame(actual_signals_list)[cols]
+    else:
+        df_actual_signals = pd.DataFrame(columns=cols)
+    # ------------------------------------------
+
+    return signals, recent_trades, current_holding, df_actual_signals
 
 
 # ============================================================================
@@ -216,10 +288,14 @@ def scan_signals_and_trades(df, params):
 def main():
     exchange = init_exchange('binance', default_type='swap')
     targets = get_top_movers(exchange, top_n=BEST_TOP_N)
-    # targets = ['BTC/USDT:USDT']
+    # targets = ['SIREN/USDT:USDT']
     all_signals = []
     symbol_trade_data = {}  # 存储每个币的交易复盘数据
     all_recent_trades = []  # 存储全局近期交易
+
+    # --- 新增：存储全局全局实际理论信号 ---
+    all_actual_dfs = []
+    # --------------------------------------
 
     print(f"🚀 开始扫描 {len(targets)} 个币种的 1h K线信号 (包含30天Warmup)...\n" + "-" * 50)
 
@@ -231,7 +307,12 @@ def main():
             print("❌ 无数据")
             continue
 
-        signals, recent_trades, current_holding = scan_signals_and_trades(df, OPTIMAL_PARAMS)
+        # --- 修改：增加接收 df_actual_signals ---
+        signals, recent_trades, current_holding, df_actual_signals = scan_signals_and_trades(df, OPTIMAL_PARAMS)
+
+        if not df_actual_signals.empty:
+            all_actual_dfs.append(df_actual_signals)
+        # ----------------------------------------
 
         if signals:
             all_signals.extend(signals)
@@ -285,7 +366,7 @@ def main():
             print("-" * 100)
 
     # ==========================
-    # 2. 打印交易复盘与统计 (新增核心功能)
+    # 2. 打印交易复盘与统计 (保持原有逻辑)
     # ==========================
     if all_recent_trades or any(data['holding'] for data in symbol_trade_data.values()):
         print("\n" + "=" * 100)
@@ -333,7 +414,7 @@ def main():
                     f"⏳ 当前持仓: 🟢 {e_str} ({holding['entry_price']:.6g}) | 现价: {holding['current_price']:.6g} | 浮盈: {holding['float_pnl']:+.2f}% | 持仓: {dur}")
             print("-" * 100)
 
-        # ========================== 全局统计汇总 (已移至末尾) ==========================
+        # ========================== 全局统计汇总 ==========================
         if all_recent_trades or all_holdings:
             print("\n🌍 全局汇总:")
 
