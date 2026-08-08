@@ -808,15 +808,13 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
-        return None, None, None, 0, 0.0, 0, 0
+        return None, None, None, 0
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
 
     # 获取时间戳用于逐笔流水表
     timestamps = df.index.to_numpy()
-    kline_days = len(df) * bm / 1440.0
-    max_allowed_trades = kline_days * 24  # 每天最多平均24笔(平均1小时1笔)
 
     # 对齐 BTC 价格序列
     if btc_close is not None:
@@ -926,18 +924,9 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
             if ent.size == 0:
                 continue
-
-            # --- 过滤器: 频率过高直接跳过，节省内存和后续计算 ---
-            if ent.size < cfg['MIN_TRADES_REPORT']:
-                continue
-            if ent.size > max_allowed_trades:
-                continue
-            # ----------------------------------------------------
-
             rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
             ok = np.isfinite(rets)
             ent, ext, rets = ent[ok], ext[ok], rets[ok]
-
             if ent.size < cfg['MIN_TRADES_REPORT']:
                 continue
 
@@ -974,9 +963,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
             rows.append(row)
 
     all_trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
-    actual_combos = len(rows)
-    total_saved_trades = sum(r['trades'] for r in rows) if rows else 0
-    return pd.DataFrame(rows), diag_df, all_trades_df, total, kline_days, actual_combos, total_saved_trades
+    return pd.DataFrame(rows), diag_df, all_trades_df, total
 
 
 # ======================================================================
@@ -1016,7 +1003,6 @@ def main(cfg=CFG):
     # ----------------------------------------------------
 
     all_pairs, all_diag, all_trades = [], [], []
-    all_coin_stats = []  # 记录所有币种的宏观统计信息
     total_trials_tested = 0  # 记录全局测试总次数
 
     for kf in kfiles:
@@ -1042,24 +1028,7 @@ def main(cfg=CFG):
             print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
 
             # 传递 btc_close 以便对齐数据
-            pairs, diag, trades_df, trials, kline_days, actual_combos, total_saved_trades = mine_symbol(coin, df, cfg,
-                                                                                                        btc_close)
-
-            # 收集该币种统计信息
-            theoretical_combos = trials
-            retention_rate = actual_combos / theoretical_combos if theoretical_combos > 0 else 0
-            avg_trade_freq = (total_saved_trades / actual_combos / kline_days) if (
-                        actual_combos > 0 and kline_days > 0) else 0
-
-            all_coin_stats.append({
-                'coin': coin,
-                'kline_days': round(kline_days, 2),
-                'theoretical_combos': theoretical_combos,
-                'actual_combos': actual_combos,
-                'retention_rate': round(retention_rate, 4),
-                'total_saved_trades': total_saved_trades,
-                'avg_trades_per_day': round(avg_trade_freq, 4)
-            })
+            pairs, diag, trades_df, trials = mine_symbol(coin, df, cfg, btc_close)
 
             # 搜索空间取最大组合数（不随币种翻倍）
             total_trials_tested = max(total_trials_tested, trials)
@@ -1096,26 +1065,6 @@ def main(cfg=CFG):
     big.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_ALL.csv'), index=False, encoding='utf-8-sig')
     pd.concat(all_diag, ignore_index=True).to_csv(
         os.path.join(cfg['OUT_DIR'], 'factor_diag_ALL.csv'), index=False, encoding='utf-8-sig')
-
-    # ================= 记录并打印全局统计信息 =================
-    if all_coin_stats:
-        stats_df = pd.DataFrame(all_coin_stats)
-        stats_df.rename(columns={
-            'coin': '币种',
-            'kline_days': 'K线天数',
-            'theoretical_combos': '理论组合数量',
-            'actual_combos': '实际回测的组合数量',
-            'retention_rate': '保留率',
-            'total_saved_trades': '最终保存的交易数量',
-            'avg_trades_per_day': '平均交易频率(次/天)'
-        }, inplace=True)
-        stats_df.to_csv(os.path.join(cfg['OUT_DIR'], 'backtest_stats_ALL.csv'), index=False, encoding='utf-8-sig')
-
-        print("\n" + "=" * 78)
-        print("📊 各币种回测过滤与统计信息")
-        print("=" * 78)
-        print(stats_df.to_string(index=False))
-    # ==========================================================
 
     # ================= 生成表1：全局逐笔交易流水 =================
     all_trades = [t for t in all_trades if t is not None and not t.empty]
@@ -1234,7 +1183,6 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
-    print("   · backtest_stats_ALL.csv        [新增] 各币种回测过滤与统计信息")
     print("   · pairs_<COIN>.csv              单币全组合明细")
     print("   · pairs_ALL.csv                 全部币种全组合明细")
     print("   · pairs_CROSS_COIN_SUMMARY.csv  跨币种稳健性汇总")
