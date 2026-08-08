@@ -4,7 +4,10 @@ import pandas as pd
 import numpy as np
 import warnings
 from datetime import datetime
+"""
+挖掘得到的一个好的策略,只用到了k线数据
 
+"""
 warnings.filterwarnings('ignore')
 
 # ============================================================================
