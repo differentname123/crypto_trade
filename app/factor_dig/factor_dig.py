@@ -1047,4 +1047,25 @@ def main(cfg=CFG):
 
 
 if __name__ == '__main__':
-    main(CFG)
+    import copy
+
+    # 定义你需要运行的周期列表
+    target_bar_minutes = [1, 5, 15, 30, 60]
+
+    for bm in target_bar_minutes:
+        print(f"\n\n" + "★" * 78)
+        print(f"★ 正在启动批量回测任务: {bm} 分钟级别数据")
+        print("★" * 78)
+
+        # 复制一份全局配置，避免在循环中污染原始配置字典
+        run_cfg = copy.deepcopy(CFG)
+
+        # 修改当前任务的 K线周期
+        run_cfg['BAR_MINUTES'] = bm
+
+        # 【关键】动态修改输出目录，防止不同周期的文件互相覆盖
+        # 例如会分别生成 ./factor_out_1m, ./factor_out_5m, ./factor_out_15m
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m'
+
+        # 调用主函数执行
+        main(run_cfg)

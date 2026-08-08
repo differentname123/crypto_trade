@@ -28,7 +28,7 @@ import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
 
-CURRENT_SYMBOL = "top_long"  # 另一个选项是 "cross"
+CURRENT_SYMBOL = "cross"  #  "cross" "top_long"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
@@ -786,8 +786,8 @@ def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache,
 
 def run_scheduler():
     """顶层编排: 每整点驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
-    api_key = get_config("myself_biance_api_key")
-    secret_key = get_config("myself_biance_api_secret")
+    api_key = get_config("nana_biance_api_copy_key")
+    secret_key = get_config("nana_biance_api_copy_secret")
 
     if platform.system().lower() == "linux":
         proxies, proxy_url = None, None
