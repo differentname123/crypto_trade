@@ -846,7 +846,7 @@ def run_scheduler():
 
 
             # 新增：每次运行一轮的最后就调用一次输出汇总信息
-            print_position_summary(exchange, ledger, open_order_cache)
+            print_position_summary(exchange, ledger)
 
         except Exception:
             logger.error(f"[SCHED] 致命异常, 30s 后恢复\n{traceback.format_exc()}")
