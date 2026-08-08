@@ -664,8 +664,13 @@ def generate_top_long_signals(df):
     if len(df) < W:
         return [], pd.DataFrame(columns=cols)
 
-    symbol = df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = symbol.split('/')[0] if '/' in symbol else symbol
+    # ================= [核心修改点] =================
+    # 根据截图，symbol和coin_name实际上是DataFrame的列。
+    # 优先从数据列的第一行获取，如果没有该列，再降级尝试从 df.attrs 中获取，最后兜底为 UNKNOWN
+    symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = df['coin_name'].iloc[0] if 'coin_name' in df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol)
+    # ===============================================
 
     # ====================================================
     # 1. 核心指标与信号布尔序列计算 (完全保留原逻辑，向量化计算)
@@ -703,7 +708,15 @@ def generate_top_long_signals(df):
 
     # 仅遍历触发了信号的事件点
     for idx in event_indices:
-        dt = df.at[idx, 'datetime_bj']
+        # 1. 提取 K 线起始的毫秒级时间戳
+        kline_start_ms = df.at[idx, 'timestamp']
+
+        # 2. 加上 K 线周期，得到真正信号触发时刻的绝对毫秒时间戳
+        signal_ts_ms = int(kline_start_ms + OPTIMAL_PARAMS['BAR_MINUTES'] * 60 * 1000)
+
+        # 3. 为了向下兼容原有的日志记录，将其转换为无时区标签的北京时间 datetime 对象
+        dt = pd.to_datetime(signal_ts_ms, unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').tz_localize(None)
+
         is_entry = entry_signal.at[idx]
         is_exit = exit_signal.at[idx]
 
@@ -739,9 +752,10 @@ def generate_top_long_signals(df):
         # 计算复用的时间戳与格式化时间 (仅在发生真实交易时才计算，极大节省性能)
         if (actual_pos == 0 and is_entry) or (actual_pos == 1 and is_exit):
             dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-            ts_ms = int(pd.Timestamp(dt).tz_localize('Asia/Shanghai').timestamp() * 1000)
+            # 直接使用精确计算得出的物理时间戳
+            ts_ms = signal_ts_ms
 
-        # 状态机流转
+            # 状态机流转
         if actual_pos == 0 and is_entry:
             actual_pos = 1
             actual_entry_price = cur_c
@@ -769,15 +783,12 @@ def generate_top_long_signals(df):
     return signals, df_actual_signals
 
 
-
 def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
     """
-    fetched_raw_data = []
-
-    max_window = 30
+    max_window = 365
 
     lookback_days = int(np.ceil(max_window)) + 30
 
@@ -845,10 +856,10 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
 
 if __name__ == "__main__":
 
-    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
-    # 将timestamp 从ms转换为 北京时间
-    df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
+    # # 将timestamp 从ms转换为 北京时间
+    # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
-    target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
+    target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
+    symbol_list = ["SIREN/USDT:USDT"]
     execute_trading_bot_workflow_top_long(target_time, symbol_list,'http://127.0.0.1:7890')

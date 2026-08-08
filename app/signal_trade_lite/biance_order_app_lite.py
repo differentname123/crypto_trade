@@ -27,34 +27,36 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
+
 logger = setup_logger(app_name="cross_trader")
 
-
-from run_cross_signal_lite import execute_trading_bot_workflow
-from biance_order_lite import ( execute_order, get_total_equity,
-    ExecStatus, safe_init_exchange
-)
+from run_cross_signal_lite import execute_trading_bot_workflow, execute_trading_bot_workflow_top_long
+from biance_order_lite import (execute_order, get_total_equity,
+                               ExecStatus, safe_init_exchange
+                               )
 
 # ==========================================
 # L0. 配置与常量
 # ==========================================
-LEDGER_FILE = "trade_records.csv"       # 本策略专属账本, 与其它策略物理隔离
+BEST_TOP_N = 20
+CURRENT_SYMBOL = "top_long" # 另一个选项是 "cross"
+LEDGER_FILE = f"trade_records_{CURRENT_SYMBOL}.csv"  # 本策略专属账本, 与其它策略物理隔离
 LEVERAGE = 1
 MIN_ORDER_VALUE = 51
 MAX_ORDER_VALUE = 2000.0
 
-PRELOAD_AHEAD_MIN = 3                    # 整点前 N 分钟预对账
-SIGNAL_WINDOW_MIN = 1                    # 信号有效窗口 (±N 分钟), 过期信号直接丢弃
-OPEN_ORDER_TIMEOUT_HOURS = 2            # 开仓单超时清理阈值
-CLOSE_ORDER_TIMEOUT_HOURS = 4          # 平仓单超时清理阈值
-POSITION_DIFF_TOLERANCE = 0.01         # 持仓一致性告警容差 (1%)
-API_MAX_RETRY = 3                       # 核心接口重试次数
+PRELOAD_AHEAD_MIN = 3  # 整点前 N 分钟预对账
+SIGNAL_WINDOW_MIN = 1  # 信号有效窗口 (±N 分钟), 过期信号直接丢弃
+OPEN_ORDER_TIMEOUT_HOURS = 2  # 开仓单超时清理阈值
+CLOSE_ORDER_TIMEOUT_HOURS = 4  # 平仓单超时清理阈值
+POSITION_DIFF_TOLERANCE = 0.01  # 持仓一致性告警容差 (1%)
+API_MAX_RETRY = 3  # 核心接口重试次数
 
 # 账本内部订单状态枚举
-ST_PENDING = "PENDING"                  # 已发出, 未完全确认
-ST_FILLED = "FILLED"                    # 正常成交 (由 REST 回填数量与均价)
-ST_CANCELED = "CANCELED"                # 主动或超时撤单
-ST_FAILED = "FAILED"                    # 执行或网络彻底失败
+ST_PENDING = "PENDING"  # 已发出, 未完全确认
+ST_FILLED = "FILLED"  # 正常成交 (由 REST 回填数量与均价)
+ST_CANCELED = "CANCELED"  # 主动或超时撤单
+ST_FAILED = "FAILED"  # 执行或网络彻底失败
 ST_MANUAL_CLOSED = "MANUAL_CLOSED_NO_POSITION"  # 平仓时已无持仓, 逻辑核销
 
 # 权益做软兜底(抖动不丢轮); 持仓/挂单做硬校验(拉取失败宁可放弃本轮, 拒绝脏数据交易)
@@ -226,7 +228,7 @@ def _filter_ssd(df, sig):
         (df["strategy_name"].astype(str).str.strip() == sig["strategy_name"]) &
         (df["symbol"].astype(str).str.strip() == sig["symbol"]) &
         (df["direction"].astype(str).str.strip().str.upper() == sig["direction"])
-    ]
+        ]
 
 
 def _closed_open_ids(df):
@@ -452,7 +454,8 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
 
     ledger.apply_updates(updates)
     if synced or canceled:
-        logger.info(f"[RECON] 完成 | 同步:{synced}笔 | 撤销:{canceled}笔 | 耗时:{(time.perf_counter() - t0) * 1000:.0f}ms")
+        logger.info(
+            f"[RECON] 完成 | 同步:{synced}笔 | 撤销:{canceled}笔 | 耗时:{(time.perf_counter() - t0) * 1000:.0f}ms")
 
 
 def check_position_consistency(ledger, position_cache):
@@ -519,7 +522,8 @@ def preload_account_state(exchange, ledger):
 
     pos_n = "N/A" if position_cache is None else len(position_cache)
     ord_n = "N/A" if open_order_cache is None else sum(len(v) for v in open_order_cache.values())
-    logger.info(f"[PRELOAD] 账户快照 | 权益:{equity:.2f} | 持仓:{pos_n}项 | 挂单:{ord_n}笔 | 耗时:{(time.perf_counter() - t0) * 1000:.0f}ms")
+    logger.info(
+        f"[PRELOAD] 账户快照 | 权益:{equity:.2f} | 持仓:{pos_n}项 | 挂单:{ord_n}笔 | 耗时:{(time.perf_counter() - t0) * 1000:.0f}ms")
     return equity, position_cache, open_order_cache
 
 
@@ -667,11 +671,47 @@ def execute_signals(exchange, target_time, total_equity, position_cache, open_or
 # ==========================================
 
 
+def get_top_movers(exchange, top_n=10):
+    print("📡 正在获取全市场 USDT 永续合约 Tickers...")
+    tickers = exchange.fetch_tickers(params={'type': 'swap'})
+
+    # 过滤出USDT本位合约，并排除没有涨跌幅数据的异常币种
+    usdt_swaps = {k: v for k, v in tickers.items() if k.endswith(':USDT') and v.get('percentage') is not None}
+    df = pd.DataFrame(usdt_swaps).T
+
+    # 按涨跌幅降序排列（涨得最多的在前面）
+    df = df.sort_values('percentage', ascending=False)
+
+    # 只取涨幅榜前 N 名
+    gainers = df.head(top_n).index.tolist()
+    targets = gainers
+
+    print(f"🔥 涨幅榜前{top_n}: {gainers}")
+    print(f"🎯 涨幅榜原始监控列表 ({len(targets)}个): {targets}\n")
+    return targets
+
+
+def get_top_long_signal_df(exchange, target_time_str, proxy_url, holding_symbols=None):
+    if holding_symbols is None:
+        holding_symbols = []
+
+    top_symbol_list = get_top_movers(exchange, top_n=BEST_TOP_N)
+
+    # 合并涨幅榜币种与当前/理论持仓币种，并去重，以确保已有持仓被策略检测
+    final_symbol_list = list(set(top_symbol_list + holding_symbols))
+
+    if holding_symbols:
+        logger.info(f"[SIGNAL] 📌 附加当前/理论持仓监控: {holding_symbols}")
+
+    signal_df = execute_trading_bot_workflow_top_long(target_time_str, symbol_list=final_symbol_list,
+                                                      proxy_url=proxy_url)
+    return signal_df
+
 
 def run_scheduler():
     """顶层编排: 每整点驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
-    api_key = get_config("nana_biance_api_copy_key")
-    secret_key = get_config("nana_biance_api_copy_secret")
+    api_key = get_config("myself_biance_api_key")
+    secret_key = get_config("myself_biance_api_secret")
 
     if platform.system().lower() == "linux":
         proxies, proxy_url = None, None
@@ -711,8 +751,32 @@ def run_scheduler():
                 time.sleep(60)
                 continue
 
-            # 拉取信号 → 窗口内执行
-            signal_df = execute_trading_bot_workflow(target_time_str, proxy_url=proxy_url)
+            # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
+            holding_symbols_set = set()
+
+            # 1. 从交易所缓存(实际持仓)中提取
+            if position_cache:
+                for k in position_cache.keys():
+                    # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
+                    holding_symbols_set.add(k.rsplit('_', 1)[0])
+
+            # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
+            df = ledger.read()
+            if not df.empty:
+                closed_ids = _closed_open_ids(df)
+                opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
+                for _, r in opens_df.iterrows():
+                    if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
+                        holding_symbols_set.add(str(r["symbol"]).strip())
+
+            holding_symbols = list(holding_symbols_set)
+
+            # 拉取信号 → 窗口内执行 (透传需要包含的已有持仓信号)
+            # signal_df = execute_trading_bot_workflow(target_time_str, proxy_url=proxy_url)
+
+            signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
+                                               holding_symbols=holding_symbols)
+
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
 
