@@ -7,6 +7,7 @@
  · 所有因子两两有序组合 (A进场,B出场) != (B进场,A出场)
  · 纯做多、每笔等名义仓位、收益率【加总不复利】
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
+ · [终极定稿] 2张底层长表 + 1张宏观看板，支撑 DSR/True N/Beta剥离 证伪
 --------------------------------------------------------------------------------
  依赖: pandas>=1.4, numpy   (numba 可选，装了快 5-20 倍)
 ================================================================================
@@ -515,7 +516,7 @@ def build_factors(df, P, rank_shift=0):
     F['BREAK_FLAT_THEN_BREAK'] = bs(F['VOL_RANGE_COMPRESSION_REAL']) & (c > maxH_N.shift(1))
     F['BREAK_RETEST_HOLD_REAL'] = (c.shift(1) > maxH_N.shift(2)) & (l <= maxH_N.shift(2) * 1.01) & (c > maxH_N.shift(2))
     F['BREAK_SECOND_WAVE_REBREAK'] = (c.shift(M) > maxH_N.shift(M + 1)) & (c.shift(1) < maxH_N.shift(M + 1)) & (
-                c > maxH_N.shift(M + 1))
+            c > maxH_N.shift(M + 1))
     F['BREAK_INSIDE_BREAK_UP'] = (h.shift(1) < h.shift(2)) & (l.shift(1) > l.shift(2)) & (c > h.shift(1))
     _rpos = (c - minL_N) / ((maxH_N - minL_N) + EPS)
     F['STRUCT_RANGE_POSITION_STRONG'] = _rpos > 0.80
@@ -772,7 +773,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     T = int(len(rets))
     d[prefix + 'trades'] = T
     if T == 0:
-        for k in ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'std_ret', 'tstat',
+        for k in ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'std_ret', 'tstat', 'sharpe',
                   'profit_factor', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss']:
             d[prefix + k] = np.nan
         return d
@@ -783,6 +784,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     sd = float(rets.std(ddof=1) * 100) if T > 1 else np.nan
     d[prefix + 'std_ret'] = sd
     d[prefix + 'tstat'] = float(d[prefix + 'avg_ret'] / (sd / math.sqrt(T))) if (sd and sd > 0) else np.nan
+    d[prefix + 'sharpe'] = float(d[prefix + 'avg_ret'] / sd) if (sd and sd > 0) else np.nan
     g = rets[rets > 0].sum()
     b = -rets[rets < 0].sum()
     d[prefix + 'profit_factor'] = float(g / b) if b > 0 else (np.inf if g > 0 else np.nan)
@@ -808,10 +810,13 @@ def mine_symbol(coin, df, cfg):
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
-        return None, None
+        return None, None, None, 0
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
+
+    # 获取时间戳用于逐笔流水表
+    timestamps = df.index.to_numpy()
 
     n = len(df)
     op = df['open'].to_numpy(float)
@@ -880,6 +885,7 @@ def mine_symbol(coin, df, cfg):
     total = len(entry_names) * len(exit_names)
 
     rows = []
+    trades_list = []  # 收集逐笔交易
     done = 0
     t1 = time.time()
     for en in entry_names:
@@ -920,6 +926,22 @@ def mine_symbol(coin, df, cfg):
             if ent.size < cfg['MIN_TRADES_REPORT']:
                 continue
 
+            # ================= 构建逐笔交易明细 =================
+            bh_rets = cl[ext] / cl[ent] - 1.0  # 标的自身买入持有收益 (基准)
+            ent_dt = timestamps[ent]
+            ext_dt = timestamps[ext]
+
+            trades_df = pd.DataFrame({
+                'combo_id': f"{en}|{xn}",
+                'coin': coin,
+                'entry_time': ent_dt,
+                'exit_time': ext_dt,
+                'net_return': rets,
+                'benchmark_return': bh_rets
+            })
+            trades_list.append(trades_df)
+            # ==========================================================
+
             row = dict(coin=coin, entry_factor=en, exit_factor=xn,
                        entry_density=dens.get(en, np.nan), exit_density=x_dens)
             row.update(trade_stats(rets, ent, ext, bm, n))
@@ -928,11 +950,8 @@ def mine_symbol(coin, df, cfg):
             row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
             rows.append(row)
 
-            # if done % 5000 == 0:
-            #     el = time.time() - t1
-            #     print(f"      ... {done}/{total}  ({done/total*100:.1f}%)  "
-            #           f"已用 {el:.0f}s  预计剩余 {el/max(done,1)*(total-done):.0f}s")
-    return pd.DataFrame(rows), diag_df
+    all_trades_df = pd.concat(trades_list, ignore_index=True) if trades_list else pd.DataFrame()
+    return pd.DataFrame(rows), diag_df, all_trades_df, total
 
 
 # ======================================================================
@@ -954,7 +973,9 @@ def main(cfg=CFG):
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
     print("=" * 78)
 
-    all_pairs, all_diag = [], []
+    all_pairs, all_diag, all_trades = [], [], []
+    total_trials_tested = 0  # 记录全局测试总次数
+
     for kf in kfiles:
         try:
             coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
@@ -977,9 +998,13 @@ def main(cfg=CFG):
                 continue
             print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
 
-            pairs, diag = mine_symbol(coin, df, cfg)
+            pairs, diag, trades_df, trials = mine_symbol(coin, df, cfg)
+            total_trials_tested += trials  # 累加测试次数
+
             if pairs is None or pairs.empty:
                 continue
+
+            all_trades.append(trades_df)
             pairs.sort_values('sum_ret', ascending=False, inplace=True)
             pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'),
                          index=False, encoding='utf-8-sig')
@@ -1009,6 +1034,22 @@ def main(cfg=CFG):
     pd.concat(all_diag, ignore_index=True).to_csv(
         os.path.join(cfg['OUT_DIR'], 'factor_diag_ALL.csv'), index=False, encoding='utf-8-sig')
 
+    # ================= 生成表1：全局逐笔交易流水 =================
+    all_trades = [t for t in all_trades if t is not None and not t.empty]
+    if all_trades:
+        all_trades_big = pd.concat(all_trades, ignore_index=True)
+        # 计算全局并发数 (同一 entry_time 触发的信号总数)
+        concurrent_counts = all_trades_big.groupby('entry_time').size().rename('concurrent_signals')
+        all_trades_big = all_trades_big.merge(concurrent_counts, left_on='entry_time', right_index=True, how='left')
+
+        cols_t1 = ['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return',
+                   'concurrent_signals']
+        all_trades_big[cols_t1].to_csv(os.path.join(cfg['OUT_DIR'], 'trades_ALL.csv'), index=False,
+                                       encoding='utf-8-sig')
+    else:
+        all_trades_big = pd.DataFrame()
+    # ====================================================================
+
     # 跨币种稳健性汇总
     g = big.groupby(['entry_factor', 'exit_factor'])
     summ = g.agg(n_coins=('coin', 'nunique'),
@@ -1030,6 +1071,75 @@ def main(cfg=CFG):
     summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'),
                 index=False, encoding='utf-8-sig')
 
+    # ================= 生成表2：组合时序切片长表 =================
+    if not all_trades_big.empty:
+        all_trades_big['date'] = pd.to_datetime(all_trades_big['entry_time']).dt.date
+        daily_agg = all_trades_big.groupby(['combo_id', 'date']).agg(
+            daily_return=('net_return', 'sum'),
+            active_coins=('coin', 'nunique')
+        ).reset_index()
+        daily_agg = daily_agg.sort_values(['combo_id', 'date'])
+        daily_agg['daily_nav'] = daily_agg.groupby('combo_id')['daily_return'].cumsum() + 1.0
+
+        cols_t2 = ['combo_id', 'date', 'daily_nav', 'daily_return', 'active_coins']
+        daily_agg[cols_t2].to_csv(os.path.join(cfg['OUT_DIR'], 'combo_timeseries_ALL.csv'), index=False,
+                                  encoding='utf-8-sig')
+    # ====================================================================
+
+    # ================= 生成表3：宏观统计档案看板 =================
+    combo_profile = big.groupby(['entry_factor', 'exit_factor']).agg(
+        total_trades=('trades', 'sum'),
+        is_oos_sharpe=('oos_sharpe', 'mean')
+    ).reset_index()
+    combo_profile['combo_id'] = combo_profile['entry_factor'] + '|' + combo_profile['exit_factor']
+
+    if not all_trades_big.empty:
+        def calc_profile_stats(group):
+            conc = group['concurrent_signals'].values
+            true_n = np.sum(1.0 / conc) if len(conc) > 0 else 0
+            rets = group['net_return'].values
+            if len(rets) > 2:
+                skew = pd.Series(rets).skew()
+                kurt = pd.Series(rets).kurtosis()
+            else:
+                skew, kurt = 0.0, 0.0
+            return pd.Series({'true_n_trades': true_n, 'skew': skew, 'kurt': kurt})
+
+        stats = all_trades_big.groupby('combo_id').apply(calc_profile_stats).reset_index()
+        combo_profile = combo_profile.merge(stats, on='combo_id', how='left')
+    else:
+        combo_profile['true_n_trades'] = np.nan
+        combo_profile['skew'] = np.nan
+        combo_profile['kurt'] = np.nan
+
+    def calc_dsr(row, total_trials):
+        sr = row['is_oos_sharpe']
+        T = row['total_trades']
+        skew = row.get('skew', 0)
+        kurt = row.get('kurt', 0)
+        if pd.isna(sr) or T <= 0 or total_trials <= 1:
+            return np.nan
+        if pd.isna(skew): skew = 0
+        if pd.isna(kurt): kurt = 0
+
+        emsr = np.sqrt(2 * np.log(total_trials))
+        var_sr = (1 - skew * sr + (kurt + 2) / 4 * sr ** 2) / T
+        if var_sr <= 0: var_sr = 1e-6
+        z = (sr - emsr) / np.sqrt(var_sr)
+        dsr = 0.5 * (1 + math.erf(z / np.sqrt(2)))
+        return dsr
+
+    combo_profile['total_trials'] = total_trials_tested
+    combo_profile['deflated_sharpe'] = combo_profile.apply(lambda r: calc_dsr(r, total_trials_tested), axis=1)
+
+    cols_t3 = ['combo_id', 'total_trials', 'true_n_trades', 'is_oos_sharpe', 'deflated_sharpe']
+    for c in cols_t3:
+        if c not in combo_profile.columns:
+            combo_profile[c] = np.nan
+    combo_profile[cols_t3].to_csv(os.path.join(cfg['OUT_DIR'], 'Combo_Profile_ALL.csv'), index=False,
+                                  encoding='utf-8-sig')
+    # ====================================================================
+
     print("\n" + "=" * 78)
     print("🏆 跨币种稳健 TOP20 (score = 均笔收益 × √笔数 × 盈利币种占比)")
     print("=" * 78)
@@ -1044,6 +1154,9 @@ def main(cfg=CFG):
     print("   · pairs_ALL.csv                 全部币种全组合明细")
     print("   · pairs_CROSS_COIN_SUMMARY.csv  跨币种稳健性汇总")
     print("   · factor_diag_<COIN>.csv        单因子体检(信号数/密度/前瞻收益t值)")
+    print("   · trades_ALL.csv                [表1] 全局逐笔交易流水(含并发与基准)")
+    print("   · combo_timeseries_ALL.csv      [表2] 组合时序切片长表(按日聚合)")
+    print("   · Combo_Profile_ALL.csv         [表3] 宏观统计档案看板(含DSR与True N)")
 
 
 if __name__ == '__main__':
