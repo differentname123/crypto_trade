@@ -1197,7 +1197,7 @@ if __name__ == '__main__':
 
     # 定义你需要运行的周期列表
     target_bar_minutes = [1, 5, 15, 30, 60]
-
+    target_bar_minutes.reverse()
     for bm in target_bar_minutes:
         print(f"\n\n" + "★" * 78)
         print(f"★ 正在启动批量回测任务: {bm} 分钟级别数据")
