@@ -691,7 +691,26 @@ def get_top_movers(exchange, top_n=10):
     return targets
 
 
-def get_top_long_signal_df(exchange, target_time_str, proxy_url, holding_symbols=None):
+def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
+    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
+    holding_symbols_set = set()
+
+    # 1. 从交易所缓存(实际持仓)中提取
+    if position_cache:
+        for k in position_cache.keys():
+            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
+            holding_symbols_set.add(k.rsplit('_', 1)[0])
+
+    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
+    df = ledger.read()
+    if not df.empty:
+        closed_ids = _closed_open_ids(df)
+        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
+        for _, r in opens_df.iterrows():
+            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
+                holding_symbols_set.add(str(r["symbol"]).strip())
+
+    holding_symbols = list(holding_symbols_set)
     if holding_symbols is None:
         holding_symbols = []
 
@@ -700,8 +719,7 @@ def get_top_long_signal_df(exchange, target_time_str, proxy_url, holding_symbols
     # 合并涨幅榜币种与当前/理论持仓币种，并去重，以确保已有持仓被策略检测
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
-    if holding_symbols:
-        logger.info(f"[SIGNAL] 📌 附加当前/理论持仓监控: {holding_symbols}")
+    logger.info(f"[SIGNAL] 最终监控币种列表 ({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_top_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
@@ -751,31 +769,12 @@ def run_scheduler():
                 time.sleep(60)
                 continue
 
-            # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-            holding_symbols_set = set()
 
-            # 1. 从交易所缓存(实际持仓)中提取
-            if position_cache:
-                for k in position_cache.keys():
-                    # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-                    holding_symbols_set.add(k.rsplit('_', 1)[0])
-
-            # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-            df = ledger.read()
-            if not df.empty:
-                closed_ids = _closed_open_ids(df)
-                opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-                for _, r in opens_df.iterrows():
-                    if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                        holding_symbols_set.add(str(r["symbol"]).strip())
-
-            holding_symbols = list(holding_symbols_set)
 
             # 拉取信号 → 窗口内执行 (透传需要包含的已有持仓信号)
             # signal_df = execute_trading_bot_workflow(target_time_str, proxy_url=proxy_url)
 
-            signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
-                                               holding_symbols=holding_symbols)
+            signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url, position_cache=position_cache, ledger=ledger)
 
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)

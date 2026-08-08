@@ -788,7 +788,7 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
     """
-    max_window = 365
+    max_window = 180
 
     lookback_days = int(np.ceil(max_window)) + 30
 
@@ -822,9 +822,11 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
 
         actual_rows = len(df_klines)
         if actual_rows < expected_rows:
-            # 提取已拿到数据的实际时间跨度
-            start_time_str = df_klines['datetime_bj'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = df_klines['datetime_bj'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+            # ================= [核心修改点] =================
+            # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            # ===============================================
             missing_count = expected_rows - actual_rows
 
             run_logger.warning(
@@ -861,5 +863,5 @@ if __name__ == "__main__":
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ["SIREN/USDT:USDT"]
+    symbol_list = ['SPCX/USDT:USDT']
     execute_trading_bot_workflow_top_long(target_time, symbol_list,'http://127.0.0.1:7890')
