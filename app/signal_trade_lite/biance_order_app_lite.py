@@ -27,7 +27,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
-CURRENT_SYMBOL = "top_long" # 另一个选项是 "cross"
+
+CURRENT_SYMBOL = "top_long"  # 另一个选项是 "cross"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
@@ -673,6 +674,64 @@ def execute_signals(exchange, target_time, total_equity, position_cache, open_or
 # L6. 高可用调度器 (顶层流程编排)
 # ==========================================
 
+def print_position_summary(exchange, ledger):
+    """
+    输出理论当前持仓的币种, 实际成交价格, 理论持仓的数量, 以及实际的数量.
+    在每轮调度最后调用，为确保实际数量准确反映本轮刚发生的新交易，会在内部安全拉取一次最新持仓。
+    """
+    # 尝试重新拉取最新持仓以反映本轮可能的发单变更
+    position_cache = _retry_fetch("汇总持仓", lambda: _fetch_positions(exchange))
+    if position_cache is None:
+        logger.warning("[SUMMARY] 最新持仓拉取失败, 跳过本轮汇总输出")
+        return
+
+    df = ledger.read()
+    if df.empty:
+        logger.info("[SUMMARY] 当前无任何账本记录。")
+        return
+
+    closed = _closed_open_ids(df)
+    opens = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
+
+    summary_list = []
+    for _, r in opens.iterrows():
+        if str(r["record_id"]) in closed:
+            continue
+        amt = to_num(r["filled_amount"])
+        if amt <= 0:
+            continue
+
+        symbol = str(r.get("symbol", "")).strip()
+        direction = str(r.get("direction", "")).strip().upper()
+        pos_key = f"{symbol}_{direction}"
+
+        # 提取实际成交价格并格式化处理空值
+        fill_price = str(r.get("actual_fill_price", ""))
+        if fill_price.lower() == "nan" or not fill_price:
+            fill_price = "N/A"
+
+        theoretical_amt = amt
+        actual_amt = abs(position_cache.get(pos_key, 0.0))
+
+        summary_list.append({
+            "symbol": symbol,
+            "direction": direction,
+            "price": fill_price,
+            "theo_amt": theoretical_amt,
+            "act_amt": actual_amt
+        })
+
+    logger.info("\n" + "=" * 65 + "\n[SUMMARY] 本轮运行结束，当前持仓状态汇总：")
+    if not summary_list:
+        logger.info("当前无理论持仓。")
+    else:
+        for item in summary_list:
+            logger.info(f"币种: {item['symbol']:<12} | 方向: {item['direction']:<5} | "
+                        f"成交均价: {item['price']:<10} | "
+                        f"理论数量: {item['theo_amt']:<12} | "
+                        f"实际数量: {item['act_amt']:<12}")
+    logger.info("=" * 65)
+
 
 def get_top_movers(exchange, top_n=10):
     print("📡 正在获取全市场 USDT 永续合约 Tickers...")
@@ -772,19 +831,21 @@ def run_scheduler():
                 time.sleep(60)
                 continue
 
-
-
             # 拉取信号 → 窗口内执行 (透传需要包含的已有持仓信号)
             if CURRENT_SYMBOL == "cross":
                 signal_df = execute_trading_bot_workflow_cross(target_time_str, proxy_url=proxy_url)
             elif CURRENT_SYMBOL == "top_long":
-                signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url, position_cache=position_cache, ledger=ledger)
+                signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
+                                                   position_cache=position_cache, ledger=ledger)
             else:
                 logger.error(f"[SIGNAL] 未知的 CURRENT_SYMBOL 配置: {CURRENT_SYMBOL}")
                 signal_df = None
 
             if signal_df is not None and not signal_df.empty:
                 execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
+
+            # 新增：每次运行一轮的最后就调用一次输出汇总信息
+            print_position_summary(exchange, ledger)
 
         except Exception:
             logger.error(f"[SCHED] 致命异常, 30s 后恢复\n{traceback.format_exc()}")
