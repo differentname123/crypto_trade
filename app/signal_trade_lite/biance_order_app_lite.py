@@ -47,7 +47,7 @@ MIN_ORDER_VALUE = 51
 MAX_ORDER_VALUE = 2000.0
 if CURRENT_SYMBOL == "top_long":
     MIN_ORDER_VALUE = 6
-    MAX_ORDER_VALUE = 100
+    MAX_ORDER_VALUE = 500
 
 PRELOAD_AHEAD_MIN = 3  # 整点前 N 分钟预对账
 SIGNAL_WINDOW_MIN = 1  # 信号有效窗口 (±N 分钟), 过期信号直接丢弃
