@@ -583,7 +583,7 @@ class ComboAnalyzer:
 if __name__ == '__main__':
 
     # ========== 请修改这里 ==========
-    OUT_DIR = './factor_out_15m'  # 自动对应新引擎的输出目录
+    OUT_DIR = './factor_out_60m'  # 自动对应新引擎的输出目录
     TARGET_COMBO = None  # 指定要深度分析的组合ID，如 "ENTRY_A|EXIT_B"
     TOP_N = 20  # 全局筛选显示 Top N
     ANALYZE_ALL_TOP = False  # 是否对 Top N 逐个深度分析

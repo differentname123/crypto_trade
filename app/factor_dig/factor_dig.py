@@ -1107,7 +1107,7 @@ def main(cfg=CFG):
                 retention_rate = valid_combos / trials if trials > 0 else 0
                 total_saved_trades = int(pairs['trades'].sum())
                 avg_tpd = (total_saved_trades / valid_combos / kline_days) if (
-                            valid_combos > 0 and kline_days > 0) else 0
+                        valid_combos > 0 and kline_days > 0) else 0
 
                 print(f"✅ [{coin}] K线: {kline_days:.1f}天 | "
                       f"组合数: {trials} -> {valid_combos} (保{retention_rate * 100:.1f}%) | "
@@ -1133,18 +1133,22 @@ def main(cfg=CFG):
     trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.parquet')
     pq_files = glob.glob(os.path.join(trades_raw_dir, "*.parquet"))
 
-    # ================= 生成表1：全局逐笔交易流水 =================
+    # ================= 生成表1：全局逐笔交易流水 (修复OOM版) =================
     if pq_files:
         print("\n[内存优化] 正在采用分块引擎读取独立Parquet文件统计并发信号 (消除 OOM)...")
         try:
             concurrent_counts = Counter()
             for pf in pq_files:
+                # 【优化阶段1】：仅读取整型ID和时间，杜绝一切字符串生成
                 df_part = pd.read_parquet(pf, columns=['entry_id', 'exit_id', 'entry_time'])
-                df_part['entry_id'] = df_part['entry_id'].astype(int)
-                df_part['exit_id'] = df_part['exit_id'].astype(int)
-                df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
-                    reverse_factor_map)
-                concurrent_counts.update(zip(df_part['combo_id'], df_part['entry_time']))
+
+                # 直接使用 .values 提取底层 NumPy 数组，打包成极轻量级的纯数字 Tuple 作为 Key
+                keys = zip(
+                    df_part['entry_id'].values,
+                    df_part['exit_id'].values,
+                    df_part['entry_time'].values
+                )
+                concurrent_counts.update(keys)
 
             if concurrent_counts:
                 has_trades = True
@@ -1153,13 +1157,22 @@ def main(cfg=CFG):
                 first_chunk = True
                 for pf in pq_files:
                     df_part = pd.read_parquet(pf)
+
+                    # 【优化阶段2】：重建纯数字 Key，从 Counter 中极速匹配并发生信号数
+                    keys = zip(
+                        df_part['entry_id'].values,
+                        df_part['exit_id'].values,
+                        df_part['entry_time'].values
+                    )
+                    df_part['concurrent_signals'] = [concurrent_counts[k] for k in keys]
+
+                    # 【阅后即焚】：只有在准备写盘前，才将 int 转回长字符串 combo_id
                     df_part['entry_id'] = df_part['entry_id'].astype(int)
                     df_part['exit_id'] = df_part['exit_id'].astype(int)
                     df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
                         reverse_factor_map)
-                    df_part['concurrent_signals'] = [concurrent_counts[(cid, et)] for cid, et in
-                                                     zip(df_part['combo_id'], df_part['entry_time'])]
 
+                    # 丢弃不再需要的整型列，转化为 pyarrow Table 写盘
                     df_part.drop(columns=['entry_id', 'exit_id'], inplace=True)
                     table = pa.Table.from_pandas(df_part)
 
@@ -1167,6 +1180,7 @@ def main(cfg=CFG):
                         writer = pq.ParquetWriter(trades_final_path, table.schema)
                         first_chunk = False
                     writer.write_table(table)
+
                 if not first_chunk:
                     writer.close()
         finally:
@@ -1293,7 +1307,6 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
-
 if __name__ == '__main__':
     import copy
 
