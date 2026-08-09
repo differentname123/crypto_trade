@@ -9,7 +9,7 @@ import time
 import zipfile
 import traceback
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed  # [新增]: 引入线程池并发库
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ccxt
 import requests
@@ -170,6 +170,15 @@ def sync_1m_klines(exchange, symbol, days=365):
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_1m_kline.csv")
 
     old_df, since = _get_resume_timestamp(out_path, exchange, days)
+
+    # [断点续传/一周时效检查]
+    now_ms = exchange.milliseconds()
+    one_week_ms = 7 * 24 * 60 * 60 * 1000
+    if not old_df.empty and (now_ms - (since - 1)) <= one_week_ms:
+        last_dt = pd.to_datetime(since - 1, unit='ms')
+        print(f"  [1m K线/跳过] 数据在1周内已是最新状态 | 标的: [{symbol}] | 最新时间: {last_dt}")
+        return
+
     mode_str = "增量补齐" if not old_df.empty else "全量初始化"
 
     raw_data = fetch_with_pagination(exchange, exchange.fetch_ohlcv, symbol, since, 1000, timeframe='1m')
@@ -268,10 +277,18 @@ def sync_5m_oi(exchange, symbol, days=365):
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_5m_oi.csv")
     old_df = pd.read_csv(out_path) if os.path.exists(out_path) else pd.DataFrame()
 
+    # [断点续传/一周时效检查]
+    now_ms = exchange.milliseconds()
+    one_week_ms = 7 * 24 * 60 * 60 * 1000
+    if not old_df.empty and 'timestamp' in old_df.columns:
+        last_ts = int(old_df['timestamp'].max())
+        if (now_ms - last_ts) <= one_week_ms:
+            print(f"  [5m OI/跳过] 数据在1周内已是最新状态 | 标的: [{symbol}] | 最新时间: {pd.to_datetime(last_ts, unit='ms')}")
+            return
+
     df_vision = auto_download_vision_daily_oi(symbol, days)
 
     # [核心修复2]: 增加币安 API 限制逻辑的防御
-    now_ms = exchange.milliseconds()
     if not df_vision.empty:
         api_since = int(df_vision['timestamp'].max()) + 1
         print(f"  [5m OI/阶段1] Vision 底座加载成功 | 标的: [{symbol}] | 准备接力 API 增量...")
@@ -307,6 +324,15 @@ def sync_funding_rates(exchange, symbol, days=365):
     out_path = os.path.join(BACKTEST_DATA_DIR, f"{clean_symbol}_funding_rates.csv")
 
     old_df, since = _get_resume_timestamp(out_path, exchange, days)
+
+    # [断点续传/一周时效检查]
+    now_ms = exchange.milliseconds()
+    one_week_ms = 7 * 24 * 60 * 60 * 1000
+    if not old_df.empty and (now_ms - (since - 1)) <= one_week_ms:
+        last_dt = pd.to_datetime(since - 1, unit='ms')
+        print(f"  [资金费率/跳过] 数据在1周内已是最新状态 | 标的: [{symbol}] | 最新时间: {last_dt}")
+        return
+
     mode_str = "增量补齐" if not old_df.empty else "全量初始化"
 
     raw_data = fetch_with_pagination(exchange, exchange.fetch_funding_rate_history, symbol, since, 1000, timeframe=None)
@@ -383,7 +409,7 @@ def get_all_symbols(exchange_name='binance', quote_currency='USDT'):
 
 if __name__ == "__main__":
     LOOP_INTERVAL = 10
-    MAX_WORKERS = 10  # [新增]: 并发度配置
+    MAX_WORKERS = 2
 
     print("=" * 80)
     print(f"🔧 [系统初始] 数据将被独立存储于: 【{os.path.abspath(BACKTEST_DATA_DIR)}】")
@@ -402,19 +428,15 @@ if __name__ == "__main__":
 
         print(f"\n⚡ [并发调度] 嗅探到 {len(target_symbols)} 个标的，启动并发线程池 (并发度: {MAX_WORKERS})...")
 
-        # [修改]: 替换原本的 for 循环，使用线程池并发执行，严格捕获并打印各线程内部的未处理异常
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # 提交所有任务到线程池
             future_to_symbol = {
                 executor.submit(fetch_independent_datasets, sym, 365): sym
                 for sym in target_symbols
             }
 
-            # as_completed 允许我们一有任务完成就立即捕获它的状态，而不用等所有任务都结束
             for future in as_completed(future_to_symbol):
                 sym = future_to_symbol[future]
                 try:
-                    # 如果线程内部抛出异常，这里调用 result() 就会将其重新抛出
                     future.result()
                 except Exception as e:
                     print(f"❌ [任务总线/严重崩溃] 标的 {sym} 主进程崩溃已被跳过 | 错误明细: {e}")
