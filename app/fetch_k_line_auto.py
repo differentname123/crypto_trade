@@ -409,7 +409,7 @@ def get_all_symbols(exchange_name='binance', quote_currency='USDT'):
 
 if __name__ == "__main__":
     LOOP_INTERVAL = 10
-    MAX_WORKERS = 2
+    MAX_WORKERS = 4
 
     print("=" * 80)
     print(f"🔧 [系统初始] 数据将被独立存储于: 【{os.path.abspath(BACKTEST_DATA_DIR)}】")
