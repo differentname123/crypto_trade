@@ -346,10 +346,13 @@ def fetch_independent_datasets(symbol, days=365):
 
 
 # ============================================================================
-# 热门标的扫描与任务调度 (入口层)
+# 标的扫描与任务调度 (入口层)
 # ============================================================================
 
-def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='USDT'):
+def get_all_symbols(exchange_name='binance', quote_currency='USDT'):
+    """
+    拉取指定计价货币(如USDT)的所有合约标的
+    """
     exchange = init_exchange(exchange_name, default_type='swap')
     try:
         exchange.load_markets()
@@ -357,11 +360,14 @@ def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='US
     except Exception as e:
         raise RuntimeError(f"嗅探 CCXT 市场列表失败，请检查网络与代理配置。详情: {e}") from e
 
+    # 剔除传统资产与大宗商品的合约(如存在)
     blacklist = {'XAU', 'XAG', 'CL', 'NG', 'NVDA', 'AMD', 'TSLA', 'AAPL', 'MSFT', 'META', 'GOOG', 'AMZN', 'COIN', 'SPX',
                  'QQQ'}
-    candidates = []
+
+    result_set = set()
 
     for symbol, ticker in tickers.items():
+        # 仅保留目标本位合约 (如 :USDT)
         if not symbol.endswith(f':{quote_currency}'):
             continue
 
@@ -369,24 +375,8 @@ def get_top_gainers_losers(exchange_name='binance', top_n=20, quote_currency='US
         if base in blacklist:
             continue
 
-        pct = ticker.get('percentage')
-        if pct is None:
-            continue
+        result_set.add(symbol)
 
-        try:
-            pct = float(pct)
-            volume = float(ticker.get('quoteVolume') or 0)
-        except (ValueError, TypeError):
-            continue
-
-        if volume >= 1_000_000:
-            candidates.append({"symbol": symbol, "percentage": pct})
-
-    sorted_cands = sorted(candidates, key=lambda x: x['percentage'])
-    gainers = sorted_cands[-top_n:]
-    losers = sorted_cands[:top_n]
-
-    result_set = {item['symbol'] for item in (gainers + losers)}
     return list(result_set)
 
 
@@ -401,18 +391,19 @@ if __name__ == "__main__":
     while True:
         try:
             print("\n🔍 [全局调度] 开始执行新一轮标的嗅探...")
-            top_symbols = get_top_gainers_losers('binance', 50, 'USDT')
+            # 拉取所有USDT本位合约
+            target_symbols = get_all_symbols('binance', 'USDT')
         except Exception as e:
             print(f"❌ [全局调度/异常] 无法获取最新市场标的 | 可能原因: 网络断开或 API 熔断 | 等待 60 秒后重试... | 错误明细: 【{e}】")
             time.sleep(60)
             continue
 
-        for sym in top_symbols:
+        for sym in target_symbols:
             try:
                 fetch_independent_datasets(symbol=sym, days=365)
             except Exception as e:
                 print(f"❌ [任务总线/严重崩溃] 标的 {sym} 主进程崩溃已被跳过 | 错误明细: {e}")
                 traceback.print_exc()
 
-        print(f"\n💤 [全局调度] ✅ 当前轮次所有 {len(top_symbols)} 个标的处理完毕 | 进入休眠倒计时: 【{LOOP_INTERVAL} 秒】...")
+        print(f"\n💤 [全局调度] ✅ 当前轮次所有 {len(target_symbols)} 个标的处理完毕 | 进入休眠倒计时: 【{LOOP_INTERVAL} 秒】...")
         time.sleep(LOOP_INTERVAL)
