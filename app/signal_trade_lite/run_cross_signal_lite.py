@@ -762,7 +762,7 @@ def generate_top_long_signals(df):
             actual_signals_list.append({
                 'time': dt_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
-                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.0001,
+                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.14,
                 'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
             })
 
@@ -772,7 +772,7 @@ def generate_top_long_signals(df):
             actual_signals_list.append({
                 'time': dt_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'CLOSE', 'price': cur_c, 'reason': exit_reason,
-                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 0.0001,
+                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 0.14,
                 'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
             })
 
