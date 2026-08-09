@@ -86,25 +86,33 @@ class ComboAnalyzer:
         for attr, fname in files_map.items():
             fpath = os.path.join(self.out_dir, fname)
             if os.path.exists(fpath):
-                df = pd.read_csv(fpath)
+                # 【优化点1】针对最大的流水表，强制指定 category 类型，缩减 70% 内存
+                if attr == 'trades':
+                    df = pd.read_csv(fpath, dtype={'combo_id': 'category', 'coin': 'category'})
+                elif attr == 'timeseries':
+                    df = pd.read_csv(fpath, dtype={'combo_id': 'category'})
+                else:
+                    df = pd.read_csv(fpath)
+
                 setattr(self, attr, df)
                 self.logger.info(f"  已加载 {fname:<32} | {len(df):>10,} 行")
             else:
                 self.logger.warning(f"  未找到 {fname}")
 
         if self.trades is not None and not self.trades.empty:
-            self.trades['entry_time'] = pd.to_datetime(self.trades['entry_time'])
-            self.trades['exit_time'] = pd.to_datetime(self.trades['exit_time'])
+            self.logger.info("  正在解析时间戳计算持仓时间 (启用 C 引擎极速解析)...")
+            # 【优化点2】启用 format='ISO8601'，解析百万行时间戳从几分钟降至几秒
+            self.trades['entry_time'] = pd.to_datetime(self.trades['entry_time'], format='ISO8601', exact=False)
+            self.trades['exit_time'] = pd.to_datetime(self.trades['exit_time'], format='ISO8601', exact=False)
             self.trades['hold_hours'] = (
-                self.trades['exit_time'] - self.trades['entry_time']
-            ).dt.total_seconds() / 3600.0
+                                                self.trades['exit_time'] - self.trades['entry_time']
+                                        ).dt.total_seconds() / 3600.0
             self.trades['alpha'] = self.trades['net_return'] - self.trades['benchmark_return']
 
         if self.timeseries is not None and not self.timeseries.empty:
-            self.timeseries['date'] = pd.to_datetime(self.timeseries['date'])
+            self.timeseries['date'] = pd.to_datetime(self.timeseries['date'], format='ISO8601', exact=False)
 
         self.logger.info("-" * 90)
-
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
