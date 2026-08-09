@@ -19,12 +19,21 @@ import time
 import math
 import itertools
 import warnings
-import csv  # [内存优化] 引入原生 csv
-import gc  # [内存优化] 引入垃圾回收
-from collections import Counter  # [内存优化] 用于极低内存的并发统计
+import csv
+import gc
+from collections import Counter
+import glob
+import concurrent.futures
+import multiprocessing
 
 import numpy as np
 import pandas as pd
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    raise ImportError("请安装 pyarrow 库: pip install pyarrow")
 
 warnings.filterwarnings("ignore")
 
@@ -36,27 +45,27 @@ CFG = dict(
     OUT_DIR='./factor_out_15m',
 
     # --- 采样与执行 ---
-    BAR_MINUTES=15,  # 1 也能跑，但组合数×数据量会非常重；建议 5/15
-    FEE_RATE=0.0005,  # 单边手续费
-    SLIPPAGE=0.0005,  # 单边滑点(山寨务必给足)
-    COOLDOWN_BARS=0,  # 平仓后冷却多少根才允许再入场
+    BAR_MINUTES=15,
+    FEE_RATE=0.0005,
+    SLIPPAGE=0.0005,
+    COOLDOWN_BARS=0,
     FORCE_CLOSE_AT_END=True,
 
     # --- 因子行为 ---
-    RANK_SHIFT=0,  # rank_W 是否 shift(1)。0=不shift(推荐) 1=按你原方案
-    DEDUPE_IDENTICAL=True,  # 自动合并完全相同的因子(别名)
-    MIN_SIGNALS=20,  # 信号数少于此的因子丢弃
-    MAX_DENSITY=0.995,  # 信号密度高于此的因子丢弃(退化为常真)
-    INCLUDE_PATH_EXITS=True,  # 是否纳入路径依赖出场因子
+    RANK_SHIFT=0,
+    DEDUPE_IDENTICAL=True,
+    MIN_SIGNALS=20,
+    MAX_DENSITY=0.995,
+    INCLUDE_PATH_EXITS=True,
 
     # --- 组合与输出 ---
-    ALLOW_SAME_FACTOR=False,  # 是否允许 A进A出
+    ALLOW_SAME_FACTOR=False,
     MAX_TRADES_PER_COMBO=100000,
-    MIN_TRADES_REPORT=3,  # 少于此笔数不写入结果(设0=全写)
-    OOS_SPLIT=0.70,  # 前70%样本内 后30%样本外
-    ENTRY_PREFIX_FILTER=None,  # 例: ('ENTRY_','PRICE_','OI_') 只用这些前缀当进场
-    EXIT_PREFIX_FILTER=None,  # 例: ('EXIT_','BREAKDOWN_','KLINE_')
-    COINS=None,  # None=全部；或 ['PEPE','WIF']
+    MIN_TRADES_REPORT=3,
+    OOS_SPLIT=0.70,
+    ENTRY_PREFIX_FILTER=None,
+    EXIT_PREFIX_FILTER=None,
+    COINS=None,
 
     # --- 因子体检 ---
     FWD_HORIZONS_H=(4, 12, 24, 72),
@@ -65,42 +74,42 @@ CFG = dict(
 EPS = 1e-12
 
 # ======================================================================
-# 1. numba 可选加速
+# 1. numba 可选加速 (已优化为稀疏索引跳跃查询)
 # ======================================================================
 try:
     from numba import njit
-
     HAS_NUMBA = True
 except Exception:
     HAS_NUMBA = False
 
-
-def _core_static(entry_flag, exit_flag, n, cooldown, max_trades):
+def _core_static(entry_idx, exit_idx, n, cooldown, max_trades):
     ent = np.empty(max_trades, dtype=np.int64)
     ext = np.empty(max_trades, dtype=np.int64)
     k = 0
-    i = 0
-    while i < n - 1 and k < max_trades:
-        if entry_flag[i]:
-            j = i + 1
-            found = -1
-            while j < n:
-                if exit_flag[j]:
-                    found = j
-                    break
-                j += 1
-            if found < 0:
-                found = n - 1
-            ent[k] = i
-            ext[k] = found
-            k += 1
-            i = found + 1 + cooldown
+    pos = 0
+    ne = entry_idx.size
+    nx = exit_idx.size
+    while pos < n - 1 and k < max_trades:
+        # 二分查找定位下一个大于等于 pos 的入场点
+        a = np.searchsorted(entry_idx, pos)
+        if a >= ne:
+            break
+        e = entry_idx[a]
+        if e >= n - 1:
+            break
+        # 二分查找定位下一个大于 e 的出场点
+        b = np.searchsorted(exit_idx, e + 1)
+        if b < nx:
+            found = exit_idx[b]
         else:
-            i += 1
+            found = n - 1
+        ent[k] = e
+        ext[k] = found
+        k += 1
+        pos = found + 1 + cooldown
     return ent[:k], ext[:k]
 
-
-def _core_path(entry_flag, static_exit, close, low, atr, n, cooldown, max_trades,
+def _core_path(entry_idx, static_exit, close, low, atr, n, cooldown, max_trades,
                exec_px,
                use_fixed, fixed_pct,
                use_barlow,
@@ -111,62 +120,65 @@ def _core_path(entry_flag, static_exit, close, low, atr, n, cooldown, max_trades
     ent = np.empty(max_trades, dtype=np.int64)
     ext = np.empty(max_trades, dtype=np.int64)
     k = 0
-    i = 0
-    while i < n - 1 and k < max_trades:
-        if entry_flag[i]:
-            e = i
-            ep = exec_px[e]
-            el = low[e]
-            peak = close[e]
-            peak_prof = 0.0
-            j = e + 1
-            hit = -1
-            while j < n:
-                cj = close[j]
-                if cj > peak:
-                    peak = cj
-                prof = cj / ep - 1.0
-                if prof > peak_prof:
-                    peak_prof = prof
-                trig = False
-                if static_exit[j]:
-                    trig = True
-                if (not trig) and use_fixed and cj < ep * (1.0 - fixed_pct):
-                    trig = True
-                if (not trig) and use_barlow and cj < el:
-                    trig = True
-                if (not trig) and use_atr:
-                    a = atr[j]
-                    if a == a and cj < peak - atr_k * a:  # a==a 过滤 NaN
-                        trig = True
-                if (not trig) and use_time and (j - e) > time_n and prof < time_th:
-                    trig = True
-                if (not trig) and use_gb and (peak_prof - prof) > gb_th:
-                    trig = True
-                if (not trig) and use_lock and prof > lock_th and cj < peak * (1.0 - lock_trail):
-                    trig = True
-                if trig:
-                    hit = j
-                    break
-                j += 1
-            if hit < 0:
-                hit = n - 1
-            ent[k] = e
-            ext[k] = hit
-            k += 1
-            i = hit + 1 + cooldown
-        else:
-            i += 1
-    return ent[:k], ext[:k]
+    pos = 0
+    ne = entry_idx.size
+    while pos < n - 1 and k < max_trades:
+        # 二分查找极速定位入场点，拒绝在布尔数组上循环爬行
+        a = np.searchsorted(entry_idx, pos)
+        if a >= ne:
+            break
+        e = entry_idx[a]
+        if e >= n - 1:
+            break
 
+        ep = exec_px[e]
+        el = low[e]
+        peak = close[e]
+        peak_prof = 0.0
+        j = e + 1
+        hit = -1
+        # 出场因为严重依赖入场价(ep)，只能局部顺序扫描
+        while j < n:
+            cj = close[j]
+            if cj > peak:
+                peak = cj
+            prof = cj / ep - 1.0
+            if prof > peak_prof:
+                peak_prof = prof
+            trig = False
+            if static_exit[j]:
+                trig = True
+            if (not trig) and use_fixed and cj < ep * (1.0 - fixed_pct):
+                trig = True
+            if (not trig) and use_barlow and cj < el:
+                trig = True
+            if (not trig) and use_atr:
+                a_v = atr[j]
+                if a_v == a_v and cj < peak - atr_k * a_v:
+                    trig = True
+            if (not trig) and use_time and (j - e) > time_n and prof < time_th:
+                trig = True
+            if (not trig) and use_gb and (peak_prof - prof) > gb_th:
+                trig = True
+            if (not trig) and use_lock and prof > lock_th and cj < peak * (1.0 - lock_trail):
+                trig = True
+            if trig:
+                hit = j
+                break
+            j += 1
+        if hit < 0:
+            hit = n - 1
+        ent[k] = e
+        ext[k] = hit
+        k += 1
+        pos = hit + 1 + cooldown
+    return ent[:k], ext[:k]
 
 if HAS_NUMBA:
     _core_static = njit(cache=True, nogil=True)(_core_static)
     _core_path = njit(cache=True, nogil=True)(_core_path)
 
-
 def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
-    """无 numba 时的跳跃匹配: O(交易数 * log n)"""
     ent, ext = [], []
     ne, nx = entry_idx.size, exit_idx.size
     pos = 0
@@ -184,9 +196,7 @@ def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
         pos = x + 1 + cooldown
     return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
 
-
 def _path_scan_np(e, ep, el, n, close, atr, static_exit, p):
-    """无 numba 时的分块路径扫描"""
     start = e + 1
     peak = close[e]
     peak_prof = 0.0
@@ -220,7 +230,6 @@ def _path_scan_np(e, ep, el, n, close, atr, static_exit, p):
         chunk = min(chunk * 2, 32768)
     return n - 1
 
-
 def _match_path_np(entry_idx, static_exit, close, low, atr, exec_px, n, cooldown, max_trades, p):
     ent, ext = [], []
     ne = entry_idx.size
@@ -238,7 +247,6 @@ def _match_path_np(entry_idx, static_exit, close, low, atr, exec_px, n, cooldown
         pos = x + 1 + cooldown
     return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
 
-
 # ======================================================================
 # 2. 数据加载 / 重采样 / 对齐
 # ======================================================================
@@ -248,10 +256,8 @@ def _pick(df, cands, what):
             return c
     raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df.columns)}")
 
-
 def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     bar = f"{bar_minutes}min"
-
     k = pd.read_csv(kline_file)
     kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
     k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
@@ -269,8 +275,7 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
 
     oi = pd.read_csv(oi_file)
     ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
-    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest',
-                    'sumOpenInterest', 'oi'], 'oi')
+    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
     oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
     oi_s = (oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc]
             .astype(float).resample(bar, label='left', closed='left').last())
@@ -286,7 +291,6 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     df['oi_amount'] = oi_s.reindex(df.index).ffill()
     df['funding_rate'] = fr_s.reindex(df.index).ffill()
 
-    # 只砍前导 NaN，保持时间网格规整(next_open 假设才成立)
     fv = df[['oi_amount', 'funding_rate']].apply(lambda s: s.first_valid_index())
     start = max([x for x in fv.tolist() if x is not None], default=df.index[0])
     df = df.loc[start:].copy()
@@ -296,23 +300,21 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
         df = df[df[c] > 0]
     return df
 
-
 # ======================================================================
-# 3. 参数体系（全部按小时折算成 bar 数）
+# 3. 参数体系
 # ======================================================================
 def make_params(bar_minutes, n_rows):
     bph = 60.0 / bar_minutes
     B = lambda hours: max(1, int(round(hours * bph)))
     P = {}
     P['BPH'] = B(1)
-    P['N'] = B(24)  # 主回看周期 24h
-    P['M'] = B(4)  # 辅助短周期 4h
-    P['W'] = B(24 * 30)  # 滚动统计窗 30d
+    P['N'] = B(24)
+    P['M'] = B(4)
+    P['W'] = B(24 * 30)
     P['H12'], P['H24'], P['H48'] = B(12), B(24), B(48)
     P['H72'], P['H168'] = B(72), B(168)
     P['D2'], P['D7'] = B(48), B(168)
 
-    # 样本不够时自动收缩统计窗
     if n_rows < P['W'] * 2:
         P['W'] = max(200, n_rows // 3)
     P['MINP_W'] = max(50, P['W'] // 5)
@@ -335,7 +337,6 @@ def make_params(bar_minutes, n_rows):
         OI_ROC_TH=0.020,
         OI_HOT_TH=0.050,
         CORR_TH=0.20,
-        # --- 路径依赖出场参数 ---
         STOP_PCT=0.05,
         TIME_STOP_BARS=B(72),
         TIME_STOP_TH=0.00,
@@ -346,9 +347,8 @@ def make_params(bar_minutes, n_rows):
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
 
-
 # ======================================================================
-# 4. 因子库（全量因子池实现）
+# 4. 因子库
 # ======================================================================
 def build_factors(df, P, rank_shift=0):
     W, N, M = P['W'], P['N'], P['M']
@@ -788,9 +788,9 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
 
 
 # ======================================================================
-# 6. 单币种全组合挖掘
+# 6. 单币种全组合挖掘 (引入 Parquet + 整型ID机制)
 # ======================================================================
-def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
+def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_dir=None):
     bm = cfg['BAR_MINUTES']
     P = make_params(bm, len(df))
 
@@ -798,7 +798,6 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     F, aux = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
-        print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
         return None, 0, 0
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
@@ -844,8 +843,6 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
                 uniq.append(k)
         keep = uniq
 
-    # [安全剔除绝对冗余] 删除了单因子前瞻收益 (fwd_hz/factor_diag) 体检表的计算逻辑
-
     P_EXITS = path_exit_specs(P) if cfg['INCLUDE_PATH_EXITS'] else {}
     entry_names = [k for k in keep]
     exit_names = [k for k in keep] + list(P_EXITS.keys())
@@ -855,6 +852,7 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     if cfg['EXIT_PREFIX_FILTER']:
         exit_names = [k for k in exit_names if k.startswith(tuple(cfg['EXIT_PREFIX_FILTER']))]
 
+    # [优化2核心]：只保留信号被触发的稀疏索引 (int64)
     idx_cache = {k: np.flatnonzero(F[k]).astype(np.int64) for k in keep}
     zeros_static = np.zeros(n, dtype=bool)
     split_bar = int(n * cfg['OOS_SPLIT'])
@@ -863,11 +861,40 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     total = len(entry_names) * len(exit_names)
 
     rows = []
-    batch_list = []  # [内存优化] 改为存放原生 tuple 的 List
+
+    # [优化4核心]：分块收集列数据进行 Parquet 落盘
+    batch_en_id, batch_xn_id, batch_coin = [], [], []
+    batch_ent_time, batch_ext_time = [], []
+    batch_rets, batch_bh_rets = [], []
+    batch_size = 0
+    writer = None
+
+    def flush_parquet():
+        nonlocal batch_size, writer
+        if batch_size == 0 or trades_raw_dir is None: return
+        table = pa.Table.from_arrays([
+            pa.array(np.concatenate(batch_en_id)),
+            pa.array(np.concatenate(batch_xn_id)),
+            pa.array(np.concatenate(batch_coin)),
+            pa.array(np.concatenate(batch_ent_time)),
+            pa.array(np.concatenate(batch_ext_time)),
+            pa.array(np.concatenate(batch_rets)),
+            pa.array(np.concatenate(batch_bh_rets))
+        ], names=['entry_id', 'exit_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return'])
+
+        if writer is None:
+            pq_file = os.path.join(trades_raw_dir, f"trades_{coin}.parquet")
+            writer = pq.ParquetWriter(pq_file, table.schema)
+        writer.write_table(table)
+
+        batch_en_id.clear(); batch_xn_id.clear(); batch_coin.clear()
+        batch_ent_time.clear(); batch_ext_time.clear()
+        batch_rets.clear(); batch_bh_rets.clear()
+        batch_size = 0
+
     done = 0
-    t1 = time.time()
     for en in entry_names:
-        ea, eidx = F[en], idx_cache[en]
+        eidx = idx_cache[en]
         for xn in exit_names:
             done += 1
             if (not cfg['ALLOW_SAME_FACTOR']) and xn == en:
@@ -877,7 +904,8 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
                 spec = P_EXITS[xn]
                 st = F[spec['static']] if (spec['static'] and spec['static'] in F) else zeros_static
                 if HAS_NUMBA:
-                    ent, ext = _core_path(ea, st, cl, lo, atr, n, cfg['COOLDOWN_BARS'], max_tr,
+                    # 传入的是极短的 eidx 索引数组
+                    ent, ext = _core_path(eidx, st, cl, lo, atr, n, cfg['COOLDOWN_BARS'], max_tr,
                                           exec_px,
                                           spec['use_fixed'], spec['fixed_pct'],
                                           spec['use_barlow'],
@@ -891,7 +919,7 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
                 x_dens = np.nan
             else:
                 if HAS_NUMBA:
-                    ent, ext = _core_static(ea, F[xn], n, cfg['COOLDOWN_BARS'], max_tr)
+                    ent, ext = _core_static(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
                 else:
                     ent, ext = _match_static_ss(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
                 x_dens = dens.get(xn, np.nan)
@@ -904,27 +932,26 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
             if ent.size < cfg['MIN_TRADES_REPORT'] or ent.size > max_allowed_trades:
                 continue
 
-            # ================= [内存优化] 原生元组流式落盘，杜绝 Pandas DataFrame 循环实例化 =================
             if btc_c is not None:
                 bh_rets = btc_c[ext] / btc_c[ent] - 1.0
             else:
                 bh_rets = cl[ext] / cl[ent] - 1.0
 
-            if trades_raw_path:
-                c_id = f"{en}|{xn}"
-                c_id_arr = itertools.repeat(c_id, ent.size)
-                coin_arr = itertools.repeat(coin, ent.size)
+            if trades_raw_dir and factor_id_map:
+                en_id = factor_id_map.get(en, -1)
+                xn_id = factor_id_map.get(xn, -1)
 
-                # 数据类型降级：收益率强制转换为 float32 节省内存
-                batch_list.extend(zip(c_id_arr, coin_arr, timestamps[ent], timestamps[ext],
-                                      rets.astype(np.float32), bh_rets.astype(np.float32)))
+                batch_en_id.append(np.full(ent.size, en_id, dtype=np.int16))
+                batch_xn_id.append(np.full(ent.size, xn_id, dtype=np.int16))
+                batch_coin.append(np.full(ent.size, coin))
+                batch_ent_time.append(timestamps[ent])
+                batch_ext_time.append(timestamps[ext])
+                batch_rets.append(rets.astype(np.float32))
+                batch_bh_rets.append(bh_rets.astype(np.float32))
 
-                if len(batch_list) >= 200000:  # 每凑齐 20 万行做一次轻量级 IO 追加
-                    with open(trades_raw_path, 'a', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerows(batch_list)
-                    batch_list.clear()
-            # =========================================================================================
+                batch_size += ent.size
+                if batch_size >= 200000:
+                    flush_parquet()
 
             row = dict(coin=coin, entry_factor=en, exit_factor=xn,
                        entry_density=dens.get(en, np.nan), exit_density=x_dens)
@@ -934,20 +961,41 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
             row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
             rows.append(row)
 
-    # 循环结束后清理剩余批次流水
-    if trades_raw_path and batch_list:
-        with open(trades_raw_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerows(batch_list)
-        batch_list.clear()
+    if trades_raw_dir:
+        try:
+            flush_parquet()
+        finally:
+            if writer is not None:
+                writer.close()
 
     return pd.DataFrame(rows), total, kline_days
 
 
 # ======================================================================
-# 7. 主流程
+# 7. 主流程 (引入多进程架构隔离与调度)
 # ======================================================================
+def mine_symbol_wrapper(args):
+    """ 多进程工作节点的包装函数 """
+    kf, cfg, btc_close, factor_id_map, trades_raw_dir = args
+    coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+    oi_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_5m_oi.csv')
+    fr_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_funding_rates.csv')
+    try:
+        df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+        if len(df) < 800:
+            return kf, coin, None, 0, 0, "bar 数不足"
+        pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close, factor_id_map, trades_raw_dir)
+        return kf, coin, pairs, trials, kline_days, "OK"
+    except Exception as e:
+        # [修正4] 加入详细堆栈信息，保留多进程调试线索
+        import traceback
+        tb = traceback.format_exc()
+        return kf, coin, None, 0, 0, f"执行异常: {e}\n{tb}"
+
+
 def main(cfg=CFG):
+    import shutil  # [修正3] 引入 shutil 用于清空文件夹
+
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
     data_dir = cfg['DATA_DIR']
     if not os.path.isdir(data_dir):
@@ -981,13 +1029,36 @@ def main(cfg=CFG):
         print("⚠️ 没有找到符合条件的币种进行回测。")
         return
 
-    # [内存优化] 使用原生 csv 写表头，避免无谓的 Pandas 操作
-    trades_raw_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL_raw.csv')
-    if os.path.exists(trades_raw_path):
-        os.remove(trades_raw_path)
-    with open(trades_raw_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return'])
+    factor_id_map = None
+    for kf in valid_kfiles:
+        coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+        oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
+        fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
+        if os.path.exists(oi_f) and os.path.exists(fr_f):
+            try:
+                df_first = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
+                if len(df_first) >= 800:
+                    P_first = make_params(cfg['BAR_MINUTES'], len(df_first))
+                    F_first, _ = build_factors(df_first, P_first)
+                    all_names = list(F_first.keys()) + list(path_exit_specs(P_first).keys())
+                    factor_id_map = {k: np.int16(i) for i, k in enumerate(all_names)}
+                    break
+            except Exception:
+                continue
+
+    if factor_id_map is None:
+        print("⚠️ 无法初始化 factor_id_map，未发现符合有效长度的币种数据。")
+        return
+
+    # 强制转化为 Python 原生 int，保障 Pandas .map() 百分百命中类型
+    reverse_factor_map = {int(i): str(k) for k, i in factor_id_map.items()}
+
+    trades_raw_dir = os.path.join(cfg['OUT_DIR'], 'trades_ALL_raw_parquet')
+
+    # 启动前强行清空历史脏数据，防止幽灵数据污染
+    if os.path.exists(trades_raw_dir):
+        shutil.rmtree(trades_raw_dir, ignore_errors=True)
+    os.makedirs(trades_raw_dir, exist_ok=True)
 
     btc_file = os.path.join(data_dir, 'BTC_USDT_USDT_1m_kline.csv')
     btc_close = None
@@ -1004,123 +1075,107 @@ def main(cfg=CFG):
     else:
         print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
 
+    tasks = [(kf, cfg, btc_close, factor_id_map, trades_raw_dir) for kf in valid_kfiles]
     total_trials_tested = 0
+    pairs_list = []
 
-    # [内存优化] 生命周期管理：删掉全局内存驻留变量 all_pairs，准备直接往外落盘
+    # 留足系统内存缓冲防止高维特征回测时OOM导致崩溃
+    max_workers = min(8, max(1, multiprocessing.cpu_count() - 2))
+
+    if HAS_NUMBA:
+        print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
+        _d_idx = np.array([0, 1], dtype=np.int64)
+        _d_bool = np.array([False, True], dtype=bool)
+        # 修正：将 0.0 改为非零的 1.0 和 2.0，避免 _core_path 计算收益率时除以零崩溃
+        _d_float = np.array([1.0, 2.0], dtype=float)
+        _core_static(_d_idx, _d_idx, 2, 0, 1)
+        _core_path(_d_idx, _d_bool, _d_float, _d_float, _d_float, 2, 0, 1, _d_float,
+                   False, 0.0, False, False, 0.0, False, 0, 0.0, False, 0.0, False, 0.0, 0.0)
+    print(f"\n🚀 启动并发回测... (分配进程核心数: {max_workers})")
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(mine_symbol_wrapper, t): t for t in tasks}
+        for fut in concurrent.futures.as_completed(futures):
+            kf, coin, pairs, trials, kline_days, msg = fut.result()
+
+            if msg != "OK":
+                print(f"⚠️ [{coin}] 执行跳过/失败: {msg}")
+                continue
+
+            if pairs is not None and not pairs.empty:
+                valid_combos = len(pairs)
+                retention_rate = valid_combos / trials if trials > 0 else 0
+                total_saved_trades = int(pairs['trades'].sum())
+                avg_tpd = (total_saved_trades / valid_combos / kline_days) if (
+                            valid_combos > 0 and kline_days > 0) else 0
+
+                print(f"✅ [{coin}] K线: {kline_days:.1f}天 | "
+                      f"组合数: {trials} -> {valid_combos} (保{retention_rate * 100:.1f}%) | "
+                      f"总笔数: {total_saved_trades} | 频次: {avg_tpd:.2f}次/天")
+
+                pairs.sort_values('sum_ret', ascending=False, inplace=True)
+                pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
+
+                pairs_list.append(pairs)
+                total_trials_tested = max(total_trials_tested, trials)
+            else:
+                print(f"✅ [{coin}] 执行完毕，但未产出有效组合。")
+
     pairs_all_path = os.path.join(cfg['OUT_DIR'], 'pairs_ALL.csv')
-    if os.path.exists(pairs_all_path):
-        os.remove(pairs_all_path)
-
-    for kf in valid_kfiles:
-        try:
-            coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-            oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
-            fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
-            if not (os.path.exists(oi_f) and os.path.exists(fr_f)):
-                print(f"⚠️  {coin} 数据不完整 (缺失OI或FR数据)，跳过")
-                continue
-
-            print(f"\n🚀 [{coin}]")
-            try:
-                df = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
-            except Exception as e:
-                print(f"    ! 加载失败: {e}")
-                continue
-            if len(df) < 800:
-                print(f"    ! bar 数不足 ({len(df)})，跳过")
-                continue
-            print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
-
-            # [安全剔除绝对冗余] 函数返回值去掉了 factor_diag，单因子诊断不产生
-            pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close, trades_raw_path)
-
-            total_trials_tested = max(total_trials_tested, trials)
-
-            if pairs is None or pairs.empty:
-                continue
-
-            pairs.sort_values('sum_ret', ascending=False, inplace=True)
-            pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
-
-            # [内存优化] 立刻追加写入汇总表，切断全局变量的常驻内存链
-            pairs.to_csv(pairs_all_path, mode='a', header=not os.path.exists(pairs_all_path), index=False,
-                         encoding='utf-8-sig')
-
-            valid_combos = len(pairs)
-            retention_rate = valid_combos / trials if trials > 0 else 0
-            total_saved_trades = int(pairs['trades'].sum())
-            avg_trades_per_day = (total_saved_trades / valid_combos / kline_days) if (
-                    valid_combos > 0 and kline_days > 0) else 0
-
-            print(
-                f"── 回测统计信息 ── | "
-                f"有效K线天数: {kline_days:.2f}天 | "
-                f"理论组合数量: {trials} | "
-                f"实际回测组合数: {valid_combos} | "
-                f"保留率: {retention_rate * 100:.2f}% | "
-                f"最终保存交易数量: {total_saved_trades} | "
-                f"平均交易频率: {avg_trades_per_day:.2f}次/天/组合"
-            )
-
-            top = pairs.head(10)
-            print("    ── TOP10 (按累加总收益) ──")
-            for _, r in top.iterrows():
-                print(f"      {r['entry_factor'][:34]:<34} -> {r['exit_factor'][:30]:<30} "
-                      f"| N={int(r['trades']):>5} | Σ={r['sum_ret']:>9.1f}% "
-                      f"| 胜率={r['win_rate']:>5.1f}% | 均={r['avg_ret']:>6.2f}% "
-                      f"| OOSΣ={r['oos_sum_ret'] if pd.notna(r['oos_sum_ret']) else float('nan'):>8.1f}%")
-        except Exception as e:
-            traceback.print_exc()
-            print(f"❌ [{coin}] 处理失败: {e}")
-            continue
-
-        # [内存优化] 单币种跑完后立刻“用完即焚”，释放底层 Pandas 与 Numpy 的重负荷大表
-        finally:
-            if 'df' in locals(): del df
-            if 'pairs' in locals(): del pairs
-            gc.collect()
-
-    if not os.path.exists(pairs_all_path):
+    if not pairs_list:
         print("\n⚠️ 没有任何有效结果。")
         return
 
-    # [内存优化] 基于写好的本地汇总表读取，而非内存内的全量 list concat
-    big = pd.read_csv(pairs_all_path)
+    big = pd.concat(pairs_list, ignore_index=True)
+    big.to_csv(pairs_all_path, index=False, encoding='utf-8-sig')
 
     has_trades = False
-    trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.csv')
+    trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.parquet')
+    pq_files = glob.glob(os.path.join(trades_raw_dir, "*.parquet"))
 
     # ================= 生成表1：全局逐笔交易流水 =================
-    if os.path.exists(trades_raw_path):
-        print("\n[内存优化] 正在采用 Chunk 分块引擎统计全局并发信号 (消除 OOM)...")
+    if pq_files:
+        print("\n[内存优化] 正在采用分块引擎读取独立Parquet文件统计并发信号 (消除 OOM)...")
         try:
-            # [内存优化] 第 1 遍扫描：极低内存的字典流式统计
             concurrent_counts = Counter()
-            for chunk in pd.read_csv(trades_raw_path, usecols=['combo_id', 'entry_time'], chunksize=1000000,
-                                     dtype={'combo_id': 'category'}):
-                concurrent_counts.update(zip(chunk['combo_id'], chunk['entry_time']))
+            for pf in pq_files:
+                df_part = pd.read_parquet(pf, columns=['entry_id', 'exit_id', 'entry_time'])
+                df_part['entry_id'] = df_part['entry_id'].astype(int)
+                df_part['exit_id'] = df_part['exit_id'].astype(int)
+                df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
+                    reverse_factor_map)
+                concurrent_counts.update(zip(df_part['combo_id'], df_part['entry_time']))
 
             if concurrent_counts:
                 has_trades = True
                 print(f"[内存优化] 正在流式拼接并发信号列并写入最终表 {trades_final_path}...")
 
-                # [内存优化] 第 2 遍扫描：将计数值匹配回去，流式分块存入终表
                 first_chunk = True
-                for chunk in pd.read_csv(trades_raw_path, chunksize=1000000,
-                                         dtype={'combo_id': 'category', 'coin': 'category'}):
-                    chunk['concurrent_signals'] = [concurrent_counts[(cid, et)] for cid, et in
-                                                   zip(chunk['combo_id'], chunk['entry_time'])]
-                    cols_t1 = ['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return',
-                               'concurrent_signals']
-                    chunk[cols_t1].to_csv(trades_final_path, mode='a' if not first_chunk else 'w',
-                                          header=first_chunk, index=False, encoding='utf-8-sig')
-                    first_chunk = False
+                for pf in pq_files:
+                    df_part = pd.read_parquet(pf)
+                    df_part['entry_id'] = df_part['entry_id'].astype(int)
+                    df_part['exit_id'] = df_part['exit_id'].astype(int)
+                    df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
+                        reverse_factor_map)
+                    df_part['concurrent_signals'] = [concurrent_counts[(cid, et)] for cid, et in
+                                                     zip(df_part['combo_id'], df_part['entry_time'])]
+
+                    df_part.drop(columns=['entry_id', 'exit_id'], inplace=True)
+                    table = pa.Table.from_pandas(df_part)
+
+                    if first_chunk:
+                        writer = pq.ParquetWriter(trades_final_path, table.schema)
+                        first_chunk = False
+                    writer.write_table(table)
+                if not first_chunk:
+                    writer.close()
         finally:
-            if os.path.exists(trades_raw_path):
-                os.remove(trades_raw_path)
             del concurrent_counts
             gc.collect()
-    # ====================================================================
+
+    # 规范释放磁盘空间生命周期，无论是否有数据生成均清理
+    if os.path.exists(trades_raw_dir):
+        shutil.rmtree(trades_raw_dir, ignore_errors=True)
 
     # 跨币种稳健性汇总
     g = big.groupby(['entry_factor', 'exit_factor'])
@@ -1140,15 +1195,18 @@ def main(cfg=CFG):
                      * np.sqrt(summ['total_trades'].clip(lower=1))
                      * summ['coin_positive_rate'])
     summ.sort_values('score', ascending=False, inplace=True)
-    summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'),
-                index=False, encoding='utf-8-sig')
+    summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'), index=False, encoding='utf-8-sig')
 
     # ================= 生成表2：组合时序切片长表 =================
     if has_trades:
-        print("[内存优化] 正在生成时序切片长表 (按需加载，降维 dtype 保护内存)...")
-        ts_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'entry_time', 'net_return', 'coin'],
-                            dtype={'combo_id': 'category', 'coin': 'category'})
-        ts_df['date'] = pd.to_datetime(ts_df['entry_time'], format='ISO8601').dt.date
+        print("[内存优化] 正在生成时序切片长表 (直接按列读取 Parquet 极速聚合)...")
+        ts_df = pd.read_parquet(trades_final_path, columns=['combo_id', 'entry_time', 'net_return', 'coin'])
+        ts_df['combo_id'] = ts_df['combo_id'].astype('category')
+        ts_df['coin'] = ts_df['coin'].astype('category')
+
+        # [修正2] 兼容 Parquet 读取出的 datetime64 原生类型，修复类型冲突崩溃
+        ts_df['date'] = pd.to_datetime(ts_df['entry_time']).dt.date
+
         daily_agg = ts_df.groupby(['combo_id', 'date'], observed=True).agg(
             daily_return=('net_return', 'sum'),
             active_coins=('coin', 'nunique')
@@ -1172,9 +1230,9 @@ def main(cfg=CFG):
     combo_profile['combo_id'] = combo_profile['entry_factor'] + '|' + combo_profile['exit_factor']
 
     if has_trades:
-        print("[内存优化] 正在生成宏观统计看板 (按需加载，降维 dtype 保护内存)...")
-        prof_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'net_return', 'concurrent_signals'],
-                              dtype={'combo_id': 'category'})
+        print("[内存优化] 正在生成宏观统计看板...")
+        prof_df = pd.read_parquet(trades_final_path, columns=['combo_id', 'net_return', 'concurrent_signals'])
+        prof_df['combo_id'] = prof_df['combo_id'].astype('category')
 
         def calc_profile_stats(group):
             conc = group['concurrent_signals'].values
@@ -1235,7 +1293,6 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
-
 
 if __name__ == '__main__':
     import copy

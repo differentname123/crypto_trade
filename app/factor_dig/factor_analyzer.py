@@ -1,19 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- 组合有效性深度分析器 (Combo Effectiveness Deep Analyzer)
+ 组合有效性深度分析器 (Combo Effectiveness Deep Analyzer) [纯 Parquet 极速版]
 --------------------------------------------------------------------------------
- · 读取回测引擎输出的 3 张表，进行宏观统计检验
+ · 彻底废弃 trades_ALL.csv，强制读取 trades_ALL.parquet，杜绝内存溢出
+ · 极速计算持仓时间，享受二进制列式存储带来的毫秒级解析体验
  · 全局宏观扫雷 + 指定组合深度体检
- · 日志输出，仅在触碰统计学底线时下达超大概率判定
- · 直接调用函数运行，无需命令行
 ================================================================================
 """
 import os
 import math
 import logging
 import warnings
-from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -68,15 +66,28 @@ class ComboAnalyzer:
         self._load_data()
 
     # ------------------------------------------------------------------
-    # 数据加载
+    # 数据加载 (纯 Parquet 引擎)
     # ------------------------------------------------------------------
     def _load_data(self):
         self.logger.info("=" * 90)
         self.logger.info(f"加载数据目录: {os.path.abspath(self.out_dir)}")
         self.logger.info("=" * 90)
 
+        # 1. 强制读取 Parquet 流水表 (摒弃 CSV)
+        trades_pq = os.path.join(self.out_dir, 'trades_ALL.parquet')
+
+        if os.path.exists(trades_pq):
+            self.logger.info("  检测到 trades_ALL.parquet，正在启用极速加载模式...")
+            self.trades = pd.read_parquet(trades_pq)
+            # 主动将字符串列转为 categorical，确保内存占用锁定在最低
+            self.trades['combo_id'] = self.trades['combo_id'].astype('category')
+            self.trades['coin'] = self.trades['coin'].astype('category')
+            self.logger.info(f"  已加载 trades_ALL.parquet | {len(self.trades):>10,} 行")
+        else:
+            self.logger.warning("  未找到 trades_ALL.parquet 流水文件")
+
+        # 2. 加载其他聚合表 (由于体积极小，继续保留轻量级 CSV 格式)
         files_map = {
-            'trades': 'trades_ALL.csv',
             'timeseries': 'combo_timeseries_ALL.csv',
             'profile': 'Combo_Profile_ALL.csv',
             'pairs_all': 'pairs_ALL.csv',
@@ -86,33 +97,33 @@ class ComboAnalyzer:
         for attr, fname in files_map.items():
             fpath = os.path.join(self.out_dir, fname)
             if os.path.exists(fpath):
-                # 【优化点1】针对最大的流水表，强制指定 category 类型，缩减 70% 内存
-                if attr == 'trades':
-                    df = pd.read_csv(fpath, dtype={'combo_id': 'category', 'coin': 'category'})
-                elif attr == 'timeseries':
+                if attr == 'timeseries':
                     df = pd.read_csv(fpath, dtype={'combo_id': 'category'})
                 else:
                     df = pd.read_csv(fpath)
-
                 setattr(self, attr, df)
                 self.logger.info(f"  已加载 {fname:<32} | {len(df):>10,} 行")
             else:
                 self.logger.warning(f"  未找到 {fname}")
 
+        # 3. 处理时间戳与指标计算
         if self.trades is not None and not self.trades.empty:
-            self.logger.info("  正在解析时间戳计算持仓时间 (启用 C 引擎极速解析)...")
-            # 【优化点2】启用 format='ISO8601'，解析百万行时间戳从几分钟降至几秒
-            self.trades['entry_time'] = pd.to_datetime(self.trades['entry_time'], format='ISO8601', exact=False)
-            self.trades['exit_time'] = pd.to_datetime(self.trades['exit_time'], format='ISO8601', exact=False)
-            self.trades['hold_hours'] = (
-                                                self.trades['exit_time'] - self.trades['entry_time']
-                                        ).dt.total_seconds() / 3600.0
-            self.trades['alpha'] = self.trades['net_return'] - self.trades['benchmark_return']
+            self.logger.info("  正在预处理流水指标...")
+
+            # 【核心优化】Parquet 天生保留 datetime64[ns] 格式，直接进行无缝数学运算
+            self.trades['hold_hours'] = (self.trades['exit_time'] - self.trades[
+                'entry_time']).dt.total_seconds() / 3600.0
+
+            # 由于底层用了 float32 降维，这里强转 float 防止高精度计算溢出
+            self.trades['alpha'] = self.trades['net_return'].astype(float) - self.trades['benchmark_return'].astype(
+                float)
 
         if self.timeseries is not None and not self.timeseries.empty:
+            # timeseries 依然是 csv，因此仍需解析一下日期
             self.timeseries['date'] = pd.to_datetime(self.timeseries['date'], format='ISO8601', exact=False)
 
         self.logger.info("-" * 90)
+
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
@@ -154,7 +165,7 @@ class ComboAnalyzer:
         if 'true_n_trades' in self.profile.columns:
             tn_valid = self.profile['true_n_trades'].dropna()
             tn_gt30 = (tn_valid > 30).sum()
-            self.logger.info(f"  True N > 30 的组合 : {tn_gt30:>10,} ({tn_gt30/len(tn_valid)*100:.2f}%)")
+            self.logger.info(f"  True N > 30 的组合 : {tn_gt30:>10,} ({tn_gt30 / len(tn_valid) * 100:.2f}%)")
             tn_lt30 = (tn_valid < 30).sum()
             if tn_lt30 > 0:
                 self.logger.info(f"  True N < 30 的组合 : {tn_lt30:>10,} (统计失效，直接淘汰)")
@@ -165,8 +176,8 @@ class ComboAnalyzer:
             if len(dsr_valid) > 0:
                 dsr_gt90 = (dsr_valid > 0.90).sum()
                 dsr_lt01 = (dsr_valid < 0.01).sum()
-                self.logger.info(f"  DSR > 0.90 的组合 : {dsr_gt90:>10,} ({dsr_gt90/len(dsr_valid)*100:.2f}%)")
-                self.logger.info(f"  DSR < 0.01 的组合 : {dsr_lt01:>10,} ({dsr_lt01/len(dsr_valid)*100:.2f}%)")
+                self.logger.info(f"  DSR > 0.90 的组合 : {dsr_gt90:>10,} ({dsr_gt90 / len(dsr_valid) * 100:.2f}%)")
+                self.logger.info(f"  DSR < 0.01 的组合 : {dsr_lt01:>10,} ({dsr_lt01 / len(dsr_valid) * 100:.2f}%)")
                 self.logger.info(f"  DSR 中位数       : {dsr_valid.median():>10.4f}")
 
                 if dsr_gt90 == 0:
@@ -219,10 +230,6 @@ class ComboAnalyzer:
     # 指定组合深度体检
     # ==================================================================
     def analyze_combo(self, combo_id):
-        """
-        对指定组合进行完整的统计诊断，输出详细日志。
-        返回包含所有计算结果的字典。
-        """
         self.logger.info("\n" + "=" * 90)
         self.logger.info(f"深度分析组合: {combo_id}")
         self.logger.info("=" * 90)
@@ -231,9 +238,6 @@ class ComboAnalyzer:
         red_flags = []
         green_flags = []
 
-        # ==============================================================
-        # 模块 1：基础档案 (Profile)
-        # ==============================================================
         if self.profile is not None and not self.profile.empty:
             prof = self.profile[self.profile['combo_id'] == combo_id]
             if not prof.empty:
@@ -268,9 +272,6 @@ class ComboAnalyzer:
             else:
                 self.logger.warning(f"  在 Profile 表中未找到该组合")
 
-        # ==============================================================
-        # 模块 2：逐笔交易分布
-        # ==============================================================
         if self.trades is not None and not self.trades.empty:
             t = self.trades[self.trades['combo_id'] == combo_id]
             if not t.empty:
@@ -282,41 +283,36 @@ class ComboAnalyzer:
                 conc = t['concurrent_signals'].values.astype(float)
                 hold = t['hold_hours'].values.astype(float)
 
-                # --- 2.1 净收益统计 ---
                 self.logger.info(f"\n  --- 净收益 (Net Return) ---")
-                self.logger.info(f"    均值       : {np.mean(net)*100:>9.4f}%")
-                self.logger.info(f"    中位数     : {np.median(net)*100:>9.4f}%")
-                self.logger.info(f"    标准差     : {np.std(net, ddof=1)*100:>9.4f}%")
+                self.logger.info(f"    均值       : {np.mean(net) * 100:>9.4f}%")
+                self.logger.info(f"    中位数     : {np.median(net) * 100:>9.4f}%")
+                self.logger.info(f"    标准差     : {np.std(net, ddof=1) * 100:>9.4f}%")
 
                 skew_val = self._safe_stat(stats.skew, net, 0.0)
                 kurt_val = self._safe_stat(stats.kurtosis, net, 0.0)
                 self.logger.info(f"    偏度       : {skew_val:>9.4f}")
                 self.logger.info(f"    峰度       : {kurt_val:>9.4f}")
-                self.logger.info(f"    最大盈利   : {np.max(net)*100:>9.4f}%")
-                self.logger.info(f"    最大亏损   : {np.min(net)*100:>9.4f}%")
-                self.logger.info(f"    胜率       : {(net > 0).mean()*100:>9.2f}%")
-                self.logger.info(f"    累计收益   : {np.sum(net)*100:>9.2f}%")
+                self.logger.info(f"    最大盈利   : {np.max(net) * 100:>9.4f}%")
+                self.logger.info(f"    最大亏损   : {np.min(net) * 100:>9.4f}%")
+                self.logger.info(f"    胜率       : {(net > 0).mean() * 100:>9.2f}%")
+                self.logger.info(f"    累计收益   : {np.sum(net) * 100:>9.2f}%")
 
-                # 分位数分布
                 self.logger.info(f"\n    分位数分布:")
                 for p in [5, 10, 25, 50, 75, 90, 95]:
-                    self.logger.info(f"      P{p:<3}: {np.percentile(net, p)*100:>9.4f}%")
+                    self.logger.info(f"      P{p:<3}: {np.percentile(net, p) * 100:>9.4f}%")
 
-                # 截尾均值
                 trimmed_mean = np.nan
                 if len(net) >= 20:
                     trimmed = stats.trimboth(net, 0.05)
                     trimmed_mean = np.mean(trimmed)
-                    self.logger.info(f"\n    截尾均值(去前后5%极值): {trimmed_mean*100:>9.4f}%")
+                    self.logger.info(f"\n    截尾均值(去前后5%极值): {trimmed_mean * 100:>9.4f}%")
 
-                # 尾部比率
                 p95 = np.percentile(net, 95)
                 p5 = np.percentile(net, 5)
                 tail_ratio = p95 / abs(p5) if abs(p5) > 1e-9 else np.nan
                 if pd.notna(tail_ratio):
                     self.logger.info(f"    尾部比率(95%/|5%|): {tail_ratio:>9.4f}")
 
-                # 盈亏结构
                 wins = net[net > 0]
                 losses = net[net < 0]
                 if len(losses) > 0 and len(wins) > 0:
@@ -324,15 +320,13 @@ class ComboAnalyzer:
                     avg_win = wins.mean()
                     avg_loss = abs(losses.mean())
                     self.logger.info(f"\n    盈利因子   : {profit_factor:>9.4f}")
-                    self.logger.info(f"    平均盈利   : {avg_win*100:>9.4f}%")
-                    self.logger.info(f"    平均亏损   : {avg_loss*100:>9.4f}%")
-                    self.logger.info(f"    盈亏比     : {avg_win/avg_loss:>9.4f}")
+                    self.logger.info(f"    平均盈利   : {avg_win * 100:>9.4f}%")
+                    self.logger.info(f"    平均亏损   : {avg_loss * 100:>9.4f}%")
+                    self.logger.info(f"    盈亏比     : {avg_win / avg_loss:>9.4f}")
 
-                # Top/Bottom 5 trades
                 self.logger.info(f"\n    最佳5笔: {np.sort(net)[-5:][::-1] * 100}")
                 self.logger.info(f"    最差5笔: {np.sort(net)[:5] * 100}")
 
-                # Top 5 利润贡献
                 if len(wins) > 0:
                     top5_sum = np.sort(net)[-5:].sum()
                     total_profit = wins.sum()
@@ -343,20 +337,18 @@ class ComboAnalyzer:
                         self.logger.info(f"  [判定] 极值依赖严重！利润极度集中于极少数历史偶然事件，实盘容错率极低")
                         red_flags.append(f"Top5笔利润占比 {top5_pct:.1f}% (极值依赖)")
 
-                # 截尾均值判断
                 if pd.notna(trimmed_mean) and trimmed_mean < 0:
                     self.logger.info(f"  [判定] 截尾均值 < 0，去掉极值后策略期望为负，核心逻辑不赚钱")
                     red_flags.append("截尾均值 < 0 (核心逻辑不赚钱)")
 
-                # --- 2.2 基准与 Alpha ---
                 self.logger.info(f"\n  --- 基准收益 (Benchmark) ---")
-                self.logger.info(f"    持仓期基准均值 : {np.mean(bench)*100:>9.4f}%")
-                self.logger.info(f"    持仓期基准累计 : {np.sum(bench)*100:>9.2f}%")
+                self.logger.info(f"    持仓期基准均值 : {np.mean(bench) * 100:>9.4f}%")
+                self.logger.info(f"    持仓期基准累计 : {np.sum(bench) * 100:>9.2f}%")
 
                 self.logger.info(f"\n  --- 纯 Alpha (Net - Benchmark) ---")
-                self.logger.info(f"    Alpha 均值     : {np.mean(alpha)*100:>9.4f}%")
-                self.logger.info(f"    Alpha 累计     : {np.sum(alpha)*100:>9.2f}%")
-                self.logger.info(f"    Alpha 胜率     : {(alpha > 0).mean()*100:>9.2f}%")
+                self.logger.info(f"    Alpha 均值     : {np.mean(alpha) * 100:>9.4f}%")
+                self.logger.info(f"    Alpha 累计     : {np.sum(alpha) * 100:>9.2f}%")
+                self.logger.info(f"    Alpha 胜率     : {(alpha > 0).mean() * 100:>9.2f}%")
 
                 if len(alpha) > 2:
                     alpha_std = np.std(alpha, ddof=1)
@@ -366,7 +358,6 @@ class ComboAnalyzer:
                         self.logger.info(f"    Alpha T统计量  : {alpha_t:>9.4f}")
                         self.logger.info(f"    Alpha P值      : {alpha_p:>9.4f}")
 
-                # --- 2.3 CAPM 回归 ---
                 if len(net) >= 10:
                     self.logger.info(f"\n  --- CAPM 回归: R_combo = alpha + beta * R_benchmark + epsilon ---")
                     try:
@@ -400,20 +391,17 @@ class ComboAnalyzer:
                     except Exception as e:
                         self.logger.warning(f"    回归计算失败: {e}")
 
-                # --- 2.4 并发与独立性 ---
                 self.logger.info(f"\n  --- 并发与独立性 ---")
                 self.logger.info(f"    平均并发信号数 : {np.mean(conc):>9.2f}")
                 self.logger.info(f"    最大并发信号数 : {np.max(conc):>9.0f}")
-                self.logger.info(f"    并发>3的占比   : {(conc > 3).mean()*100:>9.2f}%")
-                self.logger.info(f"    并发>5的占比   : {(conc > 5).mean()*100:>9.2f}%")
+                self.logger.info(f"    并发>3的占比   : {(conc > 3).mean() * 100:>9.2f}%")
+                self.logger.info(f"    并发>5的占比   : {(conc > 5).mean() * 100:>9.2f}%")
 
-                # --- 2.5 持仓时间 ---
                 self.logger.info(f"\n  --- 持仓时间 ---")
                 self.logger.info(f"    平均持仓       : {np.mean(hold):>9.2f} 小时")
                 self.logger.info(f"    中位持仓       : {np.median(hold):>9.2f} 小时")
                 self.logger.info(f"    最长持仓       : {np.max(hold):>9.2f} 小时")
 
-                # --- 2.6 币种覆盖 ---
                 coin_counts = t['coin'].value_counts()
                 n_coins = len(coin_counts)
                 coin_profit = t.groupby('coin')['net_return'].sum()
@@ -423,17 +411,16 @@ class ComboAnalyzer:
                 self.logger.info(f"    覆盖币种数     : {n_coins:>9}")
                 self.logger.info(f"    盈利币种数     : {n_pos_coins:>9}")
                 if n_coins > 0:
-                    self.logger.info(f"    币种盈利占比   : {n_pos_coins/n_coins*100:>9.2f}%")
+                    self.logger.info(f"    币种盈利占比   : {n_pos_coins / n_coins * 100:>9.2f}%")
 
                 if n_coins > 0:
                     pos_rate = n_pos_coins / n_coins
                     if pos_rate < 0.30:
                         self.logger.info(f"  [判定] 盈利币种占比 < 30%，缺乏跨币种泛化能力")
-                        red_flags.append(f"盈利币种占比 {pos_rate*100:.1f}% (无泛化能力)")
+                        red_flags.append(f"盈利币种占比 {pos_rate * 100:.1f}% (无泛化能力)")
                     elif pos_rate > 0.60:
-                        green_flags.append(f"盈利币种占比 {pos_rate*100:.1f}% (泛化能力强)")
+                        green_flags.append(f"盈利币种占比 {pos_rate * 100:.1f}% (泛化能力强)")
 
-                # Top 1 币种利润贡献
                 if n_coins > 1:
                     top_coin = coin_profit.index[0]
                     top_coin_profit = coin_profit.iloc[0]
@@ -457,9 +444,6 @@ class ComboAnalyzer:
                     'trimmed_mean': trimmed_mean,
                 }
 
-        # ==============================================================
-        # 模块 3：时序资金曲线
-        # ==============================================================
         if self.timeseries is not None and not self.timeseries.empty:
             ts = self.timeseries[self.timeseries['combo_id'] == combo_id].copy()
             if not ts.empty:
@@ -470,20 +454,19 @@ class ComboAnalyzer:
                 nav = ts['daily_nav'].values.astype(float)
 
                 self.logger.info(f"\n  --- 日度收益 ---")
-                self.logger.info(f"    日均收益       : {np.mean(daily_ret)*100:>9.4f}%")
-                self.logger.info(f"    日收益标准差   : {np.std(daily_ret, ddof=1)*100:>9.4f}%")
-                self.logger.info(f"    盈利天数占比   : {(daily_ret > 0).mean()*100:>9.2f}%")
+                self.logger.info(f"    日均收益       : {np.mean(daily_ret) * 100:>9.4f}%")
+                self.logger.info(f"    日收益标准差   : {np.std(daily_ret, ddof=1) * 100:>9.4f}%")
+                self.logger.info(f"    盈利天数占比   : {(daily_ret > 0).mean() * 100:>9.2f}%")
 
                 std_d = np.std(daily_ret, ddof=1)
                 sharpe_d = np.mean(daily_ret) / std_d * np.sqrt(365) if std_d > 0 else np.nan
                 if pd.notna(sharpe_d):
                     self.logger.info(f"    年化夏普(日度) : {sharpe_d:>9.4f}")
 
-                # 最大回撤
                 peak = np.maximum.accumulate(nav)
                 dd = (peak - nav) / np.where(peak > 0, peak, 1)
                 max_dd = np.max(dd)
-                self.logger.info(f"    最大回撤       : {max_dd*100:>9.2f}%")
+                self.logger.info(f"    最大回撤       : {max_dd * 100:>9.2f}%")
 
                 in_dd = dd > 0.001
                 if in_dd.any():
@@ -492,7 +475,6 @@ class ComboAnalyzer:
                     max_dd_dur = dd_durations.max()
                     self.logger.info(f"    最长回撤持续   : {max_dd_dur:>9.0f} 天")
 
-                # Sortino
                 downside = daily_ret[daily_ret < 0]
                 if len(downside) > 0:
                     down_std = np.std(downside, ddof=1)
@@ -500,7 +482,6 @@ class ComboAnalyzer:
                     if pd.notna(sortino):
                         self.logger.info(f"    Sortino比率    : {sortino:>9.4f}")
 
-                # Calmar
                 if max_dd > 0 and len(ts) > 1:
                     total_ret = nav[-1] / nav[0] - 1 if nav[0] != 0 else 0
                     years = len(ts) / 365.0
@@ -508,7 +489,6 @@ class ComboAnalyzer:
                     calmar = ann_ret / max_dd
                     self.logger.info(f"    Calmar比率     : {calmar:>9.4f}")
 
-                # 自相关性
                 if len(daily_ret) > 20:
                     s = pd.Series(daily_ret)
                     acf1 = s.autocorr(lag=1)
@@ -516,7 +496,6 @@ class ComboAnalyzer:
                     self.logger.info(f"\n    自相关(Lag=1)  : {acf1:>9.4f}")
                     self.logger.info(f"    自相关(Lag=5)  : {acf5:>9.4f}")
 
-                # 月度一致性
                 ts['month'] = ts['date'].dt.to_period('M')
                 monthly = ts.groupby('month')['daily_return'].sum()
                 pos_months = (monthly > 0).sum()
@@ -527,18 +506,17 @@ class ComboAnalyzer:
                 self.logger.info(f"    盈利月数       : {pos_months:>9}")
                 if total_months > 0:
                     monthly_wr = pos_months / total_months
-                    self.logger.info(f"    月度胜率       : {monthly_wr*100:>9.2f}%")
+                    self.logger.info(f"    月度胜率       : {monthly_wr * 100:>9.2f}%")
                     if total_months >= 6 and monthly_wr < 0.30:
                         self.logger.info(f"  [判定] 月度胜率 < 30%，收益可能由极少数月份贡献，缺乏时间稳健性")
-                        red_flags.append(f"月度胜率 {monthly_wr*100:.1f}% (周期过拟合)")
+                        red_flags.append(f"月度胜率 {monthly_wr * 100:.1f}% (周期过拟合)")
                     elif monthly_wr > 0.60:
-                        green_flags.append(f"月度胜率 {monthly_wr*100:.1f}% (时序稳健)")
+                        green_flags.append(f"月度胜率 {monthly_wr * 100:.1f}% (时序稳健)")
 
                 if len(monthly) > 0:
-                    self.logger.info(f"    最佳月         : {monthly.max()*100:>9.2f}%")
-                    self.logger.info(f"    最差月         : {monthly.min()*100:>9.2f}%")
+                    self.logger.info(f"    最佳月         : {monthly.max() * 100:>9.2f}%")
+                    self.logger.info(f"    最差月         : {monthly.min() * 100:>9.2f}%")
 
-                # 季度一致性
                 ts['quarter'] = ts['date'].dt.to_period('Q')
                 quarterly = ts.groupby('quarter')['daily_return'].sum()
                 pos_q = (quarterly > 0).sum()
@@ -553,9 +531,6 @@ class ComboAnalyzer:
                     'monthly_win_rate': monthly_wr if total_months > 0 else np.nan,
                 }
 
-        # ==============================================================
-        # 模块 4：跨币种稳健性
-        # ==============================================================
         if self.cross_summary is not None and not self.cross_summary.empty:
             parts = combo_id.split('|')
             if len(parts) == 2:
@@ -563,13 +538,13 @@ class ComboAnalyzer:
                 cs = self.cross_summary[
                     (self.cross_summary['entry_factor'] == entry) &
                     (self.cross_summary['exit_factor'] == exit_f)
-                ]
+                    ]
                 if not cs.empty:
                     row = cs.iloc[0]
                     self.logger.info(f"\n[4/5] 跨币种稳健性")
                     self.logger.info(f"  覆盖币种数       : {int(row.get('n_coins', 0)):>9}")
                     self.logger.info(f"  跨币总交易数     : {int(row.get('total_trades', 0)):>9,}")
-                    self.logger.info(f"  盈利币种占比     : {row.get('coin_positive_rate', 0)*100:>9.2f}%")
+                    self.logger.info(f"  盈利币种占比     : {row.get('coin_positive_rate', 0) * 100:>9.2f}%")
                     self.logger.info(f"  跨币平均均笔收益 : {row.get('mean_avg_ret', 0):>9.4f}%")
                     self.logger.info(f"  跨币平均胜率     : {row.get('mean_win_rate', 0):>9.2f}%")
                     self.logger.info(f"  跨币总收益       : {row.get('sum_ret_all', 0):>9.2f}%")
@@ -578,9 +553,6 @@ class ComboAnalyzer:
 
                     result['cross_coin'] = row.to_dict()
 
-        # ==============================================================
-        # 模块 5：综合诊断
-        # ==============================================================
         self.logger.info(f"\n[5/5] 综合诊断")
 
         if red_flags:
@@ -611,10 +583,10 @@ class ComboAnalyzer:
 if __name__ == '__main__':
 
     # ========== 请修改这里 ==========
-    OUT_DIR = './factor_out_1m'       # 回测输出目录
-    TARGET_COMBO = None                # 指定要深度分析的组合ID，如 "ENTRY_A|EXIT_B"
-    TOP_N = 20                         # 全局筛选显示 Top N
-    ANALYZE_ALL_TOP = False            # 是否对 Top N 逐个深度分析
+    OUT_DIR = './factor_out_15m'  # 自动对应新引擎的输出目录
+    TARGET_COMBO = None  # 指定要深度分析的组合ID，如 "ENTRY_A|EXIT_B"
+    TOP_N = 20  # 全局筛选显示 Top N
+    ANALYZE_ALL_TOP = False  # 是否对 Top N 逐个深度分析
     # ================================
 
     analyzer = ComboAnalyzer(OUT_DIR)
