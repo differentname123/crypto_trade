@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 # 0. 全局配置
 # ======================================================================
 CFG = dict(
-    DATA_DIR='./data',  # 数据目录
+    DATA_DIR='../data',  # 数据目录
     BAR_MINUTES=15,  # 周期时长
     FEE_RATE=0.0005,  # 单边手续费
     SLIPPAGE=0.0005,  # 单边滑点

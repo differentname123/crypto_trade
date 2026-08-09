@@ -977,9 +977,8 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
 
     return pd.DataFrame(rows), diag_df, total, kline_days
 
-
 # ======================================================================
-# 7. 主流程
+# 7. 主流程 (修改版：增加最开始打印回测币种个数)
 # ======================================================================
 def main(cfg=CFG):
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
@@ -993,9 +992,30 @@ def main(cfg=CFG):
         print("❌ 未发现 *_USDT_USDT_1m_kline.csv")
         return
 
+    # ================= 新增逻辑：提前解析并统计要回测的币种 =================
+    valid_coins = []
+    valid_kfiles = []
+    for kf in kfiles:
+        coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
+        # 如果配置了特定币种且当前币种不在其中，则跳过
+        if cfg['COINS'] and coin not in cfg['COINS']:
+            continue
+        valid_coins.append(coin)
+        valid_kfiles.append(kf)
+    # ========================================================================
+
     print("=" * 78)
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
+    print(f"🎯 本次计划回测币种个数: {len(valid_coins)} 个")
+    if len(valid_coins) <= 30:
+        print(f"📜 币种名单: {', '.join(valid_coins)}")
+    else:
+        print(f"📜 币种名单: {', '.join(valid_coins[:30])} ... 等")
     print("=" * 78)
+
+    if not valid_coins:
+        print("⚠️ 没有找到符合条件的币种进行回测。")
+        return
 
     # 初始化增量流水文件（清理旧的执行记录，并提前写入表头）
     trades_raw_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL_raw.csv')
@@ -1024,15 +1044,14 @@ def main(cfg=CFG):
     all_pairs, all_diag = [], []
     total_trials_tested = 0  # 记录全局测试总次数
 
-    for kf in kfiles:
+    # 修改遍历源，只遍历我们筛选过的 valid_kfiles
+    for kf in valid_kfiles:
         try:
             coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-            if cfg['COINS'] and coin not in cfg['COINS']:
-                continue
             oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
             fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
             if not (os.path.exists(oi_f) and os.path.exists(fr_f)):
-                print(f"⚠️  {coin} 数据不完整，跳过")
+                print(f"⚠️  {coin} 数据不完整 (缺失OI或FR数据)，跳过")
                 continue
 
             print(f"\n🚀 [{coin}]")
@@ -1109,18 +1128,16 @@ def main(cfg=CFG):
     if os.path.exists(trades_raw_path):
         print("\n[内存优化] 正在按需计算并发信号 (Groupby)...")
         try:
-            # 强制指定 category 类型，节省内存并加速 Groupby
             conc_df = pd.read_csv(trades_raw_path, usecols=['combo_id', 'entry_time'],
                                   dtype={'combo_id': 'category'})
             if not conc_df.empty:
                 has_trades = True
                 concurrent_counts = conc_df.groupby(['combo_id', 'entry_time'], observed=True).size().rename(
                     'concurrent_signals')
-                del conc_df  # 用完即释放
+                del conc_df
 
                 print(f"[内存优化] 正在按块流式合并写入最终表 {trades_final_path}...")
                 first_chunk = True
-                # 按 100 万行为块大小，流式 merge 并写入磁盘，同理指定 category
                 for chunk in pd.read_csv(trades_raw_path, chunksize=1000000,
                                          dtype={'combo_id': 'category', 'coin': 'category'}):
                     chunk = chunk.merge(concurrent_counts, left_on=['combo_id', 'entry_time'], right_index=True,
@@ -1133,7 +1150,6 @@ def main(cfg=CFG):
             else:
                 del conc_df
         finally:
-            # 确保存完即焚及异常崩溃时也能清理庞大的中间临时文件
             if os.path.exists(trades_raw_path):
                 os.remove(trades_raw_path)
     # ====================================================================
@@ -1162,19 +1178,14 @@ def main(cfg=CFG):
     # ================= 生成表2：组合时序切片长表 =================
     if has_trades:
         print("[内存优化] 正在生成时序切片长表 (按需加载)...")
-        # 仅抽取该表所需 4 列数据，强制类型转换极大节约内存
         ts_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'entry_time', 'net_return', 'coin'],
                             dtype={'combo_id': 'category', 'coin': 'category'})
-
-        # 启用 C 引擎极速解析（format='ISO8601'）防止假死
         ts_df['date'] = pd.to_datetime(ts_df['entry_time'], format='ISO8601').dt.date
-
-        # 补充 observed=True 应对 category 分组警告
         daily_agg = ts_df.groupby(['combo_id', 'date'], observed=True).agg(
             daily_return=('net_return', 'sum'),
             active_coins=('coin', 'nunique')
         ).reset_index()
-        del ts_df  # 释放内存
+        del ts_df
 
         daily_agg = daily_agg.sort_values(['combo_id', 'date'])
         daily_agg['daily_nav'] = daily_agg.groupby('combo_id', observed=True)['daily_return'].cumsum() + 1.0
@@ -1193,7 +1204,6 @@ def main(cfg=CFG):
 
     if has_trades:
         print("[内存优化] 正在生成宏观统计看板 (按需加载)...")
-        # 强制指定类型
         prof_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'net_return', 'concurrent_signals'],
                               dtype={'combo_id': 'category'})
 
@@ -1208,9 +1218,8 @@ def main(cfg=CFG):
                 skew, kurt = 0.0, 0.0
             return pd.Series({'true_n_trades': true_n, 'skew': skew, 'kurt': kurt})
 
-        # 同样补充 observed=True
         stats = prof_df.groupby('combo_id', observed=True).apply(calc_profile_stats).reset_index()
-        del prof_df  # 释放内存
+        del prof_df
 
         combo_profile = combo_profile.merge(stats, on='combo_id', how='left')
     else:
@@ -1256,13 +1265,6 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
-    print("   · pairs_<COIN>.csv              单币全组合明细")
-    print("   · pairs_ALL.csv                 全部币种全组合明细")
-    print("   · pairs_CROSS_COIN_SUMMARY.csv  跨币种稳健性汇总")
-    print("   · factor_diag_<COIN>.csv        单因子体检(信号数/密度/前瞻收益t值)")
-    print("   · trades_ALL.csv                [表1] 全局逐笔交易流水(含并发与BTC基准)")
-    print("   · combo_timeseries_ALL.csv      [表2] 组合时序切片长表(按日聚合)")
-    print("   · Combo_Profile_ALL.csv         [表3] 宏观统计档案看板(含DSR与True N)")
 
 if __name__ == '__main__':
     import copy
