@@ -1133,73 +1133,58 @@ def main(cfg=CFG):
     trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.parquet')
     pq_files = glob.glob(os.path.join(trades_raw_dir, "*.parquet"))
 
-    # ================= 生成表1：全局逐笔交易流水 (极致内存优化版) =================
+    # ================= 生成表1：全局逐笔交易流水 (修复OOM版) =================
     if pq_files:
-        print("\n[内存优化] 正在执行全局精英过滤，仅合并有效组合，杜绝 OOM...")
-
-        # 1. 在全局宏观表中，找出真正值得分析的“精英组合”
-        # 门槛极低：跨币种总收益 > 0 即可。这能安全过滤掉 80% 以上毫无价值的垃圾流水。
-        global_summary = big.groupby(['entry_factor', 'exit_factor'])['sum_ret'].sum().reset_index()
-        elite_combos = global_summary[global_summary['sum_ret'] > 0]
-
-        valid_combo_keys = set()
-        for _, row in elite_combos.iterrows():
-            e_id = factor_id_map.get(row['entry_factor'])
-            x_id = factor_id_map.get(row['exit_factor'])
-            if e_id is not None and x_id is not None:
-                valid_combo_keys.add((e_id, x_id))
-
-        print(
-            f"[内存优化] 全局共 {len(global_summary)} 种组合，合格精英 {len(valid_combo_keys)} 种，淘汰垃圾流水分批丢弃。")
-
-        if valid_combo_keys:
-            has_trades = True
-            first_chunk = True
-
+        print("\n[内存优化] 正在采用分块引擎读取独立Parquet文件统计并发信号 (消除 OOM)...")
+        try:
+            concurrent_counts = Counter()
             for pf in pq_files:
-                df_part = pd.read_parquet(pf)
-                if df_part.empty: continue
+                # 【优化阶段1】：仅读取整型ID和时间，杜绝一切字符串生成
+                df_part = pd.read_parquet(pf, columns=['entry_id', 'exit_id', 'entry_time'])
 
-                # 2. 极速过滤：只保留精英组合的流水 (这一步瞬间释放大量内存)
-                # 因为是按币种循环读取的，所以精英组合在这个亏损币种上的记录也会保留，无幸存者偏差！
-                mask = [((e, x) in valid_combo_keys) for e, x in zip(df_part['entry_id'], df_part['exit_id'])]
-                df_part = df_part[mask].copy()
+                # 直接使用 .values 提取底层 NumPy 数组，打包成极轻量级的纯数字 Tuple 作为 Key
+                keys = zip(
+                    df_part['entry_id'].values,
+                    df_part['exit_id'].values,
+                    df_part['entry_time'].values
+                )
+                concurrent_counts.update(keys)
 
-                if df_part.empty: continue
+            if concurrent_counts:
+                has_trades = True
+                print(f"[内存优化] 正在流式拼接并发信号列并写入最终表 {trades_final_path}...")
 
-                # 3. 还原字符串 combo_id
-                df_part['entry_id'] = df_part['entry_id'].astype(int)
-                df_part['exit_id'] = df_part['exit_id'].astype(int)
-                df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
-                    reverse_factor_map)
+                first_chunk = True
+                for pf in pq_files:
+                    df_part = pd.read_parquet(pf)
 
-                # 丢弃无用的 ID 列
-                df_part.drop(columns=['entry_id', 'exit_id'], inplace=True)
+                    # 【优化阶段2】：重建纯数字 Key，从 Counter 中极速匹配并发生信号数
+                    keys = zip(
+                        df_part['entry_id'].values,
+                        df_part['exit_id'].values,
+                        df_part['entry_time'].values
+                    )
+                    df_part['concurrent_signals'] = [concurrent_counts[k] for k in keys]
 
-                # 4. 直接写盘 (注意：我们把 concurrent_signals 的计算推迟到最后)
-                table = pa.Table.from_pandas(df_part)
-                if first_chunk:
-                    writer = pq.ParquetWriter(trades_final_path, table.schema)
-                    first_chunk = False
-                writer.write_table(table)
+                    # 【阅后即焚】：只有在准备写盘前，才将 int 转回长字符串 combo_id
+                    df_part['entry_id'] = df_part['entry_id'].astype(int)
+                    df_part['exit_id'] = df_part['exit_id'].astype(int)
+                    df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
+                        reverse_factor_map)
 
-            if not first_chunk:
-                writer.close()
+                    # 丢弃不再需要的整型列，转化为 pyarrow Table 写盘
+                    df_part.drop(columns=['entry_id', 'exit_id'], inplace=True)
+                    table = pa.Table.from_pandas(df_part)
 
-            # 5. 【终极降维打击】：使用 Pandas 向量化计算并发，取代 Python Counter
-            # 此时的 trades_final_path 已经被过滤得非常小了（去掉了80%以上的垃圾数据）
-            # 直接读取这两列计算并发度，几秒钟搞定，绝不 OOM
-            print("[内存优化] 正在使用向量化引擎计算精英组合的 True N 并发度...")
-            df_final = pd.read_parquet(trades_final_path)
+                    if first_chunk:
+                        writer = pq.ParquetWriter(trades_final_path, table.schema)
+                        first_chunk = False
+                    writer.write_table(table)
 
-            # 这里的原理：按组合ID和时间分组统计数量，然后合并回原表
-            concurrent_counts = df_final.groupby(['combo_id', 'entry_time']).size().reset_index(
-                name='concurrent_signals')
-            df_final = df_final.merge(concurrent_counts, on=['combo_id', 'entry_time'], how='left')
-
-            # 覆盖原文件
-            df_final.to_parquet(trades_final_path, index=False)
-            del df_final, concurrent_counts
+                if not first_chunk:
+                    writer.close()
+        finally:
+            del concurrent_counts
             gc.collect()
 
     # 规范释放磁盘空间生命周期，无论是否有数据生成均清理
