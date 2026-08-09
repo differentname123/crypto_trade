@@ -19,6 +19,9 @@ import time
 import math
 import itertools
 import warnings
+import csv  # [内存优化] 引入原生 csv
+import gc  # [内存优化] 引入垃圾回收
+from collections import Counter  # [内存优化] 用于极低内存的并发统计
 
 import numpy as np
 import pandas as pd
@@ -354,7 +357,7 @@ def build_factors(df, P, rank_shift=0):
     o, h, l, c = df['open'], df['high'], df['low'], df['close']
     v, oi, fr = df['volume'], df['oi_amount'], df['funding_rate']
 
-    def RK(s):  # rank_W —— 含当前值(因果安全)，可选 shift
+    def RK(s):
         r = s.rolling(W, min_periods=mp).rank(pct=True)
         return r.shift(rank_shift) if rank_shift else r
 
@@ -363,7 +366,7 @@ def build_factors(df, P, rank_shift=0):
         sd = s.rolling(W, min_periods=mp).std()
         return (s - m) / (sd + EPS)
 
-    def QT(s, p):  # q_W —— 阈值必须完全来自过去
+    def QT(s, p):
         return s.rolling(W, min_periods=mp).quantile(p).shift(1)
 
     def CU(a, b):
@@ -372,7 +375,7 @@ def build_factors(df, P, rank_shift=0):
     def CD(a, b):
         return (a < b) & (a.shift(1) >= b.shift(1))
 
-    def bs(s, k=1):  # bool shift
+    def bs(s, k=1):
         return s.shift(k, fill_value=False)
 
     def pctc(s, n):
@@ -441,13 +444,11 @@ def build_factors(df, P, rank_shift=0):
 
     F = {}
 
-    # ===== 一、通用过滤 =====
     F['FILTER_LIQUIDITY_OI_VALUE'] = oi_value > QT(oi_value, 0.30)
     F['FILTER_LIQUIDITY_VOLUME'] = v > QT(v, 0.30)
     F['FILTER_NOT_OVERCROWDED'] = (fr_rank < 0.95) & (oi_value_rank < 0.95) & (rk_ret_N < 0.98)
     F['FILTER_TREND_REGIME_UP'] = (c > ma_slow) & (ma_slow > ma_slow.shift(M))
 
-    # ===== 二、价格趋势与结构 =====
     F['PRICE_MA_STACK'] = (c > ma_fast) & (ma_fast > ma_slow)
     F['PRICE_MULTI_MA_STACK'] = (ma_12h > ma_24h) & (ma_24h > ma_72h) & (ma_72h > ma_7d) & (c > ma_12h)
     F['PRICE_MA_CROSS_UP'] = CU(ma_fast, ma_slow)
@@ -469,13 +470,12 @@ def build_factors(df, P, rank_shift=0):
     up_move, down_move = h.diff(), -l.diff()
     plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
-    plus_di = 100 * RSUM(plus_dm, N) / (tr_sum + EPS)  # 注: 原式用 atr_N(均值)量纲不对，此处修正为 TR 求和
+    plus_di = 100 * RSUM(plus_dm, N) / (tr_sum + EPS)
     minus_di = 100 * RSUM(minus_dm, N) / (tr_sum + EPS)
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di + EPS)) * 100
     adx = dx.rolling(N, min_periods=max(2, N // 2)).mean()
     F['ADX_TREND_UP_REAL'] = (adx > P['ADX_TH']) & (plus_di > minus_di)
 
-    # ===== 三、动量 =====
     F['MOM_RETURN_STRONG'] = rk_ret_N > 0.80
     F['MOM_ACCELERATION'] = ret_N > ret_N.shift(M)
     F['MOM_BURST'] = rk_ret_M > 0.90
@@ -490,7 +490,6 @@ def build_factors(df, P, rank_shift=0):
     _vwm = RSUM(ret_M * v, N) / (RSUM(v, N) + EPS)
     F['MOM_VOLUME_WEIGHTED'] = RK(_vwm) > 0.80
 
-    # ===== 四、波动率 =====
     F['VOL_RETURN_COMPRESSION'] = RK(ret_1h.rolling(N, min_periods=max(2, N // 2)).std()) < 0.20
     F['VOL_TRUE_RANGE_COMPRESSION'] = rk_atr < 0.20
     F['VOL_RANGE_COMPRESSION_REAL'] = rk_rng < 0.25
@@ -502,7 +501,6 @@ def build_factors(df, P, rank_shift=0):
     F['VOL_EXTREME_RISK'] = rk_atr > 0.95
     F['VOL_DOWN_SPIKE'] = F['VOL_ATR_EXPANSION'] & (ret_M < 0)
 
-    # ===== 五、突破 / 平台 / 结构 =====
     F['BREAK_N_HIGH_REAL'] = c > maxH_N.shift(1)
     F['BREAK_DONCHIAN_HIGH_EVENT_REAL'] = (c >= maxH_N.shift(1)) & (c.shift(1) < maxH_N.shift(2))
     F['BREAK_BOLLINGER_UPPER'] = c > ma_N + 2 * c.rolling(N, min_periods=max(2, N // 2)).std()
@@ -525,7 +523,6 @@ def build_factors(df, P, rank_shift=0):
     F['BREAKDOWN_DONCHIAN_LOW_REAL'] = c <= minL_N.shift(1)
     F['BREAK_FAIL_LEVEL'] = (c.shift(1) > maxH_N.shift(2)) & (c < maxH_N.shift(2))
 
-    # ===== 六、K线形态 =====
     _bodyr = c / (o + EPS) - 1.0
     F['KLINE_STRONG_GREEN'] = (c > o) & (RK(_bodyr) > 0.90)
     F['KLINE_SMALL_GREEN_ACCUM'] = ((c > o) & (_bodyr > 0) & (_bodyr < 0.01)).rolling(N).sum() >= P['K_SMALL_GREEN']
@@ -557,7 +554,6 @@ def build_factors(df, P, rank_shift=0):
     F['KLINE_THREE_RED_DOWN'] = ((c < o) & (c.shift(1) < o.shift(1)) & (c.shift(2) < o.shift(2))
                                  & (c < c.shift(1)) & (c.shift(1) < c.shift(2)))
 
-    # ===== 七、成交量与量价 =====
     F['VOLUME_MA_UP'] = vma_fast > vma_slow
     F['VOLUME_SPIKE'] = v > QT(v, 0.95)
     F['VOLUME_Z_SPIKE'] = ZS(v) > 2.0
@@ -588,7 +584,6 @@ def build_factors(df, P, rank_shift=0):
     F['VOLUME_CLIMAX_UP'] = (ret_N > 0) & (rk_v > 0.98)
     F['VOLUME_CLIMAX_DOWN'] = (ret_N < 0) & (rk_v > 0.98)
 
-    # ===== 八、OI 资金面 =====
     F['OI_MA_CROSS_UP'] = CU(oi_ma_fast, oi_ma_slow)
     F['OI_MA_UP'] = oi_ma_fast > oi_ma_slow
     F['OI_SLOPE_UP'] = oi > oi.shift(N)
@@ -623,7 +618,6 @@ def build_factors(df, P, rank_shift=0):
     F['OI_VALUE_HOT_EXTREME'] = oi_value_rank > 0.90
     F['OI_DROP_EXTREME'] = rk_oipct_N < 0.05
 
-    # ===== 九、Funding Rate 情绪 =====
     F['FR_MILD'] = (fr_rank > 0.10) & (fr_rank < 0.90)
     F['FR_LOW_NEG'] = (fr_rank < 0.20) | (fr < 0)
     F['FR_VERY_LOW'] = fr_rank < 0.05
@@ -648,7 +642,6 @@ def build_factors(df, P, rank_shift=0):
     F['FR_PRICE_BEAR_DIV'] = (c > c.shift(N)) & (fr < fr.shift(N))
     F['FR_COLD_START'] = (rk_ret_N > 0.80) & (fr_rank < 0.50)
 
-    # ===== 十、交叉入场 =====
     F['ENTRY_ABSORPTION_BREAKOUT_VOLUME'] = (bs(F['VOL_RANGE_COMPRESSION_REAL'])
                                              & bs(F['OI_HIDDEN_RISE_PRICE_FLAT'])
                                              & bs(F['FR_MILD'])
@@ -684,7 +677,6 @@ def build_factors(df, P, rank_shift=0):
     F['ENTRY_HAMMER_VOLUME_OI'] = F['KLINE_HAMMER'] & F['VOLUME_SPIKE'] & F['OI_SLOPE_UP'] & F['FR_LOW_NEG']
     F['ENTRY_THREE_GREEN_VOLUME_OI'] = F['KLINE_THREE_GREEN_UP'] & F['VOLUME_MA_UP'] & F['OI_MA_UP']
 
-    # ===== 十一、出场与风险（静态部分） =====
     F['EXIT_CHANDDELIER_N'] = c < (maxH_N.shift(1) - P['ATR_K'] * atr_N)
     F['EXIT_CLOSE_BELOW_MA_N'] = c < ma_N
     F['EXIT_MA_DEAD_CROSS'] = CD(ma_fast, ma_slow)
@@ -731,7 +723,6 @@ def build_factors(df, P, rank_shift=0):
                                     & F['KLINE_CLOSE_LOWER_RANGE']
                                     & (F['OI_DROP_EXTREME'] | F['FR_HIGH_EXTREME']))
 
-    # 统一转 bool ndarray
     out = {}
     for k_, s in F.items():
         out[k_] = np.ascontiguousarray(s.fillna(False).to_numpy(dtype=bool))
@@ -808,15 +799,13 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         print(f"    ! 数据过短(有效 {len(df) - max(warm, 0)} 根)，跳过")
-        return None, None, 0, 0
+        return None, 0, 0
     df = df.iloc[warm:].copy()
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
 
-    # 获取时间戳用于逐笔流水表
     timestamps = df.index.to_numpy()
 
-    # 对齐 BTC 价格序列
     if btc_close is not None:
         btc_c = btc_close.reindex(df.index).ffill().to_numpy(float)
     else:
@@ -834,7 +823,6 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     exec_px[-1] = cl[-1]
     cost = 2.0 * (cfg['FEE_RATE'] + cfg['SLIPPAGE'])
 
-    # ---------- 因子筛选 + 去重 ----------
     names_all = list(F.keys())
     keep, dens = [], {}
     for k in names_all:
@@ -842,7 +830,6 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
         dens[k] = s / n
         if s >= cfg['MIN_SIGNALS'] and dens[k] <= cfg['MAX_DENSITY']:
             keep.append(k)
-    dropped = [k for k in names_all if k not in keep]
 
     alias = {}
     if cfg['DEDUPE_IDENTICAL']:
@@ -857,24 +844,8 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
                 uniq.append(k)
         keep = uniq
 
-    # ---------- 因子体检: 信号后前瞻收益 ----------
-    diag = []
-    hz = {f'fwd_{hh}h': max(1, int(hh * 60 / bm)) for hh in cfg['FWD_HORIZONS_H']}
-    fwd = {kk: (np.concatenate([cl[v:], np.full(v, np.nan)]) / cl - 1.0) for kk, v in hz.items()}
-    for k in keep:
-        idx = np.flatnonzero(F[k])
-        row = dict(coin=coin, factor=k, n_signal=int(idx.size),
-                   density=float(idx.size / n), alias='|'.join(alias.get(k, [])))
-        for kk, arr in fwd.items():
-            a = arr[idx]
-            a = a[np.isfinite(a)]
-            row[kk + '_mean'] = float(np.mean(a) * 100) if a.size else np.nan
-            row[kk + '_t'] = float(np.mean(a) / (np.std(a, ddof=1) / math.sqrt(a.size)) * 1.0) \
-                if a.size > 2 and np.std(a, ddof=1) > 0 else np.nan
-        diag.append(row)
-    diag_df = pd.DataFrame(diag)
+    # [安全剔除绝对冗余] 删除了单因子前瞻收益 (fwd_hz/factor_diag) 体检表的计算逻辑
 
-    # ---------- 组合 ----------
     P_EXITS = path_exit_specs(P) if cfg['INCLUDE_PATH_EXITS'] else {}
     entry_names = [k for k in keep]
     exit_names = [k for k in keep] + list(P_EXITS.keys())
@@ -892,7 +863,7 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
     total = len(entry_names) * len(exit_names)
 
     rows = []
-    batch_list = []  # 分块收集并快速落盘
+    batch_list = []  # [内存优化] 改为存放原生 tuple 的 List
     done = 0
     t1 = time.time()
     for en in entry_names:
@@ -933,34 +904,27 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
             if ent.size < cfg['MIN_TRADES_REPORT'] or ent.size > max_allowed_trades:
                 continue
 
-            # ================= 构建逐笔交易明细 (增量式写入) =================
+            # ================= [内存优化] 原生元组流式落盘，杜绝 Pandas DataFrame 循环实例化 =================
             if btc_c is not None:
                 bh_rets = btc_c[ext] / btc_c[ent] - 1.0
             else:
                 bh_rets = cl[ext] / cl[ent] - 1.0
 
-            ent_dt = timestamps[ent]
-            ext_dt = timestamps[ext]
-
-            # [完美规避Pandas Series广播报错：先用标量构建DataFrame，再转Category降维内存]
-            trades_df = pd.DataFrame({
-                'combo_id': f"{en}|{xn}",
-                'coin': coin,
-                'entry_time': ent_dt,
-                'exit_time': ext_dt,
-                'net_return': rets.astype(np.float32),
-                'benchmark_return': bh_rets.astype(np.float32)
-            })
-            trades_df['combo_id'] = trades_df['combo_id'].astype('category')
-            trades_df['coin'] = trades_df['coin'].astype('category')
-
             if trades_raw_path:
-                batch_list.append(trades_df)
-                if len(batch_list) >= 1000:  # 收集了 1000 个有效策略的交易明细则落盘
-                    pd.concat(batch_list, ignore_index=True).to_csv(trades_raw_path, mode='a', header=False,
-                                                                    index=False)
-                    batch_list.clear()  # 存完即焚
-            # ==========================================================
+                c_id = f"{en}|{xn}"
+                c_id_arr = itertools.repeat(c_id, ent.size)
+                coin_arr = itertools.repeat(coin, ent.size)
+
+                # 数据类型降级：收益率强制转换为 float32 节省内存
+                batch_list.extend(zip(c_id_arr, coin_arr, timestamps[ent], timestamps[ext],
+                                      rets.astype(np.float32), bh_rets.astype(np.float32)))
+
+                if len(batch_list) >= 200000:  # 每凑齐 20 万行做一次轻量级 IO 追加
+                    with open(trades_raw_path, 'a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerows(batch_list)
+                    batch_list.clear()
+            # =========================================================================================
 
             row = dict(coin=coin, entry_factor=en, exit_factor=xn,
                        entry_density=dens.get(en, np.nan), exit_density=x_dens)
@@ -970,15 +934,18 @@ def mine_symbol(coin, df, cfg, btc_close=None, trades_raw_path=None):
             row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
             rows.append(row)
 
-    # 循环结束后清理剩余数据
+    # 循环结束后清理剩余批次流水
     if trades_raw_path and batch_list:
-        pd.concat(batch_list, ignore_index=True).to_csv(trades_raw_path, mode='a', header=False, index=False)
+        with open(trades_raw_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerows(batch_list)
         batch_list.clear()
 
-    return pd.DataFrame(rows), diag_df, total, kline_days
+    return pd.DataFrame(rows), total, kline_days
+
 
 # ======================================================================
-# 7. 主流程 (修改版：增加最开始打印回测币种个数)
+# 7. 主流程
 # ======================================================================
 def main(cfg=CFG):
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
@@ -992,17 +959,14 @@ def main(cfg=CFG):
         print("❌ 未发现 *_USDT_USDT_1m_kline.csv")
         return
 
-    # ================= 新增逻辑：提前解析并统计要回测的币种 =================
     valid_coins = []
     valid_kfiles = []
     for kf in kfiles:
         coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-        # 如果配置了特定币种且当前币种不在其中，则跳过
         if cfg['COINS'] and coin not in cfg['COINS']:
             continue
         valid_coins.append(coin)
         valid_kfiles.append(kf)
-    # ========================================================================
 
     print("=" * 78)
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
@@ -1017,14 +981,14 @@ def main(cfg=CFG):
         print("⚠️ 没有找到符合条件的币种进行回测。")
         return
 
-    # 初始化增量流水文件（清理旧的执行记录，并提前写入表头）
+    # [内存优化] 使用原生 csv 写表头，避免无谓的 Pandas 操作
     trades_raw_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL_raw.csv')
     if os.path.exists(trades_raw_path):
         os.remove(trades_raw_path)
-    cols_raw = ['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return']
-    pd.DataFrame(columns=cols_raw).to_csv(trades_raw_path, index=False, encoding='utf-8-sig')
+    with open(trades_raw_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return'])
 
-    # ---- 加载全局 BTC 基准数据作 Beta 剥离 ----
     btc_file = os.path.join(data_dir, 'BTC_USDT_USDT_1m_kline.csv')
     btc_close = None
     if os.path.exists(btc_file):
@@ -1039,12 +1003,14 @@ def main(cfg=CFG):
             print(f"⚠️ BTC基准数据加载失败: {e}")
     else:
         print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
-    # ----------------------------------------------------
 
-    all_pairs, all_diag = [], []
-    total_trials_tested = 0  # 记录全局测试总次数
+    total_trials_tested = 0
 
-    # 修改遍历源，只遍历我们筛选过的 valid_kfiles
+    # [内存优化] 生命周期管理：删掉全局内存驻留变量 all_pairs，准备直接往外落盘
+    pairs_all_path = os.path.join(cfg['OUT_DIR'], 'pairs_ALL.csv')
+    if os.path.exists(pairs_all_path):
+        os.remove(pairs_all_path)
+
     for kf in valid_kfiles:
         try:
             coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
@@ -1065,30 +1031,26 @@ def main(cfg=CFG):
                 continue
             print(f"    · {df.index[0]} ~ {df.index[-1]}  共 {len(df)} 根 bar")
 
-            # 传递 btc_close 以便对齐数据，并接收返回的天数
-            # 传递 trades_raw_path 实现边算边落盘
-            pairs, diag, trials, kline_days = mine_symbol(coin, df, cfg, btc_close, trades_raw_path)
+            # [安全剔除绝对冗余] 函数返回值去掉了 factor_diag，单因子诊断不产生
+            pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close, trades_raw_path)
 
-            # 搜索空间取最大组合数（不随币种翻倍）
             total_trials_tested = max(total_trials_tested, trials)
 
             if pairs is None or pairs.empty:
                 continue
 
             pairs.sort_values('sum_ret', ascending=False, inplace=True)
-            pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'),
-                         index=False, encoding='utf-8-sig')
-            diag.to_csv(os.path.join(cfg['OUT_DIR'], f'factor_diag_{coin}.csv'),
-                        index=False, encoding='utf-8-sig')
-            all_pairs.append(pairs)
-            all_diag.append(diag)
+            pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
 
-            # ================= 增加的回测统计信息打印 =================
+            # [内存优化] 立刻追加写入汇总表，切断全局变量的常驻内存链
+            pairs.to_csv(pairs_all_path, mode='a', header=not os.path.exists(pairs_all_path), index=False,
+                         encoding='utf-8-sig')
+
             valid_combos = len(pairs)
             retention_rate = valid_combos / trials if trials > 0 else 0
             total_saved_trades = int(pairs['trades'].sum())
             avg_trades_per_day = (total_saved_trades / valid_combos / kline_days) if (
-                        valid_combos > 0 and kline_days > 0) else 0
+                    valid_combos > 0 and kline_days > 0) else 0
 
             print(
                 f"── 回测统计信息 ── | "
@@ -1112,46 +1074,52 @@ def main(cfg=CFG):
             print(f"❌ [{coin}] 处理失败: {e}")
             continue
 
-    if not all_pairs:
+        # [内存优化] 单币种跑完后立刻“用完即焚”，释放底层 Pandas 与 Numpy 的重负荷大表
+        finally:
+            if 'df' in locals(): del df
+            if 'pairs' in locals(): del pairs
+            gc.collect()
+
+    if not os.path.exists(pairs_all_path):
         print("\n⚠️ 没有任何有效结果。")
         return
 
-    big = pd.concat(all_pairs, ignore_index=True)
-    big.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_ALL.csv'), index=False, encoding='utf-8-sig')
-    pd.concat(all_diag, ignore_index=True).to_csv(
-        os.path.join(cfg['OUT_DIR'], 'factor_diag_ALL.csv'), index=False, encoding='utf-8-sig')
+    # [内存优化] 基于写好的本地汇总表读取，而非内存内的全量 list concat
+    big = pd.read_csv(pairs_all_path)
 
     has_trades = False
     trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.csv')
 
     # ================= 生成表1：全局逐笔交易流水 =================
     if os.path.exists(trades_raw_path):
-        print("\n[内存优化] 正在按需计算并发信号 (Groupby)...")
+        print("\n[内存优化] 正在采用 Chunk 分块引擎统计全局并发信号 (消除 OOM)...")
         try:
-            conc_df = pd.read_csv(trades_raw_path, usecols=['combo_id', 'entry_time'],
-                                  dtype={'combo_id': 'category'})
-            if not conc_df.empty:
-                has_trades = True
-                concurrent_counts = conc_df.groupby(['combo_id', 'entry_time'], observed=True).size().rename(
-                    'concurrent_signals')
-                del conc_df
+            # [内存优化] 第 1 遍扫描：极低内存的字典流式统计
+            concurrent_counts = Counter()
+            for chunk in pd.read_csv(trades_raw_path, usecols=['combo_id', 'entry_time'], chunksize=1000000,
+                                     dtype={'combo_id': 'category'}):
+                concurrent_counts.update(zip(chunk['combo_id'], chunk['entry_time']))
 
-                print(f"[内存优化] 正在按块流式合并写入最终表 {trades_final_path}...")
+            if concurrent_counts:
+                has_trades = True
+                print(f"[内存优化] 正在流式拼接并发信号列并写入最终表 {trades_final_path}...")
+
+                # [内存优化] 第 2 遍扫描：将计数值匹配回去，流式分块存入终表
                 first_chunk = True
                 for chunk in pd.read_csv(trades_raw_path, chunksize=1000000,
                                          dtype={'combo_id': 'category', 'coin': 'category'}):
-                    chunk = chunk.merge(concurrent_counts, left_on=['combo_id', 'entry_time'], right_index=True,
-                                        how='left')
+                    chunk['concurrent_signals'] = [concurrent_counts[(cid, et)] for cid, et in
+                                                   zip(chunk['combo_id'], chunk['entry_time'])]
                     cols_t1 = ['combo_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return',
                                'concurrent_signals']
                     chunk[cols_t1].to_csv(trades_final_path, mode='a' if not first_chunk else 'w',
                                           header=first_chunk, index=False, encoding='utf-8-sig')
                     first_chunk = False
-            else:
-                del conc_df
         finally:
             if os.path.exists(trades_raw_path):
                 os.remove(trades_raw_path)
+            del concurrent_counts
+            gc.collect()
     # ====================================================================
 
     # 跨币种稳健性汇总
@@ -1177,7 +1145,7 @@ def main(cfg=CFG):
 
     # ================= 生成表2：组合时序切片长表 =================
     if has_trades:
-        print("[内存优化] 正在生成时序切片长表 (按需加载)...")
+        print("[内存优化] 正在生成时序切片长表 (按需加载，降维 dtype 保护内存)...")
         ts_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'entry_time', 'net_return', 'coin'],
                             dtype={'combo_id': 'category', 'coin': 'category'})
         ts_df['date'] = pd.to_datetime(ts_df['entry_time'], format='ISO8601').dt.date
@@ -1186,6 +1154,7 @@ def main(cfg=CFG):
             active_coins=('coin', 'nunique')
         ).reset_index()
         del ts_df
+        gc.collect()
 
         daily_agg = daily_agg.sort_values(['combo_id', 'date'])
         daily_agg['daily_nav'] = daily_agg.groupby('combo_id', observed=True)['daily_return'].cumsum() + 1.0
@@ -1203,7 +1172,7 @@ def main(cfg=CFG):
     combo_profile['combo_id'] = combo_profile['entry_factor'] + '|' + combo_profile['exit_factor']
 
     if has_trades:
-        print("[内存优化] 正在生成宏观统计看板 (按需加载)...")
+        print("[内存优化] 正在生成宏观统计看板 (按需加载，降维 dtype 保护内存)...")
         prof_df = pd.read_csv(trades_final_path, usecols=['combo_id', 'net_return', 'concurrent_signals'],
                               dtype={'combo_id': 'category'})
 
@@ -1220,6 +1189,7 @@ def main(cfg=CFG):
 
         stats = prof_df.groupby('combo_id', observed=True).apply(calc_profile_stats).reset_index()
         del prof_df
+        gc.collect()
 
         combo_profile = combo_profile.merge(stats, on='combo_id', how='left')
     else:
@@ -1265,6 +1235,7 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
+
 
 if __name__ == '__main__':
     import copy
