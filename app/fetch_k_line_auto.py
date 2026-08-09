@@ -9,6 +9,7 @@ import time
 import zipfile
 import traceback
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed  # [新增]: 引入线程池并发库
 
 import ccxt
 import requests
@@ -382,6 +383,7 @@ def get_all_symbols(exchange_name='binance', quote_currency='USDT'):
 
 if __name__ == "__main__":
     LOOP_INTERVAL = 10
+    MAX_WORKERS = 10  # [新增]: 并发度配置
 
     print("=" * 80)
     print(f"🔧 [系统初始] 数据将被独立存储于: 【{os.path.abspath(BACKTEST_DATA_DIR)}】")
@@ -398,12 +400,25 @@ if __name__ == "__main__":
             time.sleep(60)
             continue
 
-        for sym in target_symbols:
-            try:
-                fetch_independent_datasets(symbol=sym, days=365)
-            except Exception as e:
-                print(f"❌ [任务总线/严重崩溃] 标的 {sym} 主进程崩溃已被跳过 | 错误明细: {e}")
-                traceback.print_exc()
+        print(f"\n⚡ [并发调度] 嗅探到 {len(target_symbols)} 个标的，启动并发线程池 (并发度: {MAX_WORKERS})...")
+
+        # [修改]: 替换原本的 for 循环，使用线程池并发执行，严格捕获并打印各线程内部的未处理异常
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # 提交所有任务到线程池
+            future_to_symbol = {
+                executor.submit(fetch_independent_datasets, sym, 365): sym
+                for sym in target_symbols
+            }
+
+            # as_completed 允许我们一有任务完成就立即捕获它的状态，而不用等所有任务都结束
+            for future in as_completed(future_to_symbol):
+                sym = future_to_symbol[future]
+                try:
+                    # 如果线程内部抛出异常，这里调用 result() 就会将其重新抛出
+                    future.result()
+                except Exception as e:
+                    print(f"❌ [任务总线/严重崩溃] 标的 {sym} 主进程崩溃已被跳过 | 错误明细: {e}")
+                    traceback.print_exc()
 
         print(f"\n💤 [全局调度] ✅ 当前轮次所有 {len(target_symbols)} 个标的处理完毕 | 进入休眠倒计时: 【{LOOP_INTERVAL} 秒】...")
         time.sleep(LOOP_INTERVAL)
