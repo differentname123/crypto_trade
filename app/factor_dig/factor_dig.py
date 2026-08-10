@@ -56,7 +56,7 @@ CFG = dict(
     # --- 组合与输出 ---
     ALLOW_SAME_FACTOR=False,
     MAX_TRADES_PER_COMBO=100000,
-    MIN_TRADES_REPORT=3,
+    MIN_TRADES_REPORT=1,
     OOS_SPLIT=0.70,
     ENTRY_PREFIX_FILTER=None,
     EXIT_PREFIX_FILTER=None,
@@ -914,9 +914,8 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     F, aux = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
-        return None, 0, 0
+        return None, {'total_combos': 0}, 0
 
-    # 【新增】提出 rank 数组准备切片
     df = df.iloc[warm:].copy()
     rk_gain = df['rank_gain_24h'].to_numpy(float)
     rk_loss = df['rank_loss_24h'].to_numpy(float)
@@ -925,7 +924,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     atr = aux['atr'][warm:]
 
     if btc_close is not None:
-        # 【核心修复5】：双向填充，防止早期山寨币遇到 BTC 数据头部缺失导致 NaN 污染
         btc_c = btc_close.reindex(df.index).ffill().bfill().to_numpy(float)
     else:
         btc_c = None
@@ -977,7 +975,16 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     split_bar = int(n * cfg['OOS_SPLIT'])
     max_tr = min(cfg['MAX_TRADES_PER_COMBO'], n // 2 + 2)
 
-    total = len(entry_names) * len(exit_names)
+    # 【细化统计】初始化漏斗 + 按 mode 计数
+    mode_keys = [(f"{m[0]}_{m[2]}" if m[0] != 'original' else 'original') for m in FILTER_MODES]
+    stats = {
+        'total_combos': len(entry_names) * len(exit_names),
+        'skip_same_factor': 0,
+        'skip_zero_trades': 0,
+        'skip_too_few': 0,
+        'skip_too_many': 0,
+        'mode_pass_counts': {mk: 0 for mk in mode_keys},
+    }
     rows = []
     done = 0
 
@@ -986,6 +993,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         for xn in exit_names:
             done += 1
             if (not cfg['ALLOW_SAME_FACTOR']) and xn == en:
+                stats['skip_same_factor'] += 1
                 continue
 
             if xn in P_EXITS:
@@ -1012,12 +1020,13 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 x_dens = dens.get(xn, np.nan)
 
             if ent.size == 0:
+                stats['skip_zero_trades'] += 1
                 continue
+
             rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
             ok = np.isfinite(rets)
             ent_base, ext_base, rets_base = ent[ok], ext[ok], rets[ok]
 
-            # 【核心修改】引入 15 次事后环境过滤循环
             for mode_name, rank_col, threshold in FILTER_MODES:
                 if mode_name == 'original':
                     ent_f, ext_f, rets_f = ent_base, ext_base, rets_base
@@ -1025,18 +1034,25 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 else:
                     if mode_name == 'top':
                         entry_ranks = rk_gain[ent_base]
-                    else:  # bottom
+                    else:
                         entry_ranks = rk_loss[ent_base]
 
-                    # 生成掩码过滤当前满足条件的开仓
                     mask = entry_ranks <= threshold
                     ent_f = ent_base[mask]
                     ext_f = ext_base[mask]
                     rets_f = rets_base[mask]
                     filter_label = f"{mode_name}_{threshold}"
 
-                if ent_f.size < cfg['MIN_TRADES_REPORT'] or ent_f.size > max_allowed_trades:
+                # 【细化】拆分拦截原因
+                if ent_f.size < cfg['MIN_TRADES_REPORT']:
+                    stats['skip_too_few'] += 1
                     continue
+                if ent_f.size > max_allowed_trades:
+                    stats['skip_too_many'] += 1
+                    continue
+
+                # 【细化】记录该 mode 通过
+                stats['mode_pass_counts'][filter_label] += 1
 
                 if btc_c is not None:
                     bh_rets_f = btc_c[ext_f] / btc_c[ent_f] - 1.0
@@ -1044,7 +1060,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                     bh_rets_f = None
 
                 row = dict(coin=coin, entry_factor=en, exit_factor=xn,
-                           filter_mode=filter_label,  # 【新增字段】
+                           filter_mode=filter_label,
                            entry_density=dens.get(en, np.nan), exit_density=x_dens)
 
                 row.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
@@ -1059,9 +1075,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                                        prefix='oos_'))
                 rows.append(row)
 
-    return pd.DataFrame(rows), total, kline_days
-
-
+    return pd.DataFrame(rows), stats, kline_days
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度)
 # ======================================================================
@@ -1074,18 +1088,17 @@ def mine_symbol_wrapper(args):
     try:
         df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
         if len(df) < 800:
-            return kf, coin, None, 0, 0, "bar 数不足"
-        pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close)
-        return kf, coin, pairs, trials, kline_days, "OK"
+            return kf, coin, None, {'total_combos': 0}, 0, "bar 数不足"
+        pairs, stats, kline_days = mine_symbol(coin, df, cfg, btc_close)
+        return kf, coin, pairs, stats, kline_days, "OK"
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        return kf, coin, None, 0, 0, f"执行异常: {e}\n{tb}"
-
-
+        return kf, coin, None, {'total_combos': 0}, 0, f"执行异常: {e}\n{tb}"
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度，彻底修复特征丢失与DSR量纲错位)
 # ======================================================================
+
 def main(cfg=CFG):
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
     data_dir = cfg['DATA_DIR']
@@ -1154,7 +1167,7 @@ def main(cfg=CFG):
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(mine_symbol_wrapper, t): t for t in tasks}
         for fut in concurrent.futures.as_completed(futures):
-            kf, coin, pairs, trials, kline_days, msg = fut.result()
+            kf, coin, pairs, stats, kline_days, msg = fut.result()
 
             if msg != "OK":
                 print(f"⚠️ [{coin}] 执行跳过/失败: {msg}")
@@ -1162,20 +1175,50 @@ def main(cfg=CFG):
 
             if pairs is not None and not pairs.empty:
                 valid_combos = len(pairs)
-                retention_rate = valid_combos / trials if trials > 0 else 0
                 total_saved_trades = int(pairs['trades'].sum())
-                avg_tpd = (total_saved_trades / valid_combos / kline_days) if (
-                        valid_combos > 0 and kline_days > 0) else 0
+
+                # ---- 漏斗百分比 ----
+                total_combos = stats.get('total_combos', 0)
+                skip_same = stats.get('skip_same_factor', 0)
+                skip_zero = stats.get('skip_zero_trades', 0)
+                skip_too_few = stats.get('skip_too_few', 0)
+                skip_too_many = stats.get('skip_too_many', 0)
+                mode_pass = stats.get('mode_pass_counts', {})
+
+                stage1_pass = total_combos - skip_same
+                pct1 = (stage1_pass / total_combos * 100) if total_combos > 0 else 0
+
+                stage2_pass = stage1_pass - skip_zero
+                pct2 = (stage2_pass / stage1_pass * 100) if stage1_pass > 0 else 0
+
+                theoretical_filter_records = stage2_pass * len(FILTER_MODES)
+                pct3 = (valid_combos / theoretical_filter_records * 100) if theoretical_filter_records > 0 else 0
+
+                # ---- 找出最严苛 & 最宽松的 mode ----
+                if mode_pass:
+                    worst_mode = min(mode_pass, key=mode_pass.get)
+                    worst_cnt = mode_pass[worst_mode]
+                    best_mode = max(mode_pass, key=mode_pass.get)
+                    best_cnt = mode_pass[best_mode]
+                else:
+                    worst_mode, worst_cnt = 'N/A', 0
+                    best_mode, best_cnt = 'N/A', 0
 
                 print(f"✅ [{coin}] K线: {kline_days:.1f}天 | "
-                      f"组合数: {trials} -> 存留记录: {valid_combos} | "
+                      f"总组合:{total_combos} -> "
+                      f"去同因子:{stage1_pass}({pct1:.1f}%) -> "
+                      f"有交易:{stage2_pass}({pct2:.1f}%) -> "
+                      f"存留:{valid_combos}/{theoretical_filter_records}({pct3:.1f}%) | "
+                      f"不足3笔:{skip_too_few} | 超限:{skip_too_many} | "
+                      f"最严苛:{worst_mode}({worst_cnt}) | "
+                      f"最宽松:{best_mode}({best_cnt}) | "
                       f"总笔数: {total_saved_trades}")
 
                 pairs.sort_values('sum_ret', ascending=False, inplace=True)
                 pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
 
                 pairs_list.append(pairs)
-                total_trials_tested = max(total_trials_tested, trials)
+                total_trials_tested = max(total_trials_tested, total_combos)
             else:
                 print(f"✅ [{coin}] 执行完毕，但未产出有效组合。")
 
@@ -1189,10 +1232,8 @@ def main(cfg=CFG):
 
     print("\n[内存优化] 正在生成跨币种宏观评估指标 (直接由全量特征降维计算，免读交易明细)...")
 
-    # 【核心修改】加入 filter_mode 作为分组联合主键，确保不同的过滤环境单独统计
     g = big.groupby(['entry_factor', 'exit_factor', 'filter_mode'])
 
-    # 【修复1】：补全丢失的 OOS单笔夏普(pt_sharpe) 以及 Q1~Q4时序特征
     summ = g.agg(
         n_coins=('coin', 'nunique'),
         total_trades=('trades', 'sum'),
@@ -1212,14 +1253,13 @@ def main(cfg=CFG):
         mean_down_market_win_rate=('down_market_win_rate', 'mean'),
         mean_cvar_5=('cvar_5', 'mean'),
         mean_oos_sharpe=('oos_sharpe', 'mean'),
-        mean_oos_pt_sharpe=('oos_pt_sharpe', 'mean'),  # OOS 单笔夏普均值
+        mean_oos_pt_sharpe=('oos_pt_sharpe', 'mean'),
         sum_ret_q1=('ret_q1', 'sum'), sum_trades_q1=('trades_q1', 'sum'),
         sum_ret_q2=('ret_q2', 'sum'), sum_trades_q2=('trades_q2', 'sum'),
         sum_ret_q3=('ret_q3', 'sum'), sum_trades_q3=('trades_q3', 'sum'),
         sum_ret_q4=('ret_q4', 'sum'), sum_trades_q4=('trades_q4', 'sum')
     ).reset_index()
 
-    # 【核心修改】与 pos_rate 合并时也要加入 filter_mode 键
     pos_rate = g.apply(lambda x: (x['sum_ret'] > 0).mean()).rename('coin_positive_rate').reset_index()
     summ = summ.merge(pos_rate, on=['entry_factor', 'exit_factor', 'filter_mode'])
 
@@ -1227,15 +1267,12 @@ def main(cfg=CFG):
                      * np.sqrt(summ['total_trades'].clip(lower=1))
                      * summ['coin_positive_rate'])
 
-    # 【修复2】：为了解决 Z-score 量纲爆炸，严格使用“单币种平均交易笔数”作为有效样本量 T
     summ['avg_trades_per_coin'] = summ['total_trades'] / summ['n_coins'].clip(lower=1)
 
     def calc_dsr_approx(row, total_trials):
-        # 使用“单币种单笔夏普”匹配“单币种平均样本量”
         sr_pt = row['mean_oos_pt_sharpe']
         T_eff = max(3, row['avg_trades_per_coin'])
 
-        # 恢复高阶矩：保留真实的偏度和峰度，反映肥尾风险
         skew = row.get('mean_skew', 0.0)
         kurt = row.get('mean_kurt', 0.0)
         if pd.isna(skew): skew = 0.0
@@ -1248,7 +1285,6 @@ def main(cfg=CFG):
         var_sr = (1 - skew * sr_pt + (kurt + 2) / 4 * sr_pt ** 2) / T_eff
         if var_sr <= 0: var_sr = 1e-6
 
-        # 【修复3】：修正 Z-score 代数顺序：(观测值 - 期望值) / 标准差
         z = (sr_pt - emsr) / np.sqrt(var_sr)
         dsr = 0.5 * (1 + math.erf(z / np.sqrt(2)))
         return dsr
@@ -1263,7 +1299,6 @@ def main(cfg=CFG):
     print("🏆 跨币种稳健 TOP20 (score = 均笔收益 × √笔数 × 盈利币种占比)")
     print("=" * 78)
 
-    # 【修改】控制台展示增加了 filter_mode 列
     show = summ.head(20)[['entry_factor', 'exit_factor', 'filter_mode', 'n_coins', 'total_trades',
                           'mean_avg_ret', 'mean_win_rate', 'coin_positive_rate',
                           'sum_ret_all', 'oos_sum_all', 'score']]
