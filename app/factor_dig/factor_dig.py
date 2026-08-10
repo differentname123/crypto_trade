@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 ================================================================================
@@ -7,7 +8,7 @@
  · 所有因子两两有序组合 (A进场,B出场) != (B进场,A出场)
  · 纯做多、每笔等名义仓位、收益率【加总不复利】
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
- · [终极定稿] 2张底层长表 + 1张宏观看板，支撑 DSR/True N/Beta剥离 证伪
+ · [终极定稿] 内存优化版：彻底抛弃逐笔流水，在内存截取高阶统计特征，告别OOM
 ================================================================================
 """
 from __future__ import annotations
@@ -21,19 +22,13 @@ import itertools
 import warnings
 import csv
 import gc
-from collections import Counter
-import glob
+
 import concurrent.futures
 import multiprocessing
 
 import numpy as np
 import pandas as pd
-
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except ImportError:
-    raise ImportError("请安装 pyarrow 库: pip install pyarrow")
+from scipy.stats import skew, kurtosis
 
 warnings.filterwarnings("ignore")
 
@@ -755,28 +750,52 @@ def path_exit_specs(P):
 
 
 # ======================================================================
-# 5. 绩效计算
+# 5. 绩效计算 (修复了单笔夏普输出，以及补齐切片笔数防歧义)
 # ======================================================================
-def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
+def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, prefix=''):
     d = {}
     T = int(len(rets))
     d[prefix + 'trades'] = T
+
+    # 【新增】加入 pt_sharpe (单笔夏普), trades_q1~4
+    empty_keys = ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'std_ret', 'tstat', 'sharpe', 'pt_sharpe',
+                  'profit_factor', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss',
+                  'skew', 'kurt', 'cvar_5', 'equity_r2', 'corr_btc', 'down_market_win_rate',
+                  'win_hold_bars', 'loss_hold_bars',
+                  'ret_q1', 'ret_q2', 'ret_q3', 'ret_q4',
+                  'trades_q1', 'trades_q2', 'trades_q3', 'trades_q4']
+
     if T == 0:
-        for k in ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'std_ret', 'tstat', 'sharpe',
-                  'profit_factor', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss']:
+        for k in empty_keys:
             d[prefix + k] = np.nan
         return d
+
     d[prefix + 'win_rate'] = float((rets > 0).mean() * 100)
     d[prefix + 'sum_ret'] = float(rets.sum() * 100)
     d[prefix + 'avg_ret'] = float(rets.mean() * 100)
     d[prefix + 'med_ret'] = float(np.median(rets) * 100)
+
     sd = float(rets.std(ddof=1) * 100) if T > 1 else np.nan
     d[prefix + 'std_ret'] = sd
-    d[prefix + 'tstat'] = float(d[prefix + 'avg_ret'] / (sd / math.sqrt(T))) if (sd and sd > 0) else np.nan
-    d[prefix + 'sharpe'] = float(d[prefix + 'avg_ret'] / sd) if (sd and sd > 0) else np.nan
+
+    years = max(n_bars * bar_minutes / (365 * 24 * 60.0), 0.0001)
+    trades_per_year = T / years
+
+    # 【修复】同时保留纯单笔夏普(pt_sharpe)用于统计学推导，以及年化夏普用于展示
+    if sd and sd > 1e-8:
+        d[prefix + 'tstat'] = float(d[prefix + 'avg_ret'] / (sd / math.sqrt(T)))
+        per_trade_sharpe = d[prefix + 'avg_ret'] / sd
+        d[prefix + 'pt_sharpe'] = float(per_trade_sharpe)
+        d[prefix + 'sharpe'] = float(per_trade_sharpe * math.sqrt(trades_per_year))
+    else:
+        d[prefix + 'tstat'] = np.nan
+        d[prefix + 'pt_sharpe'] = np.nan
+        d[prefix + 'sharpe'] = np.nan
+
     g = rets[rets > 0].sum()
     b = -rets[rets < 0].sum()
-    d[prefix + 'profit_factor'] = float(g / b) if b > 0 else (np.inf if g > 0 else np.nan)
+    d[prefix + 'profit_factor'] = float(min(g / b, 999.0)) if b > 0 else (999.0 if g > 0 else 0.0)
+
     eq = np.concatenate(([0.0], np.cumsum(rets)))
     d[prefix + 'max_dd'] = float((np.maximum.accumulate(eq) - eq).max() * 100)
     hold = (ext - ent).astype(float)
@@ -784,13 +803,72 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     d[prefix + 'exposure'] = float(hold.sum() / max(n_bars, 1) * 100)
     d[prefix + 'max_win'] = float(rets.max() * 100)
     d[prefix + 'max_loss'] = float(rets.min() * 100)
+
+    try:
+        if sd > 1e-8:
+            d[prefix + 'skew'] = float(skew(rets, bias=False)) if T >= 3 else np.nan
+            d[prefix + 'kurt'] = float(kurtosis(rets, bias=False)) if T >= 4 else np.nan
+        else:
+            d[prefix + 'skew'], d[prefix + 'kurt'] = 0.0, 0.0
+    except Exception:
+        d[prefix + 'skew'], d[prefix + 'kurt'] = np.nan, np.nan
+
+    if T > 2:
+        p05 = np.percentile(rets, 5)
+        cvar_arr = rets[rets <= p05]
+        d[prefix + 'cvar_5'] = float(cvar_arr.mean() * 100) if len(cvar_arr) > 0 else np.nan
+        ideal = np.arange(len(eq))
+
+        if np.std(eq) > 1e-8 and np.std(ideal) > 1e-8:
+            corr = np.corrcoef(eq, ideal)[0, 1]
+            if not np.isnan(corr):
+                d[prefix + 'equity_r2'] = float(corr ** 2) if corr > 0 else float(-(corr ** 2))
+            else:
+                d[prefix + 'equity_r2'] = np.nan
+        else:
+            d[prefix + 'equity_r2'] = np.nan
+    else:
+        d[prefix + 'cvar_5'], d[prefix + 'equity_r2'] = np.nan, np.nan
+
+    if bh_rets is not None and T > 2:
+        if np.std(rets) > 1e-8 and np.std(bh_rets) > 1e-8:
+            corr_btc = np.corrcoef(rets, bh_rets)[0, 1]
+            d[prefix + 'corr_btc'] = float(corr_btc) if not np.isnan(corr_btc) else np.nan
+        else:
+            d[prefix + 'corr_btc'] = np.nan
+
+        down_idx = bh_rets < 0
+        if down_idx.sum() > 0:
+            d[prefix + 'down_market_win_rate'] = float((rets[down_idx] > 0).mean() * 100)
+        else:
+            d[prefix + 'down_market_win_rate'] = np.nan
+    else:
+        d[prefix + 'corr_btc'], d[prefix + 'down_market_win_rate'] = np.nan, np.nan
+
+    win_idx = rets > 0
+    loss_idx = rets <= 0
+    d[prefix + 'win_hold_bars'] = float(hold[win_idx].mean()) if win_idx.sum() > 0 else np.nan
+    d[prefix + 'loss_hold_bars'] = float(hold[loss_idx].mean()) if loss_idx.sum() > 0 else np.nan
+
+    relative_ent = ent - start_idx
+    chunk_size = max(n_bars / 4.0, 1.0)
+    for i in range(4):
+        mask = (relative_ent >= i * chunk_size) & (relative_ent < (i + 1) * chunk_size)
+        chunk_rets = rets[mask]
+        # 【修复】顺手记录每个切片的触发笔数，防止 0.0 歧义
+        if len(chunk_rets) > 0:
+            d[prefix + f'ret_q{i + 1}'] = float(chunk_rets.sum() * 100)
+            d[prefix + f'trades_q{i + 1}'] = int(len(chunk_rets))
+        else:
+            d[prefix + f'ret_q{i + 1}'] = 0.0
+            d[prefix + f'trades_q{i + 1}'] = 0
+
     return d
 
-
 # ======================================================================
-# 6. 单币种全组合挖掘 (引入 Parquet + 整型ID机制)
+# 6. 单币种全组合挖掘 (彻底移除Parquet，截面特征极速落盘)
 # ======================================================================
-def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_dir=None):
+def mine_symbol(coin, df, cfg, btc_close=None):
     bm = cfg['BAR_MINUTES']
     P = make_params(bm, len(df))
 
@@ -803,10 +881,9 @@ def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_di
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
 
-    timestamps = df.index.to_numpy()
-
     if btc_close is not None:
-        btc_c = btc_close.reindex(df.index).ffill().to_numpy(float)
+        # 【核心修复5】：双向填充，防止早期山寨币遇到 BTC 数据头部缺失导致 NaN 污染
+        btc_c = btc_close.reindex(df.index).ffill().bfill().to_numpy(float)
     else:
         btc_c = None
 
@@ -852,47 +929,15 @@ def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_di
     if cfg['EXIT_PREFIX_FILTER']:
         exit_names = [k for k in exit_names if k.startswith(tuple(cfg['EXIT_PREFIX_FILTER']))]
 
-    # [优化2核心]：只保留信号被触发的稀疏索引 (int64)
     idx_cache = {k: np.flatnonzero(F[k]).astype(np.int64) for k in keep}
     zeros_static = np.zeros(n, dtype=bool)
     split_bar = int(n * cfg['OOS_SPLIT'])
     max_tr = min(cfg['MAX_TRADES_PER_COMBO'], n // 2 + 2)
 
     total = len(entry_names) * len(exit_names)
-
     rows = []
-
-    # [优化4核心]：分块收集列数据进行 Parquet 落盘
-    batch_en_id, batch_xn_id, batch_coin = [], [], []
-    batch_ent_time, batch_ext_time = [], []
-    batch_rets, batch_bh_rets = [], []
-    batch_size = 0
-    writer = None
-
-    def flush_parquet():
-        nonlocal batch_size, writer
-        if batch_size == 0 or trades_raw_dir is None: return
-        table = pa.Table.from_arrays([
-            pa.array(np.concatenate(batch_en_id)),
-            pa.array(np.concatenate(batch_xn_id)),
-            pa.array(np.concatenate(batch_coin)),
-            pa.array(np.concatenate(batch_ent_time)),
-            pa.array(np.concatenate(batch_ext_time)),
-            pa.array(np.concatenate(batch_rets)),
-            pa.array(np.concatenate(batch_bh_rets))
-        ], names=['entry_id', 'exit_id', 'coin', 'entry_time', 'exit_time', 'net_return', 'benchmark_return'])
-
-        if writer is None:
-            pq_file = os.path.join(trades_raw_dir, f"trades_{coin}.parquet")
-            writer = pq.ParquetWriter(pq_file, table.schema)
-        writer.write_table(table)
-
-        batch_en_id.clear(); batch_xn_id.clear(); batch_coin.clear()
-        batch_ent_time.clear(); batch_ext_time.clear()
-        batch_rets.clear(); batch_bh_rets.clear()
-        batch_size = 0
-
     done = 0
+
     for en in entry_names:
         eidx = idx_cache[en]
         for xn in exit_names:
@@ -904,7 +949,6 @@ def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_di
                 spec = P_EXITS[xn]
                 st = F[spec['static']] if (spec['static'] and spec['static'] in F) else zeros_static
                 if HAS_NUMBA:
-                    # 传入的是极短的 eidx 索引数组
                     ent, ext = _core_path(eidx, st, cl, lo, atr, n, cfg['COOLDOWN_BARS'], max_tr,
                                           exec_px,
                                           spec['use_fixed'], spec['fixed_pct'],
@@ -935,48 +979,30 @@ def mine_symbol(coin, df, cfg, btc_close=None, factor_id_map=None, trades_raw_di
             if btc_c is not None:
                 bh_rets = btc_c[ext] / btc_c[ent] - 1.0
             else:
-                bh_rets = cl[ext] / cl[ent] - 1.0
-
-            if trades_raw_dir and factor_id_map:
-                en_id = factor_id_map.get(en, -1)
-                xn_id = factor_id_map.get(xn, -1)
-
-                batch_en_id.append(np.full(ent.size, en_id, dtype=np.int16))
-                batch_xn_id.append(np.full(ent.size, xn_id, dtype=np.int16))
-                batch_coin.append(np.full(ent.size, coin))
-                batch_ent_time.append(timestamps[ent])
-                batch_ext_time.append(timestamps[ext])
-                batch_rets.append(rets.astype(np.float32))
-                batch_bh_rets.append(bh_rets.astype(np.float32))
-
-                batch_size += ent.size
-                if batch_size >= 200000:
-                    flush_parquet()
+                bh_rets = None
 
             row = dict(coin=coin, entry_factor=en, exit_factor=xn,
                        entry_density=dens.get(en, np.nan), exit_density=x_dens)
-            row.update(trade_stats(rets, ent, ext, bm, n))
+
+            row.update(trade_stats(rets, ent, ext, bm, n_bars=n, start_idx=0, bh_rets=bh_rets))
+
             m_is = ent < split_bar
-            row.update(trade_stats(rets[m_is], ent[m_is], ext[m_is], bm, split_bar, prefix='is_'))
-            row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n - split_bar, prefix='oos_'))
+            row.update(trade_stats(rets[m_is], ent[m_is], ext[m_is], bm, n_bars=split_bar,
+                                   start_idx=0, bh_rets=bh_rets[m_is] if bh_rets is not None else None, prefix='is_'))
+
+            row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n_bars=n - split_bar,
+                                   start_idx=split_bar, bh_rets=bh_rets[~m_is] if bh_rets is not None else None,
+                                   prefix='oos_'))
             rows.append(row)
 
-    if trades_raw_dir:
-        try:
-            flush_parquet()
-        finally:
-            if writer is not None:
-                writer.close()
-
     return pd.DataFrame(rows), total, kline_days
-
 
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度)
 # ======================================================================
 def mine_symbol_wrapper(args):
     """ 多进程工作节点的包装函数 """
-    kf, cfg, btc_close, factor_id_map, trades_raw_dir = args
+    kf, cfg, btc_close = args
     coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
     oi_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_5m_oi.csv')
     fr_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_funding_rates.csv')
@@ -984,18 +1010,18 @@ def mine_symbol_wrapper(args):
         df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
         if len(df) < 800:
             return kf, coin, None, 0, 0, "bar 数不足"
-        pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close, factor_id_map, trades_raw_dir)
+        pairs, trials, kline_days = mine_symbol(coin, df, cfg, btc_close)
         return kf, coin, pairs, trials, kline_days, "OK"
     except Exception as e:
-        # [修正4] 加入详细堆栈信息，保留多进程调试线索
         import traceback
         tb = traceback.format_exc()
         return kf, coin, None, 0, 0, f"执行异常: {e}\n{tb}"
 
 
+# ======================================================================
+# 7. 主流程 (引入多进程架构隔离与调度，彻底修复特征丢失与DSR量纲错位)
+# ======================================================================
 def main(cfg=CFG):
-    import shutil  # [修正3] 引入 shutil 用于清空文件夹
-
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
     data_dir = cfg['DATA_DIR']
     if not os.path.isdir(data_dir):
@@ -1029,37 +1055,6 @@ def main(cfg=CFG):
         print("⚠️ 没有找到符合条件的币种进行回测。")
         return
 
-    factor_id_map = None
-    for kf in valid_kfiles:
-        coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
-        oi_f = os.path.join(data_dir, f'{coin}_USDT_USDT_5m_oi.csv')
-        fr_f = os.path.join(data_dir, f'{coin}_USDT_USDT_funding_rates.csv')
-        if os.path.exists(oi_f) and os.path.exists(fr_f):
-            try:
-                df_first = load_symbol(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
-                if len(df_first) >= 800:
-                    P_first = make_params(cfg['BAR_MINUTES'], len(df_first))
-                    F_first, _ = build_factors(df_first, P_first)
-                    all_names = list(F_first.keys()) + list(path_exit_specs(P_first).keys())
-                    factor_id_map = {k: np.int16(i) for i, k in enumerate(all_names)}
-                    break
-            except Exception:
-                continue
-
-    if factor_id_map is None:
-        print("⚠️ 无法初始化 factor_id_map，未发现符合有效长度的币种数据。")
-        return
-
-    # 强制转化为 Python 原生 int，保障 Pandas .map() 百分百命中类型
-    reverse_factor_map = {int(i): str(k) for k, i in factor_id_map.items()}
-
-    trades_raw_dir = os.path.join(cfg['OUT_DIR'], 'trades_ALL_raw_parquet')
-
-    # 启动前强行清空历史脏数据，防止幽灵数据污染
-    if os.path.exists(trades_raw_dir):
-        shutil.rmtree(trades_raw_dir, ignore_errors=True)
-    os.makedirs(trades_raw_dir, exist_ok=True)
-
     btc_file = os.path.join(data_dir, 'BTC_USDT_USDT_1m_kline.csv')
     btc_close = None
     if os.path.exists(btc_file):
@@ -1075,18 +1070,16 @@ def main(cfg=CFG):
     else:
         print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
 
-    tasks = [(kf, cfg, btc_close, factor_id_map, trades_raw_dir) for kf in valid_kfiles]
+    tasks = [(kf, cfg, btc_close) for kf in valid_kfiles]
     total_trials_tested = 0
     pairs_list = []
 
-    # 留足系统内存缓冲防止高维特征回测时OOM导致崩溃
     max_workers = min(18, max(1, multiprocessing.cpu_count() - 2))
 
     if HAS_NUMBA:
         print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
         _d_idx = np.array([0, 1], dtype=np.int64)
         _d_bool = np.array([False, True], dtype=bool)
-        # 修正：将 0.0 改为非零的 1.0 和 2.0，避免 _core_path 计算收益率时除以零崩溃
         _d_float = np.array([1.0, 2.0], dtype=float)
         _core_static(_d_idx, _d_idx, 2, 0, 1)
         _core_path(_d_idx, _d_bool, _d_float, _d_float, _d_float, 2, 0, 1, _d_float,
@@ -1129,173 +1122,73 @@ def main(cfg=CFG):
     big = pd.concat(pairs_list, ignore_index=True)
     big.to_csv(pairs_all_path, index=False, encoding='utf-8-sig')
 
-    has_trades = False
-    trades_final_path = os.path.join(cfg['OUT_DIR'], 'trades_ALL.parquet')
-    pq_files = glob.glob(os.path.join(trades_raw_dir, "*.parquet"))
-
-    # ================= 生成表1：全局逐笔交易流水 (修复OOM版) =================
-    if pq_files:
-        print("\n[内存优化] 正在采用分块引擎读取独立Parquet文件统计并发信号 (消除 OOM)...")
-        try:
-            concurrent_counts = Counter()
-            for pf in pq_files:
-                # 【优化阶段1】：仅读取整型ID和时间，杜绝一切字符串生成
-                df_part = pd.read_parquet(pf, columns=['entry_id', 'exit_id', 'entry_time'])
-
-                # 直接使用 .values 提取底层 NumPy 数组，打包成极轻量级的纯数字 Tuple 作为 Key
-                keys = zip(
-                    df_part['entry_id'].values,
-                    df_part['exit_id'].values,
-                    df_part['entry_time'].values
-                )
-                concurrent_counts.update(keys)
-
-            if concurrent_counts:
-                has_trades = True
-                print(f"[内存优化] 正在流式拼接并发信号列并写入最终表 {trades_final_path}...")
-
-                first_chunk = True
-                for pf in pq_files:
-                    df_part = pd.read_parquet(pf)
-
-                    # 【优化阶段2】：重建纯数字 Key，从 Counter 中极速匹配并发生信号数
-                    keys = zip(
-                        df_part['entry_id'].values,
-                        df_part['exit_id'].values,
-                        df_part['entry_time'].values
-                    )
-                    df_part['concurrent_signals'] = [concurrent_counts[k] for k in keys]
-
-                    # 【阅后即焚】：只有在准备写盘前，才将 int 转回长字符串 combo_id
-                    df_part['entry_id'] = df_part['entry_id'].astype(int)
-                    df_part['exit_id'] = df_part['exit_id'].astype(int)
-                    df_part['combo_id'] = df_part['entry_id'].map(reverse_factor_map) + '|' + df_part['exit_id'].map(
-                        reverse_factor_map)
-
-                    # 丢弃不再需要的整型列，转化为 pyarrow Table 写盘
-                    df_part.drop(columns=['entry_id', 'exit_id'], inplace=True)
-                    table = pa.Table.from_pandas(df_part)
-
-                    if first_chunk:
-                        writer = pq.ParquetWriter(trades_final_path, table.schema)
-                        first_chunk = False
-                    writer.write_table(table)
-
-                if not first_chunk:
-                    writer.close()
-        finally:
-            del concurrent_counts
-            gc.collect()
-
-    # 规范释放磁盘空间生命周期，无论是否有数据生成均清理
-    if os.path.exists(trades_raw_dir):
-        shutil.rmtree(trades_raw_dir, ignore_errors=True)
-
-    # 跨币种稳健性汇总
+    print("\n[内存优化] 正在生成跨币种宏观评估指标 (直接由全量特征降维计算，免读交易明细)...")
     g = big.groupby(['entry_factor', 'exit_factor'])
-    summ = g.agg(n_coins=('coin', 'nunique'),
-                 total_trades=('trades', 'sum'),
-                 sum_ret_all=('sum_ret', 'sum'),
-                 mean_sum_ret=('sum_ret', 'mean'),
-                 median_sum_ret=('sum_ret', 'median'),
-                 mean_avg_ret=('avg_ret', 'mean'),
-                 mean_win_rate=('win_rate', 'mean'),
-                 mean_max_dd=('max_dd', 'mean'),
-                 mean_hold_h=('avg_hold_h', 'mean'),
-                 oos_sum_all=('oos_sum_ret', 'sum')).reset_index()
+
+    # 【修复1】：补全丢失的 OOS单笔夏普(pt_sharpe) 以及 Q1~Q4时序特征
+    summ = g.agg(
+        n_coins=('coin', 'nunique'),
+        total_trades=('trades', 'sum'),
+        sum_ret_all=('sum_ret', 'sum'),
+        mean_sum_ret=('sum_ret', 'mean'),
+        median_sum_ret=('sum_ret', 'median'),
+        mean_avg_ret=('avg_ret', 'mean'),
+        mean_win_rate=('win_rate', 'mean'),
+        mean_max_dd=('max_dd', 'mean'),
+        mean_hold_h=('avg_hold_h', 'mean'),
+        oos_sum_all=('oos_sum_ret', 'sum'),
+        mean_skew=('skew', 'mean'),
+        mean_kurt=('kurt', 'mean'),
+        mean_exposure=('exposure', 'mean'),
+        mean_equity_r2=('equity_r2', 'mean'),
+        mean_corr_btc=('corr_btc', 'mean'),
+        mean_down_market_win_rate=('down_market_win_rate', 'mean'),
+        mean_cvar_5=('cvar_5', 'mean'),
+        mean_oos_sharpe=('oos_sharpe', 'mean'),
+        mean_oos_pt_sharpe=('oos_pt_sharpe', 'mean'),  # OOS 单笔夏普均值
+        sum_ret_q1=('ret_q1', 'sum'), sum_trades_q1=('trades_q1', 'sum'),
+        sum_ret_q2=('ret_q2', 'sum'), sum_trades_q2=('trades_q2', 'sum'),
+        sum_ret_q3=('ret_q3', 'sum'), sum_trades_q3=('trades_q3', 'sum'),
+        sum_ret_q4=('ret_q4', 'sum'), sum_trades_q4=('trades_q4', 'sum')
+    ).reset_index()
+
     pos_rate = g.apply(lambda x: (x['sum_ret'] > 0).mean()).rename('coin_positive_rate').reset_index()
     summ = summ.merge(pos_rate, on=['entry_factor', 'exit_factor'])
     summ['score'] = (summ['mean_avg_ret'].fillna(0)
                      * np.sqrt(summ['total_trades'].clip(lower=1))
                      * summ['coin_positive_rate'])
-    summ.sort_values('score', ascending=False, inplace=True)
-    summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'), index=False, encoding='utf-8-sig')
 
-    # ================= 生成表2：组合时序切片长表 =================
-    if has_trades:
-        print("[内存优化] 正在生成时序切片长表 (直接按列读取 Parquet 极速聚合)...")
-        ts_df = pd.read_parquet(trades_final_path, columns=['combo_id', 'entry_time', 'net_return', 'coin'])
-        ts_df['combo_id'] = ts_df['combo_id'].astype('category')
-        ts_df['coin'] = ts_df['coin'].astype('category')
+    # 【修复2】：为了解决 Z-score 量纲爆炸，严格使用“单币种平均交易笔数”作为有效样本量 T
+    summ['avg_trades_per_coin'] = summ['total_trades'] / summ['n_coins'].clip(lower=1)
 
-        # [修正2] 兼容 Parquet 读取出的 datetime64 原生类型，修复类型冲突崩溃
-        ts_df['date'] = pd.to_datetime(ts_df['entry_time']).dt.date
+    def calc_dsr_approx(row, total_trials):
+        # 使用“单币种单笔夏普”匹配“单币种平均样本量”
+        sr_pt = row['mean_oos_pt_sharpe']
+        T_eff = max(3, row['avg_trades_per_coin'])
 
-        daily_agg = ts_df.groupby(['combo_id', 'date'], observed=True).agg(
-            daily_return=('net_return', 'sum'),
-            active_coins=('coin', 'nunique')
-        ).reset_index()
-        del ts_df
-        gc.collect()
+        # 恢复高阶矩：保留真实的偏度和峰度，反映肥尾风险
+        skew = row.get('mean_skew', 0.0)
+        kurt = row.get('mean_kurt', 0.0)
+        if pd.isna(skew): skew = 0.0
+        if pd.isna(kurt): kurt = 0.0
 
-        daily_agg = daily_agg.sort_values(['combo_id', 'date'])
-        daily_agg['daily_nav'] = daily_agg.groupby('combo_id', observed=True)['daily_return'].cumsum() + 1.0
-
-        cols_t2 = ['combo_id', 'date', 'daily_nav', 'daily_return', 'active_coins']
-        daily_agg[cols_t2].to_csv(os.path.join(cfg['OUT_DIR'], 'combo_timeseries_ALL.csv'), index=False,
-                                  encoding='utf-8-sig')
-    # ====================================================================
-
-    # ================= 生成表3：宏观统计档案看板 =================
-    combo_profile = big.groupby(['entry_factor', 'exit_factor']).agg(
-        total_trades=('trades', 'sum'),
-        is_oos_sharpe=('oos_sharpe', 'mean')
-    ).reset_index()
-    combo_profile['combo_id'] = combo_profile['entry_factor'] + '|' + combo_profile['exit_factor']
-
-    if has_trades:
-        print("[内存优化] 正在生成宏观统计看板...")
-        prof_df = pd.read_parquet(trades_final_path, columns=['combo_id', 'net_return', 'concurrent_signals'])
-        prof_df['combo_id'] = prof_df['combo_id'].astype('category')
-
-        def calc_profile_stats(group):
-            conc = group['concurrent_signals'].values
-            true_n = np.sum(1.0 / conc) if len(conc) > 0 else 0
-            rets = group['net_return'].values
-            if len(rets) > 2:
-                skew = pd.Series(rets).skew()
-                kurt = pd.Series(rets).kurtosis()
-            else:
-                skew, kurt = 0.0, 0.0
-            return pd.Series({'true_n_trades': true_n, 'skew': skew, 'kurt': kurt})
-
-        stats = prof_df.groupby('combo_id', observed=True).apply(calc_profile_stats).reset_index()
-        del prof_df
-        gc.collect()
-
-        combo_profile = combo_profile.merge(stats, on='combo_id', how='left')
-    else:
-        combo_profile['true_n_trades'] = np.nan
-        combo_profile['skew'] = np.nan
-        combo_profile['kurt'] = np.nan
-
-    def calc_dsr(row, total_trials):
-        sr = row['is_oos_sharpe']
-        T = row['total_trades']
-        skew = row.get('skew', 0)
-        kurt = row.get('kurt', 0)
-        if pd.isna(sr) or T <= 0 or total_trials <= 1:
+        if pd.isna(sr_pt) or T_eff <= 0 or total_trials <= 1:
             return np.nan
-        if pd.isna(skew): skew = 0
-        if pd.isna(kurt): kurt = 0
 
         emsr = np.sqrt(2 * np.log(total_trials))
-        var_sr = (1 - skew * sr + (kurt + 2) / 4 * sr ** 2) / T
+        var_sr = (1 - skew * sr_pt + (kurt + 2) / 4 * sr_pt ** 2) / T_eff
         if var_sr <= 0: var_sr = 1e-6
-        z = (sr - emsr) / np.sqrt(var_sr)
+
+        # 【修复3】：修正 Z-score 代数顺序：(观测值 - 期望值) / 标准差
+        z = (sr_pt - emsr) / np.sqrt(var_sr)
         dsr = 0.5 * (1 + math.erf(z / np.sqrt(2)))
         return dsr
 
-    combo_profile['total_trials'] = total_trials_tested
-    combo_profile['deflated_sharpe'] = combo_profile.apply(lambda r: calc_dsr(r, total_trials_tested), axis=1)
+    summ['total_trials'] = total_trials_tested
+    summ['deflated_sharpe'] = summ.apply(lambda r: calc_dsr_approx(r, total_trials_tested), axis=1)
 
-    cols_t3 = ['combo_id', 'total_trials', 'true_n_trades', 'is_oos_sharpe', 'deflated_sharpe']
-    for c in cols_t3:
-        if c not in combo_profile.columns:
-            combo_profile[c] = np.nan
-    combo_profile[cols_t3].to_csv(os.path.join(cfg['OUT_DIR'], 'Combo_Profile_ALL.csv'), index=False,
-                                  encoding='utf-8-sig')
-    # ====================================================================
+    summ.sort_values('score', ascending=False, inplace=True)
+    summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'), index=False, encoding='utf-8-sig')
 
     print("\n" + "=" * 78)
     print("🏆 跨币种稳健 TOP20 (score = 均笔收益 × √笔数 × 盈利币种占比)")
@@ -1307,6 +1200,7 @@ def main(cfg=CFG):
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
+
 if __name__ == '__main__':
     import copy
 
