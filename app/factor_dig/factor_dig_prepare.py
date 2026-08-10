@@ -137,6 +137,8 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str):
     log(f"⏱️ 任务总耗时: {total_cost:.2f} 秒 (约 {total_cost / 60:.1f} 分钟)")
     log(f"📁 最终数据已在原目录更新: {os.path.abspath(data_dir)}")
 
+
+# df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\factor_out_60m\pairs_1INCH.csv')
 # ================= 调用示例 =================
 # 现在只需要传入包含 CSV 原始数据的目录路径即可
 add_cross_sectional_rank_stable_with_logs('../data')
