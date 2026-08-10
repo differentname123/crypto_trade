@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 ================================================================================
@@ -9,6 +8,7 @@
  · 纯做多、每笔等名义仓位、收益率【加总不复利】
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
  · [终极定稿] 内存优化版：彻底抛弃逐笔流水，在内存截取高阶统计特征，告别OOM
+ · [新增特性] 事后对入场信号进行 15 组不同强度的横截面(Rank)环境过滤测试
 ================================================================================
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ from scipy.stats import skew, kurtosis
 warnings.filterwarnings("ignore")
 
 # ======================================================================
-# 0. 全局配置
+# 0. 全局配置与环境过滤模式
 # ======================================================================
 CFG = dict(
     DATA_DIR='../data',
@@ -68,14 +68,27 @@ CFG = dict(
 
 EPS = 1e-12
 
+# 【新增】15种环境过滤模式
+FILTER_MODES = [
+    ('original', None, 0),
+    ('top', 'rank_gain_24h', 1), ('top', 'rank_gain_24h', 3), ('top', 'rank_gain_24h', 5),
+    ('top', 'rank_gain_24h', 10), ('top', 'rank_gain_24h', 20), ('top', 'rank_gain_24h', 50),
+    ('top', 'rank_gain_24h', 100),
+    ('bottom', 'rank_loss_24h', 1), ('bottom', 'rank_loss_24h', 3), ('bottom', 'rank_loss_24h', 5),
+    ('bottom', 'rank_loss_24h', 10), ('bottom', 'rank_loss_24h', 20), ('bottom', 'rank_loss_24h', 50),
+    ('bottom', 'rank_loss_24h', 100),
+]
+
 # ======================================================================
 # 1. numba 可选加速 (已优化为稀疏索引跳跃查询)
 # ======================================================================
 try:
     from numba import njit
+
     HAS_NUMBA = True
 except Exception:
     HAS_NUMBA = False
+
 
 def _core_static(entry_idx, exit_idx, n, cooldown, max_trades):
     ent = np.empty(max_trades, dtype=np.int64)
@@ -103,6 +116,7 @@ def _core_static(entry_idx, exit_idx, n, cooldown, max_trades):
         k += 1
         pos = found + 1 + cooldown
     return ent[:k], ext[:k]
+
 
 def _core_path(entry_idx, static_exit, close, low, atr, n, cooldown, max_trades,
                exec_px,
@@ -169,9 +183,11 @@ def _core_path(entry_idx, static_exit, close, low, atr, n, cooldown, max_trades,
         pos = hit + 1 + cooldown
     return ent[:k], ext[:k]
 
+
 if HAS_NUMBA:
     _core_static = njit(cache=True, nogil=True)(_core_static)
     _core_path = njit(cache=True, nogil=True)(_core_path)
+
 
 def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
     ent, ext = [], []
@@ -190,6 +206,7 @@ def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
         ext.append(x)
         pos = x + 1 + cooldown
     return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
+
 
 def _path_scan_np(e, ep, el, n, close, atr, static_exit, p):
     start = e + 1
@@ -225,6 +242,7 @@ def _path_scan_np(e, ep, el, n, close, atr, static_exit, p):
         chunk = min(chunk * 2, 32768)
     return n - 1
 
+
 def _match_path_np(entry_idx, static_exit, close, low, atr, exec_px, n, cooldown, max_trades, p):
     ent, ext = [], []
     ne = entry_idx.size
@@ -242,6 +260,7 @@ def _match_path_np(entry_idx, static_exit, close, low, atr, exec_px, n, cooldown
         pos = x + 1 + cooldown
     return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
 
+
 # ======================================================================
 # 2. 数据加载 / 重采样 / 对齐
 # ======================================================================
@@ -251,22 +270,38 @@ def _pick(df, cands, what):
             return c
     raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df.columns)}")
 
+
 def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     bar = f"{bar_minutes}min"
     k = pd.read_csv(kline_file)
     kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
     k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
     k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+
+    # 【新增】兼容如果某些基础标的(如 BTC) 没有这俩字段时，默认给超大值避开过滤
+    if 'rank_gain_24h' not in k.columns:
+        k['rank_gain_24h'] = 999999.0
+    if 'rank_loss_24h' not in k.columns:
+        k['rank_loss_24h'] = 999999.0
+
+    # 【修改】聚合时带上排名特征
     agg = k.resample(bar, label='left', closed='left').agg(
         open=('open', 'first'), high=('high', 'max'),
         low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum'))
+        volume=('volume', 'sum'),
+        rank_gain_24h=('rank_gain_24h', 'last'),
+        rank_loss_24h=('rank_loss_24h', 'last')
+    )
     agg['close'] = agg['close'].ffill()
     agg = agg[agg['close'].notna()]
     agg['open'] = agg['open'].fillna(agg['close'])
     agg['high'] = agg['high'].fillna(agg['close'])
     agg['low'] = agg['low'].fillna(agg['close'])
     agg['volume'] = agg['volume'].fillna(0.0)
+
+    # 【新增】填充空洞排名以避免 NaN
+    agg['rank_gain_24h'] = agg['rank_gain_24h'].fillna(999999.0)
+    agg['rank_loss_24h'] = agg['rank_loss_24h'].fillna(999999.0)
 
     oi = pd.read_csv(oi_file)
     ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
@@ -294,6 +329,7 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     for c in ['open', 'high', 'low', 'close']:
         df = df[df[c] > 0]
     return df
+
 
 # ======================================================================
 # 3. 参数体系
@@ -341,6 +377,7 @@ def make_params(bar_minutes, n_rows):
     )
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
+
 
 # ======================================================================
 # 4. 因子库
@@ -865,6 +902,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
 
     return d
 
+
 # ======================================================================
 # 6. 单币种全组合挖掘 (彻底移除Parquet，截面特征极速落盘)
 # ======================================================================
@@ -877,7 +915,12 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         return None, 0, 0
+
+    # 【新增】提出 rank 数组准备切片
     df = df.iloc[warm:].copy()
+    rk_gain = df['rank_gain_24h'].to_numpy(float)
+    rk_loss = df['rank_loss_24h'].to_numpy(float)
+
     F = {k: v[warm:] for k, v in F.items()}
     atr = aux['atr'][warm:]
 
@@ -972,30 +1015,52 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 continue
             rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
             ok = np.isfinite(rets)
-            ent, ext, rets = ent[ok], ext[ok], rets[ok]
-            if ent.size < cfg['MIN_TRADES_REPORT'] or ent.size > max_allowed_trades:
-                continue
+            ent_base, ext_base, rets_base = ent[ok], ext[ok], rets[ok]
 
-            if btc_c is not None:
-                bh_rets = btc_c[ext] / btc_c[ent] - 1.0
-            else:
-                bh_rets = None
+            # 【核心修改】引入 15 次事后环境过滤循环
+            for mode_name, rank_col, threshold in FILTER_MODES:
+                if mode_name == 'original':
+                    ent_f, ext_f, rets_f = ent_base, ext_base, rets_base
+                    filter_label = 'original'
+                else:
+                    if mode_name == 'top':
+                        entry_ranks = rk_gain[ent_base]
+                    else:  # bottom
+                        entry_ranks = rk_loss[ent_base]
 
-            row = dict(coin=coin, entry_factor=en, exit_factor=xn,
-                       entry_density=dens.get(en, np.nan), exit_density=x_dens)
+                    # 生成掩码过滤当前满足条件的开仓
+                    mask = entry_ranks <= threshold
+                    ent_f = ent_base[mask]
+                    ext_f = ext_base[mask]
+                    rets_f = rets_base[mask]
+                    filter_label = f"{mode_name}_{threshold}"
 
-            row.update(trade_stats(rets, ent, ext, bm, n_bars=n, start_idx=0, bh_rets=bh_rets))
+                if ent_f.size < cfg['MIN_TRADES_REPORT'] or ent_f.size > max_allowed_trades:
+                    continue
 
-            m_is = ent < split_bar
-            row.update(trade_stats(rets[m_is], ent[m_is], ext[m_is], bm, n_bars=split_bar,
-                                   start_idx=0, bh_rets=bh_rets[m_is] if bh_rets is not None else None, prefix='is_'))
+                if btc_c is not None:
+                    bh_rets_f = btc_c[ext_f] / btc_c[ent_f] - 1.0
+                else:
+                    bh_rets_f = None
 
-            row.update(trade_stats(rets[~m_is], ent[~m_is], ext[~m_is], bm, n_bars=n - split_bar,
-                                   start_idx=split_bar, bh_rets=bh_rets[~m_is] if bh_rets is not None else None,
-                                   prefix='oos_'))
-            rows.append(row)
+                row = dict(coin=coin, entry_factor=en, exit_factor=xn,
+                           filter_mode=filter_label,  # 【新增字段】
+                           entry_density=dens.get(en, np.nan), exit_density=x_dens)
+
+                row.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+
+                m_is = ent_f < split_bar
+                row.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar,
+                                       start_idx=0, bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None,
+                                       prefix='is_'))
+
+                row.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
+                                       start_idx=split_bar, bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
+                                       prefix='oos_'))
+                rows.append(row)
 
     return pd.DataFrame(rows), total, kline_days
+
 
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度)
@@ -1103,8 +1168,8 @@ def main(cfg=CFG):
                         valid_combos > 0 and kline_days > 0) else 0
 
                 print(f"✅ [{coin}] K线: {kline_days:.1f}天 | "
-                      f"组合数: {trials} -> {valid_combos} (保{retention_rate * 100:.1f}%) | "
-                      f"总笔数: {total_saved_trades} | 频次: {avg_tpd:.2f}次/天")
+                      f"组合数: {trials} -> 存留记录: {valid_combos} | "
+                      f"总笔数: {total_saved_trades}")
 
                 pairs.sort_values('sum_ret', ascending=False, inplace=True)
                 pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
@@ -1123,7 +1188,9 @@ def main(cfg=CFG):
     big.to_csv(pairs_all_path, index=False, encoding='utf-8-sig')
 
     print("\n[内存优化] 正在生成跨币种宏观评估指标 (直接由全量特征降维计算，免读交易明细)...")
-    g = big.groupby(['entry_factor', 'exit_factor'])
+
+    # 【核心修改】加入 filter_mode 作为分组联合主键，确保不同的过滤环境单独统计
+    g = big.groupby(['entry_factor', 'exit_factor', 'filter_mode'])
 
     # 【修复1】：补全丢失的 OOS单笔夏普(pt_sharpe) 以及 Q1~Q4时序特征
     summ = g.agg(
@@ -1152,8 +1219,10 @@ def main(cfg=CFG):
         sum_ret_q4=('ret_q4', 'sum'), sum_trades_q4=('trades_q4', 'sum')
     ).reset_index()
 
+    # 【核心修改】与 pos_rate 合并时也要加入 filter_mode 键
     pos_rate = g.apply(lambda x: (x['sum_ret'] > 0).mean()).rename('coin_positive_rate').reset_index()
-    summ = summ.merge(pos_rate, on=['entry_factor', 'exit_factor'])
+    summ = summ.merge(pos_rate, on=['entry_factor', 'exit_factor', 'filter_mode'])
+
     summ['score'] = (summ['mean_avg_ret'].fillna(0)
                      * np.sqrt(summ['total_trades'].clip(lower=1))
                      * summ['coin_positive_rate'])
@@ -1193,13 +1262,16 @@ def main(cfg=CFG):
     print("\n" + "=" * 78)
     print("🏆 跨币种稳健 TOP20 (score = 均笔收益 × √笔数 × 盈利币种占比)")
     print("=" * 78)
-    show = summ.head(20)[['entry_factor', 'exit_factor', 'n_coins', 'total_trades',
+
+    # 【修改】控制台展示增加了 filter_mode 列
+    show = summ.head(20)[['entry_factor', 'exit_factor', 'filter_mode', 'n_coins', 'total_trades',
                           'mean_avg_ret', 'mean_win_rate', 'coin_positive_rate',
                           'sum_ret_all', 'oos_sum_all', 'score']]
     pd.set_option('display.width', 240)
     pd.set_option('display.max_colwidth', 40)
     print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
     print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
+
 
 if __name__ == '__main__':
     import copy

@@ -11,13 +11,13 @@ def log(msg: str):
     print(f"[{current_time}] {msg}")
 
 
-def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
+def add_cross_sectional_rank_stable_with_logs(data_dir: str):
     """
     最稳定版：为所有的 1m 级别 K 线数据增加 24H 截面涨跌幅排名 (带详细监控日志)
+    注意：此版本将直接在原始数据文件上进行修改和字段追加，原地覆盖。
     """
     global_start_time = time.time()
 
-    os.makedirs(output_dir, exist_ok=True)
     kfiles = glob.glob(os.path.join(data_dir, '*_USDT_USDT_1m_kline.csv'))
     total_files = len(kfiles)
 
@@ -26,8 +26,7 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
         return
 
     log(f"🚀 开始执行横截面特征工程，共发现 {total_files} 个目标文件。")
-    log(f"📂 数据源目录: {os.path.abspath(data_dir)}")
-    log(f"📂 输出目录: {os.path.abspath(output_dir)}")
+    log(f"📂 数据源目录 (将直接在原文件上修改): {os.path.abspath(data_dir)}")
     print("-" * 60)
 
     # ==========================================
@@ -85,7 +84,7 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
     # ==========================================
     # 阶段三：回写数据并落盘 (原子级绝对等幂版)
     # ==========================================
-    log("▶️ [阶段 3/3] 正在将截面特征合并回原文件并另存...")
+    log("▶️ [阶段 3/3] 正在将截面特征合并回原文件并直接覆盖...")
     step3_start = time.time()
 
     for i, file_path in enumerate(kfiles, 1):
@@ -98,7 +97,7 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
         df_orig = pd.read_csv(file_path)
 
         # 【微调 1：清洗历史特征，保障原地覆盖等幂】
-        # 如果表里已经有这两个列（之前跑中断留下的），先无情删掉，保证每次都是干净的 Join
+        # 如果表里已经有这两个列（之前跑过的），先无情删掉，保证每次都是干净的 Join
         cols_to_clean = ['rank_gain_24h', 'rank_loss_24h']
         existing_cols = [c for c in cols_to_clean if c in df_orig.columns]
         if existing_cols:
@@ -118,14 +117,15 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
         df_orig.drop(columns=['dt_match'], inplace=True)
 
         # 【微调 2：原子级写盘（Atomic Write），防止断电产生半截残缺文件】
-        out_file = os.path.join(output_dir, file_name)
+        # 变更点：此处 out_file 直接指向原始的 file_path
+        out_file = file_path
         tmp_file = out_file + ".tmp"  # 先写到临时文件
         df_orig.to_csv(tmp_file, index=False)
-        os.replace(tmp_file, out_file)  # 瞬间重命名（系统底层原子操作，绝不会损坏）
+        os.replace(tmp_file, out_file)  # 瞬间重命名覆盖原文件（系统底层原子操作，绝不会损坏原数据）
 
-        log(f"  -> [{i}/{total_files}] 成功落盘: {coin:<10} | 耗时: {time.time() - file_start:.2f}s")
+        log(f"  -> [{i}/{total_files}] 成功更新原文件: {coin:<10} | 耗时: {time.time() - file_start:.2f}s")
 
-    log(f"✅ [阶段 3 完成] 所有文件写入完毕！耗时: {time.time() - step3_start:.2f}s")
+    log(f"✅ [阶段 3 完成] 所有文件原地写入更新完毕！耗时: {time.time() - step3_start:.2f}s")
     print("=" * 60)
 
     # ==========================================
@@ -135,7 +135,8 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str, output_dir: str):
     log(f"🎉 全部处理流程圆满结束！")
     log(f"📊 累计处理文件: {total_files} 个")
     log(f"⏱️ 任务总耗时: {total_cost:.2f} 秒 (约 {total_cost / 60:.1f} 分钟)")
-    log(f"📁 最终数据存放在: {os.path.abspath(output_dir)}")
+    log(f"📁 最终数据已在原目录更新: {os.path.abspath(data_dir)}")
 
 # ================= 调用示例 =================
-add_cross_sectional_rank_stable_with_logs('../data', '../data_with_ranks')
+# 现在只需要传入包含 CSV 原始数据的目录路径即可
+add_cross_sectional_rank_stable_with_logs('../data')
