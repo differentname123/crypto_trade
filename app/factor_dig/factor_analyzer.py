@@ -212,7 +212,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
         print(f"   {RED}无足够数据计算百搭因子。{RESET}")
 
 
-def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
+def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
     """
     模块 B：微观组合五维防伪体检
     注意：使用 tradable_summary 进行排序和抽取，彻底屏蔽“1笔交易爆赚1500%”的妖孽策略。
@@ -225,6 +225,23 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
     if tradable_summary.empty:
         print(f"{RED}🚫 没有策略通过硬性过滤条件，建议放宽过滤阈值或重新挖掘。{RESET}")
         return
+
+    # ================= 【新增】周期转换逻辑 =================
+    match = re.match(r'(\d+)([mhd])', str(tf).lower())
+    if match:
+        val = float(match.group(1))
+        unit = match.group(2)
+        if unit == 'm':
+            bars_to_days = val / (24 * 60.0)
+        elif unit == 'h':
+            bars_to_days = val / 24.0
+        elif unit == 'd':
+            bars_to_days = val
+        else:
+            bars_to_days = 1.0
+    else:
+        bars_to_days = 1.0  # 解析失败时的默认值
+    # ======================================================
 
     # ================= 核心排序调整 (Calmar 比率思想) =================
     tradable_summary = tradable_summary.copy()
@@ -385,9 +402,23 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         print(f"\n{BOLD}[4. 尾部风险与持仓特征 (Risk & Hold Asymmetry)]{RESET}")
         dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
         skew_val = f"{row['mean_skew']:.2f}" if pd.notna(row.get('mean_skew')) else "N/A"
+
+        # 🟢 【新增代码】：提取并打印最大回撤与收益回撤比
+        max_dd_val = row['mean_max_dd']
+        calmar_ratio = row['Sort_Metric']
+
+        print(f"   - 📉 平均最大回撤 (Max Drawdown): {RED}{max_dd_val:.2f}%{RESET} | 收益回撤比: {calmar_ratio:.2f}")
         print(f"   - 逆风局胜率 (BTC跌时): {dm_win}  |  偏度 (Skew): {skew_val}")
+
+        # 将 Bars 转换为 天数
+        mean_win_hold_days = mean_win_hold * bars_to_days
+        mean_loss_hold_days = mean_loss_hold * bars_to_days
+        # 防止除数为 0 报错
+        hold_ratio = mean_loss_hold / mean_win_hold if mean_win_hold > 0 else 0
+
         print(
-            f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold:.1f} Bars / 亏损单均持仓 {mean_loss_hold:.1f} Bars 持有时间比值 为 {mean_loss_hold / mean_win_hold:.2f} 倍")
+            f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold_days:.2f} 天 ({mean_win_hold:.0f} Bars) / 亏损单均持仓 {mean_loss_hold_days:.2f} 天 ({mean_loss_hold:.0f} Bars)")
+        print(f"   - 扛单死扛比: 亏损单持有时间是盈利单的 {hold_ratio:.2f} 倍")
 
         # [5] 广度与利润极权度
         print(f"\n{BOLD}[5. 广度与利润极权度 (Breadth & Concentration)]{RESET}")
@@ -425,4 +456,4 @@ if __name__ == '__main__':
             analyze_macro_ecosystem(summary, tradable_summary)
 
             # 3. 微观深度体检 (严格在净水表里提取 Top 10)
-            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=50)
+            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=50)
