@@ -40,7 +40,7 @@ from biance_order_lite import (execute_order, get_total_equity,
 # ==========================================
 # L0. 配置与常量
 # ==========================================
-BEST_TOP_N = 20
+BEST_TOP_N = 5
 LEDGER_FILE = f"trade_records_{CURRENT_SYMBOL}.csv"  # 本策略专属账本, 与其它策略物理隔离
 LEVERAGE = 1
 MIN_ORDER_VALUE = 51
