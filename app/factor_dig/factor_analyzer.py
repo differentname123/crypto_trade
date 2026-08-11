@@ -78,8 +78,7 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
     df = df.merge(top1_pct, left_on=['entry_factor', 'exit_factor', 'filter_mode'], right_index=True, how='left')
 
     # ================= 生存底线过滤 =================
-    is_friction_safe = df['mean_avg_ret'] > min_avg_ret
-
+    is_friction_safe = (df['sum_ret_all'] / df['total_trades'] / 100.0) > min_avg_ret
     # 修正：横截面有效率必须大于50%才有普适意义，而不是>=0
     is_coin_robust = df['coin_positive_rate'] > 0.50
 
@@ -224,8 +223,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
 
         # ================= 核心指标提取与重构 =================
         curr_trades = row['total_trades']
-        avg_ret_pct = row['mean_avg_ret'] * 100  # 平均单笔收益百分比
-
+        avg_ret_pct = row['sum_ret_all'] / curr_trades if curr_trades > 0 else 0
         # 🟢 新增：盈亏平衡单边滑点容忍度 (决定实盘生死)
         break_even_slippage = avg_ret_pct / 2.0
 
