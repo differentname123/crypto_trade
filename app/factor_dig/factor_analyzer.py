@@ -43,8 +43,16 @@ def load_data(tf='15m'):
     summary = pd.read_csv(sum_path)
     all_pairs = pd.read_csv(all_path)
 
+    # 1. 强制转换为 Categorical 类型（极大压缩内存并加速分组计算）
+    for col in ['entry_factor', 'exit_factor', 'filter_mode']:
+        all_pairs[col] = all_pairs[col].astype('category')
+        summary[col] = summary[col].astype('category')
+
     # 建立联合索引，让后续微观分析的查询速度提升上百倍
     all_pairs.set_index(['entry_factor', 'exit_factor', 'filter_mode'], inplace=True)
+
+    # 2. 核心修复：必须对索引进行排序，否则后续 .loc 查询会退化为全表扫描！
+    all_pairs.sort_index(inplace=True)
 
     return summary, all_pairs
 
@@ -272,11 +280,11 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         curr_pt_sharpe = row['mean_oos_pt_sharpe']
         curr_trades = row['total_trades']
 
-        # 提取底层持仓流水
-        mask = (all_pairs.index.get_level_values(0) == en) & \
-               (all_pairs.index.get_level_values(1) == ex) & \
-               (all_pairs.index.get_level_values(2) == fm)
-        combo_details = all_pairs[mask]
+        # 提取底层持仓流水 (修改点：极速 .loc 元组查询替换全表扫描的掩码)
+        try:
+            combo_details = all_pairs.loc[[(en, ex, fm)]]
+        except KeyError:
+            combo_details = pd.DataFrame()
 
         if not combo_details.empty:
             win_t = combo_details['trades'] * (combo_details['win_rate'] / 100.0)
@@ -291,7 +299,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
-                        positive_profits > 0 and max_coin_ret > 0) else 0.0
+                    positive_profits > 0 and max_coin_ret > 0) else 0.0
 
             best_coin = "未知标的"
             if positive_profits > 0:
@@ -378,7 +386,8 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
         skew_val = f"{row['mean_skew']:.2f}" if pd.notna(row.get('mean_skew')) else "N/A"
         print(f"   - 逆风局胜率 (BTC跌时): {dm_win}  |  偏度 (Skew): {skew_val}")
-        print(f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold:.1f} Bars / 亏损单均持仓 {mean_loss_hold:.1f} Bars 持有时间比值 为 {mean_loss_hold / mean_win_hold:.2f} 倍")
+        print(
+            f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold:.1f} Bars / 亏损单均持仓 {mean_loss_hold:.1f} Bars 持有时间比值 为 {mean_loss_hold / mean_win_hold:.2f} 倍")
 
         # [5] 广度与利润极权度
         print(f"\n{BOLD}[5. 广度与利润极权度 (Breadth & Concentration)]{RESET}")
@@ -398,6 +407,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             for flag in flags:
                 print(f"   {flag}")
         print(f"{BOLD}{'=' * 80}{RESET}")
+
 
 if __name__ == '__main__':
     target_timeframes = ['60m']
