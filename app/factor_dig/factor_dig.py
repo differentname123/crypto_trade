@@ -9,6 +9,8 @@
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
  · [终极定稿] 内存优化版：彻底抛弃逐笔流水，在内存截取高阶统计特征，告别OOM
  · [新增特性] 事后对入场信号进行 15 组不同强度的横截面(Rank)环境过滤测试
+ · [本次改造] 只落盘 pairs_{coin}.csv；断点续跑 + 原子写入；无感注入"测试基数"
+              (pairs_ALL / pairs_CROSS_COIN_SUMMARY 改由独立还原脚本重建)
 ================================================================================
 """
 from __future__ import annotations
@@ -1075,7 +1077,28 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                                        prefix='oos_'))
                 rows.append(row)
 
-    return pd.DataFrame(rows), stats, kline_days
+    out = pd.DataFrame(rows)
+
+    # ==================================================================
+    # 【新增】无感注入"测试基数"(多重检验搜索空间)，用于事后精确还原 DSR
+    #   n_trials_combos : 入场×出场 组合数（原口径，只按此计算会让 DSR 虚高）
+    #   n_trials_modes  : 横截面环境过滤模式数（本次为 15）
+    #   n_trials_total  : 真实搜索空间 = 组合数 × 模式数  ← 还原 DSR 请用这一列
+    #   n_trials_alive  : 实际存留(落盘)的记录数（另一种"有效试验数"口径）
+    # 这些列是常量列，不参与任何回测逻辑，纯粹为可复现性服务。
+    # ==================================================================
+    if not out.empty:
+        n_modes = len(FILTER_MODES)
+        out['bar_minutes'] = int(bm)
+        out['kline_days'] = float(kline_days)
+        out['n_trials_combos'] = int(stats['total_combos'])
+        out['n_trials_modes'] = int(n_modes)
+        out['n_trials_total'] = int(stats['total_combos'] * n_modes)
+        out['n_trials_alive'] = int(len(out))
+
+    return out, stats, kline_days
+
+
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度)
 # ======================================================================
@@ -1095,9 +1118,35 @@ def mine_symbol_wrapper(args):
         import traceback
         tb = traceback.format_exc()
         return kf, coin, None, {'total_combos': 0}, 0, f"执行异常: {e}\n{tb}"
+
+
 # ======================================================================
-# 7. 主流程 (引入多进程架构隔离与调度，彻底修复特征丢失与DSR量纲错位)
+# 7. 主流程 (只落盘单币结果 + 断点续跑 + 原子写入)
 # ======================================================================
+def _coin_out_path(out_dir, coin):
+    """单币结果文件的唯一路径（断点续跑判定依据）"""
+    return os.path.join(out_dir, f'pairs_{coin}.csv')
+
+
+def _atomic_to_csv(df, path):
+    """【新增】原子落盘：先写 .tmp 再 os.replace，杜绝中断产生半截文件污染断点"""
+    tmp = f"{path}.tmp"
+    df.to_csv(tmp, index=False, encoding='utf-8-sig')
+    os.replace(tmp, path)
+
+
+def _clean_stale_tmp(out_dir):
+    """【新增】清理上一次异常中断残留的 .tmp（它们不是有效结果，不能被当作已完成）"""
+    n = 0
+    for f in os.listdir(out_dir):
+        if f.startswith('pairs_') and f.endswith('.csv.tmp'):
+            try:
+                os.remove(os.path.join(out_dir, f))
+                n += 1
+            except OSError:
+                pass
+    return n
+
 
 def main(cfg=CFG):
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
@@ -1111,17 +1160,27 @@ def main(cfg=CFG):
         print("❌ 未发现 *_USDT_USDT_1m_kline.csv")
         return
 
+    n_tmp = _clean_stale_tmp(cfg['OUT_DIR'])
+    if n_tmp:
+        print(f"🧹 已清理上次中断残留的临时文件 {n_tmp} 个")
+
     valid_coins = []
     valid_kfiles = []
+    resume_coins = []
     for kf in kfiles:
         coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         if cfg['COINS'] and coin not in cfg['COINS']:
+            continue
+        # 【新增】断点续跑：已存在 pairs_{coin}.csv 则完全跳过回测
+        if os.path.exists(_coin_out_path(cfg['OUT_DIR'], coin)):
+            resume_coins.append(coin)
             continue
         valid_coins.append(coin)
         valid_kfiles.append(kf)
 
     print("=" * 78)
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
+    print(f"⏭️  断点续跑: 已存在结果 {len(resume_coins)} 个 -> 直接跳过回测")
     print(f"🎯 本次计划回测币种个数: {len(valid_coins)} 个")
     if len(valid_coins) <= 30:
         print(f"📜 币种名单: {', '.join(valid_coins)}")
@@ -1130,7 +1189,7 @@ def main(cfg=CFG):
     print("=" * 78)
 
     if not valid_coins:
-        print("⚠️ 没有找到符合条件的币种进行回测。")
+        print("✅ 该周期全部币种均已落盘，无需新增计算。")
         return
 
     btc_file = os.path.join(data_dir, 'BTC_USDT_USDT_1m_kline.csv')
@@ -1149,8 +1208,7 @@ def main(cfg=CFG):
         print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
 
     tasks = [(kf, cfg, btc_close) for kf in valid_kfiles]
-    total_trials_tested = 0
-    pairs_list = []
+    n_ok, n_empty, n_fail = 0, 0, 0
 
     max_workers = min(18, max(1, multiprocessing.cpu_count() - 2))
 
@@ -1170,6 +1228,7 @@ def main(cfg=CFG):
             kf, coin, pairs, stats, kline_days, msg = fut.result()
 
             if msg != "OK":
+                n_fail += 1
                 print(f"⚠️ [{coin}] 执行跳过/失败: {msg}")
                 continue
 
@@ -1212,100 +1271,27 @@ def main(cfg=CFG):
                       f"不足3笔:{skip_too_few} | 超限:{skip_too_many} | "
                       f"最严苛:{worst_mode}({worst_cnt}) | "
                       f"最宽松:{best_mode}({best_cnt}) | "
+                      f"测试基数:{total_combos}×{len(FILTER_MODES)}={total_combos * len(FILTER_MODES)} | "
                       f"总笔数: {total_saved_trades}")
 
                 pairs.sort_values('sum_ret', ascending=False, inplace=True)
-                pairs.to_csv(os.path.join(cfg['OUT_DIR'], f'pairs_{coin}.csv'), index=False, encoding='utf-8-sig')
+                # 【新增】原子写入，写完即视为该币已完成，可随时中断续跑
+                _atomic_to_csv(pairs, _coin_out_path(cfg['OUT_DIR'], coin))
+                n_ok += 1
 
-                pairs_list.append(pairs)
-                total_trials_tested = max(total_trials_tested, total_combos)
+                del pairs
+                gc.collect()
             else:
-                print(f"✅ [{coin}] 执行完毕，但未产出有效组合。")
-
-    pairs_all_path = os.path.join(cfg['OUT_DIR'], 'pairs_ALL.csv')
-    if not pairs_list:
-        print("\n⚠️ 没有任何有效结果。")
-        return
-
-    big = pd.concat(pairs_list, ignore_index=True)
-    big.to_csv(pairs_all_path, index=False, encoding='utf-8-sig')
-
-    print("\n[内存优化] 正在生成跨币种宏观评估指标 (直接由全量特征降维计算，免读交易明细)...")
-
-    g = big.groupby(['entry_factor', 'exit_factor', 'filter_mode'])
-
-    summ = g.agg(
-        n_coins=('coin', 'nunique'),
-        total_trades=('trades', 'sum'),
-        sum_ret_all=('sum_ret', 'sum'),
-        mean_sum_ret=('sum_ret', 'mean'),
-        median_sum_ret=('sum_ret', 'median'),
-        mean_avg_ret=('avg_ret', 'mean'),
-        mean_win_rate=('win_rate', 'mean'),
-        mean_max_dd=('max_dd', 'mean'),
-        mean_hold_h=('avg_hold_h', 'mean'),
-        oos_sum_all=('oos_sum_ret', 'sum'),
-        mean_skew=('skew', 'mean'),
-        mean_kurt=('kurt', 'mean'),
-        mean_exposure=('exposure', 'mean'),
-        mean_equity_r2=('equity_r2', 'mean'),
-        mean_corr_btc=('corr_btc', 'mean'),
-        mean_down_market_win_rate=('down_market_win_rate', 'mean'),
-        mean_cvar_5=('cvar_5', 'mean'),
-        mean_oos_sharpe=('oos_sharpe', 'mean'),
-        mean_oos_pt_sharpe=('oos_pt_sharpe', 'mean'),
-        sum_ret_q1=('ret_q1', 'sum'), sum_trades_q1=('trades_q1', 'sum'),
-        sum_ret_q2=('ret_q2', 'sum'), sum_trades_q2=('trades_q2', 'sum'),
-        sum_ret_q3=('ret_q3', 'sum'), sum_trades_q3=('trades_q3', 'sum'),
-        sum_ret_q4=('ret_q4', 'sum'), sum_trades_q4=('trades_q4', 'sum')
-    ).reset_index()
-
-    pos_rate = g.apply(lambda x: (x['sum_ret'] > 0).mean()).rename('coin_positive_rate').reset_index()
-    summ = summ.merge(pos_rate, on=['entry_factor', 'exit_factor', 'filter_mode'])
-
-    summ['score'] = (summ['mean_avg_ret'].fillna(0)
-                     * np.sqrt(summ['total_trades'].clip(lower=1))
-                     * summ['coin_positive_rate'])
-
-    summ['avg_trades_per_coin'] = summ['total_trades'] / summ['n_coins'].clip(lower=1)
-
-    def calc_dsr_approx(row, total_trials):
-        sr_pt = row['mean_oos_pt_sharpe']
-        T_eff = max(3, row['avg_trades_per_coin'])
-
-        skew = row.get('mean_skew', 0.0)
-        kurt = row.get('mean_kurt', 0.0)
-        if pd.isna(skew): skew = 0.0
-        if pd.isna(kurt): kurt = 0.0
-
-        if pd.isna(sr_pt) or T_eff <= 0 or total_trials <= 1:
-            return np.nan
-
-        emsr = np.sqrt(2 * np.log(total_trials))
-        var_sr = (1 - skew * sr_pt + (kurt + 2) / 4 * sr_pt ** 2) / T_eff
-        if var_sr <= 0: var_sr = 1e-6
-
-        z = (sr_pt - emsr) / np.sqrt(var_sr)
-        dsr = 0.5 * (1 + math.erf(z / np.sqrt(2)))
-        return dsr
-
-    summ['total_trials'] = total_trials_tested
-    summ['deflated_sharpe'] = summ.apply(lambda r: calc_dsr_approx(r, total_trials_tested), axis=1)
-
-    summ.sort_values('score', ascending=False, inplace=True)
-    summ.to_csv(os.path.join(cfg['OUT_DIR'], 'pairs_CROSS_COIN_SUMMARY.csv'), index=False, encoding='utf-8-sig')
+                n_empty += 1
+                print(f"✅ [{coin}] 执行完毕，但未产出有效组合(不落盘，下次仍会重试)。")
 
     print("\n" + "=" * 78)
-    print("🏆 跨币种稳健 TOP20 (score = 均笔收益 × √笔数 × 盈利币种占比)")
+    print(f"🏁 本轮结束 | 新增落盘: {n_ok} 个 | 断点跳过: {len(resume_coins)} 个 | "
+          f"无有效结果: {n_empty} 个 | 失败: {n_fail} 个")
+    print(f"📁 单币结果目录: {os.path.abspath(cfg['OUT_DIR'])}")
+    print("ℹ️  pairs_ALL.csv / pairs_CROSS_COIN_SUMMARY.csv 已取消在此生成；")
+    print("    请运行 rebuild_pairs_summary.py，由 pairs_<coin>.csv 精确还原(含真实测试基数的 DSR)。")
     print("=" * 78)
-
-    show = summ.head(20)[['entry_factor', 'exit_factor', 'filter_mode', 'n_coins', 'total_trades',
-                          'mean_avg_ret', 'mean_win_rate', 'coin_positive_rate',
-                          'sum_ret_all', 'oos_sum_all', 'score']]
-    pd.set_option('display.width', 240)
-    pd.set_option('display.max_colwidth', 40)
-    print(show.to_string(index=False, float_format=lambda x: f'{x:.3f}'))
-    print(f"\n✅ 结果已保存至 {os.path.abspath(cfg['OUT_DIR'])}")
 
 
 if __name__ == '__main__':
