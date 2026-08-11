@@ -39,7 +39,6 @@ GLOBAL_PLATEAU_RESULTS = []
 # 全局内存缓存，用于极大地加速数据读取和指标计算
 _DF_CACHE = {}
 _FACTOR_CACHE = {}
-_CROSS_CACHE = {}  # 新增：用于缓存全市场截面排名数据
 
 # ======================================================================
 # 1. numba 可选加速
@@ -115,15 +114,31 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
     k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
     k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+
+    # 【新增】兼容如果某些基础标的(如 BTC) 没有这俩字段时，默认给超大值避开过滤
+    if 'rank_gain_24h' not in k.columns:
+        k['rank_gain_24h'] = 999999.0
+    if 'rank_loss_24h' not in k.columns:
+        k['rank_loss_24h'] = 999999.0
+
+    # 【修改】聚合时带上排名特征
     agg = k.resample(bar, label='left', closed='left').agg(
         open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'), volume=('volume', 'sum'))
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum'),
+        rank_gain_24h=('rank_gain_24h', 'last'),
+        rank_loss_24h=('rank_loss_24h', 'last')
+    )
     agg['close'] = agg['close'].ffill()
     agg = agg[agg['close'].notna()]
     agg['open'] = agg['open'].fillna(agg['close'])
     agg['high'] = agg['high'].fillna(agg['close'])
     agg['low'] = agg['low'].fillna(agg['close'])
     agg['volume'] = agg['volume'].fillna(0.0)
+
+    # 【新增】填充空洞排名以避免 NaN
+    agg['rank_gain_24h'] = agg['rank_gain_24h'].fillna(999999.0)
+    agg['rank_loss_24h'] = agg['rank_loss_24h'].fillna(999999.0)
 
     oi = pd.read_csv(oi_file)
     ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
@@ -300,11 +315,25 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, prefix=''):
     return d
 
 
-def mine_symbol(coin, df, cfg, cross_mask=None):
+def mine_symbol(coin, df, cfg):
     bm = cfg['BAR_MINUTES']
     P = make_params(bm, len(df))
     if 'SEARCH_PARAMS' in cfg:
         P.update(cfg['SEARCH_PARAMS'])
+
+    # 根据配置及数据中的排序特征构建横截面掩码
+    top_k = P.get('CROSS_RANK_K', 9999)
+    rank_mode = P.get('RANK_MODE', cfg.get('RANK_MODE', 'both'))
+    rk_gain = df['rank_gain_24h']
+    rk_loss = df['rank_loss_24h']
+
+    if rank_mode == 'top':
+        cross_mask = rk_gain <= top_k
+    elif rank_mode == 'bottom':
+        cross_mask = rk_loss <= top_k
+    else:
+        cross_mask = (rk_gain <= top_k) | (rk_loss <= top_k)
+
     F = build_factors(df, P, cross_mask)
 
     warm = min(P['WARMUP'], len(df) - 100)
@@ -322,7 +351,7 @@ def mine_symbol(coin, df, cfg, cross_mask=None):
     exec_px[-1] = cl[-1]
     cost = 2.0 * (cfg['FEE_RATE'] + cfg['SLIPPAGE'])
 
-    # 精确截取到回测时间段的基准收益和回测天数
+    # 精确实截取到回测时间段的基准收益和回测天数
     bench_ret = float((cl[-1] / cl[0] - 1.0) * 100)
     bt_days = float(n * bm / 1440.0)  # 1440分钟 = 1天
 
@@ -404,7 +433,7 @@ def main(cfg=CFG):
     print("=" * 100)
 
     # ------------------------------------------------------------------
-    # 【新增逻辑】：在跑主循环前，获取整个币种池的数据计算24H涨跌幅截面排名
+    # 【新增逻辑】：在跑主循环前，获取整个币种池的数据预热
     # ------------------------------------------------------------------
     valid_coins_info = []
     for kf in kfiles:
@@ -426,44 +455,6 @@ def main(cfg=CFG):
         print("❌ 未发现符合条件的有效币种数据。")
         return
 
-    bm = cfg['BAR_MINUTES']
-    top_k = cfg.get('SEARCH_PARAMS', {}).get('CROSS_RANK_K', 9999)
-    rank_mode = cfg.get('SEARCH_PARAMS', {}).get('RANK_MODE', cfg.get('RANK_MODE', 'both'))
-
-    # 极速计算并缓存全局 24H 涨跌幅截面，消除由于周期带来的多次运算
-    if bm not in _CROSS_CACHE:
-        close_dict = {}
-        for kf, coin, oi_f, fr_f in valid_coins_info:
-            dft = _load_symbol_cached(os.path.join(data_dir, kf), oi_f, fr_f, bm)
-            close_dict[coin] = dft['close']
-
-        df_all_close = pd.DataFrame(close_dict)
-        bars_24h = int(24 * 60 / bm)
-        # 计算过去 24H 的收益率
-        ret_24h = df_all_close.pct_change(periods=bars_24h)
-        # 排名 (1 = 涨幅最大)
-        rank_24h = ret_24h.rank(axis=1, ascending=False, method='min')
-        # 每根K线的总有效交易对数量
-        valid_count = ret_24h.notna().sum(axis=1)
-
-        _CROSS_CACHE[bm] = (rank_24h, valid_count)
-
-    rank_24h, valid_count = _CROSS_CACHE[bm]
-    # 判断是否为涨幅前 K 名
-    is_top_k = rank_24h.le(top_k)
-    # 判断是否为跌幅前 K 名 (即后 K 名)
-    # 使用 subtract 防止 reshape/broadcasting 产生的异常报错
-    is_bottom_k = rank_24h.subtract(valid_count, axis=0).gt(-top_k)
-
-    # 根据动态 RANK_MODE 构建掩码池
-    if rank_mode == 'top':
-        cross_mask_df = is_top_k
-    elif rank_mode == 'bottom':
-        cross_mask_df = is_bottom_k
-    else:
-        cross_mask_df = is_top_k | is_bottom_k
-    # ------------------------------------------------------------------
-
     results = []
     all_rets = []
     all_is_rets = []
@@ -475,13 +466,7 @@ def main(cfg=CFG):
             # 采用内存读取缓存方式
             df = _load_symbol_cached(os.path.join(data_dir, kf), oi_f, fr_f, cfg['BAR_MINUTES'])
 
-            # 将该币种的截面布尔列摘出（重置索引以完全对齐回测使用的df）
-            if coin in cross_mask_df.columns:
-                coin_mask_series = cross_mask_df[coin].reindex(df.index).fillna(False)
-            else:
-                coin_mask_series = pd.Series(True, index=df.index)
-
-            res = mine_symbol(coin, df, cfg, coin_mask_series)
+            res = mine_symbol(coin, df, cfg)
 
             if res is not None and res[0] is not None:
                 res_dict, rets_list, is_rets_list, oos_rets_list, rej_rets_list = res
