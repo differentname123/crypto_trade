@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import math
+import gzip
 import numpy as np
 import pandas as pd
 
@@ -31,7 +32,7 @@ RCFG = dict(
 
 KEY_COLS = ['entry_factor', 'exit_factor', 'filter_mode']
 
-# 【完美平衡 1】：这是微观明细表 pairs_ALL.csv 需要写入的极简字段（防止几千万行把磁盘撑爆）
+# 【完美平衡 1】：这是微观明细表 pairs_ALL.csv.gz 需要写入的极简字段（防止几千万行把磁盘撑爆）
 ALL_PAIRS_NEEDED = [
     'coin', 'symbol', 'direction',
     'trades', 'win_rate', 'win_hold_bars', 'loss_hold_bars',
@@ -70,17 +71,17 @@ def _atomic_replace(tmp_path, final_path):
 
 def _atomic_to_csv(df, path):
     tmp = f"{path}.tmp"
-    df.to_csv(tmp, index=False, encoding='utf-8-sig')
+    df.to_csv(tmp, index=False, encoding='utf-8-sig', float_format='%.5f', compression='gzip')
     _atomic_replace(tmp, path)
 
 
 def _list_coin_files(out_dir):
-    exclude = {'pairs_ALL.csv', 'pairs_CROSS_COIN_SUMMARY.csv',
-               'pairs_ALL_Long.csv', 'pairs_ALL_Short.csv',
-               'pairs_CROSS_COIN_SUMMARY_Long.csv', 'pairs_CROSS_COIN_SUMMARY_Short.csv'}
+    exclude = {'pairs_ALL.csv.gz', 'pairs_CROSS_COIN_SUMMARY.csv.gz',
+               'pairs_ALL_Long.csv.gz', 'pairs_ALL_Short.csv.gz',
+               'pairs_CROSS_COIN_SUMMARY_Long.csv.gz', 'pairs_CROSS_COIN_SUMMARY_Short.csv.gz'}
     fs = []
     for f in sorted(os.listdir(out_dir)):
-        if not f.startswith('pairs_') or not f.endswith('.csv'): continue
+        if not f.startswith('pairs_') or not f.endswith('.csv.gz'): continue
         if f in exclude: continue
         fs.append(os.path.join(out_dir, f))
     return fs
@@ -257,13 +258,13 @@ def rebuild_dir(out_dir, rcfg=RCFG):
     header_long_pending = header_short_pending = True
 
     if rcfg['REBUILD_PAIRS_ALL']:
-        all_long_path = os.path.join(out_dir, 'pairs_ALL_Long.csv')
+        all_long_path = os.path.join(out_dir, 'pairs_ALL_Long.csv.gz')
         all_long_tmp = all_long_path + '.tmp'
-        fo_long = open(all_long_tmp, 'w', newline='', encoding='utf-8-sig')
+        fo_long = gzip.open(all_long_tmp, 'wt', newline='', encoding='utf-8-sig')
 
-        all_short_path = os.path.join(out_dir, 'pairs_ALL_Short.csv')
+        all_short_path = os.path.join(out_dir, 'pairs_ALL_Short.csv.gz')
         all_short_tmp = all_short_path + '.tmp'
-        fo_short = open(all_short_tmp, 'w', newline='', encoding='utf-8-sig')
+        fo_short = gzip.open(all_short_tmp, 'wt', newline='', encoding='utf-8-sig')
 
     acc_long = GroupAccumulator() if rcfg['REBUILD_SUMMARY'] else None
     acc_short = GroupAccumulator() if rcfg['REBUILD_SUMMARY'] else None
@@ -303,11 +304,11 @@ def rebuild_dir(out_dir, rcfg=RCFG):
 
                 # 1. 独立写入（仅携带必要列输出）
                 if fo_long is not None and is_long.any():
-                    subset_write[is_long].to_csv(fo_long, index=False, header=header_long_pending)
+                    subset_write[is_long].to_csv(fo_long, index=False, header=header_long_pending, float_format='%.5f')
                     header_long_pending = False
 
                 if fo_short is not None and is_short.any():
-                    subset_write[is_short].to_csv(fo_short, index=False, header=header_short_pending)
+                    subset_write[is_short].to_csv(fo_short, index=False, header=header_short_pending, float_format='%.5f')
                     header_short_pending = False
 
                 # 2. 分别累加（原生 Mask 防止内存碎片）
@@ -336,7 +337,7 @@ def rebuild_dir(out_dir, rcfg=RCFG):
     if rcfg['REBUILD_PAIRS_ALL']:
         _atomic_replace(all_long_tmp, all_long_path)
         _atomic_replace(all_short_tmp, all_short_path)
-        print(f"✅ pairs_ALL_Long.csv & pairs_ALL_Short.csv 已重建完毕(多空明细彻底分离)")
+        print(f"✅ pairs_ALL_Long.csv.gz & pairs_ALL_Short.csv.gz 已重建完毕(多空明细彻底分离)")
 
     if acc_long is None and acc_short is None: return
 
@@ -368,9 +369,9 @@ def rebuild_dir(out_dir, rcfg=RCFG):
         summ = summ.reindex(columns=[c for c in FINAL_ORDER if c in summ.columns])
         summ.sort_values('score', ascending=False, inplace=True)
 
-        sum_path = os.path.join(out_dir, f'pairs_CROSS_COIN_SUMMARY_{name}.csv')
+        sum_path = os.path.join(out_dir, f'pairs_CROSS_COIN_SUMMARY_{name}.csv.gz')
         _atomic_to_csv(summ, sum_path)
-        print(f"✅ pairs_CROSS_COIN_SUMMARY_{name}.csv 已重建完毕(全量宏观指标保留): -> {sum_path}")
+        print(f"✅ pairs_CROSS_COIN_SUMMARY_{name}.csv.gz 已重建完毕(全量宏观指标保留): -> {sum_path}")
     print()
 
 
