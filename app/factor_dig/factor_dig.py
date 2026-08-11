@@ -50,9 +50,9 @@ CFG = dict(
 
     # --- 因子行为 ---
     RANK_SHIFT=0,
-    DEDUPE_IDENTICAL=True,
-    MIN_SIGNALS=20,
-    MAX_DENSITY=0.995,
+    DEDUPE_IDENTICAL=False,
+    MIN_SIGNALS=1,
+    MAX_DENSITY=0.9,
     INCLUDE_PATH_EXITS=True,
 
     # --- 组合与输出 ---
@@ -932,7 +932,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
     n = len(df)
     kline_days = n * bm / 1440.0
-    max_allowed_trades = kline_days * 24.0
+    max_allowed_trades = kline_days * 24.0 * 60
 
     op = df['open'].to_numpy(float)
     cl = df['close'].to_numpy(float)
@@ -1235,7 +1235,7 @@ def main(cfg=CFG):
     tasks = [(kf, cfg, btc_close) for kf in valid_kfiles]
     n_ok, n_empty, n_fail = 0, 0, 0
 
-    max_workers = min(18, max(1, multiprocessing.cpu_count() - 2))
+    max_workers = min(28, max(1, multiprocessing.cpu_count() - 2))
 
     if HAS_NUMBA:
         print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
