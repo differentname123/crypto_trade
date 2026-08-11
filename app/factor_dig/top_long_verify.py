@@ -605,12 +605,12 @@ if __name__ == '__main__':
 
     # 划定核心参数的搜索空间 (新增了 RANK_MODE)
     param_grid = {
-        'UPPER_WICK_THRESH': [0.5],  # 上影线占比阈值
-        'VOL_QUANTILE': [0.95],  # 成交量分位数
-        'HIGH_CLOSE_THRESH': [0.95],  # 高位收盘价阈值
-        'CROSS_RANK_K': [20],
+        'UPPER_WICK_THRESH': [0.5,0.60,0.7],  # 上影线占比阈值
+        'VOL_QUANTILE': [0.8, 0.9, 0.95],  # 成交量分位数
+        'HIGH_CLOSE_THRESH': [0.8, 0.90, 0.95],  # 高位收盘价阈值
+        'CROSS_RANK_K': [1,3,5, 10, 20],
         'BAR_MINUTES': [60],
-        'RANK_MODE': ['top']  # <--- 新增搜索空间
+        'RANK_MODE': ['top', 'bottom']  # <--- 新增搜索空间
     }
 
     keys = list(param_grid.keys())

@@ -648,7 +648,7 @@ def generate_top_long_signals(df):
     OPTIMAL_PARAMS = {
         'BAR_MINUTES': 60,
         'UPPER_WICK_THRESH': 0.60,
-        'VOL_QUANTILE': 0.95,
+        'VOL_QUANTILE': 0.9,
         'HIGH_CLOSE_THRESH': 0.90,
         'WARMUP_DAYS': 30  # 因子计算必须的30天历史窗口
     }
