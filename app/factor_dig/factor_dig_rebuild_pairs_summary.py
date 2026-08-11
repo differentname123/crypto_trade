@@ -141,12 +141,13 @@ class GroupAccumulator:
         if miss.any():
             new_keys = pd.unique(keys.to_numpy(dtype=object)[miss])
             start = self.n
+            need = start + len(new_keys)
+            self._ensure(need)  # ✅ 先扩容（此时 self.n 仍是旧值）
             for i, k in enumerate(new_keys):
                 self.key2gid[k] = start + i
             self.keys.extend(list(new_keys))
-            self.n = start + len(new_keys)
-            self._ensure(self.n)
-            mapped = keys.map(self.key2gid)          # 补齐后重映射，保证正确
+            self.n = need  # ✅ 再更新 self.n
+            mapped = keys.map(self.key2gid)
         return mapped.to_numpy(dtype=np.int64)
 
     # ---- 累加一个 chunk ----

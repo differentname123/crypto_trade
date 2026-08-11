@@ -1100,10 +1100,10 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
 
 # ======================================================================
-# 7. 主流程 (引入多进程架构隔离与调度)
+# 7. 主流程 (引入多进程架构隔离与调度) - 已解决 OOM 内存泄漏
 # ======================================================================
 def mine_symbol_wrapper(args):
-    """ 多进程工作节点的包装函数 """
+    """ 多进程工作节点的包装函数 (核心优化：子进程落地CSV，避免跨进程传大数据) """
     kf, cfg, btc_close = args
     coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
     oi_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_5m_oi.csv')
@@ -1111,13 +1111,35 @@ def mine_symbol_wrapper(args):
     try:
         df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
         if len(df) < 800:
-            return kf, coin, None, {'total_combos': 0}, 0, "bar 数不足"
+            # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
+            return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
+
         pairs, stats, kline_days = mine_symbol(coin, df, cfg, btc_close)
-        return kf, coin, pairs, stats, kline_days, "OK"
+
+        valid_combos = 0
+        total_saved_trades = 0
+
+        # --- 【核心修改 1】将数据落盘操作移到子进程内，仅将统计数据传回主进程 ---
+        if pairs is not None and not pairs.empty:
+            valid_combos = len(pairs)
+            total_saved_trades = int(pairs['trades'].sum())
+
+            # 在子进程完成排序
+            pairs.sort_values('sum_ret', ascending=False, inplace=True)
+            # 在子进程完成写文件
+            _atomic_to_csv(pairs, _coin_out_path(cfg['OUT_DIR'], coin))
+
+            # 帮助子进程尽快释放内存
+            del pairs
+            gc.collect()
+
+        return kf, coin, valid_combos, total_saved_trades, stats, kline_days, "OK"
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        return kf, coin, None, {'total_combos': 0}, 0, f"执行异常: {e}\n{tb}"
+        return kf, coin, 0, 0, {'total_combos': 0}, 0, f"执行异常: {e}\n{tb}"
+
+
 
 
 # ======================================================================
@@ -1148,6 +1170,9 @@ def _clean_stale_tmp(out_dir):
     return n
 
 
+# ======================================================================
+# 8. 主进程入口 (只落盘单币结果 + 断点续跑 + 原子写入 + 清理Future)
+# ======================================================================
 def main(cfg=CFG):
     os.makedirs(cfg['OUT_DIR'], exist_ok=True)
     data_dir = cfg['DATA_DIR']
@@ -1171,7 +1196,7 @@ def main(cfg=CFG):
         coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         if cfg['COINS'] and coin not in cfg['COINS']:
             continue
-        # 【新增】断点续跑：已存在 pairs_{coin}.csv 则完全跳过回测
+        # 断点续跑：已存在 pairs_{coin}.csv 则完全跳过回测
         if os.path.exists(_coin_out_path(cfg['OUT_DIR'], coin)):
             resume_coins.append(coin)
             continue
@@ -1224,18 +1249,21 @@ def main(cfg=CFG):
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(mine_symbol_wrapper, t): t for t in tasks}
+
         for fut in concurrent.futures.as_completed(futures):
-            kf, coin, pairs, stats, kline_days, msg = fut.result()
+            # --- 【核心修改 2】从字典中删除当前 future 对象的强引用，阻断慢性内存泄漏 ---
+            del futures[fut]
+
+            # 解析 7 个返回值（去除了 pairs DataFrame 对象）
+            kf, coin, valid_combos, total_saved_trades, stats, kline_days, msg = fut.result()
 
             if msg != "OK":
                 n_fail += 1
                 print(f"⚠️ [{coin}] 执行跳过/失败: {msg}")
                 continue
 
-            if pairs is not None and not pairs.empty:
-                valid_combos = len(pairs)
-                total_saved_trades = int(pairs['trades'].sum())
-
+            # 如果产出了有效的组合数量
+            if valid_combos > 0:
                 # ---- 漏斗百分比 ----
                 total_combos = stats.get('total_combos', 0)
                 skip_same = stats.get('skip_same_factor', 0)
@@ -1274,13 +1302,7 @@ def main(cfg=CFG):
                       f"测试基数:{total_combos}×{len(FILTER_MODES)}={total_combos * len(FILTER_MODES)} | "
                       f"总笔数: {total_saved_trades}")
 
-                pairs.sort_values('sum_ret', ascending=False, inplace=True)
-                # 【新增】原子写入，写完即视为该币已完成，可随时中断续跑
-                _atomic_to_csv(pairs, _coin_out_path(cfg['OUT_DIR'], coin))
                 n_ok += 1
-
-                del pairs
-                gc.collect()
             else:
                 n_empty += 1
                 print(f"✅ [{coin}] 执行完毕，但未产出有效组合(不落盘，下次仍会重试)。")
