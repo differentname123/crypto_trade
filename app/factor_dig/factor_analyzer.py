@@ -323,7 +323,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         elif top1_coin_pct < 30:
             flags.append(f"{GREEN}🟢 利润标的散布健康 (最肥的羊仅占总盈利的 {top1_coin_pct:.1f}%){RESET}")
 
-        if mean_loss_hold > mean_win_hold * 1.5:
+        if mean_loss_hold > mean_win_hold * 2:
             flags.append(f"{RED}🔴 逆向持仓预警 (亏损单死扛时间是盈利单的1.5倍以上){RESET}")
         elif mean_win_hold > mean_loss_hold:
             flags.append(f"{GREEN}🟢 顺向持仓 (截断亏损，让利润奔跑){RESET}")
@@ -346,7 +346,8 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         q_rets = [row['sum_ret_q1'], row['sum_ret_q2'], row['sum_ret_q3'], row['sum_ret_q4']]
         q_trades = [row['sum_trades_q1'], row['sum_trades_q2'], row['sum_trades_q3'], row['sum_trades_q4']]
         max_q = max([q for q in q_rets if q > 0] + [0.01])
-        print(f"{BOLD}[1. 时序平稳性 (Temporal Stability)]{RESET}")
+        print(f"{BOLD}[1. 时序平稳与单笔净利 (Temporal & Profit)]{RESET}")
+        print(f"   {CYAN}- 单笔平均净水: OOS 每笔赚 {oos_pt_ret:.3f}% (IS 为 {is_pt_ret:.3f}%){RESET}")
         print(f"   - OOS 真实折损: {decay_rate:.1f}%  (IS总计 {is_ret:.1f}% -> OOS总计 {oos_ret:.1f}%)")
         print(f"   - 季度分布:")
         for i in range(4):
@@ -377,7 +378,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
         skew_val = f"{row['mean_skew']:.2f}" if pd.notna(row.get('mean_skew')) else "N/A"
         print(f"   - 逆风局胜率 (BTC跌时): {dm_win}  |  偏度 (Skew): {skew_val}")
-        print(f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold:.1f} Bars / 亏损单均持仓 {mean_loss_hold:.1f} Bars")
+        print(f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold:.1f} Bars / 亏损单均持仓 {mean_loss_hold:.1f} Bars 持有时间比值 为 {mean_loss_hold / mean_win_hold:.2f} 倍")
 
         # [5] 广度与利润极权度
         print(f"\n{BOLD}[5. 广度与利润极权度 (Breadth & Concentration)]{RESET}")
