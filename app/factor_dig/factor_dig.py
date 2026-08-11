@@ -9,7 +9,7 @@
  · 结果全量落盘 CSV，含 IS/OOS 切分与跨币种稳健性
  · [终极定稿] 内存优化版：彻底抛弃逐笔流水，在内存截取高阶统计特征，告别OOM
  · [新增特性] 事后对入场信号进行 15 组不同强度的横截面(Rank)环境过滤测试
- · [本次改造] 只落盘 pairs_{coin}.csv；断点续跑 + 原子写入；无感注入"测试基数"
+ · [本次改造] 只落盘 pairs_{coin}.csv.gz；断点续跑 + 原子写入；无感注入"测试基数"
               (pairs_ALL / pairs_CROSS_COIN_SUMMARY 改由独立还原脚本重建)
  · [性能优化] 统计基元标量化(逐位复刻) / 因子基础量去重缓存 /
               列式内存装配 / BTC 基准按 worker 一次性下发   —— 结果不变
@@ -1301,13 +1301,15 @@ def mine_symbol_wrapper(args):
 # ======================================================================
 def _coin_out_path(out_dir, coin):
     """单币结果文件的唯一路径（断点续跑判定依据）"""
-    return os.path.join(out_dir, f'pairs_{coin}.csv')
+    # 【修改】后缀改为 .csv.gz
+    return os.path.join(out_dir, f'pairs_{coin}.csv.gz')
 
 
 def _atomic_to_csv(df, path):
     """【新增】原子落盘：先写 .tmp 再 os.replace，杜绝中断产生半截文件污染断点"""
     tmp = f"{path}.tmp"
-    df.to_csv(tmp, index=False, encoding='utf-8-sig')
+    # 【修改】增加 float_format='%.5f' 截断小数，并且加入 compression='gzip'
+    df.to_csv(tmp, index=False, encoding='utf-8-sig', float_format='%.5f', compression='gzip')
     os.replace(tmp, path)
 
 
@@ -1315,7 +1317,8 @@ def _clean_stale_tmp(out_dir):
     """【新增】清理上一次异常中断残留的 .tmp（它们不是有效结果，不能被当作已完成）"""
     n = 0
     for f in os.listdir(out_dir):
-        if f.startswith('pairs_') and f.endswith('.csv.tmp'):
+        # 【修改】匹配规则扩展，适应 .csv.gz.tmp 等所有临时文件
+        if f.startswith('pairs_') and f.endswith('.tmp'):
             try:
                 os.remove(os.path.join(out_dir, f))
                 n += 1
@@ -1350,7 +1353,7 @@ def main(cfg=CFG):
         coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
         if cfg['COINS'] and coin not in cfg['COINS']:
             continue
-        # 断点续跑：已存在 pairs_{coin}.csv 则完全跳过回测
+        # 断点续跑：已存在 pairs_{coin}.csv.gz 则完全跳过回测
         if os.path.exists(_coin_out_path(cfg['OUT_DIR'], coin)):
             resume_coins.append(coin)
             continue
@@ -1468,7 +1471,8 @@ def main(cfg=CFG):
           f"无有效结果: {n_empty} 个 | 失败: {n_fail} 个")
     print(f"📁 单币结果目录: {os.path.abspath(cfg['OUT_DIR'])}")
     print("ℹ️  pairs_ALL.csv / pairs_CROSS_COIN_SUMMARY.csv 已取消在此生成；")
-    print("    请运行 rebuild_pairs_summary.py，由 pairs_<coin>.csv 精确还原(含真实测试基数的 DSR)。")
+    # 【修改】对应输出提示的后缀更新
+    print("    请运行 rebuild_pairs_summary.py，由 pairs_<coin>.csv.gz 精确还原(含真实测试基数的 DSR)。")
     print("=" * 78)
 
 

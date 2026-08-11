@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import math
-import gc
 import numpy as np
 import pandas as pd
 
@@ -128,45 +127,58 @@ class GroupAccumulator:
         n = len(df)
         if n == 0: return
 
-        key = (df['entry_factor'].astype(str) + '\x01'
-               + df['exit_factor'].astype(str) + '\x01'
-               + df['filter_mode'].astype(str))
-        gid = self._gids(key)
+        # 优化 1：放弃字符串拼接，使用 Tuple 完美规避哈希碰撞与临时字符串对象黑洞
+        keys_series = pd.Series(list(zip(df['entry_factor'], df['exit_factor'], df['filter_mode'])))
+        gid = self._gids(keys_series)
         D = self.data
 
+        # 优化 2：矩阵化 (Vectorization) 替代按列遍历
+        def get_2d_vals(cols):
+            arr = np.zeros((n, len(cols)), dtype=np.float64)
+            for i, c in enumerate(cols):
+                if c in df.columns:
+                    arr[:, i] = pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=np.float64)
+                else:
+                    arr[:, i] = np.nan
+            return arr
+
+        sr = pd.to_numeric(df['sum_ret'], errors='coerce').to_numpy(
+            dtype=np.float64) if 'sum_ret' in df.columns else np.full(n, np.nan)
+
+        rows_idx = self.col_of['rows']
+        pos_idx = self.col_of['pos']
+
+        sum_cols_idx = [self.col_of[f'{c}__sum'] for c in SUM_COLS]
+        sum_vals = get_2d_vals(SUM_COLS)
+        sum_vals = np.where(np.isnan(sum_vals), 0.0, sum_vals)
+
+        mean_sum_cols_idx = [self.col_of[f'{c}__msum'] for c in MEAN_COLS]
+        mean_cnt_cols_idx = [self.col_of[f'{c}__mcnt'] for c in MEAN_COLS]
+        mean_vals = get_2d_vals(MEAN_COLS)
+        ok_mask = ~np.isnan(mean_vals)
+        mean_sums = np.where(ok_mask, mean_vals, 0.0)
+        mean_cnts = ok_mask.astype(np.float64)
+
+        # 优化 3：广播支持的 2D 矩阵切片更新，降维打击 For 循环
         if np.unique(gid).size != gid.size:
-            def add(col, vals):
-                np.add.at(D, (gid, col), vals)
+            np.add.at(D, (gid, rows_idx), 1.0)
+            np.add.at(D, (gid, pos_idx), (sr > 0).astype(np.float64))
+            np.add.at(D, (gid[:, None], sum_cols_idx), sum_vals)
+            np.add.at(D, (gid[:, None], mean_sum_cols_idx), mean_sums)
+            np.add.at(D, (gid[:, None], mean_cnt_cols_idx), mean_cnts)
         else:
-            def add(col, vals):
-                D[gid, col] += vals
-
-        def num(c):
-            if c in df.columns:
-                return pd.to_numeric(df[c], errors='coerce').to_numpy(dtype=np.float64)
-            return np.full(n, np.nan)
-
-        sr = num('sum_ret')
-
-        add(self.col_of['rows'], 1.0)
-        add(self.col_of['pos'], (sr > 0).astype(np.float64))
-
-        for c in SUM_COLS:
-            v = sr if c == 'sum_ret' else num(c)
-            add(self.col_of[f'{c}__sum'], np.where(np.isnan(v), 0.0, v))
-
-        for c in MEAN_COLS:
-            v = sr if c == 'sum_ret' else num(c)
-            ok = ~np.isnan(v)
-            add(self.col_of[f'{c}__msum'], np.where(ok, v, 0.0))
-            add(self.col_of[f'{c}__mcnt'], ok.astype(np.float64))
+            D[gid, rows_idx] += 1.0
+            D[gid, pos_idx] += (sr > 0).astype(np.float64)
+            D[gid[:, None], sum_cols_idx] += sum_vals
+            D[gid[:, None], mean_sum_cols_idx] += mean_sums
+            D[gid[:, None], mean_cnt_cols_idx] += mean_cnts
 
     def finalize(self) -> pd.DataFrame:
         D = self.data[:self.n]
         col = self.col_of
 
-        split = [k.split('\x01') for k in self.keys[:self.n]]
-        out = pd.DataFrame(split, columns=KEY_COLS)
+        # 对应 Tuple 解析
+        out = pd.DataFrame(self.keys[:self.n], columns=KEY_COLS)
 
         def _sum(c): return D[:, col[f'{c}__sum']]
 
@@ -259,40 +271,50 @@ def rebuild_dir(out_dir, rcfg=RCFG):
     trials = {c: 0 for c in TRIAL_COLS}
     n_rows_total = 0
 
-    # 获取列名，做安全过滤
     head_df = pd.read_csv(files[0], nrows=0)
     usecols = [c for c in NEED_COLS if c in head_df.columns]
     write_cols = [c for c in (KEY_COLS + ALL_PAIRS_NEEDED) if c in head_df.columns]
 
+    # 优化 4：前置固化数据类型 (取消 pyarrow，保留 C 引擎下数据字典的巨额速度提升)
+    dtype_map = {c: np.float64 for c in NEED_COLS if c in (SUM_COLS + MEAN_COLS + TRIAL_COLS) and c != 'trades'}
+    dtype_map['trades'] = np.float64
+    dtype_map['direction'] = 'category'
+
+    read_kwargs = dict(usecols=usecols, chunksize=rcfg['CHUNKSIZE'], dtype=dtype_map, low_memory=False)
+
     try:
         for i, f in enumerate(files, 1):
             n_rows_file = 0
-            for chunk in pd.read_csv(f, usecols=usecols, chunksize=rcfg['CHUNKSIZE'], low_memory=False):
-                # 切分多空数据集
-                if 'direction' in chunk.columns:
-                    is_long = chunk['direction'].astype(str).str.lower() == 'long'
-                    is_short = chunk['direction'].astype(str).str.lower() == 'short'
-                    chunk_long = chunk[is_long]
-                    chunk_short = chunk[is_short]
-                else:
-                    # 兼容老数据格式，如果没有方向列，默认全进做多
-                    chunk_long = chunk
-                    chunk_short = pd.DataFrame(columns=chunk.columns)
+            for chunk in pd.read_csv(f, **read_kwargs):
+                # 优化 5：规避全表硬拷贝切片
+                subset_write = chunk[[c for c in write_cols if c in chunk.columns]]
 
-                # 1. 向磁盘分别写多空明细表
-                if fo_long is not None and not chunk_long.empty:
-                    chunk_long[write_cols].to_csv(fo_long, index=False, header=header_long_pending)
+                if 'direction' in chunk.columns:
+                    d_col = chunk['direction']
+                    if d_col.dtype.name == 'category':
+                        is_long = d_col.isin(['Long', 'long', 'LONG']).to_numpy(dtype=bool)
+                        is_short = d_col.isin(['Short', 'short', 'SHORT']).to_numpy(dtype=bool)
+                    else:
+                        is_long = (d_col.astype(str).str.lower() == 'long').to_numpy(dtype=bool)
+                        is_short = (d_col.astype(str).str.lower() == 'short').to_numpy(dtype=bool)
+                else:
+                    is_long = np.ones(len(chunk), dtype=bool)
+                    is_short = np.zeros(len(chunk), dtype=bool)
+
+                # 1. 独立写入（仅携带必要列输出）
+                if fo_long is not None and is_long.any():
+                    subset_write[is_long].to_csv(fo_long, index=False, header=header_long_pending)
                     header_long_pending = False
 
-                if fo_short is not None and not chunk_short.empty:
-                    chunk_short[write_cols].to_csv(fo_short, index=False, header=header_short_pending)
+                if fo_short is not None and is_short.any():
+                    subset_write[is_short].to_csv(fo_short, index=False, header=header_short_pending)
                     header_short_pending = False
 
-                # 2. 分别累加多空宏观汇总表
-                if acc_long is not None and not chunk_long.empty:
-                    acc_long.update(chunk_long)
-                if acc_short is not None and not chunk_short.empty:
-                    acc_short.update(chunk_short)
+                # 2. 分别累加（原生 Mask 防止内存碎片）
+                if acc_long is not None and is_long.any():
+                    acc_long.update(chunk[is_long])
+                if acc_short is not None and is_short.any():
+                    acc_short.update(chunk[is_short])
 
                 for tc in TRIAL_COLS:
                     if tc in chunk.columns:
@@ -304,7 +326,7 @@ def rebuild_dir(out_dir, rcfg=RCFG):
                 n_rows_total += len(chunk)
 
             print(f"   [{i}/{len(files)}] {os.path.basename(f):<38s} rows={n_rows_file:>10,} | 累计 {n_rows_total:,}")
-            gc.collect()
+            # 删除了耗时无意义的 gc.collect() 释放全局执行锁
     finally:
         if fo_long is not None:
             fo_long.close()
