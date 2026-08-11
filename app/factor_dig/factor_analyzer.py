@@ -188,6 +188,21 @@ def analyze_macro_ecosystem(summary, tradable_summary):
     else:
         print(f"   {RED}无足够数据计算百搭因子。{RESET}")
 
+    # ---------------------------------------------------------
+    # 4. 百搭出场榜单 (用清洗后的 tradable_summary) 【新增模块】
+    # ---------------------------------------------------------
+    print(f"\n{YELLOW}▶ [4. 真实百搭出场因子榜单 (Universal Exit Top 3)]{RESET}")
+    if not pos_combos.empty:
+        total_entries = tradable_summary['entry_factor'].nunique()
+        univ_exits = pos_combos.groupby('exit_factor')['entry_factor'].nunique().sort_values(ascending=False).head(3)
+
+        for rank, (ex, count) in enumerate(univ_exits.items(), 1):
+            ratio = count / total_entries * 100
+            print(
+                f"   {rank}. {BOLD}{ex}{RESET} \n      (适配了 {count}/{total_entries} 种有效入场，真实普适性 {ratio:.1f}%)")
+    else:
+        print(f"   {RED}无足够数据计算百搭因子。{RESET}")
+
 
 def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
     """
