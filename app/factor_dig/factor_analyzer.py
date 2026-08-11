@@ -235,7 +235,11 @@ def analyze_micro_deep_dive(summary, all_pairs, top_n=5):
         # ================= 终端排版打印 =================
         print(f"\n{BOLD}{'=' * 80}{RESET}")
         print(f"🏆 {YELLOW}深度体检 #{rank}: ENTRY [{en}]  =>  EXIT [{ex}]{RESET}")
-        print(f"📌 {CYAN}当前环境: {fm} | 统计置信度(DSR): {row['deflated_sharpe']:.3f}{RESET}")
+
+        dsr_new = row['deflated_sharpe']
+        dsr_legacy = row.get('deflated_sharpe_legacy', np.nan)  # 新版新增列
+        print(f"📌 当前环境: {fm} | DSR(真实): {dsr_new:.3f} | DSR(旧口径): {dsr_legacy:.3f}")
+
         print("-" * 80)
 
         # [1] 时序平稳性
