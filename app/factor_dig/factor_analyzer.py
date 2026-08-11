@@ -218,9 +218,8 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         print(f"{RED}🚫 没有策略通过硬性过滤条件，建议放宽过滤阈值或重新挖掘。{RESET}")
         return
 
-    # ================= 新增：核心排序调整 (Calmar 比率思想) =================
+    # ================= 核心排序调整 (Calmar 比率思想) =================
     tradable_summary = tradable_summary.copy()
-    # 避免分母最大回撤为 0 (加极小数避免报错)，且强制取绝对值确保正反向逻辑无误
     tradable_summary['Sort_Metric'] = tradable_summary['mean_sum_ret'] / tradable_summary['mean_max_dd'].abs().replace(
         0, 1e-9)
     sort_col = 'Sort_Metric'
@@ -247,13 +246,19 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         else:
             decay_rate = (oos_pt_ret / is_pt_ret - 1) * 100
 
-        # 邻近参数平原验证 (注意：此处查邻居需要在全量 summary 里查，保证周边环境的完整性)
+        # --------- 邻近参数平原验证计算 (增加计算参与比对的因子个数) ---------
         same_en_df = summary[
             (summary['entry_factor'] == en) & (summary['filter_mode'] == fm) & (summary['exit_factor'] != ex)]
         same_ex_df = summary[
             (summary['exit_factor'] == ex) & (summary['filter_mode'] == fm) & (summary['entry_factor'] != en)]
+
         en_neighbor_avg = same_en_df['mean_oos_pt_sharpe'].mean() if not same_en_df.empty else np.nan
         ex_neighbor_avg = same_ex_df['mean_oos_pt_sharpe'].mean() if not same_ex_df.empty else np.nan
+
+        # 新增：记录有多少个因子参与了对比测试
+        en_neighbor_count = len(same_en_df)
+        ex_neighbor_count = len(same_ex_df)
+        # ------------------------------------------------------------------
 
         # 标的过滤效能 (对比 Original 环境)
         orig_row = summary[
@@ -286,27 +291,22 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
-                    positive_profits > 0 and max_coin_ret > 0) else 0.0
+                        positive_profits > 0 and max_coin_ret > 0) else 0.0
 
-            # ================= 新增：精准定位最赚钱的“妖币”名称 =================
             best_coin = "未知标的"
             if positive_profits > 0:
-                # 使用 argmax 取整型位置，避免 MultiIndex 重复索引导致的 DataFrame 抽取错误
                 max_idx_pos = combo_details['sum_ret'].argmax()
                 best_row = combo_details.iloc[max_idx_pos]
                 if 'coin' in best_row:
                     best_coin = str(best_row['coin'])
                 elif 'symbol' in best_row:
                     best_coin = str(best_row['symbol'])
-            # ====================================================================
-
         else:
             mean_win_hold = mean_loss_hold = top1_coin_pct = np.nan
             best_coin = "未知标的"
 
         # ================= 生成客观预警 (红绿灯) =================
         flags = []
-
         if decay_rate == -999.0:
             flags.append(f"{RED}🔴 IS 样本内收益为负或极低，无对比基准，废弃。{RESET}")
         elif decay_rate > 50:
@@ -338,8 +338,6 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         # ================= 终端排版打印 =================
         print(f"\n{BOLD}{'=' * 80}{RESET}")
         print(f"🏆 {YELLOW}深度体检 #{rank}: ENTRY [{en}]  =>  EXIT [{ex}]{RESET}")
-
-        dsr_new = row.get('deflated_sharpe', np.nan)
         print(
             f"📌 排名依据: {sort_col} = {row[sort_col]:.3f} | 当前环境: {fm} | 参与币种: {row['n_coins']} 个 | 总笔数: {curr_trades} 笔")
         print("-" * 80)
@@ -367,10 +365,12 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         else:
             print("   - (无 Original 对比数据，当前可能本身就是 Original)")
 
-        # [3] 参数平原防伪
+        # [3] 参数平原防伪 (此处更新了因子个数的输出)
         print(f"\n{BOLD}[3. 邻近参数平原验证 (Parameter Plain)]{RESET}")
-        print(f"   - 保持当前进场，搭配库内【其它所有出场】 -> OOS 平均期望(Pt_Sharpe): {en_neighbor_avg:.3f}")
-        print(f"   - 保持当前出场，搭配库内【其它所有进场】 -> OOS 平均期望(Pt_Sharpe): {ex_neighbor_avg:.3f}")
+        print(
+            f"   - 保持当前进场，搭配库内【 {en_neighbor_count} 种 】其它出场 -> OOS 平均单笔期望: {en_neighbor_avg:.3f}")
+        print(
+            f"   - 保持当前出场，搭配库内【 {ex_neighbor_count} 种 】其它进场 -> OOS 平均单笔期望: {ex_neighbor_avg:.3f}")
 
         # [4] 尾部风险与持仓不对称
         print(f"\n{BOLD}[4. 尾部风险与持仓特征 (Risk & Hold Asymmetry)]{RESET}")
@@ -387,7 +387,6 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         if oos_ret <= 0:
             print(f"   - 利润集权度: {RED}整体OOS期望为负，极权度指标失效{RESET}")
         else:
-            # 修改点：将原先通用的“单一币种”替换为了准确追踪到的妖币名称
             print(f"   - 利润集权度: 盈利最高的【{best_coin}】贡献了总利润的 {top1_coin_pct:.1f}%。")
 
         # ---------------- 最终预警标签 ----------------
@@ -398,7 +397,6 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             for flag in flags:
                 print(f"   {flag}")
         print(f"{BOLD}{'=' * 80}{RESET}")
-
 
 if __name__ == '__main__':
     target_timeframes = ['60m']
