@@ -49,7 +49,7 @@ def load_data(tf='15m'):
     return summary, all_pairs
 
 
-def get_tradable_pool(summary, min_trades=50, min_coins=3):
+def get_tradable_pool(summary, min_trades=50, min_coins=3, min_avg_ret=0.002):
     """
     【新增】实盘净水器：在进入深度分析前，强制剔除统计学意义上的噪音。
     """
@@ -65,6 +65,27 @@ def get_tradable_pool(summary, min_trades=50, min_coins=3):
     df = df[df['n_coins'] >= min_coins]
 
     df = df[(df['oos_sum_all'] > 0) & (df['sum_ret_all'] - df['oos_sum_all'] > 0)]
+
+    # ================= 新增：生存底线过滤 (硬门槛) =================
+    # 抗摩擦底线: 平均单笔收益必须大于绝对阈值 (例如千分之二)
+    is_friction_safe = df['mean_avg_ret'] > min_avg_ret
+
+    # 横截面底线: coin_positive_rate 必须 >= 75%
+    is_coin_robust = df['coin_positive_rate'] >= 0.75
+
+    # 时序底线: 4 个季度中，至少有 3 个季度的 sum_ret_qX 为正
+    is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 3
+
+    # 在代码汇总时，增加三个 Boolean 列
+    df = df.assign(
+        is_friction_safe=is_friction_safe,
+        is_coin_robust=is_coin_robust,
+        is_time_robust=is_time_robust
+    )
+
+    # 任何一项为 False 的策略，直接在最终排序前剔除
+    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust']]
+    # ================================================================
 
     return df
 
@@ -151,10 +172,14 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         print(f"{RED}🚫 没有策略通过硬性过滤条件，建议放宽过滤阈值或重新挖掘。{RESET}")
         return
 
-    # 【核心调整】：不再单纯按 score 排序，改用样本外均笔夏普或 OOS 收益
-    # 此处假设你的表里有 'mean_oos_pt_sharpe'，如果想用 dsr，可以换成 'deflated_sharpe'
-    sort_col = 'mean_oos_pt_sharpe' if 'mean_oos_pt_sharpe' in tradable_summary.columns else 'score'
+    # ================= 新增：核心排序调整 (Calmar 比率思想) =================
+    tradable_summary = tradable_summary.copy()
+    # 避免分母最大回撤为 0 (加极小数避免报错)，且强制取绝对值确保正反向逻辑无误
+    tradable_summary['Sort_Metric'] = tradable_summary['mean_sum_ret'] / tradable_summary['mean_max_dd'].abs().replace(
+        0, 1e-9)
+    sort_col = 'Sort_Metric'
     top_df = tradable_summary.sort_values(sort_col, ascending=False).head(top_n)
+    # ======================================================================
 
     for rank, (_, row) in enumerate(top_df.iterrows(), 1):
         en = row['entry_factor']
@@ -215,7 +240,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
-                        positive_profits > 0 and max_coin_ret > 0) else 0.0
+                    positive_profits > 0 and max_coin_ret > 0) else 0.0
         else:
             mean_win_hold = mean_loss_hold = top1_coin_pct = np.nan
 
@@ -322,8 +347,8 @@ if __name__ == '__main__':
         summary, all_pairs = load_data(tf)
 
         if summary is not None and all_pairs is not None:
-            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战）
-            tradable_summary = get_tradable_pool(summary, min_trades=50, min_coins=3)
+            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002）
+            tradable_summary = get_tradable_pool(summary, min_trades=50, min_coins=3, min_avg_ret=0.002)
 
             # 2. 宏观分析 (传入原始表为了看物理极值，传入净水表为了看真实的百搭规律)
             analyze_macro_ecosystem(summary, tradable_summary)
