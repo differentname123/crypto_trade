@@ -138,7 +138,65 @@ def add_cross_sectional_rank_stable_with_logs(data_dir: str):
     log(f"📁 最终数据已在原目录更新: {os.path.abspath(data_dir)}")
 
 
+def check_rank_fields_exist(data_dir: str):
+    """
+    极速扫描：判断目录下的 K 线文件中，哪些已经包含了截面排名特征字段。
+
+    参数:
+        data_dir (str): 数据目录路径
+
+    返回:
+        Tuple[List[str], List[str]]: 返回一个元组，包含两个列表：
+            - processed_files: 包含目标字段的文件路径列表
+            - unprocessed_files: 不包含目标字段的文件路径列表
+    """
+    kfiles = glob.glob(os.path.join(data_dir, '*_USDT_USDT_1m_kline.csv'))
+    total_files = len(kfiles)
+
+    if total_files == 0:
+        log("❌ 未找到任何目标文件。")
+        return [], []
+
+    log(f"🔍 开始扫描 {total_files} 个文件，检查特征字段是否存在...")
+
+    # 需要检查的目标字段
+    target_cols = {'rank_gain_24h', 'rank_loss_24h'}
+
+    processed_files = []
+    unprocessed_files = []
+
+    start_time = time.time()
+
+    for i, file_path in enumerate(kfiles, 1):
+        # 【核心优化】：nrows=0 意味着只读取 CSV 的表头，不加载数据体，速度极快
+        df_header = pd.read_csv(file_path, nrows=0)
+        current_cols = set(df_header.columns)
+
+        # 判断目标字段是否是当前表头的子集（即是否全部包含）
+        if target_cols.issubset(current_cols):
+            processed_files.append(file_path)
+        else:
+            unprocessed_files.append(file_path)
+
+        # 进度打印
+        if i % 50 == 0 or i == total_files:
+            log(f"  -> 已扫描 {i}/{total_files} 个文件...")
+
+    cost_time = time.time() - start_time
+
+    # 打印统计结果
+    print("=" * 60)
+    log("📊 扫描结果统计：")
+    log(f"✅ 已包含目标字段的文件数: {len(processed_files)} 个")
+    log(f"❌ 未包含目标字段的文件数: {len(unprocessed_files)} 个")
+    log(f"⏱️ 扫描总耗时: {cost_time:.2f} 秒")
+    print("=" * 60)
+
+    return processed_files, unprocessed_files
+
 # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\factor_out_60m\pairs_1INCH.csv')
 # ================= 调用示例 =================
 # 现在只需要传入包含 CSV 原始数据的目录路径即可
-add_cross_sectional_rank_stable_with_logs('../data')
+
+check_rank_fields_exist('../data')
+# add_cross_sectional_rank_stable_with_logs('../data')
