@@ -13,6 +13,7 @@
               (pairs_ALL / pairs_CROSS_COIN_SUMMARY 改由独立还原脚本重建)
  · [性能优化] 统计基元标量化(逐位复刻) / 因子基础量去重缓存 /
               列式内存装配 / BTC 基准按 worker 一次性下发   —— 结果不变
+ · [新增特性] 支持双向回测：静态信号出场同时输出 Long/Short 两行数据
 ================================================================================
 """
 from __future__ import annotations
@@ -822,7 +823,7 @@ def _skew_unbiased(x, n):
     d = x - mean
     d2 = d * d
     m2 = d2.mean()
-    m3 = (d2 * d).mean()          # 与 scipy._moment 的平方求幂顺序一致
+    m3 = (d2 * d).mean()  # 与 scipy._moment 的平方求幂顺序一致
     if not (m2 > 0.0):
         return np.nan
     return float(math.sqrt((n - 1.0) * n) / (n - 2.0) * m3 / m2 ** 1.5)
@@ -869,7 +870,7 @@ def _quantile05_linear(x):
        取代 O(N logN) 全量排序，虚拟下标与 _lerp 分支完全照抄 numpy。"""
     n = x.shape[0]
     vi = (5 / 100.0) * (n - 1)
-    prev = int(vi)                      # vi >= 0，等价 floor
+    prev = int(vi)  # vi >= 0，等价 floor
     g = vi - prev
     nxt = prev + 1
     if nxt >= n:
@@ -911,7 +912,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
             d[prefix + k] = np.nan
         return d
 
-    pos_mask = rets > 0                       # 【性能】胜负掩码只算一次，后面复用
+    pos_mask = rets > 0  # 【性能】胜负掩码只算一次，后面复用
     d[prefix + 'win_rate'] = float(pos_mask.mean() * 100)
     d[prefix + 'sum_ret'] = float(rets.sum() * 100)
     d[prefix + 'avg_ret'] = float(rets.mean() * 100)
@@ -1093,9 +1094,10 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         'mode_pass_counts': {mk: 0 for mk in mode_keys},
     }
     # 【性能/内存】列式装配：不再堆积上百万个 dict，改为每列一个 list。
-    #   列顺序由第一行的键序确定 —— 与 pd.DataFrame(List[Dict]) 的
-    #   fast_unique_multiple_list_gen(sort=False) 行为完全一致（各行键集合恒等）。
     col_data = None
+
+    # 【新增】精确统计真实搜索空间（考虑静态组合产出2行，路径组合产出1行）
+    theoretical_tests = 0
     done = 0
 
     for en in entry_names:
@@ -1106,7 +1108,12 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 stats['skip_same_factor'] += 1
                 continue
 
-            if xn in P_EXITS:
+            is_path_exit = (xn in P_EXITS)
+            # 累加理论测试次数：静态出场测多空(×2)，路径出场仅测多(×1)
+            multiplier = 1 if is_path_exit else 2
+            theoretical_tests += multiplier * len(FILTER_MODES)
+
+            if is_path_exit:
                 spec = P_EXITS[xn]
                 st = F[spec['static']] if (spec['static'] and spec['static'] in F) else zeros_static
                 if HAS_NUMBA:
@@ -1133,72 +1140,97 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 stats['skip_zero_trades'] += 1
                 continue
 
-            rets = exec_px[ext] / exec_px[ent] - 1.0 - cost
-            ok = np.isfinite(rets)
-            ent_base, ext_base, rets_base = ent[ok], ext[ok], rets[ok]
+            # === 计算做多收益 ===
+            rets_long = exec_px[ext] / exec_px[ent] - 1.0 - cost
+            ok_l = np.isfinite(rets_long)
+            ent_base_l, ext_base_l, rets_base_l = ent[ok_l], ext[ok_l], rets_long[ok_l]
+
+            # === 计算做空收益 (仅静态出场支持)，并修正为 U本位 计算 ===
+            if not is_path_exit:
+                # 【关键修复】：U本位 做空的收益率公式应为 (1 - 期末/期初 - 手续费)
+                rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
+                ok_s = np.isfinite(rets_short)
+                ent_base_s, ext_base_s, rets_base_s = ent[ok_s], ext[ok_s], rets_short[ok_s]
 
             for mode_name, rank_col, threshold in FILTER_MODES:
+                filter_label = 'original' if mode_name == 'original' else f"{mode_name}_{threshold}"
+
+                # ================= 处理 LONG =================
                 if mode_name == 'original':
-                    ent_f, ext_f, rets_f = ent_base, ext_base, rets_base
-                    filter_label = 'original'
+                    ent_f, ext_f, rets_f = ent_base_l, ext_base_l, rets_base_l
                 else:
-                    if mode_name == 'top':
-                        entry_ranks = rk_gain[ent_base]
-                    else:
-                        entry_ranks = rk_loss[ent_base]
-
+                    entry_ranks = rk_gain[ent_base_l] if mode_name == 'top' else rk_loss[ent_base_l]
                     mask = entry_ranks <= threshold
-                    ent_f = ent_base[mask]
-                    ext_f = ext_base[mask]
-                    rets_f = rets_base[mask]
-                    filter_label = f"{mode_name}_{threshold}"
+                    ent_f, ext_f, rets_f = ent_base_l[mask], ext_base_l[mask], rets_base_l[mask]
 
-                # 【细化】拆分拦截原因
                 if ent_f.size < cfg['MIN_TRADES_REPORT']:
                     stats['skip_too_few'] += 1
-                    continue
-                if ent_f.size > max_allowed_trades:
+                elif ent_f.size > max_allowed_trades:
                     stats['skip_too_many'] += 1
-                    continue
-
-                # 【细化】记录该 mode 通过
-                stats['mode_pass_counts'][filter_label] += 1
-
-                if btc_c is not None:
-                    bh_rets_f = btc_c[ext_f] / btc_c[ent_f] - 1.0
                 else:
-                    bh_rets_f = None
+                    stats['mode_pass_counts'][filter_label] += 1
+                    bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
 
-                row = dict(coin=coin, entry_factor=en, exit_factor=xn,
-                           filter_mode=filter_label,
-                           entry_density=dens.get(en, np.nan), exit_density=x_dens)
+                    row_l = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Long',
+                                 filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
+                    row_l.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+                    m_is = ent_f < split_bar
 
-                row.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+                    # 【关键修复】：OOS 数据切片 ext_f[~m_is]，原本这里笔误写成了 ext_f[m_is] 导致长度不一致报错
+                    row_l.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
+                                             bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
+                    row_l.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
+                                             start_idx=split_bar,
+                                             bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
+                                             prefix='oos_'))
 
-                m_is = ent_f < split_bar
-                row.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar,
-                                       start_idx=0, bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None,
-                                       prefix='is_'))
+                    if col_data is None:
+                        col_data = {k_: [v_] for k_, v_ in row_l.items()}
+                    else:
+                        for k_, v_ in row_l.items():
+                            col_data[k_].append(v_)
 
-                row.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
-                                       start_idx=split_bar, bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
-                                       prefix='oos_'))
+                # ================= 处理 SHORT (仅静态出场) =================
+                if not is_path_exit:
+                    if mode_name == 'original':
+                        ent_f, ext_f, rets_f = ent_base_s, ext_base_s, rets_base_s
+                    else:
+                        entry_ranks = rk_gain[ent_base_s] if mode_name == 'top' else rk_loss[ent_base_s]
+                        mask = entry_ranks <= threshold
+                        ent_f, ext_f, rets_f = ent_base_s[mask], ext_base_s[mask], rets_base_s[mask]
 
-                if col_data is None:
-                    col_data = {k_: [v_] for k_, v_ in row.items()}
-                else:
-                    for k_, v_ in row.items():
-                        col_data[k_].append(v_)
+                    if ent_f.size < cfg['MIN_TRADES_REPORT']:
+                        stats['skip_too_few'] += 1
+                    elif ent_f.size > max_allowed_trades:
+                        stats['skip_too_many'] += 1
+                    else:
+                        stats['mode_pass_counts'][filter_label] += 1
+                        bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
+
+                        row_s = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Short',
+                                     filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
+                        row_s.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+                        m_is = ent_f < split_bar
+
+                        # 【关键修复】：OOS 数据切片 ext_f[~m_is]，原本这里笔误写成了 ext_f[m_is] 导致长度不一致报错
+                        row_s.update(
+                            trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
+                                        bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
+                        row_s.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
+                                                 start_idx=split_bar,
+                                                 bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
+                                                 prefix='oos_'))
+
+                        if col_data is None:
+                            col_data = {k_: [v_] for k_, v_ in row_s.items()}
+                        else:
+                            for k_, v_ in row_s.items():
+                                col_data[k_].append(v_)
 
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
 
     # ==================================================================
     # 【新增】无感注入"测试基数"(多重检验搜索空间)，用于事后精确还原 DSR
-    #   n_trials_combos : 入场×出场 组合数（原口径，只按此计算会让 DSR 虚高）
-    #   n_trials_modes  : 横截面环境过滤模式数（本次为 15）
-    #   n_trials_total  : 真实搜索空间 = 组合数 × 模式数  ← 还原 DSR 请用这一列
-    #   n_trials_alive  : 实际存留(落盘)的记录数（另一种"有效试验数"口径）
-    # 这些列是常量列，不参与任何回测逻辑，纯粹为可复现性服务。
     # ==================================================================
     if not out.empty:
         n_modes = len(FILTER_MODES)
@@ -1206,7 +1238,8 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         out['kline_days'] = float(kline_days)
         out['n_trials_combos'] = int(stats['total_combos'])
         out['n_trials_modes'] = int(n_modes)
-        out['n_trials_total'] = int(stats['total_combos'] * n_modes)
+        # 【修改】使用精确计算的理论测试次数，而非简单的 combos * modes
+        out['n_trials_total'] = int(theoretical_tests)
         out['n_trials_alive'] = int(len(out))
 
     return out, stats, kline_days
@@ -1261,8 +1294,6 @@ def mine_symbol_wrapper(args):
         import traceback
         tb = traceback.format_exc()
         return kf, coin, 0, 0, {'total_combos': 0}, 0, f"执行异常: {e}\n{tb}"
-
-
 
 
 # ======================================================================
@@ -1371,8 +1402,8 @@ def main(cfg=CFG):
     print(f"\n🚀 启动并发回测... (分配进程核心数: {max_workers})")
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,
-                                               initializer=_init_worker,
-                                               initargs=(btc_close,)) as executor:
+                                                initializer=_init_worker,
+                                                initargs=(btc_close,)) as executor:
         futures = {executor.submit(mine_symbol_wrapper, t): t for t in tasks}
 
         for fut in concurrent.futures.as_completed(futures):

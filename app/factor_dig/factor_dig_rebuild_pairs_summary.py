@@ -34,7 +34,7 @@ KEY_COLS = ['entry_factor', 'exit_factor', 'filter_mode']
 
 # 【完美平衡 1】：这是微观明细表 pairs_ALL.csv 需要写入的极简字段（防止几千万行把磁盘撑爆）
 ALL_PAIRS_NEEDED = [
-    'coin', 'symbol',
+    'coin', 'symbol', 'direction',
     'trades', 'win_rate', 'win_hold_bars', 'loss_hold_bars',
     'sum_ret', 'oos_sum_ret'
 ]
@@ -76,7 +76,9 @@ def _atomic_to_csv(df, path):
 
 
 def _list_coin_files(out_dir):
-    exclude = {'pairs_ALL.csv', 'pairs_CROSS_COIN_SUMMARY.csv'}
+    exclude = {'pairs_ALL.csv', 'pairs_CROSS_COIN_SUMMARY.csv',
+               'pairs_ALL_Long.csv', 'pairs_ALL_Short.csv',
+               'pairs_CROSS_COIN_SUMMARY_Long.csv', 'pairs_CROSS_COIN_SUMMARY_Short.csv'}
     fs = []
     for f in sorted(os.listdir(out_dir)):
         if not f.startswith('pairs_') or not f.endswith('.csv'): continue
@@ -239,37 +241,58 @@ def rebuild_dir(out_dir, rcfg=RCFG):
 
     if not (rcfg['REBUILD_PAIRS_ALL'] or rcfg['REBUILD_SUMMARY']): return
 
-    all_path = os.path.join(out_dir, 'pairs_ALL.csv')
-    all_tmp = all_path + '.tmp'
-    fo = None
-    header_pending = True
+    fo_long = fo_short = None
+    header_long_pending = header_short_pending = True
+
+    if rcfg['REBUILD_PAIRS_ALL']:
+        all_long_path = os.path.join(out_dir, 'pairs_ALL_Long.csv')
+        all_long_tmp = all_long_path + '.tmp'
+        fo_long = open(all_long_tmp, 'w', newline='', encoding='utf-8-sig')
+
+        all_short_path = os.path.join(out_dir, 'pairs_ALL_Short.csv')
+        all_short_tmp = all_short_path + '.tmp'
+        fo_short = open(all_short_tmp, 'w', newline='', encoding='utf-8-sig')
+
+    acc_long = GroupAccumulator() if rcfg['REBUILD_SUMMARY'] else None
+    acc_short = GroupAccumulator() if rcfg['REBUILD_SUMMARY'] else None
+
+    trials = {c: 0 for c in TRIAL_COLS}
+    n_rows_total = 0
 
     # 获取列名，做安全过滤
     head_df = pd.read_csv(files[0], nrows=0)
     usecols = [c for c in NEED_COLS if c in head_df.columns]
-
-    # pairs_ALL.csv 只写入明细表真正需要的极简列，防止磁盘与分析脚本爆炸
     write_cols = [c for c in (KEY_COLS + ALL_PAIRS_NEEDED) if c in head_df.columns]
-
-    if rcfg['REBUILD_PAIRS_ALL']:
-        fo = open(all_tmp, 'w', newline='', encoding='utf-8-sig')
-
-    acc = GroupAccumulator() if rcfg['REBUILD_SUMMARY'] else None
-    trials = {c: 0 for c in TRIAL_COLS}
-    n_rows_total = 0
 
     try:
         for i, f in enumerate(files, 1):
             n_rows_file = 0
             for chunk in pd.read_csv(f, usecols=usecols, chunksize=rcfg['CHUNKSIZE'], low_memory=False):
-                # 1. 向磁盘写明细表：只写最关键的 8 个列！
-                if fo is not None:
-                    chunk[write_cols].to_csv(fo, index=False, header=header_pending)
-                    header_pending = False
+                # 切分多空数据集
+                if 'direction' in chunk.columns:
+                    is_long = chunk['direction'].astype(str).str.lower() == 'long'
+                    is_short = chunk['direction'].astype(str).str.lower() == 'short'
+                    chunk_long = chunk[is_long]
+                    chunk_short = chunk[is_short]
+                else:
+                    # 兼容老数据格式，如果没有方向列，默认全进做多
+                    chunk_long = chunk
+                    chunk_short = pd.DataFrame(columns=chunk.columns)
 
-                # 2. 累加宏观汇总表：使用全部指标（max_dd, oos_sharpe等）在内存中累加
-                if acc is not None:
-                    acc.update(chunk)
+                # 1. 向磁盘分别写多空明细表
+                if fo_long is not None and not chunk_long.empty:
+                    chunk_long[write_cols].to_csv(fo_long, index=False, header=header_long_pending)
+                    header_long_pending = False
+
+                if fo_short is not None and not chunk_short.empty:
+                    chunk_short[write_cols].to_csv(fo_short, index=False, header=header_short_pending)
+                    header_short_pending = False
+
+                # 2. 分别累加多空宏观汇总表
+                if acc_long is not None and not chunk_long.empty:
+                    acc_long.update(chunk_long)
+                if acc_short is not None and not chunk_short.empty:
+                    acc_short.update(chunk_short)
 
                 for tc in TRIAL_COLS:
                     if tc in chunk.columns:
@@ -283,44 +306,49 @@ def rebuild_dir(out_dir, rcfg=RCFG):
             print(f"   [{i}/{len(files)}] {os.path.basename(f):<38s} rows={n_rows_file:>10,} | 累计 {n_rows_total:,}")
             gc.collect()
     finally:
-        if fo is not None:
-            fo.close()
+        if fo_long is not None:
+            fo_long.close()
+        if fo_short is not None:
+            fo_short.close()
 
     if rcfg['REBUILD_PAIRS_ALL']:
-        _atomic_replace(all_tmp, all_path)
-        print(f"✅ pairs_ALL.csv 已重建完毕(明细字段极简版)")
+        _atomic_replace(all_long_tmp, all_long_path)
+        _atomic_replace(all_short_tmp, all_short_path)
+        print(f"✅ pairs_ALL_Long.csv & pairs_ALL_Short.csv 已重建完毕(多空明细彻底分离)")
 
-    if acc is None: return
+    if acc_long is None and acc_short is None: return
 
-    summ = acc.finalize()
-    del acc
-    gc.collect()
+    for name, acc in [('Long', acc_long), ('Short', acc_short)]:
+        if acc is None: continue
+        summ = acc.finalize()
+        if summ.empty:
+            continue
 
-    legacy_trials = trials.get('n_trials_combos', 0)
-    total_trials = trials.get('n_trials_total', 0)
-    alive_trials = trials.get('n_trials_alive', 0)
+        legacy_trials = trials.get('n_trials_combos', 0)
+        total_trials = trials.get('n_trials_total', 0)
+        alive_trials = trials.get('n_trials_alive', 0)
 
-    if total_trials <= 1:
-        total_trials = int(
-            summ['entry_factor'].nunique() * summ['exit_factor'].nunique() * summ['filter_mode'].nunique())
-        legacy_trials = int(summ['entry_factor'].nunique() * summ['exit_factor'].nunique())
+        if total_trials <= 1:
+            total_trials = int(
+                summ['entry_factor'].nunique() * summ['exit_factor'].nunique() * summ['filter_mode'].nunique())
+            legacy_trials = int(summ['entry_factor'].nunique() * summ['exit_factor'].nunique())
 
-    mode = rcfg['TRIALS_MODE']
-    used_trials = {'total': total_trials, 'combos': legacy_trials, 'alive': alive_trials}.get(mode, total_trials)
-    if used_trials <= 1: used_trials = total_trials
+        mode = rcfg['TRIALS_MODE']
+        used_trials = {'total': total_trials, 'combos': legacy_trials, 'alive': alive_trials}.get(mode, total_trials)
+        if used_trials <= 1: used_trials = total_trials
 
-    summ['total_trials'] = int(used_trials)
-    summ['deflated_sharpe'] = calc_dsr_vec(summ, used_trials)
-    summ['total_trials_legacy'] = int(max(legacy_trials, 0))
-    summ['deflated_sharpe_legacy'] = calc_dsr_vec(summ, legacy_trials)
-    summ['trials_mode'] = mode
+        summ['total_trials'] = int(used_trials)
+        summ['deflated_sharpe'] = calc_dsr_vec(summ, used_trials)
+        summ['total_trials_legacy'] = int(max(legacy_trials, 0))
+        summ['deflated_sharpe_legacy'] = calc_dsr_vec(summ, legacy_trials)
+        summ['trials_mode'] = mode
 
-    summ = summ.reindex(columns=[c for c in FINAL_ORDER if c in summ.columns])
-    summ.sort_values('score', ascending=False, inplace=True)
+        summ = summ.reindex(columns=[c for c in FINAL_ORDER if c in summ.columns])
+        summ.sort_values('score', ascending=False, inplace=True)
 
-    sum_path = os.path.join(out_dir, 'pairs_CROSS_COIN_SUMMARY.csv')
-    _atomic_to_csv(summ, sum_path)
-    print(f"✅ pairs_CROSS_COIN_SUMMARY.csv 已重建完毕(全量宏观指标保留): -> {sum_path}")
+        sum_path = os.path.join(out_dir, f'pairs_CROSS_COIN_SUMMARY_{name}.csv')
+        _atomic_to_csv(summ, sum_path)
+        print(f"✅ pairs_CROSS_COIN_SUMMARY_{name}.csv 已重建完毕(全量宏观指标保留): -> {sum_path}")
     print()
 
 
