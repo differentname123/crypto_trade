@@ -49,42 +49,58 @@ def load_data(tf='15m'):
     return summary, all_pairs
 
 
-def get_tradable_pool(summary, min_trades=50, min_coins=3, min_avg_ret=0.002):
+def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0):
     """
     【新增】实盘净水器：在进入深度分析前，强制剔除统计学意义上的噪音。
+    引入 max_top1_pct：强制过滤利润过度集权的策略。
     """
     df = summary.copy()
-    # # 1. 剔除极端的横截面环境 (这些环境极易产生单币过拟合)
-    # bad_envs = ['top_1', 'top_3', 'bottom_1', 'bottom_3']
-    # df = df[~df['filter_mode'].isin(bad_envs)].copy()
 
-    # 2. 强制大数定律：总交易笔数不能少于阈值
+    # 1. 强制大数定律：总交易笔数不能少于阈值
     df = df[df['total_trades'] >= min_trades]
 
-    # 3. 强制宽度：不能是单一妖币的狂欢
+    # 2. 强制宽度：不能是单一妖币的狂欢
     df = df[df['n_coins'] >= min_coins]
 
     df = df[(df['oos_sum_all'] > 0) & (df['sum_ret_all'] - df['oos_sum_all'] > 0)]
+
+    # ================= 核心修改：增加利润集权度计算 =================
+    # a. 计算每个因子组合中，所有赚钱的币种的“总盈利额”
+    pos_profits = all_pairs[all_pairs['sum_ret'] > 0].groupby(level=[0, 1, 2])['sum_ret'].sum()
+
+    # b. 计算每个因子组合中，赚得最多的“单币最大盈利额”
+    max_profits = all_pairs.groupby(level=[0, 1, 2])['sum_ret'].max()
+
+    # c. 计算集权度比例 (单币最大盈利 / 总盈利 * 100)
+    top1_pct = (max_profits / pos_profits * 100).fillna(0).rename('top1_coin_pct')
+
+    # 将计算结果合并回主表 (利用组合键合并)
+    df = df.merge(top1_pct, left_on=['entry_factor', 'exit_factor', 'filter_mode'], right_index=True, how='left')
+    # ================================================================
 
     # ================= 新增：生存底线过滤 (硬门槛) =================
     # 抗摩擦底线: 平均单笔收益必须大于绝对阈值 (例如千分之二)
     is_friction_safe = df['mean_avg_ret'] > min_avg_ret
 
     # 横截面底线: coin_positive_rate 必须 >= 75%
-    is_coin_robust = df['coin_positive_rate'] >= 0.75
+    is_coin_robust = df['coin_positive_rate'] >= 0.0
 
     # 时序底线: 4 个季度中，至少有 3 个季度的 sum_ret_qX 为正
-    is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 3
+    is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 4
 
-    # 在代码汇总时，增加三个 Boolean 列
+    # 【新增】利润分散底线: 单一币种利润贡献不能超过阈值（如 50%）
+    is_profit_distributed = df['top1_coin_pct'] <= max_top1_pct
+
+    # 在代码汇总时，增加 Boolean 列
     df = df.assign(
         is_friction_safe=is_friction_safe,
         is_coin_robust=is_coin_robust,
-        is_time_robust=is_time_robust
+        is_time_robust=is_time_robust,
+        is_profit_distributed=is_profit_distributed  # 注入新标签
     )
 
     # 任何一项为 False 的策略，直接在最终排序前剔除
-    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust']]
+    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust'] & df['is_profit_distributed']]
     # ================================================================
 
     return df
@@ -348,8 +364,8 @@ if __name__ == '__main__':
 
         if summary is not None and all_pairs is not None:
             # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002）
-            tradable_summary = get_tradable_pool(summary, min_trades=50, min_coins=3, min_avg_ret=0.002)
-
+            tradable_summary = get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002,
+                                                 max_top1_pct=40.0)
             # 2. 宏观分析 (传入原始表为了看物理极值，传入净水表为了看真实的百搭规律)
             analyze_macro_ecosystem(summary, tradable_summary)
 

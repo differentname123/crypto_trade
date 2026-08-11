@@ -33,8 +33,11 @@ RCFG = dict(
 KEY_COLS = ['entry_factor', 'exit_factor', 'filter_mode']
 
 # 【完美平衡 1】：这是微观明细表 pairs_ALL.csv 需要写入的极简字段（防止几千万行把磁盘撑爆）
-ALL_PAIRS_NEEDED = ['trades', 'win_rate', 'win_hold_bars', 'loss_hold_bars', 'sum_ret']
-
+ALL_PAIRS_NEEDED = [
+    'coin', 'symbol',
+    'trades', 'win_rate', 'win_hold_bars', 'loss_hold_bars',
+    'sum_ret', 'oos_sum_ret'
+]
 # 【完美平衡 2】：恢复了 SUMMARY 汇总表里的所有宏观核心指标，保证你复盘时什么都能看到！
 SUM_COLS = ['trades', 'sum_ret', 'oos_sum_ret',
             'ret_q1', 'ret_q2', 'ret_q3', 'ret_q4',
