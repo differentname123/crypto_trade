@@ -179,7 +179,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
     print(f"\n{YELLOW}▶ [3. 真实百搭入场因子榜单 (Universal Entry Top 3)]{RESET}")
     if not pos_combos.empty:
         total_exits = tradable_summary['exit_factor'].nunique()
-        univ_entries = pos_combos.groupby('entry_factor')['exit_factor'].nunique().sort_values(ascending=False).head(3)
+        univ_entries = pos_combos.groupby('entry_factor')['exit_factor'].nunique().sort_values(ascending=False).head(10)
 
         for rank, (en, count) in enumerate(univ_entries.items(), 1):
             ratio = count / total_exits * 100
@@ -194,7 +194,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
     print(f"\n{YELLOW}▶ [4. 真实百搭出场因子榜单 (Universal Exit Top 3)]{RESET}")
     if not pos_combos.empty:
         total_entries = tradable_summary['entry_factor'].nunique()
-        univ_exits = pos_combos.groupby('exit_factor')['entry_factor'].nunique().sort_values(ascending=False).head(3)
+        univ_exits = pos_combos.groupby('exit_factor')['entry_factor'].nunique().sort_values(ascending=False).head(10)
 
         for rank, (ex, count) in enumerate(univ_exits.items(), 1):
             ratio = count / total_entries * 100
@@ -408,10 +408,10 @@ if __name__ == '__main__':
         if summary is not None and all_pairs is not None:
             # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002, 利润极权上限40%, 允许最大衰减40%）
             tradable_summary = get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002,
-                                                 max_top1_pct=40.0, max_decay_rate=40.0)
+                                                 max_top1_pct=20.0, max_decay_rate=40.0)
 
             # 2. 宏观分析 (传入原始表为了看物理极值，传入净水表为了看真实的百搭规律)
             analyze_macro_ecosystem(summary, tradable_summary)
 
             # 3. 微观深度体检 (严格在净水表里提取 Top 10)
-            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=10)
+            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=50)
