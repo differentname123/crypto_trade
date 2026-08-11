@@ -49,10 +49,12 @@ def load_data(tf='15m'):
     return summary, all_pairs
 
 
-def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0):
+def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0,
+                      max_decay_rate=40.0):
     """
     【新增】实盘净水器：在进入深度分析前，强制剔除统计学意义上的噪音。
     引入 max_top1_pct：强制过滤利润过度集权的策略。
+    引入 max_decay_rate：强制过滤 OOS 收益率衰减过大的过拟合策略。
     """
     df = summary.copy()
 
@@ -82,25 +84,38 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
     # 抗摩擦底线: 平均单笔收益必须大于绝对阈值 (例如千分之二)
     is_friction_safe = df['mean_avg_ret'] > min_avg_ret
 
-    # 横截面底线: coin_positive_rate 必须 >= 75%
+    # 横截面底线: coin_positive_rate 必须 >= 0.0
     is_coin_robust = df['coin_positive_rate'] >= 0.0
 
-    # 时序底线: 4 个季度中，至少有 3 个季度的 sum_ret_qX 为正
+    # 时序底线: 4 个季度中，至少有 4 个季度的 sum_ret_qX 为正
     is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 4
 
     # 【新增】利润分散底线: 单一币种利润贡献不能超过阈值（如 50%）
     is_profit_distributed = df['top1_coin_pct'] <= max_top1_pct
+
+    # ================= 【新增】时序衰减底线 (防范 -56.9% 塌方) =================
+    is_trades_arr = np.maximum(df['total_trades'] * 0.7, 1)
+    oos_trades_arr = np.maximum(df['total_trades'] * 0.3, 1)
+    is_pt_ret_arr = (df['sum_ret_all'] - df['oos_sum_all']) / is_trades_arr
+    oos_pt_ret_arr = df['oos_sum_all'] / oos_trades_arr
+
+    decay_rate_arr = (oos_pt_ret_arr / is_pt_ret_arr - 1) * 100
+    # 必须保证 IS 赚钱，且 OOS 折损率不能低于负的允许最大值 (例如允许衰减40%，则过滤掉跌幅超 -40% 的策略)
+    is_decay_safe = (is_pt_ret_arr > 0) & (decay_rate_arr >= -max_decay_rate)
+    # =========================================================================
 
     # 在代码汇总时，增加 Boolean 列
     df = df.assign(
         is_friction_safe=is_friction_safe,
         is_coin_robust=is_coin_robust,
         is_time_robust=is_time_robust,
-        is_profit_distributed=is_profit_distributed  # 注入新标签
+        is_profit_distributed=is_profit_distributed,  # 注入新标签
+        is_decay_safe=is_decay_safe  # 注入衰减防护网标签
     )
 
     # 任何一项为 False 的策略，直接在最终排序前剔除
-    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust'] & df['is_profit_distributed']]
+    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust'] & df['is_profit_distributed'] & df[
+        'is_decay_safe']]
     # ================================================================
 
     return df
@@ -257,8 +272,22 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
                     positive_profits > 0 and max_coin_ret > 0) else 0.0
+
+            # ================= 新增：精准定位最赚钱的“妖币”名称 =================
+            best_coin = "未知标的"
+            if positive_profits > 0:
+                # 使用 argmax 取整型位置，避免 MultiIndex 重复索引导致的 DataFrame 抽取错误
+                max_idx_pos = combo_details['sum_ret'].argmax()
+                best_row = combo_details.iloc[max_idx_pos]
+                if 'coin' in best_row:
+                    best_coin = str(best_row['coin'])
+                elif 'symbol' in best_row:
+                    best_coin = str(best_row['symbol'])
+            # ====================================================================
+
         else:
             mean_win_hold = mean_loss_hold = top1_coin_pct = np.nan
+            best_coin = "未知标的"
 
         # ================= 生成客观预警 (红绿灯) =================
         flags = []
@@ -343,7 +372,8 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, top_n=5):
         if oos_ret <= 0:
             print(f"   - 利润集权度: {RED}整体OOS期望为负，极权度指标失效{RESET}")
         else:
-            print(f"   - 利润集权度: 盈利最高的【单一币种】贡献了总利润的 {top1_coin_pct:.1f}%。")
+            # 修改点：将原先通用的“单一币种”替换为了准确追踪到的妖币名称
+            print(f"   - 利润集权度: 盈利最高的【{best_coin}】贡献了总利润的 {top1_coin_pct:.1f}%。")
 
         # ---------------- 最终预警标签 ----------------
         print(f"\n{BOLD}▶ 智能红绿灯研判提示:{RESET}")
@@ -363,9 +393,10 @@ if __name__ == '__main__':
         summary, all_pairs = load_data(tf)
 
         if summary is not None and all_pairs is not None:
-            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002）
+            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002, 利润极权上限40%, 允许最大衰减40%）
             tradable_summary = get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002,
-                                                 max_top1_pct=40.0)
+                                                 max_top1_pct=40.0, max_decay_rate=40.0)
+
             # 2. 宏观分析 (传入原始表为了看物理极值，传入净水表为了看真实的百搭规律)
             analyze_macro_ecosystem(summary, tradable_summary)
 
