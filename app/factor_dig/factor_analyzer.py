@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
- 因子组合 深度防伪体检与宏观生态分析 (Pro Version 2.0 - 实盘净水器版)
+ 因子组合 深度防伪体检与宏观生态分析 (Pro Version 2.0 - 极简实盘净水器版)
 --------------------------------------------------------------------------------
  核心定位：你的“最终实盘拍板”验金石。
- 本次升级：前置隔离“妖币拟合”与“单笔幸存者偏差”，确保进入 Top 解剖台的策略
-           全部具备【统计显著性】与【横截面普适性】。
+ 本次升级：剔除统计学错觉与均值陷阱，引入实盘摩擦抗性与因子真实普适率。
 ================================================================================
 """
 import os
@@ -57,12 +56,9 @@ def load_data(tf='15m'):
     return summary, all_pairs
 
 
-def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0,
-                      max_decay_rate=40.0):
+def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0):
     """
-    【新增】实盘净水器：在进入深度分析前，强制剔除统计学意义上的噪音。
-    引入 max_top1_pct：强制过滤利润过度集权的策略。
-    引入 max_decay_rate：强制过滤 OOS 收益率衰减过大的过拟合策略。
+    【重构】实盘净水器：去除不合理的时序强限制和70/30强拆，保留底层逻辑过滤。
     """
     df = summary.copy()
 
@@ -72,59 +68,32 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
     # 2. 强制宽度：不能是单一妖币的狂欢
     df = df[df['n_coins'] >= min_coins]
 
+    # 保留基本的正期望底线
     df = df[(df['oos_sum_all'] > 0) & (df['sum_ret_all'] - df['oos_sum_all'] > 0)]
 
-    # ================= 核心修改：增加利润集权度计算 =================
-    # a. 计算每个因子组合中，所有赚钱的币种的“总盈利额”
+    # ================= 利润集权度计算 =================
     pos_profits = all_pairs[all_pairs['sum_ret'] > 0].groupby(level=[0, 1, 2])['sum_ret'].sum()
-
-    # b. 计算每个因子组合中，赚得最多的“单币最大盈利额”
     max_profits = all_pairs.groupby(level=[0, 1, 2])['sum_ret'].max()
-
-    # c. 计算集权度比例 (单币最大盈利 / 总盈利 * 100)
     top1_pct = (max_profits / pos_profits * 100).fillna(0).rename('top1_coin_pct')
-
-    # 将计算结果合并回主表 (利用组合键合并)
     df = df.merge(top1_pct, left_on=['entry_factor', 'exit_factor', 'filter_mode'], right_index=True, how='left')
-    # ================================================================
 
-    # ================= 新增：生存底线过滤 (硬门槛) =================
-    # 抗摩擦底线: 平均单笔收益必须大于绝对阈值 (例如千分之二)
+    # ================= 生存底线过滤 =================
     is_friction_safe = df['mean_avg_ret'] > min_avg_ret
 
-    # 横截面底线: coin_positive_rate 必须 >= 0.0
-    is_coin_robust = df['coin_positive_rate'] >= 0.0
+    # 修正：横截面有效率必须大于50%才有普适意义，而不是>=0
+    is_coin_robust = df['coin_positive_rate'] > 0.50
 
-    # 时序底线: 4 个季度中，至少有 4 个季度的 sum_ret_qX 为正
-    is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 4
-
-    # 【新增】利润分散底线: 单一币种利润贡献不能超过阈值（如 50%）
     is_profit_distributed = df['top1_coin_pct'] <= max_top1_pct
 
-    # ================= 【新增】时序衰减底线 (防范 -56.9% 塌方) =================
-    is_trades_arr = np.maximum(df['total_trades'] * 0.7, 1)
-    oos_trades_arr = np.maximum(df['total_trades'] * 0.3, 1)
-    is_pt_ret_arr = (df['sum_ret_all'] - df['oos_sum_all']) / is_trades_arr
-    oos_pt_ret_arr = df['oos_sum_all'] / oos_trades_arr
-
-    decay_rate_arr = (oos_pt_ret_arr / is_pt_ret_arr - 1) * 100
-    # 必须保证 IS 赚钱，且 OOS 折损率不能低于负的允许最大值 (例如允许衰减40%，则过滤掉跌幅超 -40% 的策略)
-    is_decay_safe = (is_pt_ret_arr > 0) & (decay_rate_arr >= -max_decay_rate)
-    # =========================================================================
-
-    # 在代码汇总时，增加 Boolean 列
+    # 汇总过滤条件
     df = df.assign(
         is_friction_safe=is_friction_safe,
         is_coin_robust=is_coin_robust,
-        is_time_robust=is_time_robust,
-        is_profit_distributed=is_profit_distributed,  # 注入新标签
-        is_decay_safe=is_decay_safe  # 注入衰减防护网标签
+        is_profit_distributed=is_profit_distributed
     )
 
-    # 任何一项为 False 的策略，直接在最终排序前剔除
-    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_time_robust'] & df['is_profit_distributed'] & df[
-        'is_decay_safe']]
-    # ================================================================
+    # 剔除无效逻辑后的新过滤网
+    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_profit_distributed']]
 
     return df
 
@@ -132,14 +101,13 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
 def analyze_macro_ecosystem(summary, tradable_summary):
     """
     模块 A：宏观生态物理规律扫描
-    注意：物理规律梯度用全量数据看，但百搭因子必须用清洗后的 tradable_summary 看。
     """
     print(f"\n{BOLD}{'=' * 90}{RESET}")
     print(f"{CYAN}{BOLD} 🌍 模块 A: 宏观生态物理规律扫描 (Macro Ecosystem){RESET}")
     print(f"{BOLD}{'=' * 90}{RESET}")
 
     # ---------------------------------------------------------
-    # 1. 截面环境过滤响应梯度 (用全量 summary，展示物理规律的极限)
+    # 1. 截面环境过滤响应梯度
     # ---------------------------------------------------------
     print(f"\n{YELLOW}▶ [1. 截面环境过滤响应梯度 (Filter Gradient Response)]{RESET}")
     grad_top, grad_bot = {}, {}
@@ -168,7 +136,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
     print(f"   {GREEN}💡 研判提示：数值随条件收紧而平滑/阶梯上升，则证明该截面过滤逻辑有效！{RESET}")
 
     # ---------------------------------------------------------
-    # 2. 全局环境倾向 (用清洗后的 tradable_summary)
+    # 2. 全局环境倾向
     # ---------------------------------------------------------
     print(f"\n{YELLOW}▶ [2. 稳健全局环境倾向 (Robust Global Regime Preference)]{RESET}")
     pos_combos = tradable_summary[tradable_summary['oos_sum_all'] > 0]
@@ -182,7 +150,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
         print(f"   {RED}剔除噪音后，无稳健正期望组合。{RESET}")
 
     # ---------------------------------------------------------
-    # 3. 百搭入场榜单 (用清洗后的 tradable_summary)
+    # 3. 百搭入场榜单
     # ---------------------------------------------------------
     print(f"\n{YELLOW}▶ [3. 真实百搭入场因子榜单 (Universal Entry Top 3)]{RESET}")
     if not pos_combos.empty:
@@ -197,7 +165,7 @@ def analyze_macro_ecosystem(summary, tradable_summary):
         print(f"   {RED}无足够数据计算百搭因子。{RESET}")
 
     # ---------------------------------------------------------
-    # 4. 百搭出场榜单 (用清洗后的 tradable_summary) 【新增模块】
+    # 4. 百搭出场榜单
     # ---------------------------------------------------------
     print(f"\n{YELLOW}▶ [4. 真实百搭出场因子榜单 (Universal Exit Top 3)]{RESET}")
     if not pos_combos.empty:
@@ -215,18 +183,18 @@ def analyze_macro_ecosystem(summary, tradable_summary):
 def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
     """
     模块 B：微观组合五维防伪体检
-    注意：使用 tradable_summary 进行排序和抽取，彻底屏蔽“1笔交易爆赚1500%”的妖孽策略。
+    核心修改：彻底废弃 70/30假衰减率、均值参数陷阱。新增单边滑点容忍度与真胜率。
     """
     print(f"\n\n{BOLD}{'=' * 90}{RESET}")
     print(f"{CYAN}{BOLD} 🔬 模块 B: 微观组合五维防伪体检 (Micro Deep-Dive){RESET}")
-    print(f"    (当前展示的策略已通过: 笔数>=50, 币种>=3, 排除极端截面 的初筛)")
+    print(f"    (当前展示的策略已通过: 笔数>=50, 币种>=3, 胜率>50%, 排除极端截面 的初筛)")
     print(f"{BOLD}{'=' * 90}{RESET}")
 
     if tradable_summary.empty:
         print(f"{RED}🚫 没有策略通过硬性过滤条件，建议放宽过滤阈值或重新挖掘。{RESET}")
         return
 
-    # ================= 【新增】周期转换逻辑 =================
+    # ================= 周期转换逻辑 =================
     match = re.match(r'(\d+)([mhd])', str(tf).lower())
     if match:
         val = float(match.group(1))
@@ -240,64 +208,53 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
         else:
             bars_to_days = 1.0
     else:
-        bars_to_days = 1.0  # 解析失败时的默认值
-    # ======================================================
+        bars_to_days = 1.0
 
-    # ================= 核心排序调整 (Calmar 比率思想) =================
+        # ================= 核心排序调整 (Calmar 比率) =================
     tradable_summary = tradable_summary.copy()
     tradable_summary['Sort_Metric'] = tradable_summary['mean_sum_ret'] / tradable_summary['mean_max_dd'].abs().replace(
         0, 1e-9)
     sort_col = 'Sort_Metric'
     top_df = tradable_summary.sort_values(sort_col, ascending=False).head(top_n)
-    # ======================================================================
 
     for rank, (_, row) in enumerate(top_df.iterrows(), 1):
         en = row['entry_factor']
         ex = row['exit_factor']
         fm = row['filter_mode']
 
-        # ================= 数据提取与计算区 =================
-        oos_ret = row['oos_sum_all']
-        is_ret = row['sum_ret_all'] - oos_ret
+        # ================= 核心指标提取与重构 =================
+        curr_trades = row['total_trades']
+        avg_ret_pct = row['mean_avg_ret'] * 100  # 平均单笔收益百分比
 
-        is_trades = max(row['total_trades'] * 0.7, 1)
-        oos_trades = max(row['total_trades'] * 0.3, 1)
+        # 🟢 新增：盈亏平衡单边滑点容忍度 (决定实盘生死)
+        break_even_slippage = avg_ret_pct / 2.0
 
-        is_pt_ret = is_ret / is_trades
-        oos_pt_ret = oos_ret / oos_trades
-
-        if is_pt_ret <= 0:
-            decay_rate = -999.0
-        else:
-            decay_rate = (oos_pt_ret / is_pt_ret - 1) * 100
-
-        # --------- 邻近参数平原验证计算 (增加计算参与比对的因子个数) ---------
+        # --------- 邻近参数普适率 (彻底替换均值陷阱) ---------
         same_en_df = summary[
             (summary['entry_factor'] == en) & (summary['filter_mode'] == fm) & (summary['exit_factor'] != ex)]
         same_ex_df = summary[
             (summary['exit_factor'] == ex) & (summary['filter_mode'] == fm) & (summary['entry_factor'] != en)]
 
-        en_neighbor_avg = same_en_df['mean_oos_pt_sharpe'].mean() if not same_en_df.empty else np.nan
-        ex_neighbor_avg = same_ex_df['mean_oos_pt_sharpe'].mean() if not same_ex_df.empty else np.nan
-
-        # 新增：记录有多少个因子参与了对比测试
         en_neighbor_count = len(same_en_df)
         ex_neighbor_count = len(same_ex_df)
+
+        en_pos_rate = (same_en_df['mean_oos_pt_sharpe'] > 0).mean() * 100 if en_neighbor_count > 0 else 0
+        ex_pos_rate = (same_ex_df['mean_oos_pt_sharpe'] > 0).mean() * 100 if ex_neighbor_count > 0 else 0
         # ------------------------------------------------------------------
 
-        # 标的过滤效能 (对比 Original 环境)
+        # 标的过滤效能 (保留原始对比框架，去掉花哨跳转)
         orig_row = summary[
             (summary['entry_factor'] == en) & (summary['exit_factor'] == ex) & (summary['filter_mode'] == 'original')]
         if not orig_row.empty:
-            orig_pt_sharpe = orig_row['mean_oos_pt_sharpe'].values[0]
             orig_trades = orig_row['total_trades'].values[0]
+            orig_coin_rate = orig_row['coin_positive_rate'].values[0] * 100
         else:
-            orig_pt_sharpe = orig_trades = np.nan
+            orig_trades = np.nan
+            orig_coin_rate = np.nan
 
-        curr_pt_sharpe = row['mean_oos_pt_sharpe']
-        curr_trades = row['total_trades']
+        curr_coin_rate = row['coin_positive_rate'] * 100
 
-        # 提取底层持仓流水 (修改点：极速 .loc 元组查询替换全表扫描的掩码)
+        # 提取底层持仓流水
         try:
             combo_details = all_pairs.loc[[(en, ex, fm)]]
         except KeyError:
@@ -306,6 +263,9 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
         if not combo_details.empty:
             win_t = combo_details['trades'] * (combo_details['win_rate'] / 100.0)
             loss_t = combo_details['trades'] - win_t
+
+            # 🟢 新增：计算真实的全局聚合胜率
+            real_win_rate = (win_t.sum() / curr_trades) * 100 if curr_trades > 0 else 0
 
             win_hold_sum = (combo_details['win_hold_bars'].fillna(0) * win_t).sum()
             loss_hold_sum = (combo_details['loss_hold_bars'].fillna(0) * loss_t).sum()
@@ -316,7 +276,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
             positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
-                    positive_profits > 0 and max_coin_ret > 0) else 0.0
+                        positive_profits > 0 and max_coin_ret > 0) else 0.0
 
             best_coin = "未知标的"
             if positive_profits > 0:
@@ -327,113 +287,88 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
                 elif 'symbol' in best_row:
                     best_coin = str(best_row['symbol'])
         else:
-            mean_win_hold = mean_loss_hold = top1_coin_pct = np.nan
+            mean_win_hold = mean_loss_hold = top1_coin_pct = real_win_rate = np.nan
             best_coin = "未知标的"
 
-        # ================= 生成客观预警 (红绿灯) =================
-        flags = []
-        if decay_rate == -999.0:
-            flags.append(f"{RED}🔴 IS 样本内收益为负或极低，无对比基准，废弃。{RESET}")
-        elif decay_rate > 50:
-            flags.append(f"{YELLOW}🟡 逆向畸高预警 (OOS 收益反超 IS 50%以上，警惕大盘顺风车假象){RESET}")
-        elif decay_rate > 20:
-            flags.append(f"{YELLOW}🟡 OOS 逆向提升 (收益升幅 {decay_rate:.1f}%，需人工复核){RESET}")
-        elif -40 <= decay_rate <= 20:
-            flags.append(f"{GREEN}🟢 OOS 时序平稳 (年化折损 {decay_rate:.1f}%，极其健康){RESET}")
-        else:
-            flags.append(f"{RED}🔴 OOS 严重衰减 (衰减 {decay_rate:.1f}%){RESET}")
+        hold_ratio = mean_loss_hold / mean_win_hold if mean_win_hold > 0 else 0
 
+        # ================= 极简重构：客观预警 (红绿灯) =================
+        flags = []
+
+        # 1. 摩擦生死线
+        if break_even_slippage < 0.15:
+            flags.append(
+                f"{RED}🔴 极度脆弱 (单边盈亏平衡滑点 {break_even_slippage:.3f}% < 0.15%，实盘极易死于摩擦){RESET}")
+        else:
+            flags.append(f"{GREEN}🟢 摩擦抗性优秀 (单边盈亏平衡滑点容忍度 {break_even_slippage:.3f}%){RESET}")
+
+        # 2. 普适率孤岛判定 (彻底修复原来的误杀)
+        if en_pos_rate < 15:
+            flags.append(f"{RED}🔴 陷入参数孤岛 (入场因子仅有 {en_pos_rate:.1f}% 的出场搭配能实现正期望){RESET}")
+        else:
+            flags.append(f"{GREEN}🟢 因子普适性强 (与库内 {en_pos_rate:.1f}% 的出场因子搭配均为正期望){RESET}")
+
+        # 3. 持仓习惯
+        if hold_ratio > 2.0:
+            flags.append(f"{RED}🔴 扛单高危预警 (亏损单死扛时间是盈利单的 {hold_ratio:.1f} 倍){RESET}")
+        elif hold_ratio < 1.0:
+            flags.append(f"{GREEN}🟢 顺向截断持仓 (亏损单割肉果断，时间小于盈利单){RESET}")
+
+        # 4. 极权度
         if top1_coin_pct > 50:
             flags.append(f"{RED}🔴 单币利润过度极权 (单币贡献了盈利总额的 {top1_coin_pct:.1f}%){RESET}")
         elif top1_coin_pct < 30:
-            flags.append(f"{GREEN}🟢 利润标的散布健康 (最肥的羊仅占总盈利的 {top1_coin_pct:.1f}%){RESET}")
-
-        if mean_loss_hold > mean_win_hold * 2:
-            flags.append(f"{RED}🔴 逆向持仓预警 (亏损单死扛时间是盈利单的1.5倍以上){RESET}")
-        elif mean_win_hold > mean_loss_hold:
-            flags.append(f"{GREEN}🟢 顺向持仓 (截断亏损，让利润奔跑){RESET}")
-
-        if pd.isna(en_neighbor_avg) or pd.isna(ex_neighbor_avg):
-            flags.append(f"{YELLOW}🟡 缺乏邻近参数数据 (无法验证平原特征){RESET}")
-        elif en_neighbor_avg <= 0 or ex_neighbor_avg <= 0:
-            flags.append(f"{RED}🔴 陷入参数孤岛 (更换同类进/出场即变为负期望){RESET}")
-        else:
-            flags.append(f"{GREEN}🟢 参数平原宽广 (周边逻辑全部验证有效){RESET}")
+            flags.append(f"{GREEN}🟢 利润标的散布健康 (最肥的羊仅占总利润的 {top1_coin_pct:.1f}%){RESET}")
 
         # ================= 终端排版打印 =================
         print(f"\n{BOLD}{'=' * 80}{RESET}")
         print(f"🏆 {YELLOW}深度体检 #{rank}: ENTRY [{en}]  =>  EXIT [{ex}]{RESET}")
         print(
-            f"📌 排名依据: {sort_col} = {row[sort_col]:.3f} | 当前环境: {fm} | 参与币种: {row['n_coins']} 个 | 总笔数: {curr_trades} 笔")
+            f"📌 卡玛比率: {row[sort_col]:.3f} | 当前环境: {fm} | 参与币种: {row['n_coins']} 个 | 总笔数: {curr_trades} 笔")
         print("-" * 80)
 
-        # [1] 时序平稳性
+        # [1] 策略 DNA 基础数据
         q_rets = [row['sum_ret_q1'], row['sum_ret_q2'], row['sum_ret_q3'], row['sum_ret_q4']]
         q_trades = [row['sum_trades_q1'], row['sum_trades_q2'], row['sum_trades_q3'], row['sum_trades_q4']]
         max_q = max([q for q in q_rets if q > 0] + [0.01])
-        print(f"{BOLD}[1. 时序平稳与单笔净利 (Temporal & Profit)]{RESET}")
-        print(f"   {CYAN}- 单笔平均净水: OOS 每笔赚 {oos_pt_ret:.3f}% (IS 为 {is_pt_ret:.3f}%){RESET}")
-        print(f"   - OOS 真实折损: {decay_rate:.1f}%  (IS总计 {is_ret:.1f}% -> OOS总计 {oos_ret:.1f}%)")
-        print(f"   - 季度分布:")
+
+        print(f"{BOLD}[1. 策略DNA与盈利基础 (Strategy Foundation)]{RESET}")
+        print(f"   {CYAN}- 全局真实胜率: {real_win_rate:.1f}% | 平均单笔净收益: {avg_ret_pct:.3f}%{RESET}")
+        print(f"   - 单边滑点容忍极值: {break_even_slippage:.3f}% (盈亏平衡点)")
+        print(f"   - 季度时序分布:")
         for i in range(4):
             print(f"     Q{i + 1}: {make_bar(q_rets[i], max_q):<10} ({q_trades[i]:<4}笔) | 收益: {q_rets[i]:>6.1f}%")
 
-        # [2] 截面主动过滤效能
-        print(f"\n{BOLD}[2. 主动过滤效能 (Filter Efficacy - 待你裁决)]{RESET}")
-        if pd.notna(orig_pt_sharpe) and orig_trades > 0:
-            retention_rate = curr_trades / orig_trades * 100
-            orig_coin_rate = orig_row['coin_positive_rate'].values[0] * 100
-            curr_coin_rate = row['coin_positive_rate'] * 100
-
-            print(f"   - 单笔期望跃升: Original ({orig_pt_sharpe:.3f}) ➔ 当前 ({curr_pt_sharpe:.3f})")
-            print(f"   - 交易笔数保留: {curr_trades}/{int(orig_trades)} 笔 (保留了 {retention_rate:.1f}% 的交易)")
-            print(f"   - 存活标的胜率: Original ({orig_coin_rate:.1f}%) ➔ 当前 ({curr_coin_rate:.1f}%)")
-        else:
-            print("   - (无 Original 对比数据，当前可能本身就是 Original)")
-
-        # [3] 参数平原防伪 (此处更新了因子个数的输出)
-        print(f"\n{BOLD}[3. 邻近参数平原验证 (Parameter Plain)]{RESET}")
-        print(
-            f"   - 保持当前进场，搭配库内【 {en_neighbor_count} 种 】其它出场 -> OOS 平均单笔期望: {en_neighbor_avg:.3f}")
-        print(
-            f"   - 保持当前出场，搭配库内【 {ex_neighbor_count} 种 】其它进场 -> OOS 平均单笔期望: {ex_neighbor_avg:.3f}")
-
-        # [4] 尾部风险与持仓不对称
-        print(f"\n{BOLD}[4. 尾部风险与持仓特征 (Risk & Hold Asymmetry)]{RESET}")
-        dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
-        skew_val = f"{row['mean_skew']:.2f}" if pd.notna(row.get('mean_skew')) else "N/A"
-
-        # 🟢 【新增代码】：提取并打印最大回撤与收益回撤比
+        # [2] 尾部风险与持仓不对称
         max_dd_val = row['mean_max_dd']
         calmar_ratio = row['Sort_Metric']
+        dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
 
-        print(f"   - 📉 平均最大回撤 (Max Drawdown): {RED}{max_dd_val:.2f}%{RESET} | 收益回撤比: {calmar_ratio:.2f}")
-        print(f"   - 逆风局胜率 (BTC跌时): {dm_win}  |  偏度 (Skew): {skew_val}")
+        print(f"\n{BOLD}[2. 尾部风控与不对称性 (Risk & Hold Asymmetry)]{RESET}")
+        print(f"   - 📉 平均最大回撤: {RED}{max_dd_val:.2f}%{RESET} | 卡玛比率 (收益/回撤): {calmar_ratio:.2f}")
+        print(f"   - 逆风局胜率 (BTC跌时): {dm_win}")
 
-        # 将 Bars 转换为 天数
         mean_win_hold_days = mean_win_hold * bars_to_days
         mean_loss_hold_days = mean_loss_hold * bars_to_days
-        # 防止除数为 0 报错
-        hold_ratio = mean_loss_hold / mean_win_hold if mean_win_hold > 0 else 0
 
-        print(
-            f"   - 盈亏不对称: 盈利单均持仓 {mean_win_hold_days:.2f} 天 ({mean_win_hold:.0f} Bars) / 亏损单均持仓 {mean_loss_hold_days:.2f} 天 ({mean_loss_hold:.0f} Bars)")
-        print(f"   - 扛单死扛比: 亏损单持有时间是盈利单的 {hold_ratio:.2f} 倍")
+        print(f"   - 盈亏时间不对称: 盈利均持仓 {mean_win_hold_days:.2f} 天 / 亏损均持仓 {mean_loss_hold_days:.2f} 天")
+        print(f"   - 亏损死扛系数: {hold_ratio:.2f} 倍")
 
-        # [5] 广度与利润极权度
-        print(f"\n{BOLD}[5. 广度与利润极权度 (Breadth & Concentration)]{RESET}")
-        alive_rate = row['coin_positive_rate'] * 100
-        print(f"   - 参战胜率面: 过滤后剩余 {row['n_coins']} 个币种参战，其中 {alive_rate:.1f}% 为正期望。")
+        # [3] 因子有效性与极权度验证
+        print(f"\n{BOLD}[3. 实盘印证维度 (Robustness & Breadth)]{RESET}")
 
-        if oos_ret <= 0:
-            print(f"   - 利润集权度: {RED}整体OOS期望为负，极权度指标失效{RESET}")
-        else:
-            print(f"   - 利润集权度: 盈利最高的【{best_coin}】贡献了总利润的 {top1_coin_pct:.1f}%。")
+        if pd.notna(orig_trades) and orig_trades > 0:
+            retention_rate = curr_trades / orig_trades * 100
+            print(f"   - 截面有效存活率: Original ({orig_coin_rate:.1f}%) ➔ 当前条件 ({curr_coin_rate:.1f}%)")
+
+        print(f"   - 利润集权度分布: 最赚钱币种【{best_coin}】贡献占比 {top1_coin_pct:.1f}%。")
+        print(f"   - 入场因子普适率: 搭配库内 {en_neighbor_count} 种出场，有 {en_pos_rate:.1f}% 的组合实现正期望。")
+        print(f"   - 出场因子普适率: 搭配库内 {ex_neighbor_count} 种入场，有 {ex_pos_rate:.1f}% 的组合实现正期望。")
 
         # ---------------- 最终预警标签 ----------------
-        print(f"\n{BOLD}▶ 智能红绿灯研判提示:{RESET}")
+        print(f"\n{BOLD}▶ 实盘一票否决权 (智能红绿灯):{RESET}")
         if not flags:
-            print("   (无明显优劣极端特征，属中庸组合)")
+            print("   (无极端缺陷，属稳健组合)")
         else:
             for flag in flags:
                 print(f"   {flag}")
@@ -448,12 +383,12 @@ if __name__ == '__main__':
         summary, all_pairs = load_data(tf)
 
         if summary is not None and all_pairs is not None:
-            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 单笔利润>0.002, 利润极权上限40%, 允许最大衰减40%）
+            # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 过滤掉极限极权, 摒弃原有时序硬要求）
             tradable_summary = get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002,
-                                                 max_top1_pct=20.0, max_decay_rate=40.0)
+                                                 max_top1_pct=30.0)
 
-            # 2. 宏观分析 (传入原始表为了看物理极值，传入净水表为了看真实的百搭规律)
+            # 2. 宏观分析
             analyze_macro_ecosystem(summary, tradable_summary)
 
-            # 3. 微观深度体检 (严格在净水表里提取 Top 10)
+            # 3. 微观深度体检 (严格在净水表里提取 Top 50)
             analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=50)
