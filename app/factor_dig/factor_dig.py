@@ -11,6 +11,8 @@
  · [新增特性] 事后对入场信号进行 15 组不同强度的横截面(Rank)环境过滤测试
  · [本次改造] 只落盘 pairs_{coin}.csv；断点续跑 + 原子写入；无感注入"测试基数"
               (pairs_ALL / pairs_CROSS_COIN_SUMMARY 改由独立还原脚本重建)
+ · [性能优化] 统计基元标量化(逐位复刻) / 因子基础量去重缓存 /
+              列式内存装配 / BTC 基准按 worker 一次性下发   —— 结果不变
 ================================================================================
 """
 from __future__ import annotations
@@ -30,7 +32,6 @@ import multiprocessing
 
 import numpy as np
 import pandas as pd
-from scipy.stats import skew, kurtosis
 
 warnings.filterwarnings("ignore")
 
@@ -418,8 +419,16 @@ def build_factors(df, P, rank_shift=0):
     def RSUM(s, n):
         return s.rolling(n, min_periods=max(2, n // 2)).sum()
 
+    # 【性能】同窗口的收盘均线在不同因子里被重复请求(H24==N / H48 / H168)，
+    #        这里做纯记忆化：窗口相同 -> 完全相同的计算 -> 结果逐位一致
+    _ma_cache = {}
+
     def MA(n):
-        return c.rolling(n, min_periods=max(2, n // 2)).mean()
+        r = _ma_cache.get(n)
+        if r is None:
+            r = c.rolling(n, min_periods=max(2, n // 2)).mean()
+            _ma_cache[n] = r
+        return r
 
     # ---------- 基础量 ----------
     ret_1 = c.pct_change()
@@ -444,7 +453,9 @@ def build_factors(df, P, rank_shift=0):
     vma_N = v.rolling(N, min_periods=max(2, N // 2)).mean()
     vma_fast = v.rolling(M, min_periods=max(2, M // 2)).mean()
     vma_slow = vma_N
-    vwap_N = RSUM(c * v, N) / (RSUM(v, N) + EPS)
+    # 【性能】RSUM(v, N) 原本被 vwap / _vwm / VOLUME_UP_RATIO 各算一次
+    rsum_v_N = RSUM(v, N)
+    vwap_N = RSUM(c * v, N) / (rsum_v_N + EPS)
 
     obv = (np.sign(c.diff()).fillna(0.0) * v).cumsum()
     obv_ma_N = obv.rolling(N, min_periods=max(2, N // 2)).mean()
@@ -456,6 +467,9 @@ def build_factors(df, P, rank_shift=0):
     oi_ma_fast = oi.rolling(P['D2'], min_periods=max(2, P['D2'] // 2)).mean()
     oi_ma_slow = oi.rolling(P['D7'], min_periods=max(2, P['D7'] // 2)).mean()
     oiv_pct_N = pctc(oi_value, N)
+    # 【性能】oi_value 的两条 EMA 原本在 OI_VALUE_EMA_CROSS / EXIT_OI_VALUE_MA_DEAD_CROSS 各算一次
+    oiv_ema_M = oi_value.ewm(span=M, adjust=False).mean()
+    oiv_ema_N = oi_value.ewm(span=N, adjust=False).mean()
 
     rng = (h - l) + EPS
     lw = (np.minimum(o, c) - l) / rng
@@ -521,7 +535,7 @@ def build_factors(df, P, rank_shift=0):
     F['MOM_RECOVERY_FROM_LOW'] = _recov > QT(_recov, 0.80)
     F['MOM_PERSISTENCE'] = (ret_N > 0) & (ret_N.shift(N) > 0)
     F['MOM_NOT_OVERHEATED'] = rk_ret_N < 0.95
-    _vwm = RSUM(ret_M * v, N) / (RSUM(v, N) + EPS)
+    _vwm = RSUM(ret_M * v, N) / (rsum_v_N + EPS)
     F['MOM_VOLUME_WEIGHTED'] = RK(_vwm) > 0.80
 
     F['VOL_RETURN_COMPRESSION'] = RK(ret_1h.rolling(N, min_periods=max(2, N // 2)).std()) < 0.20
@@ -558,7 +572,9 @@ def build_factors(df, P, rank_shift=0):
     F['BREAK_FAIL_LEVEL'] = (c.shift(1) > maxH_N.shift(2)) & (c < maxH_N.shift(2))
 
     _bodyr = c / (o + EPS) - 1.0
-    F['KLINE_STRONG_GREEN'] = (c > o) & (RK(_bodyr) > 0.90)
+    # 【性能】RK(_bodyr) 原本在 KLINE_STRONG_GREEN / KLINE_STRONG_RED 各算一次(滚动rank最贵)
+    rk_bodyr = RK(_bodyr)
+    F['KLINE_STRONG_GREEN'] = (c > o) & (rk_bodyr > 0.90)
     F['KLINE_SMALL_GREEN_ACCUM'] = ((c > o) & (_bodyr > 0) & (_bodyr < 0.01)).rolling(N).sum() >= P['K_SMALL_GREEN']
     F['KLINE_LONG_LOWER_WICK_REAL'] = lw > 0.50
     F['KLINE_LOWER_WICK_RECLAIM'] = (lw > 0.50) & (c > o)
@@ -570,7 +586,7 @@ def build_factors(df, P, rank_shift=0):
     F['KLINE_CONSEC_STRONG_CLOSE'] = ((c > o) & (c > ma_M)).rolling(N).sum() >= P['K_STRONG_CLOSE']
     F['KLINE_BODY_STRENGTH_UP_REAL'] = (c > o) & ((c - o) / rng > 0.60)
     F['KLINE_BODY_STRENGTH_DOWN_REAL'] = (c < o) & ((o - c) / rng > 0.60)
-    F['KLINE_STRONG_RED'] = (c < o) & (RK(_bodyr) < 0.10)
+    F['KLINE_STRONG_RED'] = (c < o) & (rk_bodyr < 0.10)
     F['KLINE_RED_BREAK_MA'] = (c < o) & (c < ma_N)
     F['KLINE_SMALL_RED_PULLBACK'] = (c < o) & (RK((c - o).abs()) < 0.30) & (c > ma_N)
     F['KLINE_GAP_UP'] = o > c.shift(1) * (1 + P['GAP_TH'])
@@ -614,7 +630,7 @@ def build_factors(df, P, rank_shift=0):
     F['AD_LINE_UP'] = ad > ad_ma_N
     F['AD_LINE_BULL_DIV'] = (c < c.shift(N)) & (ad > ad.shift(N))
     F['AD_LINE_BEAR_DIV'] = (c > c.shift(N)) & (ad < ad.shift(N))
-    F['VOLUME_UP_RATIO'] = RSUM(v * (c > o), N) / (RSUM(v, N) + EPS) > 0.60
+    F['VOLUME_UP_RATIO'] = RSUM(v * (c > o), N) / (rsum_v_N + EPS) > 0.60
     F['VOLUME_CLIMAX_UP'] = (ret_N > 0) & (rk_v > 0.98)
     F['VOLUME_CLIMAX_DOWN'] = (ret_N < 0) & (rk_v > 0.98)
 
@@ -642,8 +658,7 @@ def build_factors(df, P, rank_shift=0):
     F['OI_RESET_THEN_UP'] = (oi_pct_N.shift(N) < 0) & (oi_pct_M > 0)
     F['OI_AMOUNT_UP_VALUE_NOT_HOT'] = (oi_pct_N > 0) & (oi_value_rank < 0.90)
     F['OI_VALUE_UP_AMOUNT_NOT_UP'] = (oiv_pct_N > 0) & (oi_pct_N <= 0)
-    F['OI_VALUE_EMA_CROSS'] = CU(oi_value.ewm(span=M, adjust=False).mean(),
-                                 oi_value.ewm(span=N, adjust=False).mean())
+    F['OI_VALUE_EMA_CROSS'] = CU(oiv_ema_M, oiv_ema_N)
     F['OI_VALUE_SURGE'] = RK(oiv_pct_N) > 0.90
     F['OI_ROC_BURST'] = oi_pct_N > QT(oi_pct_N, 0.95)
     F['OI_ROC_PEAK'] = (oi_pct_N >= oi_pct_N.rolling(M, min_periods=2).max()) & (oi_pct_N > P['OI_ROC_TH'])
@@ -665,8 +680,10 @@ def build_factors(df, P, rank_shift=0):
     F['FR_EXTREME_LOW'] = fr_rank < 0.05
     F['FR_ROLL_OVER_FROM_HIGH'] = (fr_rank < 0.90) & (fr_rank.shift(1) >= 0.90)
     _frstd = fr.rolling(N, min_periods=max(2, N // 2)).std()
-    F['FR_STABLE'] = RK(_frstd) < 0.30
-    F['FR_UNSTABLE'] = RK(_frstd) > 0.90
+    # 【性能】RK(_frstd) 原本在 FR_STABLE / FR_UNSTABLE 各算一次
+    rk_frstd = RK(_frstd)
+    F['FR_STABLE'] = rk_frstd < 0.30
+    F['FR_UNSTABLE'] = rk_frstd > 0.90
     F['FR_PRICE_UP_NOT_HOT'] = (ret_N > 0) & (fr_rank < 0.80)
     F['FR_PRICE_UP_HOT'] = (ret_N > 0) & (fr_rank > 0.90)
     F['FR_RESET_AFTER_HOT'] = (fr_rank.shift(M) > 0.90) & (fr_rank < 0.70)
@@ -742,8 +759,7 @@ def build_factors(df, P, rank_shift=0):
     F['EXIT_RANGE_POSITION_WEAK'] = F['STRUCT_RANGE_POSITION_WEAK']
     F['EXIT_FAILED_BREAKOUT'] = F['BREAK_FAIL_LEVEL']
     F['EXIT_FR_SPIKE_THEN_COOL'] = bs(F['FR_SPIKE_UP']) & (fr < fr.shift(1))
-    F['EXIT_OI_VALUE_MA_DEAD_CROSS'] = CD(oi_value.ewm(span=M, adjust=False).mean(),
-                                          oi_value.ewm(span=N, adjust=False).mean())
+    F['EXIT_OI_VALUE_MA_DEAD_CROSS'] = CD(oiv_ema_M, oiv_ema_N)
     F['EXIT_UPPER_WICK_REJECTION'] = (c / (maxH_N + EPS) > 0.95) & F['KLINE_LONG_UPPER_WICK'] & F['VOLUME_SPIKE']
     F['EXIT_HIGH_VOLUME_STALL'] = (c / (maxH_N + EPS) > 0.95) & F['VOLUME_SPIKE'] & (ret_M <= 0)
     F['EXIT_VOLUME_DIVERGENCE_BEAR'] = (c > maxH_N.shift(1)) & (v < vma_N)
@@ -791,6 +807,92 @@ def path_exit_specs(P):
 # ======================================================================
 # 5. 绩效计算 (修复了单笔夏普输出，以及补齐切片笔数防歧义)
 # ======================================================================
+# ---------------------------------------------------------------
+# 【性能】快速统计基元：逐位复刻 scipy / numpy 的运算顺序，
+#         只是剥掉了它们外层昂贵的 Python 校验与容器构造。
+#         输入约定：1-D float64、无 NaN/Inf（调用方已用 isfinite 过滤）。
+# ---------------------------------------------------------------
+_Q_KEYS = (('ret_q1', 'trades_q1'), ('ret_q2', 'trades_q2'),
+           ('ret_q3', 'trades_q3'), ('ret_q4', 'trades_q4'))
+
+
+def _skew_unbiased(x, n):
+    """等价 scipy.stats.skew(x, bias=False)（n >= 3）"""
+    mean = x.mean()
+    d = x - mean
+    d2 = d * d
+    m2 = d2.mean()
+    m3 = (d2 * d).mean()          # 与 scipy._moment 的平方求幂顺序一致
+    if not (m2 > 0.0):
+        return np.nan
+    return float(math.sqrt((n - 1.0) * n) / (n - 2.0) * m3 / m2 ** 1.5)
+
+
+def _kurt_unbiased(x, n):
+    """等价 scipy.stats.kurtosis(x, bias=False, fisher=True)（n >= 4）"""
+    mean = x.mean()
+    d = x - mean
+    d2 = d * d
+    m2 = d2.mean()
+    m4 = (d2 * d2).mean()
+    if not (m2 > 0.0):
+        return np.nan
+    nval = 1.0 / (n - 2) / (n - 3) * ((n ** 2 - 1.0) * m4 / m2 ** 2.0 - 3 * (n - 1) ** 2.0)
+    # scipy 先 +3 再 -3（fisher），此处保留同样的浮点路径
+    return float((nval + 3.0) - 3.0)
+
+
+def _corr_pearson(a, b):
+    """等价 np.corrcoef(a, b)[0, 1]：复刻 np.cov 的 1/(n-1) 缩放与 clip，
+       但不构造 2xN 矩阵、不生成 2x2 协方差矩阵。"""
+    n = a.shape[0]
+    if n < 2:
+        return np.nan
+    da = a - a.mean()
+    db = b - b.mean()
+    inv = 1.0 / (n - 1)
+    c00 = float(np.dot(da, da)) * inv
+    c11 = float(np.dot(db, db)) * inv
+    if not (c00 > 0.0) or not (c11 > 0.0):
+        return np.nan
+    c01 = float(np.dot(da, db)) * inv
+    r = (c01 / math.sqrt(c00)) / math.sqrt(c11)
+    if r > 1.0:
+        return 1.0
+    if r < -1.0:
+        return -1.0
+    return r
+
+
+def _quantile05_linear(x):
+    """等价 np.percentile(x, 5)（method='linear'）：用 O(N) 的 partition
+       取代 O(N logN) 全量排序，虚拟下标与 _lerp 分支完全照抄 numpy。"""
+    n = x.shape[0]
+    vi = (5 / 100.0) * (n - 1)
+    prev = int(vi)                      # vi >= 0，等价 floor
+    g = vi - prev
+    nxt = prev + 1
+    if nxt >= n:
+        return float(np.partition(x, prev)[prev]) if n > 1 else float(x[0])
+    part = np.partition(x, (prev, nxt))
+    a = float(part[prev])
+    b = float(part[nxt])
+    diff = b - a
+    if g < 0.5:
+        return a + diff * g
+    return b - diff * (1.0 - g)
+
+
+def _median_fast(x):
+    """等价 np.median(x)（输入无 NaN）：直接用 partition 取中位序统计量"""
+    n = x.shape[0]
+    half = n // 2
+    if n & 1:
+        return float(np.partition(x, half)[half])
+    part = np.partition(x, (half - 1, half))
+    return float((part[half - 1] + part[half]) / 2.0)
+
+
 def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, prefix=''):
     d = {}
     T = int(len(rets))
@@ -809,10 +911,11 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
             d[prefix + k] = np.nan
         return d
 
-    d[prefix + 'win_rate'] = float((rets > 0).mean() * 100)
+    pos_mask = rets > 0                       # 【性能】胜负掩码只算一次，后面复用
+    d[prefix + 'win_rate'] = float(pos_mask.mean() * 100)
     d[prefix + 'sum_ret'] = float(rets.sum() * 100)
     d[prefix + 'avg_ret'] = float(rets.mean() * 100)
-    d[prefix + 'med_ret'] = float(np.median(rets) * 100)
+    d[prefix + 'med_ret'] = float(_median_fast(rets) * 100)
 
     sd = float(rets.std(ddof=1) * 100) if T > 1 else np.nan
     d[prefix + 'std_ret'] = sd
@@ -831,7 +934,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
         d[prefix + 'pt_sharpe'] = np.nan
         d[prefix + 'sharpe'] = np.nan
 
-    g = rets[rets > 0].sum()
+    g = rets[pos_mask].sum()
     b = -rets[rets < 0].sum()
     d[prefix + 'profit_factor'] = float(min(g / b, 999.0)) if b > 0 else (999.0 if g > 0 else 0.0)
 
@@ -845,21 +948,22 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
 
     try:
         if sd > 1e-8:
-            d[prefix + 'skew'] = float(skew(rets, bias=False)) if T >= 3 else np.nan
-            d[prefix + 'kurt'] = float(kurtosis(rets, bias=False)) if T >= 4 else np.nan
+            d[prefix + 'skew'] = _skew_unbiased(rets, T) if T >= 3 else np.nan
+            d[prefix + 'kurt'] = _kurt_unbiased(rets, T) if T >= 4 else np.nan
         else:
             d[prefix + 'skew'], d[prefix + 'kurt'] = 0.0, 0.0
     except Exception:
         d[prefix + 'skew'], d[prefix + 'kurt'] = np.nan, np.nan
 
     if T > 2:
-        p05 = np.percentile(rets, 5)
+        p05 = _quantile05_linear(rets)
         cvar_arr = rets[rets <= p05]
         d[prefix + 'cvar_5'] = float(cvar_arr.mean() * 100) if len(cvar_arr) > 0 else np.nan
         ideal = np.arange(len(eq))
 
-        if np.std(eq) > 1e-8 and np.std(ideal) > 1e-8:
-            corr = np.corrcoef(eq, ideal)[0, 1]
+        # T > 2 => len(eq) >= 4 => np.std(ideal) >= 1.118，恒大于 1e-8，无需再算
+        if np.std(eq) > 1e-8:
+            corr = _corr_pearson(eq, ideal)
             if not np.isnan(corr):
                 d[prefix + 'equity_r2'] = float(corr ** 2) if corr > 0 else float(-(corr ** 2))
             else:
@@ -871,7 +975,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
 
     if bh_rets is not None and T > 2:
         if np.std(rets) > 1e-8 and np.std(bh_rets) > 1e-8:
-            corr_btc = np.corrcoef(rets, bh_rets)[0, 1]
+            corr_btc = _corr_pearson(rets, bh_rets)
             d[prefix + 'corr_btc'] = float(corr_btc) if not np.isnan(corr_btc) else np.nan
         else:
             d[prefix + 'corr_btc'] = np.nan
@@ -884,7 +988,7 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
     else:
         d[prefix + 'corr_btc'], d[prefix + 'down_market_win_rate'] = np.nan, np.nan
 
-    win_idx = rets > 0
+    win_idx = pos_mask
     loss_idx = rets <= 0
     d[prefix + 'win_hold_bars'] = float(hold[win_idx].mean()) if win_idx.sum() > 0 else np.nan
     d[prefix + 'loss_hold_bars'] = float(hold[loss_idx].mean()) if loss_idx.sum() > 0 else np.nan
@@ -895,12 +999,13 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
         mask = (relative_ent >= i * chunk_size) & (relative_ent < (i + 1) * chunk_size)
         chunk_rets = rets[mask]
         # 【修复】顺手记录每个切片的触发笔数，防止 0.0 歧义
+        _rk, _tk = _Q_KEYS[i]
         if len(chunk_rets) > 0:
-            d[prefix + f'ret_q{i + 1}'] = float(chunk_rets.sum() * 100)
-            d[prefix + f'trades_q{i + 1}'] = int(len(chunk_rets))
+            d[prefix + _rk] = float(chunk_rets.sum() * 100)
+            d[prefix + _tk] = int(len(chunk_rets))
         else:
-            d[prefix + f'ret_q{i + 1}'] = 0.0
-            d[prefix + f'trades_q{i + 1}'] = 0
+            d[prefix + _rk] = 0.0
+            d[prefix + _tk] = 0
 
     return d
 
@@ -987,7 +1092,10 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         'skip_too_many': 0,
         'mode_pass_counts': {mk: 0 for mk in mode_keys},
     }
-    rows = []
+    # 【性能/内存】列式装配：不再堆积上百万个 dict，改为每列一个 list。
+    #   列顺序由第一行的键序确定 —— 与 pd.DataFrame(List[Dict]) 的
+    #   fast_unique_multiple_list_gen(sort=False) 行为完全一致（各行键集合恒等）。
+    col_data = None
     done = 0
 
     for en in entry_names:
@@ -1075,9 +1183,14 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 row.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
                                        start_idx=split_bar, bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
                                        prefix='oos_'))
-                rows.append(row)
 
-    out = pd.DataFrame(rows)
+                if col_data is None:
+                    col_data = {k_: [v_] for k_, v_ in row.items()}
+                else:
+                    for k_, v_ in row.items():
+                        col_data[k_].append(v_)
+
+    out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
 
     # ==================================================================
     # 【新增】无感注入"测试基数"(多重检验搜索空间)，用于事后精确还原 DSR
@@ -1102,9 +1215,19 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 # ======================================================================
 # 7. 主流程 (引入多进程架构隔离与调度) - 已解决 OOM 内存泄漏
 # ======================================================================
+# 【性能】BTC 基准只在 worker 启动时下发一次(而不是每个 task 都 pickle 一遍)，
+#         也绝不在子进程里重复解析 BTC 的 1m CSV（那等于每个币重算一次，是负优化）。
+_BTC_CLOSE = None
+
+
+def _init_worker(btc_close):
+    global _BTC_CLOSE
+    _BTC_CLOSE = btc_close
+
+
 def mine_symbol_wrapper(args):
     """ 多进程工作节点的包装函数 (核心优化：子进程落地CSV，避免跨进程传大数据) """
-    kf, cfg, btc_close = args
+    kf, cfg = args
     coin = kf.split('_USDT_USDT_1m_kline.csv')[0]
     oi_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_5m_oi.csv')
     fr_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_funding_rates.csv')
@@ -1114,7 +1237,7 @@ def mine_symbol_wrapper(args):
             # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
             return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
 
-        pairs, stats, kline_days = mine_symbol(coin, df, cfg, btc_close)
+        pairs, stats, kline_days = mine_symbol(coin, df, cfg, _BTC_CLOSE)
 
         valid_combos = 0
         total_saved_trades = 0
@@ -1232,7 +1355,7 @@ def main(cfg=CFG):
     else:
         print("⚠️ 未发现 BTC_USDT_USDT_1m_kline.csv，将使用标的自身收益作为 fallback")
 
-    tasks = [(kf, cfg, btc_close) for kf in valid_kfiles]
+    tasks = [(kf, cfg) for kf in valid_kfiles]
     n_ok, n_empty, n_fail = 0, 0, 0
 
     max_workers = min(28, max(1, multiprocessing.cpu_count() - 2))
@@ -1247,7 +1370,9 @@ def main(cfg=CFG):
                    False, 0.0, False, False, 0.0, False, 0, 0.0, False, 0.0, False, 0.0, 0.0)
     print(f"\n🚀 启动并发回测... (分配进程核心数: {max_workers})")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,
+                                               initializer=_init_worker,
+                                               initargs=(btc_close,)) as executor:
         futures = {executor.submit(mine_symbol_wrapper, t): t for t in tasks}
 
         for fut in concurrent.futures.as_completed(futures):
