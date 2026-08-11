@@ -33,8 +33,8 @@ def make_bar(val, max_val, max_len=8):
 def load_data(tf='15m'):
     """加载指定周期的挖掘产出数据"""
     out_dir = f'./factor_out_{tf}'
-    sum_path = os.path.join(out_dir, 'pairs_CROSS_COIN_SUMMARY.csv')
-    all_path = os.path.join(out_dir, 'pairs_ALL.csv')
+    sum_path = os.path.join(out_dir, 'pairs_CROSS_COIN_SUMMARY.csv.gz')
+    all_path = os.path.join(out_dir, 'pairs_ALL.csv.gz')
 
     if not os.path.exists(sum_path) or not os.path.exists(all_path):
         print(f"{RED}❌ 找不到 {tf} 周期数据。请检查路径: {out_dir}{RESET}")
