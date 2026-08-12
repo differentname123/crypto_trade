@@ -477,6 +477,46 @@ def aggregate_direction_data(grouped, direction_name):
     avg_win_hold = (grouped['win_hold_sum_sum'] / win_trades_sum).fillna(0.0)
     avg_loss_hold = (grouped['loss_hold_sum_sum'] / loss_trades_sum).fillna(0.0)
 
+    # =========================================================================
+    # 派生指标逻辑新增区
+    # 根据方向处理资金费率乘数：做多需减去资金费率(-1)，做空需加上资金费率(1)
+    # =========================================================================
+    fr_mult = -1 if direction_name == 'Long' else 1
+
+    # 核心净收益计算
+    net_ret = grouped['sum_ret_sum'] + fr_mult * grouped['fr_sum_sum']
+    is_net_ret = grouped['is_sum_ret_sum'] + fr_mult * grouped['is_fr_sum_sum']
+    oos_net_ret = grouped['oos_sum_ret_sum'] + fr_mult * grouped['oos_fr_sum_sum']
+
+    # 1. 胜率 (%)
+    safe_trades = grouped['trades_sum'].replace(0, np.nan)
+    win_rate = (grouped['win_trades_sum'] / safe_trades * 100).fillna(0.0)
+
+    # 2. 单笔平均净收益
+    avg_net_ret = (net_ret / safe_trades).fillna(0.0)
+
+    # 3. 样本内外平均单笔净收益
+    safe_is_trades = grouped['is_trades_sum'].replace(0, np.nan)
+    is_avg_net_ret = (is_net_ret / safe_is_trades).fillna(0.0)
+
+    safe_oos_trades = grouped['oos_trades_sum'].replace(0, np.nan)
+    oos_avg_net_ret = (oos_net_ret / safe_oos_trades).fillna(0.0)
+
+    # 4. 盈亏持仓时间比
+    safe_avg_loss_hold = avg_loss_hold.replace(0, np.nan)
+    win_loss_hold_ratio = (avg_win_hold / safe_avg_loss_hold).fillna(0.0)
+
+    # 5. 最优币占总净收益百分比 (%)
+    safe_net_ret = net_ret.replace(0, np.nan)
+    best_coin_pct = (grouped['best_coin_ret'] / safe_net_ret * 100).fillna(0.0)
+
+    # 6. 净盈利季度数量
+    profitable_q_count = pd.Series(0, index=grouped.index)
+    for q in ['q1', 'q2', 'q3', 'q4']:
+        q_net_ret = grouped[f'ret_{q}_sum'] + fr_mult * grouped[f'{q}_fr_sum']
+        profitable_q_count += (q_net_ret > 0).astype(int)
+    # =========================================================================
+
     # 4. 组装最终结果表，严格遵循要求的列名
     final_df = pd.DataFrame()
     final_df['入场信号名称'] = grouped['entry_factor']
@@ -524,6 +564,18 @@ def aggregate_direction_data(grouped, direction_name):
     final_df['最低收益币的收益'] = grouped['worst_coin_ret'].round(4)
 
     final_df['各币种全局最大回撤的中位数'] = grouped['max_dd_median'].round(4)
+
+    # =========================================================================
+    # 附加新增的派生指标到最终报表中
+    # =========================================================================
+    final_df['胜率'] = win_rate.round(2)
+    final_df['单笔平均净收益'] = avg_net_ret.round(4)
+    final_df['样本内平均单笔净收益'] = is_avg_net_ret.round(4)
+    final_df['样本外平均单笔净收益'] = oos_avg_net_ret.round(4)
+    final_df['盈亏持仓时间比'] = win_loss_hold_ratio.round(2)
+    final_df['最优币占总净收益百分比'] = best_coin_pct.round(2)
+    final_df['净盈利季度数量'] = profitable_q_count
+    # =========================================================================
 
     # 降序排序输出
     final_df.sort_values(

@@ -20,12 +20,53 @@ class StrategyAnalyzer:
         print(f"📊 开始分析 {self.direction} 策略数据，总组合数: {len(self.df)}")
         print(f"{'=' * 50}")
 
+    def anonymize_signals(self, mapping_file='./summary_results/signal_mapping.csv'):
+        """对信号名称进行脱敏，并维护一个全局映射表"""
+        print(f"🔒 正在执行信号名称脱敏...")
+
+        # 提取当前数据中所有的独特信号名称
+        entry_sigs = self.df['入场信号名称'].dropna().unique().tolist()
+        exit_sigs = self.df['出场信号名称'].dropna().unique().tolist()
+        current_signals = sorted(list(set(entry_sigs) | set(exit_sigs)))
+
+        # 尝试读取已有的映射表，保证跨文件/跨运行时的脱敏一致性
+        mapping = {}
+        current_max_id = 0
+        if os.path.exists(mapping_file):
+            existing_df = pd.read_csv(mapping_file)
+            mapping = dict(zip(existing_df['Original_Signal'], existing_df['Masked_Signal']))
+            if mapping:
+                # 提取已有的最大序号，例如从 "SIGNAL_045" 中提取 45
+                current_max_id = max([int(v.split('_')[1]) for v in mapping.values()])
+
+        # 为当前数据中的新信号生成脱敏名称
+        new_mapping_count = 0
+        for sig in current_signals:
+            if sig not in mapping:
+                current_max_id += 1
+                mapping[sig] = f"SIGNAL_{current_max_id:03d}"
+                new_mapping_count += 1
+
+        # 将新的映射关系保存回文件
+        if new_mapping_count > 0 or not os.path.exists(mapping_file):
+            os.makedirs(os.path.dirname(mapping_file), exist_ok=True)
+            mapping_df = pd.DataFrame(list(mapping.items()), columns=['Original_Signal', 'Masked_Signal'])
+            mapping_df.to_csv(mapping_file, index=False, encoding='utf-8-sig')
+            print(f"   已新增 {new_mapping_count} 个信号映射，映射表已保存至: {mapping_file}")
+        else:
+            print(f"   所有信号均在已有映射表中，无需更新文件。")
+
+        # 将 DataFrame 中的原始名称替换为脱敏名称
+        self.df['入场信号名称'] = self.df['入场信号名称'].map(mapping)
+        self.df['出场信号名称'] = self.df['出场信号名称'].map(mapping)
+
+        return self
+
     def calculate_derived_fields(self):
         """0. 计算派生字段"""
         df = self.df.copy()
 
         # 1. 资金费率逻辑处理 (做多减去费率，做空加上费率)
-        # 假设原始数据中资金费率是绝对值或者按统一方向记录，按用户要求进行计算
         sign = -1 if self.direction == 'Long' else 1
 
         # 计算各类净收益
@@ -50,10 +91,9 @@ class StrategyAnalyzer:
         # 5. 盈亏持仓时间比
         df['盈亏持仓时间比'] = np.where(df['亏损单平均持仓 K 线根数'] > 0,
                                         df['盈利单平均持仓 K 线根数'] / df['亏损单平均持仓 K 线根数'],
-                                        np.inf)  # 如果没有亏损单，比例视为无限大
+                                        np.inf)
 
         # 6. 最优币占总净收益百分比 (%)
-        # 注意：如果总净收益为负数或0，这个比例没有参考价值，做特殊处理
         df['最优币净收益占比(%)'] = np.where(df['总净收益'] > 0,
                                              (df['最大收益币的收益'] / df['总净收益']) * 100,
                                              0)
@@ -71,7 +111,6 @@ class StrategyAnalyzer:
             print("❌ 数据为空，跳过过滤。")
             return self
 
-        # 定义过滤条件字典，方便扩展
         filters = {
             f"单笔平均净收益 > {min_avg_net_ret}%": df['单笔平均净收益'] > min_avg_net_ret,
             f"总交易次数 > {min_trades}": df['总交易数'] > min_trades,
@@ -84,7 +123,6 @@ class StrategyAnalyzer:
         current_df = df
         for filter_name, condition in filters.items():
             prev_count = len(current_df)
-            # 这里的 condition 是针对原 df 的 Series，需根据 current_df 的 index 进行过滤
             current_df = current_df.loc[current_df.index.intersection(df[condition].index)]
             curr_count = len(current_df)
 
@@ -106,7 +144,6 @@ class StrategyAnalyzer:
 
         print(f"\n🏆 按照 [{sort_by}] 降序排列，展示 Top {top_n} 策略组合:\n")
 
-        # 排序
         top_df = self.filtered_df.sort_values(by=sort_by, ascending=False).head(top_n)
 
         for i, (_, row) in enumerate(top_df.iterrows(), 1):
@@ -142,19 +179,22 @@ if __name__ == '__main__':
 
     # --- 你可以在这里灵活修改参数 ---
     TARGET_FILE = './summary_results/aggregated_summary_Long.csv'
+    MAPPING_FILE = './summary_results/signal_mapping.csv'
     DIRECTION = 'Long'  # 'Long' 或 'Short'
 
     # 过滤参数
-    MIN_AVG_NET_RET = 0.3  # 单笔平均净收益 > 0.3%
-    MIN_TRADES = 50  # 总交易次数 > 50
-    MIN_COINS = 5  # 产生交易的币种 > 5
-    MIN_PROFIT_RATIO = 0.5  # 盈利币比例 > 0.5 (即50%)
+    MIN_AVG_NET_RET = 0.3
+    MIN_TRADES = 50
+    MIN_COINS = 5
+    MIN_PROFIT_RATIO = 0.5
     # ------------------------------
 
     if os.path.exists(TARGET_FILE):
         analyzer = StrategyAnalyzer(filepath=TARGET_FILE, direction=DIRECTION)
 
-        analyzer.calculate_derived_fields() \
+        # 链式调用：脱敏 -> 算指标 -> 过滤 -> 展示
+        analyzer.anonymize_signals(mapping_file=MAPPING_FILE) \
+            .calculate_derived_fields() \
             .apply_hard_filters(
             min_avg_net_ret=MIN_AVG_NET_RET,
             min_trades=MIN_TRADES,
