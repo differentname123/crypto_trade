@@ -5,6 +5,14 @@ import unicodedata
 from datetime import datetime
 
 # ==========================================
+# 0. 过滤条件配置 (Filter Configuration)
+# ==========================================
+FILTER_CONFIG = {
+    'min_total_oos_trades': 30,  # 三周期样本外总交易数底线
+    'max_single_coin_concentration': 50.0  # 单币集中度(%)最大限制（大于该值则过滤）
+}
+
+# ==========================================
 # 1. 信号脱敏系统 (Anonymization System)
 # ==========================================
 signal_map = {}
@@ -44,6 +52,7 @@ def visual_len(text):
 
 def pad_label(text, width=16):
     """智能补齐标签长度，保证表格竖线对齐"""
+    text = str(text)
     vlen = visual_len(text)
     return text + ' ' * max(0, width - vlen)
 
@@ -69,9 +78,9 @@ def get_val(row, col_base, tf, fmt='raw'):
 def print_row(label, v60, v30, v15):
     """打印完美对齐的表格行"""
     lbl = pad_label(label, 14)
-    c60 = str(v60).ljust(18)
-    c30 = str(v30).ljust(18)
-    c15 = str(v15).ljust(18)
+    c60 = pad_label(v60, 18)
+    c30 = pad_label(v30, 18)
+    c15 = str(v15)
     print(f"  {lbl} | {c60} | {c30} | {c15}")
 
 
@@ -132,7 +141,19 @@ def generate_report():
             merged_df['样本外交易次数_30m'].fillna(0) +
             merged_df['样本外交易次数_15m'].fillna(0)
     )
-    filtered_df = merged_df[merged_df['total_oos_trades'] >= 30].copy()
+
+    # 提取过滤条件
+    min_trades = FILTER_CONFIG['min_total_oos_trades']
+    max_conc = FILTER_CONFIG['max_single_coin_concentration']
+
+    # 计算条件 (缺失值按0处理，防止因某个周期无交易被误杀)
+    cond_trades = merged_df['total_oos_trades'] >= min_trades
+    cond_conc_60m = merged_df['最优币占总净收益百分比_60m'].fillna(0) <= max_conc
+    cond_conc_30m = merged_df['最优币占总净收益百分比_30m'].fillna(0) <= max_conc
+    cond_conc_15m = merged_df['最优币占总净收益百分比_15m'].fillna(0) <= max_conc
+
+    # 联合过滤
+    filtered_df = merged_df[cond_trades & cond_conc_60m & cond_conc_30m & cond_conc_15m].copy()
 
     # 计算排序锚点 (三周期样本外均值)
     filtered_df['avg_oos_net'] = filtered_df[
@@ -169,14 +190,28 @@ def generate_report():
     print(filter_str.strip(" | "))
 
     print("\n3. 三周期存活率 Top 10 (全周期样本外皆盈利)：")
-    print("  [高频入场 (Entry)]                       [高频出场 (Exit)]")
+    print("  " + pad_label("[高频入场 (Entry)]", 45) + "[高频出场 (Exit)]")
     entry_list = list(top_entry_factors.items())
     exit_list = list(top_exit_factors.items())
     max_len = max(len(entry_list), len(exit_list))
+    total_survivors = len(survivors)
+
     for i in range(max_len):
-        e_str = f"- {entry_list[i][0]} ({entry_list[i][1]}次)" if i < len(entry_list) else ""
-        x_str = f"- {exit_list[i][0]} ({exit_list[i][1]}次)" if i < len(exit_list) else ""
-        print(f"  {e_str:<38} {x_str}")
+        if i < len(entry_list):
+            name, count = entry_list[i]
+            pct = (count / total_survivors * 100) if total_survivors > 0 else 0
+            e_str = f"- {name} ({count}次, 占比{pct:.1f}%)"
+        else:
+            e_str = ""
+
+        if i < len(exit_list):
+            name, count = exit_list[i]
+            pct = (count / total_survivors * 100) if total_survivors > 0 else 0
+            x_str = f"- {name} ({count}次, 占比{pct:.1f}%)"
+        else:
+            x_str = ""
+
+        print(f"  {pad_label(e_str, 45)} {x_str}")
 
     print("\n" + "=" * 90)
     print("【第二部分：Top 50 组合微观多维切片 (Micro Profiling)】")
@@ -188,8 +223,11 @@ def generate_report():
         print("-" * 90)
 
         # 第一版块：核心绩效 (Header)
-        print("  " + pad_label("核心与衰减指标",
-                               14) + f" | {'[60m 周期]'.ljust(18)} | {'[30m 周期]'.ljust(18)} | {'[15m 周期]'.ljust(18)}")
+        header_lbl = pad_label("核心与衰减指标", 14)
+        h60 = pad_label("[60m 周期]", 18)
+        h30 = pad_label("[30m 周期]", 18)
+        h15 = "[15m 周期]"
+        print(f"  {header_lbl} | {h60} | {h30} | {h15}")
         print("  " + "-" * 75)
 
         print_row("总交易数",
@@ -201,6 +239,11 @@ def generate_report():
                   get_val(row, '胜率', '60m', 'pct'),
                   get_val(row, '胜率', '30m', 'pct'),
                   get_val(row, '胜率', '15m', 'pct'))
+
+        print_row("平均单笔净利",
+                  get_val(row, '平均单笔净收益', '60m', 'pct_plus'),
+                  get_val(row, '平均单笔净收益', '30m', 'pct_plus'),
+                  get_val(row, '平均单笔净收益', '15m', 'pct_plus'))
 
         print_row("样本内单笔净利",
                   get_val(row, '样本内平均单笔净收益', '60m', 'pct_plus'),
