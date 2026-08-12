@@ -419,7 +419,7 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     success_count = 0
     total = len(final_uids_to_follow)
     for index, uid in enumerate(final_uids_to_follow, 1):
-        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)
+        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token) # 'follow' 或 'unfollow'
         if is_success:
             success_count += 1
 
