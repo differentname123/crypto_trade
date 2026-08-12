@@ -457,6 +457,9 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5, f
 
 
 if __name__ == '__main__':
+
+
+    df = pd.read_csv('./summary_results/aggregated_summary_Long.csv')
     target_timeframes = ['60m']
 
     for tf in target_timeframes:

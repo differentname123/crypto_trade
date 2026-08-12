@@ -624,7 +624,7 @@ if __name__ == '__main__':
         'UPPER_WICK_THRESH': [0.5],  # 上影线占比阈值
         'VOL_QUANTILE': [0.95],  # 成交量分位数
         'HIGH_CLOSE_THRESH': [0.95],  # 高位收盘价阈值
-        'CROSS_RANK_K': [5],
+        'CROSS_RANK_K': [50],
         'BAR_MINUTES': [60],
         'RANK_MODE': ['top']  # <--- 新增搜索空间
     }
