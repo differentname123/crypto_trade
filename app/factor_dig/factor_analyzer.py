@@ -5,6 +5,7 @@
 --------------------------------------------------------------------------------
  核心定位：你的“最终实盘拍板”验金石。
  本次升级：剔除统计学错觉与均值陷阱，引入实盘摩擦抗性与因子真实普适率。
+ (新增)：因子名称自动脱敏，排除主观偏见，只看数据说话。
 ================================================================================
 """
 import os
@@ -41,6 +42,32 @@ def load_data(tf='15m'):
 
     summary = pd.read_csv(sum_path)
     all_pairs = pd.read_csv(all_path)
+
+    # ================= 新增：因子名称自动脱敏隐射 =================
+    # 提取所有唯一的因子名称并剔除 NaN
+    all_factors = set(summary['entry_factor'].dropna().unique()) | \
+                  set(summary['exit_factor'].dropna().unique()) | \
+                  set(all_pairs['entry_factor'].dropna().unique()) | \
+                  set(all_pairs['exit_factor'].dropna().unique())
+    # 排序保证只要数据内容不变，同一批因子的映射编号每次运行都是稳定的
+    all_factors = sorted(list(all_factors))
+
+    # 生成映射字典: original_name -> Factor_001
+    factor_map = {name: f"Factor_{i:03d}" for i, name in enumerate(all_factors, 1)}
+
+    # 保存映射表到本地，方便后续人工追溯
+    map_path = os.path.join('factor_mapping.csv')
+    # 如果目录不存在先创建
+    os.makedirs(out_dir, exist_ok=True)
+    pd.DataFrame(list(factor_map.items()), columns=['Original_Name', 'Mapped_Name']).to_csv(map_path, index=False, encoding='utf-8-sig')
+    print(f"{GREEN}✅ 因子已自动脱敏，名称映射表已保存至: {map_path}{RESET}")
+
+    # 将数据中的名称全部替换为代号
+    summary['entry_factor'] = summary['entry_factor'].map(factor_map)
+    summary['exit_factor'] = summary['exit_factor'].map(factor_map)
+    all_pairs['entry_factor'] = all_pairs['entry_factor'].map(factor_map)
+    all_pairs['exit_factor'] = all_pairs['exit_factor'].map(factor_map)
+    # ==============================================================
 
     # 1. 强制转换为 Categorical 类型（极大压缩内存并加速分组计算）
     for col in ['entry_factor', 'exit_factor', 'filter_mode']:
