@@ -55,7 +55,6 @@ CFG = dict(
     DEDUPE_IDENTICAL=False,
     MIN_SIGNALS=1,
     MAX_DENSITY=0.9,
-    INCLUDE_PATH_EXITS=True,
 
     # --- 组合与输出 ---
     ALLOW_SAME_FACTOR=False,
@@ -122,75 +121,8 @@ def _core_static(entry_idx, exit_idx, n, cooldown, max_trades):
     return ent[:k], ext[:k]
 
 
-def _core_path(entry_idx, static_exit, close, low, atr, n, cooldown, max_trades,
-               exec_px,
-               use_fixed, fixed_pct,
-               use_barlow,
-               use_atr, atr_k,
-               use_time, time_n, time_th,
-               use_gb, gb_th,
-               use_lock, lock_th, lock_trail):
-    ent = np.empty(max_trades, dtype=np.int64)
-    ext = np.empty(max_trades, dtype=np.int64)
-    k = 0
-    pos = 0
-    ne = entry_idx.size
-    while pos < n - 1 and k < max_trades:
-        # 二分查找极速定位入场点，拒绝在布尔数组上循环爬行
-        a = np.searchsorted(entry_idx, pos)
-        if a >= ne:
-            break
-        e = entry_idx[a]
-        if e >= n - 1:
-            break
-
-        ep = exec_px[e]
-        el = low[e]
-        peak = close[e]
-        peak_prof = 0.0
-        j = e + 1
-        hit = -1
-        # 出场因为严重依赖入场价(ep)，只能局部顺序扫描
-        while j < n:
-            cj = close[j]
-            if cj > peak:
-                peak = cj
-            prof = cj / ep - 1.0
-            if prof > peak_prof:
-                peak_prof = prof
-            trig = False
-            if static_exit[j]:
-                trig = True
-            if (not trig) and use_fixed and cj < ep * (1.0 - fixed_pct):
-                trig = True
-            if (not trig) and use_barlow and cj < el:
-                trig = True
-            if (not trig) and use_atr:
-                a_v = atr[j]
-                if a_v == a_v and cj < peak - atr_k * a_v:
-                    trig = True
-            if (not trig) and use_time and (j - e) > time_n and prof < time_th:
-                trig = True
-            if (not trig) and use_gb and (peak_prof - prof) > gb_th:
-                trig = True
-            if (not trig) and use_lock and prof > lock_th and cj < peak * (1.0 - lock_trail):
-                trig = True
-            if trig:
-                hit = j
-                break
-            j += 1
-        if hit < 0:
-            hit = n - 1
-        ent[k] = e
-        ext[k] = hit
-        k += 1
-        pos = hit + 1 + cooldown
-    return ent[:k], ext[:k]
-
-
 if HAS_NUMBA:
     _core_static = njit(cache=True, nogil=True)(_core_static)
-    _core_path = njit(cache=True, nogil=True)(_core_path)
 
 
 def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
@@ -206,59 +138,6 @@ def _match_static_ss(entry_idx, exit_idx, n, cooldown, max_trades):
             break
         b = np.searchsorted(exit_idx, e + 1, side='left')
         x = int(exit_idx[b]) if b < nx else n - 1
-        ent.append(e)
-        ext.append(x)
-        pos = x + 1 + cooldown
-    return np.asarray(ent, np.int64), np.asarray(ext, np.int64)
-
-
-def _path_scan_np(e, ep, el, n, close, atr, static_exit, p):
-    start = e + 1
-    peak = close[e]
-    peak_prof = 0.0
-    chunk = 256
-    while start < n:
-        stop = min(start + chunk, n)
-        cl = close[start:stop]
-        pk = np.maximum.accumulate(np.maximum(cl, peak))
-        prof = cl / ep - 1.0
-        pp = np.maximum.accumulate(np.maximum(prof, peak_prof))
-        trig = static_exit[start:stop].copy()
-        if p['use_fixed']:
-            trig |= cl < ep * (1 - p['fixed_pct'])
-        if p['use_barlow']:
-            trig |= cl < el
-        if p['use_atr']:
-            trig |= cl < (pk - p['atr_k'] * atr[start:stop])
-        if p['use_time']:
-            bars = np.arange(start, stop) - e
-            trig |= (bars > p['time_n']) & (prof < p['time_th'])
-        if p['use_gb']:
-            trig |= (pp - prof) > p['gb_th']
-        if p['use_lock']:
-            trig |= (prof > p['lock_th']) & (cl < pk * (1 - p['lock_trail']))
-        w = np.flatnonzero(trig)
-        if w.size:
-            return start + int(w[0])
-        peak = pk[-1]
-        peak_prof = pp[-1]
-        start = stop
-        chunk = min(chunk * 2, 32768)
-    return n - 1
-
-
-def _match_path_np(entry_idx, static_exit, close, low, atr, exec_px, n, cooldown, max_trades, p):
-    ent, ext = [], []
-    ne = entry_idx.size
-    pos = 0
-    while pos < n - 1 and len(ent) < max_trades:
-        a = np.searchsorted(entry_idx, pos, side='left')
-        if a >= ne:
-            break
-        e = int(entry_idx[a])
-        if e >= n - 1:
-            break
-        x = _path_scan_np(e, exec_px[e], low[e], n, close, atr, static_exit, p)
         ent.append(e)
         ext.append(x)
         pos = x + 1 + cooldown
@@ -372,12 +251,6 @@ def make_params(bar_minutes, n_rows):
         OI_ROC_TH=0.020,
         OI_HOT_TH=0.050,
         CORR_TH=0.20,
-        STOP_PCT=0.05,
-        TIME_STOP_BARS=B(72),
-        TIME_STOP_TH=0.00,
-        GIVEBACK_TH=0.05,
-        LOCK_TH=0.10,
-        LOCK_TRAIL=0.05,
     )
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
@@ -777,32 +650,7 @@ def build_factors(df, P, rank_shift=0):
     out = {}
     for k_, s in F.items():
         out[k_] = np.ascontiguousarray(s.fillna(False).to_numpy(dtype=bool))
-    aux = dict(atr=atr_N.to_numpy(float))
-    return out, aux
-
-
-# ---------- 路径依赖出场（只能做出场） ----------
-def path_exit_specs(P):
-    z = dict(use_fixed=False, fixed_pct=0.0, use_barlow=False,
-             use_atr=False, atr_k=0.0, use_time=False, time_n=0, time_th=0.0,
-             use_gb=False, gb_th=0.0, use_lock=False, lock_th=0.0, lock_trail=0.0,
-             static=None)
-    S = {}
-    S['EXIT_FIXED_STOP'] = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT']}
-    S['EXIT_ATR_TRAILING'] = {**z, 'use_atr': True, 'atr_k': P['ATR_K']}
-    S['EXIT_ENTRY_BAR_LOW_BREAK'] = {**z, 'use_barlow': True}
-    S['EXIT_TIME_STOP'] = {**z, 'use_time': True, 'time_n': P['TIME_STOP_BARS'],
-                           'time_th': P['TIME_STOP_TH']}
-    S['EXIT_PROFIT_GIVEBACK'] = {**z, 'use_gb': True, 'gb_th': P['GIVEBACK_TH']}
-    S['EXIT_PROFIT_LOCK_TRAIL'] = {**z, 'use_lock': True, 'lock_th': P['LOCK_TH'],
-                                   'lock_trail': P['LOCK_TRAIL']}
-    S['EXIT_FULL_PROTECTION'] = {**z, 'use_fixed': True, 'fixed_pct': P['STOP_PCT'],
-                                 'use_atr': True, 'atr_k': P['ATR_K'],
-                                 'use_time': True, 'time_n': P['TIME_STOP_BARS'],
-                                 'time_th': P['TIME_STOP_TH'],
-                                 'use_gb': True, 'gb_th': P['GIVEBACK_TH'],
-                                 'static': 'EXIT_HIGH_VOLUME_BREAKDOWN'}
-    return S
+    return out
 
 
 # ======================================================================
@@ -1019,7 +867,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     P = make_params(bm, len(df))
 
     t0 = time.time()
-    F, aux = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
+    F = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
         return None, {'total_combos': 0}, 0
@@ -1029,7 +877,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     rk_loss = df['rank_loss_24h'].to_numpy(float)
 
     F = {k: v[warm:] for k, v in F.items()}
-    atr = aux['atr'][warm:]
 
     if btc_close is not None:
         btc_c = btc_close.reindex(df.index).ffill().bfill().to_numpy(float)
@@ -1042,7 +889,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
     op = df['open'].to_numpy(float)
     cl = df['close'].to_numpy(float)
-    lo = df['low'].to_numpy(float)
     exec_px = np.empty(n, float)
     exec_px[:-1] = op[1:]
     exec_px[-1] = cl[-1]
@@ -1069,9 +915,8 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 uniq.append(k)
         keep = uniq
 
-    P_EXITS = path_exit_specs(P) if cfg['INCLUDE_PATH_EXITS'] else {}
     entry_names = [k for k in keep]
-    exit_names = [k for k in keep] + list(P_EXITS.keys())
+    exit_names = [k for k in keep]
 
     if cfg['ENTRY_PREFIX_FILTER']:
         entry_names = [k for k in entry_names if k.startswith(tuple(cfg['ENTRY_PREFIX_FILTER']))]
@@ -1079,7 +924,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         exit_names = [k for k in exit_names if k.startswith(tuple(cfg['EXIT_PREFIX_FILTER']))]
 
     idx_cache = {k: np.flatnonzero(F[k]).astype(np.int64) for k in keep}
-    zeros_static = np.zeros(n, dtype=bool)
     split_bar = int(n * cfg['OOS_SPLIT'])
     max_tr = min(cfg['MAX_TRADES_PER_COMBO'], n // 2 + 2)
 
@@ -1096,7 +940,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     # 【性能/内存】列式装配：不再堆积上百万个 dict，改为每列一个 list。
     col_data = None
 
-    # 【新增】精确统计真实搜索空间（考虑静态组合产出2行，路径组合产出1行）
+    # 【新增】精确统计真实搜索空间（考虑静态组合产出2行）
     theoretical_tests = 0
     done = 0
 
@@ -1108,33 +952,16 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 stats['skip_same_factor'] += 1
                 continue
 
-            is_path_exit = (xn in P_EXITS)
-            # 累加理论测试次数：静态出场测多空(×2)，路径出场仅测多(×1)
-            multiplier = 1 if is_path_exit else 2
+            # 累加理论测试次数：静态出场测多空(×2)
+            multiplier = 2
             theoretical_tests += multiplier * len(FILTER_MODES)
 
-            if is_path_exit:
-                spec = P_EXITS[xn]
-                st = F[spec['static']] if (spec['static'] and spec['static'] in F) else zeros_static
-                if HAS_NUMBA:
-                    ent, ext = _core_path(eidx, st, cl, lo, atr, n, cfg['COOLDOWN_BARS'], max_tr,
-                                          exec_px,
-                                          spec['use_fixed'], spec['fixed_pct'],
-                                          spec['use_barlow'],
-                                          spec['use_atr'], spec['atr_k'],
-                                          spec['use_time'], spec['time_n'], spec['time_th'],
-                                          spec['use_gb'], spec['gb_th'],
-                                          spec['use_lock'], spec['lock_th'], spec['lock_trail'])
-                else:
-                    ent, ext = _match_path_np(eidx, st, cl, lo, atr, exec_px, n,
-                                              cfg['COOLDOWN_BARS'], max_tr, spec)
-                x_dens = np.nan
+            if HAS_NUMBA:
+                ent, ext = _core_static(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
             else:
-                if HAS_NUMBA:
-                    ent, ext = _core_static(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
-                else:
-                    ent, ext = _match_static_ss(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
-                x_dens = dens.get(xn, np.nan)
+                ent, ext = _match_static_ss(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
+
+            x_dens = dens.get(xn, np.nan)
 
             if ent.size == 0:
                 stats['skip_zero_trades'] += 1
@@ -1145,12 +972,10 @@ def mine_symbol(coin, df, cfg, btc_close=None):
             ok_l = np.isfinite(rets_long)
             ent_base_l, ext_base_l, rets_base_l = ent[ok_l], ext[ok_l], rets_long[ok_l]
 
-            # === 计算做空收益 (仅静态出场支持)，并修正为 U本位 计算 ===
-            if not is_path_exit:
-                # 【关键修复】：U本位 做空的收益率公式应为 (1 - 期末/期初 - 手续费)
-                rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
-                ok_s = np.isfinite(rets_short)
-                ent_base_s, ext_base_s, rets_base_s = ent[ok_s], ext[ok_s], rets_short[ok_s]
+            # === 计算做空收益 (U本位 计算) ===
+            rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
+            ok_s = np.isfinite(rets_short)
+            ent_base_s, ext_base_s, rets_base_s = ent[ok_s], ext[ok_s], rets_short[ok_s]
 
             for mode_name, rank_col, threshold in FILTER_MODES:
                 filter_label = 'original' if mode_name == 'original' else f"{mode_name}_{threshold}"
@@ -1176,7 +1001,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                     row_l.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
                     m_is = ent_f < split_bar
 
-                    # 【关键修复】：OOS 数据切片 ext_f[~m_is]，原本这里笔误写成了 ext_f[m_is] 导致长度不一致报错
                     row_l.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
                                              bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
                     row_l.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
@@ -1190,42 +1014,40 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                         for k_, v_ in row_l.items():
                             col_data[k_].append(v_)
 
-                # ================= 处理 SHORT (仅静态出场) =================
-                if not is_path_exit:
-                    if mode_name == 'original':
-                        ent_f, ext_f, rets_f = ent_base_s, ext_base_s, rets_base_s
+                # ================= 处理 SHORT =================
+                if mode_name == 'original':
+                    ent_f, ext_f, rets_f = ent_base_s, ext_base_s, rets_base_s
+                else:
+                    entry_ranks = rk_gain[ent_base_s] if mode_name == 'top' else rk_loss[ent_base_s]
+                    mask = entry_ranks <= threshold
+                    ent_f, ext_f, rets_f = ent_base_s[mask], ext_base_s[mask], rets_base_s[mask]
+
+                if ent_f.size < cfg['MIN_TRADES_REPORT']:
+                    stats['skip_too_few'] += 1
+                elif ent_f.size > max_allowed_trades:
+                    stats['skip_too_many'] += 1
+                else:
+                    stats['mode_pass_counts'][filter_label] += 1
+                    bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
+
+                    row_s = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Short',
+                                 filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
+                    row_s.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+                    m_is = ent_f < split_bar
+
+                    row_s.update(
+                        trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
+                                    bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
+                    row_s.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
+                                             start_idx=split_bar,
+                                             bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
+                                             prefix='oos_'))
+
+                    if col_data is None:
+                        col_data = {k_: [v_] for k_, v_ in row_s.items()}
                     else:
-                        entry_ranks = rk_gain[ent_base_s] if mode_name == 'top' else rk_loss[ent_base_s]
-                        mask = entry_ranks <= threshold
-                        ent_f, ext_f, rets_f = ent_base_s[mask], ext_base_s[mask], rets_base_s[mask]
-
-                    if ent_f.size < cfg['MIN_TRADES_REPORT']:
-                        stats['skip_too_few'] += 1
-                    elif ent_f.size > max_allowed_trades:
-                        stats['skip_too_many'] += 1
-                    else:
-                        stats['mode_pass_counts'][filter_label] += 1
-                        bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
-
-                        row_s = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Short',
-                                     filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
-                        row_s.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
-                        m_is = ent_f < split_bar
-
-                        # 【关键修复】：OOS 数据切片 ext_f[~m_is]，原本这里笔误写成了 ext_f[m_is] 导致长度不一致报错
-                        row_s.update(
-                            trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
-                                        bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
-                        row_s.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
-                                                 start_idx=split_bar,
-                                                 bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
-                                                 prefix='oos_'))
-
-                        if col_data is None:
-                            col_data = {k_: [v_] for k_, v_ in row_s.items()}
-                        else:
-                            for k_, v_ in row_s.items():
-                                col_data[k_].append(v_)
+                        for k_, v_ in row_s.items():
+                            col_data[k_].append(v_)
 
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
 
@@ -1238,7 +1060,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         out['kline_days'] = float(kline_days)
         out['n_trials_combos'] = int(stats['total_combos'])
         out['n_trials_modes'] = int(n_modes)
-        # 【修改】使用精确计算的理论测试次数，而非简单的 combos * modes
         out['n_trials_total'] = int(theoretical_tests)
         out['n_trials_alive'] = int(len(out))
 
@@ -1301,14 +1122,12 @@ def mine_symbol_wrapper(args):
 # ======================================================================
 def _coin_out_path(out_dir, coin):
     """单币结果文件的唯一路径（断点续跑判定依据）"""
-    # 【修改】后缀改为 .csv.gz
     return os.path.join(out_dir, f'pairs_{coin}.csv.gz')
 
 
 def _atomic_to_csv(df, path):
     """【新增】原子落盘：先写 .tmp 再 os.replace，杜绝中断产生半截文件污染断点"""
     tmp = f"{path}.tmp"
-    # 【修改】增加 float_format='%.5f' 截断小数，并且加入 compression='gzip'
     df.to_csv(tmp, index=False, encoding='utf-8-sig', float_format='%.5f', compression='gzip')
     os.replace(tmp, path)
 
@@ -1317,7 +1136,6 @@ def _clean_stale_tmp(out_dir):
     """【新增】清理上一次异常中断残留的 .tmp（它们不是有效结果，不能被当作已完成）"""
     n = 0
     for f in os.listdir(out_dir):
-        # 【修改】匹配规则扩展，适应 .csv.gz.tmp 等所有临时文件
         if f.startswith('pairs_') and f.endswith('.tmp'):
             try:
                 os.remove(os.path.join(out_dir, f))
@@ -1362,7 +1180,7 @@ def main(cfg=CFG):
 
     print("=" * 78)
     print(f"  因子挖掘启动 | bar={cfg['BAR_MINUTES']}min | numba={'ON' if HAS_NUMBA else 'OFF'}")
-    print(f"⏭️  断点续跑: 已存在结果 {len(resume_coins)} 个 -> 直接跳过回测")
+    print(f"⏭️  断点续跑: 已存在结果 {len(resume_coins)} 个 ->直接跳过回测")
     print(f"🎯 本次计划回测币种个数: {len(valid_coins)} 个")
     if len(valid_coins) <= 30:
         print(f"📜 币种名单: {', '.join(valid_coins)}")
@@ -1397,11 +1215,8 @@ def main(cfg=CFG):
     if HAS_NUMBA:
         print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
         _d_idx = np.array([0, 1], dtype=np.int64)
-        _d_bool = np.array([False, True], dtype=bool)
-        _d_float = np.array([1.0, 2.0], dtype=float)
         _core_static(_d_idx, _d_idx, 2, 0, 1)
-        _core_path(_d_idx, _d_bool, _d_float, _d_float, _d_float, 2, 0, 1, _d_float,
-                   False, 0.0, False, False, 0.0, False, 0, 0.0, False, 0.0, False, 0.0, 0.0)
+
     print(f"\n🚀 启动并发回测... (分配进程核心数: {max_workers})")
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers,
@@ -1471,7 +1286,6 @@ def main(cfg=CFG):
           f"无有效结果: {n_empty} 个 | 失败: {n_fail} 个")
     print(f"📁 单币结果目录: {os.path.abspath(cfg['OUT_DIR'])}")
     print("ℹ️  pairs_ALL.csv / pairs_CROSS_COIN_SUMMARY.csv 已取消在此生成；")
-    # 【修改】对应输出提示的后缀更新
     print("    请运行 rebuild_pairs_summary.py，由 pairs_<coin>.csv.gz 精确还原(含真实测试基数的 DSR)。")
     print("=" * 78)
 
