@@ -1,206 +1,278 @@
-# -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
 import os
+import unicodedata
+from datetime import datetime
+
+# ==========================================
+# 1. 信号脱敏系统 (Anonymization System)
+# ==========================================
+signal_map = {}
+signal_counter = 1
+
+
+def anonymize(signal_name):
+    """将信号名称脱敏为 SIGNAL_XXX 格式，并记录在案"""
+    global signal_counter
+    if pd.isna(signal_name) or str(signal_name).strip() == '' or signal_name == 'Unknown':
+        return 'Unknown'
+
+    signal_str = str(signal_name).strip()
+    if signal_str not in signal_map:
+        signal_map[signal_str] = f"SIGNAL_{signal_counter:03d}"
+        signal_counter += 1
+    return signal_map[signal_str]
+
+
+def save_mapping():
+    """保存脱敏映射表至 CSV"""
+    if not signal_map:
+        return
+    mapping_df = pd.DataFrame(list(signal_map.items()), columns=['真实信号名称', '脱敏代码'])
+    mapping_path = 'signal_mapping.csv'
+    mapping_df.to_csv(mapping_path, index=False, encoding='utf-8-sig')
+    print(f"[*] 信号脱敏已完成，映射表已保存至: {mapping_path}")
 
 
 # ==========================================
-# 核心分析类
+# 2. 终端显示与格式化工具 (Formatting Tools)
 # ==========================================
-class StrategyAnalyzer:
-    def __init__(self, filepath, direction):
-        """
-        :param filepath: 聚合后的 csv 文件路径
-        :param direction: 'Long' 或 'Short'，用于判断资金费率加减逻辑
-        """
-        self.filepath = filepath
-        self.direction = direction.capitalize()
-        self.df = pd.read_csv(filepath)
-        print(f"\n{'=' * 50}")
-        print(f"📊 开始分析 {self.direction} 策略数据，总组合数: {len(self.df)}")
-        print(f"{'=' * 50}")
+def visual_len(text):
+    """计算中英混合字符串的视觉长度（中文算2格）"""
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in str(text))
 
-    def anonymize_signals(self, mapping_file='./summary_results/signal_mapping.csv'):
-        """对信号名称进行脱敏，并维护一个全局映射表"""
-        print(f"🔒 正在执行信号名称脱敏...")
 
-        # 提取当前数据中所有的独特信号名称
-        entry_sigs = self.df['入场信号名称'].dropna().unique().tolist()
-        exit_sigs = self.df['出场信号名称'].dropna().unique().tolist()
-        current_signals = sorted(list(set(entry_sigs) | set(exit_sigs)))
+def pad_label(text, width=16):
+    """智能补齐标签长度，保证表格竖线对齐"""
+    vlen = visual_len(text)
+    return text + ' ' * max(0, width - vlen)
 
-        # 尝试读取已有的映射表，保证跨文件/跨运行时的脱敏一致性
-        mapping = {}
-        current_max_id = 0
-        if os.path.exists(mapping_file):
-            existing_df = pd.read_csv(mapping_file)
-            mapping = dict(zip(existing_df['Original_Signal'], existing_df['Masked_Signal']))
-            if mapping:
-                # 提取已有的最大序号，例如从 "SIGNAL_045" 中提取 45
-                current_max_id = max([int(v.split('_')[1]) for v in mapping.values()])
 
-        # 为当前数据中的新信号生成脱敏名称
-        new_mapping_count = 0
-        for sig in current_signals:
-            if sig not in mapping:
-                current_max_id += 1
-                mapping[sig] = f"SIGNAL_{current_max_id:03d}"
-                new_mapping_count += 1
+def get_val(row, col_base, tf, fmt='raw'):
+    """安全地从 DataFrame 行中提取并格式化特定周期的字段"""
+    col_name = f"{col_base}_{tf}"
+    if col_name not in row or pd.isna(row[col_name]):
+        return "N/A"
 
-        # 将新的映射关系保存回文件
-        if new_mapping_count > 0 or not os.path.exists(mapping_file):
-            os.makedirs(os.path.dirname(mapping_file), exist_ok=True)
-            mapping_df = pd.DataFrame(list(mapping.items()), columns=['Original_Signal', 'Masked_Signal'])
-            mapping_df.to_csv(mapping_file, index=False, encoding='utf-8-sig')
-            print(f"   已新增 {new_mapping_count} 个信号映射，映射表已保存至: {mapping_file}")
-        else:
-            print(f"   所有信号均在已有映射表中，无需更新文件。")
+    val = row[col_name]
+    try:
+        if fmt == 'int': return f"{int(val)}"
+        if fmt == 'pct': return f"{val:.2f}%"
+        if fmt == 'pct_plus': return f"{val:+.2f}%"
+        if fmt == 'float2': return f"{val:.2f}"
+        if fmt == 'float2_plus': return f"{val:+.2f}"
+        return str(val)
+    except:
+        return "N/A"
 
-        # 将 DataFrame 中的原始名称替换为脱敏名称
-        self.df['入场信号名称'] = self.df['入场信号名称'].map(mapping)
-        self.df['出场信号名称'] = self.df['出场信号名称'].map(mapping)
 
-        return self
-
-    def calculate_derived_fields(self):
-        """0. 计算派生字段"""
-        df = self.df.copy()
-
-        # 1. 资金费率逻辑处理 (做多减去费率，做空加上费率)
-        sign = -1 if self.direction == 'Long' else 1
-
-        # 计算各类净收益
-        df['总净收益'] = df['总收益'] + sign * df['总资金费率']
-        df['样本内净收益'] = df['样本内收益'] + sign * df['样本内资金费率']
-        df['样本外净收益'] = df['样本外收益'] + sign * df['样本外资金费率']
-
-        for q in ['Q1', 'Q2', 'Q3', 'Q4']:
-            df[f'{q}净收益'] = df[f'{q}收益'] + sign * df[f'{q}资金费率']
-
-        # 2. 计算胜率 (%)
-        df['胜率(%)'] = np.where(df['总交易数'] > 0, (df['盈利交易次数'] / df['总交易数']) * 100, 0)
-
-        # 3. 计算单笔平均净收益
-        df['单笔平均净收益'] = np.where(df['总交易数'] > 0, df['总净收益'] / df['总交易数'], 0)
-        df['样本内单笔净收益'] = np.where(df['样本内交易次数'] > 0, df['样本内净收益'] / df['样本内交易次数'], 0)
-        df['样本外单笔净收益'] = np.where(df['样本外交易次数'] > 0, df['样本外净收益'] / df['样本外交易次数'], 0)
-
-        # 4. 盈利的币比例
-        df['盈利币比例'] = np.where(df['产生交易的币种总数'] > 0, df['盈利的币数'] / df['产生交易的币种总数'], 0)
-
-        # 5. 盈亏持仓时间比
-        df['盈亏持仓时间比'] = np.where(df['亏损单平均持仓 K 线根数'] > 0,
-                                        df['盈利单平均持仓 K 线根数'] / df['亏损单平均持仓 K 线根数'],
-                                        np.inf)
-
-        # 6. 最优币占总净收益百分比 (%)
-        df['最优币净收益占比(%)'] = np.where(df['总净收益'] > 0,
-                                             (df['最大收益币的收益'] / df['总净收益']) * 100,
-                                             0)
-
-        self.df = df
-        return self
-
-    def apply_hard_filters(self, min_avg_net_ret=0.3, min_trades=50, min_coins=5, min_profit_coin_ratio=0.5):
-        """1. 硬过滤并打印漏斗分析（通过率）"""
-        print("\n🔍 正在执行硬过滤漏斗分析...")
-        df = self.df
-        total_initial = len(df)
-
-        if total_initial == 0:
-            print("❌ 数据为空，跳过过滤。")
-            return self
-
-        filters = {
-            f"单笔平均净收益 > {min_avg_net_ret}%": df['单笔平均净收益'] > min_avg_net_ret,
-            f"总交易次数 > {min_trades}": df['总交易数'] > min_trades,
-            f"产生交易的币种总数 > {min_coins}": df['产生交易的币种总数'] > min_coins,
-            f"盈利币比例 > {min_profit_coin_ratio * 100}%": df['盈利币比例'] > min_profit_coin_ratio,
-            "各季度净收益均为正": (df['Q1净收益'] > 0) & (df['Q2净收益'] > 0) & (df['Q3净收益'] > 0) & (
-                        df['Q4净收益'] > 0)
-        }
-
-        current_df = df
-        for filter_name, condition in filters.items():
-            prev_count = len(current_df)
-            current_df = current_df.loc[current_df.index.intersection(df[condition].index)]
-            curr_count = len(current_df)
-
-            pass_rate = (curr_count / prev_count * 100) if prev_count > 0 else 0
-            total_retention = (curr_count / total_initial * 100)
-
-            print(
-                f"  [{filter_name:<25}] | 剩余: {curr_count:<5} | 步骤通过率: {pass_rate:>6.2f}% | 总留存率: {total_retention:>6.2f}%")
-
-        self.filtered_df = current_df
-        print(f"\n✅ 过滤完成！最终符合条件的组合数量: {len(self.filtered_df)}")
-        return self
-
-    def display_top_n(self, top_n=10, sort_by='单笔平均净收益'):
-        """2. 排序并优雅地展示前 N 个结果"""
-        if self.filtered_df.empty:
-            print(f"\n⚠️ 没有组合通过过滤条件，无法展示 Top {top_n}。")
-            return
-
-        print(f"\n🏆 按照 [{sort_by}] 降序排列，展示 Top {top_n} 策略组合:\n")
-
-        top_df = self.filtered_df.sort_values(by=sort_by, ascending=False).head(top_n)
-
-        for i, (_, row) in enumerate(top_df.iterrows(), 1):
-            print(f"==== Top {i} ========================================================")
-            print(f"🔹 【参数配置】")
-            print(f"   入场信号: {row['入场信号名称']}")
-            print(f"   出场信号: {row['出场信号名称']}")
-            print(f"   过滤模式: {row['过滤模式']}")
-
-            print(f"\n🔹 【核心绩效】")
-            print(
-                f"   总交易次数: {row['总交易数']}  |  胜率: {row['胜率(%)']:.2f}%  |  总净收益: {row['总净收益']:.2f}%")
-            print(f"   单笔平均净收益: {row['单笔平均净收益']:.4f}%  |  全局最大回撤: {row['全局最大回撤']:.2f}%")
-
-            print(f"\n🔹 【时序稳定性】")
-            print(f"   Q1净收益: {row['Q1净收益']:>6.2f}%  |  Q2净收益: {row['Q2净收益']:>6.2f}%")
-            print(f"   Q3净收益: {row['Q3净收益']:>6.2f}%  |  Q4净收益: {row['Q4净收益']:>6.2f}%")
-            print(
-                f"   样本内平均单笔: {row['样本内单笔净收益']:.4f}%  |  样本外平均单笔: {row['样本外单笔净收益']:.4f}%")
-
-            print(f"\n🔹 【持仓与风险分布】")
-            print(
-                f"   盈利单均持仓(K线): {row['盈利单平均持仓 K 线根数']}  |  亏损单均持仓(K线): {row['亏损单平均持仓 K 线根数']}")
-            print(f"   盈亏持仓时间比: {row['盈亏持仓时间比']:.2f} (越大越能扛盈止损)")
-            print(f"   最优币名称: {row['最大收益币名称']}  |  最优币贡献占比: {row['最优币净收益占比(%)']:.2f}%")
-            print("=================================================================\n")
+def print_row(label, v60, v30, v15):
+    """打印完美对齐的表格行"""
+    lbl = pad_label(label, 14)
+    c60 = str(v60).ljust(18)
+    c30 = str(v30).ljust(18)
+    c15 = str(v15).ljust(18)
+    print(f"  {lbl} | {c60} | {c30} | {c15}")
 
 
 # ==========================================
-# 执行入口 (灵活配置)
+# 3. 数据处理与报告生成逻辑
 # ==========================================
-if __name__ == '__main__':
-    DIRECTION = 'Long'  # 'Long' 或 'Short'
-    TIME_FRAME = '60m'  # 可选: '60m', '30m', '15m'
-    # --- 你可以在这里灵活修改参数 ---
-    TARGET_FILE = f'./summary_results_{TIME_FRAME}/aggregated_summary_{DIRECTION}.csv'
-    MAPPING_FILE = f'./summary_results_{TIME_FRAME}/signal_mapping.csv'
+def load_and_prep_data():
+    paths = {
+        '60m': './summary_results_60m/aggregated_summary_Long.csv',
+        '30m': './summary_results_30m/aggregated_summary_Long.csv',
+        '15m': './summary_results_15m/aggregated_summary_Long.csv'
+    }
 
-    # 过滤参数
-    MIN_AVG_NET_RET = 0.3
-    MIN_TRADES = 50
-    MIN_COINS = 5
-    MIN_PROFIT_RATIO = 0.5
-    # ------------------------------
+    dfs = {}
+    for tf, path in paths.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"找不到文件: {path}。请确认路径。")
+        df = pd.read_csv(path)
 
-    if os.path.exists(TARGET_FILE):
-        analyzer = StrategyAnalyzer(filepath=TARGET_FILE, direction=DIRECTION)
+        # 脱敏入场和出场信号
+        df['入场信号名称'] = df['入场信号名称'].apply(anonymize)
+        df['出场信号名称'] = df['出场信号名称'].apply(anonymize)
+        df['过滤模式'] = df['过滤模式'].fillna('Unknown')
 
-        # 链式调用：脱敏 -> 算指标 -> 过滤 -> 展示
-        analyzer.anonymize_signals(mapping_file=MAPPING_FILE) \
-            .calculate_derived_fields() \
-            .apply_hard_filters(
-            min_avg_net_ret=MIN_AVG_NET_RET,
-            min_trades=MIN_TRADES,
-            min_coins=MIN_COINS,
-            min_profit_coin_ratio=MIN_PROFIT_RATIO
-        ) \
-            .display_top_n(top_n=10, sort_by='单笔平均净收益')
-    else:
-        print(f"❌ 找不到文件: {TARGET_FILE}，请确认上一步的聚合结果是否存在。")
+        dfs[tf] = df
+
+    save_mapping()
+    return dfs['60m'], dfs['30m'], dfs['15m']
+
+
+def generate_report():
+    print("正在加载与处理多周期因子数据，请稍候...\n")
+
+    try:
+        df_60m, df_30m, df_15m = load_and_prep_data()
+    except Exception as e:
+        print(f"系统错误: {e}")
+        return
+
+    # 1. 提取全局宏观统计
+    df_all = pd.concat([df_60m, df_30m, df_15m], ignore_index=True)
+    valid_returns = df_all[df_all['总收益'].abs() > 1e-6]
+    global_funding_friction = (valid_returns['总资金费率'] / valid_returns[
+        '总收益'].abs()).median() * 100 if not valid_returns.empty else 0
+    filter_oos_medians = df_all.groupby('过滤模式')['样本外平均单笔净收益'].median()
+
+    # 2. 横向拼接三周期宽表 (Full Outer Join)
+    keys = ['入场信号名称', '出场信号名称', '过滤模式']
+    d60 = df_60m.set_index(keys).add_suffix('_60m')
+    d30 = df_30m.set_index(keys).add_suffix('_30m')
+    d15 = df_15m.set_index(keys).add_suffix('_15m')
+
+    merged_df = d60.join([d30, d15], how='outer').reset_index()
+
+    # 底线过滤：剔除三周期样本外交易总数过少的组合
+    merged_df['total_oos_trades'] = (
+            merged_df['样本外交易次数_60m'].fillna(0) +
+            merged_df['样本外交易次数_30m'].fillna(0) +
+            merged_df['样本外交易次数_15m'].fillna(0)
+    )
+    filtered_df = merged_df[merged_df['total_oos_trades'] >= 30].copy()
+
+    # 计算排序锚点 (三周期样本外均值)
+    filtered_df['avg_oos_net'] = filtered_df[
+        ['样本外平均单笔净收益_60m', '样本外平均单笔净收益_30m', '样本外平均单笔净收益_15m']
+    ].mean(axis=1)
+
+    # 提取存活 Top 10 (要求三个周期 OOS 收益皆 > 0)
+    survivors = filtered_df[
+        (filtered_df['样本外平均单笔净收益_60m'] > 0) &
+        (filtered_df['样本外平均单笔净收益_30m'] > 0) &
+        (filtered_df['样本外平均单笔净收益_15m'] > 0)
+        ]
+    top_entry_factors = survivors['入场信号名称'].value_counts().head(10)
+    top_exit_factors = survivors['出场信号名称'].value_counts().head(10)
+
+    # 生成 Top 50 榜单
+    top50 = filtered_df.sort_values(by='avg_oos_net', ascending=False).head(50)
+
+    # ==========================================
+    # 打印报告
+    # ==========================================
+    print("\n" + "=" * 90)
+    print(">>> [加密货币因子挖掘 - 多周期全景印证报告] <<<")
+    print(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 排序基准：三周期平均样本外单笔净利")
+    print("=" * 90 + "\n")
+
+    print("【第一部分：宏观水位线 (Macro Baseline)】")
+    print(f"1. 全局基准：总资金费率占毛收益的平均中位数摩擦比例为 {global_funding_friction:.2f}%")
+
+    print("2. 过滤模式 (Filter) 样本外单笔净利中位数：")
+    filter_str = "  "
+    for idx, val in filter_oos_medians.items():
+        filter_str += f"[{idx}]: {val:+.2f}% | "
+    print(filter_str.strip(" | "))
+
+    print("\n3. 三周期存活率 Top 10 (全周期样本外皆盈利)：")
+    print("  [高频入场 (Entry)]                       [高频出场 (Exit)]")
+    entry_list = list(top_entry_factors.items())
+    exit_list = list(top_exit_factors.items())
+    max_len = max(len(entry_list), len(exit_list))
+    for i in range(max_len):
+        e_str = f"- {entry_list[i][0]} ({entry_list[i][1]}次)" if i < len(entry_list) else ""
+        x_str = f"- {exit_list[i][0]} ({exit_list[i][1]}次)" if i < len(exit_list) else ""
+        print(f"  {e_str:<38} {x_str}")
+
+    print("\n" + "=" * 90)
+    print("【第二部分：Top 50 组合微观多维切片 (Micro Profiling)】")
+    print("=" * 90)
+
+    for rank, (idx, row) in enumerate(top50.iterrows(), 1):
+        print(f"\n[Rank #{rank:02d}] ")
+        print(f"组合身份: Entry = {row['入场信号名称']} | Exit = {row['出场信号名称']} | Filter = {row['过滤模式']}")
+        print("-" * 90)
+
+        # 第一版块：核心绩效 (Header)
+        print("  " + pad_label("核心与衰减指标",
+                               14) + f" | {'[60m 周期]'.ljust(18)} | {'[30m 周期]'.ljust(18)} | {'[15m 周期]'.ljust(18)}")
+        print("  " + "-" * 75)
+
+        print_row("总交易数",
+                  get_val(row, '总交易数', '60m', 'int'),
+                  get_val(row, '总交易数', '30m', 'int'),
+                  get_val(row, '总交易数', '15m', 'int'))
+
+        print_row("胜率",
+                  get_val(row, '胜率', '60m', 'pct'),
+                  get_val(row, '胜率', '30m', 'pct'),
+                  get_val(row, '胜率', '15m', 'pct'))
+
+        print_row("样本内单笔净利",
+                  get_val(row, '样本内平均单笔净收益', '60m', 'pct_plus'),
+                  get_val(row, '样本内平均单笔净收益', '30m', 'pct_plus'),
+                  get_val(row, '样本内平均单笔净收益', '15m', 'pct_plus'))
+
+        print_row("样本外单笔净利",
+                  get_val(row, '样本外平均单笔净收益', '60m', 'pct_plus'),
+                  get_val(row, '样本外平均单笔净收益', '30m', 'pct_plus'),
+                  get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'))
+
+        # 盈亏 K 线整合展示
+        def get_klines(tf):
+            w = get_val(row, '盈利单平均持仓 K 线根数', tf, 'int')
+            l = get_val(row, '亏损单平均持仓 K 线根数', tf, 'int')
+            return f"盈:{w} / 亏:{l}" if w != 'N/A' and l != 'N/A' else "N/A"
+
+        print_row("盈亏K线数", get_klines('60m'), get_klines('30m'), get_klines('15m'))
+
+        print_row("盈亏持仓时间比",
+                  get_val(row, '盈亏持仓时间比', '60m', 'float2'),
+                  get_val(row, '盈亏持仓时间比', '30m', 'float2'),
+                  get_val(row, '盈亏持仓时间比', '15m', 'float2'))
+
+        # 第二版块：广度与集中度
+        print("\n> 截面宽度与单币风险")
+
+        def get_breadth(tf):
+            w = get_val(row, '盈利的币数', tf, 'int')
+            t = get_val(row, '产生交易的币种总数', tf, 'int')
+            if w != 'N/A' and t != 'N/A' and int(t) > 0:
+                return f"{(int(w) / int(t) * 100):.1f}% ({w}/{t})"
+            return "N/A"
+
+        print_row("盈利币比例", get_breadth('60m'), get_breadth('30m'), get_breadth('15m'))
+        print_row("单币集中度",
+                  get_val(row, '最优币占总净收益百分比', '60m', 'pct'),
+                  get_val(row, '最优币占总净收益百分比', '30m', 'pct'),
+                  get_val(row, '最优币占总净收益百分比', '15m', 'pct'))
+        print_row("最大收益币",
+                  get_val(row, '最大收益币名称', '60m'),
+                  get_val(row, '最大收益币名称', '30m'),
+                  get_val(row, '最大收益币名称', '15m'))
+
+        # 第三版块：时间序列平稳性
+        print("\n> 季度平稳性 (Q1-Q4净收益)")
+
+        def get_q_net(q, tf):
+            try:
+                rev = float(row[f"{q}收益_{tf}"])
+                fee = float(row[f"{q}资金费率_{tf}"])
+                if pd.notna(rev) and pd.notna(fee):
+                    return f"{(rev - fee):+.2f}"
+            except:
+                pass
+            return "N/A"
+
+        print_row("Q1 净收益", get_q_net('Q1', '60m'), get_q_net('Q1', '30m'), get_q_net('Q1', '15m'))
+        print_row("Q2 净收益", get_q_net('Q2', '60m'), get_q_net('Q2', '30m'), get_q_net('Q2', '15m'))
+        print_row("Q3 净收益", get_q_net('Q3', '60m'), get_q_net('Q3', '30m'), get_q_net('Q3', '15m'))
+        print_row("Q4 净收益", get_q_net('Q4', '60m'), get_q_net('Q4', '30m'), get_q_net('Q4', '15m'))
+
+        def get_q_win(tf):
+            v = get_val(row, '净盈利季度数量', tf, 'int')
+            return f"{v} / 4" if v != 'N/A' else 'N/A'
+
+        print_row("盈利季度数", get_q_win('60m'), get_q_win('30m'), get_q_win('15m'))
+        print("-" * 90)
+
+
+if __name__ == "__main__":
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    generate_report()
