@@ -9,7 +9,9 @@ from datetime import datetime
 # ==========================================
 FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 三周期样本外总交易数底线
-    'max_single_coin_concentration': 50.0  # 单币集中度(%)最大限制（大于该值则过滤）
+    'max_single_coin_concentration': 50.0,  # 单币集中度(%)最大限制（大于该值则过滤）
+    'max_winning_klines': 1000,  # 盈利单平均持仓K线根数最大限制
+    'min_avg_net_profit': 0.2  # 单笔平均净收益最小限制(%)，需大于该值
 }
 
 # ==========================================
@@ -145,15 +147,30 @@ def generate_report():
     # 提取过滤条件
     min_trades = FILTER_CONFIG['min_total_oos_trades']
     max_conc = FILTER_CONFIG['max_single_coin_concentration']
+    max_k_lines = FILTER_CONFIG['max_winning_klines']
+    min_avg_net = FILTER_CONFIG['min_avg_net_profit']
 
-    # 计算条件 (缺失值按0处理，防止因某个周期无交易被误杀)
+    # 计算条件 (缺失值按0处理，防止因某个周期无交易被误杀；平均净收益缺失则按很小的值处理防误通过)
     cond_trades = merged_df['total_oos_trades'] >= min_trades
     cond_conc_60m = merged_df['最优币占总净收益百分比_60m'].fillna(0) <= max_conc
     cond_conc_30m = merged_df['最优币占总净收益百分比_30m'].fillna(0) <= max_conc
     cond_conc_15m = merged_df['最优币占总净收益百分比_15m'].fillna(0) <= max_conc
 
+    cond_klines_60m = merged_df['盈利单平均持仓 K 线根数_60m'].fillna(0) <= max_k_lines
+    cond_klines_30m = merged_df['盈利单平均持仓 K 线根数_30m'].fillna(0) <= max_k_lines
+    cond_klines_15m = merged_df['盈利单平均持仓 K 线根数_15m'].fillna(0) <= max_k_lines
+
+    cond_avg_net_60m = merged_df['单笔平均净收益_60m'].fillna(-999) > min_avg_net
+    cond_avg_net_30m = merged_df['单笔平均净收益_30m'].fillna(-999) > min_avg_net
+    cond_avg_net_15m = merged_df['单笔平均净收益_15m'].fillna(-999) > min_avg_net
+
     # 联合过滤
-    filtered_df = merged_df[cond_trades & cond_conc_60m & cond_conc_30m & cond_conc_15m].copy()
+    filtered_df = merged_df[
+        cond_trades &
+        cond_conc_60m & cond_conc_30m & cond_conc_15m &
+        cond_klines_60m & cond_klines_30m & cond_klines_15m &
+        cond_avg_net_60m & cond_avg_net_30m & cond_avg_net_15m
+        ].copy()
 
     # 计算排序锚点 (三周期样本外均值)
     filtered_df['avg_oos_net'] = filtered_df[
@@ -240,10 +257,34 @@ def generate_report():
                   get_val(row, '胜率', '30m', 'pct'),
                   get_val(row, '胜率', '15m', 'pct'))
 
+        # 动态推算总体平均单笔净利（处理CSV中缺失该字段的情况）
+        def get_overall_avg_net(tf):
+            try:
+                # 优先使用真实字段 '单笔平均净收益'
+                col = f'单笔平均净收益_{tf}'
+                if col in row and pd.notna(row[col]):
+                    return f"{float(row[col]):+.2f}%"
+
+                # 如果依然没有该字段，用 样本内 和 样本外 的单笔收益按交易数进行加权平均作为备用方案
+                total_t = float(row[f'总交易数_{tf}']) if pd.notna(row.get(f'总交易数_{tf}')) else 0
+                oos_t = float(row[f'样本外交易次数_{tf}']) if pd.notna(row.get(f'样本外交易次数_{tf}')) else 0
+                is_t = total_t - oos_t
+
+                if total_t > 0:
+                    oos_net = float(row[f'样本外平均单笔净收益_{tf}']) if pd.notna(
+                        row.get(f'样本外平均单笔净收益_{tf}')) else 0
+                    is_net = float(row[f'样本内平均单笔净收益_{tf}']) if pd.notna(
+                        row.get(f'样本内平均单笔净收益_{tf}')) else 0
+                    overall = (is_net * is_t + oos_net * oos_t) / total_t
+                    return f"{overall:+.2f}%"
+            except:
+                pass
+            return "N/A"
+
         print_row("平均单笔净利",
-                  get_val(row, '平均单笔净收益', '60m', 'pct_plus'),
-                  get_val(row, '平均单笔净收益', '30m', 'pct_plus'),
-                  get_val(row, '平均单笔净收益', '15m', 'pct_plus'))
+                  get_overall_avg_net('60m'),
+                  get_overall_avg_net('30m'),
+                  get_overall_avg_net('15m'))
 
         print_row("样本内单笔净利",
                   get_val(row, '样本内平均单笔净收益', '60m', 'pct_plus'),
