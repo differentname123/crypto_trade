@@ -110,16 +110,18 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
     is_coin_robust = df['coin_positive_rate'] > 0.50
 
     is_profit_distributed = df['top1_coin_pct'] <= max_top1_pct
+    is_time_robust = (df[['sum_ret_q1', 'sum_ret_q2', 'sum_ret_q3', 'sum_ret_q4']] > 0).sum(axis=1) >= 4
 
     # 汇总过滤条件
     df = df.assign(
         is_friction_safe=is_friction_safe,
         is_coin_robust=is_coin_robust,
-        is_profit_distributed=is_profit_distributed
+        is_profit_distributed=is_profit_distributed,
+        is_time_robust=is_time_robust
     )
 
     # 剔除无效逻辑后的新过滤网
-    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_profit_distributed']]
+    df = df[df['is_friction_safe'] & df['is_coin_robust'] & df['is_profit_distributed'] & df['is_time_robust']]
 
     return df
 
@@ -390,14 +392,14 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
         print(f"   - 入场因子普适率: 搭配库内 {en_neighbor_count} 种出场，有 {en_pos_rate:.1f}% 的组合实现正期望。")
         print(f"   - 出场因子普适率: 搭配库内 {ex_neighbor_count} 种入场，有 {ex_pos_rate:.1f}% 的组合实现正期望。")
 
-        # ---------------- 最终预警标签 ----------------
-        print(f"\n{BOLD}▶ 实盘一票否决权 (智能红绿灯):{RESET}")
-        if not flags:
-            print("   (无极端缺陷，属稳健组合)")
-        else:
-            for flag in flags:
-                print(f"   {flag}")
-        print(f"{BOLD}{'=' * 80}{RESET}")
+        # # ---------------- 最终预警标签 ----------------
+        # print(f"\n{BOLD}▶ 实盘一票否决权 (智能红绿灯):{RESET}")
+        # if not flags:
+        #     print("   (无极端缺陷，属稳健组合)")
+        # else:
+        #     for flag in flags:
+        #         print(f"   {flag}")
+        # print(f"{BOLD}{'=' * 80}{RESET}")
 
 
 if __name__ == '__main__':
