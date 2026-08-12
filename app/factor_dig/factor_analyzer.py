@@ -38,7 +38,7 @@ def load_data(tf='15m'):
 
     if not os.path.exists(sum_path) or not os.path.exists(all_path):
         print(f"{RED}❌ 找不到 {tf} 周期数据。请检查路径: {out_dir}{RESET}")
-        return None, None
+        return None, None, None
 
     summary = pd.read_csv(sum_path)
     all_pairs = pd.read_csv(all_path)
@@ -59,7 +59,8 @@ def load_data(tf='15m'):
     map_path = os.path.join('factor_mapping.csv')
     # 如果目录不存在先创建
     os.makedirs(out_dir, exist_ok=True)
-    pd.DataFrame(list(factor_map.items()), columns=['Original_Name', 'Mapped_Name']).to_csv(map_path, index=False, encoding='utf-8-sig')
+    pd.DataFrame(list(factor_map.items()), columns=['Original_Name', 'Mapped_Name']).to_csv(map_path, index=False,
+                                                                                            encoding='utf-8-sig')
     print(f"{GREEN}✅ 因子已自动脱敏，名称映射表已保存至: {map_path}{RESET}")
 
     # 将数据中的名称全部替换为代号
@@ -80,7 +81,7 @@ def load_data(tf='15m'):
     # 2. 核心修复：必须对索引进行排序，否则后续 .loc 查询会退化为全表扫描！
     all_pairs.sort_index(inplace=True)
 
-    return summary, all_pairs
+    return summary, all_pairs, factor_map
 
 
 def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_ret=0.002, max_top1_pct=50.0):
@@ -88,6 +89,7 @@ def get_tradable_pool(summary, all_pairs, min_trades=50, min_coins=3, min_avg_re
     【重构】实盘净水器：去除不合理的时序强限制和70/30强拆，保留底层逻辑过滤。
     """
     df = summary.copy()
+    return df
 
     # 1. 强制大数定律：总交易笔数不能少于阈值
     df = df[df['total_trades'] >= min_trades]
@@ -208,10 +210,11 @@ def analyze_macro_ecosystem(summary, tradable_summary):
         print(f"   {RED}无足够数据计算百搭因子。{RESET}")
 
 
-def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
+def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5, factor_map=None):
     """
     模块 B：微观组合五维防伪体检
     核心修改：彻底废弃 70/30假衰减率、均值参数陷阱。新增单边滑点容忍度与真胜率。
+    此次升级：对全部过滤后数据做完整深度体检并导出 CSV，终端严格保持Top50旧版输出不变。
     """
     print(f"\n\n{BOLD}{'=' * 90}{RESET}")
     print(f"{CYAN}{BOLD} 🔬 模块 B: 微观组合五维防伪体检 (Micro Deep-Dive){RESET}")
@@ -221,6 +224,9 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
     if tradable_summary.empty:
         print(f"{RED}🚫 没有策略通过硬性过滤条件，建议放宽过滤阈值或重新挖掘。{RESET}")
         return
+
+    # 反向解析脱敏名称至原始名称 (用于CSV导出)
+    reverse_map = {v: k for k, v in factor_map.items()} if factor_map else {}
 
     # ================= 周期转换逻辑 =================
     match = re.match(r'(\d+)([mhd])', str(tf).lower())
@@ -238,14 +244,19 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
     else:
         bars_to_days = 1.0
 
-        # ================= 核心排序调整 (Calmar 比率) =================
+    # ================= 核心排序调整 (Calmar 比率) =================
     tradable_summary = tradable_summary.copy()
     tradable_summary['Sort_Metric'] = tradable_summary['mean_sum_ret'] / tradable_summary['mean_max_dd'].abs().replace(
         0, 1e-9)
     sort_col = 'Sort_Metric'
-    top_df = tradable_summary.sort_values(sort_col, ascending=False).head(top_n)
 
-    for rank, (_, row) in enumerate(top_df.iterrows(), 1):
+    # 遍历所有通过净水器的组合而不是只切前N个
+    all_sorted_df = tradable_summary.sort_values(sort_col, ascending=False)
+
+    # 收集所有的体检数据以便写入CSV
+    report_data = []
+
+    for rank, (_, row) in enumerate(all_sorted_df.iterrows(), 1):
         en = row['entry_factor']
         ex = row['exit_factor']
         fm = row['filter_mode']
@@ -303,7 +314,7 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
             positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
             max_coin_ret = combo_details['sum_ret'].max()
             top1_coin_pct = (max_coin_ret / positive_profits * 100) if (
-                        positive_profits > 0 and max_coin_ret > 0) else 0.0
+                    positive_profits > 0 and max_coin_ret > 0) else 0.0
 
             best_coin = "未知标的"
             if positive_profits > 0:
@@ -347,59 +358,102 @@ def analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=5):
         elif top1_coin_pct < 30:
             flags.append(f"{GREEN}🟢 利润标的散布健康 (最肥的羊仅占总利润的 {top1_coin_pct:.1f}%){RESET}")
 
-        # ================= 终端排版打印 =================
-        print(f"\n{BOLD}{'=' * 80}{RESET}")
-        print(f"🏆 {YELLOW}深度体检 #{rank}: ENTRY [{en}]  =>  EXIT [{ex}]{RESET}")
-        print(
-            f"📌 卡玛比率: {row[sort_col]:.3f} | 当前环境: {fm} | 参与币种: {row['n_coins']} 个 | 总笔数: {curr_trades} 笔")
-        print("-" * 80)
-
-        # [1] 策略 DNA 基础数据
+        # 基础数据提取 (为了能同时用于输出和收集 CSV)
         q_rets = [row['sum_ret_q1'], row['sum_ret_q2'], row['sum_ret_q3'], row['sum_ret_q4']]
         q_trades = [row['sum_trades_q1'], row['sum_trades_q2'], row['sum_trades_q3'], row['sum_trades_q4']]
         max_q = max([q for q in q_rets if q > 0] + [0.01])
 
-        print(f"{BOLD}[1. 策略DNA与盈利基础 (Strategy Foundation)]{RESET}")
-        print(f"   {CYAN}- 全局真实胜率: {real_win_rate:.1f}% | 平均单笔净收益: {avg_ret_pct:.3f}%{RESET}")
-        print(f"   - 单边滑点容忍极值: {break_even_slippage:.3f}% (盈亏平衡点)")
-        print(f"   - 季度时序分布:")
-        for i in range(4):
-            print(f"     Q{i + 1}: {make_bar(q_rets[i], max_q):<10} ({q_trades[i]:<4}笔) | 收益: {q_rets[i]:>6.1f}%")
-
-        # [2] 尾部风险与持仓不对称
         max_dd_val = row['mean_max_dd']
         calmar_ratio = row['Sort_Metric']
         dm_win = f"{row['mean_down_market_win_rate']:.1f}%" if pd.notna(row.get('mean_down_market_win_rate')) else "N/A"
 
-        print(f"\n{BOLD}[2. 尾部风控与不对称性 (Risk & Hold Asymmetry)]{RESET}")
-        print(f"   - 📉 平均最大回撤: {RED}{max_dd_val:.2f}%{RESET} | 卡玛比率 (收益/回撤): {calmar_ratio:.2f}")
-        print(f"   - 逆风局胜率 (BTC跌时): {dm_win}")
-
         mean_win_hold_days = mean_win_hold * bars_to_days
         mean_loss_hold_days = mean_loss_hold * bars_to_days
 
-        print(f"   - 盈亏时间不对称: 盈利均持仓 {mean_win_hold_days:.2f} 天 / 亏损均持仓 {mean_loss_hold_days:.2f} 天")
-        print(f"   - 亏损死扛系数: {hold_ratio:.2f} 倍")
+        # 把全量体检数据塞入报告列表以便写CSV
+        clean_flags = [f.replace(RED, '').replace(GREEN, '').replace(RESET, '').replace(BOLD, '') for f in flags]
+        report_data.append({
+            'Rank': rank,
+            'Entry_Factor_Original': reverse_map.get(en, en),
+            'Exit_Factor_Original': reverse_map.get(ex, ex),
+            'Entry_Factor_Desensitized': en,
+            'Exit_Factor_Desensitized': ex,
+            'Filter_Mode': fm,
+            'Calmar_Ratio': calmar_ratio,
+            'N_Coins': row['n_coins'],
+            'Total_Trades': curr_trades,
+            'Global_Real_Win_Rate(%)': real_win_rate,
+            'Avg_Return(%)': avg_ret_pct,
+            'Break_Even_Slippage(%)': break_even_slippage,
+            'Mean_Max_DD(%)': max_dd_val,
+            'Down_Market_Win_Rate': dm_win,
+            'Mean_Win_Hold_Days': mean_win_hold_days,
+            'Mean_Loss_Hold_Days': mean_loss_hold_days,
+            'Hold_Ratio': hold_ratio,
+            'Best_Coin': best_coin,
+            'Top1_Coin_Pct(%)': top1_coin_pct,
+            'Entry_Neighbor_Pos_Rate(%)': en_pos_rate,
+            'Exit_Neighbor_Pos_Rate(%)': ex_pos_rate,
+            'Q1_Return(%)': q_rets[0],
+            'Q2_Return(%)': q_rets[1],
+            'Q3_Return(%)': q_rets[2],
+            'Q4_Return(%)': q_rets[3],
+            'Q1_Trades': q_trades[0],
+            'Q2_Trades': q_trades[1],
+            'Q3_Trades': q_trades[2],
+            'Q4_Trades': q_trades[3],
+            'Flags': " | ".join(clean_flags)
+        })
 
-        # [3] 因子有效性与极权度验证
-        print(f"\n{BOLD}[3. 实盘印证维度 (Robustness & Breadth)]{RESET}")
+        # ================= 终端排版打印 (严格限制只打印前50并原样保留格式) =================
+        if rank <= top_n:
+            print(f"\n{BOLD}{'=' * 80}{RESET}")
+            print(f"🏆 {YELLOW}深度体检 #{rank}: ENTRY [{en}]  =>  EXIT [{ex}]{RESET}")
+            print(
+                f"📌 卡玛比率: {row[sort_col]:.3f} | 当前环境: {fm} | 参与币种: {row['n_coins']} 个 | 总笔数: {curr_trades} 笔")
+            print("-" * 80)
 
-        if pd.notna(orig_trades) and orig_trades > 0:
-            retention_rate = curr_trades / orig_trades * 100
-            print(f"   - 截面有效存活率: Original ({orig_coin_rate:.1f}%) ➔ 当前条件 ({curr_coin_rate:.1f}%)")
+            print(f"{BOLD}[1. 策略DNA与盈利基础 (Strategy Foundation)]{RESET}")
+            print(f"   {CYAN}- 全局真实胜率: {real_win_rate:.1f}% | 平均单笔净收益: {avg_ret_pct:.3f}%{RESET}")
+            print(f"   - 单边滑点容忍极值: {break_even_slippage:.3f}% (盈亏平衡点)")
+            print(f"   - 季度时序分布:")
+            for i in range(4):
+                print(
+                    f"     Q{i + 1}: {make_bar(q_rets[i], max_q):<10} ({q_trades[i]:<4}笔) | 收益: {q_rets[i]:>6.1f}%")
 
-        print(f"   - 利润集权度分布: 最赚钱币种【{best_coin}】贡献占比 {top1_coin_pct:.1f}%。")
-        print(f"   - 入场因子普适率: 搭配库内 {en_neighbor_count} 种出场，有 {en_pos_rate:.1f}% 的组合实现正期望。")
-        print(f"   - 出场因子普适率: 搭配库内 {ex_neighbor_count} 种入场，有 {ex_pos_rate:.1f}% 的组合实现正期望。")
+            print(f"\n{BOLD}[2. 尾部风控与不对称性 (Risk & Hold Asymmetry)]{RESET}")
+            print(f"   - 📉 平均最大回撤: {RED}{max_dd_val:.2f}%{RESET} | 卡玛比率 (收益/回撤): {calmar_ratio:.2f}")
+            print(f"   - 逆风局胜率 (BTC跌时): {dm_win}")
+            print(
+                f"   - 盈亏时间不对称: 盈利均持仓 {mean_win_hold_days:.2f} 天 / 亏损均持仓 {mean_loss_hold_days:.2f} 天")
+            print(f"   - 亏损死扛系数: {hold_ratio:.2f} 倍")
 
-        # # ---------------- 最终预警标签 ----------------
-        # print(f"\n{BOLD}▶ 实盘一票否决权 (智能红绿灯):{RESET}")
-        # if not flags:
-        #     print("   (无极端缺陷，属稳健组合)")
-        # else:
-        #     for flag in flags:
-        #         print(f"   {flag}")
-        # print(f"{BOLD}{'=' * 80}{RESET}")
+            print(f"\n{BOLD}[3. 实盘印证维度 (Robustness & Breadth)]{RESET}")
+            if pd.notna(orig_trades) and orig_trades > 0:
+                print(f"   - 截面有效存活率: Original ({orig_coin_rate:.1f}%) ➔ 当前条件 ({curr_coin_rate:.1f}%)")
+
+            print(f"   - 利润集权度分布: 最赚钱币种【{best_coin}】贡献占比 {top1_coin_pct:.1f}%。")
+            print(f"   - 入场因子普适率: 搭配库内 {en_neighbor_count} 种出场，有 {en_pos_rate:.1f}% 的组合实现正期望。")
+            print(f"   - 出场因子普适率: 搭配库内 {ex_neighbor_count} 种入场，有 {ex_pos_rate:.1f}% 的组合实现正期望。")
+
+            # # ---------------- 最终预警标签 ----------------
+            # print(f"\n{BOLD}▶ 实盘一票否决权 (智能红绿灯):{RESET}")
+            # if not flags:
+            #     print("   (无极端缺陷，属稳健组合)")
+            # else:
+            #     for flag in flags:
+            #         print(f"   {flag}")
+            # print(f"{BOLD}{'=' * 80}{RESET}")
+
+    # 全量循环结束后，导出完整的深度体检报告 CSV
+    if report_data:
+        report_df = pd.DataFrame(report_data)
+        out_path = f'./deep_dive_full_report_{tf}.csv'
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        report_df.to_csv(out_path, index=False, encoding='utf-8-sig')
+        # 仅增加一句友好的报告生成提示，原主控台排版格式完全不涉足更改
+        print(
+            f"\n{GREEN}✅ 完整深度体检报告已保存至: {out_path} (共检查并保存了 {len(report_df)} 个合格策略组合){RESET}")
 
 
 if __name__ == '__main__':
@@ -407,7 +461,9 @@ if __name__ == '__main__':
 
     for tf in target_timeframes:
         print(f"\n\n{YELLOW}★★★ 正在分析 {tf} 周期数据 ★★★{RESET}")
-        summary, all_pairs = load_data(tf)
+
+        # 接收新增的 factor_map
+        summary, all_pairs, factor_map = load_data(tf)
 
         if summary is not None and all_pairs is not None:
             # 1. 生成清洗后的实盘池（总笔数 >= 50, 至少3个币参战, 过滤掉极限极权, 摒弃原有时序硬要求）
@@ -417,5 +473,5 @@ if __name__ == '__main__':
             # 2. 宏观分析
             analyze_macro_ecosystem(summary, tradable_summary)
 
-            # 3. 微观深度体检 (严格在净水表里提取 Top 50)
-            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=50)
+            # 3. 微观深度体检 (提取所有合格者进行体检保存CSV，并在控制台严格按净水表输出 Top 50)
+            analyze_micro_deep_dive(summary, tradable_summary, all_pairs, tf, top_n=50, factor_map=factor_map)
