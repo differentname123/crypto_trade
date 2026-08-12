@@ -31,6 +31,7 @@ CFG = dict(
     OOS_SPLIT=0.70,  # 样本内外切分比例
     COINS=None,  # 填入指定的币种列表如 ['PEPE', 'WIF']，None表示全跑
     RANK_MODE='both',  # 排行榜过滤模式：'both', 'top', 'bottom'
+    SAVE_TRADE_RECORDS=True,  # 是否保存每个币的交易记录
 )
 
 EPS = 1e-12
@@ -388,6 +389,21 @@ def mine_symbol(coin, df, cfg):
 
     if ent.size < 1:
         return None, [], [], [], []
+
+    # ==========================新增保存交易记录逻辑==========================
+    if cfg.get('SAVE_TRADE_RECORDS', True):
+        os.makedirs('temp_data', exist_ok=True)
+        trade_records = pd.DataFrame({
+            'coin': coin,
+            'entry_time': df.index[ent],
+            'exit_time': df.index[ext],
+            'entry_price': exec_px[ent],
+            'exit_price': exec_px[ext],
+            'return': rets,
+            'funding_cost': funding_costs
+        })
+        trade_records.to_csv(f'temp_data/{coin}_trades.csv', index=False)
+    # =======================================================================
 
     split_bar = int(n * cfg['OOS_SPLIT'])
     # 将基准收益和时长存入行数据
