@@ -14,6 +14,15 @@
  · [性能优化] 统计基元标量化(逐位复刻) / 因子基础量去重缓存 /
               列式内存装配 / BTC 基准按 worker 一次性下发   —— 结果不变
  · [新增特性] 支持双向回测：静态信号出场同时输出 Long/Short 两行数据
+ · [本次修复①] 新增「资金费率求和」：按真实持仓区间 [入场执行时刻, 出场执行时刻)
+              左闭右开，累加该币【真实资金费率结算事件历史】(fr_event)，
+              绝不使用 8 小时估算。新增列：fr_sum / fr_avg (含 is_ / oos_ 前缀)。
+              符号为原始符号：做多实际成本 = -fr_sum，做空实际收益 = +fr_sum。
+ · [本次修复②] 修复 FILTER_MODES「事后过滤」导致的路径依赖(占坑效应)：
+              横截面排名过滤已【前置】到入场信号层——先把不达标的 bar 从入场
+              候选集中剔除，再交给状态机撮合。每个 filter_mode 现在是一条独立
+              的策略路径，劣质信号再也无法占坑挡住达标的优质机会。
+              (同一入场因子下过滤结果完全相同的 mode 会自动合并，只撮合一次)
 ================================================================================
 """
 from __future__ import annotations
@@ -197,12 +206,17 @@ def load_symbol(kline_file, oi_file, fr_file, bar_minutes):
     ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
     fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
     fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    fr_s = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc]
-            .astype(float).resample(bar, label='left', closed='left').last())
+    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
+    # 因子用的"状态值"(与原逻辑完全一致)
+    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
+    # 【新增】真实"结算事件"序列：只在结算时刻所属的那根 bar 上记账，其余 bar 记 0
+    #        (同一根 bar 落入多次结算时自动相加；不做任何 8h 估算)
+    fr_event_s = _fr_raw.resample(bar, label='left', closed='left').sum()
 
     df = agg.copy()
     df['oi_amount'] = oi_s.reindex(df.index).ffill()
     df['funding_rate'] = fr_s.reindex(df.index).ffill()
+    df['fr_event'] = fr_event_s.reindex(df.index).fillna(0.0).astype(float)
 
     fv = df[['oi_amount', 'funding_rate']].apply(lambda s: s.first_valid_index())
     start = max([x for x in fv.tolist() if x is not None], default=df.index[0])
@@ -742,18 +756,27 @@ def _median_fast(x):
     return float((part[half - 1] + part[half]) / 2.0)
 
 
-def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, prefix=''):
+def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, prefix='',
+                fr_trades=None):
+    """
+    fr_trades: 与 rets 一一对应的【每笔资金费率之和】(原始小数, 非百分比)。
+               取值口径 = 真实持仓区间 [入场执行时刻, 出场执行时刻) 左闭右开内
+               所有真实资金费率结算事件之和(见 mine_symbol 的 fr_cum)。
+               输出 fr_sum / fr_avg 单位为 %，符号为原始符号：
+                   做多实际成本 = -fr_sum ; 做空实际收益 = +fr_sum
+    """
     d = {}
     T = int(len(rets))
     d[prefix + 'trades'] = T
 
-    # 【新增】加入 pt_sharpe (单笔夏普), trades_q1~4
+    # 【新增】加入 pt_sharpe (单笔夏普), trades_q1~4, fr_sum/fr_avg (资金费率求和)
     empty_keys = ['win_rate', 'sum_ret', 'avg_ret', 'med_ret', 'std_ret', 'tstat', 'sharpe', 'pt_sharpe',
                   'profit_factor', 'max_dd', 'avg_hold_h', 'exposure', 'max_win', 'max_loss',
                   'skew', 'kurt', 'cvar_5', 'equity_r2', 'corr_btc', 'down_market_win_rate',
                   'win_hold_bars', 'loss_hold_bars',
                   'ret_q1', 'ret_q2', 'ret_q3', 'ret_q4',
-                  'trades_q1', 'trades_q2', 'trades_q3', 'trades_q4']
+                  'trades_q1', 'trades_q2', 'trades_q3', 'trades_q4',
+                  'fr_sum', 'fr_avg']
 
     if T == 0:
         for k in empty_keys:
@@ -765,6 +788,14 @@ def trade_stats(rets, ent, ext, bar_minutes, n_bars, start_idx=0, bh_rets=None, 
     d[prefix + 'sum_ret'] = float(rets.sum() * 100)
     d[prefix + 'avg_ret'] = float(rets.mean() * 100)
     d[prefix + 'med_ret'] = float(_median_fast(rets) * 100)
+
+    # 【新增】资金费率求和 / 单笔均值（单位 %）
+    if fr_trades is not None and len(fr_trades) > 0:
+        d[prefix + 'fr_sum'] = float(np.sum(fr_trades) * 100)
+        d[prefix + 'fr_avg'] = float(np.mean(fr_trades) * 100)
+    else:
+        d[prefix + 'fr_sum'] = np.nan
+        d[prefix + 'fr_avg'] = np.nan
 
     sd = float(rets.std(ddof=1) * 100) if T > 1 else np.nan
     d[prefix + 'std_ret'] = sd
@@ -876,6 +907,19 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     rk_gain = df['rank_gain_24h'].to_numpy(float)
     rk_loss = df['rank_loss_24h'].to_numpy(float)
 
+    # 【新增】资金费率结算事件的前缀和：
+    #   fr_cum[i] = sum(fr_event[0:i])
+    #   单笔持仓(信号 bar e 入场 / 信号 bar x 出场，执行分别落在 e+1 / x+1 的开盘)
+    #   真实持仓区间 = [timestamp(e+1), timestamp(x+1))  -> 左闭右开
+    #   => 应计资金费率 = 累加 bar 索引 (e, x] 上的所有真实结算事件
+    #   => fr_sum = fr_cum[x + 1] - fr_cum[e + 1]
+    if 'fr_event' in df.columns:
+        fr_ev = df['fr_event'].to_numpy(float)
+    else:
+        fr_ev = np.zeros(len(df), dtype=float)
+    fr_ev = np.nan_to_num(fr_ev, nan=0.0, posinf=0.0, neginf=0.0)
+    fr_cum = np.concatenate(([0.0], np.cumsum(fr_ev)))
+
     F = {k: v[warm:] for k, v in F.items()}
 
     if btc_close is not None:
@@ -944,8 +988,44 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     theoretical_tests = 0
     done = 0
 
+    # ==================================================================
+    # 【Bug 修复】排名过滤前置化
+    #   旧逻辑: 全量入场 -> 撮合(唯一仓位) -> 事后按 rank 删行
+    #           => 排名 80 的劣质信号先占坑，把持仓期内真正达标(rank<=50)的
+    #              优质信号挡在门外，最后自己又被删掉 -> 报表大量"漏单"
+    #   新逻辑: 每个 filter_mode 先把不达标的 bar 从"入场候选集"中剔除，
+    #           再交给状态机撮合 => 每个 mode 是一条独立、无污染的策略路径。
+    #   性能补偿: 同一入场因子下，过滤结果完全相同的 mode 合并为一个 group，
+    #             只撮合一次、只算一次统计，再复制给组内每个 label(结果逐位一致)。
+    # ==================================================================
+    def _entry_groups(eidx):
+        groups = []  # [ [e_arr, [labels...], has_original] , ... ]
+        sig_map = {}
+        for mode_name, rank_col, threshold in FILTER_MODES:
+            label = 'original' if mode_name == 'original' else f"{mode_name}_{threshold}"
+            if mode_name == 'original':
+                e_m = eidx
+            elif mode_name == 'top':
+                e_m = eidx[rk_gain[eidx] <= threshold]
+            else:
+                e_m = eidx[rk_loss[eidx] <= threshold]
+
+            key = (int(e_m.size), hash(e_m.tobytes()))
+            gi = sig_map.get(key, -1)
+            if gi >= 0 and np.array_equal(groups[gi][0], e_m):
+                groups[gi][1].append(label)
+                if label == 'original':
+                    groups[gi][2] = True
+            else:
+                sig_map[key] = len(groups)
+                groups.append([np.ascontiguousarray(e_m), [label], label == 'original'])
+        return groups
+
     for en in entry_names:
         eidx = idx_cache[en]
+        e_dens = dens.get(en, np.nan)
+        egroups = _entry_groups(eidx)
+
         for xn in exit_names:
             done += 1
             if (not cfg['ALLOW_SAME_FACTOR']) and xn == en:
@@ -956,98 +1036,85 @@ def mine_symbol(coin, df, cfg, btc_close=None):
             multiplier = 2
             theoretical_tests += multiplier * len(FILTER_MODES)
 
-            if HAS_NUMBA:
-                ent, ext = _core_static(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
-            else:
-                ent, ext = _match_static_ss(eidx, idx_cache[xn], n, cfg['COOLDOWN_BARS'], max_tr)
-
+            xidx = idx_cache[xn]
             x_dens = dens.get(xn, np.nan)
 
-            if ent.size == 0:
-                stats['skip_zero_trades'] += 1
-                continue
+            for e_arr, labels, has_orig in egroups:
+                n_lab = len(labels)
 
-            # === 计算做多收益 ===
-            rets_long = exec_px[ext] / exec_px[ent] - 1.0 - cost
-            ok_l = np.isfinite(rets_long)
-            ent_base_l, ext_base_l, rets_base_l = ent[ok_l], ext[ok_l], rets_long[ok_l]
+                # 该 mode 组过滤后已无入场候选 -> 必然 0 笔
+                if e_arr.size == 0:
+                    if has_orig:
+                        stats['skip_zero_trades'] += 1
+                        stats['skip_too_few'] += 2 * (n_lab - 1)
+                    else:
+                        stats['skip_too_few'] += 2 * n_lab
+                    continue
 
-            # === 计算做空收益 (U本位 计算) ===
-            rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
-            ok_s = np.isfinite(rets_short)
-            ent_base_s, ext_base_s, rets_base_s = ent[ok_s], ext[ok_s], rets_short[ok_s]
-
-            for mode_name, rank_col, threshold in FILTER_MODES:
-                filter_label = 'original' if mode_name == 'original' else f"{mode_name}_{threshold}"
-
-                # ================= 处理 LONG =================
-                if mode_name == 'original':
-                    ent_f, ext_f, rets_f = ent_base_l, ext_base_l, rets_base_l
+                if HAS_NUMBA:
+                    ent, ext = _core_static(e_arr, xidx, n, cfg['COOLDOWN_BARS'], max_tr)
                 else:
-                    entry_ranks = rk_gain[ent_base_l] if mode_name == 'top' else rk_loss[ent_base_l]
-                    mask = entry_ranks <= threshold
-                    ent_f, ext_f, rets_f = ent_base_l[mask], ext_base_l[mask], rets_base_l[mask]
+                    ent, ext = _match_static_ss(e_arr, xidx, n, cfg['COOLDOWN_BARS'], max_tr)
 
-                if ent_f.size < cfg['MIN_TRADES_REPORT']:
-                    stats['skip_too_few'] += 1
-                elif ent_f.size > max_allowed_trades:
-                    stats['skip_too_many'] += 1
-                else:
-                    stats['mode_pass_counts'][filter_label] += 1
+                if ent.size == 0:
+                    if has_orig:
+                        stats['skip_zero_trades'] += 1
+                        stats['skip_too_few'] += 2 * (n_lab - 1)
+                    else:
+                        stats['skip_too_few'] += 2 * n_lab
+                    continue
+
+                # 【新增】每笔资金费率之和：左闭右开真实持仓区间 -> bar 索引 (e, x]
+                fr_tr = fr_cum[ext + 1] - fr_cum[ent + 1]
+
+                # === 计算做多收益 ===
+                rets_long = exec_px[ext] / exec_px[ent] - 1.0 - cost
+                ok_l = np.isfinite(rets_long)
+
+                # === 计算做空收益 (U本位 计算) ===
+                rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
+                ok_s = np.isfinite(rets_short)
+
+                for direction, okm, rets_all in (('Long', ok_l, rets_long),
+                                                 ('Short', ok_s, rets_short)):
+                    ent_f = ent[okm]
+                    ext_f = ext[okm]
+                    rets_f = rets_all[okm]
+                    fr_f = fr_tr[okm]
+
+                    if ent_f.size < cfg['MIN_TRADES_REPORT']:
+                        stats['skip_too_few'] += n_lab
+                        continue
+                    if ent_f.size > max_allowed_trades:
+                        stats['skip_too_many'] += n_lab
+                        continue
+
                     bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
 
-                    row_l = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Long',
-                                 filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
-                    row_l.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
+                    # 同一 group 内各 label 的成交流水完全一致 -> 统计只算一次
+                    st = trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0,
+                                     bh_rets=bh_rets_f, fr_trades=fr_f)
                     m_is = ent_f < split_bar
+                    st.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm,
+                                          n_bars=split_bar, start_idx=0,
+                                          bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None,
+                                          prefix='is_', fr_trades=fr_f[m_is]))
+                    st.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm,
+                                          n_bars=n - split_bar, start_idx=split_bar,
+                                          bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
+                                          prefix='oos_', fr_trades=fr_f[~m_is]))
 
-                    row_l.update(trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
-                                             bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
-                    row_l.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
-                                             start_idx=split_bar,
-                                             bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
-                                             prefix='oos_'))
+                    for lab in labels:
+                        stats['mode_pass_counts'][lab] += 1
+                        row = dict(coin=coin, entry_factor=en, exit_factor=xn, direction=direction,
+                                   filter_mode=lab, entry_density=e_dens, exit_density=x_dens)
+                        row.update(st)
 
-                    if col_data is None:
-                        col_data = {k_: [v_] for k_, v_ in row_l.items()}
-                    else:
-                        for k_, v_ in row_l.items():
-                            col_data[k_].append(v_)
-
-                # ================= 处理 SHORT =================
-                if mode_name == 'original':
-                    ent_f, ext_f, rets_f = ent_base_s, ext_base_s, rets_base_s
-                else:
-                    entry_ranks = rk_gain[ent_base_s] if mode_name == 'top' else rk_loss[ent_base_s]
-                    mask = entry_ranks <= threshold
-                    ent_f, ext_f, rets_f = ent_base_s[mask], ext_base_s[mask], rets_base_s[mask]
-
-                if ent_f.size < cfg['MIN_TRADES_REPORT']:
-                    stats['skip_too_few'] += 1
-                elif ent_f.size > max_allowed_trades:
-                    stats['skip_too_many'] += 1
-                else:
-                    stats['mode_pass_counts'][filter_label] += 1
-                    bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
-
-                    row_s = dict(coin=coin, entry_factor=en, exit_factor=xn, direction='Short',
-                                 filter_mode=filter_label, entry_density=dens.get(en, np.nan), exit_density=x_dens)
-                    row_s.update(trade_stats(rets_f, ent_f, ext_f, bm, n_bars=n, start_idx=0, bh_rets=bh_rets_f))
-                    m_is = ent_f < split_bar
-
-                    row_s.update(
-                        trade_stats(rets_f[m_is], ent_f[m_is], ext_f[m_is], bm, n_bars=split_bar, start_idx=0,
-                                    bh_rets=bh_rets_f[m_is] if bh_rets_f is not None else None, prefix='is_'))
-                    row_s.update(trade_stats(rets_f[~m_is], ent_f[~m_is], ext_f[~m_is], bm, n_bars=n - split_bar,
-                                             start_idx=split_bar,
-                                             bh_rets=bh_rets_f[~m_is] if bh_rets_f is not None else None,
-                                             prefix='oos_'))
-
-                    if col_data is None:
-                        col_data = {k_: [v_] for k_, v_ in row_s.items()}
-                    else:
-                        for k_, v_ in row_s.items():
-                            col_data[k_].append(v_)
+                        if col_data is None:
+                            col_data = {k_: [v_] for k_, v_ in row.items()}
+                        else:
+                            for k_, v_ in row.items():
+                                col_data[k_].append(v_)
 
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
 
@@ -1308,7 +1375,7 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键】动态修改输出目录，防止不同周期的文件互相覆盖
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m'
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
 
         # 调用主函数执行
         main(run_cfg)
