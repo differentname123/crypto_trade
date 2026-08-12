@@ -12,3 +12,7 @@
 /app/data/
 /app/vision_data/
 /app/factor_dig/factor_out_60m/
+/app/factor_dig/factor_out_5m_debug/
+/app/factor_dig/factor_out_15m_debug/
+/app/factor_dig/factor_out_30m_debug/
+/app/factor_dig/factor_out_60m_debug/

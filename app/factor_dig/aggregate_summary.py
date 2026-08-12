@@ -14,8 +14,10 @@ import pandas as pd
 # ==========================================
 # 1. 配置路径
 # ==========================================
-INPUT_DIR = './factor_out_60m_debug'  # 单币回测结果目录 (pairs_{coin}.csv.gz)
-OUTPUT_DIR = './summary_results'  # 聚合结果保存目录
+
+timeframe = "60m"
+INPUT_DIR = f'./factor_out_{timeframe}_debug'  # 单币回测结果目录 (pairs_{coin}.csv.gz)
+OUTPUT_DIR = f'./summary_results_{timeframe}'  # 聚合结果保存目录
 
 # ==========================================
 # 2. 字段映射与保留列 (极限控制内存)

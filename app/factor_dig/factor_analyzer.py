@@ -176,11 +176,11 @@ class StrategyAnalyzer:
 # 执行入口 (灵活配置)
 # ==========================================
 if __name__ == '__main__':
-
-    # --- 你可以在这里灵活修改参数 ---
-    TARGET_FILE = './summary_results/aggregated_summary_Long.csv'
-    MAPPING_FILE = './summary_results/signal_mapping.csv'
     DIRECTION = 'Long'  # 'Long' 或 'Short'
+    TIME_FRAME = '60m'  # 可选: '60m', '30m', '15m'
+    # --- 你可以在这里灵活修改参数 ---
+    TARGET_FILE = f'./summary_results_{TIME_FRAME}/aggregated_summary_{DIRECTION}.csv'
+    MAPPING_FILE = f'./summary_results_{TIME_FRAME}/signal_mapping.csv'
 
     # 过滤参数
     MIN_AVG_NET_RET = 0.3
