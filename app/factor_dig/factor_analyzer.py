@@ -205,7 +205,7 @@ def generate_report():
     print("=" * 90 + "\n")
 
     print("【第一部分：宏观水位线 (Macro Baseline)】")
-    print(f"1. 全局基准：总资金费率占毛收益的平均中位数摩擦比例为 {global_funding_friction:.2f}%")
+    # print(f"1. 全局基准：总资金费率占毛收益的平均中位数摩擦比例为 {global_funding_friction:.2f}%")
 
     print("2. 过滤模式 (Filter) 样本外单笔净利中位数：")
     filter_str = "  "
