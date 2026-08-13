@@ -63,7 +63,7 @@ CFG = dict(
     RANK_SHIFT=0,
     DEDUPE_IDENTICAL=False,
     MIN_SIGNALS=0,
-    MAX_DENSITY=0.9,
+    MAX_DENSITY=1.9,
 
     # --- 组合与输出 ---
     ALLOW_SAME_FACTOR=False,
@@ -1369,7 +1369,7 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键】动态修改输出目录，防止不同周期的文件互相覆盖
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m'
 
         # 调用主函数执行
         main(run_cfg)
