@@ -10,7 +10,7 @@ from datetime import datetime
 FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 四周期样本外总交易数底线
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
-    'max_winning_klines': 1500,  # 盈利单平均持仓K线根数最大限制
+    'max_holding_hours': 30 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
     'min_profit_loss_time_ratio': 0.5  # 盈亏持仓时间比最小限制，需大于等于该值
 }
@@ -80,10 +80,10 @@ def get_val(row, col_base, tf, fmt='raw'):
 
 def print_row(label, v60, v30, v15, v5):
     """打印完美对齐的表格行"""
-    lbl = pad_label(label, 14)
-    c60 = pad_label(v60, 18)
-    c30 = pad_label(v30, 18)
-    c15 = pad_label(v15, 18)
+    lbl = pad_label(label, 16)      # <--- 改为 16
+    c60 = pad_label(v60, 24)        # <--- 改为 24
+    c30 = pad_label(v30, 24)        # <--- 改为 24
+    c15 = pad_label(v15, 24)        # <--- 改为 24
     c5 = str(v5)
     print(f"  {lbl} | {c60} | {c30} | {c15} | {c5}")
 
@@ -152,7 +152,7 @@ def generate_report():
     # 提取过滤条件
     min_trades = FILTER_CONFIG['min_total_oos_trades']
     max_conc = FILTER_CONFIG['max_single_coin_concentration']
-    max_k_lines = FILTER_CONFIG['max_winning_klines']
+    max_hours = FILTER_CONFIG['max_holding_hours']
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
 
@@ -163,10 +163,15 @@ def generate_report():
     cond_conc_15m = merged_df['最优币占总净收益百分比_15m'].fillna(0) <= max_conc
     cond_conc_5m = merged_df['最优币占总净收益百分比_5m'].fillna(0) <= max_conc
 
-    cond_klines_60m = merged_df['盈利单平均持仓 K 线根数_60m'].fillna(0) <= max_k_lines
-    cond_klines_30m = merged_df['盈利单平均持仓 K 线根数_30m'].fillna(0) <= max_k_lines
-    cond_klines_15m = merged_df['盈利单平均持仓 K 线根数_15m'].fillna(0) <= max_k_lines
-    cond_klines_5m = merged_df['盈利单平均持仓 K 线根数_5m'].fillna(0) <= max_k_lines
+    # 将各周期持仓K线数转化为持仓时间(小时)并限制盈利单与亏损单平均时间
+    cond_hours_60m = (merged_df['盈利单平均持仓 K 线根数_60m'].fillna(0) * 1 <= max_hours) & \
+                     (merged_df['亏损单平均持仓 K 线根数_60m'].fillna(0) * 1 <= max_hours)
+    cond_hours_30m = (merged_df['盈利单平均持仓 K 线根数_30m'].fillna(0) * 0.5 <= max_hours) & \
+                     (merged_df['亏损单平均持仓 K 线根数_30m'].fillna(0) * 0.5 <= max_hours)
+    cond_hours_15m = (merged_df['盈利单平均持仓 K 线根数_15m'].fillna(0) * 0.25 <= max_hours) & \
+                     (merged_df['亏损单平均持仓 K 线根数_15m'].fillna(0) * 0.25 <= max_hours)
+    cond_hours_5m = (merged_df['盈利单平均持仓 K 线根数_5m'].fillna(0) * (5/60.0) <= max_hours) & \
+                    (merged_df['亏损单平均持仓 K 线根数_5m'].fillna(0) * (5/60.0) <= max_hours)
 
     cond_avg_net_60m = merged_df['单笔平均净收益_60m'].fillna(-999) > min_avg_net
     cond_avg_net_30m = merged_df['单笔平均净收益_30m'].fillna(-999) > min_avg_net
@@ -182,7 +187,7 @@ def generate_report():
     filtered_df = merged_df[
         cond_trades &
         cond_conc_60m & cond_conc_30m & cond_conc_15m & cond_conc_5m &
-        cond_klines_60m & cond_klines_30m & cond_klines_15m & cond_klines_5m &
+        cond_hours_60m & cond_hours_30m & cond_hours_15m & cond_hours_5m &
         cond_avg_net_60m & cond_avg_net_30m & cond_avg_net_15m & cond_avg_net_5m &
         cond_pl_ratio_60m & cond_pl_ratio_30m & cond_pl_ratio_15m & cond_pl_ratio_5m
         ].copy()
@@ -256,13 +261,13 @@ def generate_report():
         print("-" * 110)
 
         # 第一版块：核心绩效 (Header)
-        header_lbl = pad_label("核心与衰减指标", 14)
-        h60 = pad_label("[60m 周期]", 18)
-        h30 = pad_label("[30m 周期]", 18)
-        h15 = pad_label("[15m 周期]", 18)
-        h5  = "[5m 周期]"
+        header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
+        h60 = pad_label("[60m 周期]", 24)  # <--- 改为 24
+        h30 = pad_label("[30m 周期]", 24)  # <--- 改为 24
+        h15 = pad_label("[15m 周期]", 24)  # <--- 改为 24
+        h5 = "[5m 周期]"
         print(f"  {header_lbl} | {h60} | {h30} | {h15} | {h5}")
-        print("  " + "-" * 95)
+        print("  " + "-" * 110)  # <--- 分割线加长到 110
 
         print_row("总交易数",
                   get_val(row, '总交易数', '60m', 'int'),
@@ -318,13 +323,21 @@ def generate_report():
                   get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
                   get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
 
-        # 盈亏 K 线整合展示
-        def get_klines(tf):
-            w = get_val(row, '盈利单平均持仓 K 线根数', tf, 'int')
-            l = get_val(row, '亏损单平均持仓 K 线根数', tf, 'int')
-            return f"盈:{w} / 亏:{l}" if w != 'N/A' and l != 'N/A' else "N/A"
+        # 盈亏持仓(小时)整合展示
+        def get_holding_hours(tf):
+            multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5/60.0}[tf]
+            w_raw = get_val(row, '盈利单平均持仓 K 线根数', tf, 'raw')
+            l_raw = get_val(row, '亏损单平均持仓 K 线根数', tf, 'raw')
+            if w_raw != 'N/A' and l_raw != 'N/A':
+                try:
+                    w_hrs = float(w_raw) * multiplier
+                    l_hrs = float(l_raw) * multiplier
+                    return f"盈:{w_hrs:.1f}h / 亏:{l_hrs:.1f}h"
+                except:
+                    return "N/A"
+            return "N/A"
 
-        print_row("盈亏K线数", get_klines('60m'), get_klines('30m'), get_klines('15m'), get_klines('5m'))
+        print_row("盈亏持仓(小时)", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
 
         print_row("盈亏持仓时间比",
                   get_val(row, '盈亏持仓时间比', '60m', 'float2'),
@@ -417,10 +430,10 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
             return "N/A"
 
     def print_row(label, v60, v30, v15, v5):
-        lbl = pad_label(label, 14)
-        c60 = pad_label(v60, 18)
-        c30 = pad_label(v30, 18)
-        c15 = pad_label(v15, 18)
+        lbl = pad_label(label, 16)  # <--- 改为 16
+        c60 = pad_label(v60, 24)  # <--- 改为 24
+        c30 = pad_label(v30, 24)  # <--- 改为 24
+        c15 = pad_label(v15, 24)  # <--- 改为 24
         c5 = str(v5)
         print(f"  {lbl} | {c60} | {c30} | {c15} | {c5}")
 
@@ -486,10 +499,18 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
             pass
         return "N/A"
 
-    def get_klines(tf):
-        w = get_val(row, '盈利单平均持仓 K 线根数', tf, 'int')
-        l = get_val(row, '亏损单平均持仓 K 线根数', tf, 'int')
-        return f"盈:{w} / 亏:{l}" if w != 'N/A' and l != 'N/A' else "N/A"
+    def get_holding_hours(tf):
+        multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5/60.0}[tf]
+        w_raw = get_val(row, '盈利单平均持仓 K 线根数', tf, 'raw')
+        l_raw = get_val(row, '亏损单平均持仓 K 线根数', tf, 'raw')
+        if w_raw != 'N/A' and l_raw != 'N/A':
+            try:
+                w_hrs = float(w_raw) * multiplier
+                l_hrs = float(l_raw) * multiplier
+                return f"盈:{w_hrs:.1f}h / 亏:{l_hrs:.1f}h"
+            except:
+                return "N/A"
+        return "N/A"
 
     def get_breadth(tf):
         w = get_val(row, '盈利的币数', tf, 'int')
@@ -519,13 +540,13 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     print(f"组合身份: Entry = {entry_name} | Exit = {exit_name} | Filter = {filter_name}")
     print("-" * 110)
 
-    header_lbl = pad_label("核心与衰减指标", 14)
-    h60 = pad_label("[60m 周期]", 18)
-    h30 = pad_label("[30m 周期]", 18)
-    h15 = pad_label("[15m 周期]", 18)
+    header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
+    h60 = pad_label("[60m 周期]", 24)  # <--- 改为 24
+    h30 = pad_label("[30m 周期]", 24)  # <--- 改为 24
+    h15 = pad_label("[15m 周期]", 24)  # <--- 改为 24
     h5 = "[5m 周期]"
     print(f"  {header_lbl} | {h60} | {h30} | {h15} | {h5}")
-    print("  " + "-" * 95)
+    print("  " + "-" * 110)  # <--- 分割线加长到 110
 
     print_row("总交易数", get_val(row, '总交易数', '60m', 'int'), get_val(row, '总交易数', '30m', 'int'),
               get_val(row, '总交易数', '15m', 'int'), get_val(row, '总交易数', '5m', 'int'))
@@ -541,7 +562,7 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
               get_val(row, '样本外平均单笔净收益', '30m', 'pct_plus'),
               get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
               get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
-    print_row("盈亏K线数", get_klines('60m'), get_klines('30m'), get_klines('15m'), get_klines('5m'))
+    print_row("盈亏持仓(小时)", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
     print_row("盈亏持仓时间比", get_val(row, '盈亏持仓时间比', '60m', 'float2'),
               get_val(row, '盈亏持仓时间比', '30m', 'float2'), get_val(row, '盈亏持仓时间比', '15m', 'float2'),
               get_val(row, '盈亏持仓时间比', '5m', 'float2'))
@@ -571,4 +592,4 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore")
     generate_report()
-    # query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
+    query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
