@@ -11,7 +11,8 @@ FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 三周期样本外总交易数底线
     'max_single_coin_concentration': 50.0,  # 单币集中度(%)最大限制（大于该值则过滤）
     'max_winning_klines': 1000,  # 盈利单平均持仓K线根数最大限制
-    'min_avg_net_profit': 0.2  # 单笔平均净收益最小限制(%)，需大于该值
+    'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
+    'min_profit_loss_time_ratio': 0.8  # 盈亏持仓时间比最小限制，需大于等于该值
 }
 
 # ==========================================
@@ -149,8 +150,9 @@ def generate_report():
     max_conc = FILTER_CONFIG['max_single_coin_concentration']
     max_k_lines = FILTER_CONFIG['max_winning_klines']
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
+    min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
 
-    # 计算条件 (缺失值按0处理，防止因某个周期无交易被误杀；平均净收益缺失则按很小的值处理防误通过)
+    # 计算条件 (缺失值按0或-1处理，防止因某个周期无交易被误杀；缺失则按很小的值处理防误通过)
     cond_trades = merged_df['total_oos_trades'] >= min_trades
     cond_conc_60m = merged_df['最优币占总净收益百分比_60m'].fillna(0) <= max_conc
     cond_conc_30m = merged_df['最优币占总净收益百分比_30m'].fillna(0) <= max_conc
@@ -164,17 +166,22 @@ def generate_report():
     cond_avg_net_30m = merged_df['单笔平均净收益_30m'].fillna(-999) > min_avg_net
     cond_avg_net_15m = merged_df['单笔平均净收益_15m'].fillna(-999) > min_avg_net
 
+    cond_pl_ratio_60m = merged_df['盈亏持仓时间比_60m'].fillna(-1) >= min_pl_time_ratio
+    cond_pl_ratio_30m = merged_df['盈亏持仓时间比_30m'].fillna(-1) >= min_pl_time_ratio
+    cond_pl_ratio_15m = merged_df['盈亏持仓时间比_15m'].fillna(-1) >= min_pl_time_ratio
+
     # 联合过滤
     filtered_df = merged_df[
         cond_trades &
         cond_conc_60m & cond_conc_30m & cond_conc_15m &
         cond_klines_60m & cond_klines_30m & cond_klines_15m &
-        cond_avg_net_60m & cond_avg_net_30m & cond_avg_net_15m
+        cond_avg_net_60m & cond_avg_net_30m & cond_avg_net_15m &
+        cond_pl_ratio_60m & cond_pl_ratio_30m & cond_pl_ratio_15m
         ].copy()
 
-    # 计算排序锚点 (三周期样本外均值)
-    filtered_df['avg_oos_net'] = filtered_df[
-        ['样本外平均单笔净收益_60m', '样本外平均单笔净收益_30m', '样本外平均单笔净收益_15m']
+    # 计算排序锚点 (改为：三周期平均单笔净收益均值)
+    filtered_df['avg_net_profit'] = filtered_df[
+        ['单笔平均净收益_60m', '单笔平均净收益_30m', '单笔平均净收益_15m']
     ].mean(axis=1)
 
     # 提取存活 Top 10 (要求三个周期 OOS 收益皆 > 0)
@@ -186,15 +193,15 @@ def generate_report():
     top_entry_factors = survivors['入场信号名称'].value_counts().head(10)
     top_exit_factors = survivors['出场信号名称'].value_counts().head(10)
 
-    # 生成 Top 50 榜单
-    top50 = filtered_df.sort_values(by='avg_oos_net', ascending=False).head(50)
+    # 生成 Top 50 榜单 (按新锚点降序排列)
+    top50 = filtered_df.sort_values(by='avg_net_profit', ascending=False).head(100)
 
     # ==========================================
     # 打印报告
     # ==========================================
     print("\n" + "=" * 90)
     print(">>> [加密货币因子挖掘 - 多周期全景印证报告] <<<")
-    print(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 排序基准：三周期平均样本外单笔净利")
+    print(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 排序基准：三周期平均单笔净收益")
     print("=" * 90 + "\n")
 
     print("【第一部分：宏观水位线 (Macro Baseline)】")
