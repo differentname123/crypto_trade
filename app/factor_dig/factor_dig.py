@@ -23,6 +23,11 @@
               候选集中剔除，再交给状态机撮合。每个 filter_mode 现在是一条独立
               的策略路径，劣质信号再也无法占坑挡住达标的优质机会。
               (同一入场因子下过滤结果完全相同的 mode 会自动合并，只撮合一次)
+ · [本次因子池改版] ①删除 GAP_TH 及全部跳空脏数据因子；②滚动窗口 W: 30天->14天；
+              ③KLINE_DOWN_EXHAUST 改为 ATR 动态阈值(0.1*ATR)；④OI_ROC_TH 提至 0.05；
+              ⑤剔除 10 个高度共线/结构错误因子(被复合因子引用者降级为局部中间量，
+                复合因子结果逐位不变)；⑥新增绝对费率极值/火药桶僵持区/爆仓猎杀V反/
+                终极轧空/高位派发OI撤退/现货抛压镇压 共 7 个客观因子。
 ================================================================================
 """
 from __future__ import annotations
@@ -238,7 +243,8 @@ def make_params(bar_minutes, n_rows):
     P['BPH'] = B(1)
     P['N'] = B(24)
     P['M'] = B(4)
-    P['W'] = B(24 * 30)
+    # 【改动②】滚动统计窗口 30 天 -> 14 天 (RK / ZS / QT / corr 全部同步变短)
+    P['W'] = B(24 * 14)
     P['H12'], P['H24'], P['H48'] = B(12), B(24), B(48)
     P['H72'], P['H168'] = B(72), B(168)
     P['D2'], P['D7'] = B(48), B(168)
@@ -256,13 +262,24 @@ def make_params(bar_minutes, n_rows):
         VOL_BREAK_MULT=2.0,
         ATR_K=3.0,
         ADX_TH=25.0,
-        GAP_TH=0.003,
-        EXHAUST_TH=0.002,
+        # 【改动①】GAP_TH 已删除：加密永续 7×24 无休市，"跳空"实为数据空洞 ffill 产生的脏数据
+        # 【改动③】十字星/衰竭实体阈值改为基于 ATR 的动态阈值 (0.1 * ATR_N)
+        EXHAUST_ATR_MULT=0.10,
         FLAT_TH=0.010,
         SILENT_TH=0.010,
-        OI_ROC_TH=0.020,
+        # 【改动④】OI 变化率底线过滤阈值 0.020 -> 0.050 (5%)
+        OI_ROC_TH=0.050,
         OI_HOT_TH=0.050,
         CORR_TH=0.20,
+        # ---- 【新增】绝对费率极值 / 终极因子阈值 ----
+        FR_ABS_TH=0.001,              # 单期资金费率绝对阈值 (±0.1%)
+        LIQ_OI_DROP_TH=-0.05,         # 爆仓猎杀: OI 断崖下跌 -5%
+        DIST_OI_DROP_TH=-0.02,        # 高位派发: OI 实质性下降 -2%
+        LIQ_WICK_TH=0.50,             # 长下影线占全长比
+        SPOT_SUPPRESS_ATR_MULT=0.50,  # 现货镇压: 阴线实体 > 0.5 * ATR
+        POWDER_OI_RK=0.90,            # 火药桶: OI 分位下限
+        POWDER_VOL_RK=0.30,           # 火药桶: 成交量分位上限
+        SQUEEZE_OI_RK=0.80,           # 终极轧空: OI 分位下限
     )
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
@@ -350,6 +367,7 @@ def build_factors(df, P, rank_shift=0):
 
     oi_value = oi * c
     oi_pct_N, oi_pct_M = pctc(oi, N), pctc(oi, M)
+    oi_pct_1h = pctc(oi, P['BPH'])  # 【新增】精确计算过去 1 小时的 OI 变化率
     oi_ma_fast = oi.rolling(P['D2'], min_periods=max(2, P['D2'] // 2)).mean()
     oi_ma_slow = oi.rolling(P['D7'], min_periods=max(2, P['D7'] // 2)).mean()
     oiv_pct_N = pctc(oi_value, N)
@@ -382,6 +400,8 @@ def build_factors(df, P, rank_shift=0):
     F['FILTER_LIQUIDITY_VOLUME'] = v > QT(v, 0.30)
     F['FILTER_NOT_OVERCROWDED'] = (fr_rank < 0.95) & (oi_value_rank < 0.95) & (rk_ret_N < 0.98)
     F['FILTER_TREND_REGIME_UP'] = (c > ma_slow) & (ma_slow > ma_slow.shift(M))
+    # 【新增·基础特征补丁】火药桶僵持区：OI 堆积天量杠杆 + 流动性干涸 -> 变盘在即
+    F['REGIME_POWDER_KEG'] = (rk_oi > P['POWDER_OI_RK']) & (rk_v < P['POWDER_VOL_RK'])
 
     F['PRICE_MA_STACK'] = (c > ma_fast) & (ma_fast > ma_slow)
     F['PRICE_MULTI_MA_STACK'] = (ma_12h > ma_24h) & (ma_24h > ma_72h) & (ma_72h > ma_7d) & (c > ma_12h)
@@ -413,7 +433,7 @@ def build_factors(df, P, rank_shift=0):
     F['MOM_RETURN_STRONG'] = rk_ret_N > 0.80
     F['MOM_ACCELERATION'] = ret_N > ret_N.shift(M)
     F['MOM_BURST'] = rk_ret_M > 0.90
-    F['MOM_ZSCORE_STRONG'] = ZS(ret_N) > 1.5
+    # 【去重】MOM_ZSCORE_STRONG 删除：Z-score>1.5 与 Rank>0.9 高度共线
     F['MOM_TURN_POSITIVE'] = (ret_N > 0) & (ret_N.shift(1) <= 0)
     F['MOM_CONSISTENT_UP_BARS'] = (c > c.shift(1)).rolling(N).sum() >= P['K_UP_BARS']
     F['MOM_NEW_HIGH_FREQ'] = (c >= maxH_M.shift(1)).rolling(N).sum() >= P['K_NEWHIGH']
@@ -424,21 +444,24 @@ def build_factors(df, P, rank_shift=0):
     _vwm = RSUM(ret_M * v, N) / (rsum_v_N + EPS)
     F['MOM_VOLUME_WEIGHTED'] = RK(_vwm) > 0.80
 
-    F['VOL_RETURN_COMPRESSION'] = RK(ret_1h.rolling(N, min_periods=max(2, N // 2)).std()) < 0.20
-    F['VOL_TRUE_RANGE_COMPRESSION'] = rk_atr < 0.20
+    # 【去重】波动收敛(盘整)类 4 个因子仅保留最直观的振幅收敛 VOL_RANGE_COMPRESSION_REAL；
+    #        其中"真实波幅收敛"被 VOL_SQUEEZE_TO_EXPAND_REAL 引用，故降级为内部中间量，
+    #        以保证复合因子结果逐位不变。
+    _vol_tr_comp = rk_atr < 0.20
     F['VOL_RANGE_COMPRESSION_REAL'] = rk_rng < 0.25
-    F['VOL_BODY_COMPRESSION'] = RK((c - o).abs().rolling(N, min_periods=max(2, N // 2)).mean()) < 0.20
     F['VOL_ATR_EXPANSION'] = ZS(atr_pct) > 1.0
-    F['VOL_SQUEEZE_TO_EXPAND_REAL'] = bs(F['VOL_TRUE_RANGE_COMPRESSION']) & F['VOL_ATR_EXPANSION']
+    F['VOL_SQUEEZE_TO_EXPAND_REAL'] = bs(_vol_tr_comp) & F['VOL_ATR_EXPANSION']
     F['VOL_LOW_TO_HIGH'] = (rk_atr.shift(M) < 0.20) & (rk_atr > 0.60)
     F['VOL_NOT_EXTREME'] = rk_atr < 0.90
     F['VOL_EXTREME_RISK'] = rk_atr > 0.95
     F['VOL_DOWN_SPIKE'] = F['VOL_ATR_EXPANSION'] & (ret_M < 0)
 
-    F['BREAK_N_HIGH_REAL'] = c > maxH_N.shift(1)
+    # 【去重】BREAK_N_HIGH_REAL(持续状态) 与 BREAK_DONCHIAN_HIGH_EVENT_REAL(瞬时事件) 高度重合，
+    #        作为状态机入场触发器保留事件型；持续状态降级为内部中间量供复合因子复用。
+    _break_n_high = c > maxH_N.shift(1)
     F['BREAK_DONCHIAN_HIGH_EVENT_REAL'] = (c >= maxH_N.shift(1)) & (c.shift(1) < maxH_N.shift(2))
     F['BREAK_BOLLINGER_UPPER'] = c > ma_N + 2 * c.rolling(N, min_periods=max(2, N // 2)).std()
-    F['BREAK_RANGE_QUANTILE'] = c > QT(c, 0.90)
+    # 【去重】BREAK_RANGE_QUANTILE 删除：价格绝对位置 Rank>0.9 与极端动量类共线
     F['BREAK_LONG_CONSOLIDATION_REAL'] = (rk_rng.shift(1) < 0.20) & (c > maxH_N.shift(1))
     F['BREAK_STRONG_CLOSE'] = (c > maxH_N.shift(1)) & (c > o)
     _bd = c / (maxH_N.shift(1) + EPS) - 1.0
@@ -475,9 +498,10 @@ def build_factors(df, P, rank_shift=0):
     F['KLINE_STRONG_RED'] = (c < o) & (rk_bodyr < 0.10)
     F['KLINE_RED_BREAK_MA'] = (c < o) & (c < ma_N)
     F['KLINE_SMALL_RED_PULLBACK'] = (c < o) & (RK((c - o).abs()) < 0.30) & (c > ma_N)
-    F['KLINE_GAP_UP'] = o > c.shift(1) * (1 + P['GAP_TH'])
-    F['KLINE_GAP_DOWN'] = o < c.shift(1) * (1 - P['GAP_TH'])
-    F['KLINE_DOWN_EXHAUST'] = (ret_N.shift(1) < 0) & (c < o) & (_bodyr.abs() < P['EXHAUST_TH']) & (c > l)
+    # 【改动①】KLINE_GAP_UP / KLINE_GAP_DOWN 已删除(7×24 市场无真实跳空，全是数据空洞脏值)
+    # 【改动③】衰竭小实体判定：由固定相对阈值改为 ATR 动态阈值 (0.1 * ATR_N)
+    F['KLINE_DOWN_EXHAUST'] = ((ret_N.shift(1) < 0) & (c < o)
+                               & ((o - c) < P['EXHAUST_ATR_MULT'] * atr_N) & (c > l))
     F['KLINE_SHOOTING_STAR'] = (ret_N.shift(1) > 0) & (uw > 0.50) & (c < o)
     F['KLINE_HAMMER'] = (ret_N.shift(1) < 0) & (lw > 0.50) & (c > o)
     F['KLINE_INSIDE_BAR'] = (h < h.shift(1)) & (l > l.shift(1))
@@ -497,7 +521,7 @@ def build_factors(df, P, rank_shift=0):
     F['VOLUME_DRY_UP'] = rk_v < 0.20
     F['VOLUME_EXPAND_PRICE_UP'] = F['VOLUME_SPIKE'] & (ret_M > 0)
     F['VOLUME_EXPAND_PRICE_DOWN'] = F['VOLUME_SPIKE'] & (ret_M < 0)
-    F['VOLUME_CONFIRM_BREAK'] = F['BREAK_N_HIGH_REAL'] & F['VOLUME_SPIKE']
+    F['VOLUME_CONFIRM_BREAK'] = _break_n_high & F['VOLUME_SPIKE']
     F['VOLUME_DRY_PULLBACK'] = (ret_M < 0) & F['VOLUME_DRY_UP'] & (c > ma_N)
     F['VOLUME_TREND_UP'] = RSUM(v * (c > c.shift(1)), N) > RSUM(v * (c < c.shift(1)), N)
     _vpc = pctc(v, M)
@@ -531,7 +555,7 @@ def build_factors(df, P, rank_shift=0):
     F['OI_PERSISTENT_UP'] = (oi_pct_M > 0).rolling(N).sum() >= P['K_OI_UP']
     F['OI_ACCELERATION'] = oi_pct_M > oi_pct_N / (N / M)
     F['OI_HIDDEN_RISE_PRICE_FLAT'] = (ret_N.abs() < P['FLAT_TH']) & (rk_oipct_N > 0.80)
-    F['OI_BREAKOUT_CONFIRM'] = F['BREAK_N_HIGH_REAL'] & (rk_oipct_M > 0.70)
+    F['OI_BREAKOUT_CONFIRM'] = _break_n_high & (rk_oipct_M > 0.70)
     F['OI_PRICE_BOTH_UP'] = (ret_N > 0) & (oi_pct_N > 0)
     F['OI_PRICE_UP_OI_DOWN'] = (ret_N > 0) & (oi_pct_N < 0)
     F['OI_PRICE_DOWN_OI_UP'] = (ret_N < 0) & (oi_pct_N > 0)
@@ -545,7 +569,7 @@ def build_factors(df, P, rank_shift=0):
     F['OI_AMOUNT_UP_VALUE_NOT_HOT'] = (oi_pct_N > 0) & (oi_value_rank < 0.90)
     F['OI_VALUE_UP_AMOUNT_NOT_UP'] = (oiv_pct_N > 0) & (oi_pct_N <= 0)
     F['OI_VALUE_EMA_CROSS'] = CU(oiv_ema_M, oiv_ema_N)
-    F['OI_VALUE_SURGE'] = RK(oiv_pct_N) > 0.90
+    # 【去重】OI_VALUE_SURGE 删除：OI市值 = OI数量 × 价格，与纯 OI_SURGE_RANK 高度共线且混入价格
     F['OI_ROC_BURST'] = oi_pct_N > QT(oi_pct_N, 0.95)
     F['OI_ROC_PEAK'] = (oi_pct_N >= oi_pct_N.rolling(M, min_periods=2).max()) & (oi_pct_N > P['OI_ROC_TH'])
     F['OI_EXTREME_PRICE_NOT_HOT'] = (rk_oi > 0.95) & ((c / (ma_N + EPS) - 1) < P['OI_HOT_TH'])
@@ -565,6 +589,9 @@ def build_factors(df, P, rank_shift=0):
     F['FR_HIGH_EXTREME'] = fr_rank > 0.90
     F['FR_EXTREME_LOW'] = fr_rank < 0.05
     F['FR_ROLL_OVER_FROM_HIGH'] = (fr_rank < 0.90) & (fr_rank.shift(1) >= 0.90)
+    # 【新增·基础特征补丁】绝对费率极值：弥补 Rank 的缺陷，过滤真实持有成本极高的状态
+    F['FR_ABSOLUTE_DEEP_NEG'] = fr < -P['FR_ABS_TH']
+    F['FR_ABSOLUTE_HIGH_POS'] = fr > P['FR_ABS_TH']
     _frstd = fr.rolling(N, min_periods=max(2, N // 2)).std()
     # 【性能】RK(_frstd) 原本在 FR_STABLE / FR_UNSTABLE 各算一次
     rk_frstd = RK(_frstd)
@@ -582,20 +609,20 @@ def build_factors(df, P, rank_shift=0):
     F['ENTRY_ABSORPTION_BREAKOUT_VOLUME'] = (bs(F['VOL_RANGE_COMPRESSION_REAL'])
                                              & bs(F['OI_HIDDEN_RISE_PRICE_FLAT'])
                                              & bs(F['FR_MILD'])
-                                             & F['BREAK_N_HIGH_REAL'] & F['VOLUME_SPIKE'])
+                                             & _break_n_high & F['VOLUME_SPIKE'])
     F['ENTRY_SILENT_ACCUMULATION'] = (ret_N.abs() < P['SILENT_TH']) & (oi_pct_N > 0) & F['FR_LOW_NEG']
     F['ENTRY_SHORT_SQUEEZE_LAUNCH'] = (bs(F['FR_VERY_LOW']) & bs(F['PRICE_HIGHER_LOWS'])
-                                       & bs(F['OI_SLOPE_UP']) & F['BREAK_N_HIGH_REAL'])
+                                       & bs(F['OI_SLOPE_UP']) & _break_n_high)
     F['ENTRY_SHORT_SQUEEZE_VOLUME'] = (fr < 0) & F['VOLUME_SPIKE'] & (ret_M > 0) & (oi_pct_M < 0)
     F['ENTRY_OI_FLASH_SURGE'] = F['OI_SURGE_RANK'] & F['PRICE_HEALTHY_EXTENSION'] & F['FR_MILD']
     F['ENTRY_BEAR_TRAP_RECLAIM_VOLUME'] = (l < minL_N.shift(1)) & (c > o) & F['VOLUME_SPIKE'] & F['OI_SLOPE_UP']
-    F['ENTRY_HIGH_PRESSURE_OI_BREAKOUT'] = (rk_oi > 0.95) & F['BREAK_N_HIGH_REAL'] & F['VOLUME_SPIKE']
+    F['ENTRY_HIGH_PRESSURE_OI_BREAKOUT'] = (rk_oi > 0.95) & _break_n_high & F['VOLUME_SPIKE']
     F['ENTRY_TREND_CONFIRM_B'] = F['PRICE_MA_STACK'] & F['OI_MA_UP'] & F['FR_MILD']
     F['ENTRY_PULLBACK_RESTART_VOLUME'] = (bs(F['PRICE_MA_STACK']) & bs(F['VOLUME_DRY_PULLBACK'])
                                           & (oi_pct_N > -0.05) & F['VOLUME_SPIKE'] & (c > maxH_M.shift(1)))
     F['ENTRY_BREAKOUT_RETEST_OI_STABLE'] = F['BREAK_RETEST_HOLD_REAL'] & (oi_pct_N > -0.03) & F['FR_MILD']
     F['ENTRY_FR_RESET_SECOND_WAVE'] = (F['FR_RESET_AFTER_HOT'] & F['PRICE_MA_STACK']
-                                       & F['OI_SLOPE_UP'] & F['BREAK_N_HIGH_REAL'])
+                                       & F['OI_SLOPE_UP'] & _break_n_high)
     F['ENTRY_HEALTHY_ACCELERATION_VOLUME'] = (F['MOM_RETURN_STRONG'] & F['VOLUME_SPIKE']
                                               & F['OI_SURGE_RANK'] & F['FR_PRICE_UP_NOT_HOT'])
     F['ENTRY_UNCROWDED_MOMENTUM'] = F['MOM_RETURN_STRONG'] & F['FR_POS_NOT_HOT'] & F['OI_VALUE_HEALTHY']
@@ -605,14 +632,30 @@ def build_factors(df, P, rank_shift=0):
     F['ENTRY_PRICE_UP_OI_DOWN_SPOT_PUSH'] = F['PRICE_MA_STACK'] & F['OI_PRICE_UP_OI_DOWN'] & F['FR_LOW_NEG']
     F['ENTRY_LONG_CONSOL_OI_VOLUME_CONFIRM'] = F['BREAK_LONG_CONSOLIDATION_REAL'] & F['OI_SURGE_RANK'] & F[
         'VOLUME_SPIKE']
-    F['ENTRY_OI_LOW_RECOVERY_BREAK'] = bs(F['OI_LOW_TO_UP']) & F['BREAK_N_HIGH_REAL']
+    F['ENTRY_OI_LOW_RECOVERY_BREAK'] = bs(F['OI_LOW_TO_UP']) & _break_n_high
     F['ENTRY_BOTTOM_STABILIZE'] = F['OI_BOTTOM_DIVERGENCE'] & F['FR_LOW_NEG'] & F['PRICE_HIGHER_LOWS']
     F['ENTRY_VWAP_RECLAIM_OI'] = F['VWAP_RECLAIM'] & F['OI_SLOPE_UP'] & F['FR_MILD']
-    F['ENTRY_OBV_BULL_DIV_BREAK'] = bs(F['OBV_BULL_DIV']) & F['BREAK_N_HIGH_REAL'] & F['VOLUME_SPIKE']
+    F['ENTRY_OBV_BULL_DIV_BREAK'] = bs(F['OBV_BULL_DIV']) & _break_n_high & F['VOLUME_SPIKE']
     F['ENTRY_INSIDE_BREAK_VOLUME'] = bs(F['KLINE_INSIDE_BAR']) & (c > h.shift(1)) & F['VOLUME_SPIKE']
     F['ENTRY_OUTSIDE_BAR_VOLUME'] = F['KLINE_OUTSIDE_BAR_UP'] & F['VOLUME_SPIKE'] & F['OI_SLOPE_UP']
     F['ENTRY_HAMMER_VOLUME_OI'] = F['KLINE_HAMMER'] & F['VOLUME_SPIKE'] & F['OI_SLOPE_UP'] & F['FR_LOW_NEG']
     F['ENTRY_THREE_GREEN_VOLUME_OI'] = F['KLINE_THREE_GREEN_UP'] & F['VOLUME_MA_UP'] & F['OI_MA_UP']
+
+    # ---------- 【新增】终极入场因子 ----------
+    # 1. 连环爆仓 V 反 / 流动性猎杀 (Liquidation Sweep Bottom)
+    #    跌破前低 -> 多头连环爆仓(OI 物理消灭) -> 长下影线极速拉回 + 局部爆量
+    #    注：OI 断崖判定沿用给定公式 oi_pct_M (M=4h 窗口)；若需 1h 口径改为 pctc(oi, P['BPH'])
+    # 1. 连环爆仓 V 反 / 流动性猎杀 (Liquidation Sweep Bottom)
+    F['ENTRY_LIQUIDATION_SWEEP_BOTTOM'] = ((l < minL_N.shift(1))
+                                           & (lw > P['LIQ_WICK_TH'])
+                                           & (oi_pct_1h < P['LIQ_OI_DROP_TH'])  # 【改动】这里改成了 oi_pct_1h
+                                           & F['VOLUME_SPIKE'])
+    # 2. 终极轧空爆发 (Extreme Short Squeeze)
+    #    空头死扛(OI 高位攀升) + 支付极高利息(深负费率) + 突破 24h 高点事件 -> 空头踩踏
+    F['ENTRY_EXTREME_SHORT_SQUEEZE'] = (F['BREAK_DONCHIAN_HIGH_EVENT_REAL']
+                                        & (rk_oi > P['SQUEEZE_OI_RK'])
+                                        & F['OI_SLOPE_UP']
+                                        & ((fr_rank < 0.05) | F['FR_ABSOLUTE_DEEP_NEG']))
 
     F['EXIT_CHANDDELIER_N'] = c < (maxH_N.shift(1) - P['ATR_K'] * atr_N)
     F['EXIT_CLOSE_BELOW_MA_N'] = c < ma_N
@@ -640,7 +683,7 @@ def build_factors(df, P, rank_shift=0):
     _crowd = (rk_ext_slow.fillna(0.5) + rk_ret_M.fillna(0.5)
               + fr_rank.fillna(0.5) + oi_value_rank.fillna(0.5))
     F['EXIT_CROWDING_SCORE_HIGH'] = _crowd > QT(_crowd, 0.90)
-    F['EXIT_GAP_DOWN_RISK'] = F['KLINE_GAP_DOWN'] & (c < ma_fast)
+    # 【改动①】EXIT_GAP_DOWN_RISK 已删除(依赖被删的 KLINE_GAP_DOWN，捕捉的是脏数据)
     F['EXIT_STRONG_RED_BAR_VOLUME'] = F['KLINE_STRONG_RED'] & F['VOLUME_SPIKE'] & (c < ma_fast)
     F['EXIT_RANGE_POSITION_WEAK'] = F['STRUCT_RANGE_POSITION_WEAK']
     F['EXIT_FAILED_BREAKOUT'] = F['BREAK_FAIL_LEVEL']
@@ -658,6 +701,18 @@ def build_factors(df, P, rank_shift=0):
     F['EXIT_MICRO_DISTRIBUTION'] = ((c / (maxH_N + EPS) > 0.95) & F['VOLUME_SPIKE']
                                     & F['KLINE_CLOSE_LOWER_RANGE']
                                     & (F['OI_DROP_EXTREME'] | F['FR_HIGH_EXTREME']))
+
+    # ---------- 【新增】终极出场因子 ----------
+    # 3. 高位派发与 OI 撤退 (Distribution Exhaustion Top)
+    #    价格仍在绝对高位(距 24h 高点<5%)，但 OI 已实质性下降(>2%) -> 大户在平多/开空
+    F['EXIT_DISTRIBUTION_EXHAUSTION_TOP'] = ((c / (maxH_N + EPS) > 0.95)
+                                             & (oi_pct_M < P['DIST_OI_DROP_TH']))
+    # 4. 现货抛压镇压 (Spot Suppression Exit)
+    #    合约多头极度拥挤(费率狂热) + 爆量 + 实体大阴线(> 0.5*ATR) -> 主力现货砸盘
+    F['EXIT_SPOT_SUPPRESSION'] = (((fr_rank > 0.95) | F['FR_ABSOLUTE_HIGH_POS'])
+                                  & F['VOLUME_SPIKE']
+                                  & (c < o)
+                                  & ((o - c) > P['SPOT_SUPPRESS_ATR_MULT'] * atr_N))
 
     out = {}
     for k_, s in F.items():
