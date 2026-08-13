@@ -592,4 +592,4 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore")
     generate_report()
-    query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
+    # query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
