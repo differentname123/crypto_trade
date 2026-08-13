@@ -62,12 +62,12 @@ CFG = dict(
     # --- 因子行为 ---
     RANK_SHIFT=0,
     DEDUPE_IDENTICAL=False,
-    MIN_SIGNALS=1,
+    MIN_SIGNALS=0,
     MAX_DENSITY=0.9,
 
     # --- 组合与输出 ---
     ALLOW_SAME_FACTOR=False,
-    MAX_TRADES_PER_COMBO=100000,
+    MAX_TRADES_PER_COMBO=1000000,
     MIN_TRADES_REPORT=1,
     OOS_SPLIT=0.70,
     ENTRY_PREFIX_FILTER=None,
@@ -80,7 +80,7 @@ CFG = dict(
 
 EPS = 1e-12
 
-# 【新增】15种环境过滤模式
+# 【新增】15种环境过滤模式 都是用的之前24小时的数据，不涉及未来数据
 FILTER_MODES = [
     ('original', None, 0),
     ('top', 'rank_gain_24h', 1), ('top', 'rank_gain_24h', 3), ('top', 'rank_gain_24h', 5),
@@ -243,8 +243,6 @@ def make_params(bar_minutes, n_rows):
     P['H72'], P['H168'] = B(72), B(168)
     P['D2'], P['D7'] = B(48), B(168)
 
-    if n_rows < P['W'] * 2:
-        P['W'] = max(200, n_rows // 3)
     P['MINP_W'] = max(50, P['W'] // 5)
 
     N, M = P['N'], P['M']
@@ -929,8 +927,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
     n = len(df)
     kline_days = n * bm / 1440.0
-    max_allowed_trades = kline_days * 24.0 * 60
-
     op = df['open'].to_numpy(float)
     cl = df['close'].to_numpy(float)
     exec_px = np.empty(n, float)
@@ -1082,12 +1078,6 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                     rets_f = rets_all[okm]
                     fr_f = fr_tr[okm]
 
-                    if ent_f.size < cfg['MIN_TRADES_REPORT']:
-                        stats['skip_too_few'] += n_lab
-                        continue
-                    if ent_f.size > max_allowed_trades:
-                        stats['skip_too_many'] += n_lab
-                        continue
 
                     bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
 
@@ -1154,9 +1144,9 @@ def mine_symbol_wrapper(args):
     fr_f = os.path.join(cfg['DATA_DIR'], f'{coin}_USDT_USDT_funding_rates.csv')
     try:
         df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
-        if len(df) < 800:
-            # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
-            return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
+        # if len(df) < 800:
+        #     # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
+        #     return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
 
         pairs, stats, kline_days = mine_symbol(coin, df, cfg, _BTC_CLOSE)
 
