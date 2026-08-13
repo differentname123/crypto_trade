@@ -907,10 +907,12 @@ def mine_symbol(coin, df, cfg, btc_close=None):
 
     # 【新增】资金费率结算事件的前缀和：
     #   fr_cum[i] = sum(fr_event[0:i])
-    #   单笔持仓(信号 bar e 入场 / 信号 bar x 出场，执行分别落在 e+1 / x+1 的开盘)
-    #   真实持仓区间 = [timestamp(e+1), timestamp(x+1))  -> 左闭右开
-    #   => 应计资金费率 = 累加 bar 索引 (e, x] 上的所有真实结算事件
-    #   => fr_sum = fr_cum[x + 1] - fr_cum[e + 1]
+    #   考虑到实盘系统的计算与网络延迟（Latency），这里的计费区间做了“贴近实战”的偏移：
+    #   1. 入场：信号在 bar e 结算产生，e+1 开盘执行。由于实盘延迟，真实建仓通常略晚于 e+1 的准点快照，因此【完美避开】e+1 的资金费。
+    #   2. 出场：信号在 bar x 结算产生，x+1 开盘执行。由于实盘延迟，真实平仓也略晚于 x+1 的准点快照，此时仍持有仓位，因此【无法逃避】x+1 的资金费。
+    #   => 真实应计资金费率的 bar 索引区间为 [e+2, x+1] (闭区间)
+    #   => 利用前缀和计算：fr_sum = fr_cum[(x + 1) + 1] - fr_cum[(e + 1) + 1]
+    #   => 化简为：fr_sum = fr_cum[x + 2] - fr_cum[e + 2]
     if 'fr_event' in df.columns:
         fr_ev = df['fr_event'].to_numpy(float)
     else:
@@ -1061,7 +1063,9 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                     continue
 
                 # 【新增】每笔资金费率之和：左闭右开真实持仓区间 -> bar 索引 (e, x]
-                fr_tr = fr_cum[ext + 1] - fr_cum[ent + 1]
+                safe_ent = np.minimum(ent + 2, n)
+                safe_ext = np.minimum(ext + 2, n)
+                fr_tr = fr_cum[safe_ext] - fr_cum[safe_ent]
 
                 # === 计算做多收益 ===
                 rets_long = exec_px[ext] / exec_px[ent] - 1.0 - cost
