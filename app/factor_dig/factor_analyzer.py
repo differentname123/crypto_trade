@@ -9,7 +9,7 @@ from datetime import datetime
 # ==========================================
 FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 三周期样本外总交易数底线
-    'max_single_coin_concentration': 50.0,  # 单币集中度(%)最大限制（大于该值则过滤）
+    'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
     'max_winning_klines': 1000,  # 盈利单平均持仓K线根数最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
     'min_profit_loss_time_ratio': 0.8  # 盈亏持仓时间比最小限制，需大于等于该值
@@ -238,11 +238,11 @@ def generate_report():
         print(f"  {pad_label(e_str, 45)} {x_str}")
 
     print("\n" + "=" * 90)
-    print("【第二部分：Top 50 组合微观多维切片 (Micro Profiling)】")
+    print("【第二部分：各个组合微观多维切片 (Micro Profiling)】")
     print("=" * 90)
 
     for rank, (idx, row) in enumerate(top50.iterrows(), 1):
-        print(f"\n[Rank #{rank:02d}] ")
+        print(f"\n[组合编号 #{rank:02d}] ")
         print(f"组合身份: Entry = {row['入场信号名称']} | Exit = {row['出场信号名称']} | Filter = {row['过滤模式']}")
         print("-" * 90)
 
