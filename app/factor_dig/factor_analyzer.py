@@ -10,9 +10,9 @@ from datetime import datetime
 FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 四周期样本外总交易数底线
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
-    'max_winning_klines': 10000,  # 盈利单平均持仓K线根数最大限制
+    'max_winning_klines': 1500,  # 盈利单平均持仓K线根数最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
-    'min_profit_loss_time_ratio': 0.8  # 盈亏持仓时间比最小限制，需大于等于该值
+    'min_profit_loss_time_ratio': 0.5  # 盈亏持仓时间比最小限制，需大于等于该值
 }
 
 # ==========================================
@@ -570,5 +570,5 @@ if __name__ == "__main__":
     import warnings
 
     warnings.filterwarnings("ignore")
-    # generate_report()
+    generate_report()
     # query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
