@@ -10,9 +10,9 @@ from datetime import datetime
 FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 四周期样本外总交易数底线
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
-    'max_holding_hours': 30 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
+    'max_holding_hours': 10 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
-    'min_profit_loss_time_ratio': 0.5  # 盈亏持仓时间比最小限制，需大于等于该值
+    'min_profit_loss_time_ratio': 0.8  # 盈亏持仓时间比最小限制，需大于等于该值
 }
 
 # ==========================================
@@ -323,7 +323,7 @@ def generate_report():
                   get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
                   get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
 
-        # 盈亏持仓(小时)整合展示
+        # 平均盈亏持仓整合展示
         def get_holding_hours(tf):
             multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5/60.0}[tf]
             w_raw = get_val(row, '盈利单平均持仓 K 线根数', tf, 'raw')
@@ -337,7 +337,7 @@ def generate_report():
                     return "N/A"
             return "N/A"
 
-        print_row("盈亏持仓(小时)", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
+        print_row("平均盈亏持仓", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
 
         print_row("盈亏持仓时间比",
                   get_val(row, '盈亏持仓时间比', '60m', 'float2'),
@@ -562,7 +562,7 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
               get_val(row, '样本外平均单笔净收益', '30m', 'pct_plus'),
               get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
               get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
-    print_row("盈亏持仓(小时)", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
+    print_row("平均盈亏持仓", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
     print_row("盈亏持仓时间比", get_val(row, '盈亏持仓时间比', '60m', 'float2'),
               get_val(row, '盈亏持仓时间比', '30m', 'float2'), get_val(row, '盈亏持仓时间比', '15m', 'float2'),
               get_val(row, '盈亏持仓时间比', '5m', 'float2'))
