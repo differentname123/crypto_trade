@@ -514,6 +514,7 @@ def build_factors(df, P, rank_shift=0):
     F['KLINE_THREE_RED_DOWN'] = ((c < o) & (c.shift(1) < o.shift(1)) & (c.shift(2) < o.shift(2))
                                  & (c < c.shift(1)) & (c.shift(1) < c.shift(2)))
 
+    F['ENTRY_ALWAYS_TRUE'] = pd.Series(True, index=df.index)
     F['VOLUME_MA_UP'] = vma_fast > vma_slow
     F['VOLUME_SPIKE'] = v > QT(v, 0.95)
     F['VOLUME_Z_SPIKE'] = ZS(v) > 2.0

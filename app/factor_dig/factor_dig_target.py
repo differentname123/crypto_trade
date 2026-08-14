@@ -79,7 +79,8 @@ CFG = dict(
     EXIT_PREFIX_FILTER=None,
     # 【需求1】精确筛选目标信号因子
     ENTRY_EXACT_FILTER=[
-    "EXIT_MULTI_MA_BREAK"
+    "EXIT_MULTI_MA_BREAK",
+    "ENTRY_ALWAYS_TRUE"
 ],
     EXIT_EXACT_FILTER=[
     "EXIT_MA_DEAD_CROSS"
@@ -505,7 +506,7 @@ def build_factors(df, P, rank_shift=0):
     F['KLINE_STRONG_RED'] = (c < o) & (rk_bodyr < 0.10)
     F['KLINE_RED_BREAK_MA'] = (c < o) & (c < ma_N)
     F['KLINE_SMALL_RED_PULLBACK'] = (c < o) & (RK((c - o).abs()) < 0.30) & (c > ma_N)
-    # 【改动①】KLINE_GAP_UP / KLINE_GAP_DOWN 已删除(7×24 市场无真实跳空，全是数据空洞脏值)
+    # 【改动①】KLINE_GAP_UP / KLINE_GAP_DOWN 已删除(7×24 市场无休市，全是数据空洞脏值)
     # 【改动③】衰竭小实体判定：由固定相对阈值改为 ATR 动态阈值 (0.1 * ATR_N)
     F['KLINE_DOWN_EXHAUST'] = ((ret_N.shift(1) < 0) & (c < o)
                                & ((o - c) < P['EXHAUST_ATR_MULT'] * atr_N) & (c > l))
@@ -663,6 +664,9 @@ def build_factors(df, P, rank_shift=0):
                                         & (rk_oi > P['SQUEEZE_OI_RK'])
                                         & F['OI_SLOPE_UP']
                                         & ((fr_rank < 0.05) | F['FR_ABSOLUTE_DEEP_NEG']))
+
+    # 【新增】表示都为True的因子，每根bar都是信号
+    F['ENTRY_ALWAYS_TRUE'] = pd.Series(True, index=df.index)
 
     F['EXIT_CHANDDELIER_N'] = c < (maxH_N.shift(1) - P['ATR_K'] * atr_N)
     F['EXIT_CLOSE_BELOW_MA_N'] = c < ma_N
@@ -1482,7 +1486,7 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键，需求3修改】动态修改输出目录为debug专用目录，防止影响正常的文件
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug_test'
 
         # 调用主函数执行
         main(run_cfg)
