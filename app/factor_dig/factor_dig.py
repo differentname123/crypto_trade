@@ -1410,7 +1410,7 @@ if __name__ == '__main__':
     import copy
 
     # 定义你需要运行的周期列表
-    target_bar_minutes = [1, 5, 15, 30, 60]
+    target_bar_minutes = [5, 15, 30, 60]
     target_bar_minutes.reverse()
     for bm in target_bar_minutes:
         print(f"\n\n" + "★" * 78)
