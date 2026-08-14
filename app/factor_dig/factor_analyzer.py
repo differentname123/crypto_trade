@@ -78,14 +78,19 @@ def get_val(row, col_base, tf, fmt='raw'):
         return "N/A"
 
 
-def print_row(label, v60, v30, v15, v5):
-    """打印完美对齐的表格行"""
+def print_row(label, vals):
+    """打印完美对齐的表格行，支持动态列数"""
     lbl = pad_label(label, 16)      # <--- 改为 16
-    c60 = pad_label(v60, 24)        # <--- 改为 24
-    c30 = pad_label(v30, 24)        # <--- 改为 24
-    c15 = pad_label(v15, 24)        # <--- 改为 24
-    c5 = str(v5)
-    print(f"  {lbl} | {c60} | {c30} | {c15} | {c5}")
+    cols = []
+    for i, v in enumerate(vals):
+        if i < len(vals) - 1:
+            cols.append(pad_label(v, 24))
+        else:
+            cols.append(str(v))
+    if not cols:
+        print(f"  {lbl} |")
+    else:
+        print(f"  {lbl} | " + " | ".join(cols))
 
 
 # ==========================================
@@ -102,7 +107,7 @@ def load_and_prep_data():
     dfs = {}
     for tf, path in paths.items():
         if not os.path.exists(path):
-            raise FileNotFoundError(f"找不到文件: {path}。请确认路径。")
+            continue  # 若路径不存在，则不报错，直接跳过处理后续有的
         df = pd.read_csv(path)
 
         # 脱敏入场和出场信号
@@ -113,41 +118,44 @@ def load_and_prep_data():
         dfs[tf] = df
 
     save_mapping()
-    return dfs['60m'], dfs['30m'], dfs['15m'], dfs['5m']
+    return dfs
 
 
 def generate_report():
     print("正在加载与处理多周期因子数据，请稍候...\n")
 
     try:
-        df_60m, df_30m, df_15m, df_5m = load_and_prep_data()
+        dfs = load_and_prep_data()
     except Exception as e:
         print(f"系统错误: {e}")
         return
 
+    if not dfs:
+        print("没有找到任何周期的有效数据文件，无法生成报告。")
+        return
+
+    tfs = list(dfs.keys())
+
     # 1. 提取全局宏观统计
-    df_all = pd.concat([df_60m, df_30m, df_15m, df_5m], ignore_index=True)
+    df_all = pd.concat(list(dfs.values()), ignore_index=True)
     valid_returns = df_all[df_all['总收益'].abs() > 1e-6]
     global_funding_friction = (valid_returns['总资金费率'] / valid_returns[
         '总收益'].abs()).median() * 100 if not valid_returns.empty else 0
     filter_oos_medians = df_all.groupby('过滤模式')['样本外平均单笔净收益'].median()
 
-    # 2. 横向拼接四周期宽表 (Full Outer Join)
+    # 2. 横向拼接多周期宽表 (Full Outer Join)
     keys = ['入场信号名称', '出场信号名称', '过滤模式']
-    d60 = df_60m.set_index(keys).add_suffix('_60m')
-    d30 = df_30m.set_index(keys).add_suffix('_30m')
-    d15 = df_15m.set_index(keys).add_suffix('_15m')
-    d5 = df_5m.set_index(keys).add_suffix('_5m')
+    d_list = [df.set_index(keys).add_suffix(f'_{tf}') for tf, df in dfs.items()]
 
-    merged_df = d60.join([d30, d15, d5], how='outer').reset_index()
+    merged_df = d_list[0]
+    if len(d_list) > 1:
+        merged_df = merged_df.join(d_list[1:], how='outer')
+    merged_df = merged_df.reset_index()
 
-    # 底线过滤：剔除四周期样本外交易总数过少的组合
-    merged_df['total_oos_trades'] = (
-            merged_df['样本外交易次数_60m'].fillna(0) +
-            merged_df['样本外交易次数_30m'].fillna(0) +
-            merged_df['样本外交易次数_15m'].fillna(0) +
-            merged_df['样本外交易次数_5m'].fillna(0)
-    )
+    # 底线过滤：剔除所有有效周期样本外交易总数过少的组合
+    merged_df['total_oos_trades'] = 0
+    for tf in tfs:
+        merged_df['total_oos_trades'] += merged_df[f'样本外交易次数_{tf}'].fillna(0)
 
     # 提取过滤条件
     min_trades = FILTER_CONFIG['min_total_oos_trades']
@@ -156,54 +164,32 @@ def generate_report():
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
 
-    # 计算条件 (缺失值按0或-1处理，防止因某个周期无交易被误杀；缺失则按很小的值处理防误通过)
-    cond_trades = merged_df['total_oos_trades'] >= min_trades
-    cond_conc_60m = merged_df['最优币占总净收益百分比_60m'].fillna(0) <= max_conc
-    cond_conc_30m = merged_df['最优币占总净收益百分比_30m'].fillna(0) <= max_conc
-    cond_conc_15m = merged_df['最优币占总净收益百分比_15m'].fillna(0) <= max_conc
-    cond_conc_5m = merged_df['最优币占总净收益百分比_5m'].fillna(0) <= max_conc
+    # 动态构建过滤条件
+    cond_all = (merged_df['total_oos_trades'] >= min_trades)
 
-    # 将各周期持仓K线数转化为持仓时间(小时)并限制盈利单与亏损单平均时间
-    cond_hours_60m = (merged_df['盈利单平均持仓 K 线根数_60m'].fillna(0) * 1 <= max_hours) & \
-                     (merged_df['亏损单平均持仓 K 线根数_60m'].fillna(0) * 1 <= max_hours)
-    cond_hours_30m = (merged_df['盈利单平均持仓 K 线根数_30m'].fillna(0) * 0.5 <= max_hours) & \
-                     (merged_df['亏损单平均持仓 K 线根数_30m'].fillna(0) * 0.5 <= max_hours)
-    cond_hours_15m = (merged_df['盈利单平均持仓 K 线根数_15m'].fillna(0) * 0.25 <= max_hours) & \
-                     (merged_df['亏损单平均持仓 K 线根数_15m'].fillna(0) * 0.25 <= max_hours)
-    cond_hours_5m = (merged_df['盈利单平均持仓 K 线根数_5m'].fillna(0) * (5/60.0) <= max_hours) & \
-                    (merged_df['亏损单平均持仓 K 线根数_5m'].fillna(0) * (5/60.0) <= max_hours)
+    for tf in tfs:
+        cond_all &= merged_df[f'最优币占总净收益百分比_{tf}'].fillna(0) <= max_conc
 
-    cond_avg_net_60m = merged_df['单笔平均净收益_60m'].fillna(-999) > min_avg_net
-    cond_avg_net_30m = merged_df['单笔平均净收益_30m'].fillna(-999) > min_avg_net
-    cond_avg_net_15m = merged_df['单笔平均净收益_15m'].fillna(-999) > min_avg_net
-    cond_avg_net_5m = merged_df['单笔平均净收益_5m'].fillna(-999) > min_avg_net
+        multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5/60.0}[tf]
+        cond_all &= (merged_df[f'盈利单平均持仓 K 线根数_{tf}'].fillna(0) * multiplier <= max_hours)
+        cond_all &= (merged_df[f'亏损单平均持仓 K 线根数_{tf}'].fillna(0) * multiplier <= max_hours)
 
-    cond_pl_ratio_60m = merged_df['盈亏持仓时间比_60m'].fillna(-1) >= min_pl_time_ratio
-    cond_pl_ratio_30m = merged_df['盈亏持仓时间比_30m'].fillna(-1) >= min_pl_time_ratio
-    cond_pl_ratio_15m = merged_df['盈亏持仓时间比_15m'].fillna(-1) >= min_pl_time_ratio
-    cond_pl_ratio_5m = merged_df['盈亏持仓时间比_5m'].fillna(-1) >= min_pl_time_ratio
+        cond_all &= merged_df[f'单笔平均净收益_{tf}'].fillna(-999) > min_avg_net
+        cond_all &= merged_df[f'盈亏持仓时间比_{tf}'].fillna(-1) >= min_pl_time_ratio
 
     # 联合过滤
-    filtered_df = merged_df[
-        cond_trades &
-        cond_conc_60m & cond_conc_30m & cond_conc_15m & cond_conc_5m &
-        cond_hours_60m & cond_hours_30m & cond_hours_15m & cond_hours_5m &
-        cond_avg_net_60m & cond_avg_net_30m & cond_avg_net_15m & cond_avg_net_5m &
-        cond_pl_ratio_60m & cond_pl_ratio_30m & cond_pl_ratio_15m & cond_pl_ratio_5m
-        ].copy()
+    filtered_df = merged_df[cond_all].copy()
 
-    # 计算排序锚点 (改为：四周期平均单笔净收益均值)
+    # 计算排序锚点 (所有存在的周期的平均单笔净收益均值)
     filtered_df['avg_net_profit'] = filtered_df[
-        ['单笔平均净收益_60m', '单笔平均净收益_30m', '单笔平均净收益_15m', '单笔平均净收益_5m']
+        [f'单笔平均净收益_{tf}' for tf in tfs]
     ].mean(axis=1)
 
-    # 提取存活 Top 10 (要求四个周期 OOS 收益皆 > 0)
-    survivors = filtered_df[
-        (filtered_df['样本外平均单笔净收益_60m'] > 0) &
-        (filtered_df['样本外平均单笔净收益_30m'] > 0) &
-        (filtered_df['样本外平均单笔净收益_15m'] > 0) &
-        (filtered_df['样本外平均单笔净收益_5m'] > 0)
-        ]
+    # 提取存活 Top 10 (要求所有的存在周期 OOS 收益皆 > 0)
+    surv_cond = pd.Series(True, index=filtered_df.index)
+    for tf in tfs:
+        surv_cond &= (filtered_df[f'样本外平均单笔净收益_{tf}'] > 0)
+    survivors = filtered_df[surv_cond]
     top_entry_factors = survivors['入场信号名称'].value_counts().head(10)
     top_exit_factors = survivors['出场信号名称'].value_counts().head(10)
 
@@ -215,7 +201,7 @@ def generate_report():
     # ==========================================
     print("\n" + "=" * 110)
     print(">>> [加密货币因子挖掘 - 多周期全景印证报告] <<<")
-    print(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 排序基准：四周期平均单笔净收益")
+    print(f"生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 排序基准：多周期平均单笔净收益")
     print("=" * 110 + "\n")
 
     print("【第一部分：宏观水位线 (Macro Baseline)】")
@@ -260,26 +246,20 @@ def generate_report():
         print(f"组合身份: Entry = {row['入场信号名称']} | Exit = {row['出场信号名称']} | Filter = {row['过滤模式']}")
         print("-" * 110)
 
-        # 第一版块：核心绩效 (Header)
+        # 第一版块：核心绩效 (Header) 动态生成存在周期的表头
         header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
-        h60 = pad_label("[60m 周期]", 24)  # <--- 改为 24
-        h30 = pad_label("[30m 周期]", 24)  # <--- 改为 24
-        h15 = pad_label("[15m 周期]", 24)  # <--- 改为 24
-        h5 = "[5m 周期]"
-        print(f"  {header_lbl} | {h60} | {h30} | {h15} | {h5}")
+        h_cols = []
+        for i, tf in enumerate(tfs):
+            if i < len(tfs) - 1:
+                h_cols.append(pad_label(f"[{tf} 周期]", 24))
+            else:
+                h_cols.append(f"[{tf} 周期]")
+        header_str = " | ".join(h_cols) if h_cols else ""
+        print(f"  {header_lbl} | {header_str}")
         print("  " + "-" * 110)  # <--- 分割线加长到 110
 
-        print_row("总交易数",
-                  get_val(row, '总交易数', '60m', 'int'),
-                  get_val(row, '总交易数', '30m', 'int'),
-                  get_val(row, '总交易数', '15m', 'int'),
-                  get_val(row, '总交易数', '5m', 'int'))
-
-        print_row("胜率",
-                  get_val(row, '胜率', '60m', 'pct'),
-                  get_val(row, '胜率', '30m', 'pct'),
-                  get_val(row, '胜率', '15m', 'pct'),
-                  get_val(row, '胜率', '5m', 'pct'))
+        print_row("总交易数", [get_val(row, '总交易数', tf, 'int') for tf in tfs])
+        print_row("胜率", [get_val(row, '胜率', tf, 'pct') for tf in tfs])
 
         # 动态推算总体平均单笔净利（处理CSV中缺失该字段的情况）
         def get_overall_avg_net(tf):
@@ -305,23 +285,11 @@ def generate_report():
                 pass
             return "N/A"
 
-        print_row("平均单笔净利",
-                  get_overall_avg_net('60m'),
-                  get_overall_avg_net('30m'),
-                  get_overall_avg_net('15m'),
-                  get_overall_avg_net('5m'))
+        print_row("平均单笔净利", [get_overall_avg_net(tf) for tf in tfs])
 
-        print_row("样本内单笔净利",
-                  get_val(row, '样本内平均单笔净收益', '60m', 'pct_plus'),
-                  get_val(row, '样本内平均单笔净收益', '30m', 'pct_plus'),
-                  get_val(row, '样本内平均单笔净收益', '15m', 'pct_plus'),
-                  get_val(row, '样本内平均单笔净收益', '5m', 'pct_plus'))
+        print_row("样本内单笔净利", [get_val(row, '样本内平均单笔净收益', tf, 'pct_plus') for tf in tfs])
 
-        print_row("样本外单笔净利",
-                  get_val(row, '样本外平均单笔净收益', '60m', 'pct_plus'),
-                  get_val(row, '样本外平均单笔净收益', '30m', 'pct_plus'),
-                  get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
-                  get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
+        print_row("样本外单笔净利", [get_val(row, '样本外平均单笔净收益', tf, 'pct_plus') for tf in tfs])
 
         # 平均盈亏持仓整合展示
         def get_holding_hours(tf):
@@ -337,13 +305,9 @@ def generate_report():
                     return "N/A"
             return "N/A"
 
-        print_row("平均盈亏持仓", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
+        print_row("平均盈亏持仓", [get_holding_hours(tf) for tf in tfs])
 
-        print_row("盈亏持仓时间比",
-                  get_val(row, '盈亏持仓时间比', '60m', 'float2'),
-                  get_val(row, '盈亏持仓时间比', '30m', 'float2'),
-                  get_val(row, '盈亏持仓时间比', '15m', 'float2'),
-                  get_val(row, '盈亏持仓时间比', '5m', 'float2'))
+        print_row("盈亏持仓时间比", [get_val(row, '盈亏持仓时间比', tf, 'float2') for tf in tfs])
 
         # 第二版块：广度与集中度
         print("\n> 截面宽度与单币风险")
@@ -355,17 +319,9 @@ def generate_report():
                 return f"{(int(w) / int(t) * 100):.1f}% ({w}/{t})"
             return "N/A"
 
-        print_row("盈利币比例", get_breadth('60m'), get_breadth('30m'), get_breadth('15m'), get_breadth('5m'))
-        print_row("单币集中度",
-                  get_val(row, '最优币占总净收益百分比', '60m', 'pct'),
-                  get_val(row, '最优币占总净收益百分比', '30m', 'pct'),
-                  get_val(row, '最优币占总净收益百分比', '15m', 'pct'),
-                  get_val(row, '最优币占总净收益百分比', '5m', 'pct'))
-        print_row("最大收益币",
-                  get_val(row, '最大收益币名称', '60m'),
-                  get_val(row, '最大收益币名称', '30m'),
-                  get_val(row, '最大收益币名称', '15m'),
-                  get_val(row, '最大收益币名称', '5m'))
+        print_row("盈利币比例", [get_breadth(tf) for tf in tfs])
+        print_row("单币集中度", [get_val(row, '最优币占总净收益百分比', tf, 'pct') for tf in tfs])
+        print_row("最大收益币", [get_val(row, '最大收益币名称', tf) for tf in tfs])
 
         # 第三版块：时间序列平稳性
         print("\n> 季度平稳性 (Q1-Q4净收益)")
@@ -380,16 +336,16 @@ def generate_report():
                 pass
             return "N/A"
 
-        print_row("Q1 净收益", get_q_net('Q1', '60m'), get_q_net('Q1', '30m'), get_q_net('Q1', '15m'), get_q_net('Q1', '5m'))
-        print_row("Q2 净收益", get_q_net('Q2', '60m'), get_q_net('Q2', '30m'), get_q_net('Q2', '15m'), get_q_net('Q2', '5m'))
-        print_row("Q3 净收益", get_q_net('Q3', '60m'), get_q_net('Q3', '30m'), get_q_net('Q3', '15m'), get_q_net('Q3', '5m'))
-        print_row("Q4 净收益", get_q_net('Q4', '60m'), get_q_net('Q4', '30m'), get_q_net('Q4', '15m'), get_q_net('Q4', '5m'))
+        print_row("Q1 净收益", [get_q_net('Q1', tf) for tf in tfs])
+        print_row("Q2 净收益", [get_q_net('Q2', tf) for tf in tfs])
+        print_row("Q3 净收益", [get_q_net('Q3', tf) for tf in tfs])
+        print_row("Q4 净收益", [get_q_net('Q4', tf) for tf in tfs])
 
         def get_q_win(tf):
             v = get_val(row, '净盈利季度数量', tf, 'int')
             return f"{v} / 4" if v != 'N/A' else 'N/A'
 
-        print_row("盈利季度数", get_q_win('60m'), get_q_win('30m'), get_q_win('15m'), get_q_win('5m'))
+        print_row("盈利季度数", [get_q_win(tf) for tf in tfs])
         print("-" * 110)
 
 
@@ -429,13 +385,18 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
         except:
             return "N/A"
 
-    def print_row(label, v60, v30, v15, v5):
+    def print_row(label, vals):
         lbl = pad_label(label, 16)  # <--- 改为 16
-        c60 = pad_label(v60, 24)  # <--- 改为 24
-        c30 = pad_label(v30, 24)  # <--- 改为 24
-        c15 = pad_label(v15, 24)  # <--- 改为 24
-        c5 = str(v5)
-        print(f"  {lbl} | {c60} | {c30} | {c15} | {c5}")
+        cols = []
+        for i, v in enumerate(vals):
+            if i < len(vals) - 1:
+                cols.append(pad_label(v, 24))
+            else:
+                cols.append(str(v))
+        if not cols:
+            print(f"  {lbl} |")
+        else:
+            print(f"  {lbl} | " + " | ".join(cols))
 
     # ==========================================
     # 1. 动态读取并精准过滤数据
@@ -448,12 +409,12 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     }
 
     dfs = []
+    tfs = []
     print(f"[*] 正在从本地文件中提取组合 [{entry_name} | {exit_name} | {filter_name}] 的数据...\n")
 
     for tf, path in paths.items():
         if not os.path.exists(path):
-            print(f"[警告] 找不到文件: {path}")
-            continue
+            continue # 如果文件不存在直接跳过，不报错中止
 
         df = pd.read_csv(path)
         df['过滤模式'] = df['过滤模式'].fillna('Unknown')
@@ -468,6 +429,7 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
             # 只取匹配到的数据，加上周期后缀并设好索引以便合并
             target = target.set_index(['入场信号名称', '出场信号名称', '过滤模式']).add_suffix(f'_{tf}')
             dfs.append(target)
+            tfs.append(tf)
 
     if not dfs:
         print(f"[查询失败] 数据库中未找到该组合的任何周期记录！")
@@ -540,52 +502,39 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     print(f"组合身份: Entry = {entry_name} | Exit = {exit_name} | Filter = {filter_name}")
     print("-" * 110)
 
+    # 动态渲染存在的周期表头
     header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
-    h60 = pad_label("[60m 周期]", 24)  # <--- 改为 24
-    h30 = pad_label("[30m 周期]", 24)  # <--- 改为 24
-    h15 = pad_label("[15m 周期]", 24)  # <--- 改为 24
-    h5 = "[5m 周期]"
-    print(f"  {header_lbl} | {h60} | {h30} | {h15} | {h5}")
+    h_cols = []
+    for i, tf in enumerate(tfs):
+        if i < len(tfs) - 1:
+            h_cols.append(pad_label(f"[{tf} 周期]", 24))
+        else:
+            h_cols.append(f"[{tf} 周期]")
+    header_str = " | ".join(h_cols) if h_cols else ""
+    print(f"  {header_lbl} | {header_str}")
     print("  " + "-" * 110)  # <--- 分割线加长到 110
 
-    print_row("总交易数", get_val(row, '总交易数', '60m', 'int'), get_val(row, '总交易数', '30m', 'int'),
-              get_val(row, '总交易数', '15m', 'int'), get_val(row, '总交易数', '5m', 'int'))
-    print_row("胜率", get_val(row, '胜率', '60m', 'pct'), get_val(row, '胜率', '30m', 'pct'),
-              get_val(row, '胜率', '15m', 'pct'), get_val(row, '胜率', '5m', 'pct'))
-    print_row("平均单笔净利", get_overall_avg_net('60m'), get_overall_avg_net('30m'), get_overall_avg_net('15m'),
-              get_overall_avg_net('5m'))
-    print_row("样本内单笔净利", get_val(row, '样本内平均单笔净收益', '60m', 'pct_plus'),
-              get_val(row, '样本内平均单笔净收益', '30m', 'pct_plus'),
-              get_val(row, '样本内平均单笔净收益', '15m', 'pct_plus'),
-              get_val(row, '样本内平均单笔净收益', '5m', 'pct_plus'))
-    print_row("样本外单笔净利", get_val(row, '样本外平均单笔净收益', '60m', 'pct_plus'),
-              get_val(row, '样本外平均单笔净收益', '30m', 'pct_plus'),
-              get_val(row, '样本外平均单笔净收益', '15m', 'pct_plus'),
-              get_val(row, '样本外平均单笔净收益', '5m', 'pct_plus'))
-    print_row("平均盈亏持仓", get_holding_hours('60m'), get_holding_hours('30m'), get_holding_hours('15m'), get_holding_hours('5m'))
-    print_row("盈亏持仓时间比", get_val(row, '盈亏持仓时间比', '60m', 'float2'),
-              get_val(row, '盈亏持仓时间比', '30m', 'float2'), get_val(row, '盈亏持仓时间比', '15m', 'float2'),
-              get_val(row, '盈亏持仓时间比', '5m', 'float2'))
+    print_row("总交易数", [get_val(row, '总交易数', tf, 'int') for tf in tfs])
+    print_row("胜率", [get_val(row, '胜率', tf, 'pct') for tf in tfs])
+    print_row("平均单笔净利", [get_overall_avg_net(tf) for tf in tfs])
+    print_row("样本内单笔净利", [get_val(row, '样本内平均单笔净收益', tf, 'pct_plus') for tf in tfs])
+    print_row("样本外单笔净利", [get_val(row, '样本外平均单笔净收益', tf, 'pct_plus') for tf in tfs])
+    print_row("平均盈亏持仓", [get_holding_hours(tf) for tf in tfs])
+    print_row("盈亏持仓时间比", [get_val(row, '盈亏持仓时间比', tf, 'float2') for tf in tfs])
 
     print("\n> 截面宽度与单币风险")
-    print_row("盈利币比例", get_breadth('60m'), get_breadth('30m'), get_breadth('15m'), get_breadth('5m'))
-    print_row("单币集中度", get_val(row, '最优币占总净收益百分比', '60m', 'pct'),
-              get_val(row, '最优币占总净收益百分比', '30m', 'pct'),
-              get_val(row, '最优币占总净收益百分比', '15m', 'pct'), get_val(row, '最优币占总净收益百分比', '5m', 'pct'))
-    print_row("最大收益币", get_val(row, '最大收益币名称', '60m'), get_val(row, '最大收益币名称', '30m'),
-              get_val(row, '最大收益币名称', '15m'), get_val(row, '最大收益币名称', '5m'))
+    print_row("盈利币比例", [get_breadth(tf) for tf in tfs])
+    print_row("单币集中度", [get_val(row, '最优币占总净收益百分比', tf, 'pct') for tf in tfs])
+    print_row("最大收益币", [get_val(row, '最大收益币名称', tf) for tf in tfs])
 
     print("\n> 季度平稳性 (Q1-Q4净收益)")
-    print_row("Q1 净收益", get_q_net('Q1', '60m'), get_q_net('Q1', '30m'), get_q_net('Q1', '15m'),
-              get_q_net('Q1', '5m'))
-    print_row("Q2 净收益", get_q_net('Q2', '60m'), get_q_net('Q2', '30m'), get_q_net('Q2', '15m'),
-              get_q_net('Q2', '5m'))
-    print_row("Q3 净收益", get_q_net('Q3', '60m'), get_q_net('Q3', '30m'), get_q_net('Q3', '15m'),
-              get_q_net('Q3', '5m'))
-    print_row("Q4 净收益", get_q_net('Q4', '60m'), get_q_net('Q4', '30m'), get_q_net('Q4', '15m'),
-              get_q_net('Q4', '5m'))
-    print_row("盈利季度数", get_q_win('60m'), get_q_win('30m'), get_q_win('15m'), get_q_win('5m'))
+    print_row("Q1 净收益", [get_q_net('Q1', tf) for tf in tfs])
+    print_row("Q2 净收益", [get_q_net('Q2', tf) for tf in tfs])
+    print_row("Q3 净收益", [get_q_net('Q3', tf) for tf in tfs])
+    print_row("Q4 净收益", [get_q_net('Q4', tf) for tf in tfs])
+    print_row("盈利季度数", [get_q_win(tf) for tf in tfs])
     print("-" * 110)
+
 
 if __name__ == "__main__":
     import warnings

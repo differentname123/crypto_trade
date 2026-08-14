@@ -16,7 +16,7 @@ import pandas as pd
 # ==========================================
 
 timeframe = "15m"
-INPUT_DIR = f'./factor_out_{timeframe}_debug'  # 单币回测结果目录 (pairs_{coin}.csv.gz)
+INPUT_DIR = f'./factor_out_{timeframe}'  # 单币回测结果目录 (pairs_{coin}.csv.gz)
 OUTPUT_DIR = f'./summary_results_{timeframe}'  # 聚合结果保存目录
 
 # ==========================================
