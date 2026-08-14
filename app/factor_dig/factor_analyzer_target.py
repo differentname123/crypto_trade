@@ -1,175 +1,140 @@
-# -*- coding: utf-8 -*-
-"""
-================================================================================
- 单一因子组合 穿透查档器 (Combo X-Ray Viewer)
---------------------------------------------------------------------------------
- 核心定位：输入指定的 入场 + 出场 + 环境，直接调取其完整体检报告与底层币种盈亏明细。
-================================================================================
-"""
 import os
 import pandas as pd
-import numpy as np
-
-# 控制台颜色高亮代码
-GREEN = '\033[92m'
-RED = '\033[91m'
-YELLOW = '\033[93m'
-CYAN = '\033[96m'
-RESET = '\033[0m'
-BOLD = '\033[1m'
 
 
-def make_bar(val, max_val, max_len=10):
-    """生成极简 ASCII 柱状图"""
-    if pd.isna(val) or val <= 0: return "[LOSS]      "
-    if max_val <= 0: return ""
-    length = max(1, int((val / max_val) * max_len))
-    return "▇" * length + " " * (max_len - length)
-
-
-def view_specific_combo(tf, target_entry, target_exit, target_filter):
-    print(f"\n{BOLD}{'=' * 90}{RESET}")
-    print(f"{CYAN}{BOLD} 🔍 因子组合穿透查档器 | 周期: {tf}{RESET}")
-    print(f"    入场: {YELLOW}{target_entry}{RESET}")
-    print(f"    出场: {YELLOW}{target_exit}{RESET}")
-    print(f"    环境: {YELLOW}{target_filter}{RESET}")
-    print(f"{BOLD}{'=' * 90}{RESET}\n")
-
-    # 1. 检查并加载数据
-    out_dir = f'./factor_out_{tf}'
-    sum_path = os.path.join(out_dir, 'pairs_CROSS_COIN_SUMMARY.csv')
-    all_path = os.path.join(out_dir, 'pairs_ALL.csv')
-
-    if not os.path.exists(sum_path) or not os.path.exists(all_path):
-        print(f"{RED}❌ 找不到 {tf} 周期数据。请检查路径: {out_dir}{RESET}")
+def show_strategy_multi_timeframe(entry_factor, exit_factor, direction,
+                                  data_path="summary_results/summary_all_intervals_combined.csv"):
+    """
+    展示指定策略组合在各个周期下的多维关键指标对比。
+    采用“指标透视”视角，将不同的【过滤模式(截面涨跌幅)】横向平铺对比，一目了然。
+    """
+    if not os.path.exists(data_path):
+        print(f"❌ 找不到数据文件: {data_path}，请先运行 aggregate_results() 生成。")
         return
 
-    summary = pd.read_csv(sum_path)
-    all_pairs = pd.read_csv(all_path)
+    # 1. 读取大表
+    df = pd.read_csv(data_path)
 
-    # 2. 定位宏观汇总数据
-    sum_mask = (summary['entry_factor'] == target_entry) & \
-               (summary['exit_factor'] == target_exit) & \
-               (summary['filter_mode'] == target_filter)
+    # 2. 筛选指定条件
+    mask = (
+            (df['方向'] == direction) &
+            (df['入场信号名称'] == entry_factor) &
+            (df['出场信号名称'] == exit_factor)
+    )
+    filtered_df = df[mask]
 
-    sum_row = summary[sum_mask]
-
-    if sum_row.empty:
-        print(f"{RED}🚫 在 {tf} 周期下，未找到该组合的数据。可能原因：{RESET}")
-        print("   1. 拼写错误。")
-        print("   2. 该组合在挖掘阶段一笔交易都没触发，被底层引擎直接抛弃。")
+    if filtered_df.empty:
+        print(f"⚠️ 未找到匹配的记录: 方向={direction}, 入场={entry_factor}, 出场={exit_factor}")
         return
 
-    row = sum_row.iloc[0]
+    # ================= 增加：前置字段含义说明 =================
+    print(f"\n{'=' * 90}")
+    print(f" 📊 策略表现透视面板 | 方向: {direction} | 入场: {entry_factor} | 出场: {exit_factor}")
 
-    # 3. 定位微观币种数据
-    all_mask = (all_pairs['entry_factor'] == target_entry) & \
-               (all_pairs['exit_factor'] == target_exit) & \
-               (all_pairs['filter_mode'] == target_filter)
+    # 3. 定义我们需要展示的核心指标
+    target_metrics = [
+        '净利润(%)',
+        '平均胜率(%)',
+        '单笔平均净利润(%)',
+        '总交易笔数'
+    ]
 
-    combo_details = all_pairs[all_mask].copy()
+    # 4. 解析宽表，转化为长表以便透视
+    records = []
+    for _, row in filtered_df.iterrows():
+        f_mode = str(row['过滤模式']).lower()  # 统一转小写防止大小写不一致
+        for col_name, val in row.items():
+            if col_name.startswith('[') and ']' in col_name:
+                interval = col_name.split(']')[0][1:]
+                metric = col_name.split(']')[1].strip()
 
-    # ================= 核心计算区 =================
-    oos_ret = row['oos_sum_all']
-    is_ret = row['sum_ret_all'] - oos_ret
-    curr_trades = row['total_trades']
+                if metric in target_metrics:
+                    records.append({
+                        '周期': interval,
+                        '过滤模式': f_mode,
+                        '指标': metric,
+                        '数值': val
+                    })
 
-    is_trades = max(curr_trades * 0.7, 1)
-    oos_trades = max(curr_trades * 0.3, 1)
+    if not records:
+        print("⚠️ 未提取到有效的指标数据。")
+        return
 
-    is_pt_ret = is_ret / is_trades
-    oos_pt_ret = oos_ret / oos_trades
-    decay_rate = (oos_pt_ret / is_pt_ret - 1) * 100 if is_pt_ret > 0 else -999.0
+    long_df = pd.DataFrame(records)
 
-    # 盈亏持仓时间计算
-    if not combo_details.empty:
-        win_t = combo_details['trades'] * (combo_details['win_rate'] / 100.0)
-        loss_t = combo_details['trades'] - win_t
-        win_hold_sum = (combo_details['win_hold_bars'].fillna(0) * win_t).sum()
-        loss_hold_sum = (combo_details['loss_hold_bars'].fillna(0) * loss_t).sum()
-        mean_win_hold = win_hold_sum / win_t.sum() if win_t.sum() > 0 else 0
-        mean_loss_hold = loss_hold_sum / loss_t.sum() if loss_t.sum() > 0 else 0
+    # 5. 定义【过滤模式】的自定义排序函数
+    def custom_sort_key(col_name):
+        """
+        将过滤模式映射为数字以实现正确排序:
+        bottom_100 -> -100
+        original   -> 0
+        top_50     -> 50
+        """
+        name = str(col_name).lower()
+        if name == 'original':
+            return 0
+        elif name.startswith('bottom_'):
+            try:
+                # 提取数字并转为负数，数字越大排名越靠前 (如 -100 < -50)
+                return -int(name.split('_')[1])
+            except ValueError:
+                return -0.1
+        elif name.startswith('top_'):
+            try:
+                # 提取数字并转为正数，数字越小越靠前 (在 original 之后，如 5 < 10)
+                return int(name.split('_')[1])
+            except ValueError:
+                return 0.1
+        else:
+            return 999  # 未知格式放在最后边
 
-        positive_profits = combo_details[combo_details['sum_ret'] > 0]['sum_ret'].sum()
-        max_coin_ret = combo_details['sum_ret'].max()
-        top1_coin_pct = (max_coin_ret / positive_profits * 100) if (positive_profits > 0 and max_coin_ret > 0) else 0.0
-    else:
-        mean_win_hold = mean_loss_hold = top1_coin_pct = 0.0
-        positive_profits = 0.0
+    # 6. 依次生成透视表
+    for metric in target_metrics:
+        metric_df = long_df[long_df['指标'] == metric]
 
-    # ================= 打印汇总报告 =================
-    print(f"{CYAN}【基础体检报告】{RESET}")
-    print(f" - 参战币种: {row['n_coins']} 个 (正期望币种比例: {row.get('coin_positive_rate', 0) * 100:.1f}%)")
-    print(f" - 交易总数: {curr_trades} 笔 (平均单笔收益: {row.get('mean_avg_ret', 0) * 100:.3f}%)")
-    print(
-        f" - 胜率情况: 整体胜率 {row.get('mean_win_rate', 0):.1f}% | 逆风胜率(大盘跌) {row.get('mean_down_market_win_rate', 0):.1f}%")
-    print(f" - 盈亏持仓: 盈利单均扛 {mean_win_hold:.1f} 根 K线 | 亏损单均扛 {mean_loss_hold:.1f} 根 K线")
+        # 透视：行=周期，列=过滤模式，值=具体数值
+        pivot_df = metric_df.pivot(index='周期', columns='过滤模式', values='数值')
 
-    if is_pt_ret > 0:
-        print(f" - 样本衰减: {decay_rate:.1f}% (IS 收益 {is_ret:.1f}% -> OOS 收益 {oos_ret:.1f}%)")
-    else:
-        print(f" - 样本衰减: {RED}IS收益为负，无基准{RESET} (IS 收益 {is_ret:.1f}% -> OOS 收益 {oos_ret:.1f}%)")
+        # 排序：固定周期的展示顺序 (行)
+        standard_intervals = ['60m', '30m', '15m', '5m', '1m']
+        actual_rows = [tf for tf in standard_intervals if tf in pivot_df.index]
+        actual_rows += [tf for tf in pivot_df.index if tf not in standard_intervals]
+        pivot_df = pivot_df.loc[actual_rows]
 
-    # 季度分布
-    q_rets = [row['sum_ret_q1'], row['sum_ret_q2'], row['sum_ret_q3'], row['sum_ret_q4']]
-    q_trades = [row['sum_trades_q1'], row['sum_trades_q2'], row['sum_trades_q3'], row['sum_trades_q4']]
-    max_q = max([q for q in q_rets if q > 0] + [0.01])
+        # 排序：使用自定义函数对过滤模式排序 (列)
+        # 根据 custom_sort_key 转换后的数字从小到大排序
+        sorted_cols = sorted(pivot_df.columns, key=custom_sort_key)
+        pivot_df = pivot_df.reindex(sorted_cols, axis=1)
 
-    print(f"\n{CYAN}【季度平稳性分布】{RESET}")
-    for i in range(4):
-        print(f"  Q{i + 1}: {make_bar(q_rets[i], max_q)} ({q_trades[i]:<4}笔) | 收益: {q_rets[i]:>6.1f}%")
+        print(f"\n>> 🎯 【{metric}】 横向截面对比")
+        print("-" * 90)
+        try:
+            # 格式化输出：浮点数保留两位小数；处理缺失值为 '-'
+            formatter = lambda x: f"{x:.2f}" if pd.notnull(x) and isinstance(x, (int, float)) else (
+                "-" if pd.isnull(x) else x)
+            print(pivot_df.map(formatter).to_markdown())
+        except ImportError:
+            print(pivot_df.fillna('-').to_string())
 
-    # ================= 打印底层币种明细 =================
-    print(f"\n{CYAN}【底层币种收益排行榜 (Top 5 盈利 & 垫底 3 亏损)】{RESET}")
-    if not combo_details.empty:
-        # 获取币种列名 (兼容 coin 或 symbol)
-        coin_col = 'coin' if 'coin' in combo_details.columns else 'symbol'
-
-        # 按收益降序排序
-        combo_details = combo_details.sort_values(by='sum_ret', ascending=False)
-
-        print(
-            f"{BOLD}{'排名':<4} | {'标的':<10} | {'收益率':<8} | {'交易笔数':<8} | {'胜率':<6} | {'盈利持仓':<8} | {'亏损持仓'}{RESET}")
-        print("-" * 75)
-
-        # 提取前 5 名赚钱的
-        top_coins = combo_details.head(5)
-        for i, (_, c_row) in enumerate(top_coins.iterrows(), 1):
-            color = GREEN if c_row['sum_ret'] > 0 else RED
-            print(
-                f" {i:<3} | {c_row[coin_col]:<10} | {color}{c_row['sum_ret']:>7.1f}%{RESET} | {c_row['trades']:>6} 笔 | {c_row['win_rate']:>5.1f}% | {c_row.get('win_hold_bars', 0):>6.1f} | {c_row.get('loss_hold_bars', 0):>6.1f}")
-
-        print(" ... (中间省略) ...")
-
-        # 提取后 3 名亏钱的 (前提是总数大于8个)
-        if len(combo_details) > 5:
-            bottom_coins = combo_details.tail(min(3, len(combo_details) - 5))
-            for i, (_, c_row) in enumerate(bottom_coins.iterrows(), len(combo_details) - len(bottom_coins) + 1):
-                color = RED if c_row['sum_ret'] < 0 else GREEN
-                print(
-                    f" {i:<3} | {c_row[coin_col]:<10} | {color}{c_row['sum_ret']:>7.1f}%{RESET} | {c_row['trades']:>6} 笔 | {c_row['win_rate']:>5.1f}% | {c_row.get('win_hold_bars', 0):>6.1f} | {c_row.get('loss_hold_bars', 0):>6.1f}")
-
-        print("-" * 75)
-        if positive_profits > 0 and len(combo_details) > 0:
-            best_coin = combo_details.iloc[0][coin_col]
-            print(f"📌 {YELLOW}利润极权度警告: 赚得最多的【{best_coin}】独占了总盈利的 {top1_coin_pct:.1f}%{RESET}")
-    else:
-        print(f"{RED}暂无底层币种交易明细。{RESET}")
-
-    print(f"\n{BOLD}{'=' * 90}{RESET}\n")
+    print("\n" + "=" * 90)
 
 
-if __name__ == '__main__':
-    # ================= 配置你需要查询的参数 =================
-    TIMEFRAME = '60m'
-    TARGET_ENTRY = 'EXIT_UPPER_WICK_REJECTION'
-    TARGET_EXIT = 'ENTRY_INSIDE_BREAK_VOLUME'
-    TARGET_FILTER = 'top_20'
-    # ========================================================
+# 调用示例 (可以在文件末尾加上下面的测试代码)
+# ==========================================
+if __name__ == "__main__":
+    print(f"{'=' * 90}")
+    print("💡 【数据维度说明】:")
+    print(" 🔹 周期 (Timeframe) : K线图的时间粒度 (如 60m=1小时线, 5m=5分钟线)。直观反映策略在不同级别趋势中的适应性。")
+    print(" 🔹 过滤模式 (Filter): 基于过去24小时涨跌幅的截面选币过滤机制。")
+    print("      - bottom_N : 仅在跌幅最大（排名垫底）的前 N 个币种上允许开仓。")
+    print("      - original : 原始状态，不对币种进行任何截面过滤，全市场轮动。")
+    print("      - top_N    : 仅在涨幅最大（排名靠前）的前 N 个币种上允许开仓。")
+    print(f"{'=' * 90}")
 
-    view_specific_combo(
-        tf=TIMEFRAME,
-        target_entry=TARGET_ENTRY,
-        target_exit=TARGET_EXIT,
-        target_filter=TARGET_FILTER
+
+    # 假设你的大表已经生成完毕，在这里调用：
+    show_strategy_multi_timeframe(
+        entry_factor='EXIT_MULTI_MA_BREAK',
+        exit_factor='EXIT_MA_DEAD_CROSS',
+        direction='Long'
     )
