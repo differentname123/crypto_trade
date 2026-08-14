@@ -12,7 +12,7 @@ FILTER_CONFIG = {
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
     'max_holding_hours': 10 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
-    'min_profit_loss_time_ratio': 0.8,  # 盈亏持仓时间比最小限制，需大于等于该值
+    'min_profit_loss_time_ratio': 0.99,  # 盈亏持仓时间比最小限制，需大于等于该值
     'min_profitable_quarters': 3  # 盈利季度数最小限制，需严格大于该值
 }
 
