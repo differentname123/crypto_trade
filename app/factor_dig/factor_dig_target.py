@@ -77,6 +77,9 @@ CFG = dict(
     OOS_SPLIT=0.70,
     ENTRY_PREFIX_FILTER=None,
     EXIT_PREFIX_FILTER=None,
+    # 【需求1】精确筛选目标信号因子
+    ENTRY_EXACT_FILTER=['EXIT_OI_DROP_AFTER_HIGH', 'PRICE_CLOSE_CROSS_MA_UP', 'EXIT_SHORT_SURGE_EXTREME'],
+    EXIT_EXACT_FILTER=['OI_PRICE_DOWN_OI_UP', 'EXIT_MA_DEAD_CROSS', 'FR_LOW_NEG'],
     COINS=None,
 
     # --- 因子体检 ---
@@ -272,14 +275,14 @@ def make_params(bar_minutes, n_rows):
         OI_HOT_TH=0.050,
         CORR_TH=0.20,
         # ---- 【新增】绝对费率极值 / 终极因子阈值 ----
-        FR_ABS_TH=0.001,              # 单期资金费率绝对阈值 (±0.1%)
-        LIQ_OI_DROP_TH=-0.05,         # 爆仓猎杀: OI 断崖下跌 -5%
-        DIST_OI_DROP_TH=-0.02,        # 高位派发: OI 实质性下降 -2%
-        LIQ_WICK_TH=0.50,             # 长下影线占全长比
+        FR_ABS_TH=0.001,  # 单期资金费率绝对阈值 (±0.1%)
+        LIQ_OI_DROP_TH=-0.05,  # 爆仓猎杀: OI 断崖下跌 -5%
+        DIST_OI_DROP_TH=-0.02,  # 高位派发: OI 实质性下降 -2%
+        LIQ_WICK_TH=0.50,  # 长下影线占全长比
         SPOT_SUPPRESS_ATR_MULT=0.50,  # 现货镇压: 阴线实体 > 0.5 * ATR
-        POWDER_OI_RK=0.90,            # 火药桶: OI 分位下限
-        POWDER_VOL_RK=0.30,           # 火药桶: 成交量分位上限
-        SQUEEZE_OI_RK=0.80,           # 终极轧空: OI 分位下限
+        POWDER_OI_RK=0.90,  # 火药桶: OI 分位下限
+        POWDER_VOL_RK=0.30,  # 火药桶: 成交量分位上限
+        SQUEEZE_OI_RK=0.80,  # 终极轧空: OI 分位下限
     )
     P['WARMUP'] = int(P['W'] + P['H168'] + 3 * N)
     return P
@@ -954,7 +957,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     F = build_factors(df, P, rank_shift=cfg['RANK_SHIFT'])
     warm = min(P['WARMUP'], len(df) - 100)
     if warm < 0 or len(df) - warm < 200:
-        return None, {'total_combos': 0}, 0
+        return None, {'total_combos': 0}, 0, None
 
     df = df.iloc[warm:].copy()
     rk_gain = df['rank_gain_24h'].to_numpy(float)
@@ -1015,9 +1018,15 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     entry_names = [k for k in keep]
     exit_names = [k for k in keep]
 
-    if cfg['ENTRY_PREFIX_FILTER']:
+    # 【修改】执行精确过滤（优先级高于前缀过滤）
+    if cfg.get('ENTRY_EXACT_FILTER'):
+        entry_names = [k for k in entry_names if k in cfg['ENTRY_EXACT_FILTER']]
+    elif cfg.get('ENTRY_PREFIX_FILTER'):
         entry_names = [k for k in entry_names if k.startswith(tuple(cfg['ENTRY_PREFIX_FILTER']))]
-    if cfg['EXIT_PREFIX_FILTER']:
+
+    if cfg.get('EXIT_EXACT_FILTER'):
+        exit_names = [k for k in exit_names if k in cfg['EXIT_EXACT_FILTER']]
+    elif cfg.get('EXIT_PREFIX_FILTER'):
         exit_names = [k for k in exit_names if k.startswith(tuple(cfg['EXIT_PREFIX_FILTER']))]
 
     idx_cache = {k: np.flatnonzero(F[k]).astype(np.int64) for k in keep}
@@ -1036,6 +1045,12 @@ def mine_symbol(coin, df, cfg, btc_close=None):
     }
     # 【性能/内存】列式装配：不再堆积上百万个 dict，改为每列一个 list。
     col_data = None
+
+    # 【新增】存储每笔交易的数组记录
+    trade_records = []
+    df_times = df.index
+    lows = df['low'].to_numpy(float)
+    highs = df['high'].to_numpy(float)
 
     # 【新增】精确统计真实搜索空间（考虑静态组合产出2行）
     theoretical_tests = 0
@@ -1137,6 +1152,20 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                     rets_f = rets_all[okm]
                     fr_f = fr_tr[okm]
 
+                    # 【新增】计算每笔交易的最大回撤
+                    mdds = np.empty(len(ent_f), dtype=float)
+                    for i in range(len(ent_f)):
+                        e = ent_f[i]
+                        x = ext_f[i]
+                        if e <= x:
+                            if direction == 'Long':
+                                lowest = np.min(lows[e:x + 1])
+                                mdds[i] = min(0.0, lowest / exec_px[e] - 1.0 - cost)
+                            else:
+                                highest = np.max(highs[e:x + 1])
+                                mdds[i] = min(0.0, 1.0 - highest / exec_px[e] - cost)
+                        else:
+                            mdds[i] = 0.0
 
                     bh_rets_f = (btc_c[ext_f] / btc_c[ent_f] - 1.0) if btc_c is not None else None
 
@@ -1165,7 +1194,25 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                             for k_, v_ in row.items():
                                 col_data[k_].append(v_)
 
+                        # 【新增】记录单笔交易详情（带入最大回撤）
+                        for i in range(len(ent_f)):
+                            trade_records.append({
+                                'coin': coin,
+                                'entry_factor': en,
+                                'exit_factor': xn,
+                                'direction': direction,
+                                'filter_mode': lab,
+                                'entry_time': df_times[ent_f[i]],
+                                'exit_time': df_times[ext_f[i]],
+                                'entry_price': exec_px[ent_f[i]],
+                                'exit_price': exec_px[ext_f[i]],
+                                'return': rets_f[i],
+                                'max_drawdown': mdds[i],
+                                'fr_sum': fr_f[i]
+                            })
+
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
+    df_trades = pd.DataFrame(trade_records) if trade_records else pd.DataFrame()
 
     # ==================================================================
     # 【新增】无感注入"测试基数"(多重检验搜索空间)，用于事后精确还原 DSR
@@ -1179,7 +1226,7 @@ def mine_symbol(coin, df, cfg, btc_close=None):
         out['n_trials_total'] = int(theoretical_tests)
         out['n_trials_alive'] = int(len(out))
 
-    return out, stats, kline_days
+    return out, stats, kline_days, df_trades
 
 
 # ======================================================================
@@ -1207,7 +1254,7 @@ def mine_symbol_wrapper(args):
         #     # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
         #     return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
 
-        pairs, stats, kline_days = mine_symbol(coin, df, cfg, _BTC_CLOSE)
+        pairs, stats, kline_days, df_trades = mine_symbol(coin, df, cfg, _BTC_CLOSE)
 
         valid_combos = 0
         total_saved_trades = 0
@@ -1222,8 +1269,15 @@ def mine_symbol_wrapper(args):
             # 在子进程完成写文件
             _atomic_to_csv(pairs, _coin_out_path(cfg['OUT_DIR'], coin))
 
+            # 【新增】写出每笔交易详情及回撤记录
+            if df_trades is not None and not df_trades.empty:
+                trades_path = os.path.join(cfg['OUT_DIR'], f'trades_{coin}.csv.gz')
+                _atomic_to_csv(df_trades, trades_path)
+
             # 帮助子进程尽快释放内存
             del pairs
+            if df_trades is not None:
+                del df_trades
             gc.collect()
 
         return kf, coin, valid_combos, total_saved_trades, stats, kline_days, "OK"
@@ -1326,7 +1380,7 @@ def main(cfg=CFG):
     tasks = [(kf, cfg) for kf in valid_kfiles]
     n_ok, n_empty, n_fail = 0, 0, 0
 
-    max_workers = min(20, max(1, multiprocessing.cpu_count() - 2))
+    max_workers = min(28, max(1, multiprocessing.cpu_count() - 2))
 
     if HAS_NUMBA:
         print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
@@ -1423,8 +1477,8 @@ if __name__ == '__main__':
         # 修改当前任务的 K线周期
         run_cfg['BAR_MINUTES'] = bm
 
-        # 【关键】动态修改输出目录，防止不同周期的文件互相覆盖
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m'
+        # 【关键，需求3修改】动态修改输出目录为debug专用目录，防止影响正常的文件
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
 
         # 调用主函数执行
         main(run_cfg)
