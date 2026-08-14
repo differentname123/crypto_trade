@@ -12,12 +12,9 @@ import numpy as np
 import pandas as pd
 
 # ==========================================
-# 1. 配置路径
+# 1. 配置路径 (已改为由主函数内的列表循环控制)
 # ==========================================
-
-timeframe = "15m"
-INPUT_DIR = f'./factor_out_{timeframe}'  # 单币回测结果目录 (pairs_{coin}.csv.gz)
-OUTPUT_DIR = f'./summary_results_{timeframe}'  # 聚合结果保存目录
+TIMEFRAMES = ["5m", "15m", "30m", "60m"]
 
 # ==========================================
 # 2. 字段映射与保留列 (极限控制内存)
@@ -203,10 +200,10 @@ def process_single_file(filepath):
 
         # 2. 计算 K线持仓总根数 (便于加权平均)
         new_cols['win_hold_sum'] = (
-            df['win_hold_bars'].to_numpy(dtype=np.float32) * win_trades
+                df['win_hold_bars'].to_numpy(dtype=np.float32) * win_trades
         ).astype('float32')
         new_cols['loss_hold_sum'] = (
-            df['loss_hold_bars'].to_numpy(dtype=np.float32) * loss_trades
+                df['loss_hold_bars'].to_numpy(dtype=np.float32) * loss_trades
         ).astype('float32')
 
         # 3. 计算 IS/OOS 的盈利交易次数
@@ -233,7 +230,7 @@ def process_single_file(filepath):
 
         # 5. 辅助列：标记正收益币种
         new_cols['is_profitable'] = (
-            df['sum_ret'].to_numpy(dtype=np.float32) > 0
+                df['sum_ret'].to_numpy(dtype=np.float32) > 0
         ).astype('float32')
 
         df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
@@ -272,24 +269,24 @@ def process_single_file(filepath):
 class DirectionAccumulator:
     """流式归约容器：把每个币的 payload 直接累加进定长数组，明细即刻释放。"""
 
-    LEVEL_BITS = 21                       # 每层分组键最多 2,097,152 个取值
+    LEVEL_BITS = 21  # 每层分组键最多 2,097,152 个取值
     LEVEL_MASK = (1 << LEVEL_BITS) - 1
     SHIFTS = (42, 21, 0)
 
     def __init__(self, name):
         self.name = name
-        self.level_vocab = [[] for _ in GROUP_KEYS]    # code -> 原始名称
-        self.level_lookup = [{} for _ in GROUP_KEYS]   # 原始名称 -> code
-        self.keys = None            # int64 组合键（唯一）
-        self.key_index = None       # pd.Index，用于向量化定位
-        self.sums = None            # (n, len(SUM_COLS)) float64，保证累加精度
+        self.level_vocab = [[] for _ in GROUP_KEYS]  # code -> 原始名称
+        self.level_lookup = [{} for _ in GROUP_KEYS]  # 原始名称 -> code
+        self.keys = None  # int64 组合键（唯一）
+        self.key_index = None  # pd.Index，用于向量化定位
+        self.sums = None  # (n, len(SUM_COLS)) float64，保证累加精度
         self.coin_count = None
         self.max_dd_max = None
         self.best_ret = None
         self.best_coin = None
         self.worst_ret = None
         self.worst_coin = None
-        self.dd_cols = []           # 仅为中位数保留：每币一列 float32
+        self.dd_cols = []  # 仅为中位数保留：每币一列 float32
 
     # ---------- 内部：容量管理 ----------
     def _alloc(self, n):
@@ -367,7 +364,7 @@ class DirectionAccumulator:
             pos = np.asarray(self.key_index.get_indexer(combined), dtype=np.int64)
             miss = pos < 0
             if miss.any():
-                new_keys = combined[miss]           # 单币内键唯一，故无重复
+                new_keys = combined[miss]  # 单币内键唯一，故无重复
                 old_n = self.keys.shape[0]
                 self.keys = np.concatenate([self.keys, new_keys])
                 self.key_index = pd.Index(self.keys)
@@ -463,8 +460,8 @@ class DirectionAccumulator:
         return grouped
 
 
-# 修改：入参改为“已归约完成”的 grouped 表（列名与原 agg 结果完全一致）
-def aggregate_direction_data(grouped, direction_name):
+# 修改：增加 output_dir 参数，接收动态的输出路径
+def aggregate_direction_data(grouped, direction_name, output_dir):
     """主进程聚合函数：基于流式归约结果，组装最终报表。"""
     if grouped is None or grouped.empty:
         print(f"没有 {direction_name} 的有效数据。")
@@ -584,107 +581,119 @@ def aggregate_direction_data(grouped, direction_name):
         by=['盈利的币数', '总收益'], ascending=[False, False], inplace=True
     )
 
-    # 保存结果
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    # 保存结果 (修改：使用透传进来的 output_dir)
+    os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.join(
-        OUTPUT_DIR, f'aggregated_summary_{direction_name}.csv'
+        output_dir, f'aggregated_summary_{direction_name}.csv'
     )
     final_df.to_csv(out_path, index=False, encoding='utf-8-sig')
     print(f"✅ {direction_name} 聚合完成，已保存至: {out_path}")
 
 
 def main():
-    if not os.path.exists(INPUT_DIR):
-        print(f"❌ 找不到输入目录: {INPUT_DIR}")
-        return
+    # 外层套循环，实现多个维度的周期数据串行处理
+    for tf in TIMEFRAMES:
+        input_dir = f'./factor_out_{tf}'
+        output_dir = f'./summary_results_{tf}'
 
-    file_pattern = os.path.join(INPUT_DIR, 'pairs_*.csv.gz')
-    files = glob.glob(file_pattern)
+        print(f"\n{'=' * 50}")
+        print(f"🚀 开始聚合时间周期: {tf}")
+        print(f"{'=' * 50}")
 
-    if not files:
-        file_pattern = os.path.join(INPUT_DIR, 'pairs_*.csv')
+        if not os.path.exists(input_dir):
+            print(f"❌ 找不到输入目录: {input_dir}，自动跳过此周期。")
+            continue
+
+        file_pattern = os.path.join(input_dir, 'pairs_*.csv.gz')
         files = glob.glob(file_pattern)
 
-    if not files:
-        print(f"❌ 在 {INPUT_DIR} 目录下未找到 pairs_ 文件")
-        return
+        if not files:
+            file_pattern = os.path.join(input_dir, 'pairs_*.csv')
+            files = glob.glob(file_pattern)
 
-    files.sort()
-    total = len(files)
-    print(f"🔍 找到 {total} 个币种的回测文件，开始多进程流式归约...")
+        if not files:
+            print(f"❌ 在 {input_dir} 目录下未找到 pairs_ 文件，自动跳过此周期。")
+            continue
 
-    accumulators = {
-        'Long': DirectionAccumulator('Long'),
-        'Short': DirectionAccumulator('Short'),
-    }
+        files.sort()
+        total = len(files)
+        print(f"🔍 找到 {total} 个币种的回测文件，开始多进程流式归约...")
 
-    max_workers = min(20, max(1, multiprocessing.cpu_count() - 2))
-    # 有界窗口：完成但未消费的结果最多驻留 window 个，杜绝结果队列无限堆积
-    window = max_workers + 2
+        accumulators = {
+            'Long': DirectionAccumulator('Long'),
+            'Short': DirectionAccumulator('Short'),
+        }
 
-    pool_kwargs = {'max_workers': max_workers}
-    if sys.version_info >= (3, 11):
-        # 定期重启 worker，归还 pandas 造成的堆碎片
-        pool_kwargs['max_tasks_per_child'] = 16
-    try:
-        executor = concurrent.futures.ProcessPoolExecutor(**pool_kwargs)
-    except (TypeError, ValueError):
-        executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+        max_workers = min(20, max(1, multiprocessing.cpu_count() - 2))
+        # 有界窗口：完成但未消费的结果最多驻留 window 个，杜绝结果队列无限堆积
+        window = max_workers + 2
 
-    done = 0
-    with executor:
-        file_iter = iter(files)
-        pending = deque()
+        pool_kwargs = {'max_workers': max_workers}
+        if sys.version_info >= (3, 11):
+            # 定期重启 worker，归还 pandas 造成的堆碎片
+            pool_kwargs['max_tasks_per_child'] = 16
+        try:
+            executor = concurrent.futures.ProcessPoolExecutor(**pool_kwargs)
+        except (TypeError, ValueError):
+            executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
 
-        def _submit_next():
-            for fp in file_iter:
-                pending.append(executor.submit(process_single_file, fp))
-                return True
-            return False
+        done = 0
+        with executor:
+            file_iter = iter(files)
+            pending = deque()
 
-        for _ in range(window):
-            if not _submit_next():
-                break
+            def _submit_next():
+                for fp in file_iter:
+                    pending.append(executor.submit(process_single_file, fp))
+                    return True
+                return False
 
-        while pending:
-            fut = pending.popleft()
-            try:
-                res = fut.result()
-            except Exception as e:
-                print(f"子进程任务异常: {e}")
-                res = None
-            del fut
+            for _ in range(window):
+                if not _submit_next():
+                    break
 
-            _submit_next()  # 消费一个立刻补一个，保持背压
+            while pending:
+                fut = pending.popleft()
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    print(f"子进程任务异常: {e}")
+                    res = None
+                del fut
 
-            if res:
-                payloads_long, payloads_short = res
-                for p in payloads_long:
-                    accumulators['Long'].update(p)
-                payloads_long.clear()
-                for p in payloads_short:
-                    accumulators['Short'].update(p)
-                payloads_short.clear()
-                del payloads_long, payloads_short
-            del res
+                _submit_next()  # 消费一个立刻补一个，保持背压
 
-            done += 1
-            if done % 20 == 0 or done == total:
-                print(f"已归约 {done}/{total} 个文件...")
-                gc.collect()
+                if res:
+                    payloads_long, payloads_short = res
+                    for p in payloads_long:
+                        accumulators['Long'].update(p)
+                    payloads_long.clear()
+                    for p in payloads_short:
+                        accumulators['Short'].update(p)
+                    payloads_short.clear()
+                    del payloads_long, payloads_short
+                del res
 
-    print("✅ 全网文件解析完毕，开始进入归约(Reduce)收尾阶段...")
+                done += 1
+                if done % 20 == 0 or done == total:
+                    print(f"已归约 {done}/{total} 个文件...")
+                    gc.collect()
 
-    for direction_name in ('Long', 'Short'):
-        acc = accumulators.pop(direction_name)
-        grouped = acc.to_frame()
-        del acc
-        gc.collect()
-        aggregate_direction_data(grouped, direction_name)
-        del grouped
-        gc.collect()
+        print(f"✅ {tf} 周期的全网文件解析完毕，开始进入归约(Reduce)收尾阶段...")
 
-    print("🎉 全部任务完美结束！")
+        for direction_name in ('Long', 'Short'):
+            acc = accumulators.pop(direction_name)
+            grouped = acc.to_frame()
+            del acc
+            gc.collect()
+            # 透传当前的 output_dir 给聚合函数
+            aggregate_direction_data(grouped, direction_name, output_dir)
+            del grouped
+            gc.collect()
+
+        print(f"🎉 {tf} 周期的聚合任务结束！")
+
+    print(f"\n🏆 所有设定的时间周期 ({', '.join(TIMEFRAMES)}) 全部串行聚合完毕！")
 
 
 if __name__ == '__main__':

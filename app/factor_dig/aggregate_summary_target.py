@@ -128,7 +128,7 @@ if __name__ == "__main__":
     df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\summary_long_60m.csv')
 
     # 指定你的输入和输出目录
-    input_directory = "factor_out_60m_debug"
+    input_directory = "factor_out_5m_debug"
     output_directory = "summary_results"
 
     aggregate_results(input_dir=input_directory, output_dir=output_directory)
