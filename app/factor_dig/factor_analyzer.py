@@ -12,8 +12,9 @@ FILTER_CONFIG = {
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
     'max_holding_hours': 10 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
-    'min_profit_loss_time_ratio': 0.99,  # 盈亏持仓时间比最小限制，需大于等于该值
-    'min_profitable_quarters': 3  # 盈利季度数最小限制，需严格大于该值
+    'min_profit_loss_time_ratio': 0.5,  # 盈亏持仓时间比最小限制，需大于等于该值
+    'min_profitable_quarters': 3,  # 盈利季度数最小限制，需严格大于该值
+    'min_60m_avg_net_profit': 1.0  # [新增] 60m单笔平均净收益最小限制(%)，需大于该值
 }
 
 # ==========================================
@@ -165,9 +166,14 @@ def generate_report():
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
     min_profitable_quarters = FILTER_CONFIG['min_profitable_quarters']
+    min_60m_avg_net = FILTER_CONFIG['min_60m_avg_net_profit']  # [新增] 提取 60m 专属阈值
 
     # 动态构建过滤条件
     cond_all = (merged_df['total_oos_trades'] >= min_trades)
+
+    # [新增] 单独对 60m 周期附加 1% 的单笔平均净收益条件（如果存在 60m 数据）
+    if '60m' in tfs:
+        cond_all &= merged_df['单笔平均净收益_60m'].fillna(-999) > min_60m_avg_net
 
     for tf in tfs:
         cond_all &= merged_df[f'最优币占总净收益百分比_{tf}'].fillna(0) <= max_conc
