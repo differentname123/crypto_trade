@@ -1326,7 +1326,7 @@ def main(cfg=CFG):
     tasks = [(kf, cfg) for kf in valid_kfiles]
     n_ok, n_empty, n_fail = 0, 0, 0
 
-    max_workers = min(20, max(1, multiprocessing.cpu_count() - 2))
+    max_workers = min(28, max(1, multiprocessing.cpu_count() - 2))
 
     if HAS_NUMBA:
         print("🔧 正在主进程预热 Numba JIT 编译器，防止并发竞态...")
