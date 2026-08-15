@@ -1114,7 +1114,9 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_
 
 
 if __name__ == "__main__":
-    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
+    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\APR_USDT_USDT_5m_latest.csv')
+    # signals, df_actual_signals = generate_multi_ma_signals(df)
+
     # # 将timestamp 从ms转换为 北京时间
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
