@@ -100,6 +100,7 @@ SUM_COLS = [
     'is_profitable',
 ]
 SUM_RET_POS = SUM_COLS.index('sum_ret')
+FR_SUM_POS = SUM_COLS.index('fr_sum')  # <--- 新增：定义资金费率的位置索引
 
 # 读文件时期望存在的数值列（缺列自动补 0，避免聚合阶段 KeyError）
 BASE_NUM_COLS = [
@@ -275,6 +276,7 @@ class DirectionAccumulator:
 
     def __init__(self, name):
         self.name = name
+        self.fr_mult = -1 if name == 'Long' else 1  # <--- 新增：多空方向资金费率乘数
         self.level_vocab = [[] for _ in GROUP_KEYS]  # code -> 原始名称
         self.level_lookup = [{} for _ in GROUP_KEYS]  # 原始名称 -> code
         self.keys = None  # int64 组合键（唯一）
@@ -282,6 +284,7 @@ class DirectionAccumulator:
         self.sums = None  # (n, len(SUM_COLS)) float64，保证累加精度
         self.coin_count = None
         self.max_dd_max = None
+        # <--- 修改：为支持 Top 3 统计，升级为 (n, 3) 形状的矩阵
         self.best_ret = None
         self.best_coin = None
         self.worst_ret = None
@@ -293,10 +296,11 @@ class DirectionAccumulator:
         self.sums = np.zeros((n, len(SUM_COLS)), dtype=np.float64)
         self.coin_count = np.zeros(n, dtype=np.int32)
         self.max_dd_max = np.full(n, -np.inf, dtype=np.float64)
-        self.best_ret = np.full(n, -np.inf, dtype=np.float64)
-        self.worst_ret = np.full(n, np.inf, dtype=np.float64)
-        self.best_coin = np.empty(n, dtype=object)
-        self.worst_coin = np.empty(n, dtype=object)
+        # <--- 修改：初始化 (n, 3) 大小的矩阵
+        self.best_ret = np.full((n, 3), -np.inf, dtype=np.float64)
+        self.worst_ret = np.full((n, 3), np.inf, dtype=np.float64)
+        self.best_coin = np.empty((n, 3), dtype=object)
+        self.worst_coin = np.empty((n, 3), dtype=object)
 
     def _grow(self, n):
         old = self.sums.shape[0]
@@ -312,17 +316,18 @@ class DirectionAccumulator:
         self.max_dd_max = np.concatenate(
             [self.max_dd_max, np.full(add, -np.inf, dtype=np.float64)]
         )
+        # <--- 修改：扩容时同样拼接 (add, 3) 形状的块
         self.best_ret = np.concatenate(
-            [self.best_ret, np.full(add, -np.inf, dtype=np.float64)]
+            [self.best_ret, np.full((add, 3), -np.inf, dtype=np.float64)], axis=0
         )
         self.worst_ret = np.concatenate(
-            [self.worst_ret, np.full(add, np.inf, dtype=np.float64)]
+            [self.worst_ret, np.full((add, 3), np.inf, dtype=np.float64)], axis=0
         )
         self.best_coin = np.concatenate(
-            [self.best_coin, np.empty(add, dtype=object)]
+            [self.best_coin, np.empty((add, 3), dtype=object)], axis=0
         )
         self.worst_coin = np.concatenate(
-            [self.worst_coin, np.empty(add, dtype=object)]
+            [self.worst_coin, np.empty((add, 3), dtype=object)], axis=0
         )
 
     def _map_level(self, li, cats):
@@ -382,18 +387,32 @@ class DirectionAccumulator:
         np.maximum(cur, dd, out=cur)
         self.max_dd_max[pos] = cur
 
-        # 【修复缺陷2】增量比较替代 idxmax/idxmin + merge，语义等价且零全表扫描
-        ret = vals[:, SUM_RET_POS].astype(np.float64)
-        better = ret > self.best_ret[pos]
-        if better.any():
-            idx = pos[better]
-            self.best_ret[idx] = ret[better]
-            self.best_coin[idx] = coin
-        worse = ret < self.worst_ret[pos]
-        if worse.any():
-            idx = pos[worse]
-            self.worst_ret[idx] = ret[worse]
-            self.worst_coin[idx] = coin
+        # =======================================================
+        # 【修复 & 新增】严格计算净收益，并维护 Top 3 极值矩阵
+        # =======================================================
+        gross_ret = vals[:, SUM_RET_POS].astype(np.float64)
+        fr_val = vals[:, FR_SUM_POS].astype(np.float64)
+        coin_net_ret = gross_ret + self.fr_mult * fr_val  # 计算出扣费后的真实净收益
+
+        # 利用 hstack 和 argsort 进行基于向量化的 Top3 快速筛选插入
+        row_indices = np.arange(n_rows)[:, None]
+        new_coin_col = np.full((n_rows, 1), coin, dtype=object)
+        new_ret_col = coin_net_ret[:, None]
+
+        # 1. 维护前 3 名最大收益 (降序)
+        concat_best_ret = np.hstack([self.best_ret[pos], new_ret_col])
+        concat_best_coin = np.hstack([self.best_coin[pos], new_coin_col])
+        idx_best = np.argsort(-concat_best_ret, axis=1)[:, :3]  # 负号实现降序，排除 -inf
+        self.best_ret[pos] = concat_best_ret[row_indices, idx_best]
+        self.best_coin[pos] = concat_best_coin[row_indices, idx_best]
+
+        # 2. 维护前 3 名最小收益/最大亏损 (升序)
+        concat_worst_ret = np.hstack([self.worst_ret[pos], new_ret_col])
+        concat_worst_coin = np.hstack([self.worst_coin[pos], new_coin_col])
+        idx_worst = np.argsort(concat_worst_ret, axis=1)[:, :3]  # 正常升序，排除 inf
+        self.worst_ret[pos] = concat_worst_ret[row_indices, idx_worst]
+        self.worst_coin[pos] = concat_worst_coin[row_indices, idx_worst]
+        # =======================================================
 
         # 中位数需要逐币样本，只保留 max_dd 这一列
         if COMPUTE_DD_MEDIAN:
@@ -448,10 +467,22 @@ class DirectionAccumulator:
         data['coin_count'] = self.coin_count
         data['max_dd_max'] = self.max_dd_max
         data['max_dd_median'] = med
-        data['best_coin_name'] = self.best_coin
-        data['best_coin_ret'] = self.best_ret
-        data['worst_coin_name'] = self.worst_coin
-        data['worst_coin_ret'] = self.worst_ret
+
+        # =======================================================
+        # 输出最优最差币种的【第一名】以兼容现有代码，并输出 Top 3 的总和
+        # =======================================================
+        data['best_coin_name'] = self.best_coin[:, 0]
+        data['best_coin_ret'] = np.where(self.best_ret[:, 0] == -np.inf, np.nan, self.best_ret[:, 0])
+        data['worst_coin_name'] = self.worst_coin[:, 0]
+        data['worst_coin_ret'] = np.where(self.worst_ret[:, 0] == np.inf, np.nan, self.worst_ret[:, 0])
+
+        # 将无效的占位符(-inf/inf)替换为0后，分别对 Top 3 进行横向求和
+        valid_best = np.where(self.best_ret == -np.inf, 0.0, self.best_ret)
+        data['top3_ret_sum'] = valid_best.sum(axis=1)
+
+        valid_worst = np.where(self.worst_ret == np.inf, 0.0, self.worst_ret)
+        data['worst3_ret_sum'] = valid_worst.sum(axis=1)
+        # =======================================================
 
         grouped = pd.DataFrame(data)
         del data
@@ -505,9 +536,13 @@ def aggregate_direction_data(grouped, direction_name, output_dir):
     safe_avg_loss_hold = avg_loss_hold.replace(0, np.nan)
     win_loss_hold_ratio = (avg_win_hold / safe_avg_loss_hold).fillna(0.0)
 
-    # 5. 最优币占总净收益百分比 (%)
+    # =========================================================================
+    # 计算极值币种占比系列指标（分母皆使用扣费后的 safe_net_ret）
+    # =========================================================================
     safe_net_ret = net_ret.replace(0, np.nan)
     best_coin_pct = (grouped['best_coin_ret'] / safe_net_ret * 100).fillna(0.0)
+    top3_best_pct = (grouped['top3_ret_sum'] / safe_net_ret * 100).fillna(0.0)
+    top3_worst_pct = (grouped['worst3_ret_sum'] / safe_net_ret * 100).fillna(0.0)
 
     # 6. 净盈利季度数量
     profitable_q_count = pd.Series(0, index=grouped.index)
@@ -572,7 +607,12 @@ def aggregate_direction_data(grouped, direction_name, output_dir):
     final_df['样本内平均单笔净收益'] = is_avg_net_ret.round(4)
     final_df['样本外平均单笔净收益'] = oos_avg_net_ret.round(4)
     final_df['盈亏持仓时间比'] = win_loss_hold_ratio.round(2)
+
+    # 核心修复及新增的净利润占比
     final_df['最优币占总净收益百分比'] = best_coin_pct.round(2)
+    final_df['Top3币种利润占总净收益百分比'] = top3_best_pct.round(2)
+    final_df['Top3币种亏损占总净收益百分比'] = top3_worst_pct.round(2)
+
     final_df['净盈利季度数量'] = profitable_q_count
     # =========================================================================
 

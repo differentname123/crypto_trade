@@ -82,7 +82,7 @@ def get_val(row, col_base, tf, fmt='raw'):
 
 def print_row(label, vals):
     """打印完美对齐的表格行，支持动态列数"""
-    lbl = pad_label(label, 16)  # <--- 改为 16
+    lbl = pad_label(label, 16)
     cols = []
     for i, v in enumerate(vals):
         if i < len(vals) - 1:
@@ -166,12 +166,12 @@ def generate_report():
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
     min_profitable_quarters = FILTER_CONFIG['min_profitable_quarters']
-    min_60m_avg_net = FILTER_CONFIG['min_60m_avg_net_profit']  # [新增] 提取 60m 专属阈值
+    min_60m_avg_net = FILTER_CONFIG['min_60m_avg_net_profit']
 
     # 动态构建过滤条件
     cond_all = (merged_df['total_oos_trades'] >= min_trades)
 
-    # [新增] 单独对 60m 周期附加 1% 的单笔平均净收益条件（如果存在 60m 数据）
+    # 单独对 60m 周期附加 1% 的单笔平均净收益条件（如果存在 60m 数据）
     if '60m' in tfs:
         cond_all &= merged_df['单笔平均净收益_60m'].fillna(-999) > min_60m_avg_net
 
@@ -189,18 +189,15 @@ def generate_report():
     # 联合过滤
     filtered_df = merged_df[cond_all].copy()
 
-    # ========================== [修改核心区] ==========================
-    # 计算各个周期的总净收益 (单笔平均净收益 * 总交易数)
-    # 并计算用于排序的复合指标 (总净收益 * 平均单笔净利)
+    # 计算各个周期的总净收益并计算复合排序分
     for tf in tfs:
         filtered_df[f'总净收益_{tf}'] = filtered_df[f'单笔平均净收益_{tf}'] * filtered_df[f'总交易数_{tf}']
         filtered_df[f'排序分_{tf}'] = filtered_df[f'总净收益_{tf}'] * filtered_df[f'单笔平均净收益_{tf}']
 
-    # 计算排序锚点 (所有存在的周期的复合得分指标 的平均值)
+    # 计算排序锚点 (所有存在的周期的复合得分指标的平均值)
     filtered_df['avg_complex_score'] = filtered_df[
         [f'排序分_{tf}' for tf in tfs]
     ].mean(axis=1)
-    # ==================================================================
 
     # 提取存活 Top 10 (要求所有的存在周期 OOS 收益皆 > 0)
     surv_cond = pd.Series(True, index=filtered_df.index)
@@ -223,8 +220,6 @@ def generate_report():
     print("=" * 110 + "\n")
 
     print("【第一部分：宏观水位线 (Macro Baseline)】")
-    # print(f"1. 全局基准：总资金费率占毛收益的平均中位数摩擦比例为 {global_funding_friction:.2f}%")
-
     print("2. 过滤模式 (Filter) 样本外单笔净利中位数：")
     filter_str = "  "
     for idx, val in filter_oos_medians.items():
@@ -264,8 +259,8 @@ def generate_report():
         print(f"组合身份: Entry = {row['入场信号名称']} | Exit = {row['出场信号名称']} | Filter = {row['过滤模式']}")
         print("-" * 110)
 
-        # 第一版块：核心绩效 (Header) 动态生成存在周期的表头
-        header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
+        # 第一版块：核心绩效
+        header_lbl = pad_label("核心与衰减指标", 16)
         h_cols = []
         for i, tf in enumerate(tfs):
             if i < len(tfs) - 1:
@@ -274,20 +269,18 @@ def generate_report():
                 h_cols.append(f"[{tf} 周期]")
         header_str = " | ".join(h_cols) if h_cols else ""
         print(f"  {header_lbl} | {header_str}")
-        print("  " + "-" * 110)  # <--- 分割线加长到 110
+        print("  " + "-" * 110)
 
         print_row("总交易数", [get_val(row, '总交易数', tf, 'int') for tf in tfs])
         print_row("胜率", [get_val(row, '胜率', tf, 'pct') for tf in tfs])
 
-        # 动态推算总体平均单笔净利（处理CSV中缺失该字段的情况）
+        # 动态推算总体平均单笔净利
         def get_overall_avg_net(tf):
             try:
-                # 优先使用真实字段 '单笔平均净收益'
                 col = f'单笔平均净收益_{tf}'
                 if col in row and pd.notna(row[col]):
                     return f"{float(row[col]):+.2f}%"
 
-                # 如果依然没有该字段，用 样本内 和 样本外 的单笔收益按交易数进行加权平均作为备用方案
                 total_t = float(row[f'总交易数_{tf}']) if pd.notna(row.get(f'总交易数_{tf}')) else 0
                 oos_t = float(row[f'样本外交易次数_{tf}']) if pd.notna(row.get(f'样本外交易次数_{tf}')) else 0
                 is_t = total_t - oos_t
@@ -304,16 +297,11 @@ def generate_report():
             return "N/A"
 
         print_row("平均单笔净利", [get_overall_avg_net(tf) for tf in tfs])
-
-        # ========= 新增：打印各个周期的总净利润 =========
         print_row("总净利润", [get_val(row, '总净收益', tf, 'pct_plus') for tf in tfs])
-        # ================================================
-
         print_row("样本内单笔净利", [get_val(row, '样本内平均单笔净收益', tf, 'pct_plus') for tf in tfs])
-
         print_row("样本外单笔净利", [get_val(row, '样本外平均单笔净收益', tf, 'pct_plus') for tf in tfs])
 
-        # 平均盈亏持仓整合展示
+        # 平均盈亏持仓展示
         def get_holding_hours(tf):
             multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5 / 60.0}[tf]
             w_raw = get_val(row, '盈利单平均持仓 K 线根数', tf, 'raw')
@@ -328,7 +316,6 @@ def generate_report():
             return "N/A"
 
         print_row("平均盈亏持仓", [get_holding_hours(tf) for tf in tfs])
-
         print_row("盈亏持仓时间比", [get_val(row, '盈亏持仓时间比', tf, 'float2') for tf in tfs])
 
         # 第二版块：广度与集中度
@@ -343,6 +330,11 @@ def generate_report():
 
         print_row("盈利币比例", [get_breadth(tf) for tf in tfs])
         print_row("单币集中度", [get_val(row, '最优币占总净收益百分比', tf, 'pct') for tf in tfs])
+
+        # [修改点 1]：新增 Top3 利润与亏损占总净收益百分比
+        print_row("Top3利润占比", [get_val(row, 'Top3币种利润占总净收益百分比', tf, 'pct') for tf in tfs])
+        print_row("Top3亏损占比", [get_val(row, 'Top3币种亏损占总净收益百分比', tf, 'pct') for tf in tfs])
+
         print_row("最大收益币", [get_val(row, '最大收益币名称', tf) for tf in tfs])
 
         # 第三版块：时间序列平稳性
@@ -375,8 +367,6 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     """
     独立查询特定策略组合的多周期详细信息。
     只需传入真实入场名、出场名和过滤模式即可。
-
-    示例: query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
     """
     import pandas as pd
     import os
@@ -408,7 +398,7 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
             return "N/A"
 
     def print_row(label, vals):
-        lbl = pad_label(label, 16)  # <--- 改为 16
+        lbl = pad_label(label, 16)
         cols = []
         for i, v in enumerate(vals):
             if i < len(vals) - 1:
@@ -436,19 +426,17 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
 
     for tf, path in paths.items():
         if not os.path.exists(path):
-            continue  # 如果文件不存在直接跳过，不报错中止
+            continue
 
         df = pd.read_csv(path)
         df['过滤模式'] = df['过滤模式'].fillna('Unknown')
 
-        # 精准定位这一行（使用真实名称，无需经过脱敏系统）
         mask = (df['入场信号名称'] == entry_name) & \
                (df['出场信号名称'] == exit_name) & \
                (df['过滤模式'] == filter_name)
 
         target = df[mask]
         if not target.empty:
-            # 只取匹配到的数据，加上周期后缀并设好索引以便合并
             target = target.set_index(['入场信号名称', '出场信号名称', '过滤模式']).add_suffix(f'_{tf}')
             dfs.append(target)
             tfs.append(tf)
@@ -457,19 +445,16 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
         print(f"[查询失败] 数据库中未找到该组合的任何周期记录！")
         return
 
-    # 将提取出的单个组合的多周期数据横向合并成一条宽记录
     merged_df = pd.concat(dfs, axis=1).reset_index()
 
-    # ========= 新增：计算各个周期的总净利润 =========
     for tf in tfs:
         if f'单笔平均净收益_{tf}' in merged_df.columns and f'总交易数_{tf}' in merged_df.columns:
             merged_df[f'总净收益_{tf}'] = merged_df[f'单笔平均净收益_{tf}'] * merged_df[f'总交易数_{tf}']
-    # ================================================
 
     row = merged_df.iloc[0]
 
     # ==========================================
-    # 辅助计算闭包 (绑定到上面提取出的 row)
+    # 辅助计算闭包
     # ==========================================
     def get_overall_avg_net(tf):
         try:
@@ -531,8 +516,7 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     print(f"组合身份: Entry = {entry_name} | Exit = {exit_name} | Filter = {filter_name}")
     print("-" * 110)
 
-    # 动态渲染存在的周期表头
-    header_lbl = pad_label("核心与衰减指标", 16)  # <--- 改为 16
+    header_lbl = pad_label("核心与衰减指标", 16)
     h_cols = []
     for i, tf in enumerate(tfs):
         if i < len(tfs) - 1:
@@ -541,17 +525,12 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
             h_cols.append(f"[{tf} 周期]")
     header_str = " | ".join(h_cols) if h_cols else ""
     print(f"  {header_lbl} | {header_str}")
-    print("  " + "-" * 110)  # <--- 分割线加长到 110
+    print("  " + "-" * 110)
 
     print_row("总交易数", [get_val(row, '总交易数', tf, 'int') for tf in tfs])
     print_row("胜率", [get_val(row, '胜率', tf, 'pct') for tf in tfs])
-
     print_row("平均单笔净利", [get_overall_avg_net(tf) for tf in tfs])
-
-    # ========= 新增：打印各个周期的总净利润 =========
     print_row("总净利润", [get_val(row, '总净收益', tf, 'pct_plus') for tf in tfs])
-    # ================================================
-
     print_row("样本内单笔净利", [get_val(row, '样本内平均单笔净收益', tf, 'pct_plus') for tf in tfs])
     print_row("样本外单笔净利", [get_val(row, '样本外平均单笔净收益', tf, 'pct_plus') for tf in tfs])
     print_row("平均盈亏持仓", [get_holding_hours(tf) for tf in tfs])
@@ -560,6 +539,11 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     print("\n> 截面宽度与单币风险")
     print_row("盈利币比例", [get_breadth(tf) for tf in tfs])
     print_row("单币集中度", [get_val(row, '最优币占总净收益百分比', tf, 'pct') for tf in tfs])
+
+    # [修改点 2]：新增 Top3 利润与亏损占总净收益百分比
+    print_row("Top3利润占比", [get_val(row, 'Top3币种利润占总净收益百分比', tf, 'pct') for tf in tfs])
+    print_row("Top3亏损占比", [get_val(row, 'Top3币种亏损占总净收益百分比', tf, 'pct') for tf in tfs])
+
     print_row("最大收益币", [get_val(row, '最大收益币名称', tf) for tf in tfs])
 
     print("\n> 季度平稳性 (Q1-Q4净收益)")
