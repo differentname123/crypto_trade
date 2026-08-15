@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -639,14 +640,79 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
         return signal_file_content
 
 
+# ==============================================================================
+# 核心持久化辅助函数：管理各策略的专属真实信号历史文件
+# ==============================================================================
+def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: dict, cols: list) -> pd.DataFrame:
+    """
+    通用状态机与信号文件同步函数：
+    1. 读取本地历史信号文件，并提取属于该 symbol 的真实交易记录。
+    2. 基于该 symbol 最新的历史事件 (OPEN 或 CLOSE)，控制状态机防重复开仓/防无效平仓。
+    3. 若有新信号产生，去重落盘追加至本地文件。
+    4. 返回该 symbol 包含最新信号在内的完整实际信号 DataFrame。
+    """
+    if os.path.exists(history_file):
+        try:
+            df_hist = pd.read_csv(history_file, dtype={'signal_timestamp_ms': 'int64', 'symbol': str})
+        except Exception:
+            df_hist = pd.DataFrame(columns=cols)
+    else:
+        df_hist = pd.DataFrame(columns=cols)
+
+    for c in cols:
+        if c not in df_hist.columns:
+            df_hist[c] = None
+
+    df_symbol_hist = df_hist[df_hist['symbol'] == symbol].copy()
+
+    # 获取当前标的的历史持仓状态
+    last_event = None
+    last_open_price = 0.0
+    if not df_symbol_hist.empty:
+        last_row = df_symbol_hist.iloc[-1]
+        last_event = str(last_row['event']).upper()
+        last_open_price = float(last_row['price']) if pd.notna(last_row['price']) else 0.0
+
+    valid_record = None
+
+    if new_record is not None:
+        incoming_event = new_record['event']
+
+        # 状态机约束：
+        # 1. 只有当前为空仓(未开过仓或上次为CLOSE)，且来了 OPEN 信号，才记录开仓
+        if incoming_event == 'OPEN' and last_event != 'OPEN':
+            valid_record = new_record
+
+        # 2. 只有当前为持仓(上次为OPEN)，且来了 CLOSE 信号，才记录平仓并计算盈亏
+        elif incoming_event == 'CLOSE' and last_event == 'OPEN':
+            if last_open_price > 0:
+                new_record['pnl'] = ((new_record['price'] - last_open_price) / last_open_price) * 100
+            else:
+                new_record['pnl'] = 0.0
+            valid_record = new_record
+
+    # 若产生了有效的新信号，进行时间戳去重并持久化落盘
+    if valid_record is not None:
+        is_duplicate = False
+        if not df_hist.empty:
+            mask = (df_hist['symbol'] == symbol) & (df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
+            if mask.any():
+                is_duplicate = True
+
+        if not is_duplicate:
+            df_new_row = pd.DataFrame([valid_record], columns=cols)
+            df_hist = pd.concat([df_hist, df_new_row], ignore_index=True)
+            df_hist.to_csv(history_file, index=False, encoding='utf-8-sig')
+            df_symbol_hist = pd.concat([df_symbol_hist, df_new_row], ignore_index=True)
+
+    return df_symbol_hist[cols] if not df_symbol_hist.empty else pd.DataFrame(columns=cols)
+
+
 def generate_top_long_signals(df):
     """
-    深度精简版：仅生成并返回 理论信号(signals) 与 实际操作信号(df_actual_signals)
-    重构亮点：跳过无效遍历，采用事件驱动型状态机，大幅提升性能与可读性。
+    截面瞬时信号生成版：针对 top_long 策略
+    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
     """
-    # ====================================================
-    # 0. 内置最优参数与常量定义
-    # ====================================================
     OPTIMAL_PARAMS = {
         'BAR_MINUTES': 60,
         'UPPER_WICK_THRESH': 0.60,
@@ -659,24 +725,18 @@ def generate_top_long_signals(df):
             'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
             'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
 
-    W = 24 * OPTIMAL_PARAMS['WARMUP_DAYS']  # 720 (默认30天1h K线)
+    W = 24 * OPTIMAL_PARAMS['WARMUP_DAYS']  # 720
     N = 24
     EPS = 1e-12
 
-    if len(df) < W:
+    if df is None or len(df) < W:
         return [], pd.DataFrame(columns=cols)
 
-    # ================= [核心修改点] =================
-    # 根据截图，symbol和coin_name实际上是DataFrame的列。
-    # 优先从数据列的第一行获取，如果没有该列，再降级尝试从 df.attrs 中获取，最后兜底为 UNKNOWN
     symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs.get('symbol', 'UNKNOWN')
     coin_name = df['coin_name'].iloc[0] if 'coin_name' in df.columns else (
         symbol.split('/')[0] if '/' in symbol else symbol)
-    # ===============================================
 
-    # ====================================================
-    # 1. 核心指标与信号布尔序列计算 (完全保留原逻辑，向量化计算)
-    # ====================================================
+    # 1. 核心指标向量化计算
     o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
 
     maxH_N = h.rolling(N, min_periods=max(2, N // 2)).max()
@@ -691,98 +751,43 @@ def generate_top_long_signals(df):
     entry_signal = (c / (maxH_N + EPS) > OPTIMAL_PARAMS['HIGH_CLOSE_THRESH']) & kline_long_upper_wick & volume_spike
     exit_signal = inside.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
 
-    # ====================================================
-    # 2. 核心优化：事件驱动状态机 (跳过无效K线，仅遍历有信号的时刻)
-    # ====================================================
-    signals = []
-    actual_signals_list = []
+    # 2. 只检查最新闭合的最后一根 K 线 (索引 -1)
+    is_entry = bool(entry_signal.iloc[-1])
+    is_exit = bool(exit_signal.iloc[-1])
 
-    # 剔除预热期的信号 (替代原先在 for 循环中逐行判断 if dt < warmup_end_time)
-    entry_signal.iloc[:W] = False
-    exit_signal.iloc[:W] = False
+    new_candidate_record = None
 
-    # 提取所有触发了开仓或平仓信号的行索引 (只遍历这些行，速度提升百倍)
-    event_indices = df.index[entry_signal | exit_signal]
-
-    seen_first_exit = False
-    actual_pos = 0  # 0代表空仓，1代表持有多单
-    actual_entry_price = 0.0
-
-    # 仅遍历触发了信号的事件点
-    for idx in event_indices:
-        # 1. 提取 K 线起始的毫秒级时间戳
-        kline_start_ms = df.at[idx, 'timestamp']
-
-        # 2. 加上 K 线周期，得到真正信号触发时刻的绝对毫秒时间戳
+    if is_entry or is_exit:
+        kline_start_ms = int(df['timestamp'].iloc[-1])
         signal_ts_ms = int(kline_start_ms + OPTIMAL_PARAMS['BAR_MINUTES'] * 60 * 1000)
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+        cur_c = float(c.iloc[-1])
+        cur_v = float(v.iloc[-1])
+        cur_vol_q = float(vol_q.iloc[-1])
+        cur_uw = float(uw.iloc[-1])
 
-        # 3. 为了向下兼容原有的日志记录，将其转换为无时区标签的北京时间 datetime 对象
-        dt = pd.to_datetime(signal_ts_ms, unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').tz_localize(None)
-
-        is_entry = entry_signal.at[idx]
-        is_exit = exit_signal.at[idx]
-
-        # 预先提取当前行的常用数值，避免代码中反复出现冗长的定位取值
-        cur_c = c.at[idx]
-        cur_v = v.at[idx]
-        cur_vol_q = vol_q.at[idx]
-        cur_uw = uw.at[idx]
-
-        # 预格式化原因字符串
-        entry_reason = f"高位长上影({cur_uw:.2f}) + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
-        exit_reason = f"孕线突破 + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
-
-        # --- A. 记录所有的理论信号 (signals) ---
         if is_entry:
-            signals.append({
-                'symbol': symbol, 'signal_type': '🟢 ENTRY (接针做多)', 'datetime_bj': dt,
-                'price': cur_c, 'reason': entry_reason
-            })
-        if is_exit:
-            signals.append({
-                'symbol': symbol, 'signal_type': '🔴 EXIT (突破止盈)', 'datetime_bj': dt,
-                'price': cur_c, 'reason': exit_reason
-            })
-
-        # --- B. 记录受持仓状态控制的实际交易信号 (df_actual_signals) ---
-        if not seen_first_exit:
-            # 必须先等待第一个平仓信号触发后，后续的开仓才算数
-            if is_exit:
-                seen_first_exit = True
-            continue  # 未经历首次平仓前，直接跳过后续的实际操作判断
-
-        # 计算复用的时间戳与格式化时间 (仅在发生真实交易时才计算，极大节省性能)
-        if (actual_pos == 0 and is_entry) or (actual_pos == 1 and is_exit):
-            dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-            # 直接使用精确计算得出的物理时间戳
-            ts_ms = signal_ts_ms
-
-            # 状态机流转
-        if actual_pos == 0 and is_entry:
-            actual_pos = 1
-            actual_entry_price = cur_c
-            actual_signals_list.append({
-                'time': dt_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
-                'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
+            entry_reason = f"高位长上影({cur_uw:.2f}) + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
+            new_candidate_record = {
+                'time': dt_bj_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
+                'event': 'OPEN', 'price': cur_c, 'reason': entry_reason,
                 'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.14,
-                'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
-            })
-
-        elif actual_pos == 1 and is_exit:
-            actual_pos = 0
-            pnl_pct_actual = (cur_c / actual_entry_price - 1.0) * 100
-            actual_signals_list.append({
-                'time': dt_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
+                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
+            }
+        elif is_exit:
+            exit_reason = f"孕线突破 + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
+            new_candidate_record = {
+                'time': dt_bj_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'CLOSE', 'price': cur_c, 'reason': exit_reason,
-                'target_weight': 0.0, 'pnl': pnl_pct_actual, 'top_k': 1, 'max_weight': 0.14,
-                'signal_timestamp_ms': ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
-            })
+                'target_weight': 0.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.14,
+                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
+            }
 
-    # ====================================================
-    # 3. 构造并返回 DataFrame
-    # ====================================================
-    df_actual_signals = pd.DataFrame(actual_signals_list, columns=cols)
-    return signals, df_actual_signals
+    # 3. 与专属本地信号文件同步，并返回真实还原后的 df_actual_signals
+    history_file = "signal_history_top_coin_long.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
+    return [], df_actual_signals
 
 
 def print_top_long_latest_signals(final_signals_df, logger, timeframe='1h'):
@@ -886,13 +891,10 @@ def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=No
 
         actual_rows = len(df_klines)
         if actual_rows < expected_rows:
-            # ================= [核心修改点] =================
-            # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
             start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
                 'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
             end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
                 'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            # ===============================================
             missing_count = expected_rows - actual_rows
 
             run_logger.warning(
@@ -901,18 +903,17 @@ def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=No
                 f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
             )
 
-        # 提取纯币种名如 'BTC'
         coin_name = symbol.split('/')[0]
         df_klines['coin_name'] = coin_name
-        # [新增] 将完整的原始 symbol 存入 dataframe 中，向下游无损传递符号元数据
         df_klines['symbol'] = symbol
-        signals, df_actual_signals = generate_top_long_signals(df_klines)  # 仅生成信号，不返回交易数据
+        signals, df_actual_signals = generate_top_long_signals(df_klines)
         df_actual_signals_df_list.append(df_actual_signals)
 
     # 将df_actual_signals_df_list合并为一个DataFrame
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 【修改】传入自身的工作 timeframe
+        # 移除重复记录以防合并时重叠
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
         print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
         output_path = "top_long_signals.csv"
         final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
@@ -926,17 +927,9 @@ def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=No
 
 def generate_multi_ma_signals(raw_df, bar_minutes=5):
     """
-    极致性能重构版：多均线共振破位策略
-    严格要求输入的是5m级别数据
-    核心优化要点（保证最终 DataFrame 输出 100% 绝对一致）：
-    1. 阻断冗余重采样：确认数据已为目标周期，直接跳过耗时的 resample().agg() 及 fillna 链路。
-    2. MA 算子复用：ma_fast (48h) 直接复用 ma_entry_2 (48h)，消除 20% 的重复 rolling 计算。
-    3. 全 NumPy 数组寻址：状态机推演基于连续一维数组下标运行，消除 Pandas .at[] 寻址开销。
-    4. 惰性时间与字符串求值：彻底移除被丢弃的 signals 构造；时区转换与 strftime 仅在真实发生开平仓时计算。
+    截面瞬时信号生成版：针对 multi_ma_break_long 策略
+    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
     """
-    # ====================================================
-    # 0. 策略最优参数与基础设置
-    # ====================================================
     STRATEGY_PARAMS = {
         'ENTRY_MA_HOURS': [24, 48, 72],  # 入场判定：价格需同时跌破这3根均线(小时)
         'EXIT_FAST_MA_HOURS': 48,  # 出场判定：快线均线周期(小时)
@@ -952,105 +945,67 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
     if raw_df is None or len(raw_df) == 0:
         return [], pd.DataFrame(columns=cols)
 
-    # 提取币种与标的信息 (兼容列与 attrs)
     symbol = raw_df['symbol'].iloc[0] if 'symbol' in raw_df.columns else raw_df.attrs.get('symbol', 'UNKNOWN')
     coin_name = raw_df['coin_name'].iloc[0] if 'coin_name' in raw_df.columns else (
         symbol.split('/')[0] if '/' in symbol else symbol
     )
 
-    # ====================================================
-    # 1. 极速数据对齐 (零拷贝 & 跳过冗余重采样)
-    # ====================================================
     df = raw_df
-    # 仅在时间戳未严格单调递增时执行低频保护性排序，正常情况下 0 耗时跳过
     if 'timestamp' in df.columns and not df['timestamp'].is_monotonic_increasing:
         df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
 
     c = df['close']
-    n_bars = len(c)
-    if n_bars == 0:
-        return [], pd.DataFrame(columns=cols)
-
-    # ====================================================
-    # 2. 核心指标向量化计算 (MA 算子去重复用)
-    # ====================================================
     bph = 60.0 / bar_minutes
 
     def B(hours):
         return max(1, int(round(hours * bph)))
 
-    # 计算均线 (动态匹配周期根数)
+    min_required_bars = B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS'])
+    if len(c) < min_required_bars:
+        return [], pd.DataFrame(columns=cols)
+
+    # 1. 核心指标向量化计算
     entry_h1, entry_h2, entry_h3 = STRATEGY_PARAMS['ENTRY_MA_HOURS']
 
     ma_entry_1 = c.rolling(B(entry_h1), min_periods=max(2, B(entry_h1) // 2)).mean()
     ma_entry_2 = c.rolling(B(entry_h2), min_periods=max(2, B(entry_h2) // 2)).mean()
     ma_entry_3 = c.rolling(B(entry_h3), min_periods=max(2, B(entry_h3) // 2)).mean()
 
-    # 【核心优化】：ma_fast 与 ma_entry_2 完全相同，直接复用结果
     ma_fast = ma_entry_2
     ma_slow = c.rolling(B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']),
                         min_periods=max(2, B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']) // 2)).mean()
 
-    # 理论信号布尔序列
-    entry_signal = ((c < ma_entry_1) & (c < ma_entry_2) & (c < ma_entry_3)).fillna(False)
-    exit_signal = ((ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1))).fillna(False)
+    # 2. 只检查最新闭合的最后一根 K 线 (索引 -1)
+    curr_c = float(c.iloc[-1])
+    curr_ma1 = float(ma_entry_1.iloc[-1])
+    curr_ma2 = float(ma_entry_2.iloc[-1])
+    curr_ma3 = float(ma_entry_3.iloc[-1])
 
-    # ====================================================
-    # 3. 提取底层 NumPy 连续数组 (极致推演速度)
-    # ====================================================
-    entry_arr = entry_signal.values
-    exit_arr = exit_signal.values
-    c_arr = c.values
-    ts_arr = df['timestamp'].values
-    ma1_arr = ma_entry_1.values
-    ma2_arr = ma_entry_2.values
-    ma3_arr = ma_entry_3.values
+    curr_fast = float(ma_fast.iloc[-1])
+    prev_fast = float(ma_fast.iloc[-2])
+    curr_slow = float(ma_slow.iloc[-1])
+    prev_slow = float(ma_slow.iloc[-2])
 
-    # 毫秒时间增量 (对齐 K 线闭合时刻)
-    bar_ms_delta = int(bar_minutes * 60 * 1000)
+    is_entry = (curr_c < curr_ma1) and (curr_c < curr_ma2) and (curr_c < curr_ma3)
+    is_exit = (curr_fast < curr_slow) and (prev_fast >= prev_slow)
 
-    # 提取所有触发了潜在入场或出场的事件点索引
-    valid_event_mask = entry_arr | exit_arr
-    event_indices = np.where(valid_event_mask)[0]
+    new_candidate_record = None
 
-    # ====================================================
-    # 4. 极速状态机 (惰性求值，仅在确认发单时格式化)
-    # ====================================================
-    actual_signals_list = []
-    seen_first_exit = False
-    actual_pos = 0  # 0: 空仓, 1: 持有多单
-    actual_entry_price = 0.0
+    if is_entry or is_exit:
+        bar_ms_delta = int(bar_minutes * 60 * 1000)
+        last_ts = int(df['timestamp'].iloc[-1])
+        signal_ts_ms = last_ts + bar_ms_delta
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
-    for idx in event_indices:
-        is_entry = entry_arr[idx]
-        is_exit = exit_arr[idx]
-
-        # 状态机门控：必须等待历史首次平仓信号后才激活交易
-        if not seen_first_exit:
-            if is_exit:
-                seen_first_exit = True
-            continue
-
-        exec_price = c_arr[idx]
-
-        # --- A. 开仓逻辑 (LONG) ---
-        if actual_pos == 0 and is_entry:
-            actual_pos = 1
-            actual_entry_price = exec_price
-
-            # 【惰性计算】：仅在确认开仓时转换时间与拼接字符串
-            signal_ts_ms = int(ts_arr[idx] + bar_ms_delta)
-            dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-                '%Y-%m-%d %H:%M:%S')
-            entry_reason = f"均线跌破(C<{ma1_arr[idx]:.4f}, C<{ma2_arr[idx]:.4f}, C<{ma3_arr[idx]:.4f})"
-
-            actual_signals_list.append({
+        if is_entry:
+            entry_reason = f"均线跌破(C<{curr_ma1:.4f}, C<{curr_ma2:.4f}, C<{curr_ma3:.4f})"
+            new_candidate_record = {
                 'time': dt_bj_str,
                 'action': 'BUY',
                 'coin': coin_name,
                 'direction': 'LONG',
                 'event': 'OPEN',
-                'price': actual_entry_price,
+                'price': curr_c,
                 'reason': entry_reason,
                 'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
                 'pnl': None,
@@ -1059,41 +1014,32 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
                 'signal_timestamp_ms': signal_ts_ms,
                 'STRATEGY_NAME': 'multi_ma_break_long',
                 'symbol': symbol
-            })
-
-        # --- B. 平仓逻辑 (CLOSE) ---
-        elif actual_pos == 1 and is_exit:
-            actual_pos = 0
-            pnl_pct_actual = ((exec_price - actual_entry_price) / actual_entry_price) * 100
-
-            # 【惰性计算】：仅在确认平仓时转换时间与拼接字符串
-            signal_ts_ms = int(ts_arr[idx] + bar_ms_delta)
-            dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-                '%Y-%m-%d %H:%M:%S')
+            }
+        elif is_exit:
             exit_reason = f"快慢死叉(MA{STRATEGY_PARAMS['EXIT_FAST_MA_HOURS']} < MA{STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']})"
-
-            actual_signals_list.append({
+            new_candidate_record = {
                 'time': dt_bj_str,
                 'action': 'SELL',
                 'coin': coin_name,
                 'direction': 'LONG',
                 'event': 'CLOSE',
-                'price': exec_price,
+                'price': curr_c,
                 'reason': exit_reason,
                 'target_weight': 0.0,
-                'pnl': pnl_pct_actual,
+                'pnl': None,
                 'top_k': 1,
                 'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
                 'signal_timestamp_ms': signal_ts_ms,
                 'STRATEGY_NAME': 'multi_ma_break_long',
                 'symbol': symbol
-            })
+            }
 
-    # ====================================================
-    # 5. 组装返回
-    # ====================================================
-    df_actual_signals = pd.DataFrame(actual_signals_list, columns=cols)
+    # 3. 与专属本地信号文件同步，并返回真实还原后的 df_actual_signals
+    history_file = "signal_history_multi_ma_break_long.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
     return [], df_actual_signals
+
 
 def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_url=None):
     """
@@ -1133,13 +1079,10 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_
 
         actual_rows = len(df_klines)
         if actual_rows < expected_rows:
-            # ================= [核心修改点] =================
-            # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
             start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
                 'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
             end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
                 'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            # ===============================================
             missing_count = expected_rows - actual_rows
 
             run_logger.warning(
@@ -1148,18 +1091,17 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_
                 f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
             )
 
-        # 提取纯币种名如 'BTC'
         coin_name = symbol.split('/')[0]
         df_klines['coin_name'] = coin_name
-        # [新增] 将完整的原始 symbol 存入 dataframe 中，向下游无损传递符号元数据
         df_klines['symbol'] = symbol
-        signals, df_actual_signals = generate_multi_ma_signals(df_klines)  # 仅生成信号，不返回交易数据
+        signals, df_actual_signals = generate_multi_ma_signals(df_klines)
         df_actual_signals_df_list.append(df_actual_signals)
 
     # 将df_actual_signals_df_list合并为一个DataFrame
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 【修改】传入自身的工作 timeframe (5m)
+        # 移除重复记录以防合并时重叠
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
         print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
         output_path = "ma_bottom_long_signals.csv"
         final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
@@ -1175,6 +1117,7 @@ if __name__ == "__main__":
     # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
     # # 将timestamp 从ms转换为 北京时间
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['MYX/USDT:USDT']
