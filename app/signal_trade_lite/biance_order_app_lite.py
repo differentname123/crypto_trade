@@ -4,8 +4,8 @@
 
 设计原则: 简单为底 / 账本为核 / 隔离为纲 / 实事求是
 
-顶层流程 (每整点驱动一轮 —— run_scheduler):
-  ① 睡到整点前 PRELOAD_AHEAD_MIN 分钟
+顶层流程 (每轮调度驱动 —— run_scheduler):
+  ① 睡到目标时间前预设分钟数
   ② preload_account_state : 拉权益/持仓/挂单 → reconcile_ledger 对账 → check_position_consistency 告警
   ③ execute_trading_bot_workflow : 拉取本轮信号
   ④ execute_signals       : 只执行 ±SIGNAL_WINDOW_MIN 分钟窗口内的信号 (OPEN→handle_open / CLOSE→handle_close)
@@ -28,11 +28,11 @@ import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
 
-CURRENT_SYMBOL = "top_long"  #  "cross" "top_long"
+CURRENT_SYMBOL = "ma_bottom_long"  # "cross" "top_long" "ma_bottom_long"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
-from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long
+from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long, execute_trading_bot_workflow_ma_bottom_long
 from biance_order_lite import (execute_order, get_total_equity,
                                ExecStatus, safe_init_exchange
                                )
@@ -45,7 +45,7 @@ LEDGER_FILE = f"trade_records_{CURRENT_SYMBOL}.csv"  # 本策略专属账本, �
 LEVERAGE = 1
 MIN_ORDER_VALUE = 51
 MAX_ORDER_VALUE = 2000.0
-if CURRENT_SYMBOL == "top_long":
+if CURRENT_SYMBOL != "cross":
     MIN_ORDER_VALUE = 6
     MAX_ORDER_VALUE = 500
 
@@ -806,8 +806,43 @@ def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache,
     return signal_df
 
 
+def get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
+    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
+    holding_symbols_set = set()
+
+    # 1. 从交易所缓存(实际持仓)中提取
+    if position_cache:
+        for k in position_cache.keys():
+            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
+            holding_symbols_set.add(k.rsplit('_', 1)[0])
+
+    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
+    df = ledger.read()
+    if not df.empty:
+        closed_ids = _closed_open_ids(df)
+        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
+        for _, r in opens_df.iterrows():
+            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
+                holding_symbols_set.add(str(r["symbol"]).strip())
+
+    holding_symbols = list(holding_symbols_set)
+    if holding_symbols is None:
+        holding_symbols = []
+
+    top_symbol_list = get_top_movers(exchange, top_n=BEST_TOP_N, mode='bottom')
+
+    # 合并涨幅榜币种与当前/理论持仓币种，并去重，以确保已有持仓被策略检测
+    final_symbol_list = list(set(top_symbol_list + holding_symbols))
+
+    logger.info(f"[SIGNAL] 最终监控币种列表 ({len(final_symbol_list)}个): {final_symbol_list}")
+
+    signal_df = execute_trading_bot_workflow_ma_bottom_long(target_time_str, symbol_list=final_symbol_list,
+                                                      proxy_url=proxy_url)
+    return signal_df
+
+
 def run_scheduler():
-    """顶层编排: 每整点驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
+    """顶层编排: 周期驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
     api_key = get_config("myself_biance_api_key")
     secret_key = get_config("myself_biance_api_secret")
 
@@ -819,15 +854,26 @@ def run_scheduler():
 
     exchange = safe_init_exchange(api_key, secret_key, proxies)
     ledger = LedgerManager(LEDGER_FILE)
-    logger.info("[SCHED] 调度系统就绪, 进入整点循环")
+    logger.info("[SCHED] 调度系统就绪, 进入调度循环")
     print_position_summary(exchange, ledger)
 
     while True:
         try:
             now = datetime.now()
-            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            target_time_str = (next_hour - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
-            preload_time = next_hour - timedelta(minutes=PRELOAD_AHEAD_MIN)
+
+            # 兼容多策略频率: 依据 CURRENT_SYMBOL 动态计算目标时间和预取时间
+            if CURRENT_SYMBOL == "ma_bottom_long":
+                add_minutes = 5 - (now.minute % 5)
+                next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
+                preload_ahead = 0.5  # 5 分钟周期，提前 1 分钟即可
+            else:
+                # 其他策略 (如 cross) 原逻辑: 每整点驱动一轮
+                next_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                preload_ahead = PRELOAD_AHEAD_MIN
+
+            target_time_str = (next_run - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+            preload_time = next_run - timedelta(minutes=preload_ahead)
+            logger.info(f"[SCHED] 下一轮调度时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')} | 预加载时间: {preload_time.strftime('%Y-%m-%d %H:%M:%S')} | 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
             if now < preload_time:
                 time.sleep((preload_time - now).total_seconds())
@@ -846,7 +892,7 @@ def run_scheduler():
                 time.sleep(3)
 
             if not ok:
-                logger.error("[PRELOAD] 连续失败, 放弃本轮调度, 等待下一整点")
+                logger.error("[PRELOAD] 连续失败, 放弃本轮调度, 等待下一轮")
                 time.sleep(60)
                 continue
 
@@ -856,14 +902,16 @@ def run_scheduler():
             elif CURRENT_SYMBOL == "top_long":
                 signal_df = get_top_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
                                                    position_cache=position_cache, ledger=ledger)
+            elif CURRENT_SYMBOL == "ma_bottom_long":
+                signal_df = get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
+                                                         position_cache=position_cache, ledger=ledger)
             else:
                 logger.error(f"[SIGNAL] 未知的 CURRENT_SYMBOL 配置: {CURRENT_SYMBOL}")
                 signal_df = None
 
             if signal_df is not None and not signal_df.empty:
-                execute_signals(exchange, next_hour, equity, position_cache, open_order_cache, signal_df, ledger)
+                execute_signals(exchange, next_run, equity, position_cache, open_order_cache, signal_df, ledger)
                 logger.info("[SCHED] 信号执行完毕，触发盘后对账以回填最新成交状态...")
-
 
             # 新增：每次运行一轮的最后就调用一次输出汇总信息
             print_position_summary(exchange, ledger)
