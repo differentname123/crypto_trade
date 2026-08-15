@@ -101,7 +101,7 @@ def run_strategy_simulation(
         trade_mode: str,
         initial_capital: float = 10000.0,
         start_trade_date: str = '2026-04-27 00:00:00',
-        logger = None
+        logger=None
 ) -> pd.DataFrame:
     """
     流式模拟引擎：基于横截面特征，运行策略状态机推演，生成与回测 100% 一致的交易账本记录。
@@ -527,6 +527,7 @@ def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logg
         # 修改点：当没有交易信号时，返回空的 DataFrame 而不是空字符串
         return pd.DataFrame()
 
+
 # ==========================================
 # 4. 程序入口点
 # ==========================================
@@ -636,6 +637,7 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
         # 执行实盘流传并捕获信号文件内容进行返回
         signal_file_content = run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
         return signal_file_content
+
 
 def generate_top_long_signals(df):
     """
@@ -783,12 +785,11 @@ def generate_top_long_signals(df):
     return signals, df_actual_signals
 
 
-
-
-def print_top_long_latest_signals(final_signals_df, logger):
+def print_top_long_latest_signals(final_signals_df, logger, timeframe='1h'):
     """
     打印策略的最新截面操作指令。
-    自动获取当前的北京时间（对齐到整点小时），去账本中匹配当下是否触发了交易信号。
+    自动获取当前的北京时间，并根据传入的 timeframe(如 '1h', '5m') 向下取整对齐到最新截面，
+    去账本中精准匹配当下是否触发了交易信号。
     """
     # 1. 空数据校验
     if final_signals_df is None or final_signals_df.empty:
@@ -801,11 +802,15 @@ def print_top_long_latest_signals(final_signals_df, logger):
     strategy_name = final_signals_df['STRATEGY_NAME'].iloc[
         0] if 'STRATEGY_NAME' in final_signals_df.columns else "top_coin_long"
 
-    # 3. 核心修改：获取当前的北京时间，并将分、秒、微秒抹零，对齐到整点小时
-    current_bjt = pd.Timestamp.now(tz='Asia/Shanghai').replace(minute=0, second=0, microsecond=0)
+    # 3. 核心修改：适配任意级别的时间，向下取整对齐到最新截面
+    # 将业务时间帧如 5m 转化为 pandas 底层支持的 frequency 字符串 5min
+    pd_freq = timeframe.lower().replace('m', 'min').replace('h', 'h')
+
+    # 获取当前的北京时间，并根据对应级别频次向下取整（如 14:02 运行 5m 策略，自动对齐至 14:00:00）
+    current_bjt = pd.Timestamp.now(tz='Asia/Shanghai').floor(pd_freq)
     latest_time_str = current_bjt.strftime('%Y-%m-%d %H:%M:%S')
 
-    # 4. 根据当前整点截面时间，过滤出此时此刻应该执行的信号
+    # 4. 根据当前截面时间，过滤出此时此刻应该执行的信号
     latest_trade_signals = final_signals_df[final_signals_df['time'] == latest_time_str]
 
     # 5. 格式化日志输出
@@ -842,7 +847,7 @@ def print_top_long_latest_signals(final_signals_df, logger):
     logger.info("-" * 70)
 
 
-def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=None):
+def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
@@ -883,8 +888,10 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
         if actual_rows < expected_rows:
             # ================= [核心修改点] =================
             # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
             # ===============================================
             missing_count = expected_rows - actual_rows
 
@@ -905,10 +912,12 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
     # 将df_actual_signals_df_list合并为一个DataFrame
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        print_top_long_latest_signals(final_signals_df, run_logger)
+        # 【修改】传入自身的工作 timeframe
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
         output_path = "top_long_signals.csv"
         final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        run_logger.info(
+            f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
         return final_signals_df
     else:
         run_logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
@@ -1030,11 +1039,16 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
         is_entry = entry_signal.at[idx]
         is_exit = exit_signal.at[idx]
 
-        dt_utc_str = idx.strftime('%Y-%m-%d %H:%M:%S')
-        dt_bj = idx.tz_convert('Asia/Shanghai').tz_localize(None)
-        signal_ts_ms = int(idx.timestamp() * 1000)
+        # 【核心改动】：idx 对应的是 K线起始时间(left label)。真实信号落表时间应该在 K线闭合时刻。
+        # 加上 K线周期时间，对齐到最新截面，再统一切换为北京时间字符串写入账本，避免下游由于 UTC 和时间偏移导致的匹配报错
+        signal_time_utc = idx + pd.Timedelta(minutes=bar_minutes)
+        dt_bj = signal_time_utc.tz_convert('Asia/Shanghai').tz_localize(None)
+        dt_bj_str = dt_bj.strftime('%Y-%m-%d %H:%M:%S')
 
-        # 【核心改动】：执行价格直接取当前触发信号的K线收盘价
+        # 精确到信号闭合点的物理时间戳
+        signal_ts_ms = int(signal_time_utc.timestamp() * 1000)
+
+        # 执行价格直接取当前触发信号的K线收盘价
         exec_price = c.at[idx]
 
         # 动态提取日志原因
@@ -1059,7 +1073,7 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
             actual_entry_price = exec_price
 
             actual_signals_list.append({
-                'time': dt_utc_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
+                'time': dt_bj_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
                 'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
                 'pnl': None, 'top_k': 1,
@@ -1072,7 +1086,7 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
             pnl_pct_actual = ((exec_price - actual_entry_price) / actual_entry_price) * 100
 
             actual_signals_list.append({
-                'time': dt_utc_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
+                'time': dt_bj_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
                 'event': 'CLOSE', 'price': exec_price, 'reason': exit_reason,
                 'target_weight': 0.0,
                 'pnl': pnl_pct_actual, 'top_k': 1,
@@ -1087,7 +1101,7 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
     return signals, df_actual_signals
 
 
-def execute_trading_bot_workflow_ma_bottom_long(target_time,symbol_list, proxy_url=None):
+def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_url=None):
     """
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
@@ -1127,8 +1141,10 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time,symbol_list, proxy_u
         if actual_rows < expected_rows:
             # ================= [核心修改点] =================
             # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
             # ===============================================
             missing_count = expected_rows - actual_rows
 
@@ -1149,10 +1165,12 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time,symbol_list, proxy_u
     # 将df_actual_signals_df_list合并为一个DataFrame
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        print_top_long_latest_signals(final_signals_df, run_logger)
+        # 【修改】传入自身的工作 timeframe (5m)
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
         output_path = "ma_bottom_long_signals.csv"
         final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        run_logger.info(
+            f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
         return final_signals_df
     else:
         run_logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
@@ -1160,11 +1178,10 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time,symbol_list, proxy_u
 
 
 if __name__ == "__main__":
-
     # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\ETH_USDT_USDT_latest.csv')
     # # 将timestamp 从ms转换为 北京时间
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['MYX/USDT:USDT']
-    execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list,'http://127.0.0.1:7890')
+    execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, 'http://127.0.0.1:7890')

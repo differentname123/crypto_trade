@@ -735,20 +735,40 @@ def print_position_summary(exchange, ledger, open_order_cache=None):
     logger.info("=" * 65)
 
 
-def get_top_movers(exchange, top_n=10):
+def get_top_movers(exchange, top_n=10, mode='top'):
+    """
+    获取合约市场的涨跌幅排名
+    :param exchange: ccxt 交易所实例
+    :param top_n: 获取的数量
+    :param mode: 'top' 获取涨幅榜, 'bottom' 获取跌幅榜, 'both' 获取包含两者的字典
+    """
     tickers = exchange.fetch_tickers(params={'type': 'swap'})
 
     # 过滤出USDT本位合约，并排除没有涨跌幅数据的异常币种
     usdt_swaps = {k: v for k, v in tickers.items() if k.endswith(':USDT') and v.get('percentage') is not None}
     df = pd.DataFrame(usdt_swaps).T
 
-    # 按涨跌幅降序排列（涨得最多的在前面）
+    # 按涨跌幅降序排列（涨得最多的在前面，跌得最多的在最后）
     df = df.sort_values('percentage', ascending=False)
 
-    # 只取涨幅榜前 N 名
-    gainers = df.head(top_n).index.tolist()
-    targets = gainers
-    return targets
+    if mode == 'top':
+        # 只取涨幅榜前 N 名
+        return df.head(top_n).index.tolist()
+
+    elif mode == 'bottom':
+        # 取跌幅榜前 N 名（末尾 N 名）。
+        # [::-1] 的作用是反转列表，让跌幅最大的排在第一位
+        return df.tail(top_n)[::-1].index.tolist()
+
+    elif mode == 'both':
+        # 同时返回涨幅榜和跌幅榜
+        return {
+            'top': df.head(top_n).index.tolist(),
+            'bottom': df.tail(top_n)[::-1].index.tolist()
+        }
+
+    else:
+        raise ValueError("mode 参数必须是 'top', 'bottom' 或 'both'")
 
 
 def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
