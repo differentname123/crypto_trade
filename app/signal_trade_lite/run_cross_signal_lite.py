@@ -783,6 +783,8 @@ def generate_top_long_signals(df):
     return signals, df_actual_signals
 
 
+
+
 def print_top_long_latest_signals(final_signals_df, logger):
     """
     打印策略的最新截面操作指令。
@@ -913,6 +915,249 @@ def execute_trading_bot_workflow_top_long(target_time,symbol_list, proxy_url=Non
         return pd.DataFrame()
 
 
+def generate_multi_ma_signals(raw_df, bar_minutes=5):
+    """
+    深度精简版：多均线共振破位策略 (高度内聚 3合1 函数)
+
+    重构亮点：
+    1. 参数高度解耦：将核心均线周期、权重等参数提取至顶部，一目了然，方便后期回测调参。
+    2. 极速状态机：利用向量化计算与事件驱动机制，跳过无用遍历，极大提升运算速度。
+    3. 撮合逻辑调整：【按照最新需求】，执行价格取“信号触发当根K线的收盘价”。
+    """
+
+    # ====================================================
+    # 0. 策略最优参数与基础设置 (解耦提取区)
+    # ====================================================
+    STRATEGY_PARAMS = {
+        # --- 入场条件参数 ---
+        'ENTRY_MA_HOURS': [24, 48, 72],  # 入场判定：价格需同时跌破这3根均线(小时)
+
+        # --- 出场条件参数 ---
+        'EXIT_FAST_MA_HOURS': 48,  # 出场判定：快线均线周期(小时)
+        'EXIT_SLOW_MA_HOURS': 168,  # 出场判定：慢线均线周期(小时)，168代表7天
+
+        # --- 仓位与风控参数 ---
+        'TARGET_WEIGHT': 1.0,  # 触发信号后的目标仓位
+        'MAX_WEIGHT': 0.14  # 策略设定的最大允许仓位限制
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    if raw_df is None or len(raw_df) == 0:
+        return [], pd.DataFrame(columns=cols)
+
+    df = raw_df.copy()
+
+    # 提取币种信息
+    symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = df['coin_name'].iloc[0] if 'coin_name' in df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol)
+
+    # ====================================================
+    # 1. 数据预处理与重采样
+    # ====================================================
+    if 'timestamp' in df.columns:
+        df['dt'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+        df = df.drop_duplicates(subset=['timestamp']).sort_values('dt').set_index('dt')
+
+    if bar_minutes > 1:
+        bar_str = f"{bar_minutes}min"
+        agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+
+        for col in df.columns:
+            if col not in agg_dict and col != 'timestamp':
+                agg_dict[col] = 'last'
+
+        df = df.resample(bar_str, label='left', closed='left').agg(agg_dict)
+
+        if 'close' in df.columns:
+            df['close'] = df['close'].ffill()
+            df = df[df['close'].notna()]
+            df['open'] = df['open'].fillna(df['close'])
+            df['high'] = df['high'].fillna(df['close'])
+            df['low'] = df['low'].fillna(df['close'])
+        if 'volume' in df.columns:
+            df['volume'] = df['volume'].fillna(0.0)
+
+    # ====================================================
+    # 2. 核心指标与信号向量化计算
+    # ====================================================
+    # K线周期转小时系数
+    bph = 60.0 / bar_minutes
+
+    def B(hours):
+        return max(1, int(round(hours * bph)))
+
+    c = df['close']
+
+    def MA(n):
+        return c.rolling(n, min_periods=max(2, n // 2)).mean()
+
+    # 根据顶部配置项，动态计算均线 (将小时数转换为K线根数)
+    entry_h1, entry_h2, entry_h3 = STRATEGY_PARAMS['ENTRY_MA_HOURS']
+    ma_entry_1 = MA(B(entry_h1))
+    ma_entry_2 = MA(B(entry_h2))
+    ma_entry_3 = MA(B(entry_h3))
+
+    ma_fast = MA(B(STRATEGY_PARAMS['EXIT_FAST_MA_HOURS']))
+    ma_slow = MA(B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']))
+
+    # 理论信号计算 (布尔矩阵)
+    # 入场：价格同时跌破配置的3根均线
+    entry_signal = (c < ma_entry_1) & (c < ma_entry_2) & (c < ma_entry_3)
+    # 出场：快线与慢线形成死叉 (当前周期快线<慢线，且上一周期快线>=慢线)
+    exit_signal = (ma_fast < ma_slow) & (ma_fast.shift(1) >= ma_slow.shift(1))
+
+    entry_signal = entry_signal.fillna(False)
+    exit_signal = exit_signal.fillna(False)
+
+    # ====================================================
+    # 3. 极速事件驱动状态机
+    # ====================================================
+    signals = []
+    actual_signals_list = []
+
+    # 直接提取所有发出信号的事件点（移除了下一根K线的非空判定，因为现在当根收盘价就能成交）
+    valid_event_mask = entry_signal | exit_signal
+    event_indices = df.index[valid_event_mask]
+
+    actual_pos = 0  # 0: 空仓, 1: 持有多单
+    actual_entry_price = 0.0
+
+    for idx in event_indices:
+        is_entry = entry_signal.at[idx]
+        is_exit = exit_signal.at[idx]
+
+        dt_utc_str = idx.strftime('%Y-%m-%d %H:%M:%S')
+        dt_bj = idx.tz_convert('Asia/Shanghai').tz_localize(None)
+        signal_ts_ms = int(idx.timestamp() * 1000)
+
+        # 【核心改动】：执行价格直接取当前触发信号的K线收盘价
+        exec_price = c.at[idx]
+
+        # 动态提取日志原因
+        entry_reason = f"均线跌破(C<{ma_entry_1.at[idx]:.4f}, C<{ma_entry_2.at[idx]:.4f}, C<{ma_entry_3.at[idx]:.4f})"
+        exit_reason = f"快慢死叉(MA{STRATEGY_PARAMS['EXIT_FAST_MA_HOURS']} < MA{STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']})"
+
+        # --- A. 记录所有理论信号 (signals) ---
+        if is_entry:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🟢 ENTRY (多均线跌破开多)', 'datetime_bj': dt_bj,
+                'price': exec_price, 'reason': entry_reason
+            })
+        if is_exit:
+            signals.append({
+                'symbol': symbol, 'signal_type': '🔴 EXIT (快慢线死叉平多)', 'datetime_bj': dt_bj,
+                'price': exec_price, 'reason': exit_reason
+            })
+
+        # --- B. 记录受持仓状态机控制的实际操作信号 ---
+        if actual_pos == 0 and is_entry:
+            actual_pos = 1
+            actual_entry_price = exec_price
+
+            actual_signals_list.append({
+                'time': dt_utc_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
+                'event': 'OPEN', 'price': actual_entry_price, 'reason': entry_reason,
+                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
+                'pnl': None, 'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'multi_ma_break_long', 'symbol': symbol
+            })
+
+        elif actual_pos == 1 and is_exit:
+            actual_pos = 0
+            pnl_pct_actual = ((exec_price - actual_entry_price) / actual_entry_price) * 100
+
+            actual_signals_list.append({
+                'time': dt_utc_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
+                'event': 'CLOSE', 'price': exec_price, 'reason': exit_reason,
+                'target_weight': 0.0,
+                'pnl': pnl_pct_actual, 'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'multi_ma_break_long', 'symbol': symbol
+            })
+
+    # ====================================================
+    # 4. 组装返回
+    # ====================================================
+    df_actual_signals = pd.DataFrame(actual_signals_list, columns=cols)
+    return signals, df_actual_signals
+
+
+def execute_trading_bot_workflow_ma_bottom_long(target_time,symbol_list, proxy_url=None):
+    """
+    拉取数据并启动整套交易工作流
+    返回最终生成的信号文件内容
+    """
+    max_window = 50
+
+    lookback_days = int(np.ceil(max_window)) + 30
+
+    run_logger = setup_logger()
+    run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    timeframe = "5m"
+    # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
+    result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+    run_logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
+    expected_rows = lookback_days * 24 * 12 + 1
+
+    df_actual_signals_df_list = []
+    for symbol in symbol_list:
+        # 从极速引擎返回的字典中安全提取对应币种的数据
+        df_klines = result_map.get(symbol, pd.DataFrame())
+
+        # 【修改点 2】检查数据缺失并输出告警日志
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} 数据完全丢失！缺失 {expected_rows} 条数据。")
+            continue
+
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            # ================= [核心修改点] =================
+            # 提取已拿到数据的实际时间跨度，从 timestamp 毫秒时间戳安全转换为北京时间字符串
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            # ===============================================
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ 数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
+        # 提取纯币种名如 'BTC'
+        coin_name = symbol.split('/')[0]
+        df_klines['coin_name'] = coin_name
+        # [新增] 将完整的原始 symbol 存入 dataframe 中，向下游无损传递符号元数据
+        df_klines['symbol'] = symbol
+        signals, df_actual_signals = generate_multi_ma_signals(df_klines)  # 仅生成信号，不返回交易数据
+        df_actual_signals_df_list.append(df_actual_signals)
+
+    # 将df_actual_signals_df_list合并为一个DataFrame
+    if df_actual_signals_df_list:
+        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        print_top_long_latest_signals(final_signals_df, run_logger)
+        output_path = "ma_bottom_long_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        return final_signals_df
+    else:
+        run_logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
+        return pd.DataFrame()
+
 
 if __name__ == "__main__":
 
@@ -921,5 +1166,5 @@ if __name__ == "__main__":
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['BLESS/USDT:USDT']
-    execute_trading_bot_workflow_top_long(target_time, symbol_list,'http://127.0.0.1:7890')
+    symbol_list = ['MYX/USDT:USDT']
+    execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list,'http://127.0.0.1:7890')
