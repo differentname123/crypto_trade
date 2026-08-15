@@ -14,6 +14,7 @@ FILTER_CONFIG = {
     'min_profitable_coin_ratio': 0.0,  # [新增] 盈利币比例(%)最小限制，需大于该值
     'max_holding_hours': 10 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
+    'min_win_rate': 0.0,  # [新增] 胜率(%)最小限制，需大于该值
     'min_profit_loss_time_ratio': 0.99,  # 盈亏持仓时间比最小限制，需大于等于该值
     'min_profitable_quarters': 3,  # 盈利季度数最小限制，需严格大于该值
     'min_60m_avg_net_profit': 1.0  # [新增] 60m单笔平均净收益最小限制(%)，需大于该值
@@ -168,6 +169,7 @@ def generate_report():
     min_prof_coin_ratio = FILTER_CONFIG['min_profitable_coin_ratio']
     max_hours = FILTER_CONFIG['max_holding_hours']
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
+    min_win_rate = FILTER_CONFIG['min_win_rate']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
     min_profitable_quarters = FILTER_CONFIG['min_profitable_quarters']
     min_60m_avg_net = FILTER_CONFIG['min_60m_avg_net_profit']
@@ -192,6 +194,7 @@ def generate_report():
         cond_all &= (merged_df[f'亏损单平均持仓 K 线根数_{tf}'].fillna(0) * multiplier <= max_hours)
 
         cond_all &= merged_df[f'单笔平均净收益_{tf}'].fillna(-999) > min_avg_net
+        cond_all &= merged_df[f'胜率_{tf}'].fillna(0) > min_win_rate
         cond_all &= merged_df[f'盈亏持仓时间比_{tf}'].fillna(-1) >= min_pl_time_ratio
         cond_all &= merged_df[f'净盈利季度数量_{tf}'].fillna(0) > min_profitable_quarters
 
