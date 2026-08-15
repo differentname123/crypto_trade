@@ -11,6 +11,7 @@ FILTER_CONFIG = {
     'min_total_oos_trades': 30,  # 四周期样本外总交易数底线
     'max_single_coin_concentration': 40.0,  # 单币集中度(%)最大限制（大于该值则过滤）
     'max_top3_profit_concentration': 80.0,  # [新增] Top3利润占比(%)最大限制（大于该值则过滤）
+    'min_profitable_coin_ratio': 0.0,  # [新增] 盈利币比例(%)最小限制，需大于该值
     'max_holding_hours': 10 * 24,  # 盈利单与亏损单平均持仓时间(小时)最大限制
     'min_avg_net_profit': 0.2,  # 单笔平均净收益最小限制(%)，需大于该值
     'min_profit_loss_time_ratio': 0.99,  # 盈亏持仓时间比最小限制，需大于等于该值
@@ -164,6 +165,7 @@ def generate_report():
     min_trades = FILTER_CONFIG['min_total_oos_trades']
     max_conc = FILTER_CONFIG['max_single_coin_concentration']
     max_top3_conc = FILTER_CONFIG['max_top3_profit_concentration']
+    min_prof_coin_ratio = FILTER_CONFIG['min_profitable_coin_ratio']
     max_hours = FILTER_CONFIG['max_holding_hours']
     min_avg_net = FILTER_CONFIG['min_avg_net_profit']
     min_pl_time_ratio = FILTER_CONFIG['min_profit_loss_time_ratio']
@@ -180,6 +182,10 @@ def generate_report():
     for tf in tfs:
         cond_all &= merged_df[f'最优币占总净收益百分比_{tf}'].fillna(0) <= max_conc
         cond_all &= merged_df[f'Top3币种利润占总净收益百分比_{tf}'].fillna(0) <= max_top3_conc
+
+        # 盈利币比例过滤：(盈利的币数 / 产生交易的币种总数 * 100) > min_prof_coin_ratio
+        prof_coin_ratio = (merged_df[f'盈利的币数_{tf}'].fillna(0) / merged_df[f'产生交易的币种总数_{tf}'].replace(0, np.nan)) * 100
+        cond_all &= prof_coin_ratio.fillna(0) > min_prof_coin_ratio
 
         multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5 / 60.0}[tf]
         cond_all &= (merged_df[f'盈利单平均持仓 K 线根数_{tf}'].fillna(0) * multiplier <= max_hours)
