@@ -103,10 +103,10 @@ def print_row(label, vals):
 # ==========================================
 def load_and_prep_data():
     paths = {
-        '60m': './summary_results_60m/aggregated_summary_Short.csv',
-        '30m': './summary_results_30m/aggregated_summary_Short.csv',
-        '15m': './summary_results_15m/aggregated_summary_Short.csv',
-        '5m': './summary_results_5m/aggregated_summary_Short.csv'
+        '60m': './summary_results_60m/aggregated_summary_Long.csv',
+        '30m': './summary_results_30m/aggregated_summary_Long.csv',
+        '15m': './summary_results_15m/aggregated_summary_Long.csv',
+        '5m': './summary_results_5m/aggregated_summary_Long.csv'
     }
 
     dfs = {}
@@ -426,10 +426,10 @@ def query_strategy_combination(entry_name, exit_name, filter_name):
     # 1. 动态读取并精准过滤数据
     # ==========================================
     paths = {
-        '60m': './summary_results_60m/aggregated_summary_Short.csv',
-        '30m': './summary_results_30m/aggregated_summary_Short.csv',
-        '15m': './summary_results_15m/aggregated_summary_Short.csv',
-        '5m': './summary_results_5m/aggregated_summary_Short.csv'
+        '60m': './summary_results_60m/aggregated_summary_Long.csv',
+        '30m': './summary_results_30m/aggregated_summary_Long.csv',
+        '15m': './summary_results_15m/aggregated_summary_Long.csv',
+        '5m': './summary_results_5m/aggregated_summary_Long.csv'
     }
 
     dfs = []
@@ -572,4 +572,4 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore")
     generate_report()
-    # query_strategy_combination('EXIT_SHORT_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
+    # query_strategy_combination('EXIT_Long_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
