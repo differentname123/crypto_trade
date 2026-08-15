@@ -844,7 +844,7 @@ def get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url, position_
     # 一行输出详细的过滤与统计信息
     logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
-    signal_df = execute_trading_bot_workflow_top_long(target_time_str, symbol_list=final_symbol_list,
+    signal_df = execute_trading_bot_workflow_ma_bottom_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
 
