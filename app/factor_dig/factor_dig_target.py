@@ -79,11 +79,44 @@ CFG = dict(
     EXIT_PREFIX_FILTER=None,
     # 【需求1】精确筛选目标信号因子
     ENTRY_EXACT_FILTER=[
+        "ENTRY_ALWAYS_TRUE",
+    "BREAK_FAIL_LEVEL",
+    "ENTRY_BOTTOM_STABILIZE",
+    "ENTRY_VWAP_RECLAIM_OI",
+    "EXIT_FR_EXTREME_HIGH",
+    "EXIT_FR_ROLL_OVER",
+    "EXIT_FR_SPIKE_THEN_COOL",
+    "EXIT_MA_DEAD_CROSS",
     "EXIT_MULTI_MA_BREAK",
-    "ENTRY_ALWAYS_TRUE"
+    "EXIT_SHORT_SURGE_EXTREME",
+    "FR_ABSOLUTE_DEEP_NEG",
+    "FR_MILD",
+    "FR_POS_NOT_HOT",
+    "FR_ZERO_ZONE",
+    "KLINE_RED_BREAK_MA",
+    "OBV_CROSS_UP",
+    "OI_MA_CROSS_UP",
+    "VOLUME_CLIMAX_DOWN",
+    "VOLUME_HIGH_CLOSE_STRONG",
+    "VWAP_CROSS_UP"
 ],
     EXIT_EXACT_FILTER=[
-    "EXIT_MA_DEAD_CROSS"
+        "ENTRY_ALWAYS_TRUE",
+
+        "BREAKDOWN_N_LOW",             # 跌破N周期低点
+    "EXIT_BREAK_N_LOW",            # 跌破N周期低点退出
+    "EXIT_FR_SPIKE_THEN_COOL",     # 资金费率飙升后冷却退出
+    "EXIT_MA_DEAD_CROSS",          # 均线死叉退出
+    "EXIT_OI_VALUE_MA_DEAD_CROSS", # OI价值均线死叉退出
+    "EXIT_RANGE_POSITION_WEAK",    # 区间位置走弱退出
+    "FR_COLD_START",               # 冷启动费率 (用作出场条件)
+    "FR_LOW_NEG",                  # 费率低/负 (用作出场条件)
+    "FR_STABLE",                   # 费率平稳 (用作出场条件)
+    "FR_TURN_POSITIVE",            # 费率转正 (用作出场条件)
+    "FR_ZERO_ZONE",                # 费率归零 (用作出场条件)
+    "OI_MA_CROSS_UP",              # OI均线金叉 (用作出场条件)
+    "PRICE_MA_SLOPE_UP",           # 价格/均线斜率向上 (用作出场条件)
+    "VOL_NOT_EXTREME"              # 交易量非极端 (用作出场条件)
 ],
     COINS=None,
 
@@ -1486,7 +1519,7 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键，需求3修改】动态修改输出目录为debug专用目录，防止影响正常的文件
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug_test'
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
 
         # 调用主函数执行
         main(run_cfg)
