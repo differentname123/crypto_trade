@@ -1032,6 +1032,7 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
     valid_event_mask = entry_signal | exit_signal
     event_indices = df.index[valid_event_mask]
 
+    seen_first_exit = False
     actual_pos = 0  # 0: 空仓, 1: 持有多单
     actual_entry_price = 0.0
 
@@ -1068,6 +1069,12 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
             })
 
         # --- B. 记录受持仓状态机控制的实际操作信号 ---
+        if not seen_first_exit:
+            # 必须先等待第一个平仓信号触发后，后续的开仓才算数
+            if is_exit:
+                seen_first_exit = True
+            continue  # 未经历首次平仓前，直接跳过后续的实际操作判断
+
         if actual_pos == 0 and is_entry:
             actual_pos = 1
             actual_entry_price = exec_price
@@ -1099,7 +1106,6 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
     # ====================================================
     df_actual_signals = pd.DataFrame(actual_signals_list, columns=cols)
     return signals, df_actual_signals
-
 
 def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_url=None):
     """
