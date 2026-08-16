@@ -186,7 +186,8 @@ def generate_report():
         cond_all &= merged_df[f'Top3币种利润占总净收益百分比_{tf}'].fillna(0) <= max_top3_conc
 
         # 盈利币比例过滤：(盈利的币数 / 产生交易的币种总数 * 100) > min_prof_coin_ratio
-        prof_coin_ratio = (merged_df[f'盈利的币数_{tf}'].fillna(0) / merged_df[f'产生交易的币种总数_{tf}'].replace(0, np.nan)) * 100
+        prof_coin_ratio = (merged_df[f'盈利的币数_{tf}'].fillna(0) / merged_df[f'产生交易的币种总数_{tf}'].replace(0,
+                                                                                                                   np.nan)) * 100
         cond_all &= prof_coin_ratio.fillna(0) > min_prof_coin_ratio
 
         multiplier = {'60m': 1, '30m': 0.5, '15m': 0.25, '5m': 5 / 60.0}[tf]
@@ -221,6 +222,26 @@ def generate_report():
 
     # 生成 Top 50 榜单 (按新复合锚点降序排列)
     top50 = filtered_df.sort_values(by='avg_complex_score', ascending=False).head(100)
+
+    # ==========================================
+    # 保存筛选后的数据并打印日志
+    # ==========================================
+    save_path = os.path.abspath('filtered_results.csv')
+    save_df = filtered_df.copy()
+
+    # 建立反向映射，将脱敏代码还原为原始信号名称
+    inv_map = {v: k for k, v in signal_map.items()}
+    save_df['入场信号名称'] = save_df['入场信号名称'].map(lambda x: inv_map.get(x, x))
+    save_df['出场信号名称'] = save_df['出场信号名称'].map(lambda x: inv_map.get(x, x))
+
+    # 保存为 CSV
+    save_df.to_csv(save_path, index=False, encoding='utf-8-sig')
+
+    # 统计相关数量并打印日志
+    final_count = len(save_df)
+    unique_combo_count = save_df[['入场信号名称', '出场信号名称']].drop_duplicates().shape[0]
+    print(
+        f"[*] 日志: 筛选数据已保存至: {save_path} | 最终数量: {final_count} | 按照 进场信号 出场信号去重的数量: {unique_combo_count}")
 
     # ==========================================
     # 打印报告
