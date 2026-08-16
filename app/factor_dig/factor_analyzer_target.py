@@ -33,7 +33,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         original_len = len(df)
         df = df[mask].copy()
 
-
+    # 将df 按照 target_direction 过滤
+    df = df[df['direction'] == target_direction].copy()
     # ---------------------------------------------------------
     # 🌟 新增功能 2: 信号名称模糊化与保存映射
     # ---------------------------------------------------------
@@ -154,7 +155,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
 
         print("\n" + "=" * 120)
         print(f" 📊 策略表现透视面板 | 方向: {target_direction} | 入场: {entry} | 出场: {exit_factor}")
-        print(f" 🏆 综合排名: #{rank} (当前面板最佳过滤档位: {best_f} , 平均性价比: {best_score:.4f})")
+        print(f" 🏆 组合编号: #{rank} (当前面板最佳过滤档位: {best_f} , 平均性价比: {best_score:.4f})")
 
         # 🌟 新增功能 3: 高密度透视面板输出多个指定维度 (定制不同的数字格式)
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
