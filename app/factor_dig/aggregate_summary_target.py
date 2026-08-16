@@ -73,6 +73,15 @@ def process_group(g):
     # 新增: 单笔最长持仓时间 (天)
     max_hold_time_d = g['hold_time_h'].max() / 24.0
 
+    # 新增: 平均持仓时间 (天)
+    avg_hold_time_d = g['hold_time_h'].mean() / 24.0
+
+    # 新增: 持仓时间中位数 (天)
+    median_hold_time_d = g['hold_time_h'].median() / 24.0
+
+    # 新增: 持仓时间90%阈值 (天)
+    quantile_90_hold_time_d = g['hold_time_h'].quantile(0.90) / 24.0
+
     # 单位时间的资金回报率 (%/天)：总真实净收益 / 总持仓天数
     sum_hold_time_d = g['hold_time_h'].sum() / 24.0
     capital_time_ret_per_day = (sum_net_return / sum_hold_time_d) if sum_hold_time_d > 0 else np.nan
@@ -162,6 +171,9 @@ def process_group(g):
         '真实盈潜比(Ret/MAE)': true_return_mae_ratio,
 
         '单笔最长持仓(天)': max_hold_time_d,
+        '平均持仓时间(天)': avg_hold_time_d,
+        '持仓时间中位数(天)': median_hold_time_d,
+        '持仓时间90%阈值(天)': quantile_90_hold_time_d,
         '资金时间回报(%/天)': capital_time_ret_per_day,
         '平均资金暴露度(%)': avg_exposure,
         'Top1币收益占比(%)': top1_ratio,
@@ -276,13 +288,13 @@ def main():
 
     # 核心修改点：加入时间信息，生成唯一文件标识
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(OUTPUT_DIR, f'advanced_summary_combined_ALL_{timestamp}.csv')
+    out_file = os.path.join(OUTPUT_DIR, f'advanced_summary_combined_ALL.csv')
 
     final_summary.to_csv(out_file, index=False, encoding='utf-8-sig', float_format="%.4f")
     print(f"🎉 四周期深度融合统计报告已生成: {os.path.abspath(out_file)}")
 
 
 if __name__ == "__main__":
-    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL_20260816_215048.csv')
+    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL.csv')
 
     main()

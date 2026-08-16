@@ -592,5 +592,5 @@ if __name__ == "__main__":
     import warnings
 
     warnings.filterwarnings("ignore")
-    generate_report()
-    # query_strategy_combination('EXIT_Long_SURGE_EXTREME', 'FR_ZERO_ZONE', 'bottom_5')
+    # generate_report()
+    query_strategy_combination('VOLUME_CLIMAX_DOWN', 'ENTRY_SILENT_ACCUMULATION', 'bottom_3')

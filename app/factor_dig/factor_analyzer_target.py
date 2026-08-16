@@ -221,7 +221,7 @@ if __name__ == "__main__":
     print(f"{'=' * 90}")
 
     # 替换为你实际的大宽表路径
-    TARGET_CSV = './summary_results/advanced_summary_combined_ALL_20260816_215048.csv'
+    TARGET_CSV = './summary_results/advanced_summary_combined_ALL.csv'
 
     # 按照需求：分离多空，默认只展示 Long，展示前 50 名
     display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Long')
