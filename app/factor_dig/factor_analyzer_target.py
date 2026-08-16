@@ -1,156 +1,180 @@
-import os
 import pandas as pd
+import numpy as np
+import os
 
-# ================= 增加：信号脱敏映射表 =================
-# 方便外部查询和内部真实数据映射
-SIGNAL_MAPPING = {
-    "SIGNAL_001": "EXIT_MULTI_MA_BREAK",
-    "SIGNAL_002": "EXIT_MA_DEAD_CROSS",
-    "SIGNAL_003": "FR_POS_NOT_HOT",
-    "SIGNAL_004": "OI_NEW_HIGH",
-    "SIGNAL_005": "FR_ROLL_OVER_FROM_HIGH",
-    "SIGNAL_006": "EXIT_DISTRIBUTION_EXHAUSTION_TOP",
-    "SIGNAL_007": "VWAP_RECLAIM",
-    "SIGNAL_008": "FR_LOW_NEG",
-    "SIGNAL_009": "FR_RESET_AFTER_HOT",
-    "SIGNAL_010": "EXIT_SHORT_SURGE_EXTREME",
-    "SIGNAL_011": "EXIT_HIGH_VOLUME_STALL",
-    "SIGNAL_012": "FR_ZERO_ZONE",
-    "SIGNAL_013": "EXIT_VOLUME_CLIMAX"
-}
+# =====================================================================
+# 核心配置区 (新增)
+# =====================================================================
+# 过滤条件：每个周期（60m,30m,15m,5m）的交易数量都必须大于该值
+MIN_TRADES_PER_TF = 50
 
-# 反向映射表 (真实信号名 -> 脱敏信号名) 备用
-REVERSE_SIGNAL_MAPPING = {v: k for k, v in SIGNAL_MAPPING.items()}
+# 模糊化信号映射表的保存路径
+SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
 
-# =======================================================
-
-
-def show_strategy_multi_timeframe(entry_factor, exit_factor, direction,
-                                  data_path="summary_results/summary_all_intervals_combined.csv"):
+def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     """
-    展示指定策略组合在各个周期下的多维关键指标对比。
-    采用“指标透视”视角，将不同的【过滤模式(截面涨跌幅)】横向平铺对比，一目了然。
+    生成高密度的策略表现二维透视面板 (增加脱敏、多维度展示与交易次数过滤)
     """
-    if not os.path.exists(data_path):
-        print(f"❌ 找不到数据文件: {data_path}，请先运行 aggregate_results() 生成。")
+    if not os.path.exists(csv_path):
+        print(f"❌ 找不到文件: {csv_path}")
         return
 
-    # 1. 读取大表
-    df = pd.read_csv(data_path)
+    # 1. 加载数据
+    print(f"📥 正在加载并处理数据: {csv_path}...")
+    df = pd.read_csv(csv_path)
 
-    # ================= 增加：将脱敏名称还原为真实名称进行数据查询 =================
-    real_entry = SIGNAL_MAPPING.get(entry_factor, entry_factor)
-    real_exit = SIGNAL_MAPPING.get(exit_factor, exit_factor)
-
-    # 2. 筛选指定条件 (使用真实名称筛选)
-    mask = (
-            (df['方向'] == direction) &
-            (df['入场信号名称'] == real_entry) &
-            (df['出场信号名称'] == real_exit)
-    )
-    filtered_df = df[mask]
-
-    if filtered_df.empty:
+    # ---------------------------------------------------------
+    # 🌟 新增功能 1: 严格过滤交易次数
+    # ---------------------------------------------------------
+    trade_cols = [c for c in df.columns if '总交易笔数_' in c]
+    if trade_cols:
+        # fillna(0) 确保如果有周期完全没开单产生 NaN，直接算作 0 次，从而被淘汰
+        mask = df[trade_cols].fillna(0).min(axis=1) > MIN_TRADES_PER_TF
+        original_len = len(df)
+        df = df[mask].copy()
         print(
-            f"⚠️ 未找到匹配的记录: 方向={direction}, 入场={entry_factor}({real_entry}), 出场={exit_factor}({real_exit})")
+            f"⚠️ 过滤要求: [每个周期的交易笔数 > {MIN_TRADES_PER_TF}]。保留符合条件的记录: {len(df)} 条 (原 {original_len} 条)。")
+
+    # ---------------------------------------------------------
+    # 🌟 新增功能 2: 信号名称模糊化与保存映射
+    # ---------------------------------------------------------
+    # 提取所有独特的因子名称并排序以保持一致性
+    all_signals = pd.concat([df['entry_factor'], df['exit_factor']]).dropna().unique()
+    # 【修复点】：兼容 Pandas 2.0+ 的 PyArrow String Array，使用标准的 sorted + list 转换
+    all_signals = sorted(list(all_signals))
+
+    # 构建映射字典 { '原始因子名' : 'SIGNAL_001' }
+    signal_mapping = {sig: f"SIGNAL_{i:003d}" for i, sig in enumerate(all_signals, 1)}
+
+    # 保存映射表到 CSV
+    mapping_df = pd.DataFrame(list(signal_mapping.items()), columns=['Original_Signal', 'Obfuscated_Signal'])
+    os.makedirs(os.path.dirname(SIGNAL_MAPPING_FILE) or '.', exist_ok=True)
+    mapping_df.to_csv(SIGNAL_MAPPING_FILE, index=False, encoding='utf-8-sig')
+    print(f"🔒 信号名称已完成模糊化脱敏！映射对照表已保存至: {os.path.abspath(SIGNAL_MAPPING_FILE)}\n")
+
+    # 执行替换模糊化
+    df['entry_factor'] = df['entry_factor'].map(signal_mapping)
+    df['exit_factor'] = df['exit_factor'].map(signal_mapping)
+
+    # ---------------------------------------------------------
+    # 2. 识别数据中包含的周期 (例如 60m, 30m, 15m, 5m)
+    all_calmar_cols = [c for c in df.columns if '策略赚钱性价比_' in c]
+    if not all_calmar_cols:
+        print("⚠️ 数据中找不到 '策略赚钱性价比' 相关的列，请检查 CSV。")
         return
 
-    # ================= 增加：前置字段含义说明 =================
-    print(f"\n{'=' * 90}")
-    # 输出时依然保持脱敏状态
-    print(f" 📊 策略表现透视面板 | 方向: {direction} | 入场: {entry_factor} | 出场: {exit_factor}")
+    timeframes = [c.split('_')[-1] for c in all_calmar_cols]
+    std_order = ['60m', '30m', '15m', '5m']
+    timeframes = [tf for tf in std_order if tf in timeframes] + [tf for tf in timeframes if tf not in std_order]
 
-    # 3. 定义我们需要展示的核心指标
-    target_metrics = [
-        '净利润(%)',
-        '平均胜率(%)',
-        '单笔平均净利润(%)',
-        '总交易笔数'
+    # 3. 计算跨周期平均性价比，并过滤方向
+    df['avg_calmar'] = df[all_calmar_cols].mean(axis=1, skipna=True)
+    df_dir = df[df['direction'] == target_direction].copy()
+
+    if df_dir.empty:
+        print(f"⚠️ 在数据中没有找到方向为 {target_direction} 且符合交易次数要求的记录。")
+        return
+
+    # 4. 提取表现最好的 Top N 个组合 (基于单行最高平均性价比)
+    df_sorted = df_dir.sort_values(by='avg_calmar', ascending=False)
+
+    seen_pairs = set()
+    top_pairs = []
+
+    for _, row in df_sorted.iterrows():
+        pair = (row['entry_factor'], row['exit_factor'])
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            top_pairs.append({
+                'entry': row['entry_factor'],
+                'exit': row['exit_factor'],
+                'best_filter': row['filter_mode'],
+                'best_score': row['avg_calmar']
+            })
+            if len(top_pairs) >= top_n:
+                break
+
+    # 5. 定义过滤模式的严格排序（确保横向时间轴的逻辑连贯性）
+    FILTER_ORDER = [
+        'bottom_100', 'bottom_50', 'bottom_20', 'bottom_10', 'bottom_5', 'bottom_3', 'bottom_1',
+        'original',
+        'top_1', 'top_3', 'top_5', 'top_10', 'top_20', 'top_50', 'top_100'
     ]
 
-    # 4. 解析宽表，转化为长表以便透视
-    records = []
-    for _, row in filtered_df.iterrows():
-        f_mode = str(row['过滤模式']).lower()  # 统一转小写防止大小写不一致
-        for col_name, val in row.items():
-            if col_name.startswith('[') and ']' in col_name:
-                interval = col_name.split(']')[0][1:]
-                metric = col_name.split(']')[1].strip()
+    # 🌟 修改点：核心面板绘制函数增加 fmt_str 参数，用于控制不同指标的浮点小数位展现
+    def print_metric_matrix(sub_df, metric_prefix, title, fmt_str="{:.4f}"):
+        available_filters = sub_df['filter_mode'].unique()
+        # 兼容 PyArrow array 的查询方式
+        available_filters_list = list(available_filters)
+        sorted_filters = [f for f in FILTER_ORDER if f in available_filters_list]
+        sorted_filters += [f for f in available_filters_list if f not in FILTER_ORDER]
 
-                if metric in target_metrics:
-                    records.append({
-                        '周期': interval,
-                        '过滤模式': f_mode,
-                        '指标': metric,
-                        '数值': val
-                    })
+        col_widths = {}
+        for f in sorted_filters:
+            col_widths[f] = len(f)
 
-    if not records:
-        print("⚠️ 未提取到有效的指标数据。")
-        return
+        for tf in timeframes:
+            col_name = f"{metric_prefix}_{tf}"
+            if col_name in sub_df.columns:
+                for f in sorted_filters:
+                    val_series = sub_df[sub_df['filter_mode'] == f][col_name]
+                    if not val_series.empty and pd.notna(val_series.values[0]):
+                        val_str = fmt_str.format(val_series.values[0])
+                    else:
+                        val_str = "-"
+                    col_widths[f] = max(col_widths[f], len(val_str))
 
-    long_df = pd.DataFrame(records)
+        print(f"\n>> {title}")
+        print("-" * 120)
 
-    # 5. 定义【过滤模式】的自定义排序函数
-    def custom_sort_key(col_name):
-        """
-        将过滤模式映射为数字以实现正确排序:
-        bottom_100 -> -100
-        original   -> 0
-        top_50     -> 50
-        """
-        name = str(col_name).lower()
-        if name == 'original':
-            return 0
-        elif name.startswith('bottom_'):
-            try:
-                # 提取数字并转为负数，数字越大排名越靠前 (如 -100 < -50)
-                return -int(name.split('_')[1])
-            except ValueError:
-                return -0.1
-        elif name.startswith('top_'):
-            try:
-                # 提取数字并转为正数，数字越小越靠前 (在 original 之后，如 5 < 10)
-                return int(name.split('_')[1])
-            except ValueError:
-                return 0.1
-        else:
-            return 999  # 未知格式放在最后边
+        header = f"{'过滤模式':<6}" + "".join([f.rjust(col_widths[f] + 2) for f in sorted_filters])
+        print(header)
+        print("周期")
 
-    # 6. 依次生成透视表
-    for metric in target_metrics:
-        metric_df = long_df[long_df['指标'] == metric]
+        for tf in timeframes:
+            col_name = f"{metric_prefix}_{tf}"
+            if col_name not in sub_df.columns:
+                continue
 
-        # 透视：行=周期，列=过滤模式，值=具体数值
-        pivot_df = metric_df.pivot(index='周期', columns='过滤模式', values='数值')
+            row_str = f"{tf:<8}"
+            for f in sorted_filters:
+                val_series = sub_df[sub_df['filter_mode'] == f][col_name]
+                if not val_series.empty and pd.notna(val_series.values[0]):
+                    val_str = fmt_str.format(val_series.values[0])
+                else:
+                    val_str = "-"
+                row_str += val_str.rjust(col_widths[f] + 2)
+            print(row_str)
 
-        # 排序：固定周期的展示顺序 (行)
-        standard_intervals = ['60m', '30m', '15m', '5m', '1m']
-        actual_rows = [tf for tf in standard_intervals if tf in pivot_df.index]
-        actual_rows += [tf for tf in pivot_df.index if tf not in standard_intervals]
-        pivot_df = pivot_df.loc[actual_rows]
+    # 6. 循环打印每一个 Top N 的透视面板
+    print("=" * 120)
+    print(f" 🚀 终极策略透视雷达 | 默认方向: {target_direction} | Top {top_n} 强势指纹")
+    print("=" * 120)
 
-        # 排序：使用自定义函数对过滤模式排序 (列)
-        # 根据 custom_sort_key 转换后的数字从小到大排序
-        sorted_cols = sorted(pivot_df.columns, key=custom_sort_key)
-        pivot_df = pivot_df.reindex(sorted_cols, axis=1)
+    for rank, pair_info in enumerate(top_pairs, 1):
+        entry = pair_info['entry']
+        exit_factor = pair_info['exit']
+        best_f = pair_info['best_filter']
+        best_score = pair_info['best_score']
 
-        print(f"\n>> 🎯 【{metric}】 横向截面对比")
-        print("-" * 90)
-        try:
-            # 格式化输出：浮点数保留两位小数；处理缺失值为 '-'
-            formatter = lambda x: f"{x:.2f}" if pd.notnull(x) and isinstance(x, (int, float)) else (
-                "-" if pd.isnull(x) else x)
-            print(pivot_df.map(formatter).to_markdown())
-        except ImportError:
-            print(pivot_df.fillna('-').to_string())
+        sub_df = df_dir[(df_dir['entry_factor'] == entry) & (df_dir['exit_factor'] == exit_factor)]
 
-    print("\n" + "=" * 90)
+        print("\n" + "=" * 120)
+        print(f" 📊 策略表现透视面板 | 方向: {target_direction} | 入场: {entry} | 出场: {exit_factor}")
+        print(f" 🏆 综合排名: #{rank} (当前面板最佳过滤档位: {best_f} , 平均性价比: {best_score:.4f})")
+
+        # 🌟 新增功能 3: 高密度透视面板输出多个指定维度 (定制不同的数字格式)
+        print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
+        print_metric_matrix(sub_df, "真实净胜率(%)", "⚖️ 【真实净胜率(%)】 横向截面对比", "{:.2f}")
+        print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
+
+        print("=" * 120)
 
 
-# 调用示例 (可以在文件末尾加上下面的测试代码)
-# ==========================================
 if __name__ == "__main__":
     print(f"{'=' * 90}")
     print("💡 【数据维度说明】:")
@@ -162,29 +186,9 @@ if __name__ == "__main__":
     print("      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
     print(f"{'=' * 90}")
 
-    # --- 打印脱敏映射表供查询 ---
-    print("\n🔍 [脱敏信号映射表参考]:")
-    for masked_name, real_name in SIGNAL_MAPPING.items():
-        print(f"   {masked_name:<12}  <=>  {real_name}")
-    print(f"{'=' * 90}\n")
 
-    # --- 组合你列出的所有 做多 (Long) 信息并批量输出 ---
-    long_combinations = [
-        {"id": "#31", "entry": "SIGNAL_001", "exit": "SIGNAL_002", "target": "bottom_5"},
-        {"id": "#07", "entry": "SIGNAL_003", "exit": "SIGNAL_002", "target": "bottom_5"},
-        {"id": "#22", "entry": "SIGNAL_004", "exit": "SIGNAL_002", "target": "bottom_10"},
-        {"id": "#57", "entry": "SIGNAL_005", "exit": "SIGNAL_006", "target": "top_50"},
-        {"id": "#44", "entry": "SIGNAL_007", "exit": "SIGNAL_008", "target": "bottom_10"},
-        {"id": "#41", "entry": "SIGNAL_009", "exit": "SIGNAL_006", "target": "bottom_20"},
-        {"id": "无编号", "entry": "SIGNAL_010", "exit": "SIGNAL_008", "target": "bottom_10"},
-        {"id": "#08", "entry": "SIGNAL_011", "exit": "SIGNAL_012", "target": "top_5"},
-        {"id": "#14", "entry": "SIGNAL_013", "exit": "SIGNAL_008", "target": "bottom_10"}
-    ]
+    # 替换为你实际的大宽表路径
+    TARGET_CSV = './summary_results/advanced_summary_combined_ALL_20260816_215048.csv'
 
-    for combo in long_combinations:
-        print(f"\n\n\n🚀 开始执行做多组合输出 | 组合编号: {combo['id']}")
-        show_strategy_multi_timeframe(
-            entry_factor=combo['entry'],
-            exit_factor=combo['exit'],
-            direction='Long'
-        )
+    # 按照需求：分离多空，默认只展示 Long，展示前 50 名
+    display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Long')
