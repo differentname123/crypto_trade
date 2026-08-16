@@ -736,5 +736,141 @@ def main():
     print(f"\n🏆 所有设定的时间周期 ({', '.join(TIMEFRAMES)}) 全部串行聚合完毕！")
 
 
+# ==========================================
+# 6. 跨周期横向聚合 (新增：对比不同周期的数据)
+# ==========================================
+# ==========================================
+# 6. 跨周期横向聚合 (深度定制版：包含真实净收益与集中度)
+# ==========================================
+def aggregate_cross_timeframes(timeframes, directions=['Long', 'Short'], output_dir='./summary_results_CrossTF'):
+    """
+    将不同周期的聚合结果进行横向合并，方便对比查看策略在不同周期的表现。
+    新增了：总资金费率、净总收益、盈利币比例、单币集中度、Top3利润占比。
+    """
+    import os
+    import pandas as pd
+    import numpy as np
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 组合键，用于对齐不同周期的数据
+    join_keys = ['入场信号名称', '出场信号名称', '过滤模式']
+
+    for direction in directions:
+        print(f"\n🔄 正在进行 {direction} 方向的跨周期数据合并...")
+        merged_df = None
+
+        # 确保按从小到大的周期顺序进行展示 (如 5m -> 15m -> 30m -> 60m)
+        sorted_tfs = sorted(timeframes, key=lambda x: int(x.replace('m', '').replace('h', '00')))
+        sorted_tfs.reverse()
+        for tf in sorted_tfs:
+            file_path = f'./summary_results_{tf}/aggregated_summary_{direction}.csv'
+            if not os.path.exists(file_path):
+                print(f"  ⚠️ 找不到 {tf} 的汇总文件，已跳过: {file_path}")
+                continue
+
+            print(f"  读取并解析: {file_path}")
+            df = pd.read_csv(file_path)
+
+            # ==========================================
+            # 智能数据补全与列名映射 (兼容未修改的旧版数据)
+            # ==========================================
+            # 1. 补全【净收益】：若之前表格里没有"净收益"列，根据多空方向计算 (多头扣除资金费率，空头增加)
+            if '净收益' not in df.columns and '总收益' in df.columns and '总资金费率' in df.columns:
+                fr_mult = -1 if direction == 'Long' else 1
+                df['净收益'] = (df['总收益'] + fr_mult * df['总资金费率']).round(4)
+
+            # 2. 计算【盈利币比例】：(盈利的币数 / 产生交易的币种总数) * 100
+            if '盈利的币数' in df.columns and '产生交易的币种总数' in df.columns:
+                safe_total_coins = df['产生交易的币种总数'].replace(0, np.nan)
+                df['盈利币比例(%)'] = (df['盈利的币数'] / safe_total_coins * 100).round(2).fillna(0.0)
+
+            # 3. 将原表过长的列名映射为你要求的清爽名称
+            rename_mapping = {
+                '最优币占总净收益百分比': '单币集中度(%)',
+                'Top3币种利润占总净收益百分比': 'Top3利润占比(%)'
+            }
+            df.rename(columns=rename_mapping, inplace=True)
+
+            # ==========================================
+            # 筛选核心对比指标
+            # ==========================================
+            # ==========================================
+            # 筛选核心对比指标
+            # ==========================================
+            core_metrics = [
+                '净收益',  # 扣减费率后的真实总利润
+                '总资金费率',
+                '总交易数',
+                '胜率',
+                '单笔平均净收益',
+                '全局最大回撤',
+                '产生交易的币种总数',  # ⬅️ 恢复：总共做过的币种数量
+                '盈利的币数',  # ⬅️ 恢复：最后赚钱的币种数量
+                '盈利币比例(%)',  # 新增：健康度诊断
+                '单币集中度(%)',  # 新增：防过拟合指标
+                'Top3利润占比(%)'
+            ]
+
+            exist_metrics = [c for c in core_metrics if c in df.columns]
+            df_sub = df[join_keys + exist_metrics].copy()
+
+            # 给指标列加上周期前缀，例如 "净收益" -> "[5m]净收益"
+            rename_dict = {col: f"[{tf}]{col}" for col in exist_metrics}
+            df_sub.rename(columns=rename_dict, inplace=True)
+
+            # 执行外连接合并 (Outer Join)
+            if merged_df is None:
+                merged_df = df_sub
+            else:
+                merged_df = pd.merge(merged_df, df_sub, on=join_keys, how='outer')
+
+        if merged_df is not None and not merged_df.empty:
+            # 填充 NaN：外连接会导致某个周期没触发交易的策略出现 NaN
+            merged_df[join_keys] = merged_df[join_keys].fillna('None')
+            merged_df = merged_df.fillna(0.0)
+
+            # ==========================================
+            # 计算【全周期总览】指标
+            # ==========================================
+            net_ret_cols = [c for c in merged_df.columns if c.endswith(']净收益')]
+            fr_cols = [c for c in merged_df.columns if c.endswith(']总资金费率')]
+            trades_cols = [c for c in merged_df.columns if c.endswith(']总交易数')]
+
+            if net_ret_cols:
+                merged_df['【全周期】净总收益'] = merged_df[net_ret_cols].sum(axis=1).round(4)
+            if fr_cols:
+                merged_df['【全周期】总资金费率'] = merged_df[fr_cols].sum(axis=1).round(4)
+            if trades_cols:
+                merged_df['【全周期】总交易数'] = merged_df[trades_cols].sum(axis=1).astype(int)
+
+            # 根据全周期的净总收益进行降序排名 (剔除只在单周期表现好的过拟合策略)
+            if '【全周期】净总收益' in merged_df.columns:
+                merged_df.sort_values('【全周期】净总收益', ascending=False, inplace=True, ignore_index=True)
+
+            # 整理列顺序：主键(最左) -> 全周期总结(中) -> 各周期明细(右侧排开)
+            front_cols = join_keys + [c for c in merged_df.columns if '【全周期】' in c]
+            other_cols = [c for c in merged_df.columns if c not in front_cols]
+            merged_df = merged_df[front_cols + other_cols]
+
+            # 导出 CSV 文件
+            out_path = os.path.join(output_dir, f'cross_timeframe_compare_{direction}.csv')
+            merged_df.to_csv(out_path, index=False, encoding='utf-8-sig')
+            print(f"✅ {direction} 方向跨周期聚合完成！已保存至: {out_path}")
+        else:
+            print(f"❌ 未找到任何 {direction} 方向的可合并数据。")
+
 if __name__ == '__main__':
-    main()
+
+    # main()
+    try:
+        df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results_CrossTF\cross_timeframe_compare_Long.csv')
+    except Exception:
+        pass  # 防止没文件时在开头报错阻断程序执行
+
+    aggregate_cross_timeframes(
+        timeframes=TIMEFRAMES,
+        directions=['Long', 'Short'],
+        output_dir='./summary_results_CrossTF'
+    )
+

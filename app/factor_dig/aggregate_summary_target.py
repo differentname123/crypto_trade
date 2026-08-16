@@ -183,7 +183,7 @@ if __name__ == "__main__":
         pass  # 防止没文件时在开头报错阻断程序执行
 
     # 设定你要跑的所有周期，以及输出目录
-    target_intervals = ['60m', '30m', '15m', '5m', '1m']
+    target_intervals = ['60m', '30m', '15m', '5m']
     output_directory = "summary_results"
 
     # input_dir_template 占位符 {} 会在循环中被替换为 '60m', '30m' 等
