@@ -118,6 +118,15 @@ def process_group(g):
         if concurrency > max_concurrency:
             max_concurrency = concurrency
 
+    # ---------------------------------------------------------
+    # 🏆 终极指标：策略赚钱性价比 (Calmar Ratio)
+    # ---------------------------------------------------------
+    if curve_maxdd > 1e-8:
+        strategy_cost_effectiveness = sum_net_return / curve_maxdd
+    else:
+        # 应对极其罕见的“零回撤一直赚钱”情况，赋予一个极高值
+        strategy_cost_effectiveness = 999.0 if sum_net_return > 0 else 0.0
+
     # 返回打包结果 (均已完成要求的格式化调整)
     return pd.Series({
         '总交易笔数': total_trades,
@@ -145,9 +154,10 @@ def process_group(g):
         '策略组合资金最大回撤(%)': curve_maxdd,
         '最大回撤历时(天)': maxdd_duration_d,
         '最大回撤历时占比(%)': maxdd_duration_ratio,
-        '最大并发持仓数': max_concurrency
-    })
+        '最大并发持仓数': max_concurrency,
 
+        '策略赚钱性价比': strategy_cost_effectiveness
+    })
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
