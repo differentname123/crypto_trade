@@ -9,10 +9,10 @@ import datetime  # 新增：用于生成带有时间戳的文件名
 # =====================================================================
 # 修改点：使用字典明确指定多周期及其对应的目录，避免 split 解析错误
 INPUT_DIRS_MAP = {
-    '60m': './factor_out_60m_debug',
-    '30m': './factor_out_30m_debug',
-    '15m': './factor_out_15m_debug',
-    '5m': './factor_out_5m_debug'
+    '60m': './factor_out_60m_debugtest',
+    '30m': './factor_out_30m_debugtest',
+    '15m': './factor_out_15m_debugtest',
+    '5m': './factor_out_5m_debugtest'
 }
 # 汇总结果保存目录
 OUTPUT_DIR = './summary_results'
