@@ -21,7 +21,6 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         return
 
     # 1. 加载数据
-    print(f"📥 正在加载并处理数据: {csv_path}...")
     df = pd.read_csv(csv_path)
 
     # ---------------------------------------------------------
@@ -33,8 +32,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         mask = df[trade_cols].fillna(0).min(axis=1) > MIN_TRADES_PER_TF
         original_len = len(df)
         df = df[mask].copy()
-        print(
-            f"⚠️ 过滤要求: [每个周期的交易笔数 > {MIN_TRADES_PER_TF}]。保留符合条件的记录: {len(df)} 条 (原 {original_len} 条)。")
+
 
     # ---------------------------------------------------------
     # 🌟 新增功能 2: 信号名称模糊化与保存映射
@@ -51,7 +49,6 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     mapping_df = pd.DataFrame(list(signal_mapping.items()), columns=['Original_Signal', 'Obfuscated_Signal'])
     os.makedirs(os.path.dirname(SIGNAL_MAPPING_FILE) or '.', exist_ok=True)
     mapping_df.to_csv(SIGNAL_MAPPING_FILE, index=False, encoding='utf-8-sig')
-    print(f"🔒 信号名称已完成模糊化脱敏！映射对照表已保存至: {os.path.abspath(SIGNAL_MAPPING_FILE)}\n")
 
     # 执行替换模糊化
     df['entry_factor'] = df['entry_factor'].map(signal_mapping)
@@ -146,11 +143,6 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
                     val_str = "-"
                 row_str += val_str.rjust(col_widths[f] + 2)
             print(row_str)
-
-    # 6. 循环打印每一个 Top N 的透视面板
-    print("=" * 120)
-    print(f" 🚀 终极策略透视雷达 | 默认方向: {target_direction} | Top {top_n} 强势指纹")
-    print("=" * 120)
 
     for rank, pair_info in enumerate(top_pairs, 1):
         entry = pair_info['entry']
