@@ -295,6 +295,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL.csv')
+    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL.csv')
 
     main()
