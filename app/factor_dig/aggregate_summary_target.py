@@ -2,14 +2,18 @@ import os
 import glob
 import pandas as pd
 import numpy as np
+import datetime  # 新增：用于生成带有时间戳的文件名
 
 # =====================================================================
 # 核心配置区
 # =====================================================================
-# 你的交易记录目录列表 (可以根据实际情况添加或修改)
-INPUT_DIRS = [
-    './factor_out_60m_debug'
-]
+# 修改点：使用字典明确指定多周期及其对应的目录，避免 split 解析错误
+INPUT_DIRS_MAP = {
+    '60m': './factor_out_60m_debug',
+    '30m': './factor_out_30m_debug',
+    '15m': './factor_out_15m_debug',
+    '5m': './factor_out_5m_debug'
+}
 # 汇总结果保存目录
 OUTPUT_DIR = './summary_results'
 
@@ -175,12 +179,14 @@ def process_group(g):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    for input_dir in INPUT_DIRS:
+    all_summaries = []  # 存储所有周期的测算结果，用于最终聚合合并
+    groupby_keys = ['entry_factor', 'exit_factor', 'direction', 'filter_mode']
+
+    # 核心修改点：遍历 60m, 30m, 15m, 5m 等多周期目录
+    for timeframe, input_dir in INPUT_DIRS_MAP.items():
         if not os.path.exists(input_dir):
             print(f"⚠️ 找不到目录: {input_dir}，跳过...")
             continue
-
-        timeframe = input_dir.split('_')[-1]
 
         file_pattern = os.path.join(input_dir, 'trades_*.csv.gz')
         trade_files = glob.glob(file_pattern)
@@ -203,7 +209,7 @@ def main():
             continue
 
         df_all = pd.concat(df_list, ignore_index=True)
-        print(f"✅ 数据加载完毕。总记录数: {len(df_all)}。正在执行预处理...")
+        print(f"✅ {timeframe} 数据加载完毕。总记录数: {len(df_all)}。正在执行预处理...")
 
         # ---------------------------------------------------------
         # 🟢 第0步：数据预处理（前置逻辑）
@@ -225,24 +231,55 @@ def main():
         # ---------------------------------------------------------
         # ⚡ 核心聚合运算
         # ---------------------------------------------------------
-        groupby_keys = ['entry_factor', 'exit_factor', 'direction', 'filter_mode']
-
         # [优化] 结构级核心降维：在拆组前，对全量数据完成一次全局预排序
         df_all.sort_values(by=groupby_keys + ['exit_time'], inplace=True)
 
-        print(f"⏳ 正在按策略指纹 {groupby_keys} 聚合并测算高阶指标，这可能需要一点时间...")
+        print(f"⏳ 正在按策略指纹聚合并测算 {timeframe} 的高阶指标...")
 
-        # =========================================================
-        # 核心修改点：务必加上 observed=True，否则 Pandas 会产生巨量内存爆炸
-        # =========================================================
+        # 务必加上 observed=True，否则 Pandas 会产生巨量内存爆炸
         summary = df_all.groupby(groupby_keys, group_keys=False, observed=True).apply(process_group).reset_index()
 
-        # 按 '总真实净收益(%)' 和 '真实盈潜比' 降序排列
-        summary.sort_values(by=['总真实净收益(%)', '真实盈潜比(Ret/MAE)'], ascending=[False, False], inplace=True)
+        # 修改点：为了最终大宽表能够横向对比，给所有的指标列重命名，带上周期后缀 (如: _60m)
+        rename_dict = {col: f"{col}_{timeframe}" for col in summary.columns if col not in groupby_keys}
+        summary.rename(columns=rename_dict, inplace=True)
 
-        out_file = os.path.join(OUTPUT_DIR, f'advanced_summary_{timeframe}.csv')
-        summary.to_csv(out_file, index=False, encoding='utf-8-sig', float_format="%.4f")
-        print(f"🎉 {timeframe} 深度统计报告已生成: {os.path.abspath(out_file)}")
+        all_summaries.append(summary)
+
+    # ---------------------------------------------------------
+    # 🔗 多周期数据终极聚合连接 (Outer Join)
+    # ---------------------------------------------------------
+    if not all_summaries:
+        print("\n⚠️ 没有任何周期数据被成功处理，退出。")
+        return
+
+    print("\n✨ 正在进行多周期策略大融合 (横向拼接宽表)...")
+    final_summary = all_summaries[0]
+    for i in range(1, len(all_summaries)):
+        final_summary = pd.merge(final_summary, all_summaries[i], on=groupby_keys, how='outer')
+
+    # 按 '总真实净收益(%)' 和 '真实盈潜比' 降序排列 (优先依据 60m 的表现排序，如果 60m 缺失则选第一个找到的周期)
+    sort_cols = []
+    ascending_flags = []
+    if '总真实净收益(%)_60m' in final_summary.columns:
+        sort_cols.extend(['总真实净收益(%)_60m', '真实盈潜比(Ret/MAE)_60m'])
+        ascending_flags.extend([False, False])
+    else:
+        # Fallback：寻找存在的 '总真实净收益' 列进行排序
+        fallback_ret = [c for c in final_summary.columns if '总真实净收益(%)' in c]
+        fallback_mae = [c for c in final_summary.columns if '真实盈潜比(Ret/MAE)' in c]
+        if fallback_ret and fallback_mae:
+            sort_cols.extend([fallback_ret[0], fallback_mae[0]])
+            ascending_flags.extend([False, False])
+
+    if sort_cols:
+        final_summary.sort_values(by=sort_cols, ascending=ascending_flags, inplace=True)
+
+    # 核心修改点：加入时间信息，生成唯一文件标识
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_file = os.path.join(OUTPUT_DIR, f'advanced_summary_combined_ALL_{timestamp}.csv')
+
+    final_summary.to_csv(out_file, index=False, encoding='utf-8-sig', float_format="%.4f")
+    print(f"🎉 四周期深度融合统计报告已生成: {os.path.abspath(out_file)}")
 
 
 if __name__ == "__main__":

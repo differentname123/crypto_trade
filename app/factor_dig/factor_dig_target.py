@@ -82,41 +82,12 @@ CFG = dict(
         "ENTRY_ALWAYS_TRUE",
     "BREAK_FAIL_LEVEL",
     "ENTRY_BOTTOM_STABILIZE",
-    "ENTRY_VWAP_RECLAIM_OI",
-    "EXIT_FR_EXTREME_HIGH",
-    "EXIT_FR_ROLL_OVER",
-    "EXIT_FR_SPIKE_THEN_COOL",
-    "EXIT_MA_DEAD_CROSS",
-    "EXIT_MULTI_MA_BREAK",
-    "EXIT_SHORT_SURGE_EXTREME",
-    "FR_ABSOLUTE_DEEP_NEG",
-    "FR_MILD",
-    "FR_POS_NOT_HOT",
-    "FR_ZERO_ZONE",
-    "KLINE_RED_BREAK_MA",
-    "OBV_CROSS_UP",
-    "OI_MA_CROSS_UP",
-    "VOLUME_CLIMAX_DOWN",
-    "VOLUME_HIGH_CLOSE_STRONG",
-    "VWAP_CROSS_UP"
 ],
     EXIT_EXACT_FILTER=[
         "ENTRY_ALWAYS_TRUE",
 
         "BREAKDOWN_N_LOW",             # 跌破N周期低点
     "EXIT_BREAK_N_LOW",            # 跌破N周期低点退出
-    "EXIT_FR_SPIKE_THEN_COOL",     # 资金费率飙升后冷却退出
-    "EXIT_MA_DEAD_CROSS",          # 均线死叉退出
-    "EXIT_OI_VALUE_MA_DEAD_CROSS", # OI价值均线死叉退出
-    "EXIT_RANGE_POSITION_WEAK",    # 区间位置走弱退出
-    "FR_COLD_START",               # 冷启动费率 (用作出场条件)
-    "FR_LOW_NEG",                  # 费率低/负 (用作出场条件)
-    "FR_STABLE",                   # 费率平稳 (用作出场条件)
-    "FR_TURN_POSITIVE",            # 费率转正 (用作出场条件)
-    "FR_ZERO_ZONE",                # 费率归零 (用作出场条件)
-    "OI_MA_CROSS_UP",              # OI均线金叉 (用作出场条件)
-    "PRICE_MA_SLOPE_UP",           # 价格/均线斜率向上 (用作出场条件)
-    "VOL_NOT_EXTREME"              # 交易量非极端 (用作出场条件)
 ],
     COINS=None,
 
@@ -1141,8 +1112,18 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 stats['skip_same_factor'] += 1
                 continue
 
-            # 累加理论测试次数：静态出场测多空(×2)
-            multiplier = 2
+            # 【新增】组合及方向精确过滤
+            valid_long = (en, xn) in cfg.get('TARGET_LONG_PAIRS', set())
+            valid_short = (en, xn) in cfg.get('TARGET_SHORT_PAIRS', set())
+
+            # 如果既不在做多列表，也不在做空列表，则彻底跳过
+            if not valid_long and not valid_short:
+                continue
+
+            # 累加理论测试次数：根据实际需要测试的方向累加
+            multiplier = 0
+            if valid_long: multiplier += 1
+            if valid_short: multiplier += 1
             theoretical_tests += multiplier * len(FILTER_MODES)
 
             xidx = idx_cache[xn]
@@ -1155,9 +1136,9 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 if e_arr.size == 0:
                     if has_orig:
                         stats['skip_zero_trades'] += 1
-                        stats['skip_too_few'] += 2 * (n_lab - 1)
+                        stats['skip_too_few'] += multiplier * (n_lab - 1)
                     else:
-                        stats['skip_too_few'] += 2 * n_lab
+                        stats['skip_too_few'] += multiplier * n_lab
                     continue
 
                 if HAS_NUMBA:
@@ -1168,9 +1149,9 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 if ent.size == 0:
                     if has_orig:
                         stats['skip_zero_trades'] += 1
-                        stats['skip_too_few'] += 2 * (n_lab - 1)
+                        stats['skip_too_few'] += multiplier * (n_lab - 1)
                     else:
-                        stats['skip_too_few'] += 2 * n_lab
+                        stats['skip_too_few'] += multiplier * n_lab
                     continue
 
                 # 【新增】每笔资金费率之和：左闭右开真实持仓区间 -> bar 索引 (e, x]
@@ -1186,8 +1167,14 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                 rets_short = 1.0 - (exec_px[ext] / exec_px[ent]) - cost
                 ok_s = np.isfinite(rets_short)
 
-                for direction, okm, rets_all in (('Long', ok_l, rets_long),
-                                                 ('Short', ok_s, rets_short)):
+                # 【修改】只循环当前组合需要的方向
+                directions_to_test = []
+                if valid_long:
+                    directions_to_test.append(('Long', ok_l, rets_long))
+                if valid_short:
+                    directions_to_test.append(('Short', ok_s, rets_short))
+
+                for direction, okm, rets_all in directions_to_test:
                     ent_f = ent[okm]
                     ext_f = ext[okm]
                     rets_f = rets_all[okm]
@@ -1235,22 +1222,22 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                             for k_, v_ in row.items():
                                 col_data[k_].append(v_)
 
-                        # 【新增】记录单笔交易详情（带入最大回撤）
-                        for i in range(len(ent_f)):
-                            trade_records.append({
-                                'coin': coin,
-                                'entry_factor': en,
-                                'exit_factor': xn,
-                                'direction': direction,
-                                'filter_mode': lab,
-                                'entry_time': df_times[ent_f[i]],
-                                'exit_time': df_times[ext_f[i]],
-                                'entry_price': exec_px[ent_f[i]],
-                                'exit_price': exec_px[ext_f[i]],
-                                'return': rets_f[i],
-                                'max_drawdown': mdds[i],
-                                'fr_sum': fr_f[i]
-                            })
+                    # 【新增】记录单笔交易详情（带入最大回撤）
+                    for i in range(len(ent_f)):
+                        trade_records.append({
+                            'coin': coin,
+                            'entry_factor': en,
+                            'exit_factor': xn,
+                            'direction': direction,
+                            'filter_mode': lab,
+                            'entry_time': df_times[ent_f[i]],
+                            'exit_time': df_times[ext_f[i]],
+                            'entry_price': exec_px[ent_f[i]],
+                            'exit_price': exec_px[ext_f[i]],
+                            'return': rets_f[i],
+                            'max_drawdown': mdds[i],
+                            'fr_sum': fr_f[i]
+                        })
 
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
     df_trades = pd.DataFrame(trade_records) if trade_records else pd.DataFrame()
@@ -1292,8 +1279,8 @@ def mine_symbol_wrapper(args):
     try:
         df = load_symbol(os.path.join(cfg['DATA_DIR'], kf), oi_f, fr_f, cfg['BAR_MINUTES'])
         # if len(df) < 800:
-        #     # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
-        #     return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
+        #      # 统一返回 7 个元素，前两个 0 分别代表 valid_combos, total_saved_trades
+        #      return kf, coin, 0, 0, {'total_combos': 0}, 0, "bar 数不足"
 
         pairs, stats, kline_days, df_trades = mine_symbol(coin, df, cfg, _BTC_CLOSE)
 
@@ -1503,9 +1490,28 @@ def main(cfg=CFG):
 
 if __name__ == '__main__':
     import copy
+    import pandas as pd
+    import os
+
+    # 【新增】读取目标组合文件，并去重
+    target_long_pairs = set()
+    if os.path.exists('filtered_long.csv'):
+        df_long = pd.read_csv('filtered_long.csv')
+        if '入场信号名称' in df_long.columns and '出场信号名称' in df_long.columns:
+            target_long_pairs = set(zip(df_long['入场信号名称'], df_long['出场信号名称']))
+
+    target_short_pairs = set()
+    if os.path.exists('filtered_short.csv'):
+        df_short = pd.read_csv('filtered_short.csv')
+        if '入场信号名称' in df_short.columns and '出场信号名称' in df_short.columns:
+            target_short_pairs = set(zip(df_short['入场信号名称'], df_short['出场信号名称']))
+
+    # 获取包含这些组合的所有独立入场/出场信号，注入到全局过滤名单中，避免计算多余无关因子
+    all_entries = list(set([p[0] for p in target_long_pairs] + [p[0] for p in target_short_pairs]))
+    all_exits = list(set([p[1] for p in target_long_pairs] + [p[1] for p in target_short_pairs]))
 
     # 定义你需要运行的周期列表
-    target_bar_minutes = [1, 5, 15, 30, 60]
+    target_bar_minutes = [5, 15, 30, 60]
     target_bar_minutes.reverse()
     for bm in target_bar_minutes:
         print(f"\n\n" + "★" * 78)
@@ -1519,7 +1525,13 @@ if __name__ == '__main__':
         run_cfg['BAR_MINUTES'] = bm
 
         # 【关键，需求3修改】动态修改输出目录为debug专用目录，防止影响正常的文件
-        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debug'
+        run_cfg['OUT_DIR'] = f'./factor_out_{bm}m_debugtest'
+
+        # 【新增】注入指定的组合以及因子过滤名单
+        run_cfg['TARGET_LONG_PAIRS'] = target_long_pairs
+        run_cfg['TARGET_SHORT_PAIRS'] = target_short_pairs
+        run_cfg['ENTRY_EXACT_FILTER'] = all_entries
+        run_cfg['EXIT_EXACT_FILTER'] = all_exits
 
         # 调用主函数执行
         main(run_cfg)
