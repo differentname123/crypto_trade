@@ -18,8 +18,9 @@ def process_group(g):
     """
     对单个策略组合 (entry, exit, direction, filter_mode) 进行高阶指标测算
     """
-    # 确保按出场时间排序，用于资金曲线和生命周期分析
-    g_sorted = g.sort_values('exit_time').reset_index(drop=True)
+    # [优化] 核心算力降维：由于外部已经完成了全局预排序，这里直接去掉了极其耗时的 sort_values，
+    # 仅保留 reset_index 用于确保后续的索引是连续的。
+    g_sorted = g.reset_index(drop=True)
 
     # ---------------------------------------------------------
     # ⏱️ 预计算策略全局时间跨度
@@ -42,7 +43,12 @@ def process_group(g):
     true_win_rate = (g['net_return'] > 0).mean() * 100
     avg_net_return = g['net_return'].mean() * 100
 
-    coin_rets = g.groupby('coin')['net_return'].sum()
+    # [优化] 框架级降维：将后续需要计算的收益和暴露度(时长)的两次 groupby 合并为一次执行。
+    # observed=True 配合分类变量使用，避免生成无意义的空分类维度。
+    coin_agg = g.groupby('coin', observed=True)[['net_return', 'hold_time_h']].sum()
+    coin_rets = coin_agg['net_return']
+    coin_hold_hours = coin_agg['hold_time_h']
+
     unique_coins = len(coin_rets)
     true_win_coins = (coin_rets > 0).sum()
     true_coin_win_rate = (true_win_coins / unique_coins * 100) if unique_coins > 0 else 0.0
@@ -69,17 +75,15 @@ def process_group(g):
 
     # 新增: 平均资金暴露度 (%)
     if strategy_lifetime_h > 0:
-        # 单币种持仓总时长 / 策略总生命周期 = 各币种自身的暴露度
-        coin_hold_hours = g.groupby('coin')['hold_time_h'].sum()
+        # 使用合并聚合计算得出的 coin_hold_hours
         coin_exposures = coin_hold_hours / strategy_lifetime_h
         avg_exposure = coin_exposures.mean() * 100
     else:
         avg_exposure = 0.0
 
-    # Top1 / Top3 收益集中度 (%)
-    coin_rets_sorted = coin_rets.sort_values(ascending=False)
-    top1_ret = coin_rets_sorted.iloc[0] * 100 if len(coin_rets_sorted) > 0 else 0.0
-    top3_ret = coin_rets_sorted.head(3).sum() * 100 if len(coin_rets_sorted) > 0 else 0.0
+    # [优化] 算法小降维：直接使用 max 和 nlargest 替代对全 Series 的 sort_values
+    top1_ret = coin_rets.max() * 100 if len(coin_rets) > 0 else 0.0
+    top3_ret = coin_rets.nlargest(3).sum() * 100 if len(coin_rets) > 0 else 0.0
 
     top1_ratio = (top1_ret / sum_net_return * 100) if sum_net_return > 0 else np.nan
     top3_ratio = (top3_ret / sum_net_return * 100) if sum_net_return > 0 else np.nan
@@ -88,35 +92,43 @@ def process_group(g):
     # 🌊 第五组：时序与并发指标（Portfolio 级）
     # ---------------------------------------------------------
     # 1. 策略级资金曲线最大回撤 & 持续时间
-    cum_eq = g_sorted['net_return'].cumsum() * 100  # 乘以100化为百分比幅度
-    running_max = cum_eq.cummax()
+    # [优化] 底层级降维：提取 .values 使用 numpy 高速计算累加与回撤
+    net_rets_arr = g_sorted['net_return'].values
+    exit_times_arr = g_sorted['exit_time'].values
+
+    cum_eq = np.cumsum(net_rets_arr) * 100
+    running_max = np.maximum.accumulate(cum_eq)
     drawdowns = running_max - cum_eq
-    curve_maxdd = drawdowns.max()
+    curve_maxdd = drawdowns.max() if len(drawdowns) > 0 else 0.0
 
     maxdd_duration_d = 0.0
     if curve_maxdd > 1e-8:
-        # 找到最大回撤落底时刻
-        trough_idx = drawdowns.idxmax()
-        trough_time = g_sorted.loc[trough_idx, 'exit_time']
-        # 找到引发该次下跌的最高峰时刻（在底谷之前最高点）
-        peak_idx = cum_eq.loc[:trough_idx].idxmax()
-        peak_time = g_sorted.loc[peak_idx, 'exit_time']
-        # 修改为天
-        maxdd_duration_d = (trough_time - peak_time).total_seconds() / 86400.0
+        # 找到底谷和前置最高峰的索引，避免使用耗时的 .loc
+        trough_idx = np.argmax(drawdowns)
+        trough_time = exit_times_arr[trough_idx]
+
+        peak_idx = np.argmax(cum_eq[:trough_idx + 1])
+        peak_time = exit_times_arr[peak_idx]
+
+        # 使用 numpy 时差格式直接提取出天数浮点值
+        maxdd_duration_d = float((trough_time - peak_time) / np.timedelta64(1, 'D'))
 
     # 最大回撤时间占比 (%)
     maxdd_duration_ratio = (maxdd_duration_d / (strategy_lifetime_h / 24.0) * 100) if strategy_lifetime_h > 0 else 0.0
 
     # 2. 最大并发持仓数量
-    events = [(t, 1) for t in g['entry_time']] + [(t, -1) for t in g['exit_time']]
-    events.sort(key=lambda x: (x[0], x[1]))
+    # [优化] 底层级降维：消灭原生 for 循环，全面改用 numpy 数组切片与累加。
+    # 且 lexsort 处理时间冲突时，出场（-1）天生优先于入场（1），严格符合原始业务逻辑。
+    entry_times = g['entry_time'].values
+    exit_times = exit_times_arr  # 借用上方已有的数组
 
-    concurrency = 0
-    max_concurrency = 0
-    for _, val in events:
-        concurrency += val
-        if concurrency > max_concurrency:
-            max_concurrency = concurrency
+    times = np.concatenate([entry_times, exit_times])
+    weights = np.concatenate([np.ones(len(entry_times), dtype=np.int8),
+                              -np.ones(len(exit_times), dtype=np.int8)])
+
+    sort_idx = np.lexsort((weights, times))
+    concurrencies = np.cumsum(weights[sort_idx])
+    max_concurrency = concurrencies.max() if len(concurrencies) > 0 else 0
 
     # ---------------------------------------------------------
     # 🏆 终极指标：策略赚钱性价比 (Calmar Ratio)
@@ -159,6 +171,7 @@ def process_group(g):
         '策略赚钱性价比': strategy_cost_effectiveness
     })
 
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -198,6 +211,12 @@ def main():
         df_all['entry_time'] = pd.to_datetime(df_all['entry_time'])
         df_all['exit_time'] = pd.to_datetime(df_all['exit_time'])
 
+        # [优化] 内存与速度双赢：将字符串分组键与币种转为 Category 类型
+        category_cols = ['entry_factor', 'exit_factor', 'direction', 'filter_mode', 'coin']
+        for col in category_cols:
+            if col in df_all.columns:
+                df_all[col] = df_all[col].astype('category')
+
         is_long = df_all['direction'] == 'Long'
         df_all['fr_impact'] = np.where(is_long, -df_all['fr_sum'], df_all['fr_sum'])
         df_all['net_return'] = df_all['return'] + df_all['fr_impact']
@@ -207,9 +226,16 @@ def main():
         # ⚡ 核心聚合运算
         # ---------------------------------------------------------
         groupby_keys = ['entry_factor', 'exit_factor', 'direction', 'filter_mode']
+
+        # [优化] 结构级核心降维：在拆组前，对全量数据完成一次全局预排序
+        df_all.sort_values(by=groupby_keys + ['exit_time'], inplace=True)
+
         print(f"⏳ 正在按策略指纹 {groupby_keys} 聚合并测算高阶指标，这可能需要一点时间...")
 
-        summary = df_all.groupby(groupby_keys, group_keys=False).apply(process_group).reset_index()
+        # =========================================================
+        # 核心修改点：务必加上 observed=True，否则 Pandas 会产生巨量内存爆炸
+        # =========================================================
+        summary = df_all.groupby(groupby_keys, group_keys=False, observed=True).apply(process_group).reset_index()
 
         # 按 '总真实净收益(%)' 和 '真实盈潜比' 降序排列
         summary.sort_values(by=['总真实净收益(%)', '真实盈潜比(Ret/MAE)'], ascending=[False, False], inplace=True)
