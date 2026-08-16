@@ -1,194 +1,213 @@
 import os
 import glob
-import numpy as np
 import pandas as pd
-from functools import reduce  # 新增：用于多个周期的 DataFrame 合并
+import numpy as np
+
+# =====================================================================
+# 核心配置区
+# =====================================================================
+# 你的交易记录目录列表 (可以根据实际情况添加或修改)
+INPUT_DIRS = [
+    './factor_out_60m_debug'
+]
+# 汇总结果保存目录
+OUTPUT_DIR = './summary_results'
 
 
-def aggregate_results(intervals=['60m', '30m', '15m', '5m', '1m'], input_dir_template="factor_out_{}_debug",
-                      output_dir="summary_results"):
-    # 1. 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
+def process_group(g):
+    """
+    对单个策略组合 (entry, exit, direction, filter_mode) 进行高阶指标测算
+    """
+    # 确保按出场时间排序，用于资金曲线和生命周期分析
+    g_sorted = g.sort_values('exit_time').reset_index(drop=True)
 
-    # 用于保存每个周期合并多空后的 DataFrame，以便最后做跨周期大聚合
-    interval_dfs_dict = {}
+    # ---------------------------------------------------------
+    # ⏱️ 预计算策略全局时间跨度
+    # ---------------------------------------------------------
+    # 策略生命周期（从该组合产生第一笔入场 到 最后一笔出场跨越的总小时数）
+    strategy_lifetime_h = (g_sorted['exit_time'].max() - g_sorted['entry_time'].min()).total_seconds() / 3600.0
 
-    for interval in intervals:
-        input_dir = input_dir_template.format(interval)
+    # ---------------------------------------------------------
+    # 📊 第一组：规模与收益类指标 (* 100 转 %)
+    # ---------------------------------------------------------
+    total_trades = len(g)
+    sum_return = g['return'].sum() * 100
+    sum_fr_impact = g['fr_impact'].sum() * 100
+    sum_net_return = g['net_return'].sum() * 100
 
-        # 2. 匹配输入目录下所有的 pairs_*.csv.gz 文件
-        file_pattern = os.path.join(input_dir, "pairs_*.csv.gz")
-        files = glob.glob(file_pattern)
+    # ---------------------------------------------------------
+    # 🎯 第二组：胜率与质量类指标 (* 100 转 %)
+    # ---------------------------------------------------------
+    win_rate = (g['return'] > 0).mean() * 100
+    true_win_rate = (g['net_return'] > 0).mean() * 100
+    avg_net_return = g['net_return'].mean() * 100
 
-        if not files:
-            print(f"⚠️ 在目录 '{input_dir}' 下未找到任何 pairs_*.csv.gz 文件，跳过 {interval} 周期！")
+    coin_rets = g.groupby('coin')['net_return'].sum()
+    unique_coins = len(coin_rets)
+    true_win_coins = (coin_rets > 0).sum()
+    true_coin_win_rate = (true_win_coins / unique_coins * 100) if unique_coins > 0 else 0.0
+
+    # ---------------------------------------------------------
+    # 📉 第三组：盘中风险与痛点指标（MAE）(* 100 转 %)
+    # ---------------------------------------------------------
+    avg_mdd = g['max_drawdown'].mean() * 100
+    mdd_5 = g['max_drawdown'].quantile(0.05) * 100
+    mdd_10 = g['max_drawdown'].quantile(0.10) * 100
+
+    # 真实盈潜比 = 平均单笔真实净收益 / 平均单笔承受回撤的绝对值 (这是个比值乘数，不需要乘100)
+    true_return_mae_ratio = (avg_net_return / abs(avg_mdd)) if avg_mdd != 0 else np.nan
+
+    # ---------------------------------------------------------
+    # ⏱️ 第四组：时间与暴露度指标
+    # ---------------------------------------------------------
+    # 新增: 单笔最长持仓时间 (天)
+    max_hold_time_d = g['hold_time_h'].max() / 24.0
+
+    # 单位时间的资金回报率 (%/天)：总真实净收益 / 总持仓天数
+    sum_hold_time_d = g['hold_time_h'].sum() / 24.0
+    capital_time_ret_per_day = (sum_net_return / sum_hold_time_d) if sum_hold_time_d > 0 else np.nan
+
+    # 新增: 平均资金暴露度 (%)
+    if strategy_lifetime_h > 0:
+        # 单币种持仓总时长 / 策略总生命周期 = 各币种自身的暴露度
+        coin_hold_hours = g.groupby('coin')['hold_time_h'].sum()
+        coin_exposures = coin_hold_hours / strategy_lifetime_h
+        avg_exposure = coin_exposures.mean() * 100
+    else:
+        avg_exposure = 0.0
+
+    # Top1 / Top3 收益集中度 (%)
+    coin_rets_sorted = coin_rets.sort_values(ascending=False)
+    top1_ret = coin_rets_sorted.iloc[0] * 100 if len(coin_rets_sorted) > 0 else 0.0
+    top3_ret = coin_rets_sorted.head(3).sum() * 100 if len(coin_rets_sorted) > 0 else 0.0
+
+    top1_ratio = (top1_ret / sum_net_return * 100) if sum_net_return > 0 else np.nan
+    top3_ratio = (top3_ret / sum_net_return * 100) if sum_net_return > 0 else np.nan
+
+    # ---------------------------------------------------------
+    # 🌊 第五组：时序与并发指标（Portfolio 级）
+    # ---------------------------------------------------------
+    # 1. 策略级资金曲线最大回撤 & 持续时间
+    cum_eq = g_sorted['net_return'].cumsum() * 100  # 乘以100化为百分比幅度
+    running_max = cum_eq.cummax()
+    drawdowns = running_max - cum_eq
+    curve_maxdd = drawdowns.max()
+
+    maxdd_duration_d = 0.0
+    if curve_maxdd > 1e-8:
+        # 找到最大回撤落底时刻
+        trough_idx = drawdowns.idxmax()
+        trough_time = g_sorted.loc[trough_idx, 'exit_time']
+        # 找到引发该次下跌的最高峰时刻（在底谷之前最高点）
+        peak_idx = cum_eq.loc[:trough_idx].idxmax()
+        peak_time = g_sorted.loc[peak_idx, 'exit_time']
+        # 修改为天
+        maxdd_duration_d = (trough_time - peak_time).total_seconds() / 86400.0
+
+    # 最大回撤时间占比 (%)
+    maxdd_duration_ratio = (maxdd_duration_d / (strategy_lifetime_h / 24.0) * 100) if strategy_lifetime_h > 0 else 0.0
+
+    # 2. 最大并发持仓数量
+    events = [(t, 1) for t in g['entry_time']] + [(t, -1) for t in g['exit_time']]
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    concurrency = 0
+    max_concurrency = 0
+    for _, val in events:
+        concurrency += val
+        if concurrency > max_concurrency:
+            max_concurrency = concurrency
+
+    # 返回打包结果 (均已完成要求的格式化调整)
+    return pd.Series({
+        '总交易笔数': total_trades,
+        '纯价差总收益(%)': sum_return,
+        '资金费总损益(%)': sum_fr_impact,
+        '总真实净收益(%)': sum_net_return,
+
+        '纯价差胜率(%)': win_rate,
+        '真实净胜率(%)': true_win_rate,
+        '单笔净期望(%)': avg_net_return,
+        '涉及币种数': unique_coins,
+        '跨币种胜率(%)': true_coin_win_rate,
+
+        '均值单笔回撤(%)': avg_mdd,
+        '最差5%极端回撤(%)': mdd_5,
+        '最差10%极端回撤(%)': mdd_10,
+        '真实盈潜比(Ret/MAE)': true_return_mae_ratio,
+
+        '单笔最长持仓(天)': max_hold_time_d,
+        '资金时间回报(%/天)': capital_time_ret_per_day,
+        '平均资金暴露度(%)': avg_exposure,
+        'Top1币收益占比(%)': top1_ratio,
+        'Top3币收益占比(%)': top3_ratio,
+
+        '策略组合资金最大回撤(%)': curve_maxdd,
+        '最大回撤历时(天)': maxdd_duration_d,
+        '最大回撤历时占比(%)': maxdd_duration_ratio,
+        '最大并发持仓数': max_concurrency
+    })
+
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    for input_dir in INPUT_DIRS:
+        if not os.path.exists(input_dir):
+            print(f"⚠️ 找不到目录: {input_dir}，跳过...")
             continue
 
-        print(f"📂 共找到 {len(files)} 个 {interval} 周期的币种结果文件，正在读取...")
+        timeframe = input_dir.split('_')[-1]
 
-        # 3. 读取并合并所有数据
+        file_pattern = os.path.join(input_dir, 'trades_*.csv.gz')
+        trade_files = glob.glob(file_pattern)
+
+        if not trade_files:
+            print(f"⚠️ {input_dir} 下未找到 trades_*.csv.gz 文件，跳过...")
+            continue
+
+        print(f"\n🚀 开始处理 {timeframe} 数据，共找到 {len(trade_files)} 个币种记录文件...")
+
         df_list = []
-        for f in files:
+        for f in trade_files:
             try:
-                df = pd.read_csv(f, compression='gzip')
+                df = pd.read_csv(f)
                 df_list.append(df)
             except Exception as e:
-                print(f"读取文件 {f} 时出错: {e}")
+                print(f"读取 {f} 失败: {e}")
 
         if not df_list:
-            print(f"❌ {interval} 周期没有成功读取到任何数据！")
             continue
 
-        all_data = pd.concat(df_list, ignore_index=True)
+        df_all = pd.concat(df_list, ignore_index=True)
+        print(f"✅ 数据加载完毕。总记录数: {len(df_all)}。正在执行预处理...")
 
-        # 定义聚合逻辑 (去掉了 avg_ret，因为我们要自己算真实的平均净利润)
-        agg_dict = {
-            'coin': 'count',  # 触发该组合的币种数量
-            'trades': 'sum',  # 总交易笔数
-            'sum_ret': 'sum',  # 总收益率求和 (%)
-            'fr_sum': 'sum',  # 资金费率总和 (%)
-            'win_rate': 'mean',  # 胜率均值 (%)
-            'sharpe': 'mean',  # 夏普比率均值
-            'max_dd': ['mean', 'max'],  # 资金曲线回撤：平均值 & 全局最惨
-            'max_loss': 'min',  # 单笔最大亏损
-            'profit_factor': 'mean',  # 盈亏比均值
-            'avg_hold_h': 'mean',  # 平均持仓时间 (小时)
-            'fr_avg': 'mean'  # 单笔资金费率均值 (%)
-        }
+        # ---------------------------------------------------------
+        # 🟢 第0步：数据预处理（前置逻辑）
+        # ---------------------------------------------------------
+        df_all['entry_time'] = pd.to_datetime(df_all['entry_time'])
+        df_all['exit_time'] = pd.to_datetime(df_all['exit_time'])
 
-        # 分别处理 做多 (Long) 和 做空 (Short)
-        for direction in ['Long', 'Short']:
-            df_dir = all_data[all_data['direction'] == direction]
+        is_long = df_all['direction'] == 'Long'
+        df_all['fr_impact'] = np.where(is_long, -df_all['fr_sum'], df_all['fr_sum'])
+        df_all['net_return'] = df_all['return'] + df_all['fr_impact']
+        df_all['hold_time_h'] = (df_all['exit_time'] - df_all['entry_time']).dt.total_seconds() / 3600.0
 
-            if df_dir.empty:
-                print(f"⚠️ 未找到 {interval} 周期的 {direction} 方向的数据，跳过生成。")
-                continue
+        # ---------------------------------------------------------
+        # ⚡ 核心聚合运算
+        # ---------------------------------------------------------
+        groupby_keys = ['entry_factor', 'exit_factor', 'direction', 'filter_mode']
+        print(f"⏳ 正在按策略指纹 {groupby_keys} 聚合并测算高阶指标，这可能需要一点时间...")
 
-            # 4. 按照核心字段分组并聚合
-            grouped = df_dir.groupby(['entry_factor', 'exit_factor', 'filter_mode'], as_index=False).agg(agg_dict)
+        summary = df_all.groupby(groupby_keys, group_keys=False).apply(process_group).reset_index()
 
-            # 扁平化多级列名
-            grouped.columns = [f"{col[0]}_{col[1]}" if col[1] else col[0] for col in grouped.columns]
+        # 按 '总真实净收益(%)' 和 '真实盈潜比' 降序排列
+        summary.sort_values(by=['总真实净收益(%)', '真实盈潜比(Ret/MAE)'], ascending=[False, False], inplace=True)
 
-            # ---------------------------------------------------------
-            # 5. 核心派生指标计算 (根据你的需求调整)
-            # ---------------------------------------------------------
-            # 【要求2】：做多减去资金费率，做空加上资金费率
-            if direction == 'Long':
-                grouped['net_profit'] = grouped['sum_ret_sum'] - grouped['fr_sum_sum']
-            else:
-                grouped['net_profit'] = grouped['sum_ret_sum'] + grouped['fr_sum_sum']
-
-            # 【要求3】：单笔平均利润 = 净利润 / 交易次数 (把分母0替换为NaN防报错)
-            safe_trades = grouped['trades_sum'].replace(0, np.nan)
-            grouped['avg_net_ret'] = grouped['net_profit'] / safe_trades
-
-            # 排序：按净利润降序排
-            grouped.sort_values(by='net_profit', ascending=False, inplace=True)
-
-            # ---------------------------------------------------------
-            # 6. 【要求1】：重命名为中文，并优化列的展示顺序
-            # ---------------------------------------------------------
-            rename_map = {
-                'entry_factor': '入场信号名称',
-                'exit_factor': '出场信号名称',
-                'filter_mode': '过滤模式',
-                'coin_count': '触发币种数量',
-                'trades_sum': '总交易笔数',
-                'sum_ret_sum': '原始总收益(%)',
-                'fr_sum_sum': '总资金费率(%)',
-                'net_profit': '净利润(%)',
-                'avg_net_ret': '单笔平均净利润(%)',
-                'win_rate_mean': '平均胜率(%)',
-                'max_loss_min': '单笔最惨亏损(%)',
-                'max_dd_max': '全局最惨资金回撤(%)',
-                'max_dd_mean': '平均资金回撤(%)',
-                'sharpe_mean': '平均夏普比率',
-                'profit_factor_mean': '平均盈亏比',
-                'avg_hold_h_mean': '平均持仓时间(小时)',
-                'fr_avg_mean': '平均单笔资金费率(%)'
-            }
-            grouped.rename(columns=rename_map, inplace=True)
-
-            # 显式规定列的排列顺序，把核心收益指标放前面
-            final_cols = [
-                '入场信号名称', '出场信号名称', '过滤模式', '触发币种数量', '总交易笔数',
-                '净利润(%)', '单笔平均净利润(%)', '原始总收益(%)', '总资金费率(%)',
-                '平均胜率(%)', '单笔最惨亏损(%)', '全局最惨资金回撤(%)', '平均资金回撤(%)',
-                '平均夏普比率', '平均盈亏比', '平均持仓时间(小时)', '平均单笔资金费率(%)'
-            ]
-
-            # 只取存在于表中的列，生成最终表
-            grouped = grouped[[c for c in final_cols if c in grouped.columns]]
-
-            # 7. 落盘保存各个周期单独的报告
-            out_name = f"summary_{direction.lower()}_{interval}.csv"
-            out_path = os.path.join(output_dir, out_name)
-
-            # 将小数四舍五入到4位，让CSV报表看起来更干净（可选）
-            grouped = grouped.round(4)
-            grouped.to_csv(out_path, index=False, encoding='utf-8-sig')
-
-            print(f"✅ 成功生成 {interval} {direction} 聚合报告: {out_path} (共 {len(grouped)} 条组合记录)")
-
-            # ---------------------------------------------------------
-            # 8. 为最终跨周期聚合做准备
-            # ---------------------------------------------------------
-            df_for_merge = grouped.copy()
-            df_for_merge.insert(0, '方向', direction)  # 插入方向字段作为合并的主键之一
-
-            # 给指标列加上当前周期的前缀（排除掉用于 Merge 的 Key）
-            merge_keys = ['方向', '入场信号名称', '出场信号名称', '过滤模式']
-            rename_prefix = {}
-            for col in df_for_merge.columns:
-                if col not in merge_keys:
-                    rename_prefix[col] = f"[{interval}] {col}"
-            df_for_merge.rename(columns=rename_prefix, inplace=True)
-
-            if interval not in interval_dfs_dict:
-                interval_dfs_dict[interval] = []
-            interval_dfs_dict[interval].append(df_for_merge)
-
-    # ---------------------------------------------------------
-    # 9. 跨周期和多空的大聚合逻辑
-    # ---------------------------------------------------------
-    final_merge_list = []
-    # 按照周期先将各个周期的多空数据 concat 在一起
-    for interval, df_list in interval_dfs_dict.items():
-        if df_list:
-            combined_dir_df = pd.concat(df_list, ignore_index=True)
-            final_merge_list.append(combined_dir_df)
-
-    if final_merge_list:
-        print("\n🔄 正在生成跨周期多空聚合总表...")
-        # 利用 reduce 按照指定的合并键进行 outer merge，确保任何周期有过触发的组合都能被保留
-        merge_keys = ['方向', '入场信号名称', '出场信号名称', '过滤模式']
-        final_df = reduce(lambda left, right: pd.merge(left, right, on=merge_keys, how='outer'), final_merge_list)
-
-        # 排序：按照方向、入场、出场、过滤模式排序，保证同策略整齐排列
-        final_df.sort_values(by=merge_keys, inplace=True)
-
-        final_out_path = os.path.join(output_dir, "summary_all_intervals_combined.csv")
-        final_df.to_csv(final_out_path, index=False, encoding='utf-8-sig')
-        print(f"🎉 成功生成跨周期聚合大表: {final_out_path} (共 {len(final_df)} 条组合记录)")
-    else:
-        print("⚠️ 未收集到任何有效数据，无法生成跨周期聚合大表。")
+        out_file = os.path.join(OUTPUT_DIR, f'advanced_summary_{timeframe}.csv')
+        summary.to_csv(out_file, index=False, encoding='utf-8-sig', float_format="%.4f")
+        print(f"🎉 {timeframe} 深度统计报告已生成: {os.path.abspath(out_file)}")
 
 
 if __name__ == "__main__":
-    # 原代码中的无关行予以保留
-    try:
-        df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\summary_all_intervals_combined.csv')
-    except Exception:
-        pass  # 防止没文件时在开头报错阻断程序执行
-
-    # 设定你要跑的所有周期，以及输出目录
-    target_intervals = ['60m', '30m', '15m', '5m']
-    output_directory = "summary_results"
-
-    # input_dir_template 占位符 {} 会在循环中被替换为 '60m', '30m' 等
-    aggregate_results(
-        intervals=target_intervals,
-        input_dir_template="factor_out_{}_debug",
-        output_dir=output_directory
-    )
+    main()
