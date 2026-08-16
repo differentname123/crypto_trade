@@ -8,6 +8,9 @@ import os
 # 过滤条件：每个周期（60m,30m,15m,5m）的交易数量都必须大于该值
 MIN_TRADES_PER_TF = 50
 
+# 过滤条件：每个周期（60m,30m,15m,5m）的最大回撤历时占比(%)都不能超过该值
+MAX_DRAWDOWN_DURATION_PCT = 50.0
+
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
@@ -23,18 +26,9 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     # 1. 加载数据
     df = pd.read_csv(csv_path)
 
-    # ---------------------------------------------------------
-    # 🌟 新增功能 1: 严格过滤交易次数
-    # ---------------------------------------------------------
-    trade_cols = [c for c in df.columns if '总交易笔数_' in c]
-    if trade_cols:
-        # fillna(0) 确保如果有周期完全没开单产生 NaN，直接算作 0 次，从而被淘汰
-        mask = df[trade_cols].fillna(0).min(axis=1) > MIN_TRADES_PER_TF
-        original_len = len(df)
-        df = df[mask].copy()
-
     # 将df 按照 target_direction 过滤
     df = df[df['direction'] == target_direction].copy()
+
     # ---------------------------------------------------------
     # 🌟 新增功能 2: 信号名称模糊化与保存映射
     # ---------------------------------------------------------
@@ -71,7 +65,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     df_dir = df[df['direction'] == target_direction].copy()
 
     if df_dir.empty:
-        print(f"⚠️ 在数据中没有找到方向为 {target_direction} 且符合交易次数要求的记录。")
+        print(f"⚠️ 在数据中没有找到方向为 {target_direction} 的记录。")
         return
 
     # 4. 提取表现最好的 Top N 个组合 (基于单行最高平均性价比，同时过滤重复表现数据)
@@ -85,12 +79,29 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     exclude_cols = {'entry_factor', 'exit_factor', 'direction', 'filter_mode'}
     numeric_cols = [c for c in df_dir.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_dir[c])]
 
+    trade_cols = [c for c in df_dir.columns if '总交易笔数_' in c]
+    dd_duration_cols = [c for c in df_dir.columns if '最大回撤历时占比(%)_' in c]
+
     for _, row in df_sorted.iterrows():
         pair = (row['entry_factor'], row['exit_factor'])
         if pair in seen_pairs:
             continue
 
-        # 提取该组合所有过滤模式下的完整矩阵并构建数据指纹
+        # ========================================================
+        # 🚦 修改点：在输出排序结果前，严格校验当前登顶的这行数据是否满足条件
+        # ========================================================
+        # 1. 验证交易次数 (如果该档位下某些周期没开单导致NaN，视为0次)
+        if trade_cols:
+            if row[trade_cols].fillna(0).min() <= MIN_TRADES_PER_TF:
+                continue  # 当前 filter_mode 不满足条件，跳过，等待该 pair 其他达标的 filter_mode
+
+        # 2. 验证最大回撤历时占比 (如果数据缺失NaN，视为100%直接淘汰)
+        if dd_duration_cols:
+            if row[dd_duration_cols].fillna(100).max() > MAX_DRAWDOWN_DURATION_PCT:
+                continue  # 当前 filter_mode 不满足条件，跳过
+        # ========================================================
+
+        # 如果通过了上述检验，提取该组合所有过滤模式下的完整矩阵（保留全局统计数据用于绘制面板）
         sub_pair_df = df_dir[(df_dir['entry_factor'] == pair[0]) & (df_dir['exit_factor'] == pair[1])].sort_values(
             'filter_mode')
 
@@ -123,7 +134,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         'top_1', 'top_3', 'top_5', 'top_10', 'top_20', 'top_50', 'top_100'
     ]
 
-    # 🌟 修改点：核心面板绘制函数增加 fmt_str 参数，用于控制不同指标的浮点小数位展现
+    # 🌟 核心面板绘制函数
     def print_metric_matrix(sub_df, metric_prefix, title, fmt_str="{:.4f}"):
         available_filters = sub_df['filter_mode'].unique()
         # 兼容 PyArrow array 的查询方式
@@ -168,6 +179,10 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
                 row_str += val_str.rjust(col_widths[f] + 2)
             print(row_str)
 
+    if not top_pairs:
+        print("⚠️ 没有符合过滤条件（交易次数及回撤历时）的策略组合可以输出。")
+        return
+
     for rank, pair_info in enumerate(top_pairs, 1):
         entry = pair_info['entry']
         exit_factor = pair_info['exit']
@@ -178,14 +193,16 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
 
         print("\n" + "=" * 120)
         print(f" 📊 策略表现透视面板 | 方向: {target_direction} | 入场: {entry} | 出场: {exit_factor}")
-        print(f" 组合编号: #{rank} (当前面板最佳过滤档位: {best_f} , 平均性价比: {best_score:.4f})")
+        print(f" 组合编号: #{rank} (当前面板最佳且达标过滤档位: {best_f} , 平均性价比: {best_score:.4f})")
 
-        # 🌟 新增功能 3: 高密度透视面板输出多个指定维度 (定制不同的数字格式)
+        # 🌟 高密度透视面板输出多个指定维度 (定制不同的数字格式)
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
         print_metric_matrix(sub_df, "真实净胜率(%)", "⚖️ 【真实净胜率(%)】 横向截面对比", "{:.2f}")
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
+
         print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
 
         print("=" * 120)
