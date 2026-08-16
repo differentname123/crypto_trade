@@ -74,24 +74,47 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print(f"⚠️ 在数据中没有找到方向为 {target_direction} 且符合交易次数要求的记录。")
         return
 
-    # 4. 提取表现最好的 Top N 个组合 (基于单行最高平均性价比)
+    # 4. 提取表现最好的 Top N 个组合 (基于单行最高平均性价比，同时过滤重复表现数据)
     df_sorted = df_dir.sort_values(by='avg_calmar', ascending=False)
 
     seen_pairs = set()
+    seen_signatures = set()
     top_pairs = []
+
+    # 提取所有数值型指标列用于计算策略表现数据指纹
+    exclude_cols = {'entry_factor', 'exit_factor', 'direction', 'filter_mode'}
+    numeric_cols = [c for c in df_dir.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_dir[c])]
 
     for _, row in df_sorted.iterrows():
         pair = (row['entry_factor'], row['exit_factor'])
-        if pair not in seen_pairs:
-            seen_pairs.add(pair)
-            top_pairs.append({
-                'entry': row['entry_factor'],
-                'exit': row['exit_factor'],
-                'best_filter': row['filter_mode'],
-                'best_score': row['avg_calmar']
-            })
-            if len(top_pairs) >= top_n:
-                break
+        if pair in seen_pairs:
+            continue
+
+        # 提取该组合所有过滤模式下的完整矩阵并构建数据指纹
+        sub_pair_df = df_dir[(df_dir['entry_factor'] == pair[0]) & (df_dir['exit_factor'] == pair[1])].sort_values(
+            'filter_mode')
+
+        # 将排序后的 filter_mode 与数值特征序列化为 tuple（保留4位小数避免浮点误差）
+        perf_signature = tuple(
+            tuple(sub_pair_df['filter_mode'].tolist()) +
+            tuple(np.round(sub_pair_df[numeric_cols].fillna(-999999).to_numpy().flatten(), 4))
+        )
+
+        seen_pairs.add(pair)
+
+        # 如果此数据表现已经存在，跳过该重复组合
+        if perf_signature in seen_signatures:
+            continue
+
+        seen_signatures.add(perf_signature)
+        top_pairs.append({
+            'entry': row['entry_factor'],
+            'exit': row['exit_factor'],
+            'best_filter': row['filter_mode'],
+            'best_score': row['avg_calmar']
+        })
+        if len(top_pairs) >= top_n:
+            break
 
     # 5. 定义过滤模式的严格排序（确保横向时间轴的逻辑连贯性）
     FILTER_ORDER = [
@@ -176,9 +199,9 @@ if __name__ == "__main__":
     print("      - bottom_N : 仅在跌幅最大（排名垫底）的前 N 个币种上允许开仓。")
     print("      - original : 原始状态，不对币种进行任何截面过滤，全市场轮动。")
     print("      - top_N    : 仅在涨幅最大（排名靠前）的前 N 个币种上允许开仓。")
-    print("      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
+    print(
+        "      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
     print(f"{'=' * 90}")
-
 
     # 替换为你实际的大宽表路径
     TARGET_CSV = './summary_results/advanced_summary_combined_ALL_20260816_215048.csv'
