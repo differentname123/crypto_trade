@@ -198,12 +198,12 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         # 🌟 高密度透视面板输出多个指定维度 (定制不同的数字格式)
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
-        print_metric_matrix(sub_df, "真实净胜率(%)", "⚖️ 【真实净胜率(%)】 横向截面对比", "{:.2f}")
+        # print_metric_matrix(sub_df, "真实净胜率(%)", "⚖️ 【真实净胜率(%)】 横向截面对比", "{:.2f}")
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
 
-        print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
+        # print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
 
         print("=" * 120)
 
