@@ -337,7 +337,7 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
             print(row_str)
 
     # 3. 遍历指定列表进行输出
-    print(f"\n🔥 开始生成指定 {len(target_pairs)} 个组合的专属报告 (无任何前置过滤)...")
+    # print(f"\n🔥 开始生成指定 {len(target_pairs)} 个组合的专属报告 (无任何前置过滤)...")
     for rank, (orig_entry, orig_exit) in enumerate(target_pairs, 1):
         # 查询映射表
         mapped_entry = signal_mapping.get(orig_entry)
