@@ -151,4 +151,5 @@ def main():
 
 
 if __name__ == "__main__":
+    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\extracted_raw_trades\extracted_target_pairs.csv')
     main()
