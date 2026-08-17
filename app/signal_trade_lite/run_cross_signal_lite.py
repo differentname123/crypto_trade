@@ -1046,7 +1046,7 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_
     拉取数据并启动整套交易工作流
     返回最终生成的信号文件内容
     """
-    max_window = 50
+    max_window = 10
 
     lookback_days = int(np.ceil(max_window)) + 30
 
