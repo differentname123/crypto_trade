@@ -362,13 +362,22 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
         # 打印面板
         print("\n" + "=" * 120)
         print(f" 🎯 专属组合透视面板 | 方向: {target_direction}")
-        print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
+        # print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
         print(f" 脱敏映射编号: 入场 ({mapped_entry}) -> 出场 ({mapped_exit})")
         print(f" 列表进度编号: #{rank} (性价比最高档位: {best_f} , 对应平均性价比: {best_score:.4f})")
 
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "跨币种胜率(%)", "💰 【跨币种胜率(%))】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "均值单笔回撤(%)", "💰 【均值单笔回撤(%))】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "平均持仓时间(天)", "💰 【平均持仓时间(天)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "持仓时间中位数(天)", "💰 【持仓时间中位数(天))】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "平均资金暴露度(%)", "💰 【平均资金暴露度(%))】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "Top3币收益占比(%)", "💰 【Top3币收益占比(%)】 横向截面对比", "{:.4f}")
+
+
+
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
 
