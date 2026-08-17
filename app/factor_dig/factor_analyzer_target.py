@@ -20,7 +20,7 @@ MAX_AVG_HOLDING_DAYS = 60.0
 MAX_TOP3_PROFIT_PCT = 60.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
-MIN_RET_MAE_RATIO = 0.01
+MIN_RET_MAE_RATIO = 0.2
 
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
@@ -39,6 +39,17 @@ long_pair = [
     # ("EXIT_SHORT_SURGE_EXTREME", "FR_LOW_NEG"),
     # ("STRUCT_SUPPORT_HOLD", "FR_RECOVERY_FROM_LOW"),
     ("FR_ROLL_OVER_FROM_HIGH", "EXIT_DISTRIBUTION_EXHAUSTION_TOP"),
+]
+
+
+short_pair = [
+    ('FR_TURN_NEGATIVE', 'FR_RESET_AFTER_HOT'),
+    # ('EXIT_MA_DEAD_CROSS', 'PRICE_CLOSE_CROSS_MA_UP'),
+    # ('REGIME_POWDER_KEG', 'FR_HIGH_EXTREME'),
+    # ('ENTRY_HIGH_PRESSURE_OI_BREAKOUT', 'FR_HIGH_EXTREME'),
+    # ('EXIT_FR_EXTREME_HIGH', 'FR_COLD_START'),
+    # ('FR_ABSOLUTE_DEEP_NEG', 'FR_TURN_POSITIVE'),
+    # ('VOLUME_CONFIRM_BREAK', 'FR_COLD_START')
 ]
 def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     """
@@ -399,7 +410,7 @@ if __name__ == "__main__":
     TARGET_CSV = './summary_results/advanced_summary_combined_ALL.csv'
 
     # ==== 打印指定列表，无任何过滤条件 ====
-    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
 
     # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
-    # display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Long')
+    # display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Short')
