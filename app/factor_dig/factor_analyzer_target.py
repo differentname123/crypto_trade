@@ -27,18 +27,18 @@ SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
 long_pair = [
     ("VOLUME_CLIMAX_DOWN", "ENTRY_SILENT_ACCUMULATION"),
-    ("EXIT_VOL_EXTREME_DOWN", "ENTRY_SILENT_ACCUMULATION"),
-    ("EXIT_FR_ROLL_OVER", "ENTRY_SILENT_ACCUMULATION"),
-    ("FR_ABSOLUTE_HIGH_POS", "OI_BOTTOM_DIVERGENCE"),
-    ("FR_HIGH_EXTREME", "ENTRY_SILENT_ACCUMULATION"),
-    ("MOM_RECOVERY_FROM_LOW", "FR_RECOVERY_FROM_LOW"),
-    ("EXIT_OI_ROC_PEAK", "EXIT_MA_DEAD_CROSS"),
-    ("OI_NEW_HIGH", "EXIT_MA_DEAD_CROSS"),
-    ("ENTRY_OI_LEAD_MOMENTUM", "VOL_DOWN_SPIKE"),
-    ("FR_RECOVERY_FROM_LOW", "STRUCT_RANGE_POSITION_WEAK"),
-    ("EXIT_SHORT_SURGE_EXTREME", "FR_LOW_NEG"),
-    ("STRUCT_SUPPORT_HOLD", "FR_RECOVERY_FROM_LOW"),
-    ("FR_ROLL_OVER_FROM_HIGH", "EXIT_DISTRIBUTION_EXHAUSTION_TOP"),
+    # ("EXIT_VOL_EXTREME_DOWN", "ENTRY_SILENT_ACCUMULATION"),
+    # ("EXIT_FR_ROLL_OVER", "ENTRY_SILENT_ACCUMULATION"),
+    # ("FR_ABSOLUTE_HIGH_POS", "OI_BOTTOM_DIVERGENCE"),
+    # ("FR_HIGH_EXTREME", "ENTRY_SILENT_ACCUMULATION"),
+    # ("MOM_RECOVERY_FROM_LOW", "FR_RECOVERY_FROM_LOW"),
+    # ("EXIT_OI_ROC_PEAK", "EXIT_MA_DEAD_CROSS"),
+    # ("OI_NEW_HIGH", "EXIT_MA_DEAD_CROSS"),
+    # ("ENTRY_OI_LEAD_MOMENTUM", "VOL_DOWN_SPIKE"),
+    # ("FR_RECOVERY_FROM_LOW", "STRUCT_RANGE_POSITION_WEAK"),
+    # ("EXIT_SHORT_SURGE_EXTREME", "FR_LOW_NEG"),
+    # ("STRUCT_SUPPORT_HOLD", "FR_RECOVERY_FROM_LOW"),
+    # ("FR_ROLL_OVER_FROM_HIGH", "EXIT_DISTRIBUTION_EXHAUSTION_TOP"),
 ]
 def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     """
@@ -362,7 +362,7 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
         # 打印面板
         print("\n" + "=" * 120)
         print(f" 🎯 专属组合透视面板 | 方向: {target_direction}")
-        # print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
+        print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
         print(f" 脱敏映射编号: 入场 ({mapped_entry}) -> 出场 ({mapped_exit})")
         # print(f" 列表进度编号: #{rank} (性价比最高档位: {best_f} , 对应平均性价比: {best_score:.4f})")
 
