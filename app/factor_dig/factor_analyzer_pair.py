@@ -124,6 +124,12 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
     """
     在控制台打印排版清晰的对比看板，快速识别 1+1 > 2 的组合
     """
+    # =================================================================
+    # 新增过滤：仅提取最大并发持仓 <= 100 的结果用于打印，剔除>100的选项
+    # =================================================================
+    valid_single_df = single_df[single_df['最大并发持仓数'] <= 100]
+    valid_pair_df = pair_df[pair_df['联合_最大并发持仓'] <= 100]
+
     print("\n" + "=" * 92)
     print(" 🌟 多因子策略【单体基准】 VS 【两两组合增强】绩效对比看板")
     print("=" * 92)
@@ -134,7 +140,7 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
     print(
         f"{'排名':<4} | {'策略指纹 (TF | Entry | Exit | Dir | Filter)':<48} | {'净收益(%)':>10} | {'最大回撤(%)':>11} | {'性价比':>8}")
     print("-" * 92)
-    for i, (_, row) in enumerate(single_df.head(5).iterrows(), 1):
+    for i, (_, row) in enumerate(valid_single_df.head(5).iterrows(), 1):
         strat_name = f"{row['周期']} | {row['入场']} | {row['出场']} | {row['方向']} | {row['过滤']}"
         if len(strat_name) > 46:
             strat_name = strat_name[:43] + "..."
@@ -142,7 +148,7 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
             f"#{i:<3} | {strat_name:<48} | {row['总真实净收益(%)']:>9.2f}% | {row['策略组合资金最大回撤(%)']:>10.2f}% | {row['策略赚钱性价比']:>8.2f}")
 
     # 2. 打印协同增强组合 Top N (按照 联合后的 赚钱性价比 降序排序)
-    pair_df_sorted = pair_df.sort_values(by='联合_赚钱性价比', ascending=False)
+    pair_df_sorted = valid_pair_df.sort_values(by='联合_赚钱性价比', ascending=False)
     top_synergy = pair_df_sorted.head(top_n)
 
     print("\n" + "=" * 92)
@@ -210,7 +216,14 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
     if level_df is None or level_df.empty:
         return
 
-    df_sorted = level_df.sort_values(by='联合_赚钱性价比', ascending=False)
+    # =================================================================
+    # 新增过滤：仅提取最大并发持仓 <= 100 的结果用于打印，剔除>100的选项
+    # =================================================================
+    valid_level_df = level_df[level_df['联合_最大并发持仓'] <= 100]
+    if valid_level_df.empty:
+        return
+
+    df_sorted = valid_level_df.sort_values(by='联合_赚钱性价比', ascending=False)
     top = df_sorted.head(top_n)
     combo_label = f"{k}联组合"
 
@@ -326,8 +339,13 @@ def analyze_pair_combinations_with_baseline(
     single_out_path = os.path.join(output_dir, single_output_filename)
     single_summary_df.to_csv(single_out_path, index=False, encoding='utf-8-sig', float_format="%.4f")
 
-    if len(unique_strategies) < 2:
-        print("⚠️ 独立策略少于 2 个，跳过两两组合测算。")
+    # =====================================================================
+    # 筛选满足【最大并发持仓数 < 100】的腿才能作为后续组合的材料
+    # =====================================================================
+    valid_strategies_for_combo = [s_id for s_id in unique_strategies if single_metrics_dict[s_id]['最大并发持仓数'] < 100]
+
+    if len(valid_strategies_for_combo) < 2:
+        print("⚠️ 满足并发条件的独立策略少于 2 个，跳过组合测算。")
         return single_summary_df, pd.DataFrame(), {}
 
     # ▼▼▼ 新增: 已评估组合指标注册表 (frozenset(成员) -> 指标Series)，单策略先入册
@@ -335,7 +353,8 @@ def analyze_pair_combinations_with_baseline(
     # ▼▼▼ 新增: 上一级中【有提升】的合格组合列表, 元素为 (combo_key, 联合性价比, 性价比增量)
     qualified_prev_level = []
 
-    pair_combos = list(itertools.combinations(unique_strategies, 2))
+    # 使用筛选后的合法策略组合
+    pair_combos = list(itertools.combinations(valid_strategies_for_combo, 2))
     total_pairs = len(pair_combos)
     print(f"🚀 开始测算 {total_pairs} 个两两组合对...")
 
@@ -470,7 +489,8 @@ def analyze_pair_combinations_with_baseline(
         # 候选生成: 种子 + 任意一条不在种子内的策略腿, frozenset 天然去重
         candidate_keys = set()
         for seed in seeds:
-            for s_id in unique_strategies:
+            # 使用筛选后的合法策略组合向外扩展
+            for s_id in valid_strategies_for_combo:
                 if s_id not in seed:
                     candidate_keys.add(seed | frozenset([s_id]))
         candidate_keys = sorted(
@@ -580,10 +600,10 @@ def analyze_pair_combinations_with_baseline(
 
         qualified_prev_level = qualified_this_level
 
-    print(f"📁 详细单体指标已保存至: {os.path.abspath(single_out_path)}")
-    print(f"📁 详细组合对比已保存至: {os.path.abspath(pair_out_path)}")
-    for k, p in level_out_paths.items():
-        print(f"📁 {k}联组合对比已保存至: {os.path.abspath(p)}")
+    # print(f"📁 详细单体指标已保存至: {os.path.abspath(single_out_path)}")
+    # print(f"📁 详细组合对比已保存至: {os.path.abspath(pair_out_path)}")
+    # for k, p in level_out_paths.items():
+    #     print(f"📁 {k}联组合对比已保存至: {os.path.abspath(p)}")
 
     return single_summary_df, pair_summary_df, level_dfs
 
@@ -593,7 +613,15 @@ def analyze_pair_combinations_with_baseline(
 # =====================================================================
 if __name__ == '__main__':
     trades_file = './extracted_raw_trades/extracted_target_pairs.csv'
-
+    print(f"{'=' * 90}")
+    print("💡 【数据维度说明】:")
+    print(" 🔹 周期 (Timeframe) : K线图的时间粒度 (如 60m=1小时线, 5m=5分钟线)。直观反映策略在不同级别趋势中的适应性。")
+    print(" 🔹 过滤模式 (Filter): 基于过去24小时涨跌幅的截面选币过滤机制。")
+    print("      - bottom_N : 仅在跌幅最大（排名垫底）的前 N 个币种上允许开仓。")
+    print("      - top_N    : 仅在涨幅最大（排名靠前）的前 N 个币种上允许开仓。")
+    print(
+        "      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
+    print(f"{'=' * 90}")
     if os.path.exists(trades_file):
         trades_df = pd.read_csv(trades_file)
 
