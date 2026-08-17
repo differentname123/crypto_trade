@@ -200,6 +200,71 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
 
 
 # =====================================================================
+# 🖥️ 新增: k联组合(k>=3) 控制台看板打印器 (基准 = 最优已评估子组合)
+# =====================================================================
+def print_multi_synergy_dashboard(level_df, k, top_n=5):
+    """
+    针对 k(>=3) 联组合的控制台看板：与【最优已评估子组合】基准对比。
+    只有打赢自己最强子组合的 k 联，才算真正的增量。
+    """
+    if level_df is None or level_df.empty:
+        return
+
+    df_sorted = level_df.sort_values(by='联合_赚钱性价比', ascending=False)
+    top = df_sorted.head(top_n)
+    combo_label = f"{k}联组合"
+
+    print("\n" + "=" * 92)
+    print(f" 🚀 【最强 {k} 联组合 Top {len(top)}】(按【联合后赚钱性价比】降序排序, 基准=最优子组合)")
+    print("=" * 92)
+
+    for rank, (_, row) in enumerate(top.iterrows(), 1):
+        cost_gain = row['【提升】性价比增量(vs最优子组合)']
+        gain_flag = "🟢 [显著提升]" if cost_gain > 0 else "🔴 [无增益/稀释]"
+
+        print(f"\n🏆 第 {rank} 名 {k}联组合 {gain_flag}")
+        for i in range(1, k + 1):
+            prefix = "├─" if i < k else "└─"
+            print(f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {row[f'腿{i}_入场']} -> {row[f'腿{i}_出场']} "
+                  f"({row[f'腿{i}_方向']}_{row[f'腿{i}_过滤']}) | 单体性价比 {row[f'腿{i}_单体性价比']:.2f}")
+        print(f"  ★ 对比基准(最优已评估子组合, 规模{int(row['最优子组合_规模'])}): {row['最优子组合_对应腿']}")
+        print(f"  {'-' * 88}")
+        print(f"  {'对比维度':<14} | {'最优子组合':>16} | {combo_label:>16} | {'增益/变化':>16}")
+        print(f"  {'-' * 88}")
+
+        # 1. 赚钱性价比
+        c_sub = row['最优子组合_赚钱性价比']
+        c_combo = row['联合_赚钱性价比']
+        c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
+        icon = "🔺" if cost_gain >= 0 else "🔻"
+        print(f"  {'赚钱性价比':<14} | {c_sub:>16.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
+
+        # 2. 资金最大回撤
+        m_sub = row['最优子组合_资金最大回撤(%)']
+        m_combo_v = row['联合_资金最大回撤(%)']
+        m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
+        m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
+        print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
+
+        # 3. 最大回撤历时(天)
+        dur_sub = row['最优子组合_最大回撤历时(天)']
+        dur_combo = row['联合_最大回撤历时(天)']
+        print(f"  {'最大回撤历时(天)':<14} | {dur_sub:>16.2f} | {dur_combo:>16.2f} | {'---':>16}")
+
+        # 4. 最大并发持仓
+        con_sub = int(row['最优子组合_最大并发持仓'])
+        con_combo = int(row['联合_最大并发持仓'])
+        print(f"  {'最大并发持仓':<14} | {con_sub:>16} | {con_combo:>16} | {'---':>16}")
+
+        # 5. Top1币收益占比
+        top1_sub = row['最优子组合_Top1币收益占比(%)']
+        top1_combo = row['联合_Top1币收益占比(%)']
+        print(f"  {'Top1币收益占比':<14} | {top1_sub:>15.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
+
+    print("\n" + "=" * 92)
+
+
+# =====================================================================
 # 核心处理主流程
 # =====================================================================
 def analyze_pair_combinations_with_baseline(
@@ -207,7 +272,11 @@ def analyze_pair_combinations_with_baseline(
         output_dir='./summary_results',
         pair_output_filename='pair_combinations_with_comparison.csv',
         single_output_filename='single_strategy_summary.csv',
-        show_top_n_dashboard=5
+        show_top_n_dashboard=5,
+        max_combo_size=4,
+        improvement_threshold=0.0,
+        max_seeds_per_level=200,
+        multi_output_filename_tpl='combo_{k}_combinations_with_comparison.csv'
 ):
     os.makedirs(output_dir, exist_ok=True)
     df = df_trades.copy()
@@ -259,7 +328,12 @@ def analyze_pair_combinations_with_baseline(
 
     if len(unique_strategies) < 2:
         print("⚠️ 独立策略少于 2 个，跳过两两组合测算。")
-        return single_summary_df, pd.DataFrame()
+        return single_summary_df, pd.DataFrame(), {}
+
+    # ▼▼▼ 新增: 已评估组合指标注册表 (frozenset(成员) -> 指标Series)，单策略先入册
+    combo_metrics_registry = {frozenset([s_id]): m for s_id, m in single_metrics_dict.items()}
+    # ▼▼▼ 新增: 上一级中【有提升】的合格组合列表, 元素为 (combo_key, 联合性价比, 性价比增量)
+    qualified_prev_level = []
 
     pair_combos = list(itertools.combinations(unique_strategies, 2))
     total_pairs = len(pair_combos)
@@ -286,6 +360,13 @@ def analyze_pair_combinations_with_baseline(
 
         lowest_single_mdd = min(m1['策略组合资金最大回撤(%)'], m2['策略组合资金最大回撤(%)'])
         mdd_change = m_combo['策略组合资金最大回撤(%)'] - lowest_single_mdd
+
+        # ▼▼▼ 新增: 注册两两组合指标, 并按提升阈值筛选出可进入 3 联扩展的合格种子
+        combo_key = frozenset((s1, s2))
+        combo_metrics_registry[combo_key] = m_combo
+        if cost_diff > improvement_threshold:
+            qualified_prev_level.append((combo_key, m_combo['策略赚钱性价比'], cost_diff))
+        # ▲▲▲ 新增结束
 
         s1_info = s1.split(' | ')
         s2_info = s2.split(' | ')
@@ -364,10 +445,147 @@ def analyze_pair_combinations_with_baseline(
     # 🖥️ 调用控制台高亮看板
     print_synergy_dashboard(single_summary_df, pair_summary_df, top_n=show_top_n_dashboard)
 
+    # =================================================================
+    # 🧬 新增: 多级组合扩展 (3 联 ~ max_combo_size 联)
+    #   规则: 只有上一级中【性价比增量 > improvement_threshold】的组合
+    #         才有资格作为种子, 向外扩展一个新策略腿;
+    #   基准: k联组合的增量 = 联合性价比 - 该组合所有【已评估真子集】
+    #         (单体 + 全部两两 + 已测的更低联) 中的最优性价比。
+    # =================================================================
+    level_dfs = {2: pair_summary_df}
+    level_out_paths = {}
+
+    for k in range(3, max_combo_size + 1):
+        if not qualified_prev_level:
+            print(f"\n⚠️ 上一级({k - 1}联)没有满足提升阈值(>{improvement_threshold})的组合，停止扩展至 {k} 联。")
+            break
+
+        # 种子排序: 优先联合性价比, 其次增量 (可按需改为 x[2] 优先增量)
+        seeds_sorted = sorted(qualified_prev_level, key=lambda x: (x[1], x[2]), reverse=True)
+        if max_seeds_per_level is not None and len(seeds_sorted) > max_seeds_per_level:
+            print(f"\n✂️ {k - 1}联合格种子共 {len(seeds_sorted)} 个，按联合性价比截取前 {max_seeds_per_level} 个用于扩展。")
+            seeds_sorted = seeds_sorted[:max_seeds_per_level]
+        seeds = [item[0] for item in seeds_sorted]
+
+        # 候选生成: 种子 + 任意一条不在种子内的策略腿, frozenset 天然去重
+        candidate_keys = set()
+        for seed in seeds:
+            for s_id in unique_strategies:
+                if s_id not in seed:
+                    candidate_keys.add(seed | frozenset([s_id]))
+        candidate_keys = sorted(
+            (ck for ck in candidate_keys if ck not in combo_metrics_registry),
+            key=lambda fs: tuple(sorted(fs))
+        )
+
+        if not candidate_keys:
+            print(f"\n⚠️ {k}联组合没有可扩展的新候选，停止扩展。")
+            break
+
+        print(f"\n🚀 [{k}联组合] 由 {len(seeds)} 个合格种子扩展出 {len(candidate_keys)} 个去重候选，开始测算...")
+
+        results_k = []
+        qualified_this_level = []
+
+        for idx, combo_key in enumerate(candidate_keys, 1):
+            members = sorted(combo_key)
+
+            combined_df = pd.concat([grouped_strats[mid] for mid in members], ignore_index=True)
+            combined_df.sort_values('exit_time', inplace=True)
+            combined_df.reset_index(drop=True, inplace=True)
+
+            m_combo = calculate_portfolio_metrics(combined_df)
+            combo_metrics_registry[combo_key] = m_combo
+
+            # 基准: 所有已评估真子集中的最优性价比
+            best_sub_key = None
+            best_sub_cost = -np.inf
+            for sub_size in range(1, k):
+                for sub in itertools.combinations(members, sub_size):
+                    sub_m = combo_metrics_registry.get(frozenset(sub))
+                    if sub_m is not None and sub_m['策略赚钱性价比'] > best_sub_cost:
+                        best_sub_cost = sub_m['策略赚钱性价比']
+                        best_sub_key = frozenset(sub)
+
+            best_sub_m = combo_metrics_registry[best_sub_key]
+            cost_diff = m_combo['策略赚钱性价比'] - best_sub_cost
+
+            row = {'组合规模': k}
+            for i, mid in enumerate(members, 1):
+                info = mid.split(' | ')
+                row[f'腿{i}_标识'] = mid
+                row[f'腿{i}_周期'] = info[0]
+                row[f'腿{i}_入场'] = info[1]
+                row[f'腿{i}_出场'] = info[2]
+                row[f'腿{i}_方向'] = info[3]
+                row[f'腿{i}_过滤'] = info[4]
+                row[f'腿{i}_单体性价比'] = single_metrics_dict[mid]['策略赚钱性价比']
+
+            row['最优子组合_规模'] = len(best_sub_key)
+            row['最优子组合_成员'] = ' ++ '.join(sorted(best_sub_key))
+            row['最优子组合_对应腿'] = ' + '.join(
+                [f"腿{i}" for i, mid in enumerate(members, 1) if mid in best_sub_key])
+            row['最优子组合_赚钱性价比'] = best_sub_cost
+            row['最优子组合_资金最大回撤(%)'] = best_sub_m['策略组合资金最大回撤(%)']
+            row['最优子组合_最大回撤历时(天)'] = best_sub_m['最大回撤历时(天)']
+            row['最优子组合_最大并发持仓'] = best_sub_m['最大并发持仓数']
+            row['最优子组合_Top1币收益占比(%)'] = best_sub_m['Top1币收益占比(%)']
+
+            row['【提升】性价比增量(vs最优子组合)'] = cost_diff
+            row['【风险】回撤变动(vs最优子组合)(%)'] = (
+                    m_combo['策略组合资金最大回撤(%)'] - best_sub_m['策略组合资金最大回撤(%)'])
+
+            row['联合_赚钱性价比'] = m_combo['策略赚钱性价比']
+            row['联合_总真实净收益(%)'] = m_combo['总真实净收益(%)']
+            row['联合_资金最大回撤(%)'] = m_combo['策略组合资金最大回撤(%)']
+            row['联合_最大回撤历时(天)'] = m_combo['最大回撤历时(天)']
+            row['联合_最大回撤历时占比(%)'] = m_combo['最大回撤历时占比(%)']
+            row['联合_真实净胜率(%)'] = m_combo['真实净胜率(%)']
+            row['联合_最大并发持仓'] = m_combo['最大并发持仓数']
+            row['联合_Top1币收益占比(%)'] = m_combo['Top1币收益占比(%)']
+            row['联合_Top3币收益占比(%)'] = m_combo['Top3币收益占比(%)']
+            row['联合_总交易笔数'] = m_combo['总交易笔数']
+            row['联合_纯价差总收益(%)'] = m_combo['纯价差总收益(%)']
+            row['联合_资金费总损益(%)'] = m_combo['资金费总损益(%)']
+            row['联合_单笔净期望(%)'] = m_combo['单笔净期望(%)']
+            row['联合_真实盈潜比(Ret/MAE)'] = m_combo['真实盈潜比(Ret/MAE)']
+            row['联合_平均持仓时间(天)'] = m_combo['平均持仓时间(天)']
+            row['联合_资金时间回报(%/天)'] = m_combo['资金时间回报(%/天)']
+            row['联合_平均资金暴露度(%)'] = m_combo['平均资金暴露度(%)']
+
+            results_k.append(row)
+
+            if cost_diff > improvement_threshold:
+                qualified_this_level.append((combo_key, m_combo['策略赚钱性价比'], cost_diff))
+
+            # if idx % 500 == 0:
+            #     print(f"   ... 已完成 {idx}/{len(candidate_keys)}")
+
+        level_df = pd.DataFrame(results_k)
+        level_df.sort_values(
+            by=['【提升】性价比增量(vs最优子组合)', '联合_赚钱性价比'],
+            ascending=[False, False],
+            inplace=True
+        )
+
+        level_out_path = os.path.join(output_dir, multi_output_filename_tpl.format(k=k))
+        level_df.to_csv(level_out_path, index=False, encoding='utf-8-sig', float_format="%.4f")
+        level_out_paths[k] = level_out_path
+        level_dfs[k] = level_df
+
+        print(f"✅ [{k}联组合] 测算完成: 共评估 {len(level_df)} 个，其中满足提升阈值的 {len(qualified_this_level)} 个。")
+
+        # 🖥️ 调用 k联组合控制台看板
+        print_multi_synergy_dashboard(level_df, k, top_n=show_top_n_dashboard)
+
+        qualified_prev_level = qualified_this_level
+
     print(f"📁 详细单体指标已保存至: {os.path.abspath(single_out_path)}")
     print(f"📁 详细组合对比已保存至: {os.path.abspath(pair_out_path)}")
+    for k, p in level_out_paths.items():
+        print(f"📁 {k}联组合对比已保存至: {os.path.abspath(p)}")
 
-    return single_summary_df, pair_summary_df
+    return single_summary_df, pair_summary_df, level_dfs
 
 
 # =====================================================================
@@ -379,12 +597,15 @@ if __name__ == '__main__':
     if os.path.exists(trades_file):
         trades_df = pd.read_csv(trades_file)
 
-        single_df, pair_df = analyze_pair_combinations_with_baseline(
+        single_df, pair_df, multi_dfs = analyze_pair_combinations_with_baseline(
             df_trades=trades_df,
             output_dir='./summary_results',
             pair_output_filename='pair_combinations_with_comparison.csv',
             single_output_filename='single_strategy_summary.csv',
-            show_top_n_dashboard=50  # 控制台打印前 5 个提升最显著的组合
+            show_top_n_dashboard=50,  # 控制台打印前 5 个提升最显著的组合
+            max_combo_size=4,  # 最多扩展到 4 联组合
+            improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
+            max_seeds_per_level=2000  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")
