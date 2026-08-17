@@ -7,6 +7,17 @@ import datetime
 # =====================================================================
 # 配置区
 # =====================================================================
+# 新增：你指定的需要单独提取的特定做空组合
+short_pair = [
+    ("FR_TURN_NEGATIVE", "FR_RESET_AFTER_HOT", "60m", "bottom_100"),
+    ("EXIT_MA_DEAD_CROSS", "PRICE_CLOSE_CROSS_MA_UP", "15m", "bottom_10"),
+    ("REGIME_POWDER_KEG", "FR_HIGH_EXTREME", "30m", "bottom_50"),
+    ("ENTRY_HIGH_PRESSURE_OI_BREAKOUT", "FR_HIGH_EXTREME", "30m", "top_50"),
+    ("EXIT_FR_EXTREME_HIGH", "FR_COLD_START", "15m", "top_5"),
+    ("FR_ABSOLUTE_DEEP_NEG", "FR_TURN_POSITIVE", "15m", "top_20"),
+    ("VOLUME_CONFIRM_BREAK", "FR_COLD_START", "60m", "top_5"),
+]
+
 # 你指定的需要单独提取的特定组合 (进场信号, 出场信号, 周期, 过滤条件)
 long_pair = [
     ("VOLUME_CLIMAX_DOWN", "ENTRY_SILENT_ACCUMULATION", "60m", "bottom_10"),
@@ -49,14 +60,22 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     all_extracted_records = []
 
-    print(f"🎯 开始提取指定的 {len(long_pair)} 个策略组合...")
+    print(f"🎯 开始提取指定的 {len(long_pair)} 个多头组合与 {len(short_pair)} 个空头组合...")
 
-    # 1. 为了提高检索效率，按周期 (Timeframe) 对指定的 pair 进行分组
+    # 1. 为了提高检索效率，按周期 (Timeframe) 对指定的 pair 进行分组，并附加上对应的多空方向
     pairs_by_tf = {}
+
+    # 录入多头组合
     for entry_sig, exit_sig, tf, filter_cond in long_pair:
         if tf not in pairs_by_tf:
             pairs_by_tf[tf] = []
-        pairs_by_tf[tf].append((entry_sig, exit_sig, filter_cond))
+        pairs_by_tf[tf].append((entry_sig, exit_sig, filter_cond, 'Long'))
+
+    # 录入空头组合
+    for entry_sig, exit_sig, tf, filter_cond in short_pair:
+        if tf not in pairs_by_tf:
+            pairs_by_tf[tf] = []
+        pairs_by_tf[tf].append((entry_sig, exit_sig, filter_cond, 'Short'))
 
     # 2. 按周期遍历对应的文件夹读取数据
     for tf, tf_pairs in pairs_by_tf.items():
@@ -86,13 +105,13 @@ def main():
                 mask = pd.Series(False, index=df.index)
 
                 # 遍历当前周期需要提取的组合条件，执行 OR (或) 操作
-                for entry_sig, exit_sig, filter_cond in tf_pairs:
-                    # 注意：组合名是 long_pair，这里默认限定 direction 为 'Long'
+                for entry_sig, exit_sig, filter_cond, direction in tf_pairs:
+                    # 注意：此处加入了对 direction 的过滤，以准确区分多空信号
                     current_mask = (
                             (df['entry_factor'] == entry_sig) &
                             (df['exit_factor'] == exit_sig) &
                             (df['filter_mode'] == filter_cond) &
-                            (df['direction'] == 'Long')
+                            (df['direction'] == direction)
                     )
                     mask = mask | current_mask
 
@@ -132,9 +151,8 @@ def main():
     # 为了方便人工核查，按周期、进场信号、出场信号、入场时间进行排序
     final_df.sort_values(by=['timeframe', 'entry_factor', 'exit_factor', 'filter_mode', 'entry_time'], inplace=True)
 
-    # 导出文件
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_file = os.path.join(OUTPUT_DIR, f'extracted_long_pairs_{timestamp}.csv')
+    # 导出文件（文件名修改为 target_pairs 以包含多空双向）
+    out_file = os.path.join(OUTPUT_DIR, f'extracted_target_pairs.csv')
 
     final_df.to_csv(out_file, index=False, encoding='utf-8-sig', float_format="%.6f")
     print(f"\n🎉 提取完毕！总共提取到 {len(final_df)} 笔交易。")
