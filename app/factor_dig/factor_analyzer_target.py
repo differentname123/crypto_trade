@@ -9,7 +9,7 @@ import os
 MIN_TRADES_PER_TF = 50
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的最大回撤历时占比(%)都不能超过该值
-MAX_DRAWDOWN_DURATION_PCT = 10.0
+MAX_DRAWDOWN_DURATION_PCT = 20.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的平均持仓时间(天)必须小于该值 (新增)
 MAX_AVG_HOLDING_DAYS = 10.0
