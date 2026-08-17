@@ -1,3 +1,5 @@
+
+
 import pandas as pd
 import numpy as np
 import os
@@ -12,18 +14,32 @@ MIN_TRADES_PER_TF = 50
 MAX_DRAWDOWN_DURATION_PCT = 20.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的平均持仓时间(天)必须小于该值 (新增)
-MAX_AVG_HOLDING_DAYS = 10.0
+MAX_AVG_HOLDING_DAYS = 60.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 Top3币收益占比(%) 必须小于该值 (新增)
 MAX_TOP3_PROFIT_PCT = 60.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
-MIN_RET_MAE_RATIO = 0.1
+MIN_RET_MAE_RATIO = 0.01
 
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
-
+long_pair = [
+    ("VOLUME_CLIMAX_DOWN", "ENTRY_SILENT_ACCUMULATION"),
+    ("EXIT_VOL_EXTREME_DOWN", "ENTRY_SILENT_ACCUMULATION"),
+    ("EXIT_FR_ROLL_OVER", "ENTRY_SILENT_ACCUMULATION"),
+    ("FR_ABSOLUTE_HIGH_POS", "OI_BOTTOM_DIVERGENCE"),
+    ("FR_HIGH_EXTREME", "ENTRY_SILENT_ACCUMULATION"),
+    ("MOM_RECOVERY_FROM_LOW", "FR_RECOVERY_FROM_LOW"),
+    ("EXIT_OI_ROC_PEAK", "EXIT_MA_DEAD_CROSS"),
+    ("OI_NEW_HIGH", "EXIT_MA_DEAD_CROSS"),
+    ("ENTRY_OI_LEAD_MOMENTUM", "VOL_DOWN_SPIKE"),
+    ("FR_RECOVERY_FROM_LOW", "STRUCT_RANGE_POSITION_WEAK"),
+    ("EXIT_SHORT_SURGE_EXTREME", "FR_LOW_NEG"),
+    ("STRUCT_SUPPORT_HOLD", "FR_RECOVERY_FROM_LOW"),
+    ("FR_ROLL_OVER_FROM_HIGH", "EXIT_DISTRIBUTION_EXHAUSTION_TOP"),
+]
 def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     """
     生成高密度的策略表现二维透视面板 (增加脱敏、多维度展示与交易次数过滤)
@@ -225,15 +241,136 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         # 🌟 高密度透视面板输出多个指定维度 (定制不同的数字格式)
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
-        # print_metric_matrix(sub_df, "真实净胜率(%)", "⚖️ 【真实净胜率(%)】 横向截面对比", "{:.2f}")
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
-        # print_metric_matrix(sub_df, "真实盈潜比(Ret/MAE)", "⚡ 【真实盈潜比(Ret/MAE)】 横向截面对比", "{:.4f}")
 
-        # print_metric_matrix(sub_df, "平均持仓时间(天)", "⚡ 平均持仓时间(天) 横向截面对比", "{:.4f}")
+        print("=" * 120)
 
-        # print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
+# =====================================================================
+# 新增功能区：专门用于输出指定组合面板的独立函数（无任何过滤条件）
+# =====================================================================
+def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long'):
+    """
+    针对给定的特定因子组合列表，单独输出它们的高密度透视面板（自动适应脱敏映射，且不附加任何过滤条件）
+    """
+    if not os.path.exists(csv_path):
+        print(f"❌ 找不到文件: {csv_path}")
+        return
+
+    # 1. 加载数据与过滤方向
+    df = pd.read_csv(csv_path)
+    df = df[df['direction'] == target_direction].copy()
+
+    # 执行与原代码完全一致的因子脱敏逻辑，以便正常读取 DataFrame
+    all_signals = pd.concat([df['entry_factor'], df['exit_factor']]).dropna().unique()
+    all_signals = sorted(list(all_signals))
+    signal_mapping = {sig: f"SIGNAL_{i:003d}" for i, sig in enumerate(all_signals, 1)}
+
+    df['entry_factor'] = df['entry_factor'].map(signal_mapping)
+    df['exit_factor'] = df['exit_factor'].map(signal_mapping)
+
+    # 2. 识别数据中包含的周期
+    all_calmar_cols = [c for c in df.columns if '策略赚钱性价比_' in c]
+    if not all_calmar_cols:
+        print("⚠️ 数据中找不到 '策略赚钱性价比' 相关的列，请检查 CSV。")
+        return
+
+    timeframes = [c.split('_')[-1] for c in all_calmar_cols]
+    std_order = ['60m', '30m', '15m', '5m']
+    timeframes = [tf for tf in std_order if tf in timeframes] + [tf for tf in timeframes if tf not in std_order]
+
+    df['avg_calmar'] = df[all_calmar_cols].mean(axis=1, skipna=True)
+    df_dir = df[df['direction'] == target_direction].copy()
+
+    if df_dir.empty:
+        print(f"⚠️ 在数据中没有找到方向为 {target_direction} 的记录。")
+        return
+
+    FILTER_ORDER = [
+        'bottom_100', 'bottom_50', 'bottom_20', 'bottom_10', 'bottom_5', 'bottom_3', 'bottom_1',
+        'original',
+        'top_1', 'top_3', 'top_5', 'top_10', 'top_20', 'top_50', 'top_100'
+    ]
+
+    # 面板绘制函数(与原函数严格保持一致)
+    def print_metric_matrix(sub_df, metric_prefix, title, fmt_str="{:.4f}"):
+        available_filters = sub_df['filter_mode'].unique()
+        available_filters_list = list(available_filters)
+        sorted_filters = [f for f in FILTER_ORDER if f in available_filters_list]
+        sorted_filters += [f for f in available_filters_list if f not in FILTER_ORDER]
+
+        col_widths = {}
+        for f in sorted_filters:
+            col_widths[f] = len(f)
+
+        for tf in timeframes:
+            col_name = f"{metric_prefix}_{tf}"
+            if col_name in sub_df.columns:
+                for f in sorted_filters:
+                    val_series = sub_df[sub_df['filter_mode'] == f][col_name]
+                    if not val_series.empty and pd.notna(val_series.values[0]):
+                        val_str = fmt_str.format(val_series.values[0])
+                    else:
+                        val_str = "-"
+                    col_widths[f] = max(col_widths[f], len(val_str))
+
+        print(f"\n>> {title}")
+        print("-" * 120)
+        header = f"{'过滤模式':<6}" + "".join([f.rjust(col_widths[f] + 2) for f in sorted_filters])
+        print(header)
+        print("周期")
+
+        for tf in timeframes:
+            col_name = f"{metric_prefix}_{tf}"
+            if col_name not in sub_df.columns:
+                continue
+
+            row_str = f"{tf:<8}"
+            for f in sorted_filters:
+                val_series = sub_df[sub_df['filter_mode'] == f][col_name]
+                if not val_series.empty and pd.notna(val_series.values[0]):
+                    val_str = fmt_str.format(val_series.values[0])
+                else:
+                    val_str = "-"
+                row_str += val_str.rjust(col_widths[f] + 2)
+            print(row_str)
+
+    # 3. 遍历指定列表进行输出
+    print(f"\n🔥 开始生成指定 {len(target_pairs)} 个组合的专属报告 (无任何前置过滤)...")
+    for rank, (orig_entry, orig_exit) in enumerate(target_pairs, 1):
+        # 查询映射表
+        mapped_entry = signal_mapping.get(orig_entry)
+        mapped_exit = signal_mapping.get(orig_exit)
+
+        if not mapped_entry or not mapped_exit:
+            print(f"\n⚠️ 组合 #{rank} [{orig_entry}, {orig_exit}] 在数据集中未找到映射记录，已跳过。")
+            continue
+
+        # 提取当前组合的所有数据
+        sub_df = df_dir[(df_dir['entry_factor'] == mapped_entry) & (df_dir['exit_factor'] == mapped_exit)].sort_values('filter_mode')
+
+        if sub_df.empty:
+            print(f"\n⚠️ 组合 #{rank} [{orig_entry}, {orig_exit}] (方向:{target_direction}) 在该方向无数据，已跳过。")
+            continue
+
+        # 因为要求无任何过滤，所以直接找平均性价比最高的一条作为最佳提示（不包含任何次数、回撤校验）
+        sub_df_sorted = sub_df.sort_values(by='avg_calmar', ascending=False)
+        best_f = sub_df_sorted.iloc[0]['filter_mode']
+        best_score = sub_df_sorted.iloc[0]['avg_calmar']
+
+        # 打印面板
+        print("\n" + "=" * 120)
+        print(f" 🎯 专属组合透视面板 | 方向: {target_direction}")
+        print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
+        print(f" 脱敏映射编号: 入场 ({mapped_entry}) -> 出场 ({mapped_exit})")
+        print(f" 列表进度编号: #{rank} (性价比最高档位: {best_f} , 对应平均性价比: {best_score:.4f})")
+
+        print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
+        print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
+        print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
 
         print("=" * 120)
 
@@ -246,12 +383,14 @@ if __name__ == "__main__":
     print("      - bottom_N : 仅在跌幅最大（排名垫底）的前 N 个币种上允许开仓。")
     print("      - original : 原始状态，不对币种进行任何截面过滤，全市场轮动。")
     print("      - top_N    : 仅在涨幅最大（排名靠前）的前 N 个币种上允许开仓。")
-    print(
-        "      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
+    print("      所有利润 或者 胜率都是完全考虑了滑点 资金费率之后的数据 回测没有用到任何的未来函数 回测标的的流动性也没有任何问题")
     print(f"{'=' * 90}")
 
     # 替换为你实际的大宽表路径
     TARGET_CSV = './summary_results/advanced_summary_combined_ALL.csv'
 
-    # 按照需求：分离多空，默认只展示 Long，展示前 50 名
-    display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Long')
+    # ==== 打印指定列表，无任何过滤条件 ====
+    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+
+    # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
+    # display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Long')
