@@ -12,7 +12,7 @@ MIN_TRADES_PER_TF = 50
 MAX_DRAWDOWN_DURATION_PCT = 50.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的平均持仓时间(天)必须小于该值 (新增)
-MAX_AVG_HOLDING_DAYS = 10.0
+MAX_AVG_HOLDING_DAYS = 100.0
 
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
@@ -211,7 +211,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
-        print_metric_matrix(sub_df, "平均持仓时间(天)", "⚡ 平均持仓时间(天) 横向截面对比", "{:.4f}")
+        # print_metric_matrix(sub_df, "平均持仓时间(天)", "⚡ 平均持仓时间(天) 横向截面对比", "{:.4f}")
 
         # print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
 
