@@ -141,11 +141,12 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         print(
             f"#{i:<3} | {strat_name:<48} | {row['总真实净收益(%)']:>9.2f}% | {row['策略组合资金最大回撤(%)']:>10.2f}% | {row['策略赚钱性价比']:>8.2f}")
 
-    # 2. 打印协同增强组合 Top N (1+1 > 2 效应最强)
-    top_synergy = pair_df.head(top_n)
+    # 2. 打印协同增强组合 Top N (按照 联合后的 赚钱性价比 降序排序)
+    pair_df_sorted = pair_df.sort_values(by='联合_赚钱性价比', ascending=False)
+    top_synergy = pair_df_sorted.head(top_n)
 
     print("\n" + "=" * 92)
-    print(f" 🚀 【最强协同增益组合 Top {len(top_synergy)}】(按【性价比提升量】降序呈现 1+1 > 2 效应)")
+    print(f" 🚀 【最强联合组合 Top {len(top_synergy)}】(按【联合后赚钱性价比】降序排序)")
     print("=" * 92)
 
     for rank, (_, row) in enumerate(top_synergy.iterrows(), 1):
@@ -161,40 +162,39 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         print(f"  {'对比维度':<14} | {'单策略 A':>14} | {'单策略 B':>14} | {'两两联合组合':>16} | {'增益/变化':>16}")
         print(f"  {'-' * 88}")
 
-        # 赚钱性价比
+        # 1. 赚钱性价比
         c_a = row['单A_赚钱性价比']
         c_b = row['单B_赚钱性价比']
         c_combo = row['联合_赚钱性价比']
         c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
-        print(
-            f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} 🔺" if cost_gain >= 0 else f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} 🔻")
+        icon = "🔺" if cost_gain >= 0 else "🔻"
+        print(f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
 
-        # 总净收益
-        r_a = row['单A_总真实净收益(%)']
-        r_b = row['单B_总真实净收益(%)']
-        r_combo = row['联合_总真实净收益(%)']
-        r_diff = row['【提升】净收益增量(vs单体最优)(%)']
-        r_diff_sign = f"+{r_diff:.2f}%" if r_diff >= 0 else f"{r_diff:.2f}%"
-        print(f"  {'总净收益(%)':<12} | {r_a:>13.2f}% | {r_b:>13.2f}% | {r_combo:>15.2f}% | {r_diff_sign:>15}")
-
-        # 最大回撤
+        # 2. 资金最大回撤
         m_a = row['单A_资金最大回撤(%)']
         m_b = row['单B_资金最大回撤(%)']
         m_combo = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs单体最低)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'资金最大回撤':<12} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>15}")
+        print(f"  {'资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
 
-        # 胜率与并发
-        w_a = row['单A_真实净胜率(%)']
-        w_b = row['单B_真实净胜率(%)']
-        w_combo = row['联合_真实净胜率(%)']
-        print(f"  {'真实净胜率':<13} | {w_a:>13.2f}% | {w_b:>13.2f}% | {w_combo:>15.2f}% | {'---':>16}")
+        # 3. 最大回撤历时(天)
+        dur_a = row['单A_最大回撤历时(天)']
+        dur_b = row['单B_最大回撤历时(天)']
+        dur_combo = row['联合_最大回撤历时(天)']
+        print(f"  {'最大回撤历时(天)':<14} | {dur_a:>14.2f} | {dur_b:>14.2f} | {dur_combo:>16.2f} | {'---':>16}")
 
+        # 4. 最大并发持仓
         con_a = int(row['单A_最大并发持仓'])
         con_b = int(row['单B_最大并发持仓'])
         con_combo = int(row['联合_最大并发持仓'])
-        print(f"  {'最大并发持仓':<12} | {con_a:>14} | {con_b:>14} | {con_combo:>16} | {'---':>16}")
+        print(f"  {'最大并发持仓':<14} | {con_a:>14} | {con_b:>14} | {con_combo:>16} | {'---':>16}")
+
+        # 5. Top1币收益占比
+        top1_a = row['单A_Top1币收益占比(%)']
+        top1_b = row['单B_Top1币收益占比(%)']
+        top1_combo = row['联合_Top1币收益占比(%)']
+        print(f"  {'Top1币收益占比':<14} | {top1_a:>13.2f}% | {top1_b:>13.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
 
     print("\n" + "=" * 92)
 
@@ -320,6 +320,10 @@ def analyze_pair_combinations_with_baseline(
             '单A_资金最大回撤(%)': m1['策略组合资金最大回撤(%)'],
             '单B_资金最大回撤(%)': m2['策略组合资金最大回撤(%)'],
 
+            '联合_最大回撤历时(天)': m_combo['最大回撤历时(天)'],
+            '单A_最大回撤历时(天)': m1['最大回撤历时(天)'],
+            '单B_最大回撤历时(天)': m2['最大回撤历时(天)'],
+
             '联合_真实净胜率(%)': m_combo['真实净胜率(%)'],
             '单A_真实净胜率(%)': m1['真实净胜率(%)'],
             '单B_真实净胜率(%)': m2['真实净胜率(%)'],
@@ -328,17 +332,21 @@ def analyze_pair_combinations_with_baseline(
             '单A_最大并发持仓': m1['最大并发持仓数'],
             '单B_最大并发持仓': m2['最大并发持仓数'],
 
+            '联合_Top1币收益占比(%)': m_combo['Top1币收益占比(%)'],
+            '单A_Top1币收益占比(%)': m1['Top1币收益占比(%)'],
+            '单B_Top1币收益占比(%)': m2['Top1币收益占比(%)'],
+
             '联合_总交易笔数': m_combo['总交易笔数'],
             '联合_纯价差总收益(%)': m_combo['纯价差总收益(%)'],
             '联合_资金费总损益(%)': m_combo['资金费总损益(%)'],
             '联合_单笔净期望(%)': m_combo['单笔净期望(%)'],
             '联合_真实盈潜比(Ret/MAE)': m_combo['真实盈潜比(Ret/MAE)'],
-            '联合_最大回撤历时(天)': m_combo['最大回撤历时(天)'],
+
             '联合_最大回撤历时占比(%)': m_combo['最大回撤历时占比(%)'],
             '联合_平均持仓时间(天)': m_combo['平均持仓时间(天)'],
             '联合_资金时间回报(%/天)': m_combo['资金时间回报(%/天)'],
             '联合_平均资金暴露度(%)': m_combo['平均资金暴露度(%)'],
-            '联合_Top1币收益占比(%)': m_combo['Top1币收益占比(%)'],
+
             '联合_Top3币收益占比(%)': m_combo['Top3币收益占比(%)']
         })
         results.append(comparison_info)
@@ -381,8 +389,11 @@ if __name__ == '__main__':
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")
 
-    origin_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL.csv')
+    origin_df = pd.read_csv(
+        r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\advanced_summary_combined_ALL.csv')
 
-    df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\single_strategy_summary.csv')
-    pair_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\pair_combinations_with_comparison.csv')
+    df = pd.read_csv(
+        r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\single_strategy_summary.csv')
+    pair_df = pd.read_csv(
+        r'W:\project\python_project\crypto_trade\app\factor_dig\summary_results\pair_combinations_with_comparison.csv')
     print()
