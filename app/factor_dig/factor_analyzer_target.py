@@ -9,13 +9,13 @@ import os
 MIN_TRADES_PER_TF = 50
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的最大回撤历时占比(%)都不能超过该值
-MAX_DRAWDOWN_DURATION_PCT = 50.0
+MAX_DRAWDOWN_DURATION_PCT = 10.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的平均持仓时间(天)必须小于该值 (新增)
-MAX_AVG_HOLDING_DAYS = 100.0
+MAX_AVG_HOLDING_DAYS = 10.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 Top3币收益占比(%) 必须小于该值 (新增)
-MAX_TOP3_PROFIT_PCT = 80.0
+MAX_TOP3_PROFIT_PCT = 60.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
 MIN_RET_MAE_RATIO = 0.1
@@ -229,6 +229,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}")
+        # print_metric_matrix(sub_df, "真实盈潜比(Ret/MAE)", "⚡ 【真实盈潜比(Ret/MAE)】 横向截面对比", "{:.4f}")
+
         # print_metric_matrix(sub_df, "平均持仓时间(天)", "⚡ 平均持仓时间(天) 横向截面对比", "{:.4f}")
 
         # print_metric_matrix(sub_df, "Top3币收益占比(%)", "👑 【Top3收益币占比(%)】 横向截面对比", "{:.2f}")
