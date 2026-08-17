@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 # =====================================================================
-# 核心配置区 (新增)
+# 核心配置区 (新增与原有配置)
 # =====================================================================
 # 过滤条件：每个周期（60m,30m,15m,5m）的交易数量都必须大于该值
 MIN_TRADES_PER_TF = 50
@@ -13,6 +13,12 @@ MAX_DRAWDOWN_DURATION_PCT = 50.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的平均持仓时间(天)必须小于该值 (新增)
 MAX_AVG_HOLDING_DAYS = 100.0
+
+# 过滤条件：每个周期（60m,30m,15m,5m）的 Top3币收益占比(%) 必须小于该值 (新增)
+MAX_TOP3_PROFIT_PCT = 80.0
+
+# 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
+MIN_RET_MAE_RATIO = 0.1
 
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
@@ -85,6 +91,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     trade_cols = [c for c in df_dir.columns if '总交易笔数_' in c]
     dd_duration_cols = [c for c in df_dir.columns if '最大回撤历时占比(%)_' in c]
     holding_days_cols = [c for c in df_dir.columns if '平均持仓时间(天)_' in c] # 新增提取持仓时间列
+    top3_profit_cols = [c for c in df_dir.columns if 'Top3币收益占比(%)_' in c] # 新增提取Top3币收益占比列
+    ret_mae_cols = [c for c in df_dir.columns if '真实盈潜比(Ret/MAE)_' in c] # 新增提取真实盈潜比列
 
     for _, row in df_sorted.iterrows():
         pair = (row['entry_factor'], row['exit_factor'])
@@ -108,6 +116,16 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         if holding_days_cols:
             if row[holding_days_cols].fillna(9999).max() >= MAX_AVG_HOLDING_DAYS:
                 continue  # 当前 filter_mode 不满足持仓时间小于阈值的条件，跳过
+
+        # 4. 验证Top3币收益占比(%) (如果数据缺失NaN，视为100%直接淘汰) 新增逻辑
+        if top3_profit_cols:
+            if row[top3_profit_cols].fillna(100).max() >= MAX_TOP3_PROFIT_PCT:
+                continue  # 当前 filter_mode 收益过度集中于前3个币，跳过
+
+        # 5. 验证真实盈潜比(Ret/MAE) (如果数据缺失NaN，视为0直接淘汰) 新增逻辑
+        if ret_mae_cols:
+            if row[ret_mae_cols].fillna(0).min() <= MIN_RET_MAE_RATIO:
+                continue  # 当前 filter_mode 盈潜比未达到最低要求，跳过
         # ========================================================
 
         # 如果通过了上述检验，提取该组合所有过滤模式下的完整矩阵（保留全局统计数据用于绘制面板）
@@ -189,7 +207,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
             print(row_str)
 
     if not top_pairs:
-        print("⚠️ 没有符合过滤条件（交易次数、回撤历时及平均持仓时间）的策略组合可以输出。")
+        print("⚠️ 没有符合过滤条件（交易次数、回撤历时、持仓时间、Top3收益占比及真实盈潜比）的策略组合可以输出。")
         return
 
     for rank, pair_info in enumerate(top_pairs, 1):
