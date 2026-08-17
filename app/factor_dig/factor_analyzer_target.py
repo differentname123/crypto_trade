@@ -364,7 +364,7 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
         print(f" 🎯 专属组合透视面板 | 方向: {target_direction}")
         # print(f" 原始因子组合: 入场 [{orig_entry}] -> 出场 [{orig_exit}]")
         print(f" 脱敏映射编号: 入场 ({mapped_entry}) -> 出场 ({mapped_exit})")
-        print(f" 列表进度编号: #{rank} (性价比最高档位: {best_f} , 对应平均性价比: {best_score:.4f})")
+        # print(f" 列表进度编号: #{rank} (性价比最高档位: {best_f} , 对应平均性价比: {best_score:.4f})")
 
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}")
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}")
