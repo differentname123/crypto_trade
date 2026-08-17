@@ -384,7 +384,7 @@ if __name__ == '__main__':
             output_dir='./summary_results',
             pair_output_filename='pair_combinations_with_comparison.csv',
             single_output_filename='single_strategy_summary.csv',
-            show_top_n_dashboard=5  # 控制台打印前 5 个提升最显著的组合
+            show_top_n_dashboard=50  # 控制台打印前 5 个提升最显著的组合
         )
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")
