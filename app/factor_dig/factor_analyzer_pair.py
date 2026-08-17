@@ -6,6 +6,31 @@ import datetime
 
 
 # =====================================================================
+# 全局信号脱敏映射模块 (新增)
+# =====================================================================
+_SIGNAL_MAPPING = {}
+_SIGNAL_COUNTER = 1
+
+def get_masked_signal(sig_name):
+    """获取脱敏后的信号名称，首次遇到则生成如 SIGNAL_001"""
+    global _SIGNAL_COUNTER
+    sig_str = str(sig_name)
+    if sig_str not in _SIGNAL_MAPPING:
+        _SIGNAL_MAPPING[sig_str] = f"SIGNAL_{_SIGNAL_COUNTER:03d}"
+        _SIGNAL_COUNTER += 1
+    return _SIGNAL_MAPPING[sig_str]
+
+def save_signal_mapping_table(output_dir='./summary_results'):
+    """保存原始信号名称与脱敏名称的映射表"""
+    if not _SIGNAL_MAPPING:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, 'signal_mapping.csv')
+    df_map = pd.DataFrame(list(_SIGNAL_MAPPING.items()), columns=['原始信号名称', '脱敏信号名称'])
+    df_map.to_csv(path, index=False, encoding='utf-8-sig')
+
+
+# =====================================================================
 # 指标测算核心函数
 # =====================================================================
 def calculate_portfolio_metrics(g_sorted):
@@ -141,7 +166,8 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         f"{'排名':<4} | {'策略指纹 (TF | Entry | Exit | Dir | Filter)':<48} | {'净收益(%)':>10} | {'最大回撤(%)':>11} | {'性价比':>8}")
     print("-" * 92)
     for i, (_, row) in enumerate(valid_single_df.head(5).iterrows(), 1):
-        strat_name = f"{row['周期']} | {row['入场']} | {row['出场']} | {row['方向']} | {row['过滤']}"
+        # 此处使用 get_masked_signal 进行脱敏
+        strat_name = f"{row['周期']} | {get_masked_signal(row['入场'])} | {get_masked_signal(row['出场'])} | {row['方向']} | {row['过滤']}"
         if len(strat_name) > 46:
             strat_name = strat_name[:43] + "..."
         print(
@@ -159,11 +185,13 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         cost_gain = row['【提升】性价比增量(vs单体最优)']
         gain_flag = "🟢 [显著提升]" if cost_gain > 0 else "🔴 [无增益/稀释]"
 
-        print(f"\n🏆 第 {rank} 名组合 {gain_flag}")
+        print(f"\n组合编号 {2}_{rank} 表现如下")
+
+        # 此处使用 get_masked_signal 进行脱敏
         print(
-            f"  ├─ 组合 A: [{row['组合A_周期']}] {row['组合A_入场']} -> {row['组合A_出场']} ({row['组合A_方向']}_{row['组合A_过滤']})")
+            f"  ├─ 组合 A: [{row['组合A_周期']}] {get_masked_signal(row['组合A_入场'])} -> {get_masked_signal(row['组合A_出场'])} ({row['组合A_方向']}_{row['组合A_过滤']})")
         print(
-            f"  └─ 组合 B: [{row['组合B_周期']}] {row['组合B_入场']} -> {row['组合B_出场']} ({row['组合B_方向']}_{row['组合B_过滤']})")
+            f"  └─ 组合 B: [{row['组合B_周期']}] {get_masked_signal(row['组合B_入场'])} -> {get_masked_signal(row['组合B_出场'])} ({row['组合B_方向']}_{row['组合B_过滤']})")
         print(f"  {'-' * 88}")
         print(f"  {'对比维度':<14} | {'单策略 A':>14} | {'单策略 B':>14} | {'两两联合组合':>16} | {'增益/变化':>16}")
         print(f"  {'-' * 88}")
@@ -235,10 +263,11 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         cost_gain = row['【提升】性价比增量(vs最优子组合)']
         gain_flag = "🟢 [显著提升]" if cost_gain > 0 else "🔴 [无增益/稀释]"
 
-        print(f"\n🏆 第 {rank} 名 {k}联组合 {gain_flag}")
+        print(f"\n组合编号 {k}_{rank} 表现如下")
         for i in range(1, k + 1):
             prefix = "├─" if i < k else "└─"
-            print(f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {row[f'腿{i}_入场']} -> {row[f'腿{i}_出场']} "
+            # 此处使用 get_masked_signal 进行脱敏
+            print(f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {get_masked_signal(row[f'腿{i}_入场'])} -> {get_masked_signal(row[f'腿{i}_出场'])} "
                   f"({row[f'腿{i}_方向']}_{row[f'腿{i}_过滤']}) | 单体性价比 {row[f'腿{i}_单体性价比']:.2f}")
         print(f"  ★ 对比基准(最优已评估子组合, 规模{int(row['最优子组合_规模'])}): {row['最优子组合_对应腿']}")
         print(f"  {'-' * 88}")
@@ -346,6 +375,7 @@ def analyze_pair_combinations_with_baseline(
 
     if len(valid_strategies_for_combo) < 2:
         print("⚠️ 满足并发条件的独立策略少于 2 个，跳过组合测算。")
+        save_signal_mapping_table(output_dir)
         return single_summary_df, pd.DataFrame(), {}
 
     # ▼▼▼ 新增: 已评估组合指标注册表 (frozenset(成员) -> 指标Series)，单策略先入册
@@ -578,9 +608,6 @@ def analyze_pair_combinations_with_baseline(
             if cost_diff > improvement_threshold:
                 qualified_this_level.append((combo_key, m_combo['策略赚钱性价比'], cost_diff))
 
-            # if idx % 500 == 0:
-            #     print(f"   ... 已完成 {idx}/{len(candidate_keys)}")
-
         level_df = pd.DataFrame(results_k)
         level_df.sort_values(
             by=['【提升】性价比增量(vs最优子组合)', '联合_赚钱性价比'],
@@ -600,10 +627,10 @@ def analyze_pair_combinations_with_baseline(
 
         qualified_prev_level = qualified_this_level
 
-    # print(f"📁 详细单体指标已保存至: {os.path.abspath(single_out_path)}")
-    # print(f"📁 详细组合对比已保存至: {os.path.abspath(pair_out_path)}")
-    # for k, p in level_out_paths.items():
-    #     print(f"📁 {k}联组合对比已保存至: {os.path.abspath(p)}")
+    # =====================================================================
+    # 将汇总好的信号字典落盘保存映射表 (方便您查询具体是哪个信号)
+    # =====================================================================
+    save_signal_mapping_table(output_dir)
 
     return single_summary_df, pair_summary_df, level_dfs
 
@@ -630,7 +657,7 @@ if __name__ == '__main__':
             output_dir='./summary_results',
             pair_output_filename='pair_combinations_with_comparison.csv',
             single_output_filename='single_strategy_summary.csv',
-            show_top_n_dashboard=50,  # 控制台打印前 5 个提升最显著的组合
+            show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
             max_combo_size=4,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
             max_seeds_per_level=2000  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
