@@ -1118,7 +1118,7 @@ def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_
 
 def generate_XSR_signals(kline_df, fr_df, bar_minutes=15):
     """
-    截面瞬时信号生成版：针对 custom_surge_and_fr_long 策略
+    截面瞬时信号生成版：针对 custom_surge_and_fr_short 策略
     仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
     """
     STRATEGY_PARAMS = {
@@ -1128,7 +1128,7 @@ def generate_XSR_signals(kline_df, fr_df, bar_minutes=15):
         'EXIT_FR_RANK_THRESHOLD': 0.20,  # 资金费率极低判定阈值 (做多出场)
         'TARGET_WEIGHT': 1.0,  # 目标仓位
         'MAX_WEIGHT': 1.0,  # 最大允许仓位
-        'STRATEGY_NAME': 'custom_surge_and_fr_long'
+        'STRATEGY_NAME': 'custom_surge_and_fr_short'
     }
 
     cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
