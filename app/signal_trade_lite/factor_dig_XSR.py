@@ -157,6 +157,9 @@ if __name__ == "__main__":
     kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_1m_kline.csv'
     # 注意：你需要补充资金费率的文件路径
     fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_funding_rates.csv'
+    fr_df = pd.read_csv(fr_file_path)
+    # 根据timestamp 生成一个新的datetime
+    fr_df['datetime'] = pd.to_datetime(fr_df['timestamp'], unit='ms', utc=True)
 
     print("正在加载数据与重采样对齐...")
     try:
