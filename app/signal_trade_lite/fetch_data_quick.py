@@ -655,10 +655,19 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
     try:
         # 获取下一次结算时间与物理机时间
         funding_info = await exchange.fetch_funding_rate(symbol)
+
+        # 【深度兼容补丁】兼容 CCXT 针对 Binance 各版本的字段映射差异，强行深挖原始字段
         next_funding_time = funding_info.get('nextFundingTimestamp')
+        if not next_funding_time:
+            next_funding_time = funding_info.get('fundingTimestamp')
+        if not next_funding_time and 'info' in funding_info:
+            raw_info = funding_info['info']
+            if 'nextFundingTime' in raw_info:
+                next_funding_time = int(raw_info['nextFundingTime'])
+
         server_time = exchange.milliseconds()
 
-        # 容错：如果交易所没有返回 nextFundingTimestamp，强行触发场景 B
+        # 容错：如果深度穿透后交易所依然没有返回 nextFundingTimestamp，强行触发场景 B
         time_to_funding = (next_funding_time - server_time) if next_funding_time else -1
 
         if 0 < time_to_funding <= threshold_ms:
@@ -852,7 +861,7 @@ if __name__ == "__main__":
 
         logger.info(">>> 准备调用数据引擎...")
 
-        # # ======= 1. K线数据极速引擎调用演示 =======
+        # ======= 1. K线数据极速引擎调用演示 =======
         # result_map = snipe_kline_data(
         #     symbol_list=symbol_list,
         #     timeframe="1m",
