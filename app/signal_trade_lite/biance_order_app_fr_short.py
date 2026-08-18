@@ -28,7 +28,7 @@ import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
 
-CURRENT_SYMBOL = "XSR_long"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short"
+CURRENT_SYMBOL = "fr_short"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
