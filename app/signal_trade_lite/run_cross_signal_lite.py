@@ -1127,8 +1127,8 @@ def generate_XSR_signals(kline_df, fr_df, bar_minutes=15):
         'ENTRY_RANK_THRESHOLD': 0.98,  # 极端拉升判定阈值 (做多入场)
         'EXIT_FR_RANK_THRESHOLD': 0.20,  # 资金费率极低判定阈值 (做多出场)
         'TARGET_WEIGHT': 1.0,  # 目标仓位
-        'MAX_WEIGHT': 1.0,  # 最大允许仓位
-        'STRATEGY_NAME': 'custom_surge_and_fr_short'
+        'MAX_WEIGHT': 1.0 / 30 / 2.1,  # 最大允许仓位
+        'STRATEGY_NAME': 'XSR'
     }
 
     cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
@@ -1382,8 +1382,8 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
         'STRONG_RET_RANK_THRESHOLD': 0.80,  # 收益率强势水位线 (>80%)
         'MILD_FR_RANK_THRESHOLD': 0.50,  # 资金费率温和水位线 (<50%)
         'TARGET_WEIGHT': 1.0,  # 目标名义仓位
-        'MAX_WEIGHT': 1.0,  # 最大允许仓位
-        'STRATEGY_NAME': 'extreme_fr_short_cold_start_close'
+        'MAX_WEIGHT': 1.0 / 7 / 1.6,  # 最大允许仓位
+        'STRATEGY_NAME': 'fr_short'
     }
 
     cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
