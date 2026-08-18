@@ -5,19 +5,23 @@ import numpy as np
 def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
     """
     高度内聚的回测与信号生成函数 (做空策略)：
-    - 开仓信号: EXIT_FR_EXTREME_HIGH (极端高费率，散户多头极其拥挤) -> 做空
-    - 平仓信号: FR_COLD_START (24h价格已强势拉升且费率未热/冷启动) -> 平空
+    - 状态A (触发做空): 资金费率极度狂热 (Extreme High Funding Rate)
+    - 状态B (触发平空): 冷启动上涨 (Cold Start: 价格强势拉升且费率处于低位)
     """
 
     # ==========================================
-    # 1. 策略参数配置 (严格对齐原代码逻辑)
+    # 1. 策略参数配置 (使用客观的物理状态命名)
     # ==========================================
     STRATEGY_PARAMS = {
         'N_HOURS': 24,  # 动量回溯周期(24小时)
         'W_DAYS': 14,  # 排名滚动窗口(14天)
-        'ENTRY_FR_RANK_THRESHOLD': 0.95,  # 做空入场: 资金费率处于14天极高位 (>95%)
-        'EXIT_RET_RANK_THRESHOLD': 0.80,  # 平空出场条件1: 24h收益率处于极高位 (>80%)
-        'EXIT_FR_RANK_THRESHOLD': 0.50,  # 平空出场条件2: 资金费率处于中低位 (<50%)
+
+        # 客观状态阈值
+        'EXTREME_FR_RANK_THRESHOLD': 0.95,  # 资金费率极高水位线 (>95%)
+        'STRONG_RET_RANK_THRESHOLD': 0.80,  # 收益率强势水位线 (>80%)
+        'MILD_FR_RANK_THRESHOLD': 0.50,  # 资金费率温和水位线 (<50%)
+
+        # 仓位与策略元数据
         'TARGET_WEIGHT': 1.0,  # 目标名义仓位
         'MAX_WEIGHT': 1.0,  # 最大允许仓位
         'STRATEGY_NAME': 'extreme_fr_short_cold_start_close'
@@ -46,7 +50,7 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
         raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
 
     # ==========================================
-    # 2. 数据加载与对齐 (与原框架一致)
+    # 2. 数据加载与对齐
     # ==========================================
     bar = f"{bar_minutes}min"
 
@@ -87,7 +91,7 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
         return pd.DataFrame(columns=cols)
 
     # ==========================================
-    # 3. 核心指标与信号计算 (复刻原代码物理学逻辑)
+    # 3. 核心指标与信号状态计算 (纯粹描述数据特征)
     # ==========================================
     bph = 60.0 / bar_minutes
     B = lambda hours: max(1, int(round(hours * bph)))
@@ -106,45 +110,45 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
     # --- 计算 资金费率排名 ---
     fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
 
-    # 信号 A (做空入场): EXIT_FR_EXTREME_HIGH (原出场因子改作入场)
-    df['signal_entry'] = fr_rank > STRATEGY_PARAMS['ENTRY_FR_RANK_THRESHOLD']
+    # 状态 A: 资金费率达到极高水平 (替代原先的 signal_entry / ENTRY_FR_EXTREME_HIGH)
+    df['cond_extreme_high_fr'] = fr_rank > STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']
 
-    # 信号 B (平空出场): FR_COLD_START (冷启动: 24h强势拉升 + 费率未热)
-    df['signal_exit'] = (rk_ret_N > STRATEGY_PARAMS['EXIT_RET_RANK_THRESHOLD']) & \
-                        (fr_rank < STRATEGY_PARAMS['EXIT_FR_RANK_THRESHOLD'])
+    # 状态 B: 冷启动上涨特征，即收益率极强但费率温和 (替代原先的 signal_exit / FR_COLD_START)
+    df['cond_cold_start'] = (rk_ret_N > STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']) & \
+                            (fr_rank < STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD'])
 
-    df['signal_entry'] = df['signal_entry'].fillna(False)
-    df['signal_exit'] = df['signal_exit'].fillna(False)
+    df['cond_extreme_high_fr'] = df['cond_extreme_high_fr'].fillna(False)
+    df['cond_cold_start'] = df['cond_cold_start'].fillna(False)
 
     # ==========================================
-    # 4. 状态机撮合模拟 (生成做空事件流)
+    # 4. 状态机撮合模拟 (将客观状态映射到交易行为)
     # ==========================================
     records = []
     in_pos = False
-    entry_price = 0.0
+    open_price = 0.0
 
     for i in range(len(df) - 1):
-        # 触发做空开仓信号
-        if not in_pos and df['signal_entry'].iloc[i]:
+        # 捕捉到极高费率状态 -> 执行做空开仓
+        if not in_pos and df['cond_extreme_high_fr'].iloc[i]:
             in_pos = True
 
             # 假定于下一根K线开盘成交
             exec_idx = i + 1
             exec_time_dt = df.index[exec_idx]
-            entry_price = float(df['open'].iloc[exec_idx])
+            open_price = float(df['open'].iloc[exec_idx])
 
             signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
             dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
-            entry_reason = f"EXIT_FR_EXTREME_HIGH(fr_rank>{STRATEGY_PARAMS['ENTRY_FR_RANK_THRESHOLD']})"
+            open_reason = f"EXTREME_HIGH_FR(fr_rank>{STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']})"
             records.append({
                 'time': dt_bj_str,
-                'action': 'SELL',  # 做空开仓
+                'action': 'SELL',  # 动作: 卖出
                 'coin': coin_name,
-                'direction': 'SHORT',  # 方向标记为做空
-                'event': 'OPEN',
-                'price': entry_price,
-                'reason': entry_reason,
+                'direction': 'SHORT',  # 仓位: 做空
+                'event': 'OPEN',  # 阶段: 开仓
+                'price': open_price,
+                'reason': open_reason,
                 'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
                 'pnl': None,
                 'top_k': 1,
@@ -154,29 +158,29 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
                 'symbol': symbol
             })
 
-        # 触发做空平仓信号
-        elif in_pos and df['signal_exit'].iloc[i]:
+        # 捕捉到冷启动状态 -> 执行做空平仓
+        elif in_pos and df['cond_cold_start'].iloc[i]:
             in_pos = False
 
             exec_idx = i + 1
             exec_time_dt = df.index[exec_idx]
-            exit_price = float(df['open'].iloc[exec_idx])
+            close_price = float(df['open'].iloc[exec_idx])
 
-            # 做空收益计算 (未计手续费与滑点，此处采用 U本位 基础公式)
-            pnl = 1.0 - (exit_price / entry_price)
+            # 做空收益计算 (未计手续费与滑点，采用 U本位 基础公式)
+            pnl = 1.0 - (close_price / open_price)
 
             signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
             dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
-            exit_reason = f"FR_COLD_START(ret24_rank>{STRATEGY_PARAMS['EXIT_RET_RANK_THRESHOLD']}&fr_rank<{STRATEGY_PARAMS['EXIT_FR_RANK_THRESHOLD']})"
+            close_reason = f"COLD_START(ret24_rank>{STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']}&fr_rank<{STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD']})"
             records.append({
                 'time': dt_bj_str,
-                'action': 'BUY',  # 买入平空
+                'action': 'BUY',  # 动作: 买入
                 'coin': coin_name,
                 'direction': 'SHORT',
-                'event': 'CLOSE',
-                'price': exit_price,
-                'reason': exit_reason,
+                'event': 'CLOSE',  # 阶段: 平仓
+                'price': close_price,
+                'reason': close_reason,
                 'target_weight': 0.0,
                 'pnl': pnl,
                 'top_k': 1,
@@ -187,13 +191,13 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
             })
 
     # ==========================================
-    # 5. 强制平仓收尾 (回测结束时清理持仓)
+    # 5. 强制平仓收尾
     # ==========================================
     if in_pos:
         exec_time_dt = df.index[-1]
-        exit_price = float(df['close'].iloc[-1])
+        close_price = float(df['close'].iloc[-1])
 
-        pnl = 1.0 - (exit_price / entry_price)
+        pnl = 1.0 - (close_price / open_price)
         signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
         dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
@@ -203,7 +207,7 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
             'coin': coin_name,
             'direction': 'SHORT',
             'event': 'CLOSE',
-            'price': exit_price,
+            'price': close_price,
             'reason': "FORCE_CLOSE_AT_END",
             'target_weight': 0.0,
             'pnl': pnl,
@@ -215,7 +219,6 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
         })
 
     return pd.DataFrame(records, columns=cols)
-
 
 
 # ==========================================
@@ -245,6 +248,7 @@ if __name__ == "__main__":
         fr_df = pd.read_csv(fr_file_path)
         fr_df['datetime'] = pd.to_datetime(fr_df['timestamp'], unit='ms', utc=True)
 
+        kline_df = kline_df.tail(1000)
         print("正在处理数据与回测...")
         trade_records_df = generate_short_fr_signals(kline_df, fr_df, bar_minutes=30)
 

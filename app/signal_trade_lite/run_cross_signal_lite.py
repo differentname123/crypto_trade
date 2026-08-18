@@ -695,7 +695,8 @@ def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: d
     if valid_record is not None:
         is_duplicate = False
         if not df_hist.empty:
-            mask = (df_hist['symbol'] == symbol) & (df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
+            mask = (df_hist['symbol'] == symbol) & (
+                        df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
             if mask.any():
                 is_duplicate = True
 
@@ -760,7 +761,8 @@ def generate_top_long_signals(df):
     if is_entry or is_exit:
         kline_start_ms = int(df['timestamp'].iloc[-1])
         signal_ts_ms = int(kline_start_ms + OPTIMAL_PARAMS['BAR_MINUTES'] * 60 * 1000)
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
         cur_c = float(c.iloc[-1])
         cur_v = float(v.iloc[-1])
         cur_vol_q = float(vol_q.iloc[-1])
@@ -995,7 +997,8 @@ def generate_multi_ma_signals(raw_df, bar_minutes=5):
         bar_ms_delta = int(bar_minutes * 60 * 1000)
         last_ts = int(df['timestamp'].iloc[-1])
         signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
 
         if is_entry:
             entry_reason = f"均线跌破(C<{curr_ma1:.4f}, C<{curr_ma2:.4f}, C<{curr_ma3:.4f})"
@@ -1364,14 +1367,251 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
         return pd.DataFrame()
 
 
+# ==============================================================================
+# 新增: Extreme FR Short 策略流转生成器
+# ==============================================================================
+def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
+    """
+    截面瞬时信号生成版：针对 extreme_fr_short_cold_start_close (做空策略)
+    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    """
+    STRATEGY_PARAMS = {
+        'N_HOURS': 24,  # 动量回溯周期(24小时)
+        'W_DAYS': 14,  # 排名滚动窗口(14天)
+        'EXTREME_FR_RANK_THRESHOLD': 0.95,  # 资金费率极高水位线 (>95%)
+        'STRONG_RET_RANK_THRESHOLD': 0.80,  # 收益率强势水位线 (>80%)
+        'MILD_FR_RANK_THRESHOLD': 0.50,  # 资金费率温和水位线 (<50%)
+        'TARGET_WEIGHT': 1.0,  # 目标名义仓位
+        'MAX_WEIGHT': 1.0,  # 最大允许仓位
+        'STRATEGY_NAME': 'extreme_fr_short_cold_start_close'
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=cols)
+
+    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol
+    )
+
+    def _pick(df_to_check, cands, what):
+        for c in cands:
+            if c in df_to_check.columns:
+                return c
+        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
+
+    # 1. 数据重采样与对齐
+    bar = f"{bar_minutes}min"
+
+    k = kline_df.copy()
+    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+
+    agg = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum')
+    )
+    agg['close'] = agg['close'].ffill()
+    agg = agg[agg['close'].notna()]
+    agg['open'] = agg['open'].fillna(agg['close'])
+
+    fr = fr_df.copy()
+    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
+    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
+    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
+    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
+    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
+
+    df = agg.copy()
+    df['funding_rate'] = fr_s.reindex(df.index).ffill()
+    start = df['funding_rate'].first_valid_index()
+    if start is not None:
+        df = df.loc[start:].copy()
+    df['funding_rate'] = df['funding_rate'].ffill()
+    df = df.dropna(subset=['funding_rate'])
+    df = df[df['close'] > 0]
+
+    bph = 60.0 / bar_minutes
+
+    def B(hours):
+        return max(1, int(round(hours * bph)))
+
+    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=cols)
+
+    # 2. 核心指标向量化计算
+    N = B(STRATEGY_PARAMS['N_HOURS'])
+    mp = max(50, W // 5)
+
+    c = df['close']
+    fr_series = df['funding_rate']
+
+    ret_N = c.pct_change(N)
+    rk_ret_N = ret_N.rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
+
+    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线)
+    curr_rk_ret_N = float(rk_ret_N.iloc[-1])
+    curr_fr_rank = float(fr_rank.iloc[-1])
+    curr_c = float(c.iloc[-1])
+
+    is_entry = curr_fr_rank > STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']
+    is_exit = (curr_rk_ret_N > STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']) and (
+                curr_fr_rank < STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD'])
+
+    new_candidate_record = None
+
+    if is_entry or is_exit:
+        bar_ms_delta = int(bar_minutes * 60 * 1000)
+        last_ts = int(df.index[-1].timestamp() * 1000)
+        signal_ts_ms = last_ts + bar_ms_delta
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+
+        if is_entry:
+            entry_reason = f"EXTREME_HIGH_FR(fr_rank:{curr_fr_rank:.3f}>{STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'SELL',  # 做空 -> SELL
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'OPEN',
+                'price': curr_c,
+                'reason': entry_reason,
+                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+        elif is_exit:
+            exit_reason = f"COLD_START(ret24_rk:{curr_rk_ret_N:.3f}>{STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']}&fr_rank:{curr_fr_rank:.3f}<{STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD']})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'BUY',  # 平空 -> BUY
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'CLOSE',
+                'price': curr_c,
+                'reason': exit_reason,
+                'target_weight': 0.0,
+                'pnl': None,  # PnL will be derived from generic sync ledger
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+
+    # 4. 状态机持久化防重复拦截
+    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
+    return [], df_actual_signals
+
+
+def execute_trading_bot_workflow_short_fr_long(target_time, symbol_list, proxy_url=None):
+    """
+    针对 Extreme FR Short 策略专属工作流：
+    拉取 K 线与资金费率数据并启动交集整套交易工作流
+    """
+    # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
+    lookback_days = 20
+
+    run_logger = setup_logger()
+    run_logger.info(f"📊 基于 Extreme FR Short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    timeframe = "30m"
+
+    # 1. 拉取 K 线数据
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
+    kline_result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    # 2. 拉取资金费率数据
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
+    funding_result_map = snipe_funding_rate_data(
+        symbol_list=symbol_list,
+        days=lookback_days,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
+    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
+
+    df_actual_signals_df_list = []
+    for symbol in symbol_list:
+        df_klines = kline_result_map.get(symbol, pd.DataFrame())
+        df_fr = funding_result_map.get(symbol, pd.DataFrame())
+
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
+            continue
+
+        if df_fr.empty:
+            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算 Extreme FR Short 策略。")
+            continue
+
+        # K线数据量验证告警
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ K线数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
+        coin_name = symbol.split('/')[0]
+        df_klines['coin_name'] = coin_name
+        df_klines['symbol'] = symbol
+
+        # 传递双数据流给截面信号引擎
+        signals, df_actual_signals = generate_short_fr_signals(df_klines, df_fr, bar_minutes=30)
+        df_actual_signals_df_list.append(df_actual_signals)
+
+    # 3. 聚合全量截面真实账本并打印指令
+    if df_actual_signals_df_list:
+        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        # 移除可能重复的信号 (根据 symbol、时间戳、事件 联合去重)
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+
+        output_path = "short_fr_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(
+            f"\n✅ Extreme FR Short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        return final_signals_df
+    else:
+        run_logger.info("\n► 历史流转中 Extreme FR Short 策略尚未产生任何有效信号。")
+        return pd.DataFrame()
+
+
 if __name__ == "__main__":
-    # df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\APR_USDT_USDT_5m_latest.csv')
-    # signals, df_actual_signals = generate_multi_ma_signals(df)
-
-    # # 将timestamp 从ms转换为 北京时间
-    # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
-
-
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
-    execute_trading_bot_workflow_XSR_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+
+    # 你可以测试调用新加的 workflow
+    execute_trading_bot_workflow_short_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
