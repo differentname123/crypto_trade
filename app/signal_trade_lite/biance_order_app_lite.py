@@ -912,7 +912,11 @@ def run_scheduler():
             if CURRENT_SYMBOL == "ma_bottom_long":
                 add_minutes = 5 - (now.minute % 5)
                 next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
-                preload_ahead = 0.5  # 5 分钟周期，提前 1 分钟即可
+                preload_ahead = 0.5  # 5 分钟周期
+            elif CURRENT_SYMBOL == "XSR_long":
+                add_minutes = 30 - (now.minute % 30)
+                next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
+                preload_ahead = 1  # 30分钟为一个周期，提前1分钟触发
             else:
                 # 其他策略 (如 cross) 原逻辑: 每整点驱动一轮
                 next_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -969,7 +973,6 @@ def run_scheduler():
         except Exception:
             logger.error(f"[SCHED] 致命异常, 30s 后恢复\n{traceback.format_exc()}")
             time.sleep(30)
-
 
 if __name__ == "__main__":
     run_scheduler()
