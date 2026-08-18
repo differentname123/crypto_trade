@@ -607,5 +607,8 @@ if __name__ == "__main__":
     # ==== 打印指定列表，无任何过滤条件 ====
     display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
 
+    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+
+
     # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
     # display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Short')
