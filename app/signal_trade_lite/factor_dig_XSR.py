@@ -144,16 +144,14 @@ def backtest_custom_combo(df: pd.DataFrame, bar_minutes: int = 15,
 # ==========================================
 if __name__ == "__main__":
 
-    origin_pairs = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\extracted_raw_trades\extracted_target_pairs.csv')
-
-    trades_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\factor_out_30m_debug\trades_AIOT.csv.gz')
-
-    filtered_trades_df = trades_df[
-        (trades_df["entry_factor"] == "EXIT_SHORT_SURGE_EXTREME") &
-        (trades_df["exit_factor"] == "FR_LOW_NEG") &
-        (trades_df["direction"] == "Long") &
-        (trades_df["filter_mode"] == "original")
-        ].copy()
+    # # 这是用作和以前交易进行对比的
+    # trades_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\factor_dig\factor_out_30m_debug\trades_AIOT.csv.gz')
+    # filtered_trades_df = trades_df[
+    #     (trades_df["entry_factor"] == "EXIT_SHORT_SURGE_EXTREME") &
+    #     (trades_df["exit_factor"] == "FR_LOW_NEG") &
+    #     (trades_df["direction"] == "Long") &
+    #     (trades_df["filter_mode"] == "original")
+    #     ].copy()
 
     # 替换为你实际的 CSV 文件路径
     kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_1m_kline.csv'
@@ -171,17 +169,7 @@ if __name__ == "__main__":
         # 第二步：执行自定义回测
         trade_records = backtest_custom_combo(df_aligned, bar_minutes=30)
 
-        # 第三步：打印结果
-        if len(trade_records) > 0:
-            print("\n========== 交易流水前 5 笔 ==========")
-            print(trade_records.head())
-            print("\n========== 回测统计 ==========")
-            print(f"总交易笔数: {len(trade_records)}")
-            print(f"胜率: {(trade_records['net_return'] > 0).mean() * 100:.2f}%")
-            print(f"累计净收益 (加总非复利): {trade_records['net_return'].sum() * 100:.2f}%")
-            print(f"平均单笔收益: {trade_records['net_return'].mean() * 100:.2f}%")
-        else:
-            print("没有触发任何交易。")
 
     except Exception as e:
         print(f"\n执行出错: {e}")
+    print()
