@@ -9,6 +9,7 @@
 【生产监控版】引入 TraceID 链路追踪、Logfmt 结构化高密度聚合、静默成功与 O(N) 滞后点名机制。
 【防弹修复版】消除 WS 硬编码兼容全币种，注入协程防异常死锁装甲，引入物理时钟强判防流动性枯竭。
 【闪现交付版】主线程金蝉脱壳 O(1) 返回、剔除 datetime_bj 性能枷锁、后台线程接管全量清洗落盘。
+【资金费率极速扩展】新增无缝时间轴哈希去重、阈值脉冲探测结算抢跑、缓存回退拼接兜底方案。
 """
 
 import asyncio
@@ -426,7 +427,8 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={len(symbol_list)} days={days}")
 
         # 2. 智能缓存装载 & 内存池初始化
-        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, log_prefix=log_prefix)
+        memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe,
+                                                        log_prefix=log_prefix)
 
         queue = asyncio.Queue()
         completion_event = asyncio.Event()
@@ -570,8 +572,233 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
 
         except Exception:
             pass  # 屏蔽一切退出时的报错，实现完美脱壳
+
+
 # =====================================================================
-# 🌟 对外暴露的公共 API [严格未修改]
+# 🗄️ 模块五：资金费率专属缓存与存储 (Funding Rate Cache & Storage)
+# =====================================================================
+def load_funding_cache(symbol_list, cache_dir="data", log_prefix=""):
+    """
+    针对资金费率的智能缓存加载，基于字典无脑覆盖，天然去重
+    """
+    memory_pool = {sym: {} for sym in symbol_list}
+    max_cache_ts_map = {sym: 0 for sym in symbol_list}
+    os.makedirs(cache_dir, exist_ok=True)
+
+    for sym in symbol_list:
+        safe_symbol = sym.replace("/", "_").replace(":", "_")
+        path = os.path.join(cache_dir, f"{safe_symbol}_funding_latest.csv")
+
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                if not df.empty and 'timestamp' in df.columns:
+                    # 极速遍历塞入哈希表
+                    records = df[['timestamp', 'fundingRate', 'symbol']].values.tolist()
+                    for row in records:
+                        ts = int(row[0])
+                        memory_pool[sym][ts] = {
+                            'timestamp': ts,
+                            'fundingRate': float(row[1]),
+                            'symbol': row[2]
+                        }
+                    max_cache_ts_map[sym] = int(df['timestamp'].max())
+            except Exception as e:
+                logger.warning(f"{log_prefix} [FUNDING_CACHE] ⚠️ 读取 {sym} 资金费率缓存失败: {e}")
+
+    return memory_pool, max_cache_ts_map
+
+
+def _save_funding_csv_sync_fast(full_dfs, cache_dir, log_prefix=""):
+    """后台独立落盘资金费率，采用临时文件防碎裂技术"""
+    os.makedirs(cache_dir, exist_ok=True)
+    for symbol, df in full_dfs.items():
+        safe_symbol = symbol.replace("/", "_").replace(":", "_")
+        path = os.path.join(cache_dir, f"{safe_symbol}_funding_latest.csv")
+        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            df.to_csv(temp_path, index=False)
+            os.replace(temp_path, path)
+        except Exception as e:
+            logger.error(f"{log_prefix} [FUNDING_DISK] ❌ 保存 {symbol} 资金费率失败: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+
+def dispatch_funding_background_save(memory_pool_copy, cache_dir="data", log_prefix=""):
+    """脱壳资金费率落盘任务"""
+
+    def _task():
+        full_dfs = {}
+        for sym, records in memory_pool_copy.items():
+            # 按 timestamp 排序
+            sorted_records = [r for _, r in sorted(records.items())]
+            full_dfs[sym] = pd.DataFrame(sorted_records, columns=['timestamp', 'fundingRate', 'symbol'])
+        _save_funding_csv_sync_fast(full_dfs, cache_dir, log_prefix)
+
+    threading.Thread(target=_task, daemon=False).start()
+
+
+# =====================================================================
+# 🎯 模块六：资金费率极速获取引擎 (Funding Rate Orchestrator)
+# =====================================================================
+async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_pool, max_cache_ts, threshold_ms=60000,
+                                    log_prefix=""):
+    """
+    单币种资金费率获取策略：
+    - 阈值内（如1m内结算）：战术休眠至T-5s，脉冲轮询最新数据
+    - 阈值外：自 最大缓存时间往前推24h 拉取进行重叠拼接
+    """
+    try:
+        # 获取下一次结算时间与物理机时间
+        funding_info = await exchange.fetch_funding_rate(symbol)
+        next_funding_time = funding_info.get('nextFundingTimestamp')
+        server_time = exchange.milliseconds()
+
+        # 容错：如果交易所没有返回 nextFundingTimestamp，强行触发场景 B
+        time_to_funding = (next_funding_time - server_time) if next_funding_time else -1
+
+        if 0 < time_to_funding <= threshold_ms:
+            # ⚡ 场景 A：临近结算时间 (进入狙击模式)
+            sleep_sec = max(0, (time_to_funding - 5000) / 1000.0)
+            logger.info(
+                f"{log_prefix} [FUNDING_SNIPE] 🎯 {symbol} 距离结算仅 {time_to_funding / 1000:.1f}s，战术休眠 {sleep_sec:.1f}s 后启动脉冲探测...")
+            await asyncio.sleep(sleep_sec)
+
+            retry_count = 0
+            while retry_count < 20:  # 保护性熔断退出，防止死循环
+                # 安全起见，since 取前一日，以防交易所默认只给一条旧的
+                since_ms = next_funding_time - (24 * 60 * 60 * 1000)
+                hist_rates = await exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=100)
+
+                if hist_rates:
+                    max_fetched_ts = max(r['timestamp'] for r in hist_rates)
+                    # 先塞入缓存去重
+                    for r in hist_rates:
+                        ts = r['timestamp']
+                        memory_pool[symbol][ts] = {'timestamp': ts, 'fundingRate': r['fundingRate'], 'symbol': symbol}
+
+                    # 判断是否已经捕捉到了最新的那个交割点
+                    if max_fetched_ts >= next_funding_time:
+                        logger.info(
+                            f"{log_prefix} [FUNDING_SNIPE] 🔫 {symbol} 脉冲命中！获取到最新结算费率，时间: {_format_bj_time(max_fetched_ts)}")
+                        break
+
+                retry_count += 1
+                await asyncio.sleep(0.5)  # 极速脉冲
+        else:
+            # 🛡️ 场景 B：平稳期 (安全重叠回补)
+            since_ms = max_cache_ts - (24 * 60 * 60 * 1000) if max_cache_ts > 0 else target_start_ms
+
+            # 格式化时间与阈值信息（包含缺失时间戳的容错）
+            next_time_str = _format_bj_time(next_funding_time) if next_funding_time else "未知"
+            dist_str = f"{time_to_funding / 1000:.1f}s" if time_to_funding > 0 else "未知"
+            threshold_sec = threshold_ms / 1000
+
+            logger.info(
+                f"{log_prefix} [FUNDING_REST] 🛒 {symbol} 距离结算较远 | "
+                f"下次结算: {next_time_str} (距今 {dist_str}) > 阈值({threshold_sec}s) | "
+                f"执行常规回补 since: {_format_bj_time(since_ms)}"
+            )
+
+            # 循环分页拉取直到最新
+            curr_since = since_ms
+            while True:
+                hist_rates = await exchange.fetch_funding_rate_history(symbol, since=curr_since, limit=1000)
+                if not hist_rates:
+                    break
+
+                for r in hist_rates:
+                    ts = r['timestamp']
+                    memory_pool[symbol][ts] = {'timestamp': ts, 'fundingRate': r['fundingRate'], 'symbol': symbol}
+
+                if len(hist_rates) < 1000:
+                    break
+                curr_since = hist_rates[-1]['timestamp'] + 1
+
+    except Exception as e:
+        logger.error(f"{log_prefix} [FUNDING_ERR] ❌ {symbol} 资金费率获取异常: {e}")
+
+
+async def _async_core_funding_orchestrator(symbol_list, days, target_time_str, proxy_url):
+    orchestrator_start_t = time.time()
+    run_id = f"F-{uuid.uuid4().hex[:4].upper()}"
+    log_prefix = f"[{run_id}]"
+
+    exchange_config = {
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    }
+    if proxy_url:
+        exchange_config['aiohttp_proxy'] = proxy_url
+        exchange_config['proxies'] = {'http': proxy_url, 'https': proxy_url}
+
+    exchange = ccxt.binance(exchange_config)
+    try:
+        await exchange.load_markets()
+        await check_time_sync(exchange, log_prefix)
+
+        # 解析时间边界 (统一使用 days 倒推起点)
+        target_end_ms = int(pd.to_datetime(target_time_str).tz_localize('Asia/Shanghai').timestamp() * 1000)
+        target_start_ms = target_end_ms - (days * 24 * 60 * 60 * 1000)
+
+        logger.info(
+            f"{log_prefix} [FUNDING_INIT] 🚀 资金费率极速引擎发车 | target={target_time_str} days={days} symbols={len(symbol_list)}")
+
+        # 1. 智能加载缓存
+        memory_pool, max_cache_ts_map = load_funding_cache(symbol_list, log_prefix=log_prefix)
+
+        # 2. 并发执行每个币种的资金费率拉取（内置阈值分流判断）
+        # 资金费率的1分钟阈值 = 60000 毫秒
+        tasks = [
+            _fetch_funding_for_symbol(exchange, sym, target_start_ms, memory_pool, max_cache_ts_map[sym], 60000,
+                                      log_prefix)
+            for sym in symbol_list
+        ]
+        await asyncio.gather(*tasks)
+
+        # 3. 后台守护线程异步落盘
+        memory_pool_copy = {sym: {k: v.copy() for k, v in pool.items()} for sym, pool in memory_pool.items()}
+        dispatch_funding_background_save(memory_pool_copy, log_prefix=log_prefix)
+
+        # 4. 闪现交付 O(1) 切片
+        final_dfs = {}
+        total_pts = 0
+        for sym in symbol_list:
+            sliced_records = [
+                r for ts, r in memory_pool[sym].items()
+                if target_start_ms <= ts <= target_end_ms
+            ]
+            # 局部排序
+            sliced_records.sort(key=lambda x: x['timestamp'])
+            df = pd.DataFrame(sliced_records, columns=['timestamp', 'fundingRate', 'symbol'])
+            final_dfs[sym] = df
+            total_pts += len(df)
+
+        total_runtime = time.time() - orchestrator_start_t
+        logger.info(
+            f"{log_prefix} [FUNDING_EXIT] 🎉 资金费率极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
+        return final_dfs
+    finally:
+        # 物理斩断释放内存
+        try:
+            if hasattr(exchange, 'session') and exchange.session:
+                if hasattr(exchange.session, 'connector') and exchange.session.connector:
+                    try:
+                        await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
+                    except:
+                        pass
+            exchange.session = None
+            await asyncio.wait_for(exchange.close(), timeout=0.00002)
+        except:
+            pass
+
+
+# =====================================================================
+# 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API]
 # =====================================================================
 def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
                      use_ws=True, use_rest=True, proxy_url=None):
@@ -590,6 +817,27 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
     )
 
 
+def snipe_funding_rate_data(symbol_list, days, target_time_str, proxy_url=None):
+    """
+    🚀 同步入口：极速获取带有本地缓存和临近结算脉冲探测的资金费率数据。
+    :param days: 期望获取的历史天数
+    :param target_time_str: 目标截止时间，例如 "2023-12-31 23:59:59"
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        raise RuntimeError("检测到已存在运行中的异步事件循环。\n请在顶部执行：import nest_asyncio; nest_asyncio.apply()")
+
+    return asyncio.run(
+        _async_core_funding_orchestrator(
+            symbol_list, days, target_time_str, proxy_url
+        )
+    )
+
+
 # =====================================================================
 # 🚀 启动入口 [严格未修改]
 # =====================================================================
@@ -597,34 +845,14 @@ if __name__ == "__main__":
 
     while True:
         symbol_list = [
-            "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
-            "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
+            "BTC/USDC:USDC"
         ]
 
         target_time = (datetime.now() + timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
         logger.info(">>> 准备调用数据引擎...")
 
-        result_map = snipe_kline_data(
-            symbol_list=symbol_list,
-            timeframe="1m",
-            days=150,
-            target_time_str=target_time,
-            use_ws=True,
-            use_rest=True,
-            proxy_url='http://127.0.0.1:7890'
-        )
-        logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
-        break
-        #
-        # symbol_list = [
-        #     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-        #     "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
-        # ]
-        # target_time = (datetime.now() + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
-        #
-        # logger.info(">>> 准备调用数据引擎...")
-        #
+        # # ======= 1. K线数据极速引擎调用演示 =======
         # result_map = snipe_kline_data(
         #     symbol_list=symbol_list,
         #     timeframe="1m",
@@ -634,3 +862,16 @@ if __name__ == "__main__":
         #     use_rest=True,
         #     proxy_url='http://127.0.0.1:7890'
         # )
+        # logger.info(f"✅ 已完成对所有币种的极速K线引擎数据请求，正在进行数据完整性检查和预处理...")
+
+        # ======= 2. 资金费率极速引擎调用演示 =======
+        logger.info(">>> 准备调用资金费率极速引擎...")
+        funding_result_map = snipe_funding_rate_data(
+            symbol_list=symbol_list,
+            days=150,
+            target_time_str=target_time,
+            proxy_url='http://127.0.0.1:7890'
+        )
+        logger.info(f"✅ 已完成资金费率数据请求，返回了指定区间的去重结算数据。")
+
+        break
