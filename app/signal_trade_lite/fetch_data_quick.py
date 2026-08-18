@@ -732,7 +732,7 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
         logger.error(f"{log_prefix} [FUNDING_ERR] ❌ {symbol} 资金费率获取异常: {e}")
 
 
-async def _async_core_funding_orchestrator(symbol_list, days, target_time_str, proxy_url):
+async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
     orchestrator_start_t = time.time()
     run_id = f"F-{uuid.uuid4().hex[:4].upper()}"
     log_prefix = f"[{run_id}]"
@@ -750,12 +750,12 @@ async def _async_core_funding_orchestrator(symbol_list, days, target_time_str, p
         await exchange.load_markets()
         await check_time_sync(exchange, log_prefix)
 
-        # 解析时间边界 (统一使用 days 倒推起点)
-        target_end_ms = int(pd.to_datetime(target_time_str).tz_localize('Asia/Shanghai').timestamp() * 1000)
+        # 核心修改：不再使用传入的 target_time，直接获取当前服务器时间作为最新右边界
+        target_end_ms = exchange.milliseconds()
         target_start_ms = target_end_ms - (days * 24 * 60 * 60 * 1000)
+        target_end_str = _format_bj_time(target_end_ms)
 
-        logger.info(
-            f"{log_prefix} [FUNDING_INIT] 🚀 资金费率极速引擎发车 | target={target_time_str} days={days} symbols={len(symbol_list)}")
+        logger.info(f"{log_prefix} [FUNDING_INIT] 🚀 资金费率极速引擎发车 | target_end={target_end_str} days={days} symbols={len(symbol_list)}")
 
         # 1. 智能加载缓存
         memory_pool, max_cache_ts_map = load_funding_cache(symbol_list, log_prefix=log_prefix)
@@ -763,8 +763,7 @@ async def _async_core_funding_orchestrator(symbol_list, days, target_time_str, p
         # 2. 并发执行每个币种的资金费率拉取（内置阈值分流判断）
         # 资金费率的1分钟阈值 = 60000 毫秒
         tasks = [
-            _fetch_funding_for_symbol(exchange, sym, target_start_ms, memory_pool, max_cache_ts_map[sym], 60000,
-                                      log_prefix)
+            _fetch_funding_for_symbol(exchange, sym, target_start_ms, memory_pool, max_cache_ts_map[sym], 60000, log_prefix)
             for sym in symbol_list
         ]
         await asyncio.gather(*tasks)
@@ -788,23 +787,18 @@ async def _async_core_funding_orchestrator(symbol_list, days, target_time_str, p
             total_pts += len(df)
 
         total_runtime = time.time() - orchestrator_start_t
-        logger.info(
-            f"{log_prefix} [FUNDING_EXIT] 🎉 资金费率极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
+        logger.info(f"{log_prefix} [FUNDING_EXIT] 🎉 资金费率极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
         return final_dfs
     finally:
         # 物理斩断释放内存
         try:
             if hasattr(exchange, 'session') and exchange.session:
                 if hasattr(exchange.session, 'connector') and exchange.session.connector:
-                    try:
-                        await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
-                    except:
-                        pass
+                    try: await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
+                    except: pass
             exchange.session = None
             await asyncio.wait_for(exchange.close(), timeout=0.00002)
-        except:
-            pass
-
+        except: pass
 
 # =====================================================================
 # 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API]
@@ -826,11 +820,10 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
     )
 
 
-def snipe_funding_rate_data(symbol_list, days, target_time_str, proxy_url=None):
+def snipe_funding_rate_data(symbol_list, days, proxy_url=None):
     """
-    🚀 同步入口：极速获取带有本地缓存和临近结算脉冲探测的资金费率数据。
-    :param days: 期望获取的历史天数
-    :param target_time_str: 目标截止时间，例如 "2023-12-31 23:59:59"
+    🚀 同步入口：极速获取带有本地缓存和临近结算脉冲探测的最新资金费率数据。
+    :param days: 期望获取的历史天数 (从当前时间往前推)
     """
     try:
         loop = asyncio.get_running_loop()
@@ -842,10 +835,9 @@ def snipe_funding_rate_data(symbol_list, days, target_time_str, proxy_url=None):
 
     return asyncio.run(
         _async_core_funding_orchestrator(
-            symbol_list, days, target_time_str, proxy_url
+            symbol_list, days, proxy_url
         )
     )
-
 
 # =====================================================================
 # 🚀 启动入口 [严格未修改]
@@ -878,7 +870,6 @@ if __name__ == "__main__":
         funding_result_map = snipe_funding_rate_data(
             symbol_list=symbol_list,
             days=150,
-            target_time_str=target_time,
             proxy_url='http://127.0.0.1:7890'
         )
         logger.info(f"✅ 已完成资金费率数据请求，返回了指定区间的去重结算数据。")

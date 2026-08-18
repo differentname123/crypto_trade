@@ -236,7 +236,7 @@ if __name__ == "__main__":
         fr_df['datetime'] = pd.to_datetime(fr_df['timestamp'], unit='ms', utc=True)
 
         print("正在处理数据与回测...")
-        trade_records_df = generate_trade_records(kline_df, fr_df, bar_minutes=30)
+        trade_records_df = generate_XSR_signals(kline_df, fr_df, bar_minutes=30)
 
         print(f"回测执行成功！共生成 {len(trade_records_df)} 条事件记录。\n")
         if not trade_records_df.empty:

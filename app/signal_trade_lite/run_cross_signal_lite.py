@@ -1369,5 +1369,5 @@ if __name__ == "__main__":
 
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['MYX/USDT:USDT']
-    execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+    symbol_list = ['AIOT/USDT:USDT']
+    execute_trading_bot_workflow_XSR_long(target_time, symbol_list, 'http://127.0.0.1:7890')
