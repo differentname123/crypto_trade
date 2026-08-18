@@ -1274,9 +1274,10 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     """
     针对 XSR 策略专属工作流：
     拉取 K 线与资金费率数据并启动交集整套交易工作流
+    EXIT_SHORT_SURGE_EXTREME -> FR_LOW_NEG Long_bottom_10 30m
     """
     # 策略要求滚动排名天数为 14 天，附加 5 天冗余预热期
-    lookback_days = 365
+    lookback_days = 20
 
     run_logger = setup_logger()
     run_logger.info(f"📊 基于 XSR 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
@@ -1304,7 +1305,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     )
 
     run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 2 + 1  # 15分钟线预期行数
+    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
 
     df_actual_signals_df_list = []
     for symbol in symbol_list:
