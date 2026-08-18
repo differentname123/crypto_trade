@@ -1519,10 +1519,15 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
     return [], df_actual_signals
 
 
-def execute_trading_bot_workflow_short_fr_long(target_time, symbol_list, proxy_url=None):
+def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=None):
     """
     针对 Extreme FR Short 策略专属工作流：
     拉取 K 线与资金费率数据并启动交集整套交易工作流
+        EXIT_FR_EXTREME_HIGH -> FR_COLD_START Short_top_1 30m
+    回测表现：
+    总交易笔数：261  单笔净收益：6.9113%  跨币种胜率(%)： 67.6768  均值单笔回撤(%)：-31.6487 平均持仓时间(天)：3.5031
+    持仓时间中位数(天)：1.7292  资金最大回撤：160.53%   最大并发持仓：7
+
     """
     # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
     lookback_days = 20
@@ -1614,4 +1619,4 @@ if __name__ == "__main__":
     symbol_list = ['AIOT/USDT:USDT']
 
     # 你可以测试调用新加的 workflow
-    execute_trading_bot_workflow_short_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+    execute_trading_bot_workflow_short_fr(target_time, symbol_list, 'http://127.0.0.1:7890')
