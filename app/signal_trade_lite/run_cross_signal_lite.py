@@ -1275,6 +1275,9 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     针对 XSR 策略专属工作流：
     拉取 K 线与资金费率数据并启动交集整套交易工作流
     EXIT_SHORT_SURGE_EXTREME -> FR_LOW_NEG Long_bottom_10 30m
+    回测表现：
+    总交易笔数：598  单笔净收益：5.8145%  跨币种胜率(%)： 48.9510  均值单笔回撤(%)：-10.9551 平均持仓时间(天)：8.1980
+    持仓时间中位数(天)：0.0208  资金最大回撤：214.53%   最大并发持仓：30
     """
     # 策略要求滚动排名天数为 14 天，附加 5 天冗余预热期
     lookback_days = 20
