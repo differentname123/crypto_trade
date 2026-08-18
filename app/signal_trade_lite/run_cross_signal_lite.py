@@ -1368,13 +1368,6 @@ if __name__ == "__main__":
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
 
 
-    kline_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_30m_latest.csv'
-    kline_df = pd.read_csv(kline_file_path)
-
-    fr_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_funding_latest.csv'
-    fr_df = pd.read_csv(fr_file_path)
-
-
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
     execute_trading_bot_workflow_XSR_long(target_time, symbol_list, 'http://127.0.0.1:7890')
