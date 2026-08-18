@@ -1276,7 +1276,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     拉取 K 线与资金费率数据并启动交集整套交易工作流
     """
     # 策略要求滚动排名天数为 14 天，附加 5 天冗余预热期
-    lookback_days = 14 + 5
+    lookback_days = 365
 
     run_logger = setup_logger()
     run_logger.info(f"📊 基于 XSR 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
@@ -1304,7 +1304,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     )
 
     run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 4 + 1  # 15分钟线预期行数
+    expected_rows = lookback_days * 24 * 2 + 1  # 15分钟线预期行数
 
     df_actual_signals_df_list = []
     for symbol in symbol_list:
@@ -1339,7 +1339,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
         df_klines['symbol'] = symbol
 
         # 传递双数据流给 XSR 截面信号引擎
-        signals, df_actual_signals = generate_XSR_signals(df_klines, df_fr, bar_minutes=15)
+        signals, df_actual_signals = generate_XSR_signals(df_klines, df_fr, bar_minutes=30)
         df_actual_signals_df_list.append(df_actual_signals)
 
     # 3. 聚合全量截面真实账本并打印指令
@@ -1366,6 +1366,13 @@ if __name__ == "__main__":
 
     # # 将timestamp 从ms转换为 北京时间
     # df['datetime_bj'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai')
+
+
+    kline_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_30m_latest.csv'
+    kline_df = pd.read_csv(kline_file_path)
+
+    fr_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_funding_latest.csv'
+    fr_df = pd.read_csv(fr_file_path)
 
 
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
