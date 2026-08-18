@@ -1277,6 +1277,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
     """
     针对 XSR 策略专属工作流：
     拉取 K 线与资金费率数据并启动交集整套交易工作流
+    策略描述：bottom_10的币种在币价出现历史级别的4小时极度暴涨时直接追高做多，当市场多头情绪彻底冷却（资金费率极低或转负）时平仓走人
     EXIT_SHORT_SURGE_EXTREME -> FR_LOW_NEG Long_bottom_10 30m
     回测表现：
     总交易笔数：598  单笔净收益：5.8145%  跨币种胜率(%)： 48.9510  均值单笔回撤(%)：-10.9551 平均持仓时间(天)：8.1980
@@ -1523,7 +1524,8 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
     """
     针对 Extreme FR Short 策略专属工作流：
     拉取 K 线与资金费率数据并启动交集整套交易工作流
-        EXIT_FR_EXTREME_HIGH -> FR_COLD_START Short_top_1 30m
+    策略描述：精准狙击全市场“多头最拥挤、做多成本最高”的唯一标的，当多头杠杆被清洗、狂热情绪回归平淡时平仓走人。
+    EXIT_FR_EXTREME_HIGH -> FR_COLD_START Short_top_1 30m
     回测表现：
     总交易笔数：261  单笔净收益：6.9113%  跨币种胜率(%)： 67.6768  均值单笔回撤(%)：-31.6487 平均持仓时间(天)：3.5031
     持仓时间中位数(天)：1.7292  资金最大回撤：160.53%   最大并发持仓：7
