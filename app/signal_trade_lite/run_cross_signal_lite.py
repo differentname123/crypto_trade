@@ -696,7 +696,7 @@ def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: d
         is_duplicate = False
         if not df_hist.empty:
             mask = (df_hist['symbol'] == symbol) & (
-                        df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
+                    df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
             if mask.any():
                 is_duplicate = True
 
@@ -1369,7 +1369,7 @@ def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=No
 
 
 # ==============================================================================
-# 新增: Extreme FR Short 策略流转生成器
+# Extreme FR Short 策略流转生成器
 # ==============================================================================
 def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
     """
@@ -1465,7 +1465,7 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
 
     is_entry = curr_fr_rank > STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']
     is_exit = (curr_rk_ret_N > STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']) and (
-                curr_fr_rank < STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD'])
+            curr_fr_rank < STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD'])
 
     new_candidate_record = None
 
@@ -1531,7 +1531,6 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
     持仓时间中位数(天)：1.7292  资金最大回撤：160.53%   最大并发持仓：7
 
     """
-    # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
     lookback_days = 20
 
     run_logger = setup_logger()
@@ -1539,7 +1538,6 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
 
     timeframe = "30m"
 
-    # 1. 拉取 K 线数据
     run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
     kline_result_map = snipe_kline_data(
         symbol_list=symbol_list,
@@ -1551,7 +1549,6 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
         proxy_url=proxy_url
     )
 
-    # 2. 拉取资金费率数据
     run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
     funding_result_map = snipe_funding_rate_data(
         symbol_list=symbol_list,
@@ -1560,7 +1557,7 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
     )
 
     run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
+    expected_rows = lookback_days * 24 * 2 + 1
 
     df_actual_signals_df_list = []
     for symbol in symbol_list:
@@ -1575,7 +1572,273 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
             run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算 Extreme FR Short 策略。")
             continue
 
-        # K线数据量验证告警
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ K线数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
+        coin_name = symbol.split('/')[0]
+        df_klines['coin_name'] = coin_name
+        df_klines['symbol'] = symbol
+
+        signals, df_actual_signals = generate_short_fr_signals(df_klines, df_fr, bar_minutes=30)
+        df_actual_signals_df_list.append(df_actual_signals)
+
+    if df_actual_signals_df_list:
+        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+
+        output_path = "short_fr_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(
+            f"\n✅ Extreme FR Short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        return final_signals_df
+    else:
+        run_logger.info("\n► 历史流转中 Extreme FR Short 策略尚未产生任何有效信号。")
+        return pd.DataFrame()
+
+
+# ==============================================================================
+# [新增]: Vol FR Long 策略流转生成器 (基于提供的新策略完全重构为瞬时信号版)
+# ==============================================================================
+def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
+    """
+    截面瞬时信号生成版：针对 vol_breakout_fr_recovery_long 策略
+    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    """
+    STRATEGY_PARAMS = {
+        'M_HOURS': 4,  # 动量/状态对比回溯周期
+        'N_HOURS': 24,  # ATR计算周期
+        'W_DAYS': 14,  # 排名(Rank)滚动窗口
+
+        'ATR_RANK_LOW_TH': 0.20,  # 4小时前波动率极度萎缩的最高分位数 (20%)
+        'ATR_RANK_HIGH_TH': 0.60,  # 当前波动率爆发的最低分位数 (60%)
+
+        'FR_RANK_LOW_TH': 0.10,  # 4小时前资金费率极度悲观的最高分位数 (10%)
+
+        'TARGET_WEIGHT': 1.0,
+        'MAX_WEIGHT': 1.0,
+        'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=cols)
+
+    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol
+    )
+
+    def _pick(df_to_check, cands, what):
+        for c in cands:
+            if c in df_to_check.columns:
+                return c
+        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
+
+    # 1. 数据重采样与对齐
+    bar = f"{bar_minutes}min"
+
+    k = kline_df.copy()
+    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+
+    agg = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum')
+    )
+    agg['close'] = agg['close'].ffill()
+    agg = agg[agg['close'].notna()]
+    agg['open'] = agg['open'].fillna(agg['close'])
+    agg['high'] = agg['high'].fillna(agg['close'])
+    agg['low'] = agg['low'].fillna(agg['close'])
+
+    fr = fr_df.copy()
+    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
+    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
+    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
+    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
+    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
+
+    df = agg.copy()
+    df['funding_rate'] = fr_s.reindex(df.index).ffill()
+    start = df['funding_rate'].first_valid_index()
+    if start is not None:
+        df = df.loc[start:].copy()
+    df['funding_rate'] = df['funding_rate'].ffill()
+    df = df.dropna(subset=['funding_rate'])
+    df = df[df['close'] > 0]
+
+    bph = 60.0 / bar_minutes
+
+    def B(hours):
+        return max(1, int(round(hours * bph)))
+
+    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=cols)
+
+    # 2. 核心指标向量化计算
+    M = B(STRATEGY_PARAMS['M_HOURS'])
+    N = B(STRATEGY_PARAMS['N_HOURS'])
+    mp = max(50, W // 5)
+
+    o, h, l, c = df['open'], df['high'], df['low'], df['close']
+    fr_series = df['funding_rate']
+    pc = c.shift(1)
+
+    EPS = 1e-12
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    atr_N = tr.rolling(N, min_periods=max(2, N // 2)).mean()
+    atr_pct = atr_N / (c + EPS)
+
+    rk_atr = atr_pct.rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
+
+    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线)
+    # 取出所有计算依赖的尾部标量状态值 (处理 shift 引发的异常边界)
+    curr_rk_atr = float(rk_atr.iloc[-1])
+    prev_M_rk_atr = float(rk_atr.shift(M).iloc[-1]) if not pd.isna(rk_atr.shift(M).iloc[-1]) else 0.0
+
+    curr_fr_rank = float(fr_rank.iloc[-1])
+    prev_M_fr_rank = float(fr_rank.shift(M).iloc[-1]) if not pd.isna(fr_rank.shift(M).iloc[-1]) else 0.0
+    prev_1_fr_rank = float(fr_rank.shift(1).iloc[-1]) if not pd.isna(fr_rank.shift(1).iloc[-1]) else 0.0
+
+    curr_c = float(c.iloc[-1])
+
+    is_entry = (prev_M_rk_atr < STRATEGY_PARAMS['ATR_RANK_LOW_TH']) and (
+                curr_rk_atr > STRATEGY_PARAMS['ATR_RANK_HIGH_TH'])
+    is_exit = (prev_M_fr_rank < STRATEGY_PARAMS['FR_RANK_LOW_TH']) and (curr_fr_rank > prev_1_fr_rank)
+
+    new_candidate_record = None
+
+    if is_entry or is_exit:
+        bar_ms_delta = int(bar_minutes * 60 * 1000)
+        last_ts = int(df.index[-1].timestamp() * 1000)
+        signal_ts_ms = last_ts + bar_ms_delta
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+
+        if is_entry:
+            entry_reason = f"VOL_LOW_TO_HIGH(rk_atr_{STRATEGY_PARAMS['M_HOURS']}h_ago:{prev_M_rk_atr:.3f}<{STRATEGY_PARAMS['ATR_RANK_LOW_TH']} & curr:{curr_rk_atr:.3f}>{STRATEGY_PARAMS['ATR_RANK_HIGH_TH']})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'BUY',
+                'coin': coin_name,
+                'direction': 'LONG',
+                'event': 'OPEN',
+                'price': curr_c,
+                'reason': entry_reason,
+                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+        elif is_exit:
+            exit_reason = f"FR_RECOVERY_FROM_LOW(rk_fr_{STRATEGY_PARAMS['M_HOURS']}h_ago:{prev_M_fr_rank:.3f}<{STRATEGY_PARAMS['FR_RANK_LOW_TH']} & curr:{curr_fr_rank:.3f}>prev:{prev_1_fr_rank:.3f})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'SELL',
+                'coin': coin_name,
+                'direction': 'LONG',
+                'event': 'CLOSE',
+                'price': curr_c,
+                'reason': exit_reason,
+                'target_weight': 0.0,
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+
+    # 4. 状态机持久化防重复拦截
+    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
+    return [], df_actual_signals
+
+
+# ==============================================================================
+# [新增]: Vol FR Long 实盘专属工作流 (严格适配返回结果为 Dict 格式)
+# ==============================================================================
+def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url=None):
+    """
+    针对 Vol FR Long 策略专属工作流：
+    返回格式严格适配 snipe_kline_data 的结构，返回以 symbol 为 key, DataFrame 为 value 的字典
+    策略描述：bottom_10的币种在币价出现历史级别的4小时极度暴涨时直接追高做多，当市场多头情绪彻底冷却（资金费率极低或转负）时平仓走人
+    VOL_LOW_TO_HIGH -> FR_RECOVERY_FROM_LOW Long_bottom_20 5m
+    回测表现：
+    总交易笔数：355  单笔净收益：13.0693%  跨币种胜率(%)： 49.6855  均值单笔回撤(%)：-11.9181 平均持仓时间(天)：15.2574
+    持仓时间中位数(天)：0.2674  策略性价比 (收益风险比):15.2262 资金最大回撤：304.7110%   最大并发持仓：27
+
+    """
+    # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
+    lookback_days = 20
+    timeframe = "5m"
+
+    run_logger = setup_logger()
+    run_logger.info(f"📊 基于 vol_fr_long 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
+    kline_result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
+    funding_result_map = snipe_funding_rate_data(
+        symbol_list=symbol_list,
+        days=lookback_days,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
+    expected_rows = lookback_days * 24 * 12 + 1  # 5分钟线预期行数
+
+    df_actual_signals_df_list = []
+    # 按照需求：组装返回结果 dict
+    result_dict = {}
+
+    for symbol in symbol_list:
+        df_klines = kline_result_map.get(symbol, pd.DataFrame())
+        df_fr = funding_result_map.get(symbol, pd.DataFrame())
+
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
+            result_dict[symbol] = pd.DataFrame()
+            continue
+
+        if df_fr.empty:
+            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算该策略。")
+            result_dict[symbol] = pd.DataFrame()
+            continue
+
         actual_rows = len(df_klines)
         if actual_rows < expected_rows:
             start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
@@ -1595,25 +1858,30 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
         df_klines['symbol'] = symbol
 
         # 传递双数据流给截面信号引擎
-        signals, df_actual_signals = generate_short_fr_signals(df_klines, df_fr, bar_minutes=30)
-        df_actual_signals_df_list.append(df_actual_signals)
+        signals, df_actual_signals = generate_vol_fr_signals(df_klines, df_fr, bar_minutes=5)
 
-    # 3. 聚合全量截面真实账本并打印指令
+        df_actual_signals_df_list.append(df_actual_signals)
+        result_dict[symbol] = df_actual_signals  # 写入字典返回池
+
+    # 附加操作：依然对信号池全聚合存盘，便于我们排查定位和展示打印
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 移除可能重复的信号 (根据 symbol、时间戳、事件 联合去重)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+        if not final_signals_df.empty:
+            final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
 
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+            print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
 
-        output_path = "short_fr_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ Extreme FR Short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        return final_signals_df
+            output_path = "vol_fr_long_signals.csv"
+            final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+            run_logger.info(
+                f"\n✅ vol_fr_long 策略的全量交易流水已聚合生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+        else:
+            run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
     else:
-        run_logger.info("\n► 历史流转中 Extreme FR Short 策略尚未产生任何有效信号。")
-        return pd.DataFrame()
+        run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
+
+    # 返回与 snipe_kline_data 格式一致的 dict
+    return result_dict
 
 
 if __name__ == "__main__":
@@ -1621,4 +1889,4 @@ if __name__ == "__main__":
     symbol_list = ['AIOT/USDT:USDT']
 
     # 你可以测试调用新加的 workflow
-    execute_trading_bot_workflow_short_fr(target_time, symbol_list, 'http://127.0.0.1:7890')
+    execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
