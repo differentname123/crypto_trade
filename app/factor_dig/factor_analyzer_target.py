@@ -18,7 +18,7 @@ MAX_AVG_HOLDING_DAYS = 60.0
 MAX_TOP3_PROFIT_PCT = 60.0
 
 # 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
-MIN_RET_MAE_RATIO = 0.2
+MIN_RET_MAE_RATIO = 0.1
 
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
@@ -604,11 +604,11 @@ if __name__ == "__main__":
     # 替换为你实际的大宽表路径
     TARGET_CSV = './summary_results/advanced_summary_combined_ALL.csv'
 
-    # ==== 打印指定列表，无任何过滤条件 ====
-    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
-
-    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+    # # ==== 打印指定列表，无任何过滤条件 ====
+    # display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
+    #
+    # display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
 
 
     # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
-    # display_pivot_panels(csv_path=TARGET_CSV, top_n=50, target_direction='Short')
+    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Long')
