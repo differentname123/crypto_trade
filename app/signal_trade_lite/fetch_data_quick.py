@@ -10,6 +10,7 @@
 【防弹修复版】消除 WS 硬编码兼容全币种，注入协程防异常死锁装甲，引入物理时钟强判防流动性枯竭。
 【闪现交付版】主线程金蝉脱壳 O(1) 返回、剔除 datetime_bj 性能枷锁、后台线程接管全量清洗落盘。
 【资金费率极速扩展】新增无缝时间轴哈希去重、阈值脉冲探测结算抢跑、缓存回退拼接兜底方案。
+【全链路防断网修复版】为所有核心 HTTP/CCXT 请求覆盖指数退避与防弹装甲，抵御 WinError 64 闪断异常。
 """
 
 import asyncio
@@ -369,12 +370,22 @@ def parse_time_params(exchange, timeframe, days, target_time_str):
 async def check_time_sync(exchange, log_prefix=""):
     """
     检测本地物理机时间与 Binance 服务器时间的精准偏差与网络往返延迟 (RTT)。
-    采用标准 NTP 估计算法剔除网络传输误差。
+    采用标准 NTP 估计算法剔除网络传输误差。引入重试防止闪断。
     """
     try:
-        t0 = time.time() * 1000
-        server_time = await exchange.fetch_time()
-        t1 = time.time() * 1000
+        t0, server_time, t1 = 0, 0, 0
+        for attempt in range(3):
+            try:
+                t0 = time.time() * 1000
+                server_time = await exchange.fetch_time()
+                t1 = time.time() * 1000
+                break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(1)
+                else:
+                    raise e
+
         rtt = t1 - t0
         local_time_at_server = t0 + (rtt / 2)
         offset = server_time - local_time_at_server
@@ -403,7 +414,8 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     # 1. 定义基础配置
     exchange_config = {
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
+        'options': {'defaultType': 'swap'},
+        'timeout': 15000  # 核心防断网：提高超时时间，允许网络小幅波段
     }
 
     # 2. 如果 proxy_url 存在（非 None 且非空），则动态注入代理配置
@@ -417,7 +429,20 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     # 3. 使用配置字典初始化 Exchange
     exchange = ccxt.binance(exchange_config)
     try:
-        await exchange.load_markets()
+        # 核心防断网装甲：load_markets 增加重试保护
+        for attempt in range(3):
+            try:
+                await exchange.load_markets()
+                break
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout, Exception) as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"{log_prefix} [INIT] load_markets 异常: {e} | {wait_time}s后重试...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"{log_prefix} [INIT] load_markets 彻底失败，将抛出给上层接管: {e}")
+                    raise
+
         await check_time_sync(exchange, log_prefix)
         # 1. 计算时间参数
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
@@ -653,8 +678,21 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
     - 阈值外：自 最大缓存时间往前推24h 拉取进行重叠拼接
     """
     try:
-        # 获取下一次结算时间与物理机时间
-        funding_info = await exchange.fetch_funding_rate(symbol)
+        # 核心防断网：给获取基础信息的请求覆盖一层重试，防止一抖动整个币种跳过
+        funding_info = None
+        for attempt in range(3):
+            try:
+                funding_info = await exchange.fetch_funding_rate(symbol)
+                break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"{log_prefix} [FUNDING_ERR] 获取 {symbol} 资金费率基础信息彻底失败: {e}")
+                    return
+
+        if not funding_info:
+            return
 
         # 【深度兼容补丁】兼容 CCXT 针对 Binance 各版本的字段映射差异，强行深挖原始字段
         next_funding_time = funding_info.get('nextFundingTimestamp')
@@ -679,22 +717,27 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
 
             retry_count = 0
             while retry_count < 20:  # 保护性熔断退出，防止死循环
-                # 安全起见，since 取前一日，以防交易所默认只给一条旧的
-                since_ms = next_funding_time - (24 * 60 * 60 * 1000)
-                hist_rates = await exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=100)
+                try:
+                    # 安全起见，since 取前一日，以防交易所默认只给一条旧的
+                    since_ms = next_funding_time - (24 * 60 * 60 * 1000)
+                    hist_rates = await exchange.fetch_funding_rate_history(symbol, since=since_ms, limit=100)
 
-                if hist_rates:
-                    max_fetched_ts = max(r['timestamp'] for r in hist_rates)
-                    # 先塞入缓存去重
-                    for r in hist_rates:
-                        ts = r['timestamp']
-                        memory_pool[symbol][ts] = {'timestamp': ts, 'fundingRate': r['fundingRate'], 'symbol': symbol}
+                    if hist_rates:
+                        max_fetched_ts = max(r['timestamp'] for r in hist_rates)
+                        # 先塞入缓存去重
+                        for r in hist_rates:
+                            ts = r['timestamp']
+                            memory_pool[symbol][ts] = {'timestamp': ts, 'fundingRate': r['fundingRate'],
+                                                       'symbol': symbol}
 
-                    # 判断是否已经捕捉到了最新的那个交割点
-                    if max_fetched_ts >= next_funding_time:
-                        logger.info(
-                            f"{log_prefix} [FUNDING_SNIPE] 🔫 {symbol} 脉冲命中！获取到最新结算费率，时间: {_format_bj_time(max_fetched_ts)}")
-                        break
+                        # 判断是否已经捕捉到了最新的那个交割点
+                        if max_fetched_ts >= next_funding_time:
+                            logger.info(
+                                f"{log_prefix} [FUNDING_SNIPE] 🔫 {symbol} 脉冲命中！获取到最新结算费率，时间: {_format_bj_time(max_fetched_ts)}")
+                            break
+                except Exception as e:
+                    # 核心防断网：局部捕获脉冲异常，避免直接抛到外层终止探测
+                    logger.warning(f"{log_prefix} [FUNDING_SNIPE] {symbol} 脉冲抓取异常: {e}，将在下次循环重试...")
 
                 retry_count += 1
                 await asyncio.sleep(0.5)  # 极速脉冲
@@ -716,7 +759,19 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
             # 循环分页拉取直到最新
             curr_since = since_ms
             while True:
-                hist_rates = await exchange.fetch_funding_rate_history(symbol, since=curr_since, limit=1000)
+                hist_rates = None
+                # 核心防断网：为每一次分页请求提供重试保护
+                for attempt in range(3):
+                    try:
+                        hist_rates = await exchange.fetch_funding_rate_history(symbol, since=curr_since, limit=1000)
+                        break
+                    except Exception as e:
+                        if attempt < 2:
+                            await asyncio.sleep(2)
+                        else:
+                            logger.error(f"{log_prefix} [FUNDING_REST] {symbol} 历史分页请求中断: {e}")
+                            raise e  # 彻底失败，交由外层 except 处理
+
                 if not hist_rates:
                     break
 
@@ -729,7 +784,7 @@ async def _fetch_funding_for_symbol(exchange, symbol, target_start_ms, memory_po
                 curr_since = hist_rates[-1]['timestamp'] + 1
 
     except Exception as e:
-        logger.error(f"{log_prefix} [FUNDING_ERR] ❌ {symbol} 资金费率获取异常: {e}")
+        logger.error(f"{log_prefix} [FUNDING_ERR] ❌ {symbol} 资金费率获取异常退出: {e}")
 
 
 async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
@@ -739,7 +794,8 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
 
     exchange_config = {
         'enableRateLimit': True,
-        'options': {'defaultType': 'swap'}
+        'options': {'defaultType': 'swap'},
+        'timeout': 15000  # 核心防断网
     }
     if proxy_url:
         exchange_config['aiohttp_proxy'] = proxy_url
@@ -747,7 +803,20 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
 
     exchange = ccxt.binance(exchange_config)
     try:
-        await exchange.load_markets()
+        # 核心防断网装甲：资金费率引擎同步覆盖 load_markets 保护
+        for attempt in range(3):
+            try:
+                await exchange.load_markets()
+                break
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, ccxt.RequestTimeout, Exception) as e:
+                if attempt < 2:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"{log_prefix} [FUNDING_INIT] load_markets 异常: {e} | {wait_time}s后重试...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"{log_prefix} [FUNDING_INIT] load_markets 彻底失败: {e}")
+                    raise
+
         await check_time_sync(exchange, log_prefix)
 
         # 核心修改：不再使用传入的 target_time，直接获取当前服务器时间作为最新右边界
@@ -755,7 +824,8 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
         target_start_ms = target_end_ms - (days * 24 * 60 * 60 * 1000)
         target_end_str = _format_bj_time(target_end_ms)
 
-        logger.info(f"{log_prefix} [FUNDING_INIT] 🚀 资金费率极速引擎发车 | target_end={target_end_str} days={days} symbols={len(symbol_list)}")
+        logger.info(
+            f"{log_prefix} [FUNDING_INIT] 🚀 资金费率极速引擎发车 | target_end={target_end_str} days={days} symbols={len(symbol_list)}")
 
         # 1. 智能加载缓存
         memory_pool, max_cache_ts_map = load_funding_cache(symbol_list, log_prefix=log_prefix)
@@ -763,7 +833,8 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
         # 2. 并发执行每个币种的资金费率拉取（内置阈值分流判断）
         # 资金费率的1分钟阈值 = 60000 毫秒
         tasks = [
-            _fetch_funding_for_symbol(exchange, sym, target_start_ms, memory_pool, max_cache_ts_map[sym], 60000, log_prefix)
+            _fetch_funding_for_symbol(exchange, sym, target_start_ms, memory_pool, max_cache_ts_map[sym], 60000,
+                                      log_prefix)
             for sym in symbol_list
         ]
         await asyncio.gather(*tasks)
@@ -787,18 +858,23 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
             total_pts += len(df)
 
         total_runtime = time.time() - orchestrator_start_t
-        logger.info(f"{log_prefix} [FUNDING_EXIT] 🎉 资金费率极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
+        logger.info(
+            f"{log_prefix} [FUNDING_EXIT] 🎉 资金费率极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
         return final_dfs
     finally:
         # 物理斩断释放内存
         try:
             if hasattr(exchange, 'session') and exchange.session:
                 if hasattr(exchange.session, 'connector') and exchange.session.connector:
-                    try: await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
-                    except: pass
+                    try:
+                        await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
+                    except:
+                        pass
             exchange.session = None
             await asyncio.wait_for(exchange.close(), timeout=0.00002)
-        except: pass
+        except:
+            pass
+
 
 # =====================================================================
 # 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API]
@@ -838,6 +914,7 @@ def snipe_funding_rate_data(symbol_list, days, proxy_url=None):
             symbol_list, days, proxy_url
         )
     )
+
 
 # =====================================================================
 # 🚀 启动入口 [严格未修改]
