@@ -233,7 +233,6 @@ def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15)
 
     return pd.DataFrame(records, columns=cols)
 
-
 # ==========================================
 # 测试入口
 # ==========================================
@@ -248,9 +247,9 @@ if __name__ == "__main__":
         (trades_df["filter_mode"] == "original")
         ].copy()
 
-    kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_1m_kline.csv'
-    fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_funding_rates.csv'
-    oi_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_5m_oi.csv'
+    kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_1m_kline.csv'
+    fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_funding_rates.csv'
+    oi_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_5m_oi.csv'
     try:
         kline_df = pd.read_csv(kline_file_path)
         # 为 kline_df 补充 symbol 属性 (模拟实盘数据源结构)
