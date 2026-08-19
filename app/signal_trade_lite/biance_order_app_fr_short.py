@@ -931,8 +931,8 @@ def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache,
 
 def run_scheduler():
     """顶层编排: 周期驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
-    api_key = get_config("myself_biance_api_key")
-    secret_key = get_config("myself_biance_api_secret")
+    api_key = get_config("mama_biance_api_key")
+    secret_key = get_config("mama_biance_api_secret")
 
     if platform.system().lower() == "linux":
         proxies, proxy_url = None, None
