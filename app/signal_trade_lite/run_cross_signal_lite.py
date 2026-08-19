@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 
 from common_utils_lite import setup_logger
-from fetch_data_quick import snipe_kline_data, snipe_funding_rate_data
+from fetch_data_quick import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
 
 
 def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
