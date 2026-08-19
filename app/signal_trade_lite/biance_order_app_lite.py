@@ -28,11 +28,11 @@ import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
 
-CURRENT_SYMBOL = "vol_fr_long"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long"
+CURRENT_SYMBOL = "vol_fr_long"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long" "bottom_power_short"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
-from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long, execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_XSR_long, execute_trading_bot_workflow_short_fr, execute_trading_bot_workflow_vol_fr_long
+from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long, execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_XSR_long, execute_trading_bot_workflow_short_fr, execute_trading_bot_workflow_vol_fr_long,execute_trading_bot_workflow_bottom_powder_short
 from biance_order_lite import (execute_order, get_total_equity,
                                ExecStatus, safe_init_exchange
                                )
@@ -928,6 +928,45 @@ def get_vol_fr_long_signal_df(exchange, target_time_str, proxy_url, position_cac
     return signal_df
 
 
+def get_bottom_power_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
+    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
+    # 获取当前实际持仓与账本理论持仓
+    actual_symbols_set = set()
+    theoretical_symbols_set = set()
+
+    # 1. 从交易所缓存(实际持仓)中提取
+    if position_cache:
+        for k in position_cache.keys():
+            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
+            actual_symbols_set.add(k.rsplit('_', 1)[0])
+
+    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
+    df = ledger.read()
+    if not df.empty:
+        closed_ids = _closed_open_ids(df)
+        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
+        for _, r in opens_df.iterrows():
+            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
+                theoretical_symbols_set.add(str(r["symbol"]).strip())
+
+    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
+    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
+    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
+    holding_symbols = list(holding_symbols_set)
+
+    # 获取涨幅榜
+    top_symbol_list = get_top_movers(exchange, top_n=10, mode='bottom')  # 获取跌幅榜
+
+    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
+    final_symbol_list = list(set(top_symbol_list + holding_symbols))
+
+    # 一行输出详细的过滤与统计信息
+    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+
+    signal_df = execute_trading_bot_workflow_bottom_powder_short(target_time_str, symbol_list=final_symbol_list,
+                                                      proxy_url=proxy_url)
+    return signal_df
+
 
 
 def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
@@ -999,6 +1038,10 @@ def run_scheduler():
                 add_minutes = 30 - (now.minute % 30)
                 next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
                 preload_ahead = 1  # 30分钟为一个周期，提前1分钟触发
+            elif CURRENT_SYMBOL == "bottom_power_short":
+                add_minutes = 15 - (now.minute % 15)
+                next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
+                preload_ahead = 1  # 15分钟为一个周期，提前1分钟触发
             else:
                 # 其他策略 (如 cross) 原逻辑: 每整点驱动一轮
                 next_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -1047,6 +1090,9 @@ def run_scheduler():
             elif CURRENT_SYMBOL == "vol_fr_long":
                 signal_df = get_vol_fr_long_signal_df(exchange, target_time_str, proxy_url=proxy_url,
                                                       position_cache=position_cache, ledger=ledger)
+            elif CURRENT_SYMBOL == "bottom_power_short":
+                signal_df = get_bottom_power_short_signal_df(exchange, target_time_str, proxy_url=proxy_url,
+                                                            position_cache=position_cache, ledger=ledger)
             else:
                 logger.error(f"[SIGNAL] 未知的 CURRENT_SYMBOL 配置: {CURRENT_SYMBOL}")
                 signal_df = None

@@ -2062,6 +2062,10 @@ def execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, p
     针对 Bottom Powder Short 策略专属工作流：
     拉取 K 线、资金费率与 OI 数据并启动交集整套交易工作流
     策略描述：精准抄底左侧企稳、爆仓池已经积累火药桶的空头标的。
+    ENTRY_BOTTOM_STABILIZE -> REGIME_POWDER_KEG Short_bottom_10 15m
+    回测表现：
+    总交易笔数：157  单笔净收益：12.5116%  跨币种胜率(%)： 74.4186  均值单笔回撤(%)：-32.4334 平均持仓时间(天)：23.9702
+    持仓时间中位数(天)：16.4792  策略性价比 (收益风险比):18.1403 资金最大回撤：108.2850%   最大并发持仓：24
     """
     lookback_days = 20
     timeframe = "15m"
