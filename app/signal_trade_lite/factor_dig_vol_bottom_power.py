@@ -247,7 +247,7 @@ if __name__ == "__main__":
         (trades_df["filter_mode"] == "original")
         ].copy()
 
-    kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_1m_kline.csv'
+    kline_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_15m_latest.csv'
     fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_funding_rates.csv'
     oi_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_5m_oi.csv'
     try:
