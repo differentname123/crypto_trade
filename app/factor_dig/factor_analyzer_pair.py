@@ -230,6 +230,30 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         top1_combo = row['联合_Top1币收益占比(%)']
         print(f"  {'Top1币收益占比':<14} | {top1_a:>13.2f}% | {top1_b:>13.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
 
+        # 6. 单笔净期望(%)
+        exp_a = row['单A_单笔净期望(%)']
+        exp_b = row['单B_单笔净期望(%)']
+        exp_combo = row['联合_单笔净期望(%)']
+        print(f"  {'单笔净期望(%)':<14} | {exp_a:>13.2f}% | {exp_b:>13.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
+
+        # 7. 涉及币种数
+        coin_cnt_a = int(row['单A_涉及币种数'])
+        coin_cnt_b = int(row['单B_涉及币种数'])
+        coin_cnt_combo = int(row['联合_涉及币种数'])
+        print(f"  {'涉及币种数':<14} | {coin_cnt_a:>14} | {coin_cnt_b:>14} | {coin_cnt_combo:>16} | {'---':>16}")
+
+        # 8. 跨币种胜率(%)
+        cw_a = row['单A_跨币种胜率(%)']
+        cw_b = row['单B_跨币种胜率(%)']
+        cw_combo = row['联合_跨币种胜率(%)']
+        print(f"  {'跨币种胜率(%)':<14} | {cw_a:>13.2f}% | {cw_b:>13.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
+
+        # 9. 平均持仓时间(天)
+        ht_a = row['单A_平均持仓时间(天)']
+        ht_b = row['单B_平均持仓时间(天)']
+        ht_combo = row['联合_平均持仓时间(天)']
+        print(f"  {'平均持仓时间(天)':<14} | {ht_a:>14.2f} | {ht_b:>14.2f} | {ht_combo:>16.2f} | {'---':>16}")
+
     print("\n" + "=" * 92)
 
 
@@ -302,6 +326,26 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         top1_sub = row['最优子组合_Top1币收益占比(%)']
         top1_combo = row['联合_Top1币收益占比(%)']
         print(f"  {'Top1币收益占比':<14} | {top1_sub:>15.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
+
+        # 6. 单笔净期望(%)
+        exp_sub = row['最优子组合_单笔净期望(%)']
+        exp_combo = row['联合_单笔净期望(%)']
+        print(f"  {'单笔净期望(%)':<14} | {exp_sub:>15.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
+
+        # 7. 涉及币种数
+        coin_cnt_sub = int(row['最优子组合_涉及币种数'])
+        coin_cnt_combo = int(row['联合_涉及币种数'])
+        print(f"  {'涉及币种数':<14} | {coin_cnt_sub:>16} | {coin_cnt_combo:>16} | {'---':>16}")
+
+        # 8. 跨币种胜率(%)
+        cw_sub = row['最优子组合_跨币种胜率(%)']
+        cw_combo = row['联合_跨币种胜率(%)']
+        print(f"  {'跨币种胜率(%)':<14} | {cw_sub:>15.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
+
+        # 9. 平均持仓时间(天)
+        ht_sub = row['最优子组合_平均持仓时间(天)']
+        ht_combo = row['联合_平均持仓时间(天)']
+        print(f"  {'平均持仓时间(天)':<14} | {ht_sub:>16.2f} | {ht_combo:>16.2f} | {'---':>16}")
 
     print("\n" + "=" * 92)
 
@@ -462,6 +506,17 @@ def analyze_pair_combinations_with_baseline(
             '单A_最大并发持仓': m1['最大并发持仓数'],
             '单B_最大并发持仓': m2['最大并发持仓数'],
 
+            '单A_单笔净期望(%)': m1['单笔净期望(%)'],
+            '单B_单笔净期望(%)': m2['单笔净期望(%)'],
+            '联合_涉及币种数': m_combo['涉及币种数'],
+            '单A_涉及币种数': m1['涉及币种数'],
+            '单B_涉及币种数': m2['涉及币种数'],
+            '联合_跨币种胜率(%)': m_combo['跨币种胜率(%)'],
+            '单A_跨币种胜率(%)': m1['跨币种胜率(%)'],
+            '单B_跨币种胜率(%)': m2['跨币种胜率(%)'],
+            '单A_平均持仓时间(天)': m1['平均持仓时间(天)'],
+            '单B_平均持仓时间(天)': m2['平均持仓时间(天)'],
+
             '联合_Top1币收益占比(%)': m_combo['Top1币收益占比(%)'],
             '单A_Top1币收益占比(%)': m1['Top1币收益占比(%)'],
             '单B_Top1币收益占比(%)': m2['Top1币收益占比(%)'],
@@ -580,6 +635,10 @@ def analyze_pair_combinations_with_baseline(
             row['最优子组合_最大回撤历时(天)'] = best_sub_m['最大回撤历时(天)']
             row['最优子组合_最大并发持仓'] = best_sub_m['最大并发持仓数']
             row['最优子组合_Top1币收益占比(%)'] = best_sub_m['Top1币收益占比(%)']
+            row['最优子组合_单笔净期望(%)'] = best_sub_m['单笔净期望(%)']
+            row['最优子组合_涉及币种数'] = best_sub_m['涉及币种数']
+            row['最优子组合_跨币种胜率(%)'] = best_sub_m['跨币种胜率(%)']
+            row['最优子组合_平均持仓时间(天)'] = best_sub_m['平均持仓时间(天)']
 
             row['【提升】性价比增量(vs最优子组合)'] = cost_diff
             row['【风险】回撤变动(vs最优子组合)(%)'] = (
@@ -594,6 +653,8 @@ def analyze_pair_combinations_with_baseline(
             row['联合_最大并发持仓'] = m_combo['最大并发持仓数']
             row['联合_Top1币收益占比(%)'] = m_combo['Top1币收益占比(%)']
             row['联合_Top3币收益占比(%)'] = m_combo['Top3币收益占比(%)']
+            row['联合_涉及币种数'] = m_combo['涉及币种数']
+            row['联合_跨币种胜率(%)'] = m_combo['跨币种胜率(%)']
             row['联合_总交易笔数'] = m_combo['总交易笔数']
             row['联合_纯价差总收益(%)'] = m_combo['纯价差总收益(%)']
             row['联合_资金费总损益(%)'] = m_combo['资金费总损益(%)']
@@ -660,7 +721,7 @@ if __name__ == '__main__':
             show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
             max_combo_size=4,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
-            max_seeds_per_level=200  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
+            max_seeds_per_level=2000  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")
