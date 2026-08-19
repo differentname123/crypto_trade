@@ -1083,7 +1083,7 @@ async def _async_core_oi_orchestrator(symbol_list, timeframe, days, target_time_
         # 2. 并发执行所有币种的 OI 纯 REST 轮询拉取（封装成 Task 以便支持超时熔断）
         tasks = [
             asyncio.create_task(
-                _fetch_oi_for_symbol(exchange, sym, timeframe, start_time_ms, timeframe_ms, memory_pool,
+                _fetch_oi_for_symbol(exchange, sym, timeframe, start_time_ms, target_close_time_ms, memory_pool,
                                      max_cache_ts_map[sym], log_prefix)
             )
             for sym in symbol_list
@@ -1244,7 +1244,7 @@ if __name__ == "__main__":
         logger.info(">>> 准备调用 OI 未平仓合约极速引擎...")
         oi_result_map = snipe_oi_data(
             symbol_list=symbol_list,
-            timeframe="15m",
+            timeframe="5m",
             days=20,
             target_time_str=target_time,  # 加入指定的统一时间边界
             proxy_url='http://127.0.0.1:7890'
