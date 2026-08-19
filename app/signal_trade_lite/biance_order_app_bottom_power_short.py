@@ -27,6 +27,11 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils_lite import get_config, setup_logger
+import re
+import hashlib
+import uuid
+import pandas as pd
+
 
 CURRENT_SYMBOL = "bottom_power_short"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long" "bottom_power_short" "oi_decay_short"
 
@@ -167,37 +172,62 @@ def map_exchange_status(ccxt_status):
     return ST_PENDING
 
 
+
+def _safe_oid_component(text, max_len):
+    """
+    优雅清洗：只保留币安允许的字符(字母,数字,.-_)
+    如果全是非法字符(如纯中文)，则使用MD5哈希短码代替，保证确定性与唯一性。
+    """
+    text_str = str(text).strip()
+    # 移除非法字符
+    safe_str = re.sub(r'[^a-zA-Z0-9_.-]', '', text_str)
+    if not safe_str:
+        # 如果清洗后为空(例如纯中文"币安人生")，采用哈希前缀
+        safe_str = hashlib.md5(text_str.encode('utf-8')).hexdigest()
+
+    return safe_str[:max_len]
+
+
 def parse_signal(row):
     """信号行 → 标准化字典, 并派生隔离 Key(ssd_key) 与可溯源 Client OID"""
     st = pd.to_datetime(row["time"])
-    # API 时间若带时区, 剥离为 naive, 与本地 naive 时间安全对比 (否则窗口过滤会报错)
     if getattr(st, "tzinfo", None) is not None:
         st = st.tz_localize(None)
 
-    strategy = str(row.get("STRATEGY_NAME", "DEF")).strip()
-    symbol = str(row["symbol"]).strip()
-    coin = str(row["coin"]).strip().upper()
-    direction = str(row["direction"]).strip().upper()
-    event = str(row["event"]).strip().upper()
-    action = str(row["action"]).strip().lower()
-    # Client OID 前缀: 策略_币种_方向_开平_时间戳, 既全局唯一又能一眼识别归属
-    prefix = f"{strategy[-6:]}_{coin[:4]}_{direction[:1]}_{event[:1]}_{st.strftime('%d%H%M')}"
+    # 1. 原始数据提取 (保留给账本和本地逻辑使用，允许中文)
+    raw_strategy = str(row.get("STRATEGY_NAME", "DEF")).strip()
+    raw_symbol = str(row["symbol"]).strip()
+    raw_coin = str(row["coin"]).strip().upper()
+    raw_direction = str(row["direction"]).strip().upper()
+    raw_event = str(row["event"]).strip().upper()
+
+    # 2. 交易所安全的 OID 组件转化
+    safe_strategy = _safe_oid_component(raw_strategy, 6)
+    safe_coin = _safe_oid_component(raw_coin, 4)
+    safe_dir = _safe_oid_component(raw_direction, 1)
+    safe_evt = _safe_oid_component(raw_event, 1)
+
+    # Client OID 前缀拼接，最大长度: 6+1+4+1+1+1+1+1+6 = 22个字符
+    prefix = f"{safe_strategy}_{safe_coin}_{safe_dir}_{safe_evt}_{st.strftime('%d%H%M')}"
+
+    # 最终 OID: 22 + 1 + 5 = 28个字符 (完美符合币安 <= 36 字符的要求)
+    client_oid = f"{prefix}_{uuid.uuid4().hex[:5]}"
+
     return {
         "signal_time": st,
-        "strategy_name": strategy,
-        "symbol": symbol,
-        "coin": coin,
-        "direction": direction,
-        "event": event,
-        "action": action,
+        "strategy_name": raw_strategy,  # 本地账本依然记为 "币安人生"
+        "symbol": raw_symbol,
+        "coin": raw_coin,
+        "direction": raw_direction,
+        "event": raw_event,
+        "action": str(row["action"]).strip().lower(),
         "price": float(row["price"]),
         "max_weight": float(row.get("max_weight", 0.1)),
-        "ssd_key": f"{strategy}_{symbol}_{direction}",  # 最小隔离单元
-        "pos_key": f"{symbol}_{direction}",
+        "ssd_key": f"{raw_strategy}_{raw_symbol}_{raw_direction}",
+        "pos_key": f"{raw_symbol}_{raw_direction}",
         "prefix": prefix,
-        "client_oid": f"{prefix}_{uuid.uuid4().hex[:5]}",
+        "client_oid": client_oid,  # 发给交易所的安全 ID
     }
-
 
 def make_record(sig, target_amount, target_value, status, client_oid,
                 exchange_oid, error_msg="", filled_amount="", actual_fill_price="",
