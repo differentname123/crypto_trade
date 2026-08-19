@@ -818,8 +818,6 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
                     logger.error(f"{log_prefix} [FUNDING_INIT] load_markets 彻底失败: {e}")
                     raise
 
-        await check_time_sync(exchange, log_prefix)
-
         # 核心修改：不再使用传入的 target_time，直接获取当前服务器时间作为最新右边界
         target_end_ms = exchange.milliseconds()
         target_start_ms = target_end_ms - (days * 24 * 60 * 60 * 1000)
@@ -1067,8 +1065,6 @@ async def _async_core_oi_orchestrator(symbol_list, timeframe, days, target_time_
                 else:
                     logger.error(f"{log_prefix} [OI_INIT] load_markets 彻底失败: {e}")
                     raise
-
-        await check_time_sync(exchange, log_prefix)
 
         # 调用已有的 parse_time_params，实现数学级向下对齐，算出严苛时间边界
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(

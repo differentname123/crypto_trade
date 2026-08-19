@@ -1,48 +1,44 @@
-import numpy as np
 import pandas as pd
+import numpy as np
 
 
-def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
+def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15):
     """
     高度内聚的回测与信号生成函数：
-    1. 策略参数配置统一在开头。
-    2. 入场: BOTTOM_STABILIZE (原 ENTRY_BOTTOM_STABILIZE)
-    3. 出场: POWDER_KEG (原 REGIME_POWDER_KEG)
-    4. 内部自我包含所有对齐和撮合逻辑，零外部依赖。
+    1. 策略逻辑：BOTTOM_STABILIZE 触发开空 (SHORT)，POWDER_KEG 触发平空。
+    2. 计算逻辑严格复刻原版系统的 N/M/W 滚动窗口特征。
+    3. 生成与实盘一致的标准化交易事件流 (OPEN/CLOSE 分离)。
     """
 
     # ==========================================
-    # 1. 策略参数配置
+    # 1. 策略参数配置 (严格对齐原始系统)
     # ==========================================
     STRATEGY_PARAMS = {
-        'N_HOURS': 24,  # 宏观结构判定周期(小时)
-        'M_HOURS': 4,  # 微观突变判定周期(小时)
-        'W_DAYS': 14,  # 排名/分位数滚动窗口(天)
-        'POWDER_OI_RK': 0.90,  # 火药桶: OI分位下限
-        'POWDER_VOL_RK': 0.30,  # 火药桶: 成交量分位上限
-        'TARGET_WEIGHT': 1.0,  # 目标仓位
-        'MAX_WEIGHT': 1.0,  # 最大允许仓位
-        'STRATEGY_NAME': 'bottom_stabilize_powder_keg_long'
+        'N_HOURS': 24,  # 基础趋势周期 (24小时)
+        'M_HOURS': 4,  # 快速动量周期 (4小时)
+        'W_DAYS': 14,  # 排名滚动窗口 (14天)
+
+        # POWDER_KEG (火药桶) 参数
+        'POWDER_OI_RK': 0.90,  # OI极高分位
+        'POWDER_VOL_RK': 0.30,  # 交易量极低分位
+
+        'TARGET_WEIGHT': 1.0,
+        'MAX_WEIGHT': 1.0,
+        'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'
     }
 
-    EPS = 1e-12
-
-    # 规范化的输出列名
     cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
             'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
             'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
 
-    # 边界保护
-    if any(df is None or len(df) == 0 for df in [kline_df, fr_df, oi_df]):
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0 or oi_df is None or len(oi_df) == 0:
         return pd.DataFrame(columns=cols)
 
-    # 提取标的信息
     symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
     coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
         symbol.split('/')[0] if '/' in symbol else symbol
     )
 
-    # --- 内嵌辅助函数：寻找可用列名 ---
     def _pick(df_to_check, cands, what):
         for c in cands:
             if c in df_to_check.columns:
@@ -50,16 +46,15 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
         raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
 
     # ==========================================
-    # 2. 数据加载与对齐
+    # 2. 数据加载与对齐 (合并 Kline, FR, OI)
     # ==========================================
     bar = f"{bar_minutes}min"
 
-    # 处理 K线数据
+    # 处理 K线
     k = kline_df.copy()
     kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
     k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
     k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-
     agg = k.resample(bar, label='left', closed='left').agg(
         open=('open', 'first'), high=('high', 'max'),
         low=('low', 'min'), close=('close', 'last'),
@@ -68,52 +63,51 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
     agg['close'] = agg['close'].ffill()
     agg = agg[agg['close'].notna()]
     agg['open'] = agg['open'].fillna(agg['close'])
-    agg['high'] = agg['high'].fillna(agg['close'])
     agg['low'] = agg['low'].fillna(agg['close'])
-    agg['volume'] = agg['volume'].fillna(0.0)
 
-    # 处理 资金费率数据 (按状态采样)
+    # 处理 资金费率
     fr = fr_df.copy()
     ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
     fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
     fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
-    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
+    fr_s = fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float).resample(bar,
+                                                                                                        label='left',
+                                                                                                        closed='left').last()
 
     # 处理 OI数据
     oi = oi_df.copy()
     ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
     oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
     oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
-    oi_s = (oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc]
-            .astype(float).resample(bar, label='left', closed='left').last())
+    oi_s = oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc].astype(float).resample(bar,
+                                                                                                        label='left',
+                                                                                                        closed='left').last()
 
-    # 合并对齐 (以K线为主体)
+    # 合并
     df = agg.copy()
     df['funding_rate'] = fr_s.reindex(df.index).ffill()
     df['oi_amount'] = oi_s.reindex(df.index).ffill()
 
-    # 截取全部数据有效的起点
-    fv = df[['oi_amount', 'funding_rate']].apply(lambda s: s.first_valid_index())
-    start = max([x for x in fv.tolist() if x is not None], default=df.index[0])
-    df = df.loc[start:].copy()
-    df[['oi_amount', 'funding_rate']] = df[['oi_amount', 'funding_rate']].ffill()
-    df = df.dropna(subset=['oi_amount', 'funding_rate'])
+    start = df[['funding_rate', 'oi_amount']].apply(lambda s: s.first_valid_index()).max()
+    if start is not None:
+        df = df.loc[start:].copy()
+    df = df.dropna(subset=['funding_rate', 'oi_amount'])
     df = df[df['close'] > 0]
 
     if len(df) == 0:
         return pd.DataFrame(columns=cols)
 
     # ==========================================
-    # 3. 核心指标与信号计算 (严格复刻原始代码逻辑)
+    # 3. 核心指标与信号计算 (严格复刻原始因子库)
     # ==========================================
+    EPS = 1e-12
     bph = 60.0 / bar_minutes
     B = lambda hours: max(1, int(round(hours * bph)))
 
     N = B(STRATEGY_PARAMS['N_HOURS'])
     M = B(STRATEGY_PARAMS['M_HOURS'])
     W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    mp = max(50, W // 5)  # 滚动窗口的最小有效长度
+    mp = max(50, W // 5)
 
     c = df['close']
     l = df['low']
@@ -121,44 +115,43 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
     oi_amt = df['oi_amount']
     fr_rate = df['funding_rate']
 
-    # --- 基础特征 ---
+    # --- 基础计算量 ---
     minL_N = l.rolling(N, min_periods=max(2, N // 2)).min()
-
-    # 1. 底部持仓背离 (OI_BOTTOM_DIVERGENCE)
     oi_min_M = oi_amt.rolling(M, min_periods=2).min()
-    oi_bottom_divergence = (c / (minL_N + EPS) < 1.03) & (oi_amt > oi_min_M * 1.05)
 
-    # 2. 情绪极度悲观 (FR_LOW_NEG)
-    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
-    fr_low_neg = (fr_rank < 0.20) | (fr_rate < 0)
-
-    # 3. 价格结构抬升 (PRICE_HIGHER_LOWS)
-    price_higher_lows = minL_N > minL_N.shift(N)
-
-    # 4. 杠杆高企 & 流动性枯竭 (POWDER_KEG)
+    # 排名滚动
     rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
     rk_v = v.rolling(W, min_periods=mp).rank(pct=True)
-    powder_keg = (rk_oi > STRATEGY_PARAMS['POWDER_OI_RK']) & (rk_v < STRATEGY_PARAMS['POWDER_VOL_RK'])
+    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
 
-    # --- 组合最终信号 ---
-    df['signal_entry'] = oi_bottom_divergence & fr_low_neg & price_higher_lows
-    df['signal_exit'] = powder_keg
+    # --- 信号 A (开仓): BOTTOM_STABILIZE ---
+    # 1. OI_BOTTOM_DIVERGENCE: 价格贴近前低(<1.03) 且 OI较M周期底反弹(>1.05)
+    oi_bottom_div = (c / (minL_N + EPS) < 1.03) & (oi_amt > oi_min_M * 1.05)
+    # 2. FR_LOW_NEG: 费率绝对值为负 或 处于前20%极低位
+    fr_low_neg = (fr_rank < 0.20) | (fr_rate < 0)
+    # 3. PRICE_HIGHER_LOWS: N周期前低 > N周期再往前的低点
+    price_higher_lows = minL_N > minL_N.shift(N)
 
-    df['signal_entry'] = df['signal_entry'].fillna(False)
-    df['signal_exit'] = df['signal_exit'].fillna(False)
+    df['signal_open'] = oi_bottom_div & fr_low_neg & price_higher_lows
+
+    # --- 信号 B (平仓): POWDER_KEG ---
+    # OI分位极高(爆仓池已满) 且 交易量分位极低(流动性干涸)
+    df['signal_close'] = (rk_oi > STRATEGY_PARAMS['POWDER_OI_RK']) & (rk_v < STRATEGY_PARAMS['POWDER_VOL_RK'])
+
+    df['signal_open'] = df['signal_open'].fillna(False)
+    df['signal_close'] = df['signal_close'].fillna(False)
 
     # ==========================================
-    # 4. 状态机撮合模拟 (生成规范化事件流)
+    # 4. 状态机撮合模拟 (空头交易)
     # ==========================================
     records = []
     in_pos = False
     entry_price = 0.0
 
     for i in range(len(df) - 1):
-        if not in_pos and df['signal_entry'].iloc[i]:
+        if not in_pos and df['signal_open'].iloc[i]:
             in_pos = True
 
-            # 假定于下一根K线开盘成交
             exec_idx = i + 1
             exec_time_dt = df.index[exec_idx]
             entry_price = float(df['open'].iloc[exec_idx])
@@ -166,16 +159,14 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
             signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
             dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
-            # 使用客观、去除前缀的命名
-            entry_reason = "BOTTOM_STABILIZE(OI_div & FR_neg & HL)"
             records.append({
                 'time': dt_bj_str,
-                'action': 'BUY',
+                'action': 'SELL',  # 开空是SELL
                 'coin': coin_name,
-                'direction': 'LONG',
+                'direction': 'SHORT',  # 明确做空方向
                 'event': 'OPEN',
                 'price': entry_price,
-                'reason': entry_reason,
+                'reason': 'BOTTOM_STABILIZE',
                 'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
                 'pnl': None,
                 'top_k': 1,
@@ -185,27 +176,26 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
                 'symbol': symbol
             })
 
-        elif in_pos and df['signal_exit'].iloc[i]:
+        elif in_pos and df['signal_close'].iloc[i]:
             in_pos = False
 
             exec_idx = i + 1
             exec_time_dt = df.index[exec_idx]
             exit_price = float(df['open'].iloc[exec_idx])
 
-            pnl = (exit_price / entry_price) - 1.0
+            # 做空的收益率计算 (1 - 平仓价/开仓价)
+            pnl = 1.0 - (exit_price / entry_price)
             signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
             dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
-            # 使用客观、去除前缀的命名
-            exit_reason = f"POWDER_KEG(OI_rank>{STRATEGY_PARAMS['POWDER_OI_RK']} & VOL_rank<{STRATEGY_PARAMS['POWDER_VOL_RK']})"
             records.append({
                 'time': dt_bj_str,
-                'action': 'SELL',
+                'action': 'BUY',  # 平空是BUY
                 'coin': coin_name,
-                'direction': 'LONG',
+                'direction': 'SHORT',
                 'event': 'CLOSE',
                 'price': exit_price,
-                'reason': exit_reason,
+                'reason': 'POWDER_KEG',
                 'target_weight': 0.0,
                 'pnl': pnl,
                 'top_k': 1,
@@ -220,15 +210,15 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
         exec_time_dt = df.index[-1]
         exit_price = float(df['close'].iloc[-1])
 
-        pnl = (exit_price / entry_price) - 1.0
+        pnl = 1.0 - (exit_price / entry_price)
         signal_ts_ms = int(exec_time_dt.timestamp() * 1000)
         dt_bj_str = exec_time_dt.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
         records.append({
             'time': dt_bj_str,
-            'action': 'SELL',
+            'action': 'BUY',
             'coin': coin_name,
-            'direction': 'LONG',
+            'direction': 'SHORT',
             'event': 'CLOSE',
             'price': exit_price,
             'reason': "FORCE_CLOSE_AT_END",
@@ -242,6 +232,7 @@ def generate_bottom_powder_signals(kline_df, fr_df, oi_df, bar_minutes=15):
         })
 
     return pd.DataFrame(records, columns=cols)
+
 
 # ==========================================
 # 测试入口
@@ -257,8 +248,8 @@ if __name__ == "__main__":
         (trades_df["filter_mode"] == "original")
         ].copy()
 
-    kline_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_15m_latest.csv'
-    fr_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_funding_latest.csv'
+    kline_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_1m_kline.csv'
+    fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_funding_rates.csv'
     oi_file_path = r'W:\project\python_project\crypto_trade\app\data\AAOI_USDT_USDT_5m_oi.csv'
     try:
         kline_df = pd.read_csv(kline_file_path)
@@ -272,7 +263,7 @@ if __name__ == "__main__":
         oi_df = pd.read_csv(oi_file_path)
 
         print("正在处理数据与回测...")
-        trade_records_df = generate_bottom_powder_signals(kline_df, fr_df,oi_df, bar_minutes=15)
+        trade_records_df = generate_bottom_powder_short_signals(kline_df, fr_df,oi_df, bar_minutes=15)
 
         print(f"回测执行成功！共生成 {len(trade_records_df)} 条事件记录。\n")
         if not trade_records_df.empty:
