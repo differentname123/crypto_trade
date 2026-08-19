@@ -1779,19 +1779,19 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     return [], df_actual_signals
 
 
+
 # ==============================================================================
-# [新增]: Vol FR Long 实盘专属工作流 (严格适配返回结果为 Dict 格式)
+# [新增]: Vol FR Long 实盘专属工作流 (严格适配返回结果为 Dict 格式) -> 已修复为 DataFrame
 # ==============================================================================
 def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url=None):
     """
     针对 Vol FR Long 策略专属工作流：
-    返回格式严格适配 snipe_kline_data 的结构，返回以 symbol 为 key, DataFrame 为 value 的字典
+    拉取 K 线与资金费率数据并启动交集整套交易工作流
     策略描述：bottom_10的币种在币价出现历史级别的4小时极度暴涨时直接追高做多，当市场多头情绪彻底冷却（资金费率极低或转负）时平仓走人
     VOL_LOW_TO_HIGH -> FR_RECOVERY_FROM_LOW Long_bottom_20 5m
     回测表现：
     总交易笔数：355  单笔净收益：13.0693%  跨币种胜率(%)： 49.6855  均值单笔回撤(%)：-11.9181 平均持仓时间(天)：15.2574
     持仓时间中位数(天)：0.2674  策略性价比 (收益风险比):15.2262 资金最大回撤：304.7110%   最大并发持仓：27
-
     """
     # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
     lookback_days = 20
@@ -1822,8 +1822,6 @@ def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url
     expected_rows = lookback_days * 24 * 12 + 1  # 5分钟线预期行数
 
     df_actual_signals_df_list = []
-    # 按照需求：组装返回结果 dict
-    result_dict = {}
 
     for symbol in symbol_list:
         df_klines = kline_result_map.get(symbol, pd.DataFrame())
@@ -1831,12 +1829,10 @@ def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url
 
         if df_klines.empty:
             run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
-            result_dict[symbol] = pd.DataFrame()
             continue
 
         if df_fr.empty:
             run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算该策略。")
-            result_dict[symbol] = pd.DataFrame()
             continue
 
         actual_rows = len(df_klines)
@@ -1861,28 +1857,23 @@ def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url
         signals, df_actual_signals = generate_vol_fr_signals(df_klines, df_fr, bar_minutes=5)
 
         df_actual_signals_df_list.append(df_actual_signals)
-        result_dict[symbol] = df_actual_signals  # 写入字典返回池
 
     # 附加操作：依然对信号池全聚合存盘，便于我们排查定位和展示打印
     if df_actual_signals_df_list:
         final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        if not final_signals_df.empty:
-            final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
 
-            print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
 
-            output_path = "vol_fr_long_signals.csv"
-            final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-            run_logger.info(
-                f"\n✅ vol_fr_long 策略的全量交易流水已聚合生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        else:
-            run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
+        output_path = "vol_fr_long_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(
+            f"\n✅ vol_fr_long 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+
+        return final_signals_df
     else:
         run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
-
-    # 返回与 snipe_kline_data 格式一致的 dict
-    return result_dict
-
+        return pd.DataFrame()
 
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
