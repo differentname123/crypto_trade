@@ -1610,7 +1610,7 @@ def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=No
 
 
 # ==============================================================================
-# [新增]: Vol FR Long 策略流转生成器 (基于提供的新策略完全重构为瞬时信号版)
+# Vol FR Long 策略流转生成器
 # ==============================================================================
 def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     """
@@ -1723,7 +1723,7 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     curr_c = float(c.iloc[-1])
 
     is_entry = (prev_M_rk_atr < STRATEGY_PARAMS['ATR_RANK_LOW_TH']) and (
-                curr_rk_atr > STRATEGY_PARAMS['ATR_RANK_HIGH_TH'])
+            curr_rk_atr > STRATEGY_PARAMS['ATR_RANK_HIGH_TH'])
     is_exit = (prev_M_fr_rank < STRATEGY_PARAMS['FR_RANK_LOW_TH']) and (curr_fr_rank > prev_1_fr_rank)
 
     new_candidate_record = None
@@ -1779,10 +1779,6 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     return [], df_actual_signals
 
 
-
-# ==============================================================================
-# [新增]: Vol FR Long 实盘专属工作流 (严格适配返回结果为 Dict 格式) -> 已修复为 DataFrame
-# ==============================================================================
 def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url=None):
     """
     针对 Vol FR Long 策略专属工作流：
@@ -1875,9 +1871,300 @@ def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url
         run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
         return pd.DataFrame()
 
+
+# ==============================================================================
+# [新增]: Bottom Powder Short 策略流转生成器与工作流
+# ==============================================================================
+def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15):
+    """
+    截面瞬时信号生成版：针对 bottom_stabilize_powder_keg_short (做空策略)
+    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    """
+    STRATEGY_PARAMS = {
+        'N_HOURS': 24,  # 基础趋势周期 (24小时)
+        'M_HOURS': 4,  # 快速动量周期 (4小时)
+        'W_DAYS': 14,  # 排名滚动窗口 (14天)
+
+        'POWDER_OI_RK': 0.90,  # OI极高分位
+        'POWDER_VOL_RK': 0.30,  # 交易量极低分位
+
+        'TARGET_WEIGHT': 1.0,
+        'MAX_WEIGHT': 1.0,
+        'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0 or oi_df is None or len(oi_df) == 0:
+        return [], pd.DataFrame(columns=cols)
+
+    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol
+    )
+
+    def _pick(df_to_check, cands, what):
+        for c in cands:
+            if c in df_to_check.columns:
+                return c
+        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
+
+    # 1. 数据重采样与对齐
+    bar = f"{bar_minutes}min"
+
+    k = kline_df.copy()
+    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+    agg = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum')
+    )
+    agg['close'] = agg['close'].ffill()
+    agg = agg[agg['close'].notna()]
+    agg['open'] = agg['open'].fillna(agg['close'])
+    agg['low'] = agg['low'].fillna(agg['close'])
+
+    fr = fr_df.copy()
+    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
+    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
+    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
+    fr_s = fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float).resample(bar,
+                                                                                                        label='left',
+                                                                                                        closed='left').last()
+
+    oi = oi_df.copy()
+    ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
+    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
+    oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
+    oi_s = oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc].astype(float).resample(bar,
+                                                                                                        label='left',
+                                                                                                        closed='left').last()
+
+    df = agg.copy()
+    df['funding_rate'] = fr_s.reindex(df.index).ffill()
+    df['oi_amount'] = oi_s.reindex(df.index).ffill()
+
+    start = df[['funding_rate', 'oi_amount']].apply(lambda s: s.first_valid_index()).max()
+    if start is not None:
+        df = df.loc[start:].copy()
+    df = df.dropna(subset=['funding_rate', 'oi_amount'])
+    df = df[df['close'] > 0]
+
+    bph = 60.0 / bar_minutes
+
+    def B(hours):
+        return max(1, int(round(hours * bph)))
+
+    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=cols)
+
+    # 2. 核心指标向量化计算
+    N = B(STRATEGY_PARAMS['N_HOURS'])
+    M = B(STRATEGY_PARAMS['M_HOURS'])
+    mp = max(50, W // 5)
+    EPS = 1e-12
+
+    c = df['close']
+    l = df['low']
+    v = df['volume']
+    oi_amt = df['oi_amount']
+    fr_rate = df['funding_rate']
+
+    minL_N = l.rolling(N, min_periods=max(2, N // 2)).min()
+    oi_min_M = oi_amt.rolling(M, min_periods=2).min()
+
+    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
+    rk_v = v.rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
+
+    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线，处理好NaN边界)
+    curr_c = float(c.iloc[-1])
+    curr_minL_N = float(minL_N.iloc[-1]) if not pd.isna(minL_N.iloc[-1]) else 0.0
+    curr_oi_amt = float(oi_amt.iloc[-1]) if not pd.isna(oi_amt.iloc[-1]) else 0.0
+    curr_oi_min_M = float(oi_min_M.iloc[-1]) if not pd.isna(oi_min_M.iloc[-1]) else 0.0
+
+    curr_fr_rank = float(fr_rank.iloc[-1]) if not pd.isna(fr_rank.iloc[-1]) else 0.0
+    curr_fr_rate = float(fr_rate.iloc[-1]) if not pd.isna(fr_rate.iloc[-1]) else 0.0
+
+    prev_N_minL_N = float(minL_N.shift(N).iloc[-1]) if not pd.isna(minL_N.shift(N).iloc[-1]) else 0.0
+
+    curr_rk_oi = float(rk_oi.iloc[-1]) if not pd.isna(rk_oi.iloc[-1]) else 0.0
+    curr_rk_v = float(rk_v.iloc[-1]) if not pd.isna(rk_v.iloc[-1]) else 0.0
+
+    # 信号运算
+    oi_bottom_div = (curr_c / (curr_minL_N + EPS) < 1.03) and (curr_oi_amt > curr_oi_min_M * 1.05)
+    fr_low_neg = (curr_fr_rank < 0.20) or (curr_fr_rate < 0)
+    price_higher_lows = curr_minL_N > prev_N_minL_N
+
+    is_entry = oi_bottom_div and fr_low_neg and price_higher_lows
+    is_exit = (curr_rk_oi > STRATEGY_PARAMS['POWDER_OI_RK']) and (curr_rk_v < STRATEGY_PARAMS['POWDER_VOL_RK'])
+
+    new_candidate_record = None
+
+    if is_entry or is_exit:
+        bar_ms_delta = int(bar_minutes * 60 * 1000)
+        last_ts = int(df.index[-1].timestamp() * 1000)
+        signal_ts_ms = last_ts + bar_ms_delta
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+
+        if is_entry:
+            entry_reason = f"BOTTOM_STABILIZE(c/L:<1.03, oi_amt:{curr_oi_amt:.2f}>minM*1.05, fr_rk<0.2 or fr<0)"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'SELL',  # 开空是 SELL
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'OPEN',
+                'price': curr_c,
+                'reason': entry_reason,
+                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+        elif is_exit:
+            exit_reason = f"POWDER_KEG(rk_oi:{curr_rk_oi:.2f}>{STRATEGY_PARAMS['POWDER_OI_RK']}, rk_v:{curr_rk_v:.2f}<{STRATEGY_PARAMS['POWDER_VOL_RK']})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'BUY',  # 平空是 BUY
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'CLOSE',
+                'price': curr_c,
+                'reason': exit_reason,
+                'target_weight': 0.0,
+                'pnl': None,  # 由底层持久化组件负责盈亏兜底计算
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+
+    # 4. 状态机持久化防重复拦截
+    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
+    return [], df_actual_signals
+
+
+def execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, proxy_url=None):
+    """
+    针对 Bottom Powder Short 策略专属工作流：
+    拉取 K 线、资金费率与 OI 数据并启动交集整套交易工作流
+    策略描述：精准抄底左侧企稳、爆仓池已经积累火药桶的空头标的。
+    """
+    lookback_days = 20
+    timeframe = "15m"
+
+    run_logger = setup_logger()
+    run_logger.info(
+        f"📊 基于 bottom_powder_short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
+    kline_result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
+    funding_result_map = snipe_funding_rate_data(
+        symbol_list=symbol_list,
+        days=lookback_days,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 OI 数据...")
+    oi_result_map = snipe_oi_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("✅ 已完成对所有币种的三重数据请求，正在进行截面信号推演...")
+    expected_rows = lookback_days * 24 * 4 + 1  # 15分钟线预期行数
+
+    df_actual_signals_df_list = []
+
+    for symbol in symbol_list:
+        df_klines = kline_result_map.get(symbol, pd.DataFrame())
+        df_fr = funding_result_map.get(symbol, pd.DataFrame())
+        df_oi = oi_result_map.get(symbol, pd.DataFrame())
+
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
+            continue
+
+        if df_fr.empty:
+            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算该策略。")
+            continue
+
+        if df_oi.empty:
+            run_logger.warning(f"❌ 警告：{symbol} OI数据丢失！无法计算该策略。")
+            continue
+
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ K线数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
+        coin_name = symbol.split('/')[0]
+        df_klines['coin_name'] = coin_name
+        df_klines['symbol'] = symbol
+
+        # 传递三维数据流给截面信号引擎
+        signals, df_actual_signals = generate_bottom_powder_short_signals(df_klines, df_fr, df_oi, bar_minutes=15)
+
+        df_actual_signals_df_list.append(df_actual_signals)
+
+    if df_actual_signals_df_list:
+        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+
+        output_path = "bottom_powder_short_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(
+            f"\n✅ bottom_powder_short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+
+        return final_signals_df
+    else:
+        run_logger.info("\n► 历史流转中 bottom_powder_short 策略尚未产生任何有效信号。")
+        return pd.DataFrame()
+
+
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
 
-    # 你可以测试调用新加的 workflow
-    execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+    # 测试原有 workflow
+    # execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+
+    # 测试新增的工作流
+    execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, 'http://127.0.0.1:7890')
