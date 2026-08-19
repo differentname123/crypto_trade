@@ -1,663 +1,178 @@
+# =============================================================================
+# [功能摘要]
+#   加密合约多策略「实盘信号引擎」：拉取行情/资金费率/持仓量(OI)，推演出当下这一刻应该
+#   下发的开平仓指令，并把真实成交账本持久化到本地 CSV（跨进程续跑的持仓状态机）。
+#   含两条独立主干：A) 4H 横截面动量组合(多币轮动)；B) 6 个单标的截面瞬时策略。
+#
+# [输入数据]
+#   · snipe_kline_data(symbol_list, timeframe, days, ...) -> {symbol: DataFrame}
+#       DataFrame 关键列: timestamp(ms,UTC), open, high, low, close, volume
+#   · snipe_funding_rate_data(symbol_list, days, ...)      -> {symbol: DataFrame}
+#       关键列: timestamp|fundingTime, funding_rate|fundingRate|rate
+#   · snipe_oi_data(symbol_list, timeframe, days, ...)     -> {symbol: DataFrame}
+#       关键列: timestamp|time, oi_amount|openInterest|sumOpenInterest
+#   · 本地历史信号文件 signal_history_<策略名>.csv（跨进程持仓状态来源）
+#
+# [数据流转/交互]
+#   主干A(cross): 1m K线 --重采样(4h+offset)--> 每币 open/high/low/close 4 列
+#                --横向concat + 全币公共区间截断 + ffill--> 4H 截面矩阵
+#                --run_strategy_simulation(numpy 状态机: BTC均线开关定方向 → 风险调整动量
+#                  排序取TopK → 平掉出局仓位 → 按 1/波动率 分配权重开仓)--> 交易账本
+#                --时间+4h(K线走完才执行) → 生成UTC毫秒戳 + 北京时间列--> 匹配最新截面发单
+#   主干B(截面): 原始K线 --重采样 + FR/OI 前向对齐 + 三源公共起点截断--> 单标的特征表
+#                --只算最后一根闭合K线的入/出场布尔--> 候选 record
+#                --_sync_persistent_signal_ledger(读本地CSV判定当前是否持仓, 防重复开仓/
+#                  防无效平仓, 时间戳去重, 补PnL, 追加落盘)--> 该标的真实信号账本
+#
+# [输出数据]
+#   · 返回值: 全量信号/账本 DataFrame（无信号时为空 DataFrame）
+#   · 副作用: 写出 live_simulation_logs.csv / <策略>_signals.csv /
+#             signal_history_<策略>.csv；并向 logger 输出结构化的发单指令与体检报告
+# =============================================================================
+
 import os
 from datetime import datetime, timedelta
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from common_utils_lite import setup_logger
 from fetch_data_quick import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
 
-
-def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
-    """
-    将交易所拉取的【分钟级 K线列表】无损转换为信号引擎所需的【4H 截面 DataFrame】
-    返回的 DataFrame 列名包含各币种的 open, high, low 以及作为 close 的币种名。
-    """
-    resampled_coin_dfs = []
-
-    # [新增] 记录所有币种在底层 1m 级别的时间首尾边界
-    m1_starts = []
-    m1_ends = []
-
-    for df in minute_klines_list:
-        if df is None or df.empty:
-            continue
-
-        df_coin = df.copy()
-
-        # 1. 提取当前 df 对应的币种名称
-        coin_name = df_coin['coin_name'].iloc[0]
-
-        # 2. 统一时间索引处理：保持标准 UTC 时间，不直接进行暴力的数值加减
-        df_coin['timestamp'] = pd.to_datetime(df_coin['timestamp'], unit='ms')
-
-        # 冗余保留 time 列以防外部依赖
-        df_coin['time'] = df_coin['timestamp']
-
-        df_coin.set_index('timestamp', inplace=True)
-        df_coin.sort_index(inplace=True)
-
-        # [新增] 提取当前币种 1m 数据的精确首尾时间
-        m1_starts.append(df_coin.index[0])
-        m1_ends.append(df_coin.index[-1])
-
-        # 3. 核心对齐：使用与回测一致的重采样逻辑生成高低价
-        df_coin_4h = df_coin['close'].resample('4h', offset=time_offset).agg(
-            open='first',
-            high='max',
-            low='min',
-            close='last'
-        )
-
-        # 4. 清理因时间错位产生的碎片空 K 线
-        df_coin_4h.dropna(how='all', inplace=True)
-
-        # 5. 统一重命名规范 (重要：下游引擎依赖此命名格式)
-        df_coin_4h.rename(columns={
-            'open': f"{coin_name}_open",
-            'high': f"{coin_name}_high",
-            'low': f"{coin_name}_low",
-            'close': coin_name
-        }, inplace=True)
-
-        resampled_coin_dfs.append(df_coin_4h)
-
-    if not resampled_coin_dfs:
-        raise ValueError("传入的 minute_klines_list 全为空或无法解析！")
-
-    # [新增] 严格取交集：找出最晚上市的起点和最早结束的终点，输出精确 1m 日志
-    common_1m_start = max(m1_starts)
-    common_1m_end = min(m1_ends)
-
-    # 格式化时间为字符串，去除时区偏移信息，保持清爽
-    start_str = common_1m_start.tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-    end_str = common_1m_end.tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-    logger.info(f"真正对最终 4h 数据有贡献的底层 1m 数据范围: {start_str} 至 {end_str} (北京时间)")
-
-    # 6. 横向合并与严格交集对齐 (对齐了 prepare_environment 中的公共区间截断逻辑)
-    df_merged_raw = pd.concat(resampled_coin_dfs, axis=1).sort_index()
-
-    # 提取只包含收盘价(即币种名)的主列
-    main_coins = [c for c in df_merged_raw.columns if not any(x in c for x in ['_open', '_high', '_low'])]
-
-    # 锁定所有币种在 4h 级别都有数据的绝对公共区间
-    coin_starts_4h = [df_merged_raw[c].first_valid_index() for c in main_coins]
-    coin_ends_4h = [df_merged_raw[c].last_valid_index() for c in main_coins]
-
-    common_4h_start = max(coin_starts_4h)
-    common_4h_end = min(coin_ends_4h)
-
-    # 先用 loc 截断所有非公共期的参差不齐的数据，然后再执行 ffill 兜底
-    df_merged_filled = df_merged_raw.loc[common_4h_start:common_4h_end].ffill()
-
-    return df_merged_filled
-
-
-# ==========================================
-# 2. 核心流式推演引擎 (账本级对齐) - 严禁修改核心逻辑
-# ==========================================
-def run_strategy_simulation(
-        df_cross_section: pd.DataFrame,
-        strategy_params: dict,
-        trade_mode: str,
-        initial_capital: float = 10000.0,
-        start_trade_date: str = '2026-04-27 00:00:00',
-        logger=None
-) -> pd.DataFrame:
-    """
-    流式模拟引擎：基于横截面特征，运行策略状态机推演，生成与回测 100% 一致的交易账本记录。
-    """
-    MOM_WINDOW = strategy_params['MOM_WINDOW']
-    VOL_WINDOW = strategy_params['VOL_WINDOW']
-    BTC_TREND_WINDOW = strategy_params['BTC_TREND_WINDOW']
-    TOP_K = int(strategy_params.get('TOP_K', 2))
-    MAX_WEIGHT = strategy_params['MAX_WEIGHT']
-    FEE_RATE = 0.000
-
-    # 提取纯币种名称列（即收盘价列）
-    target_coins = [c for c in df_cross_section.columns if
-                    not any(suffix in c for suffix in ['_open', '_high', '_low'])]
-    n_coins = len(target_coins)
-    coin_to_idx = {c: idx for idx, c in enumerate(target_coins)}
-
-    if 'BTC' not in target_coins:
-        raise ValueError("数据矩阵中必须包含 BTC 作为宏观开关！")
-
-    # === 批量计算向量化指标 ===
-    df_close = df_cross_section[target_coins]
-    df_returns = df_close.pct_change(MOM_WINDOW)
-
-    df_high = df_cross_section[[f"{c}_high" for c in target_coins]].copy()
-    df_high.columns = target_coins
-    df_low = df_cross_section[[f"{c}_low" for c in target_coins]].copy()
-    df_low.columns = target_coins
-    df_prev_close = df_close.shift(1)
-
-    # TR 和 ATR 计算
-    true_range_arr = np.fmax.reduce([
-        (df_high - df_low).values,
-        (df_high - df_prev_close).abs().values,
-        (df_low - df_prev_close).abs().values
-    ])
-    df_atr = pd.DataFrame(true_range_arr, index=df_cross_section.index, columns=target_coins).rolling(
-        window=VOL_WINDOW).mean()
-    df_volatility_pct = df_atr / df_close
-
-    # 风险调整后动量
-    df_adj_mom = df_returns / (df_volatility_pct + 1e-8)
-
-    # 宏观大盘开关
-    df_btc_ma = df_cross_section['BTC'].rolling(window=BTC_TREND_WINDOW).mean()
-    df_btc_trend_active = df_cross_section['BTC'] > df_btc_ma
-
-    # 提取底层的 Numpy 数组加速后续流式循环
-    mom_arr = df_adj_mom.values
-    vol_arr = df_volatility_pct.values
-    btc_trend_arr = df_btc_trend_active.values
-    close_arr = df_close.values
-
-    # --- 新增：为日志提取必需的基准数组 ---
-    # 1. 提取 MOM_WINDOW 周期前的价格作为零动量阈值价格矩阵
-    ref_price_arr = df_close.shift(MOM_WINDOW).values
-    # 2. 提取 BTC 均线数组，避免在循环体内产生 pd.Series 寻址开销
-    btc_ma_arr = df_btc_ma.values
-    # -----------------------------------
-
-    time_index = df_cross_section.index
-
-    # === 状态机初始化 ===
-    cash = float(initial_capital)
-    positions_arr = np.zeros(n_coins, dtype=float)
-    coin_states = {c: {'qty': 0.0, 'cost': 0.0, 'side': None} for c in target_coins}
-    trade_ledger = []
-
-    warmup_period = max(MOM_WINDOW, VOL_WINDOW, BTC_TREND_WINDOW)
-    kline_signal_diagnostics = ["无信号: 指标预热期"] * len(df_cross_section)
-    start_trade_timestamp = pd.to_datetime(start_trade_date) if start_trade_date else None
-
-    # === 逐根 K 线流转推演 ===
-    for i in range(warmup_period, len(df_cross_section)):
-        current_time = time_index[i]
-        current_prices = close_arr[i]
-
-        total_equity = cash + np.dot(positions_arr, current_prices)
-
-        current_mom = mom_arr[i]
-        current_vol = vol_arr[i]
-        is_btc_trend_on = btc_trend_arr[i]
-
-        candidate_longs = []
-        candidate_shorts = []
-
-        # 候选队列筛选
-        if is_btc_trend_on:
-            if trade_mode in ['BOTH', 'LONG_ONLY']:
-                mask = ~np.isnan(current_mom) & (current_mom > 0)
-                if mask.any():
-                    valid_idx = np.where(mask)[0]
-                    valid_vals = current_mom[valid_idx]
-                    order = np.argsort(-valid_vals, kind='stable')
-                    candidate_longs = [target_coins[idx] for idx in valid_idx[order[:TOP_K]]]
-        else:
-            if trade_mode in ['BOTH', 'SHORT_ONLY']:
-                mask = ~np.isnan(current_mom) & (current_mom < 0)
-                if mask.any():
-                    valid_idx = np.where(mask)[0]
-                    valid_vals = current_mom[valid_idx]
-                    order = np.argsort(valid_vals, kind='stable')
-                    candidate_shorts = [target_coins[idx] for idx in valid_idx[order[:TOP_K]]]
-
-        # 时间拦截器：未到发车时间，强制掐断交易候选名单
-        if start_trade_timestamp is not None and current_time < start_trade_timestamp:
-            candidate_longs = []
-            candidate_shorts = []
-            kline_signal_diagnostics[i] = "无信号: 未到设定的发车时间"
-        else:
-            # 记录当根 K 线的具体信号状态及原因
-            if is_btc_trend_on:
-                if trade_mode in ['BOTH', 'LONG_ONLY']:
-                    if candidate_longs:
-                        kline_signal_diagnostics[i] = f"有信号 (做多): {', '.join(candidate_longs)}"
-                    else:
-                        kline_signal_diagnostics[i] = "无信号: 大盘看多，但所有标的动量均不满足做多阈值"
-                else:
-                    kline_signal_diagnostics[i] = "无信号: 大盘看多，但策略模式禁止做多"
-            else:
-                if trade_mode in ['BOTH', 'SHORT_ONLY']:
-                    if candidate_shorts:
-                        kline_signal_diagnostics[i] = f"有信号 (做空): {', '.join(candidate_shorts)}"
-                    else:
-                        kline_signal_diagnostics[i] = "无信号: 大盘看空，但所有标的动量均不满足做空阈值"
-                else:
-                    kline_signal_diagnostics[i] = "无信号: 大盘看空，但策略模式禁止做空"
-
-        # --- A. 平仓逻辑 ---
-        for idx_c in range(n_coins):
-            c = target_coins[idx_c]
-
-            # 平多
-            if positions_arr[idx_c] > 0 and c not in candidate_longs:
-                sell_amount = positions_arr[idx_c]
-                actual_sell_val = sell_amount * current_prices[idx_c]
-                fee = actual_sell_val * FEE_RATE
-                positions_arr[idx_c] = 0
-                cash += (actual_sell_val - fee)
-
-                cost = coin_states[c]['cost']
-                net_pnl = sell_amount * (current_prices[idx_c] - cost) - fee
-                pnl_pct = (net_pnl / (cost * sell_amount)) * 100 if cost > 0 else 0.0
-
-                if not is_btc_trend_on:
-                    close_reason = "大盘开关关闭"
-                elif current_mom[idx_c] <= 0:
-                    close_reason = "动量转负退场"
-                else:
-                    close_reason = "掉出前K名排名"
-                trade_ledger.append({
-                    "time": current_time, "action": "SELL", "coin": c, "direction": "LONG", "event": "CLOSE",
-                    "price": current_prices[idx_c], "amount": sell_amount, "value": actual_sell_val, "fee": fee,
-                    "reason": close_reason, "target_weight": 0.0, "pnl": pnl_pct,
-                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                })
-                coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
-
-            # 平空
-            elif positions_arr[idx_c] < 0 and c not in candidate_shorts:
-                buy_amount = abs(positions_arr[idx_c])
-                actual_buy_val = buy_amount * current_prices[idx_c]
-                fee = actual_buy_val * FEE_RATE
-                positions_arr[idx_c] = 0
-                cash -= (actual_buy_val + fee)
-
-                cost = coin_states[c]['cost']
-                net_pnl = buy_amount * (cost - current_prices[idx_c]) - fee
-                pnl_pct = (net_pnl / (cost * buy_amount)) * 100 if cost > 0 else 0.0
-
-                if is_btc_trend_on:
-                    close_reason = "大盘开关关闭"
-                elif current_mom[idx_c] >= 0:
-                    close_reason = "动量转正退场"
-                else:
-                    close_reason = "掉出前K名排名"
-                trade_ledger.append({
-                    "time": current_time, "action": "BUY", "coin": c, "direction": "SHORT", "event": "CLOSE",
-                    "price": current_prices[idx_c], "amount": buy_amount, "value": actual_buy_val, "fee": fee,
-                    "reason": close_reason, "target_weight": 0.0, "pnl": pnl_pct,
-                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                })
-                coin_states[c] = {'qty': 0.0, 'cost': 0.0, 'side': None}
-
-        # --- B. 开仓逻辑 (多) ---
-        if candidate_longs:
-            inv_vols = [1.0 / current_vol[coin_to_idx[c]] if current_vol[coin_to_idx[c]] > 0 else 0 for c in
-                        candidate_longs]
-            total_inv_vol = sum(inv_vols)
-
-            for k_, c in enumerate(candidate_longs):
-                idx_c = coin_to_idx[c]
-                if positions_arr[idx_c] == 0 and total_inv_vol > 0:
-                    target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
-                    target_val = total_equity * target_weight
-
-                    buy_val = target_val / (1 + FEE_RATE) if cash >= target_val / (1 + FEE_RATE) else cash / (
-                            1 + FEE_RATE)
-
-                    if buy_val > 1.0:
-                        fee = buy_val * FEE_RATE
-                        buy_amount = buy_val / current_prices[idx_c]
-                        positions_arr[idx_c] += buy_amount
-                        cash -= (buy_val + fee)
-
-                        coin_states[c] = {
-                            'qty': buy_amount,
-                            'cost': current_prices[idx_c] + (fee / buy_amount),
-                            'side': 'LONG'
-                        }
-
-                        trade_ledger.append({
-                            "time": current_time, "action": "BUY", "coin": c, "direction": "LONG", "event": "OPEN",
-                            "price": current_prices[idx_c], "amount": buy_amount, "value": buy_val, "fee": fee,
-                            "reason": "Signal Entry Long", "target_weight": target_weight, "pnl": np.nan,
-                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                        })
-
-        # --- C. 开仓逻辑 (空) ---
-        if candidate_shorts:
-            inv_vols = [1.0 / current_vol[coin_to_idx[c]] if current_vol[coin_to_idx[c]] > 0 else 0 for c in
-                        candidate_shorts]
-            total_inv_vol = sum(inv_vols)
-
-            for k_, c in enumerate(candidate_shorts):
-                idx_c = coin_to_idx[c]
-                if positions_arr[idx_c] == 0 and total_inv_vol > 0:
-                    target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
-                    sell_val = total_equity * target_weight / (1 + FEE_RATE)
-
-                    if sell_val > 1.0:
-                        fee = sell_val * FEE_RATE
-                        sell_amount = sell_val / current_prices[idx_c]
-                        positions_arr[idx_c] -= sell_amount
-                        cash += (sell_val - fee)
-
-                        coin_states[c] = {
-                            'qty': -sell_amount,
-                            'cost': current_prices[idx_c] - (fee / sell_amount),
-                            'side': 'SHORT'
-                        }
-
-                        trade_ledger.append({
-                            "time": current_time, "action": "SELL", "coin": c, "direction": "SHORT", "event": "OPEN",
-                            "price": current_prices[idx_c], "amount": sell_amount, "value": sell_val, "fee": fee,
-                            "reason": "Signal Entry Short", "target_weight": target_weight, "pnl": np.nan,
-                            "top_k": TOP_K, "max_weight": MAX_WEIGHT
-                        })
-
-        # --- 新增：打印最新一根 K 线的详细情况 (含参数周期、零动量价格及价格偏差) ---
-        if i == len(df_cross_section) - 1 and logger is not None:
-            logger.info(f"\n{'=' * 25} 最新 K 线信号详情 {'=' * 25}")
-            logger.info(f"时间: {current_time}")
-            logger.info(f"策略参数: 动量周期={MOM_WINDOW}, 波动率周期={VOL_WINDOW}, 前K名={TOP_K}")
-
-            # 提取大盘数据与偏差
-            btc_idx = coin_to_idx.get('BTC', -1)
-            if btc_idx != -1:
-                current_btc_price = current_prices[btc_idx]
-                current_btc_ma = btc_ma_arr[i]
-                btc_deviation = (current_btc_price - current_btc_ma) / current_btc_ma if current_btc_ma > 0 else 0.0
-
-                logger.info(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
-                logger.info(f"  ├─ BTC 当前价: {current_btc_price:.2f}")
-                logger.info(f"  ├─ 均线阈值 ({BTC_TREND_WINDOW} 周期): {current_btc_ma:.2f}")
-                logger.info(f"  └─ 当前偏差幅度: {btc_deviation:+.2%}")
-            else:
-                logger.info(f"BTC 大盘开关: {'打开 (多头趋势)' if is_btc_trend_on else '关闭 (空头趋势)'}")
-
-            logger.info(f"当前策略模式: {trade_mode}")
-            logger.info(f"本期信号诊断: {kline_signal_diagnostics[i]}")
-
-            # 判断当前激活的候选列表
-            active_candidates = candidate_longs if is_btc_trend_on else candidate_shorts
-            direction_str = "做多候选" if is_btc_trend_on else "做空候选"
-
-            logger.info("-" * 20 + " 候选币种详细参数 " + "-" * 20)
-            if active_candidates:
-                for c in active_candidates:
-                    idx = coin_to_idx[c]
-                    p_current = current_prices[idx]
-                    p_threshold = ref_price_arr[i, idx]
-                    p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
-
-                    logger.info(
-                        f"[{direction_str}] 标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
-                    logger.info(
-                        f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
-            else:
-                logger.info("当前无候选发车币种 (可能原因: 动量不达标 / 策略模式限制 / 未到发车时间)。")
-
-            logger.info("-" * 20 + " 其他未入选币种情况 " + "-" * 20)
-            other_coins = [c for c in target_coins if c not in active_candidates]
-            for c in other_coins:
-                idx = coin_to_idx[c]
-                p_current = current_prices[idx]
-                p_threshold = ref_price_arr[i, idx]
-                p_dev = (p_current - p_threshold) / p_threshold if p_threshold > 0 else 0.0
-
-                logger.info(
-                    f"[未入选]   标的: {c:<8} | 风险调整后动量: {current_mom[idx]:>8.4f} | 波动率: {current_vol[idx]:.4%}")
-                logger.info(
-                    f"            └─ 当前价: {p_current:<10.4f} | 零动量阈值价: {p_threshold:<10.4f} | 价格偏差涨跌幅: {p_dev:+.2%}")
-
-            logger.info("=" * 68 + "\n")
-
-    # 将状态原因落表追踪
-    df_cross_section['signal_status'] = kline_signal_diagnostics
-
-    return pd.DataFrame(trade_ledger)
-
-
-# ==========================================
-# 3. 实盘自动化主流水线
-# ==========================================
-def run_live_pipeline(minute_klines_list: list, strategy_params_list: list, logger):
-    """
-    接收最新行情数据，遍历运行多个参数策略流水线，并生成各参数当前最新截面的操作指令。
-    返回合并后的全量交易流水账本 DataFrame。
-    """
-    all_strategy_ledgers = []
-
-    # [新增] 动态建立纯币种名到完整 symbol 的映射字典，避免硬编码后缀
-    coin_to_symbol = {}
-    for df in minute_klines_list:
-        if df is not None and not df.empty and 'coin_name' in df.columns and 'symbol' in df.columns:
-            coin_to_symbol[df['coin_name'].iloc[0]] = df['symbol'].iloc[0]
-
-    # 循环遍历运行多个参数
-    for params in strategy_params_list:
-        strategy_name = params['STRATEGY_NAME']
-        time_offset = params['TIME_OFFSET']
-        trade_mode = params['TRADE_MODE']
-
-        logger.info(f"⏳ [策略: {strategy_name}] 正在将分钟级数据组装为 4H 矩阵 (Offset: {time_offset})...")
-        df_4h_features = build_4h_cross_section(logger, minute_klines_list, time_offset=time_offset)
-
-        if df_4h_features is None or df_4h_features.empty:
-            continue
-
-        # 日志：展示数据边界 (标准处理：声明当前为 UTC，并转换为北京时间展示)
-        start_time_bjt = df_4h_features.index[0].tz_localize('UTC').tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-        end_time_bjt = df_4h_features.index[-1].tz_localize('UTC').tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-        logger.info(f"   [{strategy_name}] 起始: {start_time_bjt} | 截止: {end_time_bjt} (北京时间)")
-
-        trade_ledger_df = run_strategy_simulation(
-            df_cross_section=df_4h_features,
-            strategy_params=params,
-            trade_mode=trade_mode,
-            logger=logger
-        )
-
-        if trade_ledger_df.empty:
-            logger.info(f"🧠 [{strategy_name}] 正在运行状态推演机，生成理论交易账本 | 生成数量: 0 | 最新信号时间: 无")
-            logger.info(f"► [{strategy_name}] 历史流转中尚未产生任何交易信号。")
-        else:
-            # 重要：对齐实盘执行时间。4H K线的开盘时间需加上4小时，代表K线走完真正执行信号的时刻。(此时依然是纯净的 UTC 时间)
-            trade_ledger_df['time'] = pd.to_datetime(trade_ledger_df['time']) + pd.Timedelta(hours=4)
-
-            # 【核心健壮点 1】生成绝对准确的毫秒级 Unix 时间戳 (基于纯净 UTC 计算，无视任何时区漂移，保证下游 API 不会认错)
-            trade_ledger_df['signal_timestamp_ms'] = trade_ledger_df['time'].astype('int64') // 10 ** 6
-
-            # 【核心健壮点 2】将 dataframe 的 time 列安全转换为北京时间，最后剥离时区标签 (tz_localize(None))，保证输出给人类看的 CSV 格式清爽且时间正确
-            trade_ledger_df['time'] = trade_ledger_df['time'].dt.tz_localize('UTC').dt.tz_convert(
-                'Asia/Shanghai').dt.tz_localize(None)
-
-            # 新增参数标识，方便区分产生的交易数据
-            trade_ledger_df['STRATEGY_NAME'] = strategy_name
-
-            # [新增] 动态为账本添加完整的 symbol 字段，若映射失败则根据示例规则自动拼接兜底
-            trade_ledger_df['symbol'] = trade_ledger_df['coin'].map(coin_to_symbol).fillna(
-                trade_ledger_df['coin'] + '/USDT:USDT')
-
-            all_strategy_ledgers.append(trade_ledger_df)
-
-            gen_count = len(trade_ledger_df)
-            latest_signal_time_bjt = trade_ledger_df['time'].max().strftime('%Y-%m-%d %H:%M:%S')
-
-            # 后置推演日志：此时已获知推演量及时间
-            logger.info(
-                f"🧠 [{strategy_name}] 正在运行状态推演机，生成理论交易账本 | 生成数量: {gen_count} | 最新信号时间: {latest_signal_time_bjt} (北京时间)")
-
-        # 4. 提取当前策略在当下截面的实盘发单指令
-        # 计算最新截面执行时间的 UTC 值
-        latest_kline_end_time_utc = df_4h_features.index[-1] + pd.Timedelta(hours=4)
-        # 将其转化为无标签的北京时间，用于和账本（已转为北京时间）进行精准匹配
-        latest_kline_end_time_bjt = latest_kline_end_time_utc.tz_localize('UTC').tz_convert(
-            'Asia/Shanghai').tz_localize(None)
-
-        if not trade_ledger_df.empty:
-            latest_trade_signals = trade_ledger_df[trade_ledger_df['time'] == latest_kline_end_time_bjt]
-        else:
-            latest_trade_signals = pd.DataFrame()
-
-        logger.info(
-            f"🎯 [当前截面时刻: {latest_kline_end_time_bjt.strftime('%Y-%m-%d %H:%M:%S')} (北京时间) | 策略: {strategy_name} 实盘发单指令]")
-        if latest_trade_signals.empty:
-            logger.info("   ► 当前无平仓或开仓信号，继续保持现有仓位。")
-        else:
-            for _, row in latest_trade_signals.iterrows():
-                if row['event'] == 'CLOSE':
-                    logger.info(
-                        f"   🔴 平仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 数量: {row['amount']:.4f} | 原因: {row['reason']}")
-                elif row['event'] == 'OPEN':
-                    logger.info(
-                        f"   🔴 开仓指令 | {row['action']:<4} {row['coin']:<4} | 方向: {row['direction']:<5} | 价格: {row['price']} | 目标权重: {row['target_weight'] * 100:.1f}% | 原因: {row['reason']}")
-        logger.info("-" * 70)
-
-    # 3. 汇总并导出完整的流水日志
-    output_path = "live_simulation_logs.csv"
-    if all_strategy_ledgers:
-        final_ledger_df = pd.concat(all_strategy_ledgers, ignore_index=True)
-        # 依然保留导出 CSV 的动作，方便本地查阅
-        final_ledger_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        logger.info(f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_ledger_df)} 条记录)")
-
-        # 修改点：直接返回 DataFrame 对象
-        return final_ledger_df
+# 所有截面策略信号账本的统一列序（下游 CSV / 状态机均依赖此顺序）
+SIGNAL_COLS = ['time', 'action', 'coin', 'direction', 'event', 'price',
+               'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+               'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+
+# =============================================================================
+# 一、通用小工具（时间 / 列名 / 换算 / 取值）
+# =============================================================================
+def _fmt_bjt(value):
+    """把 UTC 毫秒戳或 UTC 时间对象统一格式化为北京时间字符串，供人类阅读。"""
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        ts = pd.to_datetime(int(value), unit='ms', utc=True)
     else:
-        logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
-        # 修改点：当没有交易信号时，返回空的 DataFrame 而不是空字符串
-        return pd.DataFrame()
+        ts = pd.Timestamp(value)
+        ts = ts.tz_localize('UTC') if ts.tzinfo is None else ts
+    return ts.tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
 
-# ==========================================
-# 4. 程序入口点
-# ==========================================
-def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
+def _pick_column(df, candidates, tag):
+    """在多种交易所字段命名中挑出第一个可用列名；全都找不到直接报错并暴露真实列。"""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    raise KeyError(f"[{tag}] 找不到列 {candidates}，实际列: {list(df.columns)}")
+
+
+def _bars(hours, bar_minutes):
+    """小时数 -> 对应 K 线根数（至少 1 根）。"""
+    return max(1, int(round(hours * (60.0 / bar_minutes))))
+
+
+def _tail_float(series, offset=0, default=0.0):
+    """取倒数第 (1+offset) 个值转 float；越界或 NaN 时回落默认值（对齐原代码的 NaN 兜底）。"""
+    if len(series) <= offset:
+        return default
+    val = series.iloc[-1 - offset]
+    return default if pd.isna(val) else float(val)
+
+
+def _frame_of(result_map, symbol):
+    """从极速引擎返回的字典里安全取出某标的数据，缺失统一返回空 DataFrame。"""
+    df = result_map.get(symbol) if result_map else None
+    return df if df is not None else pd.DataFrame()
+
+
+def _resolve_identity(df):
+    """提取标的身份：优先取列，其次取 attrs，最后从 symbol 反解币名。返回 (symbol, coin_name)。"""
+    symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs.get('symbol', 'UNKNOWN')
+    if 'coin_name' in df.columns:
+        return symbol, df['coin_name'].iloc[0]
+    return symbol, (symbol.split('/')[0] if '/' in symbol else symbol)
+
+
+# =============================================================================
+# 二、行情重采样与多源对齐（K线 + 资金费率 + OI 合成单表）
+# =============================================================================
+def _attach_series(df, src_df, time_keys, value_keys, out_col, bar, tag):
+    """把外部时间序列(FR/OI)重采样后前向对齐进主表，写入 out_col。"""
+    src = src_df.copy()
+    tcol = _pick_column(src, time_keys, tag)
+    vcol = _pick_column(src, value_keys, tag)
+    src['dt'] = pd.to_datetime(src[tcol], unit='ms', utc=True)
+    series = (src.drop_duplicates(subset=[tcol]).sort_values('dt')
+                 .set_index('dt')[vcol].astype(float)
+                 .resample(bar, label='left', closed='left').last())
+    df[out_col] = series.reindex(df.index).ffill()
+
+
+def _build_aligned_frame(kline_df, bar_minutes, fr_df=None, oi_df=None):
     """
-    拉取数据并启动整套交易工作流
-    返回最终生成的信号文件内容
+    构建策略特征底表：K线重采样 + FR/OI 前向对齐 + 多源公共起点截断。
+
+    入参形貌: kline_df 需含 [timestamp|open_time|time|ts, open, high, low, close, volume]
+             fr_df 需含 [timestamp|fundingTime|..] + [funding_rate|fundingRate|rate]
+             oi_df 需含 [timestamp|time|ts] + [oi_amount|openInterest|sumOpenInterest|oi]
+    出参形貌: DataFrame(index=UTC DatetimeIndex,
+                       cols=[open, high, low, close, volume, (funding_rate), (oi_amount)])
     """
-    fetched_raw_data = []
+    bar = f"{bar_minutes}min"
+    k = kline_df.copy()
+    kt = _pick_column(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
 
-    # 2. 支持多组参数批量运行的列表格式
-    strategy_params_list = [
-        {
-            'STRATEGY_NAME': 'Grid_No.43629',
-            'MOM_WINDOW': 48,
-            'VOL_WINDOW': 42,
-            'BTC_TREND_WINDOW': 120,
-            'MAX_WEIGHT': 2.6,
-            'TOP_K': 1,
-            'TIME_OFFSET': '2h',
-            'TRADE_MODE': 'LONG_ONLY'
-        },
-        {
-            'STRATEGY_NAME': 'Grid_No.69393',
-            'MOM_WINDOW': 90,
-            'VOL_WINDOW': 120,
-            'BTC_TREND_WINDOW': 720,
-            'MAX_WEIGHT': 0.4,
-            'TOP_K': 3,
-            'TIME_OFFSET': '0h',
-            'TRADE_MODE': 'SHORT_ONLY'
-        }
-    ]
-
-    # 3. 动态计算 lookback_days：最大所需时间(Max 4H Bar Window)转换成天数，再加上 1 天
-    # 1个 4H bar 等于 4 小时，一天有 6 个 4H bar (24/4 = 6)
-    max_window = 0
-    for params in strategy_params_list:
-        current_max = max(params['MOM_WINDOW'], params['VOL_WINDOW'], params['BTC_TREND_WINDOW'])
-        if current_max > max_window:
-            max_window = current_max
-
-    lookback_days = int(np.ceil(max_window / 6)) + 30
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    symbol_list = [
-        "BTC/USDC:USDC", "ETH/USDC:USDC", "SOL/USDC:USDC",
-        "XRP/USDC:USDC", "BNB/USDC:USDC", "DOGE/USDC:USDC"
-    ]
-    symbol_list = [
-        "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-        "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"
-    ]
-    timeframe = "1m"
-    # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
-    result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    df = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum')
     )
-    run_logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
-    # 1分钟周期的理论预期总行数：天数 * 24小时 * 60分钟 + 1根
-    expected_rows = lookback_days * 24 * 60 + 1
+    # 空洞 bar 的 close 用前值补齐，OHL 再回落到 close，保证 ATR/最低价类指标不被 NaN 击穿
+    df['close'] = df['close'].ffill()
+    df = df[df['close'].notna()]
+    for col in ('open', 'high', 'low'):
+        df[col] = df[col].fillna(df['close'])
 
-    for symbol in symbol_list:
-        # 从极速引擎返回的字典中安全提取对应币种的数据
-        df_klines = result_map.get(symbol, pd.DataFrame())
+    extra_cols = []
+    if fr_df is not None and len(fr_df) > 0:
+        _attach_series(df, fr_df, ['timestamp', 'fundingTime', 'time', 'ts'],
+                       ['funding_rate', 'fundingRate', 'rate'], 'funding_rate', bar, 'fr')
+        extra_cols.append('funding_rate')
+    if oi_df is not None and len(oi_df) > 0:
+        _attach_series(df, oi_df, ['timestamp', 'time', 'ts'],
+                       ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'],
+                       'oi_amount', bar, 'oi')
+        extra_cols.append('oi_amount')
 
-        # 【修改点 2】检查数据缺失并输出告警日志
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
+    if extra_cols:
+        # 以最晚出现的那一路数据为公共起点（原实现在全 NaN 时会因 df.loc[NaN:] 崩溃，此处已修）
+        starts = [s for s in (df[c].first_valid_index() for c in extra_cols) if s is not None]
+        if starts:
+            df = df.loc[max(starts):].copy()
+        df = df.dropna(subset=extra_cols)
 
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            # 提取已拿到数据的实际时间跨度
-            start_time_str = df_klines['datetime_bj'].iloc[0].strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = df_klines['datetime_bj'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ 数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        # 提取纯币种名如 'BTC'
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        # [新增] 将完整的原始 symbol 存入 dataframe 中，向下游无损传递符号元数据
-        df_klines['symbol'] = symbol
-
-        fetched_raw_data.append(df_klines)
-
-    if not fetched_raw_data:
-        run_logger.error("❌ 错误：没有任何数据被成功加载，程序退出。请检查网络或 fetch_binance_futures_klines 模块。")
-        return ""
-    else:
-        run_logger.info(f"\n🚀 数据加载完毕，共 {len(fetched_raw_data)} 个标的。")
-        run_logger.info("═" * 70)
-        # 执行实盘流传并捕获信号文件内容进行返回
-        signal_file_content = run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
-        return signal_file_content
+    return df[df['close'] > 0]
 
 
-# ==============================================================================
-# 核心持久化辅助函数：管理各策略的专属真实信号历史文件
-# ==============================================================================
-def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: dict, cols: list) -> pd.DataFrame:
+# =============================================================================
+# 三、信号账本持久化状态机（跨进程续跑的唯一真相来源）
+# =============================================================================
+def _sync_persistent_signal_ledger(history_file, symbol, new_record, cols):
     """
-    通用状态机与信号文件同步函数：
-    1. 读取本地历史信号文件，并提取属于该 symbol 的真实交易记录。
-    2. 基于该 symbol 最新的历史事件 (OPEN 或 CLOSE)，控制状态机防重复开仓/防无效平仓。
-    3. 若有新信号产生，去重落盘追加至本地文件。
-    4. 返回该 symbol 包含最新信号在内的完整实际信号 DataFrame。
+    读本地历史信号 -> 用"上一条事件"约束状态机(防重复开仓/防无效平仓) -> 去重落盘 -> 回吐该标的完整账本。
+
+    入参形貌: new_record 需含 SIGNAL_COLS 全部键（尤其 event/price/signal_timestamp_ms），可为 None
+    出参形貌: DataFrame(cols=SIGNAL_COLS)，仅含该 symbol 的真实信号（含本次新增）
     """
+    df_hist = pd.DataFrame(columns=cols)
     if os.path.exists(history_file):
         try:
             df_hist = pd.read_csv(history_file, dtype={'signal_timestamp_ms': 'int64', 'symbol': str})
         except Exception:
+            # 原设计即容错吞噬：历史文件损坏时按空账本重来，避免脏文件阻断整条实盘信号链路
             df_hist = pd.DataFrame(columns=cols)
-    else:
-        df_hist = pd.DataFrame(columns=cols)
 
     for c in cols:
         if c not in df_hist.columns:
@@ -665,41 +180,27 @@ def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: d
 
     df_symbol_hist = df_hist[df_hist['symbol'] == symbol].copy()
 
-    # 获取当前标的的历史持仓状态
-    last_event = None
-    last_open_price = 0.0
+    last_event, last_open_price = None, 0.0
     if not df_symbol_hist.empty:
         last_row = df_symbol_hist.iloc[-1]
         last_event = str(last_row['event']).upper()
         last_open_price = float(last_row['price']) if pd.notna(last_row['price']) else 0.0
 
+    # 状态机：空仓才接 OPEN；持仓才接 CLOSE 并补算盈亏
     valid_record = None
-
     if new_record is not None:
-        incoming_event = new_record['event']
-
-        # 状态机约束：
-        # 1. 只有当前为空仓(未开过仓或上次为CLOSE)，且来了 OPEN 信号，才记录开仓
-        if incoming_event == 'OPEN' and last_event != 'OPEN':
+        event = new_record['event']
+        if event == 'OPEN' and last_event != 'OPEN':
+            valid_record = new_record
+        elif event == 'CLOSE' and last_event == 'OPEN':
+            new_record['pnl'] = (((new_record['price'] - last_open_price) / last_open_price) * 100
+                                 if last_open_price > 0 else 0.0)
             valid_record = new_record
 
-        # 2. 只有当前为持仓(上次为OPEN)，且来了 CLOSE 信号，才记录平仓并计算盈亏
-        elif incoming_event == 'CLOSE' and last_event == 'OPEN':
-            if last_open_price > 0:
-                new_record['pnl'] = ((new_record['price'] - last_open_price) / last_open_price) * 100
-            else:
-                new_record['pnl'] = 0.0
-            valid_record = new_record
-
-    # 若产生了有效的新信号，进行时间戳去重并持久化落盘
     if valid_record is not None:
-        is_duplicate = False
-        if not df_hist.empty:
-            mask = (df_hist['symbol'] == symbol) & (
-                    df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])
-            if mask.any():
-                is_duplicate = True
-
+        is_duplicate = (not df_hist.empty) and bool(
+            ((df_hist['symbol'] == symbol) &
+             (df_hist['signal_timestamp_ms'] == valid_record['signal_timestamp_ms'])).any())
         if not is_duplicate:
             df_new_row = pd.DataFrame([valid_record], columns=cols)
             df_hist = pd.concat([df_hist, df_new_row], ignore_index=True)
@@ -709,1731 +210,1002 @@ def _sync_persistent_signal_ledger(history_file: str, symbol: str, new_record: d
     return df_symbol_hist[cols] if not df_symbol_hist.empty else pd.DataFrame(columns=cols)
 
 
+def _build_record(strategy_name, symbol, coin, event, direction, price, reason,
+                  signal_ts_ms, target_weight, max_weight):
+    """
+    组装单条标准信号记录。action 由 (direction, event) 唯一推导：
+    LONG+OPEN=BUY / LONG+CLOSE=SELL / SHORT+OPEN=SELL / SHORT+CLOSE=BUY
+    """
+    action = 'BUY' if (direction == 'LONG') == (event == 'OPEN') else 'SELL'
+    return {'time': _fmt_bjt(signal_ts_ms), 'action': action, 'coin': coin, 'direction': direction,
+            'event': event, 'price': price, 'reason': reason, 'target_weight': target_weight,
+            'pnl': None, 'top_k': 1, 'max_weight': max_weight,
+            'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': strategy_name, 'symbol': symbol}
+
+
+# =============================================================================
+# 四、各策略「最后一根 K 线」信号生成器
+#     统一约定: 入参为该标的原始 K线(+FR/+OI)，出参 ([], DataFrame(SIGNAL_COLS))
+#     首元素恒为空列表，仅为兼容既有调用方 `signals, df = fn(...)` 的解包写法
+# =============================================================================
 def generate_top_long_signals(df):
     """
-    截面瞬时信号生成版：针对 top_long 策略
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    top_coin_long：小时线「高位长上影 + 爆量」入场，「孕线突破 + 爆量」出场。
+    入参形貌: df 需含 [timestamp(ms), open, high, low, close, volume, symbol, coin_name]
     """
-    OPTIMAL_PARAMS = {
-        'BAR_MINUTES': 60,
-        'UPPER_WICK_THRESH': 0.60,
-        'VOL_QUANTILE': 0.9,
-        'HIGH_CLOSE_THRESH': 0.90,
-        'WARMUP_DAYS': 30  # 因子计算必须的30天历史窗口
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
-
-    W = 24 * OPTIMAL_PARAMS['WARMUP_DAYS']  # 720
-    N = 24
-    EPS = 1e-12
+    P = {'BAR_MINUTES': 60, 'UPPER_WICK_THRESH': 0.60, 'VOL_QUANTILE': 0.9,
+         'HIGH_CLOSE_THRESH': 0.90, 'WARMUP_DAYS': 30}
+    W, N, EPS = 24 * P['WARMUP_DAYS'], 24, 1e-12
 
     if df is None or len(df) < W:
-        return [], pd.DataFrame(columns=cols)
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
 
-    symbol = df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = df['coin_name'].iloc[0] if 'coin_name' in df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol)
-
-    # 1. 核心指标向量化计算
+    symbol, coin_name = _resolve_identity(df)
     o, h, l, c, v = df['open'], df['high'], df['low'], df['close'], df['volume']
 
-    maxH_N = h.rolling(N, min_periods=max(2, N // 2)).max()
-    rng = (h - l) + EPS
-    uw = (h - np.maximum(o, c)) / rng
-    inside = (h < h.shift(1)) & (l > l.shift(1))
-    vol_q = v.rolling(W, min_periods=50).quantile(OPTIMAL_PARAMS['VOL_QUANTILE']).shift(1)
+    max_high_n = h.rolling(N, min_periods=max(2, N // 2)).max()
+    upper_wick = (h - np.maximum(o, c)) / ((h - l) + EPS)
+    is_inside_bar = (h < h.shift(1)) & (l > l.shift(1))
+    vol_threshold = v.rolling(W, min_periods=50).quantile(P['VOL_QUANTILE']).shift(1)
+    volume_spike = v > vol_threshold
 
-    kline_long_upper_wick = uw > OPTIMAL_PARAMS['UPPER_WICK_THRESH']
-    volume_spike = v > vol_q
+    entry_signal = (c / (max_high_n + EPS) > P['HIGH_CLOSE_THRESH']) & (upper_wick > P['UPPER_WICK_THRESH']) & volume_spike
+    exit_signal = is_inside_bar.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
 
-    entry_signal = (c / (maxH_N + EPS) > OPTIMAL_PARAMS['HIGH_CLOSE_THRESH']) & kline_long_upper_wick & volume_spike
-    exit_signal = inside.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
-
-    # 2. 只检查最新闭合的最后一根 K 线 (索引 -1)
-    is_entry = bool(entry_signal.iloc[-1])
-    is_exit = bool(exit_signal.iloc[-1])
-
-    new_candidate_record = None
-
+    is_entry, is_exit = bool(entry_signal.iloc[-1]), bool(exit_signal.iloc[-1])
+    record = None
     if is_entry or is_exit:
-        kline_start_ms = int(df['timestamp'].iloc[-1])
-        signal_ts_ms = int(kline_start_ms + OPTIMAL_PARAMS['BAR_MINUTES'] * 60 * 1000)
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-        cur_c = float(c.iloc[-1])
-        cur_v = float(v.iloc[-1])
-        cur_vol_q = float(vol_q.iloc[-1])
-        cur_uw = float(uw.iloc[-1])
-
+        signal_ts_ms = int(df['timestamp'].iloc[-1]) + P['BAR_MINUTES'] * 60 * 1000
+        price, cur_v = float(c.iloc[-1]), float(v.iloc[-1])
+        cur_vq, cur_uw = float(vol_threshold.iloc[-1]), float(upper_wick.iloc[-1])
         if is_entry:
-            entry_reason = f"高位长上影({cur_uw:.2f}) + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
-            new_candidate_record = {
-                'time': dt_bj_str, 'action': 'BUY', 'coin': coin_name, 'direction': 'LONG',
-                'event': 'OPEN', 'price': cur_c, 'reason': entry_reason,
-                'target_weight': 1.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.14,
-                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"孕线突破 + 爆量({cur_v:.0f} > {cur_vol_q:.0f})"
-            new_candidate_record = {
-                'time': dt_bj_str, 'action': 'SELL', 'coin': coin_name, 'direction': 'LONG',
-                'event': 'CLOSE', 'price': cur_c, 'reason': exit_reason,
-                'target_weight': 0.0, 'pnl': None, 'top_k': 1, 'max_weight': 0.14,
-                'signal_timestamp_ms': signal_ts_ms, 'STRATEGY_NAME': 'top_coin_long', 'symbol': symbol
-            }
+            record = _build_record('top_coin_long', symbol, coin_name, 'OPEN', 'LONG', price,
+                                   f"高位长上影({cur_uw:.2f}) + 爆量({cur_v:.0f} > {cur_vq:.0f})",
+                                   signal_ts_ms, 1.0, 0.14)
+        else:
+            record = _build_record('top_coin_long', symbol, coin_name, 'CLOSE', 'LONG', price,
+                                   f"孕线突破 + 爆量({cur_v:.0f} > {cur_vq:.0f})",
+                                   signal_ts_ms, 0.0, 0.14)
 
-    # 3. 与专属本地信号文件同步，并返回真实还原后的 df_actual_signals
-    history_file = "signal_history_top_coin_long.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
-
-
-def print_top_long_latest_signals(final_signals_df, logger, timeframe='1h'):
-    """
-    打印策略的最新截面操作指令。
-    自动获取当前的北京时间，并根据传入的 timeframe(如 '1h', '5m') 向下取整对齐到最新截面，
-    去账本中精准匹配当下是否触发了交易信号。
-    """
-    # 1. 空数据校验
-    if final_signals_df is None or final_signals_df.empty:
-        logger.info("🎯 [当前截面无信号 | 实盘发单指令]")
-        logger.info("   ► 全量账本为空，当前无平仓或开仓信号，继续保持现有仓位。")
-        logger.info("-" * 70)
-        return
-
-    # 2. 动态提取策略名称 (优先从数据列中取，读不到则兜底)
-    strategy_name = final_signals_df['STRATEGY_NAME'].iloc[
-        0] if 'STRATEGY_NAME' in final_signals_df.columns else "top_coin_long"
-
-    # 3. 核心修改：适配任意级别的时间，向下取整对齐到最新截面
-    # 将业务时间帧如 5m 转化为 pandas 底层支持的 frequency 字符串 5min
-    pd_freq = timeframe.lower().replace('m', 'min').replace('h', 'h')
-
-    # 获取当前的北京时间，并根据对应级别频次向下取整（如 14:02 运行 5m 策略，自动对齐至 14:00:00）
-    current_bjt = pd.Timestamp.now(tz='Asia/Shanghai').floor(pd_freq)
-    latest_time_str = current_bjt.strftime('%Y-%m-%d %H:%M:%S')
-
-    # 4. 根据当前截面时间，过滤出此时此刻应该执行的信号
-    latest_trade_signals = final_signals_df[final_signals_df['time'] == latest_time_str]
-
-    # 5. 格式化日志输出
-    logger.info(f"🎯 [当前截面时刻: {latest_time_str} (北京时间) | 策略: {strategy_name} 实盘发单指令]")
-
-    if latest_trade_signals.empty:
-        logger.info("   ► 当前时刻无平仓或开仓信号，继续保持现有仓位。")
-    else:
-        for _, row in latest_trade_signals.iterrows():
-            # 安全提取字段，防止某些意外缺失导致的报错
-            action = row.get('action', 'UNKNOWN')
-            coin = row.get('coin', 'UNKNOWN')
-            direction = row.get('direction', 'LONG')
-            price = row.get('price', 0.0)
-            reason = row.get('reason', '')
-
-            if row['event'] == 'CLOSE':
-                # 提取盈亏百分比
-                pnl = row.get('pnl', None)
-                pnl_str = f"{pnl:.2f}%" if pd.notna(pnl) else "N/A"
-
-                logger.info(
-                    f"   🔴 平仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 本次盈亏: {pnl_str} | 原因: {reason}"
-                )
-
-            elif row['event'] == 'OPEN':
-                # 提取目标仓位权重
-                target_weight = row.get('target_weight', 0.0)
-
-                logger.info(
-                    f"   🔴 开仓指令 | {action:<4} {coin:<4} | 方向: {direction:<5} | 价格: {price} | 目标权重: {target_weight * 100:.1f}% | 原因: {reason}"
-                )
-
-    logger.info("-" * 70)
-
-
-def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=None):
-    """
-    拉取数据并启动整套交易工作流
-    返回最终生成的信号文件内容
-    """
-    max_window = 180
-
-    lookback_days = int(np.ceil(max_window)) + 30
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    timeframe = "1h"
-    # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
-    result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
-    )
-    run_logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
-    # 1分钟周期的理论预期总行数：天数 * 24小时 * 60分钟 + 1根
-    expected_rows = lookback_days * 24 + 1
-
-    df_actual_signals_df_list = []
-    for symbol in symbol_list:
-        # 从极速引擎返回的字典中安全提取对应币种的数据
-        df_klines = result_map.get(symbol, pd.DataFrame())
-
-        # 【修改点 2】检查数据缺失并输出告警日志
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ 数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-        signals, df_actual_signals = generate_top_long_signals(df_klines)
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    # 将df_actual_signals_df_list合并为一个DataFrame
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 移除重复记录以防合并时重叠
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-        output_path = "top_long_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
-        return pd.DataFrame()
+    return [], _sync_persistent_signal_ledger("signal_history_top_coin_long.csv", symbol, record, SIGNAL_COLS)
 
 
 def generate_multi_ma_signals(raw_df, bar_minutes=5):
     """
-    截面瞬时信号生成版：针对 multi_ma_break_long 策略
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    multi_ma_break_long：价格同时跌破 24/48/72 小时均线入场，快慢均线死叉出场。
+    入参形貌: raw_df 需含 [timestamp(ms), close, symbol, coin_name]
     """
-    STRATEGY_PARAMS = {
-        'ENTRY_MA_HOURS': [24, 48, 72],  # 入场判定：价格需同时跌破这3根均线(小时)
-        'EXIT_FAST_MA_HOURS': 48,  # 出场判定：快线均线周期(小时)
-        'EXIT_SLOW_MA_HOURS': 168,  # 出场判定：慢线均线周期(小时)
-        'TARGET_WEIGHT': 1.0,  # 目标仓位
-        'MAX_WEIGHT': 0.14  # 策略最大允许仓位
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+    P = {'ENTRY_MA_HOURS': [24, 48, 72], 'EXIT_FAST_MA_HOURS': 48, 'EXIT_SLOW_MA_HOURS': 168,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 0.14}
 
     if raw_df is None or len(raw_df) == 0:
-        return [], pd.DataFrame(columns=cols)
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
 
-    symbol = raw_df['symbol'].iloc[0] if 'symbol' in raw_df.columns else raw_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = raw_df['coin_name'].iloc[0] if 'coin_name' in raw_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
-
+    symbol, coin_name = _resolve_identity(raw_df)
     df = raw_df
     if 'timestamp' in df.columns and not df['timestamp'].is_monotonic_increasing:
         df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp')
 
     c = df['close']
-    bph = 60.0 / bar_minutes
+    slow_bars = _bars(P['EXIT_SLOW_MA_HOURS'], bar_minutes)
+    if len(c) < slow_bars:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
 
-    def B(hours):
-        return max(1, int(round(hours * bph)))
+    def ma(hours):
+        n = _bars(hours, bar_minutes)
+        return c.rolling(n, min_periods=max(2, n // 2)).mean()
 
-    min_required_bars = B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS'])
-    if len(c) < min_required_bars:
-        return [], pd.DataFrame(columns=cols)
+    h1, h2, h3 = P['ENTRY_MA_HOURS']
+    ma1, ma2, ma3 = ma(h1), ma(h2), ma(h3)
+    ma_fast, ma_slow = ma2, ma(P['EXIT_SLOW_MA_HOURS'])
 
-    # 1. 核心指标向量化计算
-    entry_h1, entry_h2, entry_h3 = STRATEGY_PARAMS['ENTRY_MA_HOURS']
+    price = float(c.iloc[-1])
+    v1, v2, v3 = float(ma1.iloc[-1]), float(ma2.iloc[-1]), float(ma3.iloc[-1])
+    curr_fast, prev_fast = float(ma_fast.iloc[-1]), float(ma_fast.iloc[-2])
+    curr_slow, prev_slow = float(ma_slow.iloc[-1]), float(ma_slow.iloc[-2])
 
-    ma_entry_1 = c.rolling(B(entry_h1), min_periods=max(2, B(entry_h1) // 2)).mean()
-    ma_entry_2 = c.rolling(B(entry_h2), min_periods=max(2, B(entry_h2) // 2)).mean()
-    ma_entry_3 = c.rolling(B(entry_h3), min_periods=max(2, B(entry_h3) // 2)).mean()
-
-    ma_fast = ma_entry_2
-    ma_slow = c.rolling(B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']),
-                        min_periods=max(2, B(STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']) // 2)).mean()
-
-    # 2. 只检查最新闭合的最后一根 K 线 (索引 -1)
-    curr_c = float(c.iloc[-1])
-    curr_ma1 = float(ma_entry_1.iloc[-1])
-    curr_ma2 = float(ma_entry_2.iloc[-1])
-    curr_ma3 = float(ma_entry_3.iloc[-1])
-
-    curr_fast = float(ma_fast.iloc[-1])
-    prev_fast = float(ma_fast.iloc[-2])
-    curr_slow = float(ma_slow.iloc[-1])
-    prev_slow = float(ma_slow.iloc[-2])
-
-    is_entry = (curr_c < curr_ma1) and (curr_c < curr_ma2) and (curr_c < curr_ma3)
+    is_entry = (price < v1) and (price < v2) and (price < v3)
     is_exit = (curr_fast < curr_slow) and (prev_fast >= prev_slow)
 
-    new_candidate_record = None
-
+    record = None
     if is_entry or is_exit:
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df['timestamp'].iloc[-1])
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
+        signal_ts_ms = int(df['timestamp'].iloc[-1]) + int(bar_minutes * 60 * 1000)
         if is_entry:
-            entry_reason = f"均线跌破(C<{curr_ma1:.4f}, C<{curr_ma2:.4f}, C<{curr_ma3:.4f})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': 'multi_ma_break_long',
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"快慢死叉(MA{STRATEGY_PARAMS['EXIT_FAST_MA_HOURS']} < MA{STRATEGY_PARAMS['EXIT_SLOW_MA_HOURS']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': 'multi_ma_break_long',
-                'symbol': symbol
-            }
+            record = _build_record('multi_ma_break_long', symbol, coin_name, 'OPEN', 'LONG', price,
+                                   f"均线跌破(C<{v1:.4f}, C<{v2:.4f}, C<{v3:.4f})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record('multi_ma_break_long', symbol, coin_name, 'CLOSE', 'LONG', price,
+                                   f"快慢死叉(MA{P['EXIT_FAST_MA_HOURS']} < MA{P['EXIT_SLOW_MA_HOURS']})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
 
-    # 3. 与专属本地信号文件同步，并返回真实还原后的 df_actual_signals
-    history_file = "signal_history_multi_ma_break_long.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
-
-
-def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_url=None):
-    """
-    拉取数据并启动整套交易工作流
-    返回最终生成的信号文件内容
-    """
-    max_window = 10
-
-    lookback_days = int(np.ceil(max_window)) + 30
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于最大策略指标窗口({max_window} bars)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    timeframe = "5m"
-    # 【修改点 1】一次性调用高并发极速双擎获取全部币种数据
-    result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
-    )
-    run_logger.info(f"✅ 已完成对所有币种的极速引擎数据请求，正在进行数据完整性检查和预处理...")
-    expected_rows = lookback_days * 24 * 12 + 1
-
-    df_actual_signals_df_list = []
-    for symbol in symbol_list:
-        # 从极速引擎返回的字典中安全提取对应币种的数据
-        df_klines = result_map.get(symbol, pd.DataFrame())
-
-        # 【修改点 2】检查数据缺失并输出告警日志
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ 数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-        signals, df_actual_signals = generate_multi_ma_signals(df_klines)
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    # 将df_actual_signals_df_list合并为一个DataFrame
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 移除重复记录以防合并时重叠
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-        output_path = "ma_bottom_long_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ 所有策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中所有策略均未产生任何交易信号。")
-        return pd.DataFrame()
+    return [], _sync_persistent_signal_ledger("signal_history_multi_ma_break_long.csv", symbol, record, SIGNAL_COLS)
 
 
 def generate_XSR_signals(kline_df, fr_df, bar_minutes=15):
     """
-    截面瞬时信号生成版：针对 custom_surge_and_fr_short 策略
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
+    XSR：4 小时收益率排名冲到历史极值(>98%)追高做多；资金费率排名极低或转负时平仓。
+    入参形貌: kline_df=原始K线, fr_df=资金费率(见 _build_aligned_frame 说明)
     """
-    STRATEGY_PARAMS = {
-        'M_HOURS': 4,  # 动量回溯周期(小时)
-        'W_DAYS': 14,  # 排名滚动窗口(天)
-        'ENTRY_RANK_THRESHOLD': 0.98,  # 极端拉升判定阈值 (做多入场)
-        'EXIT_FR_RANK_THRESHOLD': 0.20,  # 资金费率极低判定阈值 (做多出场)
-        'TARGET_WEIGHT': 1.0,  # 目标仓位
-        'MAX_WEIGHT': 1.0 / 30 / 2.1,  # 最大允许仓位
-        'STRATEGY_NAME': 'XSR'
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+    P = {'M_HOURS': 4, 'W_DAYS': 14, 'ENTRY_RANK_THRESHOLD': 0.98, 'EXIT_FR_RANK_THRESHOLD': 0.20,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 30 / 2.1, 'STRATEGY_NAME': 'XSR'}
 
     if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
-        return [], pd.DataFrame(columns=cols)
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
 
-    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
+    symbol, coin_name = _resolve_identity(kline_df)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
 
-    def _pick(df_to_check, cands, what):
-        for c in cands:
-            if c in df_to_check.columns:
-                return c
-        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
 
-    # ==========================================
-    # 1. 数据重采样与对齐
-    # ==========================================
-    bar = f"{bar_minutes}min"
-
-    k = kline_df.copy()
-    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
-    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
-    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-
-    agg = k.resample(bar, label='left', closed='left').agg(
-        open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum')
-    )
-    agg['close'] = agg['close'].ffill()
-    agg = agg[agg['close'].notna()]
-    agg['open'] = agg['open'].fillna(agg['close'])
-
-    fr = fr_df.copy()
-    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
-    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
-    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
-    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
-
-    df = agg.copy()
-    df['funding_rate'] = fr_s.reindex(df.index).ffill()
-    start = df['funding_rate'].first_valid_index()
-    if start is not None:
-        df = df.loc[start:].copy()
-    df['funding_rate'] = df['funding_rate'].ffill()
-    df = df.dropna(subset=['funding_rate'])
-    df = df[df['close'] > 0]
-
-    bph = 60.0 / bar_minutes
-
-    def B(hours):
-        return max(1, int(round(hours * bph)))
-
-    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    if len(df) < W:  # 数据不足以计算滚动排名
-        return [], pd.DataFrame(columns=cols)
-
-    # ==========================================
-    # 2. 核心指标向量化计算
-    # ==========================================
-    M = B(STRATEGY_PARAMS['M_HOURS'])
-    mp = max(50, W // 5)
-
-    c = df['close']
-    fr_series = df['funding_rate']
-
-    ret_M = c.pct_change(M)
-    rk_ret_M = ret_M.rolling(W, min_periods=mp).rank(pct=True)
+    M, mp = _bars(P['M_HOURS'], bar_minutes), max(50, W // 5)
+    c, fr_series = df['close'], df['funding_rate']
+    rk_ret_m = c.pct_change(M).rolling(W, min_periods=mp).rank(pct=True)
     fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
 
-    # ==========================================
-    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线)
-    # ==========================================
-    curr_rk_ret_M = float(rk_ret_M.iloc[-1])
-    curr_fr_rank = float(fr_rank.iloc[-1])
-    curr_fr = float(fr_series.iloc[-1])
-    curr_c = float(c.iloc[-1])
+    curr_rk, curr_fr_rank = float(rk_ret_m.iloc[-1]), float(fr_rank.iloc[-1])
+    curr_fr, price = float(fr_series.iloc[-1]), float(c.iloc[-1])
 
-    is_entry = curr_rk_ret_M > STRATEGY_PARAMS['ENTRY_RANK_THRESHOLD']
-    is_exit = (curr_fr_rank < STRATEGY_PARAMS['EXIT_FR_RANK_THRESHOLD']) or (curr_fr < 0)
+    is_entry = curr_rk > P['ENTRY_RANK_THRESHOLD']
+    is_exit = (curr_fr_rank < P['EXIT_FR_RANK_THRESHOLD']) or (curr_fr < 0)
 
-    new_candidate_record = None
-
+    record = None
     if is_entry or is_exit:
-        # 下一根信号的生效时间为当前 K 线的结束时刻
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df.index[-1].timestamp() * 1000)
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
         if is_entry:
-            entry_reason = f"SURGE_EXTREME(rk_ret_M: {curr_rk_ret_M:.3f} > {STRATEGY_PARAMS['ENTRY_RANK_THRESHOLD']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"FR_LOW_NEG(fr_rank: {curr_fr_rank:.3f} < {STRATEGY_PARAMS['EXIT_FR_RANK_THRESHOLD']} or fr: {curr_fr:.4%}<0)"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'LONG', price,
+                                   f"SURGE_EXTREME(rk_ret_M: {curr_rk:.3f} > {P['ENTRY_RANK_THRESHOLD']})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'LONG', price,
+                                   f"FR_LOW_NEG(fr_rank: {curr_fr_rank:.3f} < {P['EXIT_FR_RANK_THRESHOLD']} "
+                                   f"or fr: {curr_fr:.4%}<0)",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
 
-    # ==========================================
-    # 4. 状态机持久化防重复拦截
-    # ==========================================
-    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
 
-    return [], df_actual_signals
+
+def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
+    """
+    fr_short：资金费率排名极高(>95%，多头最拥挤)时做空；24h 收益强势而费率回归温和时平空。
+    入参形貌: kline_df=原始K线, fr_df=资金费率
+    """
+    P = {'N_HOURS': 24, 'W_DAYS': 14, 'EXTREME_FR_RANK_THRESHOLD': 0.95,
+         'STRONG_RET_RANK_THRESHOLD': 0.80, 'MILD_FR_RANK_THRESHOLD': 0.50,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 7 / 1.6, 'STRATEGY_NAME': 'fr_short'}
+
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
+
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    N, mp = _bars(P['N_HOURS'], bar_minutes), max(50, W // 5)
+    c, fr_series = df['close'], df['funding_rate']
+    rk_ret_n = c.pct_change(N).rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
+
+    curr_rk_ret, curr_fr_rank, price = float(rk_ret_n.iloc[-1]), float(fr_rank.iloc[-1]), float(c.iloc[-1])
+    is_entry = curr_fr_rank > P['EXTREME_FR_RANK_THRESHOLD']
+    is_exit = (curr_rk_ret > P['STRONG_RET_RANK_THRESHOLD']) and (curr_fr_rank < P['MILD_FR_RANK_THRESHOLD'])
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', price,
+                                   f"EXTREME_HIGH_FR(fr_rank:{curr_fr_rank:.3f}>{P['EXTREME_FR_RANK_THRESHOLD']})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', price,
+                                   f"COLD_START(ret24_rk:{curr_rk_ret:.3f}>{P['STRONG_RET_RANK_THRESHOLD']}"
+                                   f"&fr_rank:{curr_fr_rank:.3f}<{P['MILD_FR_RANK_THRESHOLD']})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
+    """
+    vol_breakout_fr_recovery_long：4 小时前波动率极度萎缩、当下爆发时做多；费率自极低位回升时平仓。
+    入参形貌: kline_df=原始K线, fr_df=资金费率
+    """
+    P = {'M_HOURS': 4, 'N_HOURS': 24, 'W_DAYS': 14,
+         'ATR_RANK_LOW_TH': 0.20, 'ATR_RANK_HIGH_TH': 0.60, 'FR_RANK_LOW_TH': 0.10,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 27 / 3,
+         'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'}
+
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
+
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    M, N, mp, EPS = _bars(P['M_HOURS'], bar_minutes), _bars(P['N_HOURS'], bar_minutes), max(50, W // 5), 1e-12
+    h, l, c, fr_series = df['high'], df['low'], df['close'], df['funding_rate']
+    prev_close = c.shift(1)
+
+    true_range = pd.concat([h - l, (h - prev_close).abs(), (l - prev_close).abs()], axis=1).max(axis=1)
+    atr_pct = true_range.rolling(N, min_periods=max(2, N // 2)).mean() / (c + EPS)
+    rk_atr = atr_pct.rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
+
+    curr_rk_atr, prev_m_rk_atr = float(rk_atr.iloc[-1]), _tail_float(rk_atr, M)
+    curr_fr_rank = float(fr_rank.iloc[-1])
+    prev_m_fr_rank, prev_1_fr_rank = _tail_float(fr_rank, M), _tail_float(fr_rank, 1)
+    price = float(c.iloc[-1])
+
+    is_entry = (prev_m_rk_atr < P['ATR_RANK_LOW_TH']) and (curr_rk_atr > P['ATR_RANK_HIGH_TH'])
+    is_exit = (prev_m_fr_rank < P['FR_RANK_LOW_TH']) and (curr_fr_rank > prev_1_fr_rank)
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'LONG', price,
+                                   f"VOL_LOW_TO_HIGH(rk_atr_{P['M_HOURS']}h_ago:{prev_m_rk_atr:.3f}"
+                                   f"<{P['ATR_RANK_LOW_TH']} & curr:{curr_rk_atr:.3f}>{P['ATR_RANK_HIGH_TH']})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'LONG', price,
+                                   f"FR_RECOVERY_FROM_LOW(rk_fr_{P['M_HOURS']}h_ago:{prev_m_fr_rank:.3f}"
+                                   f"<{P['FR_RANK_LOW_TH']} & curr:{curr_fr_rank:.3f}>prev:{prev_1_fr_rank:.3f})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15):
+    """
+    bottom_stabilize_powder_keg_short：底部企稳 + OI 抬升 + 情绪悲观时追空；OI 极高而成交极度萎缩("火药桶")时平空。
+    入参形貌: kline_df=原始K线, fr_df=资金费率, oi_df=持仓量
+    """
+    P = {'N_HOURS': 24, 'M_HOURS': 4, 'W_DAYS': 14, 'POWDER_OI_RK': 0.90, 'POWDER_VOL_RK': 0.30,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 24, 'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'}
+
+    if (kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0
+            or oi_df is None or len(oi_df) == 0):
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df, oi_df=oi_df)
+
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    N, M, mp, EPS = _bars(P['N_HOURS'], bar_minutes), _bars(P['M_HOURS'], bar_minutes), max(50, W // 5), 1e-12
+    c, low, vol = df['close'], df['low'], df['volume']
+    oi_amt, fr_rate = df['oi_amount'], df['funding_rate']
+
+    min_low_n = low.rolling(N, min_periods=max(2, N // 2)).min()
+    oi_min_m = oi_amt.rolling(M, min_periods=2).min()
+    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
+    rk_vol = vol.rolling(W, min_periods=mp).rank(pct=True)
+    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
+
+    price = float(c.iloc[-1])
+    curr_min_low, prev_n_min_low = _tail_float(min_low_n), _tail_float(min_low_n, N)
+    curr_oi, curr_oi_min_m = _tail_float(oi_amt), _tail_float(oi_min_m)
+    curr_fr_rank, curr_fr = _tail_float(fr_rank), _tail_float(fr_rate)
+    curr_rk_oi, curr_rk_vol = _tail_float(rk_oi), _tail_float(rk_vol)
+
+    oi_bottom_div = (price / (curr_min_low + EPS) < 1.03) and (curr_oi > curr_oi_min_m * 1.05)
+    fr_low_neg = (curr_fr_rank < 0.20) or (curr_fr < 0)
+    price_higher_lows = curr_min_low > prev_n_min_low
+
+    is_entry = oi_bottom_div and fr_low_neg and price_higher_lows
+    is_exit = (curr_rk_oi > P['POWDER_OI_RK']) and (curr_rk_vol < P['POWDER_VOL_RK'])
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', price,
+                                   f"BOTTOM_STABILIZE(c/L:<1.03, oi_amt:{curr_oi:.2f}>minM*1.05, "
+                                   f"fr_rk<0.2 or fr<0)",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', price,
+                                   f"POWDER_KEG(rk_oi:{curr_rk_oi:.2f}>{P['POWDER_OI_RK']}, "
+                                   f"rk_v:{curr_rk_vol:.2f}<{P['POWDER_VOL_RK']})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
+    """
+    oi_value_decay_short：OI 名义价值 EMA(4h) 下穿 EMA(24h)（杠杆资金撤退）做空；OI 极高但价格不热时平空。
+    入参形貌: kline_df=原始K线, oi_df=持仓量
+    """
+    P = {'M_HOURS': 4, 'N_HOURS': 24, 'W_DAYS': 14, 'OI_RANK_EXTREME_TH': 0.95, 'OI_HOT_TH': 0.050,
+         'TARGET_WEIGHT': -1.0, 'MAX_WEIGHT': 1.0 / 9 / 1.1, 'STRATEGY_NAME': 'oi_value_decay_short'}
+
+    if kline_df is None or len(kline_df) == 0 or oi_df is None or len(oi_df) == 0:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    df = _build_aligned_frame(kline_df, bar_minutes, oi_df=oi_df)
+
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    M, N, mp, EPS = _bars(P['M_HOURS'], bar_minutes), _bars(P['N_HOURS'], bar_minutes), max(50, W // 5), 1e-12
+    c, oi_amt = df['close'], df['oi_amount']
+
+    oi_value = oi_amt * c
+    ema_fast = oi_value.ewm(span=M, adjust=False).mean()
+    ema_slow = oi_value.ewm(span=N, adjust=False).mean()
+    ma_n = c.rolling(N, min_periods=max(2, N // 2)).mean()
+    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
+
+    price = float(c.iloc[-1])
+    curr_ma_n, curr_rk_oi = _tail_float(ma_n), _tail_float(rk_oi)
+    curr_fast, curr_slow = _tail_float(ema_fast), _tail_float(ema_slow)
+    prev_fast, prev_slow = _tail_float(ema_fast, 1), _tail_float(ema_slow, 1)
+
+    is_entry = (curr_fast < curr_slow) and (prev_fast >= prev_slow)
+    is_exit = (curr_rk_oi > P['OI_RANK_EXTREME_TH']) and ((price / (curr_ma_n + EPS) - 1.0) < P['OI_HOT_TH'])
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', price,
+                                   f"OI_VALUE_DEAD_CROSS(EMA4h:{curr_fast:.2f} < EMA24h:{curr_slow:.2f})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', price,
+                                   f"OI_EXTREME_PRICE_NOT_HOT(Rank_OI:{curr_rk_oi:.2f}"
+                                   f">{P['OI_RANK_EXTREME_TH']} & Dev<5%)",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+# =============================================================================
+# 五、通用截面工作流驱动（所有 execute_trading_bot_workflow_* 的唯一实现）
+# =============================================================================
+def print_top_long_latest_signals(final_signals_df, logger, timeframe='1h'):
+    """
+    按当前北京时间向下取整到最新截面，从账本中精准捞出"此刻该执行"的指令并聚合打印。
+    入参形貌: final_signals_df 需含 [time(北京时间字符串), event, action, coin, direction, price, reason, pnl, target_weight]
+    """
+    if final_signals_df is None or final_signals_df.empty:
+        logger.info("[发单指令] 全量账本为空，当前无开平仓信号，保持现有仓位")
+        return
+
+    strategy_name = (final_signals_df['STRATEGY_NAME'].iloc[0]
+                     if 'STRATEGY_NAME' in final_signals_df.columns else "top_coin_long")
+    current_bjt = pd.Timestamp.now(tz='Asia/Shanghai').floor(timeframe.lower().replace('m', 'min'))
+    latest_time_str = current_bjt.strftime('%Y-%m-%d %H:%M:%S')
+    latest = final_signals_df[final_signals_df['time'] == latest_time_str]
+
+    if latest.empty:
+        logger.info(f"[发单指令/{strategy_name}] 截面 [{latest_time_str}] (北京时间) 无开平仓信号，保持现有仓位")
+        return
+
+    lines = [f"[发单指令/{strategy_name}] 截面 [{latest_time_str}] (北京时间) 共 [{len(latest)}] 条待执行:"]
+    for _, row in latest.iterrows():
+        base = (f"  ► {row['action']:<4} {row.get('coin', 'UNKNOWN'):<8}"
+                f" | 方向: [{row.get('direction', 'LONG')}] | 价格: [{row.get('price', 0.0)}]")
+        if row['event'] == 'CLOSE':
+            pnl = row.get('pnl', None)
+            pnl_str = f"{pnl:.2f}%" if pd.notna(pnl) else "N/A"
+            lines.append(f"🔴 平仓{base} | 本次盈亏: [{pnl_str}] | 原因: [{row.get('reason', '')}]")
+        else:
+            lines.append(f"🟢 开仓{base} | 目标权重: [{row.get('target_weight', 0.0) * 100:.1f}%]"
+                         f" | 原因: [{row.get('reason', '')}]")
+    logger.info("\n".join(lines))
+
+
+def _warn_data_gap(logger, label, symbol, df_kline, expected_rows):
+    """K 线行数不足时给出「缺多少 + 实际可用区间 + 可能原因」的一条人话告警。"""
+    actual = len(df_kline)
+    if actual >= expected_rows:
+        return
+    span = "未知区间"
+    if 'timestamp' in df_kline.columns and actual > 0:
+        span = f"{_fmt_bjt(df_kline['timestamp'].iloc[0])} ~ {_fmt_bjt(df_kline['timestamp'].iloc[-1])}"
+    logger.warning(
+        f"⚠️ [{label}/数据体检] 标的 [{symbol}] K线不足，指标可能失真 | "
+        f"预期: [{expected_rows}] 实际: [{actual}] 缺口: [{expected_rows - actual}] | "
+        f"可用区间: [{span}] (北京时间) | "
+        f"可能原因: 该合约上线时间晚于回溯起点、交易所限频丢包或代理不稳"
+    )
+
+
+def _run_signal_workflow(label, target_time, symbol_list, timeframe, bar_minutes, lookback_days,
+                         signal_fn, output_path, proxy_url, need_funding=False, need_oi=False):
+    """
+    截面策略统一工作流：并发取数 -> 逐标的数据体检 -> 调用信号生成器 -> 聚合去重 -> 打印发单 -> 落盘。
+    入参形貌: signal_fn(df_kline, fr_df_or_None, oi_df_or_None) -> DataFrame(SIGNAL_COLS)
+    出参: 聚合后的信号 DataFrame（无标的进入推演时为空表）；副作用: 写出 output_path
+    """
+    logger = setup_logger()
+    expected_rows = lookback_days * (1440 // bar_minutes) + 1
+    logger.info(f"🚀 [{label}/启动] 实盘截面信号推演 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
+                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
+
+    kline_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                                target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
+    fr_map = (snipe_funding_rate_data(symbol_list=symbol_list, days=lookback_days, proxy_url=proxy_url)
+              if need_funding else {})
+    oi_map = (snipe_oi_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                            target_time_str=target_time, proxy_url=proxy_url) if need_oi else {})
+
+    logger.info(f"✅ [{label}/取数完成] K线到位: [{sum(1 for s in symbol_list if not _frame_of(kline_map, s).empty)}"
+                f"/{len(symbol_list)}]"
+                + (f" | 资金费率到位: [{sum(1 for s in symbol_list if not _frame_of(fr_map, s).empty)}"
+                   f"/{len(symbol_list)}]" if need_funding else "")
+                + (f" | OI到位: [{sum(1 for s in symbol_list if not _frame_of(oi_map, s).empty)}"
+                   f"/{len(symbol_list)}]" if need_oi else ""))
+
+    frames, skipped = [], []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+        df_fr = _frame_of(fr_map, symbol) if need_funding else pd.DataFrame()
+        df_oi = _frame_of(oi_map, symbol) if need_oi else pd.DataFrame()
+
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+        if need_funding and df_fr.empty:
+            skipped.append(f"{symbol}(资金费率为空)")
+            continue
+        if need_oi and df_oi.empty:
+            skipped.append(f"{symbol}(OI为空)")
+            continue
+
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            frames.append(signal_fn(df_kline,
+                                    df_fr if need_funding else None,
+                                    df_oi if need_oi else None))
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 的信号计算中断 | 原因: [{exc}] | "
+                         f"排查线索: 检查该标的 K线/资金费率/OI 的列名是否符合预期、数据长度是否够滚动窗口",
+                         exc_info=True)
+            raise
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的: {skipped} | "
+                       f"可能原因: 交易所无该合约、接口限频或代理不通")
+
+    if not frames:
+        logger.info(f"► [{label}/收官] 无任何标的进入推演，未产生有效信号")
+        return pd.DataFrame(columns=SIGNAL_COLS)
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+    final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+    print_top_long_latest_signals(final_signals_df, logger, timeframe=timeframe)
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录数: [{len(final_signals_df)}]")
+    return final_signals_df
+
+
+def execute_trading_bot_workflow_top_long(target_time, symbol_list, proxy_url=None):
+    """top_coin_long 工作流（1h 线）：高位长上影+爆量做多，孕线突破+爆量离场。"""
+    return _run_signal_workflow(
+        label='top_long', target_time=target_time, symbol_list=symbol_list,
+        timeframe="1h", bar_minutes=60, lookback_days=210, output_path="top_long_signals.csv",
+        proxy_url=proxy_url,
+        signal_fn=lambda k, fr, oi: generate_top_long_signals(k)[1]
+    )
+
+
+def execute_trading_bot_workflow_ma_bottom_long(target_time, symbol_list, proxy_url=None):
+    """multi_ma_break_long 工作流（5m 线）：跌破多重均线做多，快慢死叉离场。"""
+    return _run_signal_workflow(
+        label='ma_bottom_long', target_time=target_time, symbol_list=symbol_list,
+        timeframe="5m", bar_minutes=5, lookback_days=40, output_path="ma_bottom_long_signals.csv",
+        proxy_url=proxy_url,
+        signal_fn=lambda k, fr, oi: generate_multi_ma_signals(k)[1]
+    )
 
 
 def execute_trading_bot_workflow_XSR_long(target_time, symbol_list, proxy_url=None):
     """
-    针对 XSR 策略专属工作流：
-    拉取 K 线与资金费率数据并启动交集整套交易工作流
-    策略描述：bottom_10的币种在币价出现历史级别的4小时极度暴涨时直接追高做多，当市场多头情绪彻底冷却（资金费率极低或转负）时平仓走人
-    EXIT_SHORT_SURGE_EXTREME -> FR_LOW_NEG Long_bottom_10 30m
-    回测表现：
-    总交易笔数：598  单笔净收益：5.8145%  跨币种胜率(%)： 48.9510  均值单笔回撤(%)：-10.9551 平均持仓时间(天)：8.1980
-    持仓时间中位数(天)：0.0208  资金最大回撤：214.53%   最大并发持仓：30
+    XSR 工作流（30m 线，需资金费率）：
+    bottom_10 币种出现历史级 4 小时极度暴涨时追高做多，多头情绪彻底冷却（费率极低/转负）时离场。
+    回测：598 笔 | 单笔净收益 5.81% | 胜率 48.95% | 均值单笔回撤 -10.96% | 最大并发 30
     """
-    # 策略要求滚动排名天数为 14 天，附加 5 天冗余预热期
-    lookback_days = 20
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于 XSR 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    timeframe = "30m"
-
-    # 1. 拉取 K 线数据
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
-    kline_result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    return _run_signal_workflow(
+        label='XSR', target_time=target_time, symbol_list=symbol_list,
+        timeframe="30m", bar_minutes=30, lookback_days=20, output_path="XSR_long_signals.csv",
+        proxy_url=proxy_url, need_funding=True,
+        signal_fn=lambda k, fr, oi: generate_XSR_signals(k, fr, bar_minutes=30)[1]
     )
-
-    # 2. 拉取资金费率数据
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
-    funding_result_map = snipe_funding_rate_data(
-        symbol_list=symbol_list,
-        days=lookback_days,
-        proxy_url=proxy_url
-    )
-
-    run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
-
-    df_actual_signals_df_list = []
-    for symbol in symbol_list:
-        df_klines = kline_result_map.get(symbol, pd.DataFrame())
-        df_fr = funding_result_map.get(symbol, pd.DataFrame())
-
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        if df_fr.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算 XSR 策略。")
-            continue
-
-        # K线数据量验证告警
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ K线数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-
-        # 传递双数据流给 XSR 截面信号引擎
-        signals, df_actual_signals = generate_XSR_signals(df_klines, df_fr, bar_minutes=30)
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    # 3. 聚合全量截面真实账本并打印指令
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        # 移除可能重复的信号 (根据 symbol、时间戳、事件 联合去重)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-
-        output_path = "XSR_long_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ XSR 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中 XSR 策略尚未产生任何有效信号。")
-        return pd.DataFrame()
-
-
-# ==============================================================================
-# Extreme FR Short 策略流转生成器
-# ==============================================================================
-def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
-    """
-    截面瞬时信号生成版：针对 extreme_fr_short_cold_start_close (做空策略)
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
-    """
-    STRATEGY_PARAMS = {
-        'N_HOURS': 24,  # 动量回溯周期(24小时)
-        'W_DAYS': 14,  # 排名滚动窗口(14天)
-        'EXTREME_FR_RANK_THRESHOLD': 0.95,  # 资金费率极高水位线 (>95%)
-        'STRONG_RET_RANK_THRESHOLD': 0.80,  # 收益率强势水位线 (>80%)
-        'MILD_FR_RANK_THRESHOLD': 0.50,  # 资金费率温和水位线 (<50%)
-        'TARGET_WEIGHT': 1.0,  # 目标名义仓位
-        'MAX_WEIGHT': 1.0 / 7 / 1.6,  # 最大允许仓位
-        'STRATEGY_NAME': 'fr_short'
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
-
-    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
-        return [], pd.DataFrame(columns=cols)
-
-    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
-
-    def _pick(df_to_check, cands, what):
-        for c in cands:
-            if c in df_to_check.columns:
-                return c
-        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
-
-    # 1. 数据重采样与对齐
-    bar = f"{bar_minutes}min"
-
-    k = kline_df.copy()
-    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
-    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
-    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-
-    agg = k.resample(bar, label='left', closed='left').agg(
-        open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum')
-    )
-    agg['close'] = agg['close'].ffill()
-    agg = agg[agg['close'].notna()]
-    agg['open'] = agg['open'].fillna(agg['close'])
-
-    fr = fr_df.copy()
-    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
-    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
-    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
-    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
-
-    df = agg.copy()
-    df['funding_rate'] = fr_s.reindex(df.index).ffill()
-    start = df['funding_rate'].first_valid_index()
-    if start is not None:
-        df = df.loc[start:].copy()
-    df['funding_rate'] = df['funding_rate'].ffill()
-    df = df.dropna(subset=['funding_rate'])
-    df = df[df['close'] > 0]
-
-    bph = 60.0 / bar_minutes
-
-    def B(hours):
-        return max(1, int(round(hours * bph)))
-
-    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    if len(df) < W:
-        return [], pd.DataFrame(columns=cols)
-
-    # 2. 核心指标向量化计算
-    N = B(STRATEGY_PARAMS['N_HOURS'])
-    mp = max(50, W // 5)
-
-    c = df['close']
-    fr_series = df['funding_rate']
-
-    ret_N = c.pct_change(N)
-    rk_ret_N = ret_N.rolling(W, min_periods=mp).rank(pct=True)
-    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
-
-    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线)
-    curr_rk_ret_N = float(rk_ret_N.iloc[-1])
-    curr_fr_rank = float(fr_rank.iloc[-1])
-    curr_c = float(c.iloc[-1])
-
-    is_entry = curr_fr_rank > STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']
-    is_exit = (curr_rk_ret_N > STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']) and (
-            curr_fr_rank < STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD'])
-
-    new_candidate_record = None
-
-    if is_entry or is_exit:
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df.index[-1].timestamp() * 1000)
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
-        if is_entry:
-            entry_reason = f"EXTREME_HIGH_FR(fr_rank:{curr_fr_rank:.3f}>{STRATEGY_PARAMS['EXTREME_FR_RANK_THRESHOLD']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',  # 做空 -> SELL
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"COLD_START(ret24_rk:{curr_rk_ret_N:.3f}>{STRATEGY_PARAMS['STRONG_RET_RANK_THRESHOLD']}&fr_rank:{curr_fr_rank:.3f}<{STRATEGY_PARAMS['MILD_FR_RANK_THRESHOLD']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',  # 平空 -> BUY
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,  # PnL will be derived from generic sync ledger
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-
-    # 4. 状态机持久化防重复拦截
-    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
 
 
 def execute_trading_bot_workflow_short_fr(target_time, symbol_list, proxy_url=None):
     """
-    针对 Extreme FR Short 策略专属工作流：
-    拉取 K 线与资金费率数据并启动交集整套交易工作流
-    策略描述：精准狙击全市场“多头最拥挤、做多成本最高”的唯一标的，当多头杠杆被清洗、狂热情绪回归平淡时平仓走人。
-    EXIT_FR_EXTREME_HIGH -> FR_COLD_START Short_top_1 30m
-    回测表现：
-    总交易笔数：261  单笔净收益：6.9113%  跨币种胜率(%)： 67.6768  均值单笔回撤(%)：-31.6487 平均持仓时间(天)：3.5031
-    持仓时间中位数(天)：1.7292  资金最大回撤：160.53%   最大并发持仓：7
-
+    Extreme FR Short 工作流（30m 线，需资金费率）：
+    狙击全市场"多头最拥挤、做多成本最高"的标的做空，杠杆被清洗、情绪回归平淡时离场。
+    回测：261 笔 | 单笔净收益 6.91% | 胜率 67.68% | 均值单笔回撤 -31.65% | 最大并发 7
     """
-    lookback_days = 20
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于 Extreme FR Short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    timeframe = "30m"
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
-    kline_result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    return _run_signal_workflow(
+        label='fr_short', target_time=target_time, symbol_list=symbol_list,
+        timeframe="30m", bar_minutes=30, lookback_days=20, output_path="short_fr_signals.csv",
+        proxy_url=proxy_url, need_funding=True,
+        signal_fn=lambda k, fr, oi: generate_short_fr_signals(k, fr, bar_minutes=30)[1]
     )
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
-    funding_result_map = snipe_funding_rate_data(
-        symbol_list=symbol_list,
-        days=lookback_days,
-        proxy_url=proxy_url
-    )
-
-    run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 2 + 1
-
-    df_actual_signals_df_list = []
-    for symbol in symbol_list:
-        df_klines = kline_result_map.get(symbol, pd.DataFrame())
-        df_fr = funding_result_map.get(symbol, pd.DataFrame())
-
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        if df_fr.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算 Extreme FR Short 策略。")
-            continue
-
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ K线数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-
-        signals, df_actual_signals = generate_short_fr_signals(df_klines, df_fr, bar_minutes=30)
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-
-        output_path = "short_fr_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ Extreme FR Short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中 Extreme FR Short 策略尚未产生任何有效信号。")
-        return pd.DataFrame()
-
-
-# ==============================================================================
-# Vol FR Long 策略流转生成器
-# ==============================================================================
-def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
-    """
-    截面瞬时信号生成版：针对 vol_breakout_fr_recovery_long 策略
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
-    """
-    STRATEGY_PARAMS = {
-        'M_HOURS': 4,  # 动量/状态对比回溯周期
-        'N_HOURS': 24,  # ATR计算周期
-        'W_DAYS': 14,  # 排名(Rank)滚动窗口
-
-        'ATR_RANK_LOW_TH': 0.20,  # 4小时前波动率极度萎缩的最高分位数 (20%)
-        'ATR_RANK_HIGH_TH': 0.60,  # 当前波动率爆发的最低分位数 (60%)
-
-        'FR_RANK_LOW_TH': 0.10,  # 4小时前资金费率极度悲观的最高分位数 (10%)
-
-        'TARGET_WEIGHT': 1.0,
-        'MAX_WEIGHT': 1.0 / 27 / 3,
-        'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
-
-    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
-        return [], pd.DataFrame(columns=cols)
-
-    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
-
-    def _pick(df_to_check, cands, what):
-        for c in cands:
-            if c in df_to_check.columns:
-                return c
-        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
-
-    # 1. 数据重采样与对齐
-    bar = f"{bar_minutes}min"
-
-    k = kline_df.copy()
-    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
-    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
-    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-
-    agg = k.resample(bar, label='left', closed='left').agg(
-        open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum')
-    )
-    agg['close'] = agg['close'].ffill()
-    agg = agg[agg['close'].notna()]
-    agg['open'] = agg['open'].fillna(agg['close'])
-    agg['high'] = agg['high'].fillna(agg['close'])
-    agg['low'] = agg['low'].fillna(agg['close'])
-
-    fr = fr_df.copy()
-    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
-    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
-    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    _fr_raw = (fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float))
-    fr_s = _fr_raw.resample(bar, label='left', closed='left').last()
-
-    df = agg.copy()
-    df['funding_rate'] = fr_s.reindex(df.index).ffill()
-    start = df['funding_rate'].first_valid_index()
-    if start is not None:
-        df = df.loc[start:].copy()
-    df['funding_rate'] = df['funding_rate'].ffill()
-    df = df.dropna(subset=['funding_rate'])
-    df = df[df['close'] > 0]
-
-    bph = 60.0 / bar_minutes
-
-    def B(hours):
-        return max(1, int(round(hours * bph)))
-
-    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    if len(df) < W:
-        return [], pd.DataFrame(columns=cols)
-
-    # 2. 核心指标向量化计算
-    M = B(STRATEGY_PARAMS['M_HOURS'])
-    N = B(STRATEGY_PARAMS['N_HOURS'])
-    mp = max(50, W // 5)
-
-    o, h, l, c = df['open'], df['high'], df['low'], df['close']
-    fr_series = df['funding_rate']
-    pc = c.shift(1)
-
-    EPS = 1e-12
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    atr_N = tr.rolling(N, min_periods=max(2, N // 2)).mean()
-    atr_pct = atr_N / (c + EPS)
-
-    rk_atr = atr_pct.rolling(W, min_periods=mp).rank(pct=True)
-    fr_rank = fr_series.rolling(W, min_periods=mp).rank(pct=True)
-
-    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线)
-    # 取出所有计算依赖的尾部标量状态值 (处理 shift 引发的异常边界)
-    curr_rk_atr = float(rk_atr.iloc[-1])
-    prev_M_rk_atr = float(rk_atr.shift(M).iloc[-1]) if not pd.isna(rk_atr.shift(M).iloc[-1]) else 0.0
-
-    curr_fr_rank = float(fr_rank.iloc[-1])
-    prev_M_fr_rank = float(fr_rank.shift(M).iloc[-1]) if not pd.isna(fr_rank.shift(M).iloc[-1]) else 0.0
-    prev_1_fr_rank = float(fr_rank.shift(1).iloc[-1]) if not pd.isna(fr_rank.shift(1).iloc[-1]) else 0.0
-
-    curr_c = float(c.iloc[-1])
-
-    is_entry = (prev_M_rk_atr < STRATEGY_PARAMS['ATR_RANK_LOW_TH']) and (
-            curr_rk_atr > STRATEGY_PARAMS['ATR_RANK_HIGH_TH'])
-    is_exit = (prev_M_fr_rank < STRATEGY_PARAMS['FR_RANK_LOW_TH']) and (curr_fr_rank > prev_1_fr_rank)
-
-    new_candidate_record = None
-
-    if is_entry or is_exit:
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df.index[-1].timestamp() * 1000)
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
-        if is_entry:
-            entry_reason = f"VOL_LOW_TO_HIGH(rk_atr_{STRATEGY_PARAMS['M_HOURS']}h_ago:{prev_M_rk_atr:.3f}<{STRATEGY_PARAMS['ATR_RANK_LOW_TH']} & curr:{curr_rk_atr:.3f}>{STRATEGY_PARAMS['ATR_RANK_HIGH_TH']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"FR_RECOVERY_FROM_LOW(rk_fr_{STRATEGY_PARAMS['M_HOURS']}h_ago:{prev_M_fr_rank:.3f}<{STRATEGY_PARAMS['FR_RANK_LOW_TH']} & curr:{curr_fr_rank:.3f}>prev:{prev_1_fr_rank:.3f})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',
-                'coin': coin_name,
-                'direction': 'LONG',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-
-    # 4. 状态机持久化防重复拦截
-    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
 
 
 def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url=None):
     """
-    针对 Vol FR Long 策略专属工作流：
-    拉取 K 线与资金费率数据并启动交集整套交易工作流
+    Vol FR Long 工作流（5m 线，需资金费率）：
     策略描述：bottom_10的币种在币价出现历史级别的4小时极度暴涨时直接追高做多，当市场多头情绪彻底冷却（资金费率极低或转负）时平仓走人
     VOL_LOW_TO_HIGH -> FR_RECOVERY_FROM_LOW Long_bottom_20 5m
     回测表现：
     总交易笔数：355  单笔净收益：13.0693%  跨币种胜率(%)： 49.6855  均值单笔回撤(%)：-11.9181 平均持仓时间(天)：15.2574
     持仓时间中位数(天)：0.2674  策略性价比 (收益风险比):15.2262 资金最大回撤：304.7110%   最大并发持仓：27
     """
-    # 策略要求滚动排名天数为 14 天，附加 6 天冗余预热期
-    lookback_days = 20
-    timeframe = "5m"
-
-    run_logger = setup_logger()
-    run_logger.info(f"📊 基于 vol_fr_long 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
-    kline_result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    return _run_signal_workflow(
+        label='vol_fr_long', target_time=target_time, symbol_list=symbol_list,
+        timeframe="5m", bar_minutes=5, lookback_days=20, output_path="vol_fr_long_signals.csv",
+        proxy_url=proxy_url, need_funding=True,
+        signal_fn=lambda k, fr, oi: generate_vol_fr_signals(k, fr, bar_minutes=5)[1]
     )
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
-    funding_result_map = snipe_funding_rate_data(
-        symbol_list=symbol_list,
-        days=lookback_days,
-        proxy_url=proxy_url
-    )
-
-    run_logger.info("✅ 已完成对所有币种的数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 12 + 1  # 5分钟线预期行数
-
-    df_actual_signals_df_list = []
-
-    for symbol in symbol_list:
-        df_klines = kline_result_map.get(symbol, pd.DataFrame())
-        df_fr = funding_result_map.get(symbol, pd.DataFrame())
-
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        if df_fr.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算该策略。")
-            continue
-
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ K线数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-
-        # 传递双数据流给截面信号引擎
-        signals, df_actual_signals = generate_vol_fr_signals(df_klines, df_fr, bar_minutes=5)
-
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    # 附加操作：依然对信号池全聚合存盘，便于我们排查定位和展示打印
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-
-        output_path = "vol_fr_long_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ vol_fr_long 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中 vol_fr_long 策略尚未产生任何有效信号。")
-        return pd.DataFrame()
-
-
-# ==============================================================================
-# Bottom Powder Short 策略流转生成器与工作流
-# ==============================================================================
-def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15):
-    """
-    截面瞬时信号生成版：针对 bottom_stabilize_powder_keg_short (做空策略)
-    仅检测最新闭合的一根 K 线，并通过本地持久化文件还原完整真实的 df_actual_signals
-    """
-    STRATEGY_PARAMS = {
-        'N_HOURS': 24,  # 基础趋势周期 (24小时)
-        'M_HOURS': 4,  # 快速动量周期 (4小时)
-        'W_DAYS': 14,  # 排名滚动窗口 (14天)
-
-        'POWDER_OI_RK': 0.90,  # OI极高分位
-        'POWDER_VOL_RK': 0.30,  # 交易量极低分位
-
-        'TARGET_WEIGHT': 1.0,
-        'MAX_WEIGHT': 1.0 / 24,
-        'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
-
-    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0 or oi_df is None or len(oi_df) == 0:
-        return [], pd.DataFrame(columns=cols)
-
-    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
-
-    def _pick(df_to_check, cands, what):
-        for c in cands:
-            if c in df_to_check.columns:
-                return c
-        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
-
-    # 1. 数据重采样与对齐
-    bar = f"{bar_minutes}min"
-
-    k = kline_df.copy()
-    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
-    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
-    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-    agg = k.resample(bar, label='left', closed='left').agg(
-        open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum')
-    )
-    agg['close'] = agg['close'].ffill()
-    agg = agg[agg['close'].notna()]
-    agg['open'] = agg['open'].fillna(agg['close'])
-    agg['low'] = agg['low'].fillna(agg['close'])
-
-    fr = fr_df.copy()
-    ft = _pick(fr, ['timestamp', 'fundingTime', 'time', 'ts'], 'fr')
-    fc = _pick(fr, ['funding_rate', 'fundingRate', 'rate'], 'fr')
-    fr['dt'] = pd.to_datetime(fr[ft], unit='ms', utc=True)
-    fr_s = fr.drop_duplicates(subset=[ft]).sort_values('dt').set_index('dt')[fc].astype(float).resample(bar,
-                                                                                                        label='left',
-                                                                                                        closed='left').last()
-
-    oi = oi_df.copy()
-    ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
-    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
-    oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
-    oi_s = oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc].astype(float).resample(bar,
-                                                                                                        label='left',
-                                                                                                        closed='left').last()
-
-    df = agg.copy()
-    df['funding_rate'] = fr_s.reindex(df.index).ffill()
-    df['oi_amount'] = oi_s.reindex(df.index).ffill()
-
-    start = df[['funding_rate', 'oi_amount']].apply(lambda s: s.first_valid_index()).max()
-    if start is not None:
-        df = df.loc[start:].copy()
-    df = df.dropna(subset=['funding_rate', 'oi_amount'])
-    df = df[df['close'] > 0]
-
-    bph = 60.0 / bar_minutes
-
-    def B(hours):
-        return max(1, int(round(hours * bph)))
-
-    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    if len(df) < W:
-        return [], pd.DataFrame(columns=cols)
-
-    # 2. 核心指标向量化计算
-    N = B(STRATEGY_PARAMS['N_HOURS'])
-    M = B(STRATEGY_PARAMS['M_HOURS'])
-    mp = max(50, W // 5)
-    EPS = 1e-12
-
-    c = df['close']
-    l = df['low']
-    v = df['volume']
-    oi_amt = df['oi_amount']
-    fr_rate = df['funding_rate']
-
-    minL_N = l.rolling(N, min_periods=max(2, N // 2)).min()
-    oi_min_M = oi_amt.rolling(M, min_periods=2).min()
-
-    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
-    rk_v = v.rolling(W, min_periods=mp).rank(pct=True)
-    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
-
-    # 3. 截面瞬时信号检测 (只看最后一根闭合的 K 线，处理好NaN边界)
-    curr_c = float(c.iloc[-1])
-    curr_minL_N = float(minL_N.iloc[-1]) if not pd.isna(minL_N.iloc[-1]) else 0.0
-    curr_oi_amt = float(oi_amt.iloc[-1]) if not pd.isna(oi_amt.iloc[-1]) else 0.0
-    curr_oi_min_M = float(oi_min_M.iloc[-1]) if not pd.isna(oi_min_M.iloc[-1]) else 0.0
-
-    curr_fr_rank = float(fr_rank.iloc[-1]) if not pd.isna(fr_rank.iloc[-1]) else 0.0
-    curr_fr_rate = float(fr_rate.iloc[-1]) if not pd.isna(fr_rate.iloc[-1]) else 0.0
-
-    prev_N_minL_N = float(minL_N.shift(N).iloc[-1]) if not pd.isna(minL_N.shift(N).iloc[-1]) else 0.0
-
-    curr_rk_oi = float(rk_oi.iloc[-1]) if not pd.isna(rk_oi.iloc[-1]) else 0.0
-    curr_rk_v = float(rk_v.iloc[-1]) if not pd.isna(rk_v.iloc[-1]) else 0.0
-
-    # 信号运算
-    oi_bottom_div = (curr_c / (curr_minL_N + EPS) < 1.03) and (curr_oi_amt > curr_oi_min_M * 1.05)
-    fr_low_neg = (curr_fr_rank < 0.20) or (curr_fr_rate < 0)
-    price_higher_lows = curr_minL_N > prev_N_minL_N
-
-    is_entry = oi_bottom_div and fr_low_neg and price_higher_lows
-    is_exit = (curr_rk_oi > STRATEGY_PARAMS['POWDER_OI_RK']) and (curr_rk_v < STRATEGY_PARAMS['POWDER_VOL_RK'])
-
-    new_candidate_record = None
-
-    if is_entry or is_exit:
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df.index[-1].timestamp() * 1000)
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
-        if is_entry:
-            entry_reason = f"BOTTOM_STABILIZE(c/L:<1.03, oi_amt:{curr_oi_amt:.2f}>minM*1.05, fr_rk<0.2 or fr<0)"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',  # 开空是 SELL
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"POWDER_KEG(rk_oi:{curr_rk_oi:.2f}>{STRATEGY_PARAMS['POWDER_OI_RK']}, rk_v:{curr_rk_v:.2f}<{STRATEGY_PARAMS['POWDER_VOL_RK']})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',  # 平空是 BUY
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,  # 由底层持久化组件负责盈亏兜底计算
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-
-    # 4. 状态机持久化防重复拦截
-    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
 
 
 def execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, proxy_url=None):
     """
-    针对 Bottom Powder Short 策略专属工作流：
-    拉取 K 线、资金费率与 OI 数据并启动交集整套交易工作流
-
+    Bottom Powder Short 工作流（15m 线，需资金费率 + OI）：
     策略描述：bottom_10的币种在底部出现空头持仓激增且情绪极度悲观（资金费率为负）的短暂企稳时直接顺势追空，当盘面进入杠杆极高且成交量极度萎缩的“火药桶”僵持状态时平仓走人。
     ENTRY_BOTTOM_STABILIZE -> REGIME_POWDER_KEG Short_bottom_10 15m
     回测表现：
     总交易笔数：157  单笔净收益：12.5116%  跨币种胜率(%)： 74.4186  均值单笔回撤(%)：-32.4334 平均持仓时间(天)：23.9702
     持仓时间中位数(天)：16.4792  策略性价比 (收益风险比):18.1403 资金最大回撤：108.2850%   最大并发持仓：24
     """
-    lookback_days = 20
-    timeframe = "15m"
-
-    run_logger = setup_logger()
-    run_logger.info(
-        f"📊 基于 bottom_powder_short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
-    kline_result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    return _run_signal_workflow(
+        label='bottom_powder_short', target_time=target_time, symbol_list=symbol_list,
+        timeframe="15m", bar_minutes=15, lookback_days=20,
+        output_path="bottom_powder_short_signals.csv", proxy_url=proxy_url,
+        need_funding=True, need_oi=True,
+        signal_fn=lambda k, fr, oi: generate_bottom_powder_short_signals(k, fr, oi, bar_minutes=15)[1]
     )
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 资金费率数据...")
-    funding_result_map = snipe_funding_rate_data(
-        symbol_list=symbol_list,
-        days=lookback_days,
-        proxy_url=proxy_url
-    )
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 OI 数据...")
-    oi_result_map = snipe_oi_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        proxy_url=proxy_url
-    )
-
-    run_logger.info("✅ 已完成对所有币种的三重数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 4 + 1  # 15分钟线预期行数
-
-    df_actual_signals_df_list = []
-
-    for symbol in symbol_list:
-        df_klines = kline_result_map.get(symbol, pd.DataFrame())
-        df_fr = funding_result_map.get(symbol, pd.DataFrame())
-        df_oi = oi_result_map.get(symbol, pd.DataFrame())
-
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
-            continue
-
-        if df_fr.empty:
-            run_logger.warning(f"❌ 警告：{symbol} 资金费率数据丢失！无法计算该策略。")
-            continue
-
-        if df_oi.empty:
-            run_logger.warning(f"❌ 警告：{symbol} OI数据丢失！无法计算该策略。")
-            continue
-
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
-
-            run_logger.warning(
-                f"⚠️ K线数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
-
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
-
-        # 传递三维数据流给截面信号引擎
-        signals, df_actual_signals = generate_bottom_powder_short_signals(df_klines, df_fr, df_oi, bar_minutes=15)
-
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-
-        output_path = "bottom_powder_short_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ bottom_powder_short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中 bottom_powder_short 策略尚未产生任何有效信号。")
-        return pd.DataFrame()
-
-
-# ==============================================================================
-# [新增] OI Decay Short 策略流转生成器与工作流
-# ==============================================================================
-def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
-    """
-    截面瞬时信号生成版：针对 oi_value_decay_short (做空策略)
-    1. 仅检测最新闭合的一根 K 线，避免全量历史循环，提升性能。
-    2. 基于 EMA 死叉开空，OI极高且不拉升时平空规避。
-    3. 通过本地持久化文件还原完整真实的 df_actual_signals。
-    """
-    STRATEGY_PARAMS = {
-        'M_HOURS': 4,  # 短周期：4小时
-        'N_HOURS': 24,  # 长周期：24小时
-        'W_DAYS': 14,  # 排名滚动窗口：14天
-        'OI_RANK_EXTREME_TH': 0.95,  # OI极值排名阈值 (>95分位)
-        'OI_HOT_TH': 0.050,  # 价格过热判定阈值 (<5%乖离率)
-        'TARGET_WEIGHT': -1.0,  # 目标仓位 (做空为 -1.0)
-        'MAX_WEIGHT': 1.0 / 9 / 1.1,  # 最大允许名义仓位 (绝对值)
-        'STRATEGY_NAME': 'oi_value_decay_short'
-    }
-
-    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
-            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
-            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
-
-    if kline_df is None or len(kline_df) == 0 or oi_df is None or len(oi_df) == 0:
-        return [], pd.DataFrame(columns=cols)
-
-    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
-    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
-        symbol.split('/')[0] if '/' in symbol else symbol
-    )
-
-    def _pick(df_to_check, cands, what):
-        for c in cands:
-            if c in df_to_check.columns:
-                return c
-        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
-
-    # 1. 数据重采样与对齐
-    bar = f"{bar_minutes}min"
-
-    k = kline_df.copy()
-    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
-    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
-    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
-
-    agg = k.resample(bar, label='left', closed='left').agg(
-        open=('open', 'first'), high=('high', 'max'),
-        low=('low', 'min'), close=('close', 'last'),
-        volume=('volume', 'sum')
-    )
-    agg['close'] = agg['close'].ffill()
-    agg = agg[agg['close'].notna()]
-    agg['open'] = agg['open'].fillna(agg['close'])
-
-    oi = oi_df.copy()
-    ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
-    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
-    oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
-    oi_s = oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc].astype(float).resample(bar,
-                                                                                                        label='left',
-                                                                                                        closed='left').last()
-
-    df = agg.copy()
-    df['oi_amount'] = oi_s.reindex(df.index).ffill()
-
-    start = df['oi_amount'].first_valid_index()
-    if start is not None:
-        df = df.loc[start:].copy()
-    df = df.dropna(subset=['oi_amount'])
-    df = df[df['close'] > 0]
-
-    bph = 60.0 / bar_minutes
-
-    def B(hours):
-        return max(1, int(round(hours * bph)))
-
-    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
-    if len(df) < W:
-        return [], pd.DataFrame(columns=cols)
-
-    # 2. 核心指标向量化计算
-    M = B(STRATEGY_PARAMS['M_HOURS'])
-    N = B(STRATEGY_PARAMS['N_HOURS'])
-    mp = max(50, W // 5)
-    EPS = 1e-12
-
-    c = df['close']
-    oi_amt = df['oi_amount']
-
-    oi_value = oi_amt * c
-    oiv_ema_M = oi_value.ewm(span=M, adjust=False).mean()
-    oiv_ema_N = oi_value.ewm(span=N, adjust=False).mean()
-
-    ma_N = c.rolling(N, min_periods=max(2, N // 2)).mean()
-    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
-
-    # 3. 截面瞬时信号检测 (只取最新闭合的一根 K 线和前一根的状态)
-    curr_c = float(c.iloc[-1])
-    curr_ma_N = float(ma_N.iloc[-1]) if not pd.isna(ma_N.iloc[-1]) else 0.0
-    curr_rk_oi = float(rk_oi.iloc[-1]) if not pd.isna(rk_oi.iloc[-1]) else 0.0
-
-    curr_ema_M = float(oiv_ema_M.iloc[-1]) if not pd.isna(oiv_ema_M.iloc[-1]) else 0.0
-    curr_ema_N = float(oiv_ema_N.iloc[-1]) if not pd.isna(oiv_ema_N.iloc[-1]) else 0.0
-    prev_ema_M = float(oiv_ema_M.iloc[-2]) if len(oiv_ema_M) > 1 and not pd.isna(oiv_ema_M.iloc[-2]) else 0.0
-    prev_ema_N = float(oiv_ema_N.iloc[-2]) if len(oiv_ema_N) > 1 and not pd.isna(oiv_ema_N.iloc[-2]) else 0.0
-
-    # 核心判断逻辑
-    is_entry = (curr_ema_M < curr_ema_N) and (prev_ema_M >= prev_ema_N)
-    is_exit = (curr_rk_oi > STRATEGY_PARAMS['OI_RANK_EXTREME_TH']) and (
-            (curr_c / (curr_ma_N + EPS) - 1.0) < STRATEGY_PARAMS['OI_HOT_TH'])
-
-    new_candidate_record = None
-
-    if is_entry or is_exit:
-        bar_ms_delta = int(bar_minutes * 60 * 1000)
-        last_ts = int(df.index[-1].timestamp() * 1000)
-        signal_ts_ms = last_ts + bar_ms_delta
-        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
-            '%Y-%m-%d %H:%M:%S')
-
-        if is_entry:
-            entry_reason = f"OI_VALUE_DEAD_CROSS(EMA4h:{curr_ema_M:.2f} < EMA24h:{curr_ema_N:.2f})"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'SELL',  # 开空为 SELL
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'OPEN',
-                'price': curr_c,
-                'reason': entry_reason,
-                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-        elif is_exit:
-            exit_reason = f"OI_EXTREME_PRICE_NOT_HOT(Rank_OI:{curr_rk_oi:.2f}>{STRATEGY_PARAMS['OI_RANK_EXTREME_TH']} & Dev<5%)"
-            new_candidate_record = {
-                'time': dt_bj_str,
-                'action': 'BUY',  # 平空为 BUY
-                'coin': coin_name,
-                'direction': 'SHORT',
-                'event': 'CLOSE',
-                'price': curr_c,
-                'reason': exit_reason,
-                'target_weight': 0.0,
-                'pnl': None,
-                'top_k': 1,
-                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
-                'signal_timestamp_ms': signal_ts_ms,
-                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
-                'symbol': symbol
-            }
-
-    # 4. 状态机持久化防重复拦截
-    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
-    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
-
-    return [], df_actual_signals
 
 
 def execute_trading_bot_oi_decay_short(target_time, symbol_list, proxy_url=None):
     """
-    针对 OI Value Decay Short 策略专属工作流：
-    拉取 K 线与 OI 数据，运行状态机并持久化落盘。
-
+    OI Value Decay Short 工作流（30m 线，需 OI）：
     策略描述：top_3的币种在市场杠杆资金明显开始撤退降温时顺势做空，当盘面积聚了历史级别的天量杠杆但价格却陷入僵持（面临随时爆拉的反洗风险）时，果断平仓走人。
     EXIT_OI_VALUE_MA_DEAD_CROSS -> OI_EXTREME_PRICE_NOT_HOT Short_top_3 30m
     回测表现：
     总交易笔数：89  单笔净收益：15.4668%  跨币种胜率(%)： 72.0588  均值单笔回撤(%)：-60.4100 平均持仓时间(天)：15.0960
     持仓时间中位数(天)：13.0833  策略性价比 (收益风险比):12.3636 资金最大回撤：111.3390%   最大并发持仓：9
     """
-    lookback_days = 20
-    timeframe = "30m"
-
-    run_logger = setup_logger()
-    run_logger.info(
-        f"📊 基于 oi_value_decay_short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
-
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
-    kline_result_map = snipe_kline_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        use_ws=True,
-        use_rest=True,
-        proxy_url=proxy_url
+    return _run_signal_workflow(
+        label='oi_decay_short', target_time=target_time, symbol_list=symbol_list,
+        timeframe="30m", bar_minutes=30, lookback_days=20,
+        output_path="oi_decay_short_signals.csv", proxy_url=proxy_url, need_oi=True,
+        signal_fn=lambda k, fr, oi: generate_oi_decay_short_signals(k, oi, bar_minutes=30)[1]
     )
 
-    run_logger.info("⏳ 正在调用极速引擎拉取全量 OI 数据...")
-    oi_result_map = snipe_oi_data(
-        symbol_list=symbol_list,
-        timeframe=timeframe,
-        days=lookback_days,
-        target_time_str=target_time,
-        proxy_url=proxy_url
+
+# =============================================================================
+# 六、主干 A：4H 横截面动量组合（矩阵组装 -> 状态机推演 -> 实盘流水线）
+# =============================================================================
+def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
+    """
+    分钟级 K 线列表 -> 4H 横截面矩阵（每币 4 列：COIN_open/high/low + COIN 作为收盘价）。
+
+    入参形貌: minute_klines_list=[df(含 timestamp(ms), close, coin_name)]
+    出参形貌: DataFrame(index=4H UTC, cols=各币 open/high/low + 币名)，
+              已按"全币种 4H 公共区间"截断并 ffill（与回测的公共区间截断逻辑对齐）
+    """
+    resampled, m1_starts, m1_ends = [], [], []
+    for df in minute_klines_list:
+        if df is None or df.empty:
+            continue
+        coin = df['coin_name'].iloc[0]
+        s = df.copy()
+        s['timestamp'] = pd.to_datetime(s['timestamp'], unit='ms')
+        s = s.set_index('timestamp').sort_index()
+        m1_starts.append(s.index[0])
+        m1_ends.append(s.index[-1])
+
+        bars = s['close'].resample('4h', offset=time_offset).agg(
+            open='first', high='max', low='min', close='last'
+        ).dropna(how='all')
+        # 下游引擎强依赖此命名格式：收盘价列直接用币名
+        bars.columns = [f"{coin}_open", f"{coin}_high", f"{coin}_low", coin]
+        resampled.append(bars)
+
+    if not resampled:
+        raise ValueError("传入的 minute_klines_list 全为空或无法解析！")
+
+    df_raw = pd.concat(resampled, axis=1).sort_index()
+    main_coins = [c for c in df_raw.columns if not any(x in c for x in ('_open', '_high', '_low'))]
+    common_start = max(df_raw[c].first_valid_index() for c in main_coins)
+    common_end = min(df_raw[c].last_valid_index() for c in main_coins)
+    df_merged = df_raw.loc[common_start:common_end].ffill()
+
+    logger.info(
+        f"[4H矩阵/组装完成] 币种数: [{len(resampled)}] | Offset: [{time_offset}] | "
+        f"有效 1m 交集: [{_fmt_bjt(max(m1_starts))} ~ {_fmt_bjt(min(m1_ends))}] | "
+        f"4H 公共区间: [{_fmt_bjt(common_start)} ~ {_fmt_bjt(common_end)}] | "
+        f"矩阵: [{df_merged.shape[0]}行 x {df_merged.shape[1]}列] (北京时间)"
     )
+    return df_merged
 
-    run_logger.info("✅ 已完成对所有币种的双重数据请求，正在进行截面信号推演...")
-    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
 
-    df_actual_signals_df_list = []
+def run_strategy_simulation(df_cross_section, strategy_params, trade_mode, initial_capital=10000.0,
+                            start_trade_date='2026-04-27 00:00:00', logger=None):
+    """
+    流式状态机推演：横截面特征 -> 逐根 4H K 线选币/开平仓 -> 与回测 100% 一致的交易账本。
 
-    for symbol in symbol_list:
-        df_klines = kline_result_map.get(symbol, pd.DataFrame())
-        df_oi = oi_result_map.get(symbol, pd.DataFrame())
+    入参形貌: df_cross_section 列含 {COIN, COIN_open, COIN_high, COIN_low}，必须包含 'BTC'
+             strategy_params 必含 MOM_WINDOW / VOL_WINDOW / BTC_TREND_WINDOW / MAX_WEIGHT，可选 TOP_K
+    出参形貌: DataFrame 列含 time/action/coin/direction/event/price/amount/value/fee/reason/
+             target_weight/pnl/top_k/max_weight
+    副作用: 向 df_cross_section 追加 'signal_status' 列（逐根 K 线的信号诊断）
+    """
+    MOM_WINDOW = strategy_params['MOM_WINDOW']
+    VOL_WINDOW = strategy_params['VOL_WINDOW']
+    BTC_TREND_WINDOW = strategy_params['BTC_TREND_WINDOW']
+    TOP_K = int(strategy_params.get('TOP_K', 2))
+    MAX_WEIGHT = strategy_params['MAX_WEIGHT']
+    FEE_RATE = 0.000
 
-        if df_klines.empty:
-            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
+    target_coins = [c for c in df_cross_section.columns
+                    if not any(sfx in c for sfx in ('_open', '_high', '_low'))]
+    if 'BTC' not in target_coins:
+        raise ValueError("数据矩阵中必须包含 BTC 作为宏观开关！")
+    n_coins = len(target_coins)
+    coin_to_idx = {c: i for i, c in enumerate(target_coins)}
+
+    # === 向量化指标：动量 / ATR 波动率 / 风险调整动量 / BTC 趋势开关 ===
+    df_close = df_cross_section[target_coins]
+    df_returns = df_close.pct_change(MOM_WINDOW)
+
+    df_high = df_cross_section[[f"{c}_high" for c in target_coins]].copy()
+    df_high.columns = target_coins
+    df_low = df_cross_section[[f"{c}_low" for c in target_coins]].copy()
+    df_low.columns = target_coins
+    df_prev_close = df_close.shift(1)
+
+    true_range_arr = np.fmax.reduce([
+        (df_high - df_low).values,
+        (df_high - df_prev_close).abs().values,
+        (df_low - df_prev_close).abs().values
+    ])
+    df_atr = pd.DataFrame(true_range_arr, index=df_cross_section.index,
+                          columns=target_coins).rolling(window=VOL_WINDOW).mean()
+    df_volatility_pct = df_atr / df_close
+    df_adj_mom = df_returns / (df_volatility_pct + 1e-8)
+
+    df_btc_ma = df_cross_section['BTC'].rolling(window=BTC_TREND_WINDOW).mean()
+
+    mom_arr = df_adj_mom.values
+    vol_arr = df_volatility_pct.values
+    btc_trend_arr = (df_cross_section['BTC'] > df_btc_ma).values
+    close_arr = df_close.values
+    ref_price_arr = df_close.shift(MOM_WINDOW).values   # 零动量阈值价（MOM_WINDOW 周期前的价格）
+    btc_ma_arr = df_btc_ma.values
+    time_index = df_cross_section.index
+
+    # === 状态机初始化 ===
+    cash = float(initial_capital)
+    positions_arr = np.zeros(n_coins, dtype=float)
+    coin_states = {c: {'qty': 0.0, 'cost': 0.0, 'side': None} for c in target_coins}
+    trade_ledger = []
+    kline_signal_diagnostics = ["无信号: 指标预热期"] * len(df_cross_section)
+    warmup_period = max(MOM_WINDOW, VOL_WINDOW, BTC_TREND_WINDOW)
+
+    start_trade_timestamp = pd.to_datetime(start_trade_date) if start_trade_date else None
+
+    for i in range(warmup_period, len(df_cross_section)):
+        current_time = time_index[i]
+        current_prices = close_arr[i]
+        current_mom, current_vol = mom_arr[i], vol_arr[i]
+        is_btc_trend_on = bool(btc_trend_arr[i])
+        total_equity = cash + np.dot(positions_arr, current_prices)
+
+        # --- 候选筛选：大盘开关定方向，风险调整动量排序取 TOP_K ---
+        is_long_side = is_btc_trend_on
+        side_word = '做多' if is_long_side else '做空'
+        mode_allowed = trade_mode in (('BOTH', 'LONG_ONLY') if is_long_side else ('BOTH', 'SHORT_ONLY'))
+
+        picks = []
+        if mode_allowed:
+            mask = ~np.isnan(current_mom) & ((current_mom > 0) if is_long_side else (current_mom < 0))
+            valid_idx = np.where(mask)[0]
+            if valid_idx.size:
+                valid_vals = current_mom[valid_idx]
+                order = np.argsort(-valid_vals if is_long_side else valid_vals, kind='stable')
+                picks = [target_coins[j] for j in valid_idx[order[:TOP_K]]]
+
+        candidate_longs = picks if is_long_side else []
+        candidate_shorts = [] if is_long_side else picks
+
+        # 时间拦截器：未到发车时间，强制掐断候选名单
+        if start_trade_timestamp is not None and current_time < start_trade_timestamp:
+            candidate_longs, candidate_shorts = [], []
+            kline_signal_diagnostics[i] = "无信号: 未到设定的发车时间"
+        elif picks:
+            kline_signal_diagnostics[i] = f"有信号 ({side_word}): {', '.join(picks)}"
+        elif mode_allowed:
+            kline_signal_diagnostics[i] = (f"无信号: 大盘{'看多' if is_long_side else '看空'}，"
+                                           f"但所有标的动量均不满足{side_word}阈值")
+        else:
+            kline_signal_diagnostics[i] = (f"无信号: 大盘{'看多' if is_long_side else '看空'}，"
+                                           f"但策略模式禁止{side_word}")
+
+        # --- A. 平仓：不在最新候选名单里的持仓一律出清 ---
+        for idx_c in range(n_coins):
+            pos = positions_arr[idx_c]
+            coin = target_coins[idx_c]
+            if pos > 0 and coin not in candidate_longs:
+                pos_is_long = True
+            elif pos < 0 and coin not in candidate_shorts:
+                pos_is_long = False
+            else:
+                continue
+
+            amount = abs(pos)
+            price = current_prices[idx_c]
+            value = amount * price
+            fee = value * FEE_RATE
+            cost = coin_states[coin]['cost']
+            positions_arr[idx_c] = 0.0
+
+            if pos_is_long:
+                cash += (value - fee)
+                net_pnl = amount * (price - cost) - fee
+                close_reason = ("大盘开关关闭" if not is_btc_trend_on
+                                else ("动量转负退场" if current_mom[idx_c] <= 0 else "掉出前K名排名"))
+            else:
+                cash -= (value + fee)
+                net_pnl = amount * (cost - price) - fee
+                close_reason = ("大盘开关关闭" if is_btc_trend_on
+                                else ("动量转正退场" if current_mom[idx_c] >= 0 else "掉出前K名排名"))
+
+            trade_ledger.append({
+                "time": current_time, "action": "SELL" if pos_is_long else "BUY", "coin": coin,
+                "direction": "LONG" if pos_is_long else "SHORT", "event": "CLOSE",
+                "price": price, "amount": amount, "value": value, "fee": fee,
+                "reason": close_reason, "target_weight": 0.0,
+                "pnl": (net_pnl / (cost * amount)) * 100 if cost > 0 else 0.0,
+                "top_k": TOP_K, "max_weight": MAX_WEIGHT
+            })
+            coin_states[coin] = {'qty': 0.0, 'cost': 0.0, 'side': None}
+
+        # --- B. 开仓：按 1/波动率 分配权重（MAX_WEIGHT 封顶），多头额外受现金约束 ---
+        for side_is_long, candidates in ((True, candidate_longs), (False, candidate_shorts)):
+            if not candidates:
+                continue
+            inv_vols = [1.0 / current_vol[coin_to_idx[c]] if current_vol[coin_to_idx[c]] > 0 else 0
+                        for c in candidates]
+            total_inv_vol = sum(inv_vols)
+            if total_inv_vol <= 0:
+                continue
+
+            for k_, coin in enumerate(candidates):
+                idx_c = coin_to_idx[coin]
+                if positions_arr[idx_c] != 0:
+                    continue
+
+                target_weight = min(inv_vols[k_] / total_inv_vol, MAX_WEIGHT)
+                notional = total_equity * target_weight / (1 + FEE_RATE)
+                if side_is_long and cash < notional:
+                    notional = cash / (1 + FEE_RATE)
+                if notional <= 1.0:
+                    continue
+
+                price = current_prices[idx_c]
+                fee = notional * FEE_RATE
+                amount = notional / price
+
+                if side_is_long:
+                    positions_arr[idx_c] += amount
+                    cash -= (notional + fee)
+                    coin_states[coin] = {'qty': amount, 'cost': price + (fee / amount), 'side': 'LONG'}
+                else:
+                    positions_arr[idx_c] -= amount
+                    cash += (notional - fee)
+                    coin_states[coin] = {'qty': -amount, 'cost': price - (fee / amount), 'side': 'SHORT'}
+
+                trade_ledger.append({
+                    "time": current_time, "action": "BUY" if side_is_long else "SELL", "coin": coin,
+                    "direction": "LONG" if side_is_long else "SHORT", "event": "OPEN",
+                    "price": price, "amount": amount, "value": notional, "fee": fee,
+                    "reason": "Signal Entry Long" if side_is_long else "Signal Entry Short",
+                    "target_weight": target_weight, "pnl": np.nan,
+                    "top_k": TOP_K, "max_weight": MAX_WEIGHT
+                })
+
+        # --- C. 最新一根 K 线的全景诊断（聚合为单条日志，避免碎片刷屏） ---
+        if logger is not None and i == len(df_cross_section) - 1:
+            btc_idx = coin_to_idx['BTC']
+            btc_price, btc_ma = current_prices[btc_idx], btc_ma_arr[i]
+            btc_dev = (btc_price - btc_ma) / btc_ma if btc_ma > 0 else 0.0
+            picked = set(candidate_longs) | set(candidate_shorts)
+
+            lines = [
+                f"[策略推演/最新截面] 时间: [{current_time}] | 模式: [{trade_mode}] | "
+                f"参数: [MOM={MOM_WINDOW} VOL={VOL_WINDOW} BTC_MA={BTC_TREND_WINDOW} TOP_K={TOP_K}]",
+                f"  ├─ 大盘开关: [{'ON 多头趋势' if is_btc_trend_on else 'OFF 空头趋势'}] | "
+                f"BTC现价: [{btc_price:.2f}] vs 均线: [{btc_ma:.2f}] | 偏离: [{btc_dev:+.2%}]",
+                f"  ├─ 信号诊断: [{kline_signal_diagnostics[i]}]",
+                f"  ├─ 账户状态: 权益 [{total_equity:,.2f}] | 现金 [{cash:,.2f}] | "
+                f"持仓标的数 [{int(np.count_nonzero(positions_arr))}]",
+            ]
+            for coin in target_coins:
+                idx = coin_to_idx[coin]
+                p_now, p_ref = current_prices[idx], ref_price_arr[i, idx]
+                p_dev = (p_now - p_ref) / p_ref if p_ref > 0 else 0.0
+                tag = f"★入选-{side_word}" if coin in picked else "  未入选"
+                lines.append(
+                    f"  ├─ [{tag}] {coin:<8} | 风险调整动量: [{current_mom[idx]:>8.4f}] | "
+                    f"波动率: [{current_vol[idx]:.4%}] | 现价: [{p_now:<12.4f}] | "
+                    f"零动量阈值价: [{p_ref:<12.4f}] | 价格偏离: [{p_dev:+.2%}]"
+                )
+            lines.append(f"  └─ 本截面新增账本记录: "
+                         f"[{sum(1 for r in trade_ledger if r['time'] == current_time)}] 条")
+            logger.info("\n".join(lines))
+
+    df_cross_section['signal_status'] = kline_signal_diagnostics
+    return pd.DataFrame(trade_ledger)
+
+
+def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
+    """
+    多参数实盘流水线：4H 矩阵 -> 状态机推演 -> 账本时间对齐(+4h、UTC毫秒戳、北京时间) -> 发单指令 -> 汇总落盘。
+
+    入参形貌: minute_klines_list=[df(含 timestamp/close/coin_name/symbol)]
+             strategy_params_list=[{STRATEGY_NAME, TIME_OFFSET, TRADE_MODE, MOM_WINDOW, VOL_WINDOW,
+                                    BTC_TREND_WINDOW, MAX_WEIGHT, TOP_K}]
+    出参: 全量账本 DataFrame（无信号时为空表）；副作用: 写出 live_simulation_logs.csv
+    """
+    # 币名 -> 完整 symbol 的动态映射，避免下游硬编码交易对后缀
+    coin_to_symbol = {df['coin_name'].iloc[0]: df['symbol'].iloc[0] for df in minute_klines_list
+                      if df is not None and not df.empty and {'coin_name', 'symbol'} <= set(df.columns)}
+
+    all_ledgers = []
+    for params in strategy_params_list:
+        name, offset, mode = params['STRATEGY_NAME'], params['TIME_OFFSET'], params['TRADE_MODE']
+        logger.info(f"⏳ [流水线/{name}] 开始组装 4H 矩阵并推演 | Offset: [{offset}] | 模式: [{mode}]")
+
+        df_4h = build_4h_cross_section(logger, minute_klines_list, time_offset=offset)
+        if df_4h is None or df_4h.empty:
+            logger.warning(f"⚠️ [流水线/{name}] 4H 矩阵为空已跳过 | "
+                           f"可能原因: 分钟级数据缺失或各币种无公共时间区间")
             continue
 
-        if df_oi.empty:
-            run_logger.warning(f"❌ 警告：{symbol} OI数据丢失！无法计算该策略。")
-            continue
+        ledger = run_strategy_simulation(df_cross_section=df_4h, strategy_params=params,
+                                        trade_mode=mode, logger=logger)
 
-        actual_rows = len(df_klines)
-        if actual_rows < expected_rows:
-            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
-                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
-            missing_count = expected_rows - actual_rows
+        # 4H K 线走完（开盘 +4h）才是信号真正的实盘执行时刻
+        latest_exec_bjt = (df_4h.index[-1] + pd.Timedelta(hours=4)) \
+            .tz_localize('UTC').tz_convert('Asia/Shanghai').tz_localize(None)
 
-            run_logger.warning(
-                f"⚠️ K线数据缺失告警：{symbol} | "
-                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
-                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
-            )
+        if ledger.empty:
+            logger.info(f"🧠 [流水线/{name}] 推演完成 | 账本记录: [0] | 最新信号时间: [无]")
+            latest_signals = pd.DataFrame()
+        else:
+            ledger['time'] = pd.to_datetime(ledger['time']) + pd.Timedelta(hours=4)
+            # 先基于纯净 UTC 生成毫秒戳（无视时区漂移，保证下游 API 不认错），再转北京时间给人看
+            ledger['signal_timestamp_ms'] = ledger['time'].astype('int64') // 10 ** 6
+            ledger['time'] = ledger['time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Shanghai').dt.tz_localize(None)
+            ledger['STRATEGY_NAME'] = name
+            ledger['symbol'] = ledger['coin'].map(coin_to_symbol).fillna(ledger['coin'] + '/USDT:USDT')
+            all_ledgers.append(ledger)
 
-        coin_name = symbol.split('/')[0]
-        df_klines['coin_name'] = coin_name
-        df_klines['symbol'] = symbol
+            logger.info(f"🧠 [流水线/{name}] 推演完成 | 账本记录: [{len(ledger)}] | "
+                        f"最新信号时间: [{ledger['time'].max():%Y-%m-%d %H:%M:%S}] (北京时间)")
+            latest_signals = ledger[ledger['time'] == latest_exec_bjt]
 
-        # 传递双维数据流给截面信号引擎
-        signals, df_actual_signals = generate_oi_decay_short_signals(df_klines, df_oi, bar_minutes=30)
+        if latest_signals.empty:
+            logger.info(f"🎯 [发单指令/{name}] 截面 [{latest_exec_bjt:%Y-%m-%d %H:%M:%S}] (北京时间) "
+                        f"无开平仓信号，保持现有仓位")
+        else:
+            lines = [f"🎯 [发单指令/{name}] 截面 [{latest_exec_bjt:%Y-%m-%d %H:%M:%S}] (北京时间) "
+                     f"共 [{len(latest_signals)}] 条待执行:"]
+            for _, row in latest_signals.iterrows():
+                base = (f"{row['action']:<4} {row['coin']:<8} | 方向: [{row['direction']}] | "
+                        f"价格: [{row['price']}]")
+                if row['event'] == 'CLOSE':
+                    lines.append(f"  ► 🔴 平仓 | {base} | 数量: [{row['amount']:.4f}] | "
+                                 f"原因: [{row['reason']}]")
+                else:
+                    lines.append(f"  ► 🟢 开仓 | {base} | 目标权重: [{row['target_weight'] * 100:.1f}%] | "
+                                 f"原因: [{row['reason']}]")
+            logger.info("\n".join(lines))
 
-        df_actual_signals_df_list.append(df_actual_signals)
-
-    if df_actual_signals_df_list:
-        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
-        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
-
-        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
-
-        output_path = "oi_decay_short_signals.csv"
-        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-        run_logger.info(
-            f"\n✅ oi_value_decay_short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
-
-        return final_signals_df
-    else:
-        run_logger.info("\n► 历史流转中 oi_value_decay_short 策略尚未产生任何有效信号。")
+    if not all_ledgers:
+        logger.info("► [流水线/收官] 所有策略在历史流转中均未产生任何交易信号")
         return pd.DataFrame()
 
+    output_path = "live_simulation_logs.csv"
+    final_ledger_df = pd.concat(all_ledgers, ignore_index=True)
+    final_ledger_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [流水线/账本落盘] 文件: [{output_path}] | 记录数: [{len(final_ledger_df)}] | "
+                f"覆盖策略数: [{len(all_ledgers)}]")
+    return final_ledger_df
 
+
+def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
+    """
+    4H 横截面动量组合入口：按最大指标窗口反推预热天数 -> 拉 1m K线 -> 多参数并行推演。
+    出参: 全量账本 DataFrame；无任何数据时返回空字符串（见下方）
+    """
+    strategy_params_list = [
+        {'STRATEGY_NAME': 'Grid_No.43629', 'MOM_WINDOW': 48, 'VOL_WINDOW': 42, 'BTC_TREND_WINDOW': 120,
+         'MAX_WEIGHT': 2.6, 'TOP_K': 1, 'TIME_OFFSET': '2h', 'TRADE_MODE': 'LONG_ONLY'},
+        {'STRATEGY_NAME': 'Grid_No.69393', 'MOM_WINDOW': 90, 'VOL_WINDOW': 120, 'BTC_TREND_WINDOW': 720,
+         'MAX_WEIGHT': 0.4, 'TOP_K': 3, 'TIME_OFFSET': '0h', 'TRADE_MODE': 'SHORT_ONLY'},
+    ]
+    symbol_list = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
+                   "XRP/USDT:USDT", "BNB/USDT:USDT", "DOGE/USDT:USDT"]
+    timeframe = "1m"
+
+    # 一天 6 根 4H bar，故 bar 窗口 /6 换算成天数，再加 30 天冗余
+    max_window = max(max(p['MOM_WINDOW'], p['VOL_WINDOW'], p['BTC_TREND_WINDOW'])
+                     for p in strategy_params_list)
+    lookback_days = int(np.ceil(max_window / 6)) + 30
+    expected_rows = lookback_days * 24 * 60 + 1
+
+    run_logger = setup_logger()
+    run_logger.info(f"🚀 [Cross/启动] 4H 横截面动量组合 | 策略数: [{len(strategy_params_list)}] | "
+                    f"最大指标窗口: [{max_window} bars] | 预热天数: [{lookback_days}] | "
+                    f"标的数: [{len(symbol_list)}] | 单标的预期K线: [{expected_rows}] | "
+                    f"目标时刻: [{target_time}]")
+
+    result_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                                 target_time_str=target_time, use_ws=True, use_rest=True,
+                                 proxy_url=proxy_url)
+
+    fetched_raw_data, missing = [], []
+    for symbol in symbol_list:
+        df_klines = _frame_of(result_map, symbol)
+        if df_klines.empty:
+            missing.append(symbol)
+            continue
+        _warn_data_gap(run_logger, 'Cross', symbol, df_klines, expected_rows)
+        df_klines['coin_name'] = symbol.split('/')[0]
+        df_klines['symbol'] = symbol   # 向下游无损传递完整符号元数据
+        fetched_raw_data.append(df_klines)
+
+    if missing:
+        run_logger.warning(f"⚠️ [Cross/数据体检] 完全无数据的标的: {missing} | "
+                           f"可能原因: 交易所无该合约、网络/代理不通或 snipe_kline_data 引擎异常")
+
+    if not fetched_raw_data:
+        run_logger.error("❌ [Cross/致命] 没有任何标的数据被成功加载，无法组装横截面矩阵 | "
+                         "排查线索: 检查网络/代理与 fetch_data_quick 取数引擎")
+        return ""
+
+    run_logger.info(f"✅ [Cross/取数完成] 标的到位: [{len(fetched_raw_data)}/{len(symbol_list)}]，开始多参数推演")
+    return run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
+
+
+# =============================================================================
+# 七、程序入口（本地联调用）
+# =============================================================================
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
 
-    # 测试原有 workflow
-    # execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
-
-    # 测试原有底部的 workflow
-    # execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, 'http://127.0.0.1:7890')
-
-    # 测试新增的工作流
     execute_trading_bot_oi_decay_short(target_time, symbol_list, 'http://127.0.0.1:7890')
