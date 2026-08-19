@@ -20,6 +20,9 @@ MAX_TOP3_PROFIT_PCT = 60.0
 # 过滤条件：每个周期（60m,30m,15m,5m）的 真实盈潜比(Ret/MAE) 必须大于该值 (新增)
 MIN_RET_MAE_RATIO = 0.1
 
+# 过滤条件：每个周期（60m,30m,15m,5m）的最大并发持仓数 必须小于该值 (新增)
+MAX_CONCURRENT_POSITIONS = 50
+
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
@@ -122,6 +125,7 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     holding_days_cols = [c for c in df_dir.columns if '平均持仓时间(天)_' in c]  # 新增提取持仓时间列
     top3_profit_cols = [c for c in df_dir.columns if 'Top3币收益占比(%)_' in c]  # 新增提取Top3币收益占比列
     ret_mae_cols = [c for c in df_dir.columns if '真实盈潜比(Ret/MAE)_' in c]  # 新增提取真实盈潜比列
+    max_pos_cols = [c for c in df_dir.columns if '最大并发持仓数_' in c]  # 新增提取最大并发持仓数列
 
     for _, row in df_sorted.iterrows():
         pair = (row['entry_factor'], row['exit_factor'])
@@ -155,6 +159,11 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         if ret_mae_cols:
             if row[ret_mae_cols].fillna(0).min() <= MIN_RET_MAE_RATIO:
                 continue  # 当前 filter_mode 盈潜比未达到最低要求，跳过
+
+        # 6. 验证最大并发持仓数 (如果数据缺失NaN，视为9999直接淘汰) 新增逻辑
+        if max_pos_cols:
+            if row[max_pos_cols].fillna(9999).max() >= MAX_CONCURRENT_POSITIONS:
+                continue  # 当前 filter_mode 最大并发持仓数超出限制，跳过
         # ========================================================
 
         # 如果通过了上述检验，提取该组合所有过滤模式下的完整矩阵（保留全局统计数据用于绘制面板）
@@ -263,7 +272,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
             print(row_str)
 
     if not top_pairs:
-        print("⚠️ 没有符合过滤条件（交易次数、回撤历时、持仓时间、Top3收益占比及真实盈潜比）的策略组合可以输出。")
+        print(
+            "⚠️ 没有符合过滤条件（交易次数、回撤历时、持仓时间、Top3收益占比、真实盈潜比及最大并发持仓数）的策略组合可以输出。")
         return
 
     # 存储最终满足条件的最优组合参数
@@ -292,12 +302,14 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
                 hold_col = f"平均持仓时间(天)_{curr_tf}"
                 top3_col = f"Top3币收益占比(%)_{curr_tf}"
                 ret_mae_col = f"真实盈潜比(Ret/MAE)_{curr_tf}"
+                max_pos_col = f"最大并发持仓数_{curr_tf}"
 
                 trades = row_data[trade_col] if trade_col in sub_df.columns else 0
                 dd_dur = row_data[dd_dur_col] if dd_dur_col in sub_df.columns else 100
                 hold_days = row_data[hold_col] if hold_col in sub_df.columns else 9999
                 top3_pct = row_data[top3_col] if top3_col in sub_df.columns else 100
                 ret_mae = row_data[ret_mae_col] if ret_mae_col in sub_df.columns else 0
+                max_pos = row_data[max_pos_col] if max_pos_col in sub_df.columns else 9999
 
                 # 缺失值的保守处理
                 if pd.isna(trades): trades = 0
@@ -305,13 +317,15 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
                 if pd.isna(hold_days): hold_days = 9999
                 if pd.isna(top3_pct): top3_pct = 100
                 if pd.isna(ret_mae): ret_mae = 0
+                if pd.isna(max_pos): max_pos = 9999
 
                 if (pd.notna(val) and
                         trades > MIN_TRADES_PER_TF and
                         dd_dur <= MAX_DRAWDOWN_DURATION_PCT and
                         hold_days < MAX_AVG_HOLDING_DAYS and
                         top3_pct < MAX_TOP3_PROFIT_PCT and
-                        ret_mae > MIN_RET_MAE_RATIO):
+                        ret_mae > MIN_RET_MAE_RATIO and
+                        max_pos < MAX_CONCURRENT_POSITIONS):
                     valid_nodes.append((val, curr_tf, curr_f))
 
         # 按性价比降序排序，取前2名
@@ -334,9 +348,9 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
 
         if top_2_nodes:
             node_strs = [f"过滤模式 [{n[2]}] + 周期 [{n[1]}]" for n in top_2_nodes]
-            print(f" 🌟 本组合高性价比节点识别 (满足所有5项核心过滤条件): {' 以及 '.join(node_strs)} (表现将高亮显示)")
+            print(f" 🌟 本组合高性价比节点识别 (满足所有6项核心过滤条件): {' 以及 '.join(node_strs)} (表现将高亮显示)")
         else:
-            print(" ⚠️ 本组合在所有节点均未找到满足所有5项核心过滤条件的有效数据点。")
+            print(" ⚠️ 本组合在所有节点均未找到满足所有6项核心过滤条件的有效数据点。")
 
         # 🌟 高密度透视面板输出多个指定维度 (定制不同的数字格式，传入高亮参数)
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}", hl_nodes)
@@ -345,7 +359,6 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大并发持仓数", "⚡ 【最大并发持仓数】 横向截面对比", "{:.4f}", hl_nodes)
-
 
         print("=" * 120)
 
@@ -519,12 +532,14 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
                 hold_col = f"平均持仓时间(天)_{curr_tf}"
                 top3_col = f"Top3币收益占比(%)_{curr_tf}"
                 ret_mae_col = f"真实盈潜比(Ret/MAE)_{curr_tf}"
+                max_pos_col = f"最大并发持仓数_{curr_tf}"
 
                 trades = row_data[trade_col] if trade_col in sub_df.columns else 0
                 dd_dur = row_data[dd_dur_col] if dd_dur_col in sub_df.columns else 100
                 hold_days = row_data[hold_col] if hold_col in sub_df.columns else 9999
                 top3_pct = row_data[top3_col] if top3_col in sub_df.columns else 100
                 ret_mae = row_data[ret_mae_col] if ret_mae_col in sub_df.columns else 0
+                max_pos = row_data[max_pos_col] if max_pos_col in sub_df.columns else 9999
 
                 # 缺失值的保守处理
                 if pd.isna(trades): trades = 0
@@ -532,13 +547,15 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
                 if pd.isna(hold_days): hold_days = 9999
                 if pd.isna(top3_pct): top3_pct = 100
                 if pd.isna(ret_mae): ret_mae = 0
+                if pd.isna(max_pos): max_pos = 9999
 
                 if (pd.notna(val) and
                         trades > MIN_TRADES_PER_TF and
                         dd_dur <= MAX_DRAWDOWN_DURATION_PCT and
                         hold_days < MAX_AVG_HOLDING_DAYS and
                         top3_pct < MAX_TOP3_PROFIT_PCT and
-                        ret_mae > MIN_RET_MAE_RATIO):
+                        ret_mae > MIN_RET_MAE_RATIO and
+                        max_pos < MAX_CONCURRENT_POSITIONS):
                     valid_nodes.append((val, curr_tf, curr_f))
 
         # 按性价比降序排序，取前2名
@@ -562,9 +579,9 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
 
         if top_2_nodes:
             node_strs = [f"过滤模式 [{n[2]}] + 周期 [{n[1]}]" for n in top_2_nodes]
-            print(f" 🌟 本组合高性价比节点识别 (满足所有5项核心过滤条件): {' 以及 '.join(node_strs)} (表现将高亮显示)")
+            print(f" 🌟 本组合高性价比节点识别 (满足所有6项核心过滤条件): {' 以及 '.join(node_strs)} (表现将高亮显示)")
         else:
-            print(" ⚠️ 本组合在所有节点均未找到满足所有5项核心过滤条件的有效数据点。")
+            print(" ⚠️ 本组合在所有节点均未找到满足所有6项核心过滤条件的有效数据点。")
 
         print_metric_matrix(sub_df, "总真实净收益(%)", "🎯 【净利润(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "总交易笔数", "📝 【总交易笔数】 横向截面对比", "{:.0f}", hl_nodes)
@@ -612,6 +629,5 @@ if __name__ == "__main__":
     #
     # display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
 
-
     # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
-    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Short')
+    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Long')
