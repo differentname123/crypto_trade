@@ -1628,7 +1628,7 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
         'FR_RANK_LOW_TH': 0.10,  # 4小时前资金费率极度悲观的最高分位数 (10%)
 
         'TARGET_WEIGHT': 1.0,
-        'MAX_WEIGHT': 1.0,
+        'MAX_WEIGHT': 1.0 / 27 / 3,
         'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'
     }
 
@@ -1873,7 +1873,7 @@ def execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, proxy_url
 
 
 # ==============================================================================
-# [新增]: Bottom Powder Short 策略流转生成器与工作流
+# Bottom Powder Short 策略流转生成器与工作流
 # ==============================================================================
 def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15):
     """
@@ -1889,7 +1889,7 @@ def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15)
         'POWDER_VOL_RK': 0.30,  # 交易量极低分位
 
         'TARGET_WEIGHT': 1.0,
-        'MAX_WEIGHT': 1.0,
+        'MAX_WEIGHT': 1.0 / 24,
         'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'
     }
 
@@ -2164,6 +2164,267 @@ def execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, p
         return pd.DataFrame()
 
 
+# ==============================================================================
+# [新增] OI Decay Short 策略流转生成器与工作流
+# ==============================================================================
+def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
+    """
+    截面瞬时信号生成版：针对 oi_value_decay_short (做空策略)
+    1. 仅检测最新闭合的一根 K 线，避免全量历史循环，提升性能。
+    2. 基于 EMA 死叉开空，OI极高且不拉升时平空规避。
+    3. 通过本地持久化文件还原完整真实的 df_actual_signals。
+    """
+    STRATEGY_PARAMS = {
+        'M_HOURS': 4,  # 短周期：4小时
+        'N_HOURS': 24,  # 长周期：24小时
+        'W_DAYS': 14,  # 排名滚动窗口：14天
+        'OI_RANK_EXTREME_TH': 0.95,  # OI极值排名阈值 (>95分位)
+        'OI_HOT_TH': 0.050,  # 价格过热判定阈值 (<5%乖离率)
+        'TARGET_WEIGHT': -1.0,  # 目标仓位 (做空为 -1.0)
+        'MAX_WEIGHT': 1.0 / 9 / 1.1,  # 最大允许名义仓位 (绝对值)
+        'STRATEGY_NAME': 'oi_value_decay_short'
+    }
+
+    cols = ['time', 'action', 'coin', 'direction', 'event', 'price',
+            'reason', 'target_weight', 'pnl', 'top_k', 'max_weight',
+            'signal_timestamp_ms', 'STRATEGY_NAME', 'symbol']
+
+    if kline_df is None or len(kline_df) == 0 or oi_df is None or len(oi_df) == 0:
+        return [], pd.DataFrame(columns=cols)
+
+    symbol = kline_df['symbol'].iloc[0] if 'symbol' in kline_df.columns else kline_df.attrs.get('symbol', 'UNKNOWN')
+    coin_name = kline_df['coin_name'].iloc[0] if 'coin_name' in kline_df.columns else (
+        symbol.split('/')[0] if '/' in symbol else symbol
+    )
+
+    def _pick(df_to_check, cands, what):
+        for c in cands:
+            if c in df_to_check.columns:
+                return c
+        raise KeyError(f"[{what}] 找不到列 {cands}，实际列: {list(df_to_check.columns)}")
+
+    # 1. 数据重采样与对齐
+    bar = f"{bar_minutes}min"
+
+    k = kline_df.copy()
+    kt = _pick(k, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+    k['dt'] = pd.to_datetime(k[kt], unit='ms', utc=True)
+    k = k.drop_duplicates(subset=[kt]).sort_values('dt').set_index('dt')
+
+    agg = k.resample(bar, label='left', closed='left').agg(
+        open=('open', 'first'), high=('high', 'max'),
+        low=('low', 'min'), close=('close', 'last'),
+        volume=('volume', 'sum')
+    )
+    agg['close'] = agg['close'].ffill()
+    agg = agg[agg['close'].notna()]
+    agg['open'] = agg['open'].fillna(agg['close'])
+
+    oi = oi_df.copy()
+    ot = _pick(oi, ['timestamp', 'time', 'ts'], 'oi')
+    oc = _pick(oi, ['oi_amount', 'openInterest', 'open_interest', 'sumOpenInterest', 'oi'], 'oi')
+    oi['dt'] = pd.to_datetime(oi[ot], unit='ms', utc=True)
+    oi_s = oi.drop_duplicates(subset=[ot]).sort_values('dt').set_index('dt')[oc].astype(float).resample(bar,
+                                                                                                        label='left',
+                                                                                                        closed='left').last()
+
+    df = agg.copy()
+    df['oi_amount'] = oi_s.reindex(df.index).ffill()
+
+    start = df['oi_amount'].first_valid_index()
+    if start is not None:
+        df = df.loc[start:].copy()
+    df = df.dropna(subset=['oi_amount'])
+    df = df[df['close'] > 0]
+
+    bph = 60.0 / bar_minutes
+
+    def B(hours):
+        return max(1, int(round(hours * bph)))
+
+    W = B(STRATEGY_PARAMS['W_DAYS'] * 24)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=cols)
+
+    # 2. 核心指标向量化计算
+    M = B(STRATEGY_PARAMS['M_HOURS'])
+    N = B(STRATEGY_PARAMS['N_HOURS'])
+    mp = max(50, W // 5)
+    EPS = 1e-12
+
+    c = df['close']
+    oi_amt = df['oi_amount']
+
+    oi_value = oi_amt * c
+    oiv_ema_M = oi_value.ewm(span=M, adjust=False).mean()
+    oiv_ema_N = oi_value.ewm(span=N, adjust=False).mean()
+
+    ma_N = c.rolling(N, min_periods=max(2, N // 2)).mean()
+    rk_oi = oi_amt.rolling(W, min_periods=mp).rank(pct=True)
+
+    # 3. 截面瞬时信号检测 (只取最新闭合的一根 K 线和前一根的状态)
+    curr_c = float(c.iloc[-1])
+    curr_ma_N = float(ma_N.iloc[-1]) if not pd.isna(ma_N.iloc[-1]) else 0.0
+    curr_rk_oi = float(rk_oi.iloc[-1]) if not pd.isna(rk_oi.iloc[-1]) else 0.0
+
+    curr_ema_M = float(oiv_ema_M.iloc[-1]) if not pd.isna(oiv_ema_M.iloc[-1]) else 0.0
+    curr_ema_N = float(oiv_ema_N.iloc[-1]) if not pd.isna(oiv_ema_N.iloc[-1]) else 0.0
+    prev_ema_M = float(oiv_ema_M.iloc[-2]) if len(oiv_ema_M) > 1 and not pd.isna(oiv_ema_M.iloc[-2]) else 0.0
+    prev_ema_N = float(oiv_ema_N.iloc[-2]) if len(oiv_ema_N) > 1 and not pd.isna(oiv_ema_N.iloc[-2]) else 0.0
+
+    # 核心判断逻辑
+    is_entry = (curr_ema_M < curr_ema_N) and (prev_ema_M >= prev_ema_N)
+    is_exit = (curr_rk_oi > STRATEGY_PARAMS['OI_RANK_EXTREME_TH']) and (
+            (curr_c / (curr_ma_N + EPS) - 1.0) < STRATEGY_PARAMS['OI_HOT_TH'])
+
+    new_candidate_record = None
+
+    if is_entry or is_exit:
+        bar_ms_delta = int(bar_minutes * 60 * 1000)
+        last_ts = int(df.index[-1].timestamp() * 1000)
+        signal_ts_ms = last_ts + bar_ms_delta
+        dt_bj_str = pd.to_datetime(signal_ts_ms, unit='ms', utc=True).tz_convert('Asia/Shanghai').strftime(
+            '%Y-%m-%d %H:%M:%S')
+
+        if is_entry:
+            entry_reason = f"OI_VALUE_DEAD_CROSS(EMA4h:{curr_ema_M:.2f} < EMA24h:{curr_ema_N:.2f})"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'SELL',  # 开空为 SELL
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'OPEN',
+                'price': curr_c,
+                'reason': entry_reason,
+                'target_weight': STRATEGY_PARAMS['TARGET_WEIGHT'],
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+        elif is_exit:
+            exit_reason = f"OI_EXTREME_PRICE_NOT_HOT(Rank_OI:{curr_rk_oi:.2f}>{STRATEGY_PARAMS['OI_RANK_EXTREME_TH']} & Dev<5%)"
+            new_candidate_record = {
+                'time': dt_bj_str,
+                'action': 'BUY',  # 平空为 BUY
+                'coin': coin_name,
+                'direction': 'SHORT',
+                'event': 'CLOSE',
+                'price': curr_c,
+                'reason': exit_reason,
+                'target_weight': 0.0,
+                'pnl': None,
+                'top_k': 1,
+                'max_weight': STRATEGY_PARAMS['MAX_WEIGHT'],
+                'signal_timestamp_ms': signal_ts_ms,
+                'STRATEGY_NAME': STRATEGY_PARAMS['STRATEGY_NAME'],
+                'symbol': symbol
+            }
+
+    # 4. 状态机持久化防重复拦截
+    history_file = f"signal_history_{STRATEGY_PARAMS['STRATEGY_NAME']}.csv"
+    df_actual_signals = _sync_persistent_signal_ledger(history_file, symbol, new_candidate_record, cols)
+
+    return [], df_actual_signals
+
+
+def execute_trading_bot_oi_decay_short(target_time, symbol_list, proxy_url=None):
+    """
+    针对 OI Value Decay Short 策略专属工作流：
+    拉取 K 线与 OI 数据，运行状态机并持久化落盘。
+
+    策略描述：top_3的币种在市场杠杆资金明显开始撤退降温时顺势做空，当盘面积聚了历史级别的天量杠杆但价格却陷入僵持（面临随时爆拉的反洗风险）时，果断平仓走人。
+    EXIT_OI_VALUE_MA_DEAD_CROSS -> OI_EXTREME_PRICE_NOT_HOT Short_top_3 30m
+    回测表现：
+    总交易笔数：89  单笔净收益：15.4668%  跨币种胜率(%)： 72.0588  均值单笔回撤(%)：-60.4100 平均持仓时间(天)：15.0960
+    持仓时间中位数(天)：13.0833  策略性价比 (收益风险比):12.3636 资金最大回撤：111.3390%   最大并发持仓：9
+    """
+    lookback_days = 20
+    timeframe = "30m"
+
+    run_logger = setup_logger()
+    run_logger.info(
+        f"📊 基于 oi_value_decay_short 策略滚动窗口需求(14天)，动态计算所需历史预热数据天数: {lookback_days} 天。")
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 K线数据...")
+    kline_result_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("⏳ 正在调用极速引擎拉取全量 OI 数据...")
+    oi_result_map = snipe_oi_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        proxy_url=proxy_url
+    )
+
+    run_logger.info("✅ 已完成对所有币种的双重数据请求，正在进行截面信号推演...")
+    expected_rows = lookback_days * 24 * 2 + 1  # 30分钟线预期行数
+
+    df_actual_signals_df_list = []
+
+    for symbol in symbol_list:
+        df_klines = kline_result_map.get(symbol, pd.DataFrame())
+        df_oi = oi_result_map.get(symbol, pd.DataFrame())
+
+        if df_klines.empty:
+            run_logger.warning(f"❌ 警告：{symbol} K线数据完全丢失！缺失 {expected_rows} 条数据。")
+            continue
+
+        if df_oi.empty:
+            run_logger.warning(f"❌ 警告：{symbol} OI数据丢失！无法计算该策略。")
+            continue
+
+        actual_rows = len(df_klines)
+        if actual_rows < expected_rows:
+            start_time_str = pd.to_datetime(df_klines['timestamp'].iloc[0], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            end_time_str = pd.to_datetime(df_klines['timestamp'].iloc[-1], unit='ms').tz_localize('UTC').tz_convert(
+                'Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
+            missing_count = expected_rows - actual_rows
+
+            run_logger.warning(
+                f"⚠️ K线数据缺失告警：{symbol} | "
+                f"缺失量: {missing_count} 条 (预期 {expected_rows}, 实际 {actual_rows}) | "
+                f"可用数据区间: [{start_time_str} 至 {end_time_str}]"
+            )
+
+        coin_name = symbol.split('/')[0]
+        df_klines['coin_name'] = coin_name
+        df_klines['symbol'] = symbol
+
+        # 传递双维数据流给截面信号引擎
+        signals, df_actual_signals = generate_oi_decay_short_signals(df_klines, df_oi, bar_minutes=30)
+
+        df_actual_signals_df_list.append(df_actual_signals)
+
+    if df_actual_signals_df_list:
+        final_signals_df = pd.concat(df_actual_signals_df_list, ignore_index=True)
+        final_signals_df.drop_duplicates(subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True)
+
+        print_top_long_latest_signals(final_signals_df, run_logger, timeframe=timeframe)
+
+        output_path = "oi_decay_short_signals.csv"
+        final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+        run_logger.info(
+            f"\n✅ oi_value_decay_short 策略的全量交易流水(Ledger)已合并生成: {output_path} (共 {len(final_signals_df)} 条记录)")
+
+        return final_signals_df
+    else:
+        run_logger.info("\n► 历史流转中 oi_value_decay_short 策略尚未产生任何有效信号。")
+        return pd.DataFrame()
+
+
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
@@ -2171,5 +2432,8 @@ if __name__ == "__main__":
     # 测试原有 workflow
     # execute_trading_bot_workflow_vol_fr_long(target_time, symbol_list, 'http://127.0.0.1:7890')
 
+    # 测试原有底部的 workflow
+    # execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, 'http://127.0.0.1:7890')
+
     # 测试新增的工作流
-    execute_trading_bot_workflow_bottom_powder_short(target_time, symbol_list, 'http://127.0.0.1:7890')
+    execute_trading_bot_oi_decay_short(target_time, symbol_list, 'http://127.0.0.1:7890')
