@@ -210,7 +210,7 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         m_combo = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs单体最低)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
+        # print(f"  {'资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
         dur_a = row['单A_最大回撤历时(天)']
@@ -286,7 +286,7 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         m_combo_v = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
+        # print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
         dur_sub = row['最优子组合_最大回撤历时(天)']
@@ -660,7 +660,7 @@ if __name__ == '__main__':
             show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
             max_combo_size=4,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
-            max_seeds_per_level=2000  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
+            max_seeds_per_level=200  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")
