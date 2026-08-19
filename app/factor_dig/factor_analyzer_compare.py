@@ -65,10 +65,8 @@ def _compare_single_pair(pairs_file, trades_file, conditions):
         return "errors", coin_name, f"[错误] 处理 {coin_name} 时发生异常: {e}"
 
 
-def batch_compare_trades_parallel():
-    # 统一使用同一个目录
-    target_dir = Path(r'W:\project\python_project\crypto_trade\app\factor_dig\factor_out_30m_debugtest')
-
+def batch_compare_trades_parallel(target_dir):
+    # 改为接收参数传入目标目录，从而复用逻辑
     conditions = {
         "entry_factor": "EXIT_SHORT_SURGE_EXTREME",
         "exit_factor": "FR_LOW_NEG",
@@ -124,9 +122,9 @@ def batch_compare_trades_parallel():
             if processed_count % 50 == 0:
                 print(f"进度: {processed_count} / {total_files}...")
 
-    # 打印最终汇总报告
+    # 打印最终汇总报告 (稍微修改了输出标题以标记当前目录)
     print("\n" + "=" * 50)
-    print("比对完成！内部交叉验证报告：")
+    print(f"比对完成！[{target_dir.name}] 内部交叉验证报告：")
     print(f"总计检查文件对: {total_files}")
     print(f"✅ 完全一致: {len(results['consistent'])} 对")
     print(f"❌ 数据不一致: {len(results['inconsistent'])} 对")
@@ -136,4 +134,22 @@ def batch_compare_trades_parallel():
 
 
 if __name__ == "__main__":
-    batch_compare_trades_parallel()
+    # 定义基础路径
+    base_path = Path(r'W:\project\python_project\crypto_trade\app\factor_dig')
+
+    # 定义需要串行遍历的周期时间
+    timeframes = ['60m', '30m', '15m', '5m']
+
+    # 循环对每个目录进行串行检测
+    for tf in timeframes:
+        target_directory = base_path / f'factor_out_{tf}_debugtest'
+
+        print(f"\n\n{'#' * 60}")
+        print(f"开始串行检测目录: {target_directory}")
+        print(f"{'#' * 60}")
+
+        # 为了防错，如果某目录不存在则抛出提示并跳过，避免报错退出
+        if target_directory.exists():
+            batch_compare_trades_parallel(target_directory)
+        else:
+            print(f"[跳过] 目录不存在: {target_directory}")
