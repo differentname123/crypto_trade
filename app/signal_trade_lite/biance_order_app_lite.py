@@ -32,7 +32,10 @@ CURRENT_SYMBOL = "vol_fr_long"  # "cross" "top_long" "ma_bottom_long" “XSR_lon
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
-from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long, execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_XSR_long, execute_trading_bot_workflow_short_fr, execute_trading_bot_workflow_vol_fr_long,execute_trading_bot_workflow_bottom_powder_short
+from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_trading_bot_workflow_top_long, \
+    execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_XSR_long, \
+    execute_trading_bot_workflow_short_fr, execute_trading_bot_workflow_vol_fr_long, \
+    execute_trading_bot_workflow_bottom_powder_short
 from biance_order_lite import (execute_order, get_total_equity,
                                ExecStatus, safe_init_exchange
                                )
@@ -803,11 +806,13 @@ def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache,
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_top_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
+
 
 def get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
     # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
@@ -842,10 +847,11 @@ def get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url, position_
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_ma_bottom_long(target_time_str, symbol_list=final_symbol_list,
-                                                      proxy_url=proxy_url)
+                                                            proxy_url=proxy_url)
     return signal_df
 
 
@@ -882,11 +888,13 @@ def get_XSR_signal_df(exchange, target_time_str, proxy_url, position_cache, ledg
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_XSR_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
+
 
 def get_vol_fr_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
     # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
@@ -921,10 +929,11 @@ def get_vol_fr_long_signal_df(exchange, target_time_str, proxy_url, position_cac
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_vol_fr_long(target_time_str, symbol_list=final_symbol_list,
-                                                      proxy_url=proxy_url)
+                                                         proxy_url=proxy_url)
     return signal_df
 
 
@@ -961,12 +970,12 @@ def get_bottom_power_short_signal_df(exchange, target_time_str, proxy_url, posit
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_bottom_powder_short(target_time_str, symbol_list=final_symbol_list,
-                                                      proxy_url=proxy_url)
+                                                                 proxy_url=proxy_url)
     return signal_df
-
 
 
 def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
@@ -1002,7 +1011,8 @@ def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache,
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
-    logger.info(f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    logger.info(
+        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
 
     signal_df = execute_trading_bot_workflow_short_fr(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
@@ -1049,7 +1059,8 @@ def run_scheduler():
 
             target_time_str = (next_run - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
             preload_time = next_run - timedelta(minutes=preload_ahead)
-            logger.info(f"[SCHED] 下一轮调度时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')} | 预加载时间: {preload_time.strftime('%Y-%m-%d %H:%M:%S')} | 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(
+                f"[SCHED] 下一轮调度时间: {next_run.strftime('%Y-%m-%d %H:%M:%S')} | 预加载时间: {preload_time.strftime('%Y-%m-%d %H:%M:%S')} | 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
             if now < preload_time:
                 time.sleep((preload_time - now).total_seconds())
@@ -1092,7 +1103,7 @@ def run_scheduler():
                                                       position_cache=position_cache, ledger=ledger)
             elif CURRENT_SYMBOL == "bottom_power_short":
                 signal_df = get_bottom_power_short_signal_df(exchange, target_time_str, proxy_url=proxy_url,
-                                                            position_cache=position_cache, ledger=ledger)
+                                                             position_cache=position_cache, ledger=ledger)
             else:
                 logger.error(f"[SIGNAL] 未知的 CURRENT_SYMBOL 配置: {CURRENT_SYMBOL}")
                 signal_df = None
@@ -1107,6 +1118,7 @@ def run_scheduler():
         except Exception:
             logger.error(f"[SCHED] 致命异常, 30s 后恢复\n{traceback.format_exc()}")
             time.sleep(30)
+
 
 if __name__ == "__main__":
     run_scheduler()
