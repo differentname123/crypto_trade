@@ -660,7 +660,7 @@ if __name__ == '__main__':
             show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
             max_combo_size=4,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
-            max_seeds_per_level=200  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
+            max_seeds_per_level=2000  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
     else:
         print(f"❌ 找不到文件: {trades_file}，请先执行提取脚本。")

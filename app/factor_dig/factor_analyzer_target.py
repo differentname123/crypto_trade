@@ -26,32 +26,99 @@ MAX_CONCURRENT_POSITIONS = 50
 # 模糊化信号映射表的保存路径
 SIGNAL_MAPPING_FILE = './summary_results/signal_mapping.csv'
 
-long_pair = [
-    ("VOLUME_CLIMAX_DOWN", "ENTRY_SILENT_ACCUMULATION"),
-    ("EXIT_VOL_EXTREME_DOWN", "ENTRY_SILENT_ACCUMULATION"),
-    ("EXIT_FR_ROLL_OVER", "ENTRY_SILENT_ACCUMULATION"),
-    ("FR_ABSOLUTE_HIGH_POS", "OI_BOTTOM_DIVERGENCE"),
-    ("FR_HIGH_EXTREME", "ENTRY_SILENT_ACCUMULATION"),
-    ("MOM_RECOVERY_FROM_LOW", "FR_RECOVERY_FROM_LOW"),
-    ("EXIT_OI_ROC_PEAK", "EXIT_MA_DEAD_CROSS"),
-    ("OI_NEW_HIGH", "EXIT_MA_DEAD_CROSS"),
-    ("ENTRY_OI_LEAD_MOMENTUM", "VOL_DOWN_SPIKE"),
-    ("FR_RECOVERY_FROM_LOW", "STRUCT_RANGE_POSITION_WEAK"),
-    ("EXIT_SHORT_SURGE_EXTREME", "FR_LOW_NEG"),
-    ("STRUCT_SUPPORT_HOLD", "FR_RECOVERY_FROM_LOW"),
-    ("FR_ROLL_OVER_FROM_HIGH", "EXIT_DISTRIBUTION_EXHAUSTION_TOP"),
-]
-
 short_pair = [
-    ('FR_TURN_NEGATIVE', 'FR_RESET_AFTER_HOT'),
-    ('EXIT_MA_DEAD_CROSS', 'PRICE_CLOSE_CROSS_MA_UP'),
-    ('REGIME_POWDER_KEG', 'FR_HIGH_EXTREME'),
-    ('ENTRY_HIGH_PRESSURE_OI_BREAKOUT', 'FR_HIGH_EXTREME'),
+    ('ENTRY_BOTTOM_STABILIZE', 'REGIME_POWDER_KEG'),
+    ('EXIT_OI_VALUE_MA_DEAD_CROSS', 'OI_EXTREME_PRICE_NOT_HOT'),
+    ('EXIT_VWAP_BREAK', 'OI_SLOPE_UP'),
     ('EXIT_FR_EXTREME_HIGH', 'FR_COLD_START'),
-    ('FR_ABSOLUTE_DEEP_NEG', 'FR_TURN_POSITIVE'),
-    ('VOLUME_CONFIRM_BREAK', 'FR_COLD_START')
+    ('EXIT_OI_VALUE_MA_DEAD_CROSS', 'ENTRY_TREND_CONFIRM_B'),
+    ('VOL_LOW_TO_HIGH', 'VOL_DOWN_SPIKE'),
+    ('REGIME_POWDER_KEG', 'FR_HIGH_EXTREME'),
+    ('EXIT_FAILED_BREAKOUT', 'FR_COLD_START'),
+    ('PRICE_MA_SQUEEZE_UP', 'FR_COLD_START'),
+    ('ENTRY_BOTTOM_STABILIZE', 'ENTRY_HEALTHY_ACCELERATION_VOLUME'),
+    ('EXIT_SPOT_SUPPRESSION', 'FR_COLD_START'),
+    ('OI_MA_CROSS_UP', 'OI_HIDDEN_RISE_PRICE_FLAT'),
+    ('ENTRY_BOTTOM_STABILIZE', 'OI_MA_CROSS_UP'),
+    ('FR_ABSOLUTE_HIGH_POS', 'FR_ZERO_ZONE'),
+    ('PRICE_MA_SQUEEZE_UP', 'VWAP_CROSS_UP'),
+    ('EXIT_OI_VALUE_EXTREME', 'EXIT_FR_SPIKE_THEN_COOL'),
+    ('ENTRY_BOTTOM_STABILIZE', 'FR_ZERO_ZONE'),
+    ('FR_ABSOLUTE_HIGH_POS', 'ENTRY_TREND_CONFIRM_B'),
+    ('ENTRY_BOTTOM_STABILIZE', 'VOLUME_DRY_AT_SUPPORT'),
+    ('ENTRY_BOTTOM_STABILIZE', 'ENTRY_SILENT_ACCUMULATION'),
+    ('ENTRY_BOTTOM_STABILIZE', 'FR_STABLE'),
+    ('FR_ABSOLUTE_HIGH_POS', 'FR_COLD_START'),
+    ('EXIT_MA_DEAD_CROSS', 'OI_RESET_THEN_UP'),
+    ('EXIT_PRICE_NEWHIGH_OI_WEAK', 'FR_COLD_START'),
+    ('EXIT_MA_DEAD_CROSS', 'PRICE_CLOSE_CROSS_MA_UP'),
+    ('EXIT_MA_DEAD_CROSS', 'STRUCT_SUPPORT_HOLD'),
+    ('ENTRY_BOTTOM_STABILIZE', 'OI_HIDDEN_RISE_PRICE_FLAT'),
+    ('BREAK_RETEST_HOLD_REAL', 'FR_COLD_START'),
+    ('EXIT_MA_DEAD_CROSS', 'OI_VALUE_EMA_CROSS'),
+    ('FR_PRICE_UP_HOT', 'FR_POS_NOT_HOT'),
+    ('FR_HIGH_EXTREME', 'FR_POS_NOT_HOT'),
+    ('EXIT_MA_DEAD_CROSS', 'PRICE_HEALTHY_EXTENSION'),
+    ('BREAK_FLAT_THEN_BREAK', 'ENTRY_THREE_GREEN_VOLUME_OI'),
+    ('EXIT_MA_DEAD_CROSS', 'VWAP_RECLAIM'),
+    ('VOL_LOW_TO_HIGH', 'VOLUME_EXPAND_PRICE_DOWN'),
+    ('BREAK_LONG_CONSOLIDATION_REAL', 'ENTRY_THREE_GREEN_VOLUME_OI'),
+    ('EXIT_MA_DEAD_CROSS', 'VWAP_ABOVE'),
+    ('EXIT_PRICE_NEWHIGH_OI_WEAK', 'ENTRY_FUNDING_COLD_START_TREND'),
+    ('FR_ABSOLUTE_HIGH_POS', 'FR_PRICE_BEAR_DIV'),
+    ('ENTRY_BOTTOM_STABILIZE', 'EXIT_FR_SPIKE_THEN_COOL'),
+    ('EXIT_VOLUME_CLIMAX', 'FR_COLD_START'),
+    ('EXIT_MA_DEAD_CROSS', 'PRICE_MA_SLOPE_UP'),
+    ('BREAK_LONG_CONSOLIDATION_REAL', 'OI_ZSCORE_UP'),
+    ('EXIT_MA_DEAD_CROSS', 'VOLUME_MA_UP'),
+    ('BREAK_FLAT_THEN_BREAK', 'OI_ZSCORE_UP'),
+    ('BREAK_FLAT_THEN_BREAK', 'OI_MA_UP'),
+    ('PRICE_MA_SQUEEZE_UP', 'ENTRY_FUNDING_COLD_START_TREND'),
+    ('EXIT_MA_DEAD_CROSS', 'ENTRY_VWAP_RECLAIM_OI'),
+    ('OI_MA_CROSS_UP', 'ENTRY_UNCROWDED_MOMENTUM'),
+    ('EXIT_MA_DEAD_CROSS', 'VWAP_CROSS_UP'),
+    ('PRICE_MULTI_MA_STACK', 'EXIT_OI_VALUE_MA_DEAD_CROSS'),
+    ('FR_ABSOLUTE_DEEP_NEG', 'OI_MA_CROSS_UP'),
+    ('ENTRY_BOTTOM_STABILIZE', 'VOLUME_CLIMAX_UP'),
+    ('OI_MA_CROSS_UP', 'EXIT_PARABOLIC_EXTENSION'),
+    ('EXIT_FR_ROLL_OVER', 'VOL_ATR_EXPANSION'),
+    ('EXIT_MA_DEAD_CROSS', 'FR_POS_NOT_HOT'),
+    ('FR_ABSOLUTE_DEEP_NEG', 'FR_POS_NOT_HOT'),
+    ('OI_MA_CROSS_UP', 'EXIT_OI_VALUE_EXTREME')
 ]
 
+long_pair = [
+    ('ENTRY_VWAP_RECLAIM_OI', 'FR_LOW_NEG'),
+    ('EXIT_SHORT_SURGE_EXTREME', 'FR_LOW_NEG'),
+    ('ENTRY_TREND_CONFIRM_B', 'FR_VERY_LOW'),
+    ('VOL_LOW_TO_HIGH', 'FR_RECOVERY_FROM_LOW'),
+    ('EXIT_SHORT_SURGE_EXTREME', 'VOL_NOT_EXTREME'),
+    ('EXIT_MULTI_MA_BREAK', 'OI_ROC_PEAK'),
+    ('ENTRY_OI_FLASH_SURGE', 'FR_LOW_NEG'),
+    ('VWAP_CROSS_UP', 'PRICE_HIGHER_LOWS'),
+    ('ENTRY_VWAP_RECLAIM_OI', 'FR_PRICE_BULL_DIV'),
+    ('OI_LOW_TO_UP', 'EXIT_FR_SPIKE_THEN_COOL'),
+    ('VWAP_CROSS_UP', 'STRUCT_RANGE_POSITION_WEAK'),
+    ('ENTRY_VWAP_RECLAIM_OI', 'EXIT_OI_VALUE_MA_DEAD_CROSS'),
+    ('MOM_RECOVERY_FROM_LOW', 'FR_SLOPE_RISING'),
+    ('VWAP_ABOVE', 'EXIT_RANGE_POSITION_WEAK'),
+    ('FR_RESET_AFTER_HOT', 'FR_LOW_NEG'),
+    ('ENTRY_OI_LEAD_MOMENTUM', 'VOL_DOWN_SPIKE'),
+    ('MOM_BURST', 'FR_LOW_NEG'),
+    ('EXIT_VWAP_BREAK', 'FR_PRICE_BULL_DIV'),
+    ('STRUCT_SUPPORT_HOLD', 'FR_LOW_NEG'),
+    ('FR_ABSOLUTE_HIGH_POS', 'OI_MA_CROSS_UP'),
+    ('PRICE_CLOSE_CROSS_MA_UP', 'FR_LOW_NEG'),
+    ('EXIT_MULTI_MA_BREAK', 'OI_DROP_EXTREME'),
+    ('EXIT_FR_ROLL_OVER', 'FR_LOW_NEG'),
+    ('ENTRY_VWAP_RECLAIM_OI', 'OI_PRICE_DOWN_OI_DOWN'),
+    ('EXIT_FR_ROLL_OVER', 'EXIT_DISTRIBUTION_EXHAUSTION_TOP'),
+    ('EXIT_FR_EXTREME_HIGH', 'OI_MA_CROSS_UP'),
+    ('FR_POS_NOT_HOT', 'FR_LOW_NEG'),
+    ('FR_HIGH_EXTREME', 'FR_LOW_NEG'),
+    ('VWAP_RECLAIM', 'FR_PRICE_BULL_DIV'),
+    ('OI_LOW_TO_UP', 'FR_SPIKE_UP')
+]
 
 def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
     """
@@ -359,7 +426,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大并发持仓数", "⚡ 【最大并发持仓数】 横向截面对比", "{:.4f}", hl_nodes)
-
+        print_metric_matrix(sub_df, "真实净胜率(%)", "⚡ 【真实净胜率(%)】 横向截面对比", "{:.4f}", hl_nodes)
+        print_metric_matrix(sub_df, "策略组合资金最大回撤(%)", "⚡ 【策略组合资金最大回撤(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print("=" * 120)
 
     # 在遍历结束后，统一打印所有入选的最佳组合节点参数
@@ -595,7 +663,8 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大并发持仓数", "⚡ 【最大并发持仓数】 横向截面对比", "{:.4f}", hl_nodes)
-
+        print_metric_matrix(sub_df, "真实净胜率(%)", "⚡ 【真实净胜率(%)】 横向截面对比", "{:.4f}", hl_nodes)
+        print_metric_matrix(sub_df, "策略组合资金最大回撤(%)", "⚡ 【策略组合资金最大回撤(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print("=" * 120)
 
     # 在遍历结束后，统一打印所有入选的最佳组合节点参数
@@ -624,10 +693,10 @@ if __name__ == "__main__":
     # 替换为你实际的大宽表路径
     TARGET_CSV = './summary_results/advanced_summary_combined_ALL.csv'
 
-    # # ==== 打印指定列表，无任何过滤条件 ====
-    # display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
-    #
-    # display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+    # ==== 打印指定列表，无任何过滤条件 ====
+    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=short_pair, target_direction='Short')
 
-    # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
-    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Long')
+    display_specific_pairs_panels(csv_path=TARGET_CSV, target_pairs=long_pair, target_direction='Long')
+
+    # # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
+    # display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Long')
