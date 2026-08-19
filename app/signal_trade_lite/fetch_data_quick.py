@@ -11,6 +11,7 @@
 【闪现交付版】主线程金蝉脱壳 O(1) 返回、剔除 datetime_bj 性能枷锁、后台线程接管全量清洗落盘。
 【资金费率极速扩展】新增无缝时间轴哈希去重、阈值脉冲探测结算抢跑、缓存回退拼接兜底方案。
 【全链路防断网修复版】为所有核心 HTTP/CCXT 请求覆盖指数退避与防弹装甲，抵御 WinError 64 闪断异常。
+【OI未平仓合约极速扩展版】新增 Open Interest 历史持仓量全链路极速拉取引擎（纯REST轮询，双列极简版）。
 """
 
 import asyncio
@@ -877,7 +878,271 @@ async def _async_core_funding_orchestrator(symbol_list, days, proxy_url):
 
 
 # =====================================================================
-# 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API]
+# 📊 模块七：OI 未平仓合约缓存与存储引擎 (Open Interest Cache & Storage)
+# =====================================================================
+def load_oi_cache(symbol_list, timeframe, cache_dir="data", log_prefix=""):
+    """
+    智能加载 OI 本地缓存，严禁多余字段，仅提取并保留 timestamp 和 oi_amount。
+    """
+    memory_pool = {sym: {} for sym in symbol_list}
+    max_cache_ts_map = {sym: 0 for sym in symbol_list}
+    os.makedirs(cache_dir, exist_ok=True)
+
+    for sym in symbol_list:
+        safe_symbol = sym.replace("/", "_").replace(":", "_")
+        path = os.path.join(cache_dir, f"{safe_symbol}_oi_{timeframe}_latest.csv")
+
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                if not df.empty and 'timestamp' in df.columns and 'oi_amount' in df.columns:
+                    records = df[['timestamp', 'oi_amount']].values.tolist()
+                    for row in records:
+                        ts = int(row[0])
+                        memory_pool[sym][ts] = {
+                            'timestamp': ts,
+                            'oi_amount': float(row[1]) if pd.notna(row[1]) else 0.0
+                        }
+                    max_cache_ts_map[sym] = int(df['timestamp'].max())
+            except Exception as e:
+                logger.warning(f"{log_prefix} [OI_CACHE] ⚠️ 读取 {sym} OI 缓存失败: {e}")
+
+    return memory_pool, max_cache_ts_map
+
+
+def _save_oi_csv_sync_fast(full_dfs, cache_dir, timeframe, log_prefix=""):
+    """后台独立落盘 OI 数据，严格保障双列极简格式，辅以临时文件防损坏"""
+    os.makedirs(cache_dir, exist_ok=True)
+    for symbol, df in full_dfs.items():
+        safe_symbol = symbol.replace("/", "_").replace(":", "_")
+        path = os.path.join(cache_dir, f"{safe_symbol}_oi_{timeframe}_latest.csv")
+        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            # df 中本身已被修剪为纯净两列
+            df.to_csv(temp_path, index=False)
+            os.replace(temp_path, path)
+        except Exception as e:
+            logger.error(f"{log_prefix} [OI_DISK] ❌ 保存 {symbol} OI 失败: {e}")
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+
+def dispatch_oi_background_save(memory_pool_copy, timeframe, cache_dir="data", log_prefix=""):
+    """释放主线程的 OI 落盘任务"""
+
+    def _task():
+        full_dfs = {}
+        for sym, records in memory_pool_copy.items():
+            sorted_records = [r for _, r in sorted(records.items())]
+            full_dfs[sym] = pd.DataFrame(
+                sorted_records,
+                columns=['timestamp', 'oi_amount']
+            )
+        _save_oi_csv_sync_fast(full_dfs, cache_dir, timeframe, log_prefix)
+
+    threading.Thread(target=_task, daemon=False).start()
+
+
+# =====================================================================
+# 🚀 模块八：OI 未平仓合约极速获取引擎 (Open Interest Orchestrator)
+# =====================================================================
+async def _fetch_oi_for_symbol(exchange, symbol, timeframe, target_start_ms, target_time_ms, memory_pool, max_cache_ts,
+                               log_prefix=""):
+    """
+    单币种 OI 获取：纯 REST API 分页轮询拉取，受到目标时间硬性边界约束。
+    智能实现历史追赶、战术休眠以及目标时间到达后的脉冲探测，保证必须拉取到 target_time_ms 的数据。
+    """
+    try:
+        # 如果缓存有数据，从缓存最大时间回退两个 timeframe 作为安全拼接点；否则从起跑线拉取
+        timeframe_ms = exchange.parse_timeframe(timeframe) * 1000
+        since_ms = max_cache_ts - (timeframe_ms * 2) if max_cache_ts > 0 else target_start_ms
+        curr_since = since_ms
+
+        logger.info(
+            f"{log_prefix} [OI_REST] 🛒 {symbol} 启动纯 REST 轮询拉取 OI | 起点: {_format_bj_time(curr_since)} | 目标: {_format_bj_time(target_time_ms)}")
+
+        while True:
+            hist_oi = None
+            # 核心防断网装甲：三次指数退避重试
+            for attempt in range(3):
+                try:
+                    # limit=500 是 Binance 等交易所对 OI 接口的标准常见限制
+                    hist_oi = await exchange.fetch_open_interest_history(symbol, timeframe, since=curr_since, limit=500)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(2)
+                    else:
+                        logger.error(f"{log_prefix} [OI_REST] {symbol} OI 历史分页请求中断: {e}")
+                        raise e
+
+            if hist_oi:
+                for r in hist_oi:
+                    ts = int(r['timestamp'])
+                    # 包容性提取：CCXT 返回的 openInterestAmount 即为币的持仓量
+                    amt = r.get('openInterestAmount', 0.0)
+
+                    # 如果标准字段提取失败，尝试兼容 info 中的原始数据
+                    if (amt is None or amt == 0.0) and 'info' in r:
+                        raw_sum_amt = r['info'].get('sumOpenInterest')
+                        if raw_sum_amt: amt = float(raw_sum_amt)
+
+                    # 严格按照两列格式写入内存池
+                    memory_pool[symbol][ts] = {
+                        'timestamp': ts,
+                        'oi_amount': amt if amt else 0.0
+                    }
+
+                latest_ts = hist_oi[-1]['timestamp']
+
+                # 【核心修正】：如果最新数据已经覆盖或超越了目标时间，大功告成，直接跳出
+                if latest_ts >= target_time_ms:
+                    logger.info(
+                        f"{log_prefix} [OI_REST] 🎯 {symbol} 成功捕获目标时间 {_format_bj_time(target_time_ms)} 的 OI 数据！")
+                    break
+
+                # 如果拉满了 500 条且还未到目标时间，说明历史还没拉完，直接继续拉下一页
+                if len(hist_oi) == 500:
+                    curr_since = latest_ts + 1
+                    continue
+                else:
+                    curr_since = latest_ts + 1
+            else:
+                # 没有拉到数据，兜底检查内存池最高水位是否已经满足目标（防死循环）
+                if memory_pool[symbol] and max(memory_pool[symbol].keys()) >= target_time_ms:
+                    break
+
+            # =====================================================================
+            # 执行到这里，说明历史数据已经拉到【当前最新】，但【当前最新】还没有达到目标时间 target_time_ms。
+            # 需要进入【挂起/轮询】阶段，死等目标数据产出。
+            # =====================================================================
+            current_sys_ms = time.time() * 1000
+            time_to_wait = target_time_ms - current_sys_ms
+
+            if time_to_wait > 0:
+                # 场景 A：目标时间还在未来，进入战术休眠直到目标时间到达（加 1 秒防提前苏醒）
+                sleep_sec = (time_to_wait / 1000.0) + 1.0
+                logger.info(f"{log_prefix} [OI_REST] 💤 {symbol} 目标未到，休眠 {sleep_sec:.1f}s 后启动冲刺探测...")
+                await asyncio.sleep(sleep_sec)
+            else:
+                # 场景 B：目标时间已过，但交易所还没刷新出该时间点的数据（延迟），启动高频脉冲轮询
+                await asyncio.sleep(1.0)  # 2秒轮询一次，兼顾极限速度与防封
+
+    except asyncio.CancelledError:
+        # 响应外部的超时熔断
+        raise
+    except Exception as e:
+        logger.error(f"{log_prefix} [OI_ERR] ❌ {symbol} OI 获取异常退出: {e}")
+
+
+async def _async_core_oi_orchestrator(symbol_list, timeframe, days, target_time_str, proxy_url):
+    orchestrator_start_t = time.time()
+    run_id = f"O-{uuid.uuid4().hex[:4].upper()}"
+    log_prefix = f"[{run_id}]"
+
+    exchange_config = {
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'},
+        'timeout': 15000
+    }
+    if proxy_url:
+        exchange_config['aiohttp_proxy'] = proxy_url
+        exchange_config['proxies'] = {'http': proxy_url, 'https': proxy_url}
+
+    exchange = ccxt.binance(exchange_config)
+    try:
+        # 防断网加载 Markets
+        for attempt in range(3):
+            try:
+                await exchange.load_markets()
+                break
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"{log_prefix} [OI_INIT] load_markets 彻底失败: {e}")
+                    raise
+
+        await check_time_sync(exchange, log_prefix)
+
+        # 调用已有的 parse_time_params，实现数学级向下对齐，算出严苛时间边界
+        timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
+            exchange, timeframe, days, target_time_str)
+
+        logger.info(
+            f"{log_prefix} [OI_INIT] 🚀 OI 未平仓极速引擎发车 | target={_format_bj_time(target_time_ms)} timeframe={timeframe} days={days} symbols={len(symbol_list)}")
+
+        # 1. 智能加载双列缓存
+        memory_pool, max_cache_ts_map = load_oi_cache(symbol_list, timeframe, log_prefix=log_prefix)
+
+        # 2. 并发执行所有币种的 OI 纯 REST 轮询拉取（封装成 Task 以便支持超时熔断）
+        tasks = [
+            asyncio.create_task(
+                _fetch_oi_for_symbol(exchange, sym, timeframe, start_time_ms, timeframe_ms, memory_pool,
+                                     max_cache_ts_map[sym], log_prefix)
+            )
+            for sym in symbol_list
+        ]
+
+        # 绝对超时限制：与K线引擎对齐，目标收盘时间 + 60秒宽限期，防止API长时假死
+        absolute_deadline_ms = target_close_time_ms + 60000
+        current_ms = exchange.milliseconds()
+        timeout = max(5.0, (absolute_deadline_ms - current_ms) / 1000.0)
+
+        try:
+            # 等待所有任务完成，或者触发绝对超时熔断
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"{log_prefix} [OI_RACE] 🚨 触发绝对超时硬熔断(>1m)！强制终止脉冲轮询，交卷返回当前已获取数据！")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 3. 后台守护线程异步落盘 (仅保存 timestamp, oi_amount)
+        memory_pool_copy = {sym: {k: v.copy() for k, v in pool.items()} for sym, pool in memory_pool.items()}
+        dispatch_oi_background_save(memory_pool_copy, timeframe, log_prefix=log_prefix)
+
+        # 4. 闪现交付 O(1) 切片 (仅返回 timestamp, oi_amount 两列)
+        final_dfs = {}
+        total_pts = 0
+        for sym in symbol_list:
+            sliced_records = [
+                r for ts, r in memory_pool[sym].items()
+                if start_time_ms <= ts <= target_time_ms
+            ]
+            sliced_records.sort(key=lambda x: x['timestamp'])
+
+            # DataFrame 彻底净化为两列
+            df = pd.DataFrame(sliced_records, columns=['timestamp', 'oi_amount'])
+            final_dfs[sym] = df
+            total_pts += len(df)
+
+        total_runtime = time.time() - orchestrator_start_t
+        logger.info(
+            f"{log_prefix} [OI_EXIT] 🎉 OI 纯REST极速交付完毕 | total_rows={total_pts} runtime={total_runtime:.2f}s")
+        return final_dfs
+    finally:
+        try:
+            if hasattr(exchange, 'session') and exchange.session:
+                if hasattr(exchange.session, 'connector') and exchange.session.connector:
+                    try:
+                        await asyncio.wait_for(exchange.session.connector.close(), timeout=0.00002)
+                    except:
+                        pass
+            exchange.session = None
+            await asyncio.wait_for(exchange.close(), timeout=0.00002)
+        except:
+            pass
+
+
+# =====================================================================
+# 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API & 新增 OI API]
 # =====================================================================
 def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
                      use_ws=True, use_rest=True, proxy_url=None):
@@ -916,8 +1181,32 @@ def snipe_funding_rate_data(symbol_list, days, proxy_url=None):
     )
 
 
+def snipe_oi_data(symbol_list, timeframe, days, target_time_str, proxy_url=None):
+    """
+    🚀 同步入口：极速获取 Open Interest (未平仓合约) 历史数据。
+    纯REST全链路轮询拉取，指定截止时间，确保返回 O(1) [timestamp, oi_amount] 双列极简切片。
+    :param symbol_list: 币种列表
+    :param timeframe: OI 获取的周期，如 '5m', '1h'
+    :param days: 期望获取的历史天数
+    :param target_time_str: 期望获取的截止时间边界
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        raise RuntimeError("检测到已存在运行中的异步事件循环。\n请在顶部执行：import nest_asyncio; nest_asyncio.apply()")
+
+    return asyncio.run(
+        _async_core_oi_orchestrator(
+            symbol_list, timeframe, days, target_time_str, proxy_url
+        )
+    )
+
+
 # =====================================================================
-# 🚀 启动入口 [严格未修改]
+# 🚀 启动入口 [严格未修改（仅增加了 OI 的调用示例）]
 # =====================================================================
 if __name__ == "__main__":
 
@@ -930,11 +1219,11 @@ if __name__ == "__main__":
 
         logger.info(">>> 准备调用数据引擎...")
 
-        # ======= 1. K线数据极速引擎调用演示 =======
+        # # ======= 1. K线数据极速引擎调用演示 =======
         # result_map = snipe_kline_data(
         #     symbol_list=symbol_list,
-        #     timeframe="1m",
-        #     days=150,
+        #     timeframe="15m",
+        #     days=10,
         #     target_time_str=target_time,
         #     use_ws=True,
         #     use_rest=True,
@@ -943,12 +1232,24 @@ if __name__ == "__main__":
         # logger.info(f"✅ 已完成对所有币种的极速K线引擎数据请求，正在进行数据完整性检查和预处理...")
 
         # ======= 2. 资金费率极速引擎调用演示 =======
-        logger.info(">>> 准备调用资金费率极速引擎...")
-        funding_result_map = snipe_funding_rate_data(
+        # logger.info(">>> 准备调用资金费率极速引擎...")
+        # funding_result_map = snipe_funding_rate_data(
+        #     symbol_list=symbol_list,
+        #     days=150,
+        #     proxy_url='http://127.0.0.1:7890'
+        # )
+        # logger.info(f"✅ 已完成资金费率数据请求，返回了指定区间的去重结算数据。")
+
+        # ======= 3. OI 未平仓合约极速引擎调用演示 =======
+        logger.info(">>> 准备调用 OI 未平仓合约极速引擎...")
+        oi_result_map = snipe_oi_data(
             symbol_list=symbol_list,
-            days=150,
+            timeframe="15m",
+            days=20,
+            target_time_str=target_time,  # 加入指定的统一时间边界
             proxy_url='http://127.0.0.1:7890'
         )
-        logger.info(f"✅ 已完成资金费率数据请求，返回了指定区间的去重结算数据。")
+        logger.info(f"✅ 已完成 OI 数据纯REST请求，自动合并落盘并返回两列 O(1) 切片。")
+        # print(oi_result_map['BTC/USDC:USDC'].head()) # 打印验证，应仅包含 timestamp 与 oi_amount
 
         break
