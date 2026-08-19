@@ -1222,22 +1222,22 @@ def mine_symbol(coin, df, cfg, btc_close=None):
                             for k_, v_ in row.items():
                                 col_data[k_].append(v_)
 
-                    # 【新增】记录单笔交易详情（带入最大回撤）
-                    for i in range(len(ent_f)):
-                        trade_records.append({
-                            'coin': coin,
-                            'entry_factor': en,
-                            'exit_factor': xn,
-                            'direction': direction,
-                            'filter_mode': lab,
-                            'entry_time': df_times[ent_f[i]],
-                            'exit_time': df_times[ext_f[i]],
-                            'entry_price': exec_px[ent_f[i]],
-                            'exit_price': exec_px[ext_f[i]],
-                            'return': rets_f[i],
-                            'max_drawdown': mdds[i],
-                            'fr_sum': fr_f[i]
-                        })
+                        # 【新增】记录单笔交易详情（带入最大回撤）
+                        for i in range(len(ent_f)):
+                            trade_records.append({
+                                'coin': coin,
+                                'entry_factor': en,
+                                'exit_factor': xn,
+                                'direction': direction,
+                                'filter_mode': lab,
+                                'entry_time': df_times[ent_f[i]],
+                                'exit_time': df_times[ext_f[i]],
+                                'entry_price': exec_px[ent_f[i]],
+                                'exit_price': exec_px[ext_f[i]],
+                                'return': rets_f[i],
+                                'max_drawdown': mdds[i],
+                                'fr_sum': fr_f[i]
+                            })
 
     out = pd.DataFrame(col_data) if col_data else pd.DataFrame()
     df_trades = pd.DataFrame(trade_records) if trade_records else pd.DataFrame()
