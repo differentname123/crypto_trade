@@ -344,6 +344,8 @@ def display_pivot_panels(csv_path, top_n=50, target_direction='Long'):
         print_metric_matrix(sub_df, "单笔净期望(%)", "💰 【单笔净收益 / 单笔净期望(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
+        print_metric_matrix(sub_df, "最大并发持仓数", "⚡ 【最大并发持仓数】 横向截面对比", "{:.4f}", hl_nodes)
+
 
         print("=" * 120)
 
@@ -575,6 +577,7 @@ def display_specific_pairs_panels(csv_path, target_pairs, target_direction='Long
         print_metric_matrix(sub_df, "Top3币收益占比(%)", "💰 【Top3币收益占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "策略赚钱性价比", "⚡ 【策略性价比 (收益风险比)】 横向截面对比", "{:.4f}", hl_nodes)
         print_metric_matrix(sub_df, "最大回撤历时占比(%)", "⚡ 【最大回撤历时占比(%)】 横向截面对比", "{:.4f}", hl_nodes)
+        print_metric_matrix(sub_df, "最大并发持仓数", "⚡ 【最大并发持仓数】 横向截面对比", "{:.4f}", hl_nodes)
 
         print("=" * 120)
 
@@ -611,4 +614,4 @@ if __name__ == "__main__":
 
 
     # 如果需要恢复原来的输出 Top N 功能，取消下面一行的注释即可
-    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Long')
+    display_pivot_panels(csv_path=TARGET_CSV, top_n=500, target_direction='Short')
