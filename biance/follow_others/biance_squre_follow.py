@@ -26,16 +26,18 @@ import random
 import time
 import threading
 from datetime import datetime, timedelta
+from common.common_utils import setup_logger, get_config, read_json, save_json
+logger = setup_logger(app_name="biance_follow")
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from biance.biance_playwright import get_auth_tokens_robust
-from common.common_utils import setup_logger, get_config, read_json, save_json
+
+
 from biance.biance_squre_api import fetch_binance_feed, toggle_binance_follow, \
     fetch_binance_relations, fetch_binance_user_profile
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
-logger = setup_logger(app_name="biance_follow")
 
 # ---------------------------- 全局常量与锁 ----------------------------
 COOKIE_UPDATE_INTERVAL_DAYS = 1
