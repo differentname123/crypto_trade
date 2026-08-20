@@ -888,6 +888,53 @@ def run_single_strategy(config):
     strategy.run_main_loop()
 
 
+def cancel_all_orders_for_symbol(exchange, symbol):
+    """
+    一键取消指定交易对的所有未成交挂单。
+    优先尝试交易所的高效原生批量撤单接口；若不支持，则自动降级为遍历撤单。
+
+    参数:
+      - exchange: 已初始化 API Key 和 Secret 的 ccxt 交易所实例
+      - symbol: 交易对名称, 例如 "STX/USDT:USDT" (合约) 或 "STX/USDT" (现货)
+
+    返回:
+      - bool: 执行是否成功
+    """
+    logger.info(f"[紧急清理] 开始撤销 【{symbol}】 的所有活动挂单...")
+    try:
+        # 1. 优先尝试 ccxt 的批量撤单接口 (币安等主流交易所均支持，单次网络请求即可完成)
+        if exchange.has.get('cancelAllOrders'):
+            exchange.cancel_all_orders(symbol)
+            logger.info(f"[紧急清理] 【{symbol}】 批量撤单指令下发成功 (调用了 cancelAllOrders 接口)")
+            return True
+
+        # 2. 兜底方案：如果 API 不支持批量撤单，则拉取当前挂单并逐个撤销
+        logger.warning(f"[紧急清理] 当前交易所不支持一键撤单，自动降级为逐个撤销模式...")
+        open_orders = exchange.fetch_open_orders(symbol)
+
+        if not open_orders:
+            logger.info(f"[紧急清理] 【{symbol}】 当前盘口没有活动挂单，无需撤销")
+            return True
+
+        cancel_count = 0
+        for order in open_orders:
+            order_id = order.get('id')
+            if order_id:
+                exchange.cancel_order(order_id, symbol)
+                cancel_count += 1
+                logger.debug(f"[紧急清理] 已撤销订单 ID:[{order_id}]")
+
+        logger.info(f"[紧急清理] 【{symbol}】 成功逐个撤销了 {cancel_count} 张挂单")
+        return True
+
+    except Exception as ne:
+        logger.error(f"[紧急清理] 网络异常导致撤单失败，请检查网络或代理设置 | 错误: {ne}")
+        return False
+    except Exception as e:
+        logger.error(f"[紧急清理] 撤销 【{symbol}】 挂单时发生未知异常 | 错误: {e}")
+        return False
+
+
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
     current_symbol = "20260721"
@@ -903,11 +950,11 @@ def main_app():
         ),  # 消耗  464  u 网格数量 101
 
         GridConfig(
-            strategy_id=f"STX{current_symbol}", symbol="STX/USDT:USDT",
-            min_price=0.05, max_price=0.163, price_ratio=0.92, quantity=100,
-        ),  # 消耗  132  u 网格数量 129
+            strategy_id=f"STX{20260820}", symbol="STX/USDT:USDT",
+            min_price=0.05, max_price=0.19, price_ratio=1.44, quantity=300,
+        ),  # 消耗  242  u 网格数量 93
 
-        # 总共节点和为 62+101+129=292 个节点, 资金消耗约 581+464+132=1177 u
+        # 总共节点和为 62+101+93= 256 个节点, 总消耗约 581+464+242=1287 u
     ]
     processes = []
     for config in configs:
@@ -930,3 +977,10 @@ def main_app():
 
 if __name__ == "__main__":
     main_app()
+
+    #
+    # # 取消 STX 的挂单
+    # api_key = get_config("nana_biance_api_copy_key")
+    # secret_key = get_config("nana_biance_api_copy_secret")
+    # proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+    # cancel_all_orders_for_symbol(safe_init_exchange(api_key, secret_key, proxies), "STX/USDT:USDT")
