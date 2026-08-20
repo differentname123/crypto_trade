@@ -310,7 +310,7 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         m_combo_v = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        # print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
+        print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
         dur_sub = row['最优子组合_最大回撤历时(天)']
