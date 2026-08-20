@@ -413,30 +413,35 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
         blacklist_candidates = [uid for uid in ordered_following_uids if uid not in global_fans_uids]
 
         # 末位淘汰：通过切片 [-need_unfollow_count:] 直接提取列表尾端（最老的一批）执行取关
-        # 完美避开了头部刚刚关注还未回关的新人，天然生成数天的时间缓冲期
-        uids_to_unfollow = blacklist_candidates[-need_unfollow_count:] if need_unfollow_count <= len(
-            blacklist_candidates) else blacklist_candidates
+        # 完美避开了头部刚刚关注还未回关的新人，天然生成数天的时间缓冲期 (Python切片自带防越界，直接截取即可)
+        uids_to_unfollow = blacklist_candidates[-need_unfollow_count:]
 
-        logger.info(
-            f"[蓄水池/锁定目标] 过滤矩阵粉丝后, 锁定尾部最老的【{len(uids_to_unfollow)}】名非互关粉丝准备清理")
-
-        unfollow_success_count = 0
         total_unfollow = len(uids_to_unfollow)
-        for index, uid in enumerate(uids_to_unfollow, 1):
-            is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
-            if is_success:
-                unfollow_success_count += 1
+
+        # 修复死锁：如果全是矩阵互关粉，导致清洗目标为0，则跳过清洗避免本账号永远卡死停工
+        if total_unfollow == 0:
+            logger.warning(
+                f"[蓄水池/死锁警告] 账号【{user_key}】全为互关铁粉，无白嫖党可清理！ | 关键参数: 当前关注【{current_following_count}】 | 结果: 放弃清洗，强行向下流转防卡死")
+        else:
+            logger.info(
+                f"[蓄水池/锁定目标] 过滤矩阵粉丝后, 锁定尾部最老的【{total_unfollow}】名非互关粉丝准备清理")
+
+            unfollow_success_count = 0
+            for index, uid in enumerate(uids_to_unfollow, 1):
+                is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
+                if is_success:
+                    unfollow_success_count += 1
+
+                logger.info(
+                    f"[网络交互/行为执行] 触发账号【取关】动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total_unfollow}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
+
+                if index < total_unfollow:
+                    sleep_time = random.uniform(6, 9)
+                    time.sleep(sleep_time)
 
             logger.info(
-                f"[网络交互/行为执行] 触发账号【取关】动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total_unfollow}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
-
-            if index < total_unfollow:
-                sleep_time = random.uniform(6, 9)
-                time.sleep(sleep_time)
-
-        logger.info(
-            f"[调度流转/账号完结] 单账号清洗流闭环完毕 | 关键参数: 账号【{user_key}】, 计划清理【{total_unfollow}】, 成功【{unfollow_success_count}】 | 结果: 释放线程资源")
-        return  # 泄洪轮次直接结束，不执行下方的关注逻辑，等待主线下一轮心跳
+                f"[调度流转/账号完结] 单账号清洗流闭环完毕 | 关键参数: 账号【{user_key}】, 计划清理【{total_unfollow}】, 成功【{unfollow_success_count}】 | 结果: 释放线程资源")
+            return  # 泄洪轮次直接结束，不执行下方的关注逻辑，等待主线下一轮心跳
     # ===============================================================
 
     # ---------------- 核心装填逻辑：绝对优先级排序 ----------------
