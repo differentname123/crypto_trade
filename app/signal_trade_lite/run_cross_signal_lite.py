@@ -420,7 +420,7 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     """
     P = {'M_HOURS': 4, 'N_HOURS': 24, 'W_DAYS': 14,
          'ATR_RANK_LOW_TH': 0.20, 'ATR_RANK_HIGH_TH': 0.60, 'FR_RANK_LOW_TH': 0.10,
-         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 27 / 3,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 1.4,
          'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'}
 
     if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
@@ -474,7 +474,7 @@ def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15)
     入参形貌: kline_df=原始K线, fr_df=资金费率, oi_df=持仓量
     """
     P = {'N_HOURS': 24, 'M_HOURS': 4, 'W_DAYS': 14, 'POWDER_OI_RK': 0.90, 'POWDER_VOL_RK': 0.30,
-         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 24, 'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'}
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 1.4, 'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short'}
 
     if (kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0
             or oi_df is None or len(oi_df) == 0):
@@ -534,7 +534,7 @@ def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
     入参形貌: kline_df=原始K线, oi_df=持仓量
     """
     P = {'M_HOURS': 4, 'N_HOURS': 24, 'W_DAYS': 14, 'OI_RANK_EXTREME_TH': 0.95, 'OI_HOT_TH': 0.050,
-         'TARGET_WEIGHT': -1.0, 'MAX_WEIGHT': 1.0 / 9 / 1.1, 'STRATEGY_NAME': 'oi_value_decay_short'}
+         'TARGET_WEIGHT': -1.0, 'MAX_WEIGHT': 1.0 / 1.4, 'STRATEGY_NAME': 'oi_value_decay_short'}
 
     if kline_df is None or len(kline_df) == 0 or oi_df is None or len(oi_df) == 0:
         return [], pd.DataFrame(columns=SIGNAL_COLS)
