@@ -399,6 +399,46 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     following_map, _ = _get_current_relations(my_name, max_count=10000)
     my_following_uids = set(following_map.values())
 
+    # ================= 蓄水池水位控制与取关清洗逻辑 =================
+    current_following_count = len(my_following_uids)
+    if current_following_count >= 1900:
+        need_unfollow_count = current_following_count - 1700
+        logger.info(
+            f"[蓄水池/水位告警] 账号【{user_key}】当前关注数【{current_following_count}】触达高水位1900 | 关键参数: 目标降至1700 | 结果: 阻断加粉, 触发清洗模式")
+
+        # 保持API返回的原始顺序（Python3.7+字典维持插入序，此列表前端为最新关注，尾端为最老关注）
+        ordered_following_uids = list(following_map.values())
+
+        # 过滤掉矩阵全局粉丝，找出所有白嫖党（不关注我们任何号的人）
+        blacklist_candidates = [uid for uid in ordered_following_uids if uid not in global_fans_uids]
+
+        # 末位淘汰：通过切片 [-need_unfollow_count:] 直接提取列表尾端（最老的一批）执行取关
+        # 完美避开了头部刚刚关注还未回关的新人，天然生成数天的时间缓冲期
+        uids_to_unfollow = blacklist_candidates[-need_unfollow_count:] if need_unfollow_count <= len(
+            blacklist_candidates) else blacklist_candidates
+
+        logger.info(
+            f"[蓄水池/锁定目标] 过滤矩阵粉丝后, 锁定尾部最老的【{len(uids_to_unfollow)}】名非互关粉丝准备清理")
+
+        unfollow_success_count = 0
+        total_unfollow = len(uids_to_unfollow)
+        for index, uid in enumerate(uids_to_unfollow, 1):
+            is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
+            if is_success:
+                unfollow_success_count += 1
+
+            logger.info(
+                f"[网络交互/行为执行] 触发账号【取关】动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total_unfollow}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
+
+            if index < total_unfollow:
+                sleep_time = random.uniform(6, 9)
+                time.sleep(sleep_time)
+
+        logger.info(
+            f"[调度流转/账号完结] 单账号清洗流闭环完毕 | 关键参数: 账号【{user_key}】, 计划清理【{total_unfollow}】, 成功【{unfollow_success_count}】 | 结果: 释放线程资源")
+        return  # 泄洪轮次直接结束，不执行下方的关注逻辑，等待主线下一轮心跳
+    # ===============================================================
+
     # ---------------- 核心装填逻辑：绝对优先级排序 ----------------
     # 1. 提取全矩阵粉丝中的未关注对象作为【优先队列】（保证所有粉丝必须先被关注）
     vip_queue = global_fans_uids - my_following_uids
@@ -419,7 +459,7 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     success_count = 0
     total = len(final_uids_to_follow)
     for index, uid in enumerate(final_uids_to_follow, 1):
-        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token) # 'follow' 或 'unfollow'
+        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)  # 'follow' 或 'unfollow'
         if is_success:
             success_count += 1
 
@@ -453,8 +493,8 @@ def consumer_auto_sync_main(accounts=None):
 
             # 2. 初始化全局数据基座
             seed_user_names = set()
-            global_following_uids = set() # 矩阵所有账号的已关注池(用于绝对隔离去重)
-            global_fans_uids = set()      # 矩阵所有账号的粉丝大集合(最高优先级VIP)
+            global_following_uids = set()  # 矩阵所有账号的已关注池(用于绝对隔离去重)
+            global_fans_uids = set()  # 矩阵所有账号的粉丝大集合(最高优先级VIP)
 
             for acc in accounts:
                 my_name = get_config(f"{acc}_name")
@@ -552,7 +592,8 @@ if __name__ == "__main__":
             "[运行时框架/引导激活] 主程序内存空间分配完毕 | 关键参数: 【生产者挂载/消费者挂载】 | 结果: 双擎并发点火")
 
         t_producer = threading.Thread(target=producer_fetch_content_main, name="ProducerThread", daemon=True)
-        t_consumer = threading.Thread(target=consumer_auto_sync_main, kwargs={"accounts": ["dahao", "nana", "jie", "mama", "ruru", "yang", "daniang"]},
+        t_consumer = threading.Thread(target=consumer_auto_sync_main,
+                                      kwargs={"accounts": ["dahao", "nana", "jie", "mama", "ruru", "yang", "daniang"]},
                                       name="ConsumerThread", daemon=True)
 
         t_producer.start()
