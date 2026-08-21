@@ -1202,10 +1202,94 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
 
 
 # =============================================================================
+# 请将此函数添加到原代码 “四、各策略「最后一根 K 线」信号生成器” 区域中
+# =============================================================================
+def generate_high_fr_bear_div_short_signals(kline_df, fr_df, bar_minutes=15):
+    """
+    short_high_fr_bear_div（截面瞬时实盘版）：
+    当前资金费率绝对值极高(>0.1%)时做空；价格对比 24h 前创新高但费率反而下降（顶背离）时平仓。
+    入参形貌: kline_df=原始K线, fr_df=资金费率
+    """
+    P = {'N_HOURS': 24, 'FR_ABS_TH': 0.001, 'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0,
+         'STRATEGY_NAME': 'short_high_fr_bear_div'}
+
+    # 边界保护
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    # 调用原框架内建的超强对齐底座函数 (K线重采样 + 费率前向对齐补齐)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
+
+    N = _bars(P['N_HOURS'], bar_minutes)
+    if len(df) < N + 1:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    c, fr_series = df['close'], df['funding_rate']
+
+    # --- 截面瞬时特征切片：仅取当前最新一根和 N 个周期前的值 ---
+    curr_price = float(c.iloc[-1])
+    prev_n_price = _tail_float(c, N)
+
+    curr_fr = float(fr_series.iloc[-1])
+    prev_n_fr = _tail_float(fr_series, N)
+
+    # --- 核心逻辑判断 ---
+    is_entry = curr_fr > P['FR_ABS_TH']
+    is_exit = (curr_price > prev_n_price) and (curr_fr < prev_n_fr)
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', curr_price,
+                                   f"FR_ABSOLUTE_HIGH(fr:{curr_fr:.5f} > {P['FR_ABS_TH']})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', curr_price,
+                                   f"FR_PRICE_BEAR_DIV(P_curr:{curr_price:.4f}>P_24h:{prev_n_price:.4f} "
+                                   f"& fr_curr:{curr_fr:.5f}<fr_24h:{prev_n_fr:.5f})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    # 交由本地持久化状态机过滤无效/重复信号并还原真实账本
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+# =============================================================================
+# 请将此函数添加到原代码 “五、通用截面工作流驱动” 区域中
+# =============================================================================
+def execute_trading_bot_high_fr_bear_div_short(target_time, symbol_list, proxy_url=None):
+    """
+    High FR Bear Div Short 工作流（15m 线，需资金费率）：
+    根据绝对费率极值开空，费率与价格顶背离平空。
+    策略描述：Short_top_1 当市场极度疯狂、大家都在支付天价利息追涨时，果断进场做空（押注暴跌）；如果发现价格虽然还在创新高，但追涨的热度却已经开始下降，说明这波上涨很“虚”、随时会出事，立刻平仓安全撤退。
+    FR_ABSOLUTE_HIGH_POS -> FR_PRICE_BEAR_DIV Short_top_1
+    回测表现：
+    总交易笔数：188  单笔净收益：4.0501%  跨币种胜率(%)： 67.2414  均值单笔回撤(%)：-18.1552 平均持仓时间(天)：0.5933
+    持仓时间中位数(天)：0.3333  策略性价比 (收益风险比):4.9165 资金最大回撤：154.8710%   最大并发持仓：3
+
+    """
+    return _run_signal_workflow(
+        label='high_fr_bear_div_short',
+        target_time=target_time,
+        symbol_list=symbol_list,
+        timeframe="15m",
+        bar_minutes=15,
+        lookback_days=5,  # 只需要 24小时的偏移计算，给5天作为数据冗余保护
+        output_path="high_fr_bear_div_short_signals.csv",
+        proxy_url=proxy_url,
+        need_funding=True,
+        need_oi=False,
+        signal_fn=lambda k, fr, oi: generate_high_fr_bear_div_short_signals(k, fr, bar_minutes=15)[1]
+    )
+
+# =============================================================================
 # 七、程序入口（本地联调用）
 # =============================================================================
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
 
-    execute_trading_bot_oi_decay_short(target_time, symbol_list, 'http://127.0.0.1:7890')
+    execute_trading_bot_high_fr_bear_div_short(target_time, symbol_list, 'http://127.0.0.1:7890')
