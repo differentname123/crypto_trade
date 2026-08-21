@@ -3,6 +3,25 @@ import itertools
 import pandas as pd
 import numpy as np
 import datetime
+import re
+
+# =====================================================================
+# 🎛️ 打印看板控制台输出字段开关配置 (在此处注释掉不想在控制台输出的字段即可)
+# =====================================================================
+DASHBOARD_METRICS_TOGGLE = [
+    "赚钱性价比",
+    # "原始资金最大回撤",
+    # "最大单笔回撤",
+    # "最终资金最大回撤",
+    "最大回撤历时(天)",
+    "最大并发持仓",
+    "Top1币收益占比",
+    "单笔净期望(%)",
+    "涉及币种数",
+    "跨币种胜率(%)",
+    "平均持仓时间(天)",
+    # "持仓覆盖比例(%)"  # <--- 如果不想输出这行，只需在这行前面加个 # 注释掉即可
+]
 
 # =====================================================================
 # 全局信号脱敏映射模块 (新增)
@@ -184,9 +203,6 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
     """
     在控制台打印排版清晰的对比看板，快速识别 1+1 > 2 的组合
     """
-    # =================================================================
-    # 新增过滤：仅提取最大并发持仓 <= 100 的结果用于打印，剔除>100的选项
-    # =================================================================
     valid_single_df = single_df[single_df['最大并发持仓数'] <= 100]
     valid_pair_df = pair_df[pair_df['联合_最大并发持仓'] <= 100]
 
@@ -201,14 +217,12 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         f"{'排名':<4} | {'策略指纹 (TF | Entry | Exit | Dir | Filter)':<48} | {'净收益(%)':>10} | {'最大回撤(%)':>11} | {'性价比':>8}")
     print("-" * 92)
     for i, (_, row) in enumerate(valid_single_df.head(5).iterrows(), 1):
-        # 此处使用 get_masked_signal 进行脱敏
         strat_name = f"{row['周期']} | {get_masked_signal(row['入场'])} | {get_masked_signal(row['出场'])} | {row['方向']} | {row['过滤']}"
         if len(strat_name) > 46:
             strat_name = strat_name[:43] + "..."
         print(
             f"#{i:<3} | {strat_name:<48} | {row['总真实净收益(%)']:>9.2f}% | {row['策略组合资金最大回撤(%)']:>10.2f}% | {row['策略赚钱性价比']:>8.2f}")
 
-    # 2. 打印协同增强组合 Top N (按照 联合后的 赚钱性价比 降序排序)
     pair_df_sorted = valid_pair_df.sort_values(by='联合_赚钱性价比', ascending=False)
     top_synergy = pair_df_sorted.head(top_n)
 
@@ -218,11 +232,8 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
 
     for rank, (_, row) in enumerate(top_synergy.iterrows(), 1):
         cost_gain = row['【提升】性价比增量(vs单体最优)']
-        gain_flag = "🟢 [显著提升]" if cost_gain > 0 else "🔴 [无增益/稀释]"
 
         print(f"\n组合编号 {2}_{rank} 表现如下")
-
-        # 此处使用 get_masked_signal 进行脱敏
         print(
             f"  ├─ 组合 A: [{row['组合A_周期']}] {get_masked_signal(row['组合A_入场'])} -> {get_masked_signal(row['组合A_出场'])} ({row['组合A_方向']}_{row['组合A_过滤']})")
         print(
@@ -232,79 +243,93 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         print(f"  {'-' * 88}")
 
         # 1. 赚钱性价比
-        c_a = row['单A_赚钱性价比']
-        c_b = row['单B_赚钱性价比']
-        c_combo = row['联合_赚钱性价比']
-        c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
-        icon = "🔺" if cost_gain >= 0 else "🔻"
-        print(f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
+        if "赚钱性价比" in DASHBOARD_METRICS_TOGGLE:
+            c_a = row['单A_赚钱性价比']
+            c_b = row['单B_赚钱性价比']
+            c_combo = row['联合_赚钱性价比']
+            c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
+            icon = "🔺" if cost_gain >= 0 else "🔻"
+            print(f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
 
         # 2. 资金最大回撤系列
-        orig_a = row['单A_原始资金最大回撤(%)']
-        orig_b = row['单B_原始资金最大回撤(%)']
-        orig_combo = row['联合_原始资金最大回撤(%)']
-        print(f"  {'原始资金最大回撤':<14} | {orig_a:>13.2f}% | {orig_b:>13.2f}% | {orig_combo:>15.2f}% | {'---':>16}")
+        if "原始资金最大回撤" in DASHBOARD_METRICS_TOGGLE:
+            orig_a = row['单A_原始资金最大回撤(%)']
+            orig_b = row['单B_原始资金最大回撤(%)']
+            orig_combo = row['联合_原始资金最大回撤(%)']
+            print(
+                f"  {'原始资金最大回撤':<14} | {orig_a:>13.2f}% | {orig_b:>13.2f}% | {orig_combo:>15.2f}% | {'---':>16}")
 
-        single_a = row['单A_最大单笔回撤(%)']
-        single_b = row['单B_最大单笔回撤(%)']
-        single_combo = row['联合_最大单笔回撤(%)']
-        print(
-            f"  {'最大单笔回撤':<14} | {single_a:>13.2f}% | {single_b:>13.2f}% | {single_combo:>15.2f}% | {'---':>16}")
+        if "最大单笔回撤" in DASHBOARD_METRICS_TOGGLE:
+            single_a = row['单A_最大单笔回撤(%)']
+            single_b = row['单B_最大单笔回撤(%)']
+            single_combo = row['联合_最大单笔回撤(%)']
+            print(
+                f"  {'最大单笔回撤':<14} | {single_a:>13.2f}% | {single_b:>13.2f}% | {single_combo:>15.2f}% | {'---':>16}")
 
-        m_a = row['单A_资金最大回撤(%)']
-        m_b = row['单B_资金最大回撤(%)']
-        m_combo = row['联合_资金最大回撤(%)']
-        m_diff = row['【风险】回撤变动(vs单体最低)(%)']
-        m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'最终资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
+        if "最终资金最大回撤" in DASHBOARD_METRICS_TOGGLE:
+            m_a = row['单A_资金最大回撤(%)']
+            m_b = row['单B_资金最大回撤(%)']
+            m_combo = row['联合_资金最大回撤(%)']
+            m_diff = row['【风险】回撤变动(vs单体最低)(%)']
+            m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
+            print(f"  {'最终资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
-        dur_a = row['单A_最大回撤历时(天)']
-        dur_b = row['单B_最大回撤历时(天)']
-        dur_combo = row['联合_最大回撤历时(天)']
-        print(f"  {'最大回撤历时(天)':<14} | {dur_a:>14.2f} | {dur_b:>14.2f} | {dur_combo:>16.2f} | {'---':>16}")
+        if "最大回撤历时(天)" in DASHBOARD_METRICS_TOGGLE:
+            dur_a = row['单A_最大回撤历时(天)']
+            dur_b = row['单B_最大回撤历时(天)']
+            dur_combo = row['联合_最大回撤历时(天)']
+            print(f"  {'最大回撤历时(天)':<14} | {dur_a:>14.2f} | {dur_b:>14.2f} | {dur_combo:>16.2f} | {'---':>16}")
 
         # 4. 最大并发持仓
-        con_a = int(row['单A_最大并发持仓'])
-        con_b = int(row['单B_最大并发持仓'])
-        con_combo = int(row['联合_最大并发持仓'])
-        print(f"  {'最大并发持仓':<14} | {con_a:>14} | {con_b:>14} | {con_combo:>16} | {'---':>16}")
+        if "最大并发持仓" in DASHBOARD_METRICS_TOGGLE:
+            con_a = int(row['单A_最大并发持仓'])
+            con_b = int(row['单B_最大并发持仓'])
+            con_combo = int(row['联合_最大并发持仓'])
+            print(f"  {'最大并发持仓':<14} | {con_a:>14} | {con_b:>14} | {con_combo:>16} | {'---':>16}")
 
         # 5. Top1币收益占比
-        top1_a = row['单A_Top1币收益占比(%)']
-        top1_b = row['单B_Top1币收益占比(%)']
-        top1_combo = row['联合_Top1币收益占比(%)']
-        print(f"  {'Top1币收益占比':<14} | {top1_a:>13.2f}% | {top1_b:>13.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
+        if "Top1币收益占比" in DASHBOARD_METRICS_TOGGLE:
+            top1_a = row['单A_Top1币收益占比(%)']
+            top1_b = row['单B_Top1币收益占比(%)']
+            top1_combo = row['联合_Top1币收益占比(%)']
+            print(
+                f"  {'Top1币收益占比':<14} | {top1_a:>13.2f}% | {top1_b:>13.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
 
         # 6. 单笔净期望(%)
-        exp_a = row['单A_单笔净期望(%)']
-        exp_b = row['单B_单笔净期望(%)']
-        exp_combo = row['联合_单笔净期望(%)']
-        print(f"  {'单笔净期望(%)':<14} | {exp_a:>13.2f}% | {exp_b:>13.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
+        if "单笔净期望(%)" in DASHBOARD_METRICS_TOGGLE:
+            exp_a = row['单A_单笔净期望(%)']
+            exp_b = row['单B_单笔净期望(%)']
+            exp_combo = row['联合_单笔净期望(%)']
+            print(f"  {'单笔净期望(%)':<14} | {exp_a:>13.2f}% | {exp_b:>13.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
 
         # 7. 涉及币种数
-        coin_cnt_a = int(row['单A_涉及币种数'])
-        coin_cnt_b = int(row['单B_涉及币种数'])
-        coin_cnt_combo = int(row['联合_涉及币种数'])
-        print(f"  {'涉及币种数':<14} | {coin_cnt_a:>14} | {coin_cnt_b:>14} | {coin_cnt_combo:>16} | {'---':>16}")
+        if "涉及币种数" in DASHBOARD_METRICS_TOGGLE:
+            coin_cnt_a = int(row['单A_涉及币种数'])
+            coin_cnt_b = int(row['单B_涉及币种数'])
+            coin_cnt_combo = int(row['联合_涉及币种数'])
+            print(f"  {'涉及币种数':<14} | {coin_cnt_a:>14} | {coin_cnt_b:>14} | {coin_cnt_combo:>16} | {'---':>16}")
 
         # 8. 跨币种胜率(%)
-        cw_a = row['单A_跨币种胜率(%)']
-        cw_b = row['单B_跨币种胜率(%)']
-        cw_combo = row['联合_跨币种胜率(%)']
-        print(f"  {'跨币种胜率(%)':<14} | {cw_a:>13.2f}% | {cw_b:>13.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
+        if "跨币种胜率(%)" in DASHBOARD_METRICS_TOGGLE:
+            cw_a = row['单A_跨币种胜率(%)']
+            cw_b = row['单B_跨币种胜率(%)']
+            cw_combo = row['联合_跨币种胜率(%)']
+            print(f"  {'跨币种胜率(%)':<14} | {cw_a:>13.2f}% | {cw_b:>13.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
 
         # 9. 平均持仓时间(天)
-        ht_a = row['单A_平均持仓时间(天)']
-        ht_b = row['单B_平均持仓时间(天)']
-        ht_combo = row['联合_平均持仓时间(天)']
-        print(f"  {'平均持仓时间(天)':<14} | {ht_a:>14.2f} | {ht_b:>14.2f} | {ht_combo:>16.2f} | {'---':>16}")
+        if "平均持仓时间(天)" in DASHBOARD_METRICS_TOGGLE:
+            ht_a = row['单A_平均持仓时间(天)']
+            ht_b = row['单B_平均持仓时间(天)']
+            ht_combo = row['联合_平均持仓时间(天)']
+            print(f"  {'平均持仓时间(天)':<14} | {ht_a:>14.2f} | {ht_b:>14.2f} | {ht_combo:>16.2f} | {'---':>16}")
 
         # 10. 持仓时间覆盖比例(%)
-        cov_a = row['单A_持仓时间覆盖比例(%)']
-        cov_b = row['单B_持仓时间覆盖比例(%)']
-        cov_combo = row['联合_持仓时间覆盖比例(%)']
-        print(f"  {'持仓覆盖比例(%)':<14} | {cov_a:>13.2f}% | {cov_b:>13.2f}% | {cov_combo:>15.2f}% | {'---':>16}")
+        if "持仓覆盖比例(%)" in DASHBOARD_METRICS_TOGGLE:
+            cov_a = row['单A_持仓时间覆盖比例(%)']
+            cov_b = row['单B_持仓时间覆盖比例(%)']
+            cov_combo = row['联合_持仓时间覆盖比例(%)']
+            print(f"  {'持仓覆盖比例(%)':<14} | {cov_a:>13.2f}% | {cov_b:>13.2f}% | {cov_combo:>15.2f}% | {'---':>16}")
 
     print("\n" + "=" * 92)
 
@@ -320,9 +345,6 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
     if level_df is None or level_df.empty:
         return
 
-    # =================================================================
-    # 新增过滤：仅提取最大并发持仓 <= 100 的结果用于打印，剔除>100的选项
-    # =================================================================
     valid_level_df = level_df[level_df['联合_最大并发持仓'] <= 100]
     if valid_level_df.empty:
         return
@@ -337,12 +359,10 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
 
     for rank, (_, row) in enumerate(top.iterrows(), 1):
         cost_gain = row['【提升】性价比增量(vs最优子组合)']
-        gain_flag = "🟢 [显著提升]" if cost_gain > 0 else "🔴 [无增益/稀释]"
 
         print(f"\n组合编号 {k}_{rank} 表现如下")
         for i in range(1, k + 1):
             prefix = "├─" if i < k else "└─"
-            # 此处使用 get_masked_signal 进行脱敏
             print(
                 f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {get_masked_signal(row[f'腿{i}_入场'])} -> {get_masked_signal(row[f'腿{i}_出场'])} "
                 f"({row[f'腿{i}_方向']}_{row[f'腿{i}_过滤']}) | 单体性价比 {row[f'腿{i}_单体性价比']:.2f}")
@@ -352,66 +372,78 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         print(f"  {'-' * 88}")
 
         # 1. 赚钱性价比
-        c_sub = row['最优子组合_赚钱性价比']
-        c_combo = row['联合_赚钱性价比']
-        c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
-        icon = "🔺" if cost_gain >= 0 else "🔻"
-        print(f"  {'赚钱性价比':<14} | {c_sub:>16.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
+        if "赚钱性价比" in DASHBOARD_METRICS_TOGGLE:
+            c_sub = row['最优子组合_赚钱性价比']
+            c_combo = row['联合_赚钱性价比']
+            c_diff_sign = f"+{cost_gain:.2f}" if cost_gain >= 0 else f"{cost_gain:.2f}"
+            icon = "🔺" if cost_gain >= 0 else "🔻"
+            print(f"  {'赚钱性价比':<14} | {c_sub:>16.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
 
         # 2. 资金最大回撤系列
-        orig_sub = row['最优子组合_原始资金最大回撤(%)']
-        orig_combo_v = row['联合_原始资金最大回撤(%)']
-        print(f"  {'原始资金最大回撤':<14} | {orig_sub:>15.2f}% | {orig_combo_v:>15.2f}% | {'---':>16}")
+        if "原始资金最大回撤" in DASHBOARD_METRICS_TOGGLE:
+            orig_sub = row['最优子组合_原始资金最大回撤(%)']
+            orig_combo_v = row['联合_原始资金最大回撤(%)']
+            print(f"  {'原始资金最大回撤':<14} | {orig_sub:>15.2f}% | {orig_combo_v:>15.2f}% | {'---':>16}")
 
-        single_sub = row['最优子组合_最大单笔回撤(%)']
-        single_combo_v = row['联合_最大单笔回撤(%)']
-        print(f"  {'最大单笔回撤':<14} | {single_sub:>15.2f}% | {single_combo_v:>15.2f}% | {'---':>16}")
+        if "最大单笔回撤" in DASHBOARD_METRICS_TOGGLE:
+            single_sub = row['最优子组合_最大单笔回撤(%)']
+            single_combo_v = row['联合_最大单笔回撤(%)']
+            print(f"  {'最大单笔回撤':<14} | {single_sub:>15.2f}% | {single_combo_v:>15.2f}% | {'---':>16}")
 
-        m_sub = row['最优子组合_资金最大回撤(%)']
-        m_combo_v = row['联合_资金最大回撤(%)']
-        m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
-        m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'最终资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
+        if "最终资金最大回撤" in DASHBOARD_METRICS_TOGGLE:
+            m_sub = row['最优子组合_资金最大回撤(%)']
+            m_combo_v = row['联合_资金最大回撤(%)']
+            m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
+            m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
+            print(f"  {'最终资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
-        dur_sub = row['最优子组合_最大回撤历时(天)']
-        dur_combo = row['联合_最大回撤历时(天)']
-        print(f"  {'最大回撤历时(天)':<14} | {dur_sub:>16.2f} | {dur_combo:>16.2f} | {'---':>16}")
+        if "最大回撤历时(天)" in DASHBOARD_METRICS_TOGGLE:
+            dur_sub = row['最优子组合_最大回撤历时(天)']
+            dur_combo = row['联合_最大回撤历时(天)']
+            print(f"  {'最大回撤历时(天)':<14} | {dur_sub:>16.2f} | {dur_combo:>16.2f} | {'---':>16}")
 
         # 4. 最大并发持仓
-        con_sub = int(row['最优子组合_最大并发持仓'])
-        con_combo = int(row['联合_最大并发持仓'])
-        print(f"  {'最大并发持仓':<14} | {con_sub:>16} | {con_combo:>16} | {'---':>16}")
+        if "最大并发持仓" in DASHBOARD_METRICS_TOGGLE:
+            con_sub = int(row['最优子组合_最大并发持仓'])
+            con_combo = int(row['联合_最大并发持仓'])
+            print(f"  {'最大并发持仓':<14} | {con_sub:>16} | {con_combo:>16} | {'---':>16}")
 
         # 5. Top1币收益占比
-        top1_sub = row['最优子组合_Top1币收益占比(%)']
-        top1_combo = row['联合_Top1币收益占比(%)']
-        print(f"  {'Top1币收益占比':<14} | {top1_sub:>15.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
+        if "Top1币收益占比" in DASHBOARD_METRICS_TOGGLE:
+            top1_sub = row['最优子组合_Top1币收益占比(%)']
+            top1_combo = row['联合_Top1币收益占比(%)']
+            print(f"  {'Top1币收益占比':<14} | {top1_sub:>15.2f}% | {top1_combo:>15.2f}% | {'---':>16}")
 
         # 6. 单笔净期望(%)
-        exp_sub = row['最优子组合_单笔净期望(%)']
-        exp_combo = row['联合_单笔净期望(%)']
-        print(f"  {'单笔净期望(%)':<14} | {exp_sub:>15.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
+        if "单笔净期望(%)" in DASHBOARD_METRICS_TOGGLE:
+            exp_sub = row['最优子组合_单笔净期望(%)']
+            exp_combo = row['联合_单笔净期望(%)']
+            print(f"  {'单笔净期望(%)':<14} | {exp_sub:>15.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
 
         # 7. 涉及币种数
-        coin_cnt_sub = int(row['最优子组合_涉及币种数'])
-        coin_cnt_combo = int(row['联合_涉及币种数'])
-        print(f"  {'涉及币种数':<14} | {coin_cnt_sub:>16} | {coin_cnt_combo:>16} | {'---':>16}")
+        if "涉及币种数" in DASHBOARD_METRICS_TOGGLE:
+            coin_cnt_sub = int(row['最优子组合_涉及币种数'])
+            coin_cnt_combo = int(row['联合_涉及币种数'])
+            print(f"  {'涉及币种数':<14} | {coin_cnt_sub:>16} | {coin_cnt_combo:>16} | {'---':>16}")
 
         # 8. 跨币种胜率(%)
-        cw_sub = row['最优子组合_跨币种胜率(%)']
-        cw_combo = row['联合_跨币种胜率(%)']
-        print(f"  {'跨币种胜率(%)':<14} | {cw_sub:>15.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
+        if "跨币种胜率(%)" in DASHBOARD_METRICS_TOGGLE:
+            cw_sub = row['最优子组合_跨币种胜率(%)']
+            cw_combo = row['联合_跨币种胜率(%)']
+            print(f"  {'跨币种胜率(%)':<14} | {cw_sub:>15.2f}% | {cw_combo:>15.2f}% | {'---':>16}")
 
         # 9. 平均持仓时间(天)
-        ht_sub = row['最优子组合_平均持仓时间(天)']
-        ht_combo = row['联合_平均持仓时间(天)']
-        print(f"  {'平均持仓时间(天)':<14} | {ht_sub:>16.2f} | {ht_combo:>16.2f} | {'---':>16}")
+        if "平均持仓时间(天)" in DASHBOARD_METRICS_TOGGLE:
+            ht_sub = row['最优子组合_平均持仓时间(天)']
+            ht_combo = row['联合_平均持仓时间(天)']
+            print(f"  {'平均持仓时间(天)':<14} | {ht_sub:>16.2f} | {ht_combo:>16.2f} | {'---':>16}")
 
         # 10. 持仓时间覆盖比例(%)
-        cov_sub = row['最优子组合_持仓时间覆盖比例(%)']
-        coverage = row['联合_持仓时间覆盖比例(%)']
-        print(f"  {'持仓覆盖比例(%)':<14} | {cov_sub:>15.2f}% | {coverage:>15.2f}% | {'---':>16}")
+        if "持仓覆盖比例(%)" in DASHBOARD_METRICS_TOGGLE:
+            cov_sub = row['最优子组合_持仓时间覆盖比例(%)']
+            coverage = row['联合_持仓时间覆盖比例(%)']
+            print(f"  {'持仓覆盖比例(%)':<14} | {cov_sub:>15.2f}% | {coverage:>15.2f}% | {'---':>16}")
 
     print("\n" + "=" * 92)
 
@@ -479,10 +511,21 @@ def analyze_pair_combinations_with_baseline(
     single_summary_df.to_csv(single_out_path, index=False, encoding='utf-8-sig', float_format="%.4f")
 
     # =====================================================================
-    # 筛选满足【最大并发持仓数 < 100】的腿才能作为后续组合的材料
+    # 筛选满足【最大并发持仓数 < 100】且【过滤数字 <= 20】的腿才能作为后续组合的材料
     # =====================================================================
-    valid_strategies_for_combo = [s_id for s_id in unique_strategies if
-                                  single_metrics_dict[s_id]['最大并发持仓数'] < 100]
+    valid_strategies_for_combo = []
+    for s_id in unique_strategies:
+        if single_metrics_dict[s_id]['最大并发持仓数'] < 100:
+            s_info = s_id.split(' | ')
+            filter_mode = s_info[4] if len(s_info) > 4 else ""
+
+            # 使用正则提取出字符串末尾的数字，如 bottom_10 提取 10，Long_Top_50 提取 50
+            nums = re.findall(r'\d+', filter_mode)
+            filter_num = int(nums[-1]) if nums else 0
+
+            # 大于20的过滤掉，不参与任何组合
+            if filter_num <= 20:
+                valid_strategies_for_combo.append(s_id)
 
     if len(valid_strategies_for_combo) < 2:
         print("⚠️ 满足并发条件的独立策略少于 2 个，跳过组合测算。")
