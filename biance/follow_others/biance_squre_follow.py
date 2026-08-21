@@ -46,6 +46,28 @@ MIN_FISSION_PROBABILITY = 85
 PROFILE_CACHE_PATH = "user_profile.json"
 PRODUCER_SWEEP_INTERVAL = 10000
 
+# =====================================================================
+# [新增] 黑名单持久化存取逻辑
+# =====================================================================
+BLACKLIST_PATH = "unfollow_blacklist.txt"
+
+def append_to_blacklist(uid):
+    """简单追加UID到黑名单文本"""
+    try:
+        with open(BLACKLIST_PATH, 'a', encoding='utf-8') as f:
+            f.write(f"{uid}\n")
+    except Exception as e:
+        logger.error(f"[黑名单写入失败] UID: {uid}, 报错: {e}")
+
+def load_blacklist():
+    """读取黑名单集合"""
+    try:
+        with open(BLACKLIST_PATH, 'r', encoding='utf-8') as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
 MUTUAL_FOLLOW_KEYWORDS = [
     "互关", "必回", "互粉", '回关', "互赞", "互评", "互fo", "互助互关", "互关互粉", "互赞互评", "互粉互赞", "互关互赞",
     "互换关注", "关注必回", "点赞必回", "评论必回", "留下评论必回", "必回关", "关必回", "秒回关", "互关秒回", "粉必回",
@@ -415,7 +437,6 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
         blacklist_candidates = [uid for uid in ordered_following_uids if uid not in global_fans_uids]
 
         # 末位淘汰：通过切片 [-need_unfollow_count:] 直接提取列表尾端（最老的一批）执行取关
-        # 完美避开了头部刚刚关注还未回关的新人，天然生成数天的时间缓冲期 (Python切片自带防越界，直接截取即可)
         uids_to_unfollow = blacklist_candidates[-need_unfollow_count:]
 
         total_unfollow = len(uids_to_unfollow)
@@ -433,6 +454,8 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
                 is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
                 if is_success:
                     unfollow_success_count += 1
+                    # 【新增】: 取关成功后，立刻写入本地黑名单文件
+                    append_to_blacklist(uid)
 
                 logger.info(
                     f"[网络交互/行为执行] 触发账号【取关】动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total_unfollow}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
@@ -466,7 +489,7 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     success_count = 0
     total = len(final_uids_to_follow)
     for index, uid in enumerate(final_uids_to_follow, 1):
-        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)  # 'follow' 或 'unfollow'
+        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)
         if is_success:
             success_count += 1
 
@@ -479,7 +502,6 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
 
     logger.info(
         f"[调度流转/账号完结] 单账号执行流闭环完毕 | 关键参数: 账号【{user_key}】, 触达总量【{total}】, 成功【{success_count}】 | 结果: 释放线程资源")
-
 
 def consumer_auto_sync_main(accounts=None):
     """
@@ -516,10 +538,12 @@ def consumer_auto_sync_main(accounts=None):
             global_wild_uids = shared_post_uids.union(set(global_worth_uids))
 
             # 3. 核心清洗：野生池 减去 所有账号已关注的 减去 所有粉丝，留下纯净且未开垦的荒地
-            pure_wild_uids = list(global_wild_uids - global_following_uids - global_fans_uids)
+            # 【新增/修改】: 加载本地黑名单，确保被取关过的人不会再进入探测池
+            blacklisted_uids = load_blacklist()
+            pure_wild_uids = list(global_wild_uids - global_following_uids - global_fans_uids - blacklisted_uids)
 
             logger.info(
-                f"[资源调度/全量统筹] 聚合公网线索与矩阵资产 | 关键参数: 帖子线索【{len(shared_post_uids)}】, 裂变输血【{len(global_worth_uids)}】, 矩阵全网粉丝池【{len(global_fans_uids)}】, 全局去重后纯净探索池【{len(pure_wild_uids)}】 | 结果: 分发至各节点执行")
+                f"[资源调度/全量统筹] 聚合公网线索与矩阵资产 | 关键参数: 帖子线索【{len(shared_post_uids)}】, 裂变输血【{len(global_worth_uids)}】, 矩阵全网粉丝池【{len(global_fans_uids)}】, 全局去重后纯净探索池【{len(pure_wild_uids)}】 (已过滤黑名单【{len(blacklisted_uids)}】人) | 结果: 分发至各节点执行")
 
             if not global_fans_uids and not pure_wild_uids:
                 logger.info(
@@ -548,7 +572,6 @@ def consumer_auto_sync_main(accounts=None):
                 f"[系统崩溃/主干线阻断] 消费者顶层心跳意外终止 | 关键参数: 【循环抛错】 | 结果: 短休眠60秒后复活 | 可能原因: 币安网关拒绝响应或数据库连接断裂 [{e}]",
                 exc_info=True)
             time.sleep(60)
-
 
 # =====================================================================
 # [生产者] 增量抓取与DB投递持久化
