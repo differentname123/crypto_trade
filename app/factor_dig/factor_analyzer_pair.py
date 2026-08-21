@@ -10,17 +10,18 @@ import re
 # =====================================================================
 DASHBOARD_METRICS_TOGGLE = [
     "赚钱性价比",
-    # "原始资金最大回撤",
-    # "最大单笔回撤",
-    # "最终资金最大回撤",
+    "原始资金最大回撤",
+    "最大单笔回撤",
+    "最终资金最大回撤",
     "最大回撤历时(天)",
     "最大并发持仓",
     "Top1币收益占比",
     "单笔净期望(%)",
+    "真实净胜率(%)",  # <--- 新增：真实净胜率
     "涉及币种数",
     "跨币种胜率(%)",
     "平均持仓时间(天)",
-    # "持仓覆盖比例(%)"  # <--- 如果不想输出这行，只需在这行前面加个 # 注释掉即可
+    "持仓覆盖比例(%)"  # <--- 如果不想输出这行，只需在这行前面加个 # 注释掉即可
 ]
 
 # =====================================================================
@@ -303,6 +304,13 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
             exp_combo = row['联合_单笔净期望(%)']
             print(f"  {'单笔净期望(%)':<14} | {exp_a:>13.2f}% | {exp_b:>13.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
 
+        # *. 真实净胜率(%) (新增)
+        if "真实净胜率(%)" in DASHBOARD_METRICS_TOGGLE:
+            wr_a = row['单A_真实净胜率(%)']
+            wr_b = row['单B_真实净胜率(%)']
+            wr_combo = row['联合_真实净胜率(%)']
+            print(f"  {'真实净胜率(%)':<14} | {wr_a:>13.2f}% | {wr_b:>13.2f}% | {wr_combo:>15.2f}% | {'---':>16}")
+
         # 7. 涉及币种数
         if "涉及币种数" in DASHBOARD_METRICS_TOGGLE:
             coin_cnt_a = int(row['单A_涉及币种数'])
@@ -420,6 +428,12 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
             exp_sub = row['最优子组合_单笔净期望(%)']
             exp_combo = row['联合_单笔净期望(%)']
             print(f"  {'单笔净期望(%)':<14} | {exp_sub:>15.2f}% | {exp_combo:>15.2f}% | {'---':>16}")
+
+        # *. 真实净胜率(%) (新增)
+        if "真实净胜率(%)" in DASHBOARD_METRICS_TOGGLE:
+            wr_sub = row['最优子组合_真实净胜率(%)']
+            wr_combo = row['联合_真实净胜率(%)']
+            print(f"  {'真实净胜率(%)':<14} | {wr_sub:>15.2f}% | {wr_combo:>15.2f}% | {'---':>16}")
 
         # 7. 涉及币种数
         if "涉及币种数" in DASHBOARD_METRICS_TOGGLE:
@@ -768,6 +782,9 @@ def analyze_pair_combinations_with_baseline(
             row['最优子组合_跨币种胜率(%)'] = best_sub_m['跨币种胜率(%)']
             row['最优子组合_平均持仓时间(天)'] = best_sub_m['平均持仓时间(天)']
 
+            # --- 新增 ---
+            row['最优子组合_真实净胜率(%)'] = best_sub_m['真实净胜率(%)']
+
             row['【提升】性价比增量(vs最优子组合)'] = cost_diff
             row['【风险】回撤变动(vs最优子组合)(%)'] = (
                     m_combo['策略组合资金最大回撤(%)'] - best_sub_m['策略组合资金最大回撤(%)'])
@@ -852,7 +869,7 @@ if __name__ == '__main__':
             pair_output_filename='pair_combinations_with_comparison.csv',
             single_output_filename='single_strategy_summary.csv',
             show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
-            max_combo_size=2,  # 最多扩展到 4 联组合
+            max_combo_size=5,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
             max_seeds_per_level=200  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
