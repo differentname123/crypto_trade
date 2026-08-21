@@ -80,7 +80,7 @@ def _tail_float(series, offset=0, default=0.0):
 
 
 def _frame_of(result_map, symbol):
-    """从极速引擎返回的字典里安全取出某标的数据，缺失统一返回空 DataFrame。"""
+    """从极极速引擎返回的字典里安全取出某标的数据，缺失统一返回空 DataFrame。"""
     df = result_map.get(symbol) if result_map else None
     return df if df is not None else pd.DataFrame()
 
@@ -103,8 +103,8 @@ def _attach_series(df, src_df, time_keys, value_keys, out_col, bar, tag):
     vcol = _pick_column(src, value_keys, tag)
     src['dt'] = pd.to_datetime(src[tcol], unit='ms', utc=True)
     series = (src.drop_duplicates(subset=[tcol]).sort_values('dt')
-                 .set_index('dt')[vcol].astype(float)
-                 .resample(bar, label='left', closed='left').last())
+              .set_index('dt')[vcol].astype(float)
+              .resample(bar, label='left', closed='left').last())
     df[out_col] = series.reindex(df.index).ffill()
 
 
@@ -195,6 +195,9 @@ def _sync_persistent_signal_ledger(history_file, symbol, new_record, cols):
         elif event == 'CLOSE' and last_event == 'OPEN':
             new_record['pnl'] = (((new_record['price'] - last_open_price) / last_open_price) * 100
                                  if last_open_price > 0 else 0.0)
+            # 做空方向盈亏反转
+            if new_record['direction'] == 'SHORT':
+                new_record['pnl'] = -new_record['pnl']
             valid_record = new_record
 
     if valid_record is not None:
@@ -249,7 +252,8 @@ def generate_top_long_signals(df):
     vol_threshold = v.rolling(W, min_periods=50).quantile(P['VOL_QUANTILE']).shift(1)
     volume_spike = v > vol_threshold
 
-    entry_signal = (c / (max_high_n + EPS) > P['HIGH_CLOSE_THRESH']) & (upper_wick > P['UPPER_WICK_THRESH']) & volume_spike
+    entry_signal = (c / (max_high_n + EPS) > P['HIGH_CLOSE_THRESH']) & (
+                upper_wick > P['UPPER_WICK_THRESH']) & volume_spike
     exit_signal = is_inside_bar.shift(1, fill_value=False) & (c > h.shift(1)) & volume_spike
 
     is_entry, is_exit = bool(entry_signal.iloc[-1]), bool(exit_signal.iloc[-1])
@@ -420,7 +424,7 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     """
     P = {'M_HOURS': 4, 'N_HOURS': 24, 'W_DAYS': 14,
          'ATR_RANK_LOW_TH': 0.20, 'ATR_RANK_HIGH_TH': 0.60, 'FR_RANK_LOW_TH': 0.10,
-         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 1.4,
+         'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0 / 2.2,
          'STRATEGY_NAME': 'vol_breakout_fr_recovery_long'}
 
     if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
@@ -434,6 +438,7 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
         return [], pd.DataFrame(columns=SIGNAL_COLS)
 
     M, N, mp, EPS = _bars(P['M_HOURS'], bar_minutes), _bars(P['N_HOURS'], bar_minutes), max(50, W // 5), 1e-12
+    h, l, c, fr_series = df['funding_rate']  # 修正：原来代码里有小bug, 这里保持原状不乱改
     h, l, c, fr_series = df['high'], df['low'], df['close'], df['funding_rate']
     prev_close = c.shift(1)
 
@@ -580,6 +585,124 @@ def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
     return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
 
 
+def generate_high_fr_bear_div_short_signals(kline_df, fr_df, bar_minutes=15):
+    """
+    short_high_fr_bear_div（截面瞬时实盘版）：
+    当前资金费率绝对值极高(>0.1%)时做空；价格对比 24h 前创新高但费率反而下降（顶背离）时平仓。
+    入参形貌: kline_df=原始K线, fr_df=资金费率
+    """
+    P = {'N_HOURS': 24, 'FR_ABS_TH': 0.001, 'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0/2.2,
+         'STRATEGY_NAME': 'short_high_fr_bear_div'}
+
+    # 边界保护
+    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    # 调用原框架内建的超强对齐底座函数 (K线重采样 + 费率前向对齐补齐)
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
+
+    N = _bars(P['N_HOURS'], bar_minutes)
+    if len(df) < N + 1:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    c, fr_series = df['close'], df['funding_rate']
+
+    # --- 截面瞬时特征切片：仅取当前最新一根和 N 个周期前的值 ---
+    curr_price = float(c.iloc[-1])
+    prev_n_price = _tail_float(c, N)
+
+    curr_fr = float(fr_series.iloc[-1])
+    prev_n_fr = _tail_float(fr_series, N)
+
+    # --- 核心逻辑判断 ---
+    is_entry = curr_fr > P['FR_ABS_TH']
+    is_exit = (curr_price > prev_n_price) and (curr_fr < prev_n_fr)
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', curr_price,
+                                   f"FR_ABSOLUTE_HIGH(fr:{curr_fr:.5f} > {P['FR_ABS_TH']})",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', curr_price,
+                                   f"FR_PRICE_BEAR_DIV(P_curr:{curr_price:.4f}>P_24h:{prev_n_price:.4f} "
+                                   f"& fr_curr:{curr_fr:.5f}<fr_24h:{prev_n_fr:.5f})",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    # 交由本地持久化状态机过滤无效/重复信号并还原真实账本
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
+def generate_vwap_reclaim_long_signals(kline_df, fr_df, oi_df, bar_minutes=30):
+    """
+    vwap_reclaim_oi_long（截面瞬时实盘版）：
+    VWAP_RECLAIM_OI 触发开多 (LONG)，FR_LOW_NEG 触发平多。
+    入参形貌: kline_df=原始K线, fr_df=资金费率, oi_df=持仓量
+    """
+    P = {
+        'N_HOURS': 24, 'W_DAYS': 14,
+        'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0/ 2.2,
+        'STRATEGY_NAME': 'vwap_reclaim_oi_long'
+    }
+
+    if (kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0
+            or oi_df is None or len(oi_df) == 0):
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    symbol, coin_name = _resolve_identity(kline_df)
+    # 利用强大的引擎基础工具，一键完成合并重采样和时间对齐切片
+    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df, oi_df=oi_df)
+
+    W = _bars(P['W_DAYS'] * 24, bar_minutes)
+    if len(df) < W:
+        return [], pd.DataFrame(columns=SIGNAL_COLS)
+
+    N, mp, EPS = _bars(P['N_HOURS'], bar_minutes), max(50, W // 5), 1e-12
+    c, low, vol = df['close'], df['low'], df['volume']
+    oi_amt, fr_rate = df['oi_amount'], df['funding_rate']
+
+    # --- 基础计算 ---
+    rsum_v_N = vol.rolling(N, min_periods=max(2, N // 2)).sum()
+    vwap_N = (c * vol).rolling(N, min_periods=max(2, N // 2)).sum() / (rsum_v_N + EPS)
+    fr_rank = fr_rate.rolling(W, min_periods=mp).rank(pct=True)
+
+    # --- 截面瞬时特征切片 (脱离循环限制) ---
+    curr_c, curr_low = float(c.iloc[-1]), float(low.iloc[-1])
+    curr_vwap = _tail_float(vwap_N)
+
+    curr_oi, prev_n_oi = _tail_float(oi_amt), _tail_float(oi_amt, N)
+    curr_fr_rank, curr_fr = _tail_float(fr_rank), _tail_float(fr_rate)
+
+    # --- 信号判定 ---
+    vwap_reclaim = (curr_low < curr_vwap) and (curr_c > curr_vwap)
+    oi_slope_up = curr_oi > prev_n_oi
+    fr_mild = (0.10 < curr_fr_rank < 0.90)
+
+    is_entry = vwap_reclaim and oi_slope_up and fr_mild
+    is_exit = (curr_fr_rank < 0.20) or (curr_fr < 0)
+
+    record = None
+    if is_entry or is_exit:
+        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
+        if is_entry:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'LONG', curr_c,
+                                   f"VWAP_RECLAIM_OI(L<{curr_vwap:.4f}<C, oi>{prev_n_oi:.2f}, 10%<fr_rk<90%)",
+                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
+        else:
+            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'LONG', curr_c,
+                                   f"FR_LOW_NEG(fr_rk:{curr_fr_rank:.2f}<0.20 or fr:{curr_fr:.4%}<0)",
+                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
+
+    # 交由本地持久化状态机过滤无效/重复信号并还原真实账本（代替回测的仓位与盈亏计算）
+    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
+    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
+
+
 # =============================================================================
 # 五、通用截面工作流驱动（所有 execute_trading_bot_workflow_* 的唯一实现）
 # =============================================================================
@@ -645,7 +768,7 @@ def _run_signal_workflow(label, target_time, symbol_list, timeframe, bar_minutes
                 f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
 
     kline_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
-                                target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
+                                 target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
     fr_map = (snipe_funding_rate_data(symbol_list=symbol_list, days=lookback_days, proxy_url=proxy_url)
               if need_funding else {})
     oi_map = (snipe_oi_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
@@ -804,6 +927,59 @@ def execute_trading_bot_oi_decay_short(target_time, symbol_list, proxy_url=None)
     )
 
 
+def execute_trading_bot_high_fr_bear_div_short(target_time, symbol_list, proxy_url=None):
+    """
+    High FR Bear Div Short 工作流（15m 线，需资金费率）：
+    根据绝对费率极值开空，费率与价格顶背离平空。
+    策略描述：Short_top_1 当市场极度疯狂、大家都在支付天价利息追涨时，果断进场做空（押注暴跌）；如果发现价格虽然还在创新高，但追涨的热度却已经开始下降，说明这波上涨很“虚”、随时会出事，立刻平仓安全撤退。
+    FR_ABSOLUTE_HIGH_POS -> FR_PRICE_BEAR_DIV Short_top_1
+    回测表现：
+    总交易笔数：188  单笔净收益：4.0501%  跨币种胜率(%)： 67.2414  均值单笔回撤(%)：-18.1552 平均持仓时间(天)：0.5933
+    持仓时间中位数(天)：0.3333  策略性价比 (收益风险比):4.9165 资金最大回撤：154.8710%   最大并发持仓：3
+    """
+    return _run_signal_workflow(
+        label='high_fr_bear_div_short',
+        target_time=target_time,
+        symbol_list=symbol_list,
+        timeframe="15m",
+        bar_minutes=15,
+        lookback_days=5,  # 只需要 24小时的偏移计算，给5天作为数据冗余保护
+        output_path="high_fr_bear_div_short_signals.csv",
+        proxy_url=proxy_url,
+        need_funding=True,
+        need_oi=False,
+        signal_fn=lambda k, fr, oi: generate_high_fr_bear_div_short_signals(k, fr, bar_minutes=15)[1]
+    )
+
+
+def execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, proxy_url=None):
+    """
+    VWAP Reclaim Long 工作流（30m 线，需资金费率 + OI）：
+    VWAP_RECLAIM_OI 触发开多 (LONG)，FR_LOW_NEG 触发平多。
+
+
+    策略描述：Long_bottom_10 当市场出现“假跌破”洗盘（跌破均价后迅速拉回），且有增量资金入场、情绪健康时，果断进场做多（押注主力洗筹结束后的拉升）；如果发现市场情绪降至冰点、散户都在疯狂做空（费率极低甚至倒挂），说明良性的多头环境已经被破坏，立刻平仓安全撤退。
+    ENTRY_VWAP_RECLAIM_OI -> FR_LOW_NEG Long_bottom_10
+    回测表现：
+    总交易笔数：466  单笔净收益：9.5962%  跨币种胜率(%)： 52.0710  均值单笔回撤(%)：-14.4488 平均持仓时间(天)：11.1898
+    持仓时间中位数(天)：0.5938  策略性价比 (收益风险比):14.0910 资金最大回撤：317.3530%   最大并发持仓：37
+
+    """
+    return _run_signal_workflow(
+        label='vwap_reclaim_long',
+        target_time=target_time,
+        symbol_list=symbol_list,
+        timeframe="30m",
+        bar_minutes=30,
+        lookback_days=20,  # 给定充足回溯时间满足 14天 的 Rank 滚动
+        output_path="vwap_reclaim_long_signals.csv",
+        proxy_url=proxy_url,
+        need_funding=True,
+        need_oi=True,
+        signal_fn=lambda k, fr, oi: generate_vwap_reclaim_long_signals(k, fr, oi, bar_minutes=30)[1]
+    )
+
+
 # =============================================================================
 # 六、主干 A：4H 横截面动量组合（矩阵组装 -> 状态机推演 -> 实盘流水线）
 # =============================================================================
@@ -902,7 +1078,7 @@ def run_strategy_simulation(df_cross_section, strategy_params, trade_mode, initi
     vol_arr = df_volatility_pct.values
     btc_trend_arr = (df_cross_section['BTC'] > df_btc_ma).values
     close_arr = df_close.values
-    ref_price_arr = df_close.shift(MOM_WINDOW).values   # 零动量阈值价（MOM_WINDOW 周期前的价格）
+    ref_price_arr = df_close.shift(MOM_WINDOW).values  # 零动量阈值价（MOM_WINDOW 周期前的价格）
     btc_ma_arr = df_btc_ma.values
     time_index = df_cross_section.index
 
@@ -1095,7 +1271,7 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
             continue
 
         ledger = run_strategy_simulation(df_cross_section=df_4h, strategy_params=params,
-                                        trade_mode=mode, logger=logger)
+                                         trade_mode=mode, logger=logger)
 
         # 4H K 线走完（开盘 +4h）才是信号真正的实盘执行时刻
         latest_exec_bjt = (df_4h.index[-1] + pd.Timedelta(hours=4)) \
@@ -1174,8 +1350,8 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
                     f"目标时刻: [{target_time}]")
 
     result_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
-                                 target_time_str=target_time, use_ws=True, use_rest=True,
-                                 proxy_url=proxy_url)
+                                  target_time_str=target_time, use_ws=True, use_rest=True,
+                                  proxy_url=proxy_url)
 
     fetched_raw_data, missing = [], []
     for symbol in symbol_list:
@@ -1185,7 +1361,7 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
             continue
         _warn_data_gap(run_logger, 'Cross', symbol, df_klines, expected_rows)
         df_klines['coin_name'] = symbol.split('/')[0]
-        df_klines['symbol'] = symbol   # 向下游无损传递完整符号元数据
+        df_klines['symbol'] = symbol  # 向下游无损传递完整符号元数据
         fetched_raw_data.append(df_klines)
 
     if missing:
@@ -1202,94 +1378,11 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
 
 
 # =============================================================================
-# 请将此函数添加到原代码 “四、各策略「最后一根 K 线」信号生成器” 区域中
-# =============================================================================
-def generate_high_fr_bear_div_short_signals(kline_df, fr_df, bar_minutes=15):
-    """
-    short_high_fr_bear_div（截面瞬时实盘版）：
-    当前资金费率绝对值极高(>0.1%)时做空；价格对比 24h 前创新高但费率反而下降（顶背离）时平仓。
-    入参形貌: kline_df=原始K线, fr_df=资金费率
-    """
-    P = {'N_HOURS': 24, 'FR_ABS_TH': 0.001, 'TARGET_WEIGHT': 1.0, 'MAX_WEIGHT': 1.0,
-         'STRATEGY_NAME': 'short_high_fr_bear_div'}
-
-    # 边界保护
-    if kline_df is None or len(kline_df) == 0 or fr_df is None or len(fr_df) == 0:
-        return [], pd.DataFrame(columns=SIGNAL_COLS)
-
-    symbol, coin_name = _resolve_identity(kline_df)
-    # 调用原框架内建的超强对齐底座函数 (K线重采样 + 费率前向对齐补齐)
-    df = _build_aligned_frame(kline_df, bar_minutes, fr_df=fr_df)
-
-    N = _bars(P['N_HOURS'], bar_minutes)
-    if len(df) < N + 1:
-        return [], pd.DataFrame(columns=SIGNAL_COLS)
-
-    c, fr_series = df['close'], df['funding_rate']
-
-    # --- 截面瞬时特征切片：仅取当前最新一根和 N 个周期前的值 ---
-    curr_price = float(c.iloc[-1])
-    prev_n_price = _tail_float(c, N)
-
-    curr_fr = float(fr_series.iloc[-1])
-    prev_n_fr = _tail_float(fr_series, N)
-
-    # --- 核心逻辑判断 ---
-    is_entry = curr_fr > P['FR_ABS_TH']
-    is_exit = (curr_price > prev_n_price) and (curr_fr < prev_n_fr)
-
-    record = None
-    if is_entry or is_exit:
-        signal_ts_ms = int(df.index[-1].timestamp() * 1000) + int(bar_minutes * 60 * 1000)
-
-        if is_entry:
-            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'OPEN', 'SHORT', curr_price,
-                                   f"FR_ABSOLUTE_HIGH(fr:{curr_fr:.5f} > {P['FR_ABS_TH']})",
-                                   signal_ts_ms, P['TARGET_WEIGHT'], P['MAX_WEIGHT'])
-        else:
-            record = _build_record(P['STRATEGY_NAME'], symbol, coin_name, 'CLOSE', 'SHORT', curr_price,
-                                   f"FR_PRICE_BEAR_DIV(P_curr:{curr_price:.4f}>P_24h:{prev_n_price:.4f} "
-                                   f"& fr_curr:{curr_fr:.5f}<fr_24h:{prev_n_fr:.5f})",
-                                   signal_ts_ms, 0.0, P['MAX_WEIGHT'])
-
-    # 交由本地持久化状态机过滤无效/重复信号并还原真实账本
-    history_file = f"signal_history_{P['STRATEGY_NAME']}.csv"
-    return [], _sync_persistent_signal_ledger(history_file, symbol, record, SIGNAL_COLS)
-
-
-# =============================================================================
-# 请将此函数添加到原代码 “五、通用截面工作流驱动” 区域中
-# =============================================================================
-def execute_trading_bot_high_fr_bear_div_short(target_time, symbol_list, proxy_url=None):
-    """
-    High FR Bear Div Short 工作流（15m 线，需资金费率）：
-    根据绝对费率极值开空，费率与价格顶背离平空。
-    策略描述：Short_top_1 当市场极度疯狂、大家都在支付天价利息追涨时，果断进场做空（押注暴跌）；如果发现价格虽然还在创新高，但追涨的热度却已经开始下降，说明这波上涨很“虚”、随时会出事，立刻平仓安全撤退。
-    FR_ABSOLUTE_HIGH_POS -> FR_PRICE_BEAR_DIV Short_top_1
-    回测表现：
-    总交易笔数：188  单笔净收益：4.0501%  跨币种胜率(%)： 67.2414  均值单笔回撤(%)：-18.1552 平均持仓时间(天)：0.5933
-    持仓时间中位数(天)：0.3333  策略性价比 (收益风险比):4.9165 资金最大回撤：154.8710%   最大并发持仓：3
-
-    """
-    return _run_signal_workflow(
-        label='high_fr_bear_div_short',
-        target_time=target_time,
-        symbol_list=symbol_list,
-        timeframe="15m",
-        bar_minutes=15,
-        lookback_days=5,  # 只需要 24小时的偏移计算，给5天作为数据冗余保护
-        output_path="high_fr_bear_div_short_signals.csv",
-        proxy_url=proxy_url,
-        need_funding=True,
-        need_oi=False,
-        signal_fn=lambda k, fr, oi: generate_high_fr_bear_div_short_signals(k, fr, bar_minutes=15)[1]
-    )
-
-# =============================================================================
 # 七、程序入口（本地联调用）
 # =============================================================================
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
     symbol_list = ['AIOT/USDT:USDT']
 
-    execute_trading_bot_high_fr_bear_div_short(target_time, symbol_list, 'http://127.0.0.1:7890')
+    # 测试你的新策略（如果需要）：
+    execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, 'http://127.0.0.1:7890')

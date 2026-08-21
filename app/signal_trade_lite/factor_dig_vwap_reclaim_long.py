@@ -241,13 +241,15 @@ if __name__ == "__main__":
         ].copy()
 
     kline_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_30m_latest.csv'
-    fr_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_funding_rates.csv'
+    fr_file_path = r'W:\project\python_project\crypto_trade\app\signal_trade_lite\data\AIOT_USDT_USDT_funding_latest.csv'
+
+
     oi_file_path = r'W:\project\python_project\crypto_trade\app\data\AIOT_USDT_USDT_5m_oi.csv'
     try:
         kline_df = pd.read_csv(kline_file_path)
         # 为 kline_df 补充 symbol 属性 (模拟实盘数据源结构)
         kline_df['symbol'] = 'AIOT/USDT'
-
+        # kline_df = kline_df.tail(3000)
         fr_df = pd.read_csv(fr_file_path)
         fr_df['datetime'] = pd.to_datetime(fr_df['timestamp'], unit='ms', utc=True)
 
