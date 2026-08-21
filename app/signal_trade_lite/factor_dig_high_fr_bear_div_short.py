@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 
-def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
+def generate_high_fr_bear_div_short_signals(kline_df, fr_df, bar_minutes=15):
     """
     高度内聚的回测与信号生成函数：
     根据绝对费率极值开空，费率与价格顶背离平空。
