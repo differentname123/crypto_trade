@@ -4,12 +4,12 @@ import pandas as pd
 import numpy as np
 import datetime
 
-
 # =====================================================================
 # 全局信号脱敏映射模块 (新增)
 # =====================================================================
 _SIGNAL_MAPPING = {}
 _SIGNAL_COUNTER = 1
+
 
 def get_masked_signal(sig_name):
     """获取脱敏后的信号名称，首次遇到则生成如 SIGNAL_001"""
@@ -19,6 +19,7 @@ def get_masked_signal(sig_name):
         _SIGNAL_MAPPING[sig_str] = f"SIGNAL_{_SIGNAL_COUNTER:03d}"
         _SIGNAL_COUNTER += 1
     return _SIGNAL_MAPPING[sig_str]
+
 
 def save_signal_mapping_table(output_dir='./summary_results'):
     """保存原始信号名称与脱敏名称的映射表"""
@@ -41,6 +42,26 @@ def calculate_portfolio_metrics(g_sorted):
     exit_max = g_sorted['exit_time'].max()
     strategy_lifetime_h = (exit_max - entry_min).total_seconds() / 3600.0 if pd.notnull(entry_min) and pd.notnull(
         exit_max) else 0.0
+
+    # ==========================================
+    # 新增计算：持仓时间覆盖比例
+    # ==========================================
+    intervals = g_sorted[['entry_time', 'exit_time']].dropna().values.tolist()
+    intervals.sort(key=lambda x: x[0])
+    merged_intervals = []
+    for start, end in intervals:
+        if not merged_intervals:
+            merged_intervals.append([start, end])
+        else:
+            last_start, last_end = merged_intervals[-1]
+            if start <= last_end:
+                merged_intervals[-1][1] = max(last_end, end)
+            else:
+                merged_intervals.append([start, end])
+
+    total_covered_seconds = sum((end - start).total_seconds() for start, end in merged_intervals)
+    total_covered_hours = total_covered_seconds / 3600.0
+    coverage_ratio = (total_covered_hours / strategy_lifetime_h * 100) if strategy_lifetime_h > 0 else 0.0
 
     total_trades = len(g_sorted)
     sum_return = g_sorted['return'].sum() * 100
@@ -85,10 +106,21 @@ def calculate_portfolio_metrics(g_sorted):
     cum_eq = np.cumsum(net_rets_arr) * 100
     running_max = np.maximum.accumulate(cum_eq)
     drawdowns = running_max - cum_eq
-    curve_maxdd = drawdowns.max() if len(drawdowns) > 0 else 0.0
+
+    # ==========================================
+    # 回撤修复：策略组合资金最大回撤不能小于最大单笔回撤
+    # ==========================================
+    original_curve_maxdd = drawdowns.max() if len(drawdowns) > 0 else 0.0
+
+    if 'max_drawdown' in g_sorted.columns and not g_sorted['max_drawdown'].empty:
+        max_single_trade_dd = g_sorted['max_drawdown'].abs().max() * 100
+    else:
+        max_single_trade_dd = 0.0
+
+    curve_maxdd = max(original_curve_maxdd, max_single_trade_dd)
 
     maxdd_duration_d = 0.0
-    if curve_maxdd > 1e-8:
+    if original_curve_maxdd > 1e-8:
         trough_idx = np.argmax(drawdowns)
         trough_time = exit_times_arr[trough_idx]
         peak_idx = np.argmax(cum_eq[:trough_idx + 1])
@@ -134,7 +166,10 @@ def calculate_portfolio_metrics(g_sorted):
         '平均资金暴露度(%)': avg_exposure,
         'Top1币收益占比(%)': top1_ratio,
         'Top3币收益占比(%)': top3_ratio,
+        '原始策略组合资金最大回撤(%)': original_curve_maxdd,
+        '最大单笔回撤(%)': max_single_trade_dd,
         '策略组合资金最大回撤(%)': curve_maxdd,
+        '持仓时间覆盖比例(%)': coverage_ratio,
         '最大回撤历时(天)': maxdd_duration_d,
         '最大回撤历时占比(%)': maxdd_duration_ratio,
         '最大并发持仓数': max_concurrency,
@@ -204,13 +239,24 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         icon = "🔺" if cost_gain >= 0 else "🔻"
         print(f"  {'赚钱性价比':<14} | {c_a:>14.2f} | {c_b:>14.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
 
-        # 2. 资金最大回撤
+        # 2. 资金最大回撤系列
+        orig_a = row['单A_原始资金最大回撤(%)']
+        orig_b = row['单B_原始资金最大回撤(%)']
+        orig_combo = row['联合_原始资金最大回撤(%)']
+        print(f"  {'原始资金最大回撤':<14} | {orig_a:>13.2f}% | {orig_b:>13.2f}% | {orig_combo:>15.2f}% | {'---':>16}")
+
+        single_a = row['单A_最大单笔回撤(%)']
+        single_b = row['单B_最大单笔回撤(%)']
+        single_combo = row['联合_最大单笔回撤(%)']
+        print(
+            f"  {'最大单笔回撤':<14} | {single_a:>13.2f}% | {single_b:>13.2f}% | {single_combo:>15.2f}% | {'---':>16}")
+
         m_a = row['单A_资金最大回撤(%)']
         m_b = row['单B_资金最大回撤(%)']
         m_combo = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs单体最低)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        # print(f"  {'资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
+        print(f"  {'最终资金最大回撤':<14} | {m_a:>13.2f}% | {m_b:>13.2f}% | {m_combo:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
         dur_a = row['单A_最大回撤历时(天)']
@@ -254,6 +300,12 @@ def print_synergy_dashboard(single_df, pair_df, top_n=5):
         ht_combo = row['联合_平均持仓时间(天)']
         print(f"  {'平均持仓时间(天)':<14} | {ht_a:>14.2f} | {ht_b:>14.2f} | {ht_combo:>16.2f} | {'---':>16}")
 
+        # 10. 持仓时间覆盖比例(%)
+        cov_a = row['单A_持仓时间覆盖比例(%)']
+        cov_b = row['单B_持仓时间覆盖比例(%)']
+        cov_combo = row['联合_持仓时间覆盖比例(%)']
+        print(f"  {'持仓覆盖比例(%)':<14} | {cov_a:>13.2f}% | {cov_b:>13.2f}% | {cov_combo:>15.2f}% | {'---':>16}")
+
     print("\n" + "=" * 92)
 
 
@@ -291,8 +343,9 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         for i in range(1, k + 1):
             prefix = "├─" if i < k else "└─"
             # 此处使用 get_masked_signal 进行脱敏
-            print(f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {get_masked_signal(row[f'腿{i}_入场'])} -> {get_masked_signal(row[f'腿{i}_出场'])} "
-                  f"({row[f'腿{i}_方向']}_{row[f'腿{i}_过滤']}) | 单体性价比 {row[f'腿{i}_单体性价比']:.2f}")
+            print(
+                f"  {prefix} 腿 {i}: [{row[f'腿{i}_周期']}] {get_masked_signal(row[f'腿{i}_入场'])} -> {get_masked_signal(row[f'腿{i}_出场'])} "
+                f"({row[f'腿{i}_方向']}_{row[f'腿{i}_过滤']}) | 单体性价比 {row[f'腿{i}_单体性价比']:.2f}")
         print(f"  ★ 对比基准(最优已评估子组合, 规模{int(row['最优子组合_规模'])}): {row['最优子组合_对应腿']}")
         print(f"  {'-' * 88}")
         print(f"  {'对比维度':<14} | {'最优子组合':>16} | {combo_label:>16} | {'增益/变化':>16}")
@@ -305,12 +358,20 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         icon = "🔺" if cost_gain >= 0 else "🔻"
         print(f"  {'赚钱性价比':<14} | {c_sub:>16.2f} | {c_combo:>16.2f} | {c_diff_sign:>14} {icon}")
 
-        # 2. 资金最大回撤
+        # 2. 资金最大回撤系列
+        orig_sub = row['最优子组合_原始资金最大回撤(%)']
+        orig_combo_v = row['联合_原始资金最大回撤(%)']
+        print(f"  {'原始资金最大回撤':<14} | {orig_sub:>15.2f}% | {orig_combo_v:>15.2f}% | {'---':>16}")
+
+        single_sub = row['最优子组合_最大单笔回撤(%)']
+        single_combo_v = row['联合_最大单笔回撤(%)']
+        print(f"  {'最大单笔回撤':<14} | {single_sub:>15.2f}% | {single_combo_v:>15.2f}% | {'---':>16}")
+
         m_sub = row['最优子组合_资金最大回撤(%)']
         m_combo_v = row['联合_资金最大回撤(%)']
         m_diff = row['【风险】回撤变动(vs最优子组合)(%)']
         m_diff_sign = f"+{m_diff:.2f}%" if m_diff >= 0 else f"{m_diff:.2f}%"
-        print(f"  {'资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
+        print(f"  {'最终资金最大回撤':<14} | {m_sub:>15.2f}% | {m_combo_v:>15.2f}% | {m_diff_sign:>16}")
 
         # 3. 最大回撤历时(天)
         dur_sub = row['最优子组合_最大回撤历时(天)']
@@ -346,6 +407,11 @@ def print_multi_synergy_dashboard(level_df, k, top_n=5):
         ht_sub = row['最优子组合_平均持仓时间(天)']
         ht_combo = row['联合_平均持仓时间(天)']
         print(f"  {'平均持仓时间(天)':<14} | {ht_sub:>16.2f} | {ht_combo:>16.2f} | {'---':>16}")
+
+        # 10. 持仓时间覆盖比例(%)
+        cov_sub = row['最优子组合_持仓时间覆盖比例(%)']
+        coverage = row['联合_持仓时间覆盖比例(%)']
+        print(f"  {'持仓覆盖比例(%)':<14} | {cov_sub:>15.2f}% | {coverage:>15.2f}% | {'---':>16}")
 
     print("\n" + "=" * 92)
 
@@ -415,7 +481,8 @@ def analyze_pair_combinations_with_baseline(
     # =====================================================================
     # 筛选满足【最大并发持仓数 < 100】的腿才能作为后续组合的材料
     # =====================================================================
-    valid_strategies_for_combo = [s_id for s_id in unique_strategies if single_metrics_dict[s_id]['最大并发持仓数'] < 100]
+    valid_strategies_for_combo = [s_id for s_id in unique_strategies if
+                                  single_metrics_dict[s_id]['最大并发持仓数'] < 100]
 
     if len(valid_strategies_for_combo) < 2:
         print("⚠️ 满足并发条件的独立策略少于 2 个，跳过组合测算。")
@@ -494,6 +561,18 @@ def analyze_pair_combinations_with_baseline(
             '单A_资金最大回撤(%)': m1['策略组合资金最大回撤(%)'],
             '单B_资金最大回撤(%)': m2['策略组合资金最大回撤(%)'],
 
+            '联合_原始资金最大回撤(%)': m_combo['原始策略组合资金最大回撤(%)'],
+            '单A_原始资金最大回撤(%)': m1['原始策略组合资金最大回撤(%)'],
+            '单B_原始资金最大回撤(%)': m2['原始策略组合资金最大回撤(%)'],
+
+            '联合_最大单笔回撤(%)': m_combo['最大单笔回撤(%)'],
+            '单A_最大单笔回撤(%)': m1['最大单笔回撤(%)'],
+            '单B_最大单笔回撤(%)': m2['最大单笔回撤(%)'],
+
+            '联合_持仓时间覆盖比例(%)': m_combo['持仓时间覆盖比例(%)'],
+            '单A_持仓时间覆盖比例(%)': m1['持仓时间覆盖比例(%)'],
+            '单B_持仓时间覆盖比例(%)': m2['持仓时间覆盖比例(%)'],
+
             '联合_最大回撤历时(天)': m_combo['最大回撤历时(天)'],
             '单A_最大回撤历时(天)': m1['最大回撤历时(天)'],
             '单B_最大回撤历时(天)': m2['最大回撤历时(天)'],
@@ -567,7 +646,8 @@ def analyze_pair_combinations_with_baseline(
         # 种子排序: 优先联合性价比, 其次增量 (可按需改为 x[2] 优先增量)
         seeds_sorted = sorted(qualified_prev_level, key=lambda x: (x[1], x[2]), reverse=True)
         if max_seeds_per_level is not None and len(seeds_sorted) > max_seeds_per_level:
-            print(f"\n✂️ {k - 1}联合格种子共 {len(seeds_sorted)} 个，按联合性价比截取前 {max_seeds_per_level} 个用于扩展。")
+            print(
+                f"\n✂️ {k - 1}联合格种子共 {len(seeds_sorted)} 个，按联合性价比截取前 {max_seeds_per_level} 个用于扩展。")
             seeds_sorted = seeds_sorted[:max_seeds_per_level]
         seeds = [item[0] for item in seeds_sorted]
 
@@ -631,7 +711,12 @@ def analyze_pair_combinations_with_baseline(
             row['最优子组合_对应腿'] = ' + '.join(
                 [f"腿{i}" for i, mid in enumerate(members, 1) if mid in best_sub_key])
             row['最优子组合_赚钱性价比'] = best_sub_cost
+
             row['最优子组合_资金最大回撤(%)'] = best_sub_m['策略组合资金最大回撤(%)']
+            row['最优子组合_原始资金最大回撤(%)'] = best_sub_m['原始策略组合资金最大回撤(%)']
+            row['最优子组合_最大单笔回撤(%)'] = best_sub_m['最大单笔回撤(%)']
+            row['最优子组合_持仓时间覆盖比例(%)'] = best_sub_m['持仓时间覆盖比例(%)']
+
             row['最优子组合_最大回撤历时(天)'] = best_sub_m['最大回撤历时(天)']
             row['最优子组合_最大并发持仓'] = best_sub_m['最大并发持仓数']
             row['最优子组合_Top1币收益占比(%)'] = best_sub_m['Top1币收益占比(%)']
@@ -646,7 +731,12 @@ def analyze_pair_combinations_with_baseline(
 
             row['联合_赚钱性价比'] = m_combo['策略赚钱性价比']
             row['联合_总真实净收益(%)'] = m_combo['总真实净收益(%)']
+
             row['联合_资金最大回撤(%)'] = m_combo['策略组合资金最大回撤(%)']
+            row['联合_原始资金最大回撤(%)'] = m_combo['原始策略组合资金最大回撤(%)']
+            row['联合_最大单笔回撤(%)'] = m_combo['最大单笔回撤(%)']
+            row['联合_持仓时间覆盖比例(%)'] = m_combo['持仓时间覆盖比例(%)']
+
             row['联合_最大回撤历时(天)'] = m_combo['最大回撤历时(天)']
             row['联合_最大回撤历时占比(%)'] = m_combo['最大回撤历时占比(%)']
             row['联合_真实净胜率(%)'] = m_combo['真实净胜率(%)']
@@ -719,7 +809,7 @@ if __name__ == '__main__':
             pair_output_filename='pair_combinations_with_comparison.csv',
             single_output_filename='single_strategy_summary.csv',
             show_top_n_dashboard=20,  # 控制台打印前 5 个提升最显著的组合
-            max_combo_size=4,  # 最多扩展到 4 联组合
+            max_combo_size=2,  # 最多扩展到 4 联组合
             improvement_threshold=0.0,  # 增量 > 该阈值才有资格进入下一级扩展
             max_seeds_per_level=200  # 每级最多取多少个合格种子向外扩展(防组合爆炸)
         )
