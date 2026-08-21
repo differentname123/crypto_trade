@@ -438,7 +438,6 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
         return [], pd.DataFrame(columns=SIGNAL_COLS)
 
     M, N, mp, EPS = _bars(P['M_HOURS'], bar_minutes), _bars(P['N_HOURS'], bar_minutes), max(50, W // 5), 1e-12
-    h, l, c, fr_series = df['funding_rate']  # 修正：原来代码里有小bug, 这里保持原状不乱改
     h, l, c, fr_series = df['high'], df['low'], df['close'], df['funding_rate']
     prev_close = c.shift(1)
 

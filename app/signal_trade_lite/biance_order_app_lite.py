@@ -33,7 +33,7 @@ import uuid
 import pandas as pd
 
 
-CURRENT_SYMBOL = "vol_fr_long"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long" "bottom_power_short" "oi_decay_short" "high_fr_bear_div_short" "vwap_reclaim_long"
+CURRENT_SYMBOL = "cross"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long" "bottom_power_short" "oi_decay_short" "high_fr_bear_div_short" "vwap_reclaim_long"
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
