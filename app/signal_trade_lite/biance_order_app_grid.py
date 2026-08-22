@@ -937,25 +937,27 @@ def cancel_all_orders_for_symbol(exchange, symbol):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
-    current_symbol = "20260821"
+    current_symbol = "20260822"
     # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
     configs = [
 
+        # GridConfig(
+        #     strategy_id=f"STX{current_symbol}", symbol="STX/USDT:USDT",
+        #     min_price=0.05, max_price=0.21, price_ratio=1.44, quantity=400,
+        # ),  # 消耗  924  u 网格数量 100
         GridConfig(
-            strategy_id=f"STX{current_symbol}", symbol="STX/USDT:USDT",
-            min_price=0.05, max_price=0.21, price_ratio=1.44, quantity=400,
-        ),  # 消耗  924  u 网格数量 100
-        # GridConfig(
-        #     strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
-        #     min_price=25, max_price=107, price_ratio=1.2, quantity=1,
-        # ),  # 消耗  992  u 网格数量 121
-        # GridConfig(
-        #     strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
-        #     min_price=50000, max_price=84500, price_ratio=0.73, quantity=0.001,
-        # ), # 消耗  1150  u 网格数量 72
+            strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
+            min_price=50000, max_price=82363, price_ratio=0.73, quantity=0.001,
+        ),  # 消耗  1194  u 网格数量 68
+
+        GridConfig(
+            strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
+            min_price=25, max_price=103, price_ratio=1.2, quantity=1,
+        ),  # 消耗  1147  u 网格数量 118
 
 
-        # 总共节点和为 100 + 121 + 72 = 293 个节点，消耗资金为 924 + 992 + 1150 = 3066 u
+
+        # 总共节点和为 68 + 118 = 186 个节点，消耗 1194 + 1147 = 2341 u
     ]
     processes = []
     for config in configs:
