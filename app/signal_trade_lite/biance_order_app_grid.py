@@ -516,12 +516,25 @@ class GridNode:
             logger.critical(f"[挂单] {tag} | 结果:[UNKNOWN] 请求发出后未收到交易所回执(疑似网络中断), "
                             f"无法确认是否已受理; 节点转入防御, 等待看门狗点查对账修复")
         else:
-            self.state = NodeState.ERROR
-            self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
-                                   self.active_client_oid, price, self.quantity, "ERROR", msg=res.error_msg)
-            logger.error(f"[挂单] {tag} | 结果:[明确拒单] 节点已挂起(ERROR)停止自动交易 | "
-                         f"可能原因: 保证金不足/价格触发限制/数量精度不合法 | 交易所回执:[{res.error_msg}]")
+            # 【修复核心】提取报错信息，判断是否为交易所的临时系统风控/限频
+            error_msg_lower = str(res.error_msg).lower()
+            is_transient = "-1008" in error_msg_lower or "throttled" in error_msg_lower or "-1001" in error_msg_lower
 
+            if is_transient:
+                # 瞬态错误：不将节点置为 ERROR，维持当前的 WAIT_OPEN 或 WAIT_CLOSE 状态
+                # 依靠 5 秒 (ORDER_GRACE_PERIOD) 后看门狗发现盘口无单，投递 CANCELED 事件交由主循环自动重试
+                self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                       self.active_client_oid, price, self.quantity, "WARN", msg="触发限频")
+                logger.warning(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
+                               f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
+                               f"交易所回执:[{res.error_msg}]")
+            else:
+                # 真正的致命错误（余额不足、精度错误等）：必须挂起(ERROR)，防止产生死循环疯狂发单
+                self.state = NodeState.ERROR
+                self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                       self.active_client_oid, price, self.quantity, "ERROR", msg=res.error_msg)
+                logger.error(f"[挂单] {tag} | 结果:[明确拒单] 节点已挂起(ERROR)停止自动交易 | "
+                             f"可能原因: 保证金不足/价格触发限制/数量精度不合法 | 交易所回执:[{res.error_msg}]")
 
 def build_geometric_grid(config, broker, ctx):
     """等比生成网格节点; 低价位处若等比价差 < tickSize 则精度塌陷, 提前收口。"""
