@@ -752,22 +752,45 @@ if __name__ == "__main__":
     read_json(temp_path)
     save_json(temp_path, {"test": "test"})
 
+    # 1. 抽取交易对列表
+    symbols_list = [
+    "AAVEUSDT",
+    "AVAXUSDT",
+    "BNBUSDT",
+    "BTCUSDT",
+    "DOGEUSDT",
+    "ETHUSDT",
+    "GMXUSDT",
+    "JUPUSDT",
+    "KASUSDT",
+    "LDOUSDT",
+    "LINKUSDT",
+    "MKRUSDT",
+    "NEARUSDT",
+    "ONDOUSDT",
+    "PENDLEUSDT",
+    "PYTHUSDT",
+    "RAYUSDT",
+    "RENDERUSDT",
+    "RNDRUSDT",
+    "RUNEUSDT",
+    "SKYUSDT",
+    "SOLUSDT",
+    "STXUSDT",
+    "TAOUSDT",
+    "TONUSDT",
+    "TRXUSDT",
+    "UNIUSDT"
+]
+
+    # 2. 提取公共的目录路径和文件后缀
+    base_dir = r"W:\project\python_project\oke_auto_trade\kline_data"
+    suffix = "_1m_2021-01-01_merged.csv"
+
+    # 3. 使用列表推导式优雅拼接
     param_list = [
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\ETHUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\SOLUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\BNBUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\DOGEUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\LINKUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TRXUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\AAVEUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\TONUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\STXUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RENDERUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\RUNEUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\PENDLEUSDT_1m_2021-01-01_merged.csv"},
-        {"csv_file_path": r"W:\project\python_project\oke_auto_trade\kline_data\KASUSDT_1m_2021-01-01_merged.csv"}
+        {"csv_file_path": rf"{base_dir}\{symbol}{suffix}"}
+        for symbol in symbols_list
     ]
     raw_margin_info = read_json("margin_info.json")
     margin_info = {float(k): v for k, v in raw_margin_info.items()} if raw_margin_info else {}
