@@ -954,10 +954,10 @@ def main_app():
     # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
     configs = [
 
-        # GridConfig(
-        #     strategy_id=f"STX{current_symbol}", symbol="STX/USDT:USDT",
-        #     min_price=0.05, max_price=0.21, price_ratio=1.44, quantity=400,
-        # ),  # 消耗  924  u 网格数量 100
+        GridConfig(
+            strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
+            min_price=2.5, max_price=8.25, price_ratio=1.3, quantity=12,
+        ),  # 消耗  1157  u 网格数量 92
         GridConfig(
             strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
             min_price=50000, max_price=82363, price_ratio=0.73, quantity=0.001,
@@ -970,7 +970,7 @@ def main_app():
 
 
 
-        # 总共节点和为 68 + 118 = 186 个节点，消耗 1194 + 1147 = 2341 u
+        # 总共节点和为 68 + 118 + 92 = 278 个节点，消耗资金约为 1157 + 1194 + 1147 = 3498 u
     ]
     processes = []
     for config in configs:
