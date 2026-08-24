@@ -232,6 +232,22 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
         coin_name = os.path.basename(file_path).split('_')[0].upper()
         try:
             raw_df = pd.read_csv(file_path)
+
+            # ================= 新增：拦截不符合“最近一个月内”条件的废弃币种 =================
+            if 'open_time' in raw_df.columns and not raw_df.empty:
+                try:
+                    max_ms = float(raw_df['open_time'].max())
+                    if pd.notna(max_ms):
+                        # 获取当前 UTC 时间向前推一个月的毫秒级时间戳
+
+                        one_month_ago_ms = (pd.Timestamp.now('UTC') - pd.DateOffset(months=1)).timestamp() * 1000
+                        if max_ms < one_month_ago_ms:
+                            logger.info(f"[{coin_name}] 的最新数据不在最近一个月内，跳过处理该币种。")
+                            continue
+                except Exception as e:
+                    logger.warning(f"[{coin_name}] 检查 ms 级别 open_time 时异常，继续处理: {e}")
+            # =============================================================================
+
             data_cache[coin_name] = _prepare_dataframe(raw_df)
         except Exception as e:
             logger.error(f"解析文件失败 {file_path}: {e}")
@@ -769,7 +785,6 @@ if __name__ == "__main__":
     "ONDOUSDT",
     "PENDLEUSDT",
     "PYTHUSDT",
-    "RAYUSDT",
     "RENDERUSDT",
     "RUNEUSDT",
     "SKYUSDT",
