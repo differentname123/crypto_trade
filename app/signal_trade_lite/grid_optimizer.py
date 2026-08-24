@@ -9,12 +9,12 @@
 
 [数据流转/交互]
 1. 预处理与缓存：全量加载 CSV 历史数据并标准化时间轴与数据类型，驻留内存以消除重复 I/O。
-2. 静态特征提取：以 BTC 历史最高点的时间为全市场对齐锚点，横向计算所有标的的最大回撤边界；纵向重采样计算多周期（5min~24h）的归一化真实波幅（NTR）日均得分。
-3. 理论底线推演：以 BTC 的历史最大回撤为标尺，通过比例映射推导出各山寨币的“理论最低价”。
-4. 动态估值（实时交互）：拉取各币种实时现价，计算当前距离理论底部的回撤比例，向下兼容 BTC 实时跌幅作为底线要求，查表获取所需保证金，最终求得 (日均得分/保证金) 的动态性价比分数。
+2. 静态特征提取：纵向重采样计算多周期（5min~24h）的归一化真实波幅（NTR）日均得分；通过BTC参照收盘价对比计算各币种兑BTC的最大比例特征。
+3. 理论底线推演：以 BTC 46000 结合最大的比例来反推当前币的新理论底价。
+4. 动态估值（实时交互）：拉取各币种实时现价，计算当前距离新理论底部的回撤比例，向下兼容 BTC 实时跌幅作为底线要求，查表获取所需保证金，求得最终性价比分数。
 
 [输出数据]
-输出并持久化一份包含静态统计特征、理论极值边界、实时价格及最终评级分数的综合排序 DataFrame（导出为 CSV），供后续自动交易或人工决策使用。
+输出并持久化一份包含静态统计特征、理论极值边界、实时价格及最终评级分数的综合排序 DataFrame（导出为 CSV）。
 """
 
 import os
@@ -98,63 +98,15 @@ def calculate_grid_score(df, resample_rule='15min'):
     return final_score, median_ntr_pct
 
 
-def _extract_coin_features(coin_name, df, btc_max_price_time, periods, btc_ref_close=None, ratio_resample_rule='1D',
+def _extract_coin_features(coin_name, df, periods, btc_ref_close=None, ratio_resample_rule='1D',
                            ratio_window_days=365):
     """
     What & Why:
     解耦提取单个币种所有静态特征的逻辑。
-    对齐 BTC 峰值时间寻找山寨币同期极值，并计算历史最大回撤及各周期网格得分。
-    （新增：接收BTC参照收盘价对比计算各币种兑BTC的最大比例特征，周期与时间窗口参数化控制）
+    计算与 BTC 的历史比率极值及各周期网格得分（已剔除与新分数无关的自身最大回撤逻辑）。
     """
-    result = {'Coin': coin_name}
+    result = {'币种': coin_name}
 
-    try:
-        high_col, low_col = df['high'], df['low']
-
-        # 确定极值点：若非 BTC，则在 BTC 峰值前后1个月窗口内寻找共振最高点
-        if btc_max_price_time is not None and coin_name.upper() not in ['BTC', 'BTCUSDT']:
-            window_start = btc_max_price_time - pd.DateOffset(months=1)
-            window_end = btc_max_price_time + pd.DateOffset(months=1)
-            window_high = high_col.loc[window_start:window_end]
-
-            max_price_series = window_high if not window_high.empty else high_col
-        else:
-            max_price_series = high_col
-
-        max_price = max_price_series.max()
-        max_price_time = max_price_series.idxmax()
-
-        # 计算历史最大回撤及起止点
-        cum_max = high_col.cummax()
-        drawdowns = (low_col - cum_max) / cum_max
-        max_dd_end_time = drawdowns.idxmin()
-        max_dd_pct = drawdowns.min() * 100
-
-        max_dd_end_price = low_col.loc[max_dd_end_time]
-        if isinstance(max_dd_end_price, pd.Series):
-            max_dd_end_price = max_dd_end_price.iloc[0]
-
-        pre_dd_high = high_col.loc[:max_dd_end_time]
-        max_dd_start_time = pre_dd_high.idxmax()
-        max_dd_start_price = pre_dd_high.loc[max_dd_start_time]
-        if isinstance(max_dd_start_price, pd.Series):
-            max_dd_start_price = max_dd_start_price.iloc[0]
-
-        result.update({
-            'Max_Price': max_price, 'Max_Price_Time': max_price_time, 'Max_DD(%)': max_dd_pct,
-            'Max_DD_Start_Time': max_dd_start_time, 'Max_DD_Start_Price': max_dd_start_price,
-            'Max_DD_End_Time': max_dd_end_time, 'Max_DD_End_Price': max_dd_end_price
-        })
-
-    except Exception as e:
-        logger.warning(f"[{coin_name}] 极值和回撤统计失败: {e}")
-        result.update({
-            'Max_Price': None, 'Max_Price_Time': None, 'Max_DD(%)': None,
-            'Max_DD_Start_Time': None, 'Max_DD_Start_Price': None,
-            'Max_DD_End_Time': None, 'Max_DD_End_Price': None
-        })
-
-    # ================= 新增逻辑：计算与 BTC 指定周期的参照收盘价最大比例等特征 =================
     max_ratio = None
     max_ratio_time = None
     btc_price_at_max_ratio = None
@@ -193,21 +145,20 @@ def _extract_coin_features(coin_name, df, btc_max_price_time, periods, btc_ref_c
         logger.warning(f"[{coin_name}] 计算BTC收盘比例特征时发生异常: {e}")
 
     result.update({
-        'Max_Ratio_vs_BTC': max_ratio,
-        'Max_Ratio_Time': max_ratio_time,
-        'BTC_Price_At_Max_Ratio': btc_price_at_max_ratio,
-        'Coin_Price_At_Max_Ratio': coin_price_at_max_ratio
+        '相对BTC最大比例': max_ratio,
+        '最大比例发生时间': max_ratio_time,
+        '最大比例时BTC价格': btc_price_at_max_ratio,
+        '最大比例时本币价格': coin_price_at_max_ratio
     })
-    # =================================================================================
 
     scores = []
     for period in periods:
         score, med_pct = calculate_grid_score(df, resample_rule=period)
-        result[f'{period}_Score'] = score
-        result[f'{period}_Med(%)'] = med_pct
+        result[f'{period}_得分'] = score
+        result[f'{period}_中位数(%)'] = med_pct
         scores.append(score)
 
-    result['Avg_Score'] = sum(scores) / len(scores) if scores else 0.0
+    result['平均网格得分'] = sum(scores) / len(scores) if scores else 0.0
     return result
 
 
@@ -216,8 +167,7 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
     """
     What & Why:
     统筹全局静态数据的缓存、解析与跨标的换算。
-    构建一次性内存缓存池 (data_cache) 消除重复 I/O，并建立 BTC 回撤基准体系推导全市场理论底部。
-    (提供 ratio_resample_rule 和 ratio_window_days 暴露给外部调用，以实现对提取计算的参数化管控)
+    构建一次性内存缓存池 (data_cache) 消除重复 I/O，并建立 BTC 极值比例基准体系推导全市场新理论底部。
     """
     if os.path.exists(output_file):
         logger.info(f"统计文件 [{output_file}] 已存在，直接加载跳过重算。")
@@ -233,20 +183,16 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
         try:
             raw_df = pd.read_csv(file_path)
 
-            # ================= 新增：拦截不符合“最近一个月内”条件的废弃币种 =================
             if 'open_time' in raw_df.columns and not raw_df.empty:
                 try:
                     max_ms = float(raw_df['open_time'].max())
                     if pd.notna(max_ms):
-                        # 获取当前 UTC 时间向前推一个月的毫秒级时间戳
-
                         one_month_ago_ms = (pd.Timestamp.now('UTC') - pd.DateOffset(months=1)).timestamp() * 1000
                         if max_ms < one_month_ago_ms:
                             logger.info(f"[{coin_name}] 的最新数据不在最近一个月内，跳过处理该币种。")
                             continue
                 except Exception as e:
                     logger.warning(f"[{coin_name}] 检查 ms 级别 open_time 时异常，继续处理: {e}")
-            # =============================================================================
 
             data_cache[coin_name] = _prepare_dataframe(raw_df)
         except Exception as e:
@@ -256,107 +202,46 @@ def generate_statistics(param_list, output_file="grid_statistics_result.csv", ra
         logger.warning("数据缓存池为空，请检查数据源配置。")
         return None
 
-    # 2. 提取全市场共振时间锚点 (BTC 峰值) 以及 BTC 参照收盘价供比率计算
-    btc_max_price_time = None
+    # 2. 提取 BTC 参照收盘价供比率计算
     btc_ref_close = None
     btc_df = data_cache.get('BTC', data_cache.get('BTCUSDT'))
     if btc_df is not None and not btc_df.empty:
-        btc_max_price_time = btc_df['high'].idxmax()
-        # 提取BTC指定周期的收盘价，用于透传到各标的特征提取中
         btc_ref_close = btc_df['close'].resample(ratio_resample_rule).last().dropna()
-        logger.info(f"成功锁定 BTC 峰值时间锚点: {btc_max_price_time}")
+        logger.info("成功锁定 BTC 用于对比的收盘价基准数据")
     else:
-        logger.warning("未定位到 BTC 数据，各标的将独立寻找历史极值。")
+        logger.warning("未定位到 BTC 数据，比值极值推导将受限。")
 
     # 3. 遍历计算特征
     periods = ['1h', '2h', '4h', '8h', '12h', '24h']
     results = []
 
     for coin_name, df in data_cache.items():
-        # 透传参数
         coin_result = _extract_coin_features(
-            coin_name, df, btc_max_price_time, periods,
+            coin_name, df, periods,
             btc_ref_close=btc_ref_close,
             ratio_resample_rule=ratio_resample_rule,
             ratio_window_days=ratio_window_days
         )
-
-        # ================== 新增：计算最优网格间距并集成结果 ==================
-        # 考虑到 df 的 'open_time' 已经被 _prepare_dataframe 转化为了 index (DatetimeIndex)
-        # 为兼容 optimize_grid_interval 内部基于毫秒时间戳的 365 天截取逻辑，我们将其还原为整数类型的 open_time 列
-        temp_df = df.copy()
-        if 'open_time' not in temp_df.columns and temp_df.index.name == 'open_time':
-            temp_df['open_time'] = temp_df.index.astype('int64') // 10**6
-
-        optimal_results = optimize_grid_interval(
-            temp_df,
-            step_pct=0.01,
-            min_pct=0.2,
-            max_pct=2.0,
-            fee_pct=0.04
-        )
-        # 过滤得到optimal_results中Trades大于 365
-        optimal_results = optimal_results[optimal_results['Trades'] > 365*5]
-        if not optimal_results.empty:
-            best_grid = optimal_results.iloc[0]
-            coin_result['Best_Grid_Interval_Pct'] = best_grid['Grid_Interval_Pct']
-            coin_result['Best_Grid_Interval_Float'] = best_grid['Interval_Float']
-            coin_result['Best_Grid_Trades'] = best_grid['Trades']
-            coin_result['Best_Grid_Score'] = best_grid['Score']
-        else:
-            coin_result['Best_Grid_Interval_Pct'] = None
-            coin_result['Best_Grid_Interval_Float'] = None
-            coin_result['Best_Grid_Trades'] = None
-            coin_result['Best_Grid_Score'] = None
-        # ======================================================================
-
         results.append(coin_result)
         logger.info(f"[{coin_name}] 静态特征提取完成")
 
     final_df = pd.DataFrame(results)
 
-    # 4. 动态换算理论回撤与最低价 (依赖 BTC 基准)
-    btc_row = final_df[final_df['Coin'].isin(['BTC', 'BTCUSDT'])]
-    if not btc_row.empty and pd.notna(btc_row.iloc[0]['Max_Price']) and btc_row.iloc[0]['Max_DD(%)'] != 0:
-        btc_max_price = btc_row.iloc[0]['Max_Price']
-        btc_max_dd_pct = btc_row.iloc[0]['Max_DD(%)']
-        btc_theory_lowest = 46000.0
-        btc_theory_dd_pct = (btc_theory_lowest - btc_max_price) / btc_max_price * 100
-
-        dd_ratio = final_df['Max_DD(%)'] / btc_max_dd_pct
-        final_df['Theory_DD(%)'] = dd_ratio * btc_theory_dd_pct
-        final_df['Theory_Lowest_Price'] = final_df['Max_Price'] * (1 + final_df['Theory_DD(%)'] / 100)
-
-        # 新增计算新的一种理论最低价格：以 BTC 46000 结合最大的比例来反推当前币的理论底价
-        final_df['New_Theory_Lowest_Price'] = final_df.apply(
-            lambda row: (46000.0 / row['Max_Ratio_vs_BTC']) if pd.notna(row['Max_Ratio_vs_BTC']) and row[
-                'Max_Ratio_vs_BTC'] > 0 else None,
+    # 4. 动态换算新理论最低价
+    btc_row = final_df[final_df['币种'].isin(['BTC', 'BTCUSDT'])]
+    if not btc_row.empty:
+        final_df['新理论底价'] = final_df.apply(
+            lambda row: (46000.0 / row['相对BTC最大比例']) if pd.notna(row['相对BTC最大比例']) and row['相对BTC最大比例'] > 0 else None,
             axis=1
         )
     else:
         logger.warning("未能建立 BTC 回撤换算基准。")
-        final_df['Theory_DD(%)'] = None
-        final_df['Theory_Lowest_Price'] = None
-        final_df['New_Theory_Lowest_Price'] = None
+        final_df['新理论底价'] = None
 
     # 5. 格式化、排序并持久化
-    final_df.sort_values(by='Avg_Score', ascending=False, inplace=True)
+    final_df.sort_values(by='平均网格得分', ascending=False, inplace=True)
     final_df.reset_index(drop=True, inplace=True)
 
-    ordered_columns = ['Coin']
-    for p in periods:
-        ordered_columns.extend([f'{p}_Score', f'{p}_Med(%)'])
-
-    # 将所有的新增统计列也补充到最终输出结果的列序中
-    ordered_columns.extend([
-        'Avg_Score', 'Max_Price', 'Max_Price_Time', 'Max_DD(%)', 'Theory_DD(%)', 'Theory_Lowest_Price',
-        'Max_DD_Start_Time', 'Max_DD_Start_Price', 'Max_DD_End_Time', 'Max_DD_End_Price',
-        'Max_Ratio_vs_BTC', 'Max_Ratio_Time', 'BTC_Price_At_Max_Ratio', 'Coin_Price_At_Max_Ratio',
-        'New_Theory_Lowest_Price',
-        'Best_Grid_Interval_Pct', 'Best_Grid_Interval_Float', 'Best_Grid_Trades', 'Best_Grid_Score'
-    ])
-
-    final_df = final_df[[col for col in ordered_columns if col in final_df.columns]]
     final_df.to_csv(output_file, index=False)
     logger.info(f"静态评分已落地至: {output_file}")
 
@@ -367,7 +252,6 @@ def get_latest_price(symbol):
     """
     What & Why:
     对接 Binance 公开接口拉取实时盘口现价。
-    保持原有代理策略穿透网络限制，为动态评分提供当前时点的数据支撑。
     """
     sym = symbol.upper()
     if not sym.endswith('USDT'):
@@ -390,49 +274,34 @@ def get_latest_price(symbol):
 def calculate_final_score(df, margin_info, up_pct_target=10):
     """
     What & Why:
-    融合实时现价生成最终资金分配策略得分。
-    通过比对当前价格与理论底价计算实时跌幅，映射保证金表，折算投入产出比。
-    采用“不破坏原有 DataFrame”设计模式。
-    （新增1：关于 New_Theory_Lowest_Price 的等效回撤、保证金与评分字段）
-    （新增2：基于BTC最新价推导出的理论价，以及现价偏离该理论价的百分比）
-    （修改3：将上涨目标参数化，默认上涨20%，计算目标价格以及达到目标后的新分数）
-    （新增4：反推计算达到对标 BTC 当前 new_score 所需的理论涨跌幅及具体价格）
-    （新增5：反推计算达到对标 BTC 上涨后 new_score 所需的理论涨跌幅及具体价格）
+    完全基于“新理论底价”的逻辑线，融合实时现价生成最终资金分配策略得分。
+    去除了与新分数无关的所有旧日回撤及旧分数衍生字段，并保证字段名纯中文。
     """
     result_df = df.copy()
     latest_prices_dict = {}
 
-    btc_drop_pct = None
     new_btc_drop_pct = None
     btc_price = None
-    btc_new_score = None  # 存储 BTC 当前的最终分数
+    btc_new_score = None
 
-    # [新增] 存储 BTC 上涨 up_pct_target 后的状态标杆
     new_btc_drop_pct_at_target = None
     btc_up_target_new_score = None
 
     # 1. 批量预取现价，锁定 BTC 实时回撤底线
-    for coin in result_df['Coin']:
+    for coin in result_df['币种']:
         latest_prices_dict[coin] = get_latest_price(coin)
 
-    btc_row = result_df[result_df['Coin'].isin(['BTC', 'BTCUSDT'])]
+    btc_row = result_df[result_df['币种'].isin(['BTC', 'BTCUSDT'])]
     if not btc_row.empty:
-        btc_coin = btc_row.iloc[0]['Coin']
+        btc_coin = btc_row.iloc[0]['币种']
         btc_price = latest_prices_dict.get(btc_coin)
 
-        btc_theory_lowest = btc_row.iloc[0]['Theory_Lowest_Price']
-        new_btc_theory_lowest = btc_row.iloc[0]['New_Theory_Lowest_Price']
-        btc_avg_score = btc_row.iloc[0]['Avg_Score']
+        new_btc_theory_lowest = btc_row.iloc[0]['新理论底价']
+        btc_avg_score = btc_row.iloc[0]['平均网格得分']
 
         if btc_price and btc_price > 0:
-            # BTC上涨后目标价
             btc_up_price = btc_price * (1 + up_pct_target / 100.0)
 
-            # 原有逻辑：BTC基于旧理论价格的跌幅
-            if pd.notna(btc_theory_lowest):
-                btc_drop_pct = max(0.0, (btc_price - btc_theory_lowest) / btc_price * 100)
-
-            # 基于新理论价格的跌幅及分数推导
             if pd.notna(new_btc_theory_lowest):
                 # 【当前状态】BTC现价跌幅与分数
                 new_btc_drop_pct = max(0.0, (btc_price - new_btc_theory_lowest) / btc_price * 100)
@@ -450,38 +319,39 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
                 if btc_up_req_margin > 0:
                     btc_up_target_new_score = (btc_avg_score / btc_up_req_margin * 10000)
 
-    # 2. 动态计分评估 (扩充了字典以存储新分数及计算字段)
+    # 2. 动态计分评估（仅保留新分数逻辑线核心指标）
     metrics = {
-        'price': [],
-        'drop_pct': [], 'margin': [], 'score': [],
-        'new_drop_pct': [], 'new_margin': [], 'new_score': [],
-        'latest_theory_price': [], 'deviation_pct': [],
-        'req_pct_for_btc_score': [], 'target_price_for_btc_score': [],
-        'up_target_price': [], 'up_target_new_score': [],  # [修改/新增字段3：参数化上涨价格及该价格下的新分数]
-        'req_pct_for_btc_up_score': [], 'target_price_for_btc_up_score': []  # [新增字段5：对标BTC上涨后分数所需的具体目标价及跌幅]
+        '最新价格': [],
+        '距新理论底价跌幅(%)': [],
+        '新所需保证金': [],
+        '新最终分数': [],
+        '基于当前BTC的理论价': [],
+        '现价偏离理论价(%)': [],
+        '对标BTC当前分数所需涨跌幅(%)': [],
+        '对标BTC当前分数所需目标价': [],
+        f'上涨{up_pct_target}%目标价': [],
+        f'上涨{up_pct_target}%后新分数': [],
+        f'对标BTC上涨{up_pct_target}%分数所需涨跌幅(%)': [],
+        f'对标BTC上涨{up_pct_target}%分数所需目标价': []
     }
 
     for _, row in result_df.iterrows():
-        coin = row['Coin']
-        avg_score = row['Avg_Score']
-        theory_lowest = row['Theory_Lowest_Price']
-        new_theory_lowest = row['New_Theory_Lowest_Price']
-        max_ratio = row.get('Max_Ratio_vs_BTC', None)
+        coin = row['币种']
+        avg_score = row['平均网格得分']
+        new_theory_lowest = row['新理论底价']
+        max_ratio = row.get('相对BTC最大比例', None)
 
         price = latest_prices_dict.get(coin)
-        metrics['price'].append(price)
+        metrics['最新价格'].append(price)
 
-        # ==================== [修改/新增逻辑3] 计算上涨 up_pct_target 后的价格及其分数 ====================
+        # 计算上涨 up_pct_target 后的价格及其分数
         up_price = None
         up_target_score = None
 
         if price and price > 0:
             up_price = price * (1 + up_pct_target / 100.0)
-
-            # 计算如果在 up_price 时，该币的 new_score 会是多少
             if pd.notna(new_theory_lowest):
                 drop_at_up = max(0.0, (up_price - new_theory_lowest) / up_price * 100)
-                # 依然需要严格遵守不得小于（对应状态下）BTC跌幅的约束
                 if new_btc_drop_pct_at_target is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
                     drop_at_up = max(drop_at_up, new_btc_drop_pct_at_target)
 
@@ -491,61 +361,40 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
                 if up_req_margin > 0:
                     up_target_score = (avg_score / up_req_margin * 10000)
 
-        metrics['up_target_price'].append(up_price)
-        metrics['up_target_new_score'].append(up_target_score)
+        metrics[f'上涨{up_pct_target}%目标价'].append(up_price)
+        metrics[f'上涨{up_pct_target}%后新分数'].append(up_target_score)
 
-        # ==================== [原有逻辑] 基于 Theory_Lowest_Price ====================
-        if price and pd.notna(theory_lowest) and price > 0:
-            drop_pct = max(0.0, (price - theory_lowest) / price * 100)
-
-            if btc_drop_pct is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
-                drop_pct = max(drop_pct, btc_drop_pct)
-            metrics['drop_pct'].append(drop_pct)
-
-            req_margin = min(margin_info.keys(), key=lambda k: abs(k - drop_pct)) if margin_info else 0.0
-            req_margin = margin_info.get(req_margin, 0.0)
-            metrics['margin'].append(req_margin)
-
-            f_score = (avg_score / req_margin * 10000) if req_margin > 0 else 0.0
-            metrics['score'].append(f_score)
-        else:
-            metrics['drop_pct'].append(None)
-            metrics['margin'].append(None)
-            metrics['score'].append(None)
-
-        # ==================== [新增逻辑1] 基于 New_Theory_Lowest_Price ====================
+        # 基于 新理论底价 计算的核心分数指标
         if price and pd.notna(new_theory_lowest) and price > 0:
             new_drop_pct = max(0.0, (price - new_theory_lowest) / price * 100)
-
             if new_btc_drop_pct is not None and coin.upper() not in ['BTC', 'BTCUSDT']:
                 new_drop_pct = max(new_drop_pct, new_btc_drop_pct)
-            metrics['new_drop_pct'].append(new_drop_pct)
+            metrics['距新理论底价跌幅(%)'].append(new_drop_pct)
 
             new_req_margin = min(margin_info.keys(), key=lambda k: abs(k - new_drop_pct)) if margin_info else 0.0
             new_req_margin = margin_info.get(new_req_margin, 0.0)
-            metrics['new_margin'].append(new_req_margin)
+            metrics['新所需保证金'].append(new_req_margin)
 
             new_f_score = (avg_score / new_req_margin * 10000) if new_req_margin > 0 else 0.0
-            metrics['new_score'].append(new_f_score)
+            metrics['新最终分数'].append(new_f_score)
         else:
-            metrics['new_drop_pct'].append(None)
-            metrics['new_margin'].append(None)
-            metrics['new_score'].append(None)
+            metrics['距新理论底价跌幅(%)'].append(None)
+            metrics['新所需保证金'].append(None)
+            metrics['新最终分数'].append(None)
 
-        # ==================== [新增逻辑2] 基于当前BTC最新价的理论价及偏差 ====================
+        # 基于当前BTC最新价的反推理论价及偏差
         ltp = None
         dev_pct = None
 
         if btc_price and pd.notna(max_ratio) and max_ratio > 0:
             ltp = btc_price / max_ratio
-
             if price and pd.notna(ltp) and ltp > 0:
                 dev_pct = (price - ltp) / ltp * 100
 
-        metrics['latest_theory_price'].append(ltp)
-        metrics['deviation_pct'].append(dev_pct)
+        metrics['基于当前BTC的理论价'].append(ltp)
+        metrics['现价偏离理论价(%)'].append(dev_pct)
 
-        # ==================== [新增逻辑4] 反推同等 BTC 当前分数所需的理论涨跌幅及具体价格 ====================
+        # 反推同等 BTC 当前分数所需的理论涨跌幅及具体价格
         req_pct = None
         req_target_price = None
 
@@ -563,20 +412,19 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
                     req_target_price = p_target
                     req_pct = (p_target - price) / price * 100
 
-        metrics['req_pct_for_btc_score'].append(req_pct)
-        metrics['target_price_for_btc_score'].append(req_target_price)
+        metrics['对标BTC当前分数所需涨跌幅(%)'].append(req_pct)
+        metrics['对标BTC当前分数所需目标价'].append(req_target_price)
 
-        # ==================== [新增逻辑5] 反推同等 BTC 上涨后分数所需的理论涨跌幅及具体价格 ====================
+        # 反推同等 BTC 上涨后分数所需的理论涨跌幅及具体价格
         req_up_pct = None
         req_up_target_price = None
 
         if btc_up_target_new_score is not None and btc_up_target_new_score > 0 and price and price > 0 and pd.notna(
                 new_theory_lowest) and margin_info:
             if coin.upper() in ['BTC', 'BTCUSDT']:
-                req_up_pct = up_pct_target  # BTC自身对标未来状态所需涨幅就是参数设定的涨幅
+                req_up_pct = up_pct_target
                 req_up_target_price = up_price
             else:
-                # 反推所需的保证金数值，目标是BTC上涨后的新分数
                 target_margin_up = (avg_score / btc_up_target_new_score) * 10000
                 best_k_up = min(margin_info.keys(), key=lambda k: abs(margin_info[k] - target_margin_up))
 
@@ -585,79 +433,39 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
                     req_up_target_price = p_target_up
                     req_up_pct = (p_target_up - price) / price * 100
 
-        metrics['req_pct_for_btc_up_score'].append(req_up_pct)
-        metrics['target_price_for_btc_up_score'].append(req_up_target_price)
+        metrics[f'对标BTC上涨{up_pct_target}%分数所需涨跌幅(%)'].append(req_up_pct)
+        metrics[f'对标BTC上涨{up_pct_target}%分数所需目标价'].append(req_up_target_price)
 
     # 3. 数据融合与输出整理
-    result_df['最新价格'] = metrics['price']
+    for key, val_list in metrics.items():
+        result_df[key] = val_list
 
-    # 填充原有字段
-    result_df['到理论低价的回撤比例'] = metrics['drop_pct']
-    result_df['所需资金'] = metrics['margin']
-    result_df['最终分数'] = metrics['score']
-
-    # 填充新增逻辑1字段
-    result_df['到新理论低价的回撤比例'] = metrics['new_drop_pct']
-    result_df['新所需资金'] = metrics['new_margin']
-    result_df['新最终分数'] = metrics['new_score']
-
-    # 填充新增逻辑2字段（理论价格与偏差）
-    result_df['基于当前BTC的理论价格'] = metrics['latest_theory_price']
-    result_df['现价偏离理论价(%)'] = metrics['deviation_pct']
-
-    # 填充新增逻辑4字段（对标BTC当前分数所需目标价及涨跌幅）
-    result_df['对标BTC分数所需目标价'] = metrics['target_price_for_btc_score']
-    result_df['对标BTC分数所需涨跌幅(%)'] = metrics['req_pct_for_btc_score']
-
-    # 填充修改/新增的逻辑3和5字段（动态字段名，体现参数变量）
-    result_df[f'上涨{up_pct_target}%目标价'] = metrics['up_target_price']
-    result_df[f'上涨{up_pct_target}%后新分数'] = metrics['up_target_new_score']
-    result_df[f'对标BTC上涨{up_pct_target}%分数所需目标价'] = metrics['target_price_for_btc_up_score']
-    result_df[f'对标BTC上涨{up_pct_target}%分数所需涨跌幅(%)'] = metrics['req_pct_for_btc_up_score']
-
-    # 保持对原有排序逻辑不干扰，依旧采用旧的最终分数进行主要排序
-    result_df.sort_values(by='最终分数', ascending=False, inplace=True)
+    # 直接使用纯洁版的新最终分数进行降序排序
+    result_df.sort_values(by='新最终分数', ascending=False, inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
     return result_df
 
 def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0.05):
     """
+    (未涉及部分保持不变，由于该功能与新分数无关，已从上层主干流程中剥离调用关联)
     寻找最优网格间距 (支持多种时间格式与DatetimeIndex自适应，并加入全链路日志)
-
-    参数:
-    df: 包含K线数据的DataFrame，需包含 'open', 'high', 'low', 'close' 列。
-        时间列支持 DatetimeIndex 或名为 'open_time' 的列(格式可以是datetime或时间戳)。
-    step_pct: 步长(%)，默认 0.1 (即0.1%)
-    min_pct: 最小间距(%)，默认 0.2 (即0.2%)
-    max_pct: 最大间距(%)，默认 3.0 (即3.0%)
-    fee_pct: 手续费率(%)，默认 0.05 (即0.05%)
-
-    返回:
-    包含不同网格间距统计数据的结果表格，按分数降序排列
     """
     logger.info(f"开始进行网格间距寻优 | 区间: {min_pct}% ~ {max_pct}% | 步长: {step_pct}%")
     original_len = len(df)
 
-    # ---------------- 优化：自适应时间截取逻辑 ----------------
-    # 目标：截取最近 365 天的数据，兼容 DatetimeIndex 和 open_time (时间戳或datetime) 列
     try:
         if isinstance(df.index, pd.DatetimeIndex):
-            # 场景 1: 索引已经是 DatetimeIndex (如经 _prepare_dataframe 处理后)
             max_time = df.index.max()
             cutoff_time = max_time - pd.Timedelta(days=365)
             df = df[df.index >= cutoff_time].copy()
-
         elif 'open_time' in df.columns:
             if pd.api.types.is_datetime64_any_dtype(df['open_time']):
-                # 场景 2: open_time 列是 datetime 对象
                 max_time = df['open_time'].max()
                 cutoff_time = max_time - pd.Timedelta(days=365)
                 df = df[df['open_time'] >= cutoff_time].copy()
             else:
-                # 场景 3: open_time 是数值型时间戳 (需动态判断是毫秒还是秒)
                 max_time = df['open_time'].max()
-                # 如果最大时间戳大于 10^12，说明通常是毫秒 (2001-09-09 之后的毫秒都大于 10^12)
                 if max_time > 1e12:
                     offset = 365 * 24 * 60 * 60 * 1000
                 else:
@@ -665,7 +473,7 @@ def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0
                 cutoff_time = max_time - offset
                 df = df[df['open_time'] >= cutoff_time].copy()
         else:
-            logger.warning("未检测到有效的时间轴 (DatetimeIndex 或 open_time)，将使用全量数据进行网格寻优。")
+            logger.warning("未检测到有效的时间轴，将使用全量数据进行网格寻优。")
 
         filtered_len = len(df)
         if filtered_len < original_len:
@@ -677,28 +485,22 @@ def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0
     if df.empty:
         logger.warning("截取最近365天后，数据量为空，退出寻优。")
         return pd.DataFrame()
-    # ---------------------------------------------------
 
-    # 1. 确保核心列的数据类型为浮点数
     cols = ['open', 'high', 'low', 'close']
     for col in cols:
         if df[col].dtype != np.float64:
             df[col] = df[col].astype(float)
 
-    # 2. 将百分比参数转换为实际小数
     step = step_pct / 100.0
     fee = fee_pct / 100.0
     min_interval = min_pct / 100.0
     max_interval = max_pct / 100.0
 
-    # 3. 获取DF中的最高价作为网格基准点 (锚点)
     max_price = df['high'].max()
 
-    # 4. 生成需要遍历的间距列表 (使用 round 避免浮点数精度问题)
     num_steps = int(round((max_interval - min_interval) / step)) + 1
     intervals = [round(min_interval + i * step, 5) for i in range(num_steps)]
 
-    # ================= 核心提速区：数据向量化准备 =================
     o_vals = df['open'].values
     h_vals = df['high'].values
     l_vals = df['low'].values
@@ -715,17 +517,14 @@ def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0
     all_prices[1::3] = p1
     all_prices[2::3] = p2
     all_prices[3::3] = p3
-    # ==============================================================
 
     results = []
 
-    # 5. 遍历每个间距进行回测
     for interval in intervals:
         spacing_abs = max_price * interval
         if spacing_abs == 0:
             continue
 
-        # ================= 核心提速区：真实网格状态机模拟 =================
         zones = np.floor((max_price - all_prices) / spacing_abs).astype(np.int32)
         diffs = np.diff(zones)
         change_idx = np.where(diffs != 0)[0]
@@ -739,9 +538,7 @@ def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0
             trades = max(0, trades)
         else:
             trades = 0
-        # ================================================================
 
-        # 6. 计算分数: (单次网格利润 - 手续费) * 交易次数 * 资金复用率权重(interval)
         score = (interval - fee) * trades * interval
 
         results.append({
@@ -751,7 +548,6 @@ def optimize_grid_interval(df, step_pct=0.1, min_pct=0.2, max_pct=3.0, fee_pct=0
             'Score': score
         })
 
-    # 7. 汇总结果并按得分降序排序
     result_df = pd.DataFrame(results)
     if not result_df.empty:
         result_df = result_df.sort_values(by='Score', ascending=False).reset_index(drop=True)
@@ -770,30 +566,11 @@ if __name__ == "__main__":
 
     # 1. 抽取交易对列表
     symbols_list = [
-    "AAVEUSDT",
-    "AVAXUSDT",
-    "BNBUSDT",
-    "BTCUSDT",
-    "DOGEUSDT",
-    "ETHUSDT",
-    "GMXUSDT",
-    "JUPUSDT",
-    "KASUSDT",
-    "LDOUSDT",
-    "LINKUSDT",
-    "NEARUSDT",
-    "ONDOUSDT",
-    "PENDLEUSDT",
-    "PYTHUSDT",
-    "RENDERUSDT",
-    "RUNEUSDT",
-    "SKYUSDT",
-    "SOLUSDT",
-    "STXUSDT",
-    "TAOUSDT",
-    "TRXUSDT",
-    "UNIUSDT"
-]
+        "AAVEUSDT", "AVAXUSDT", "BNBUSDT", "BTCUSDT", "DOGEUSDT", "ETHUSDT",
+        "GMXUSDT", "JUPUSDT", "KASUSDT", "LDOUSDT", "LINKUSDT", "NEARUSDT",
+        "ONDOUSDT", "PENDLEUSDT", "PYTHUSDT", "RENDERUSDT", "RUNEUSDT",
+        "SKYUSDT", "SOLUSDT", "STXUSDT", "TAOUSDT", "TRXUSDT", "UNIUSDT"
+    ]
 
     # 2. 提取公共的目录路径和文件后缀
     base_dir = r"W:\project\python_project\oke_auto_trade\kline_data"
@@ -812,6 +589,6 @@ if __name__ == "__main__":
 
     if final_df is not None:
         logger.info("=== 启动动态实时报价与计分计算 ===")
-        # 新最终分数作为排序依据，选哪个看这个字段就行了
+        # 直接围绕新最终分数体系生成结果
         final_df = calculate_final_score(final_df, margin_info)
         logger.info("流程全量执行完毕。")
