@@ -112,6 +112,12 @@ def _extract_coin_features(coin_name, df, periods, btc_ref_close=None, ratio_res
     btc_price_at_max_ratio = None
     coin_price_at_max_ratio = None
 
+    # 新增：记录最强（最小比例）相关变量
+    min_ratio = None
+    min_ratio_time = None
+    btc_price_at_min_ratio = None
+    coin_price_at_min_ratio = None
+
     try:
         if btc_ref_close is not None and coin_name.upper() not in ['BTC', 'BTCUSDT']:
             # 当前币种收盘价按传入的周期参数进行重采样
@@ -138,9 +144,16 @@ def _extract_coin_features(coin_name, df, periods, btc_ref_close=None, ratio_res
                         max_ratio_time = ratio_series.idxmax()
                         btc_price_at_max_ratio = btc_aligned.loc[max_ratio_time]
                         coin_price_at_max_ratio = coin_aligned.loc[max_ratio_time]
+
+                        # 新增：计算最强（最小比例）特征
+                        min_ratio = ratio_series.min()
+                        min_ratio_time = ratio_series.idxmin()
+                        btc_price_at_min_ratio = btc_aligned.loc[min_ratio_time]
+                        coin_price_at_min_ratio = coin_aligned.loc[min_ratio_time]
         elif coin_name.upper() in ['BTC', 'BTCUSDT']:
             # 若是BTC自身，比例固定为1.0
             max_ratio = 1.0
+            min_ratio = 1.0 # 新增
     except Exception as e:
         logger.warning(f"[{coin_name}] 计算BTC收盘比例特征时发生异常: {e}")
 
@@ -148,7 +161,12 @@ def _extract_coin_features(coin_name, df, periods, btc_ref_close=None, ratio_res
         '相对BTC最大比例': max_ratio,
         '最大比例发生时间': max_ratio_time,
         '最大比例时BTC价格': btc_price_at_max_ratio,
-        '最大比例时本币价格': coin_price_at_max_ratio
+        '最大比例时本币价格': coin_price_at_max_ratio,
+        # 新增：将最强比例及其相关价格输出
+        '相对BTC最小比例': min_ratio,
+        '最小比例发生时间': min_ratio_time,
+        '最小比例时BTC价格': btc_price_at_min_ratio,
+        '最小比例时本币价格': coin_price_at_min_ratio
     })
 
     scores = []
@@ -325,8 +343,10 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
         '距新理论底价跌幅(%)': [],
         '新所需保证金': [],
         '新最终分数': [],
-        '基于当前BTC的理论价': [],
-        '现价偏离理论价(%)': [],
+        '基于当前BTC的理论底价': [],     # 修正：补充"底"字以明确含义并与下方顶价对应
+        '现价偏离理论底价(%)': [],       # 修正：补充"底"字
+        '基于当前BTC的理论顶价': [],     # 新增：记录理论顶价
+        '现价偏离理论顶价(%)': [],       # 新增：记录偏离理论顶价百分比
         '对标BTC当前分数所需涨跌幅(%)': [],
         '对标BTC当前分数所需目标价': [],
         f'上涨{up_pct_target}%目标价': [],
@@ -340,6 +360,7 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
         avg_score = row['平均网格得分']
         new_theory_lowest = row['新理论底价']
         max_ratio = row.get('相对BTC最大比例', None)
+        min_ratio = row.get('相对BTC最小比例', None)  # 新增：提取最小比例用于计算顶价
 
         price = latest_prices_dict.get(coin)
         metrics['最新价格'].append(price)
@@ -382,7 +403,7 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
             metrics['新所需保证金'].append(None)
             metrics['新最终分数'].append(None)
 
-        # 基于当前BTC最新价的反推理论价及偏差
+        # 基于当前BTC最新价的反推理论底价及偏差 (原有的理论底价)
         ltp = None
         dev_pct = None
 
@@ -391,8 +412,20 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
             if price and pd.notna(ltp) and ltp > 0:
                 dev_pct = (price - ltp) / ltp * 100
 
-        metrics['基于当前BTC的理论价'].append(ltp)
-        metrics['现价偏离理论价(%)'].append(dev_pct)
+        metrics['基于当前BTC的理论底价'].append(ltp)       # 修正
+        metrics['现价偏离理论底价(%)'].append(dev_pct)     # 修正
+
+        # 新增：基于当前BTC最新价的反推理论顶价（基于最强比例）及偏差
+        htp = None
+        dev_htp_pct = None
+
+        if btc_price and pd.notna(min_ratio) and min_ratio > 0:
+            htp = btc_price / min_ratio
+            if price and pd.notna(htp) and htp > 0:
+                dev_htp_pct = (price - htp) / htp * 100
+
+        metrics['基于当前BTC的理论顶价'].append(htp)
+        metrics['现价偏离理论顶价(%)'].append(dev_htp_pct)
 
         # 反推同等 BTC 当前分数所需的理论涨跌幅及具体价格
         req_pct = None
