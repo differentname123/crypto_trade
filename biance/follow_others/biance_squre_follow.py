@@ -623,7 +623,7 @@ if __name__ == "__main__":
 
         t_producer = threading.Thread(target=producer_fetch_content_main, name="ProducerThread", daemon=True)
         t_consumer = threading.Thread(target=consumer_auto_sync_main,
-                                      kwargs={"accounts": ["dahao", "nana", "jie", "mama", "ruru", "yang", "daniang"]},
+                                      kwargs={"accounts": ["dahao", "nana", "mama", "ruru", "yang", "daniang"]},
                                       name="ConsumerThread", daemon=True)
 
         t_producer.start()
