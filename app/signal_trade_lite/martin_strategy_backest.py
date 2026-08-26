@@ -26,11 +26,25 @@ Margin 的单位是"首单名义价值的倍数"(1 Unit = 首单 Notional)。
 3) 外层按"块"提交到 ThreadPoolExecutor (非逐 cycle 提交), 依赖 nogil 真并行,
    结果按下标写入预分配数组 => 与串行版逐位一致、可复现。
 4) 已删除 tolist() (fast_lists) 路径, K 线一律以连续 float64/int64 数组传入。
+
+内存说明 (Stage 1, v2)
+----------------------
+浮亏阶梯不再"每 Cycle 一个小 ndarray"(百万级 Cycle 时仅对象头就占 1~2GB),
+而是压缩为 CSR 扁平结构:
+    cycles_df["dd_off"]         : int64, 该 Cycle 在扁平数组中的起始下标
+    cycles_df["n_dd_steps"]     : int32, 台阶点个数
+    cycles_df.attrs["dd_times_flat"] : int32 数组, 单位 = 分钟 (= ms // 60000, 无损)
+    cycles_df.attrs["dd_vals_flat"]  : float64 数组, 浮亏值
+    cycles_df.attrs["dd_time_scale"] : 60000 (还原成 ms 的乘数)
+TimelineReplayer 同时兼容新 CSR 格式与老的 dd_times/dd_vals/dd_steps 格式。
 """
 
+import gc
 import os
 import pickle
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -63,6 +77,48 @@ DEFAULT_FEE = 0.0005  # 单边综合成本(手续费+滑点+资金费率折算)
 DEFAULT_ADD_STEP = 0.002  # 加仓间距(基于持仓均价)
 DEFAULT_TP_STEP = 0.003  # 止盈间距(基于持仓均价)
 DEFAULT_MULT = 2.0  # 加仓倍数(数量翻倍)
+
+
+# =====================================================================
+# 日志与内存观测工具 (轻量, 无强依赖)
+# =====================================================================
+_LOG_T0 = time.time()
+_PROC = None
+
+
+def _rss_mb():
+    """当前进程物理内存(MB); 无 psutil 时返回 nan (不影响主流程)"""
+    global _PROC
+    if _PROC is None:
+        try:
+            import psutil  # 可选
+            _PROC = psutil.Process(os.getpid())
+        except Exception:
+            _PROC = False
+    if _PROC is False:
+        return float("nan")
+    try:
+        return _PROC.memory_info().rss / 1048576.0
+    except Exception:
+        return float("nan")
+
+
+def _log(msg, indent=0):
+    r = _rss_mb()
+    mem = ("RSS=%6.0fMB" % r) if r == r else "RSS=   n/a "
+    print("[%s |%8.1fs| %s] %s%s"
+          % (time.strftime("%H:%M:%S"), time.time() - _LOG_T0, mem, "  " * indent, msg),
+          flush=True)
+
+
+def _fmt_hms(sec):
+    try:
+        if not np.isfinite(sec):
+            return "--:--:--"
+    except Exception:
+        return "--:--:--"
+    sec = int(max(sec, 0))
+    return "%02d:%02d:%02d" % (sec // 3600, (sec % 3600) // 60, sec % 60)
 
 
 # ---------------------------------------------------------
@@ -581,13 +637,21 @@ def run_stage1(df,
                dd_format="array",
                fast_lists=None,
                progress=0,
-               n_jobs=None):
+               n_jobs=None,
+               log_interval_sec=15.0,
+               verbose=True):
     """
     第一阶段: 无限保证金平行宇宙生成。
 
     dd_format:
-        "array" (默认, 省内存/最快): cycles_df 存 dd_times(int64 ms) / dd_vals(float64) 两个 numpy 列
-        "list"  : 额外生成方案原文要求的 dd_steps 列 = [(ms, dd), ...]
+        "array" (默认, 省内存/最快): 浮亏阶梯以 CSR 扁平结构存放
+                cycles_df["dd_off"] + cycles_df["n_dd_steps"]
+                cycles_df.attrs["dd_times_flat"] (int32, 单位=分钟)
+                cycles_df.attrs["dd_vals_flat"]  (float64)
+                cycles_df.attrs["dd_time_scale"] = 60000
+            (v1 的 dd_times/dd_vals 对象列已废弃: 百万级 Cycle 时仅 ndarray
+             对象头就要吃掉 1~2GB, 且 pickle 极慢。TimelineReplayer 仍兼容旧文件。)
+        "list"  : 额外生成方案原文要求的 dd_steps 列 = [(ms, dd), ...] (仅供人读, 极吃内存)
         "both"  : 两者都有
     dd_abort:
         浮亏熔断阈值。None = 严格按方案(不熔断)。若设置, 必须 > 你要测试的最大 Margin,
@@ -597,17 +661,32 @@ def run_stage1(df,
               从而影响 Stage 3 "仅闭环 Cycle" 的横向统计表。
     fast_lists:
         【已废弃, 保留仅为向后兼容, 传什么都被忽略】
-        原 tolist() 路径在大数据上会产生数 GB Python 对象开销, 且与 JIT 不兼容。
     n_jobs:
         Stage 1 并发线程数 (None = os.cpu_count())。底层 K 线只读共享, 内存不随线程增长。
         无 numba 时强制退化为 1 (GIL 无法释放, 多线程只会更慢)。
+    log_interval_sec:
+        后台心跳日志间隔(秒)。>0 时会启动守护线程周期输出 进度/速率/ETA/RSS,
+        即使卡在单个"长尾 Cycle"上也能看到程序仍在推进。0 或 None 表示关闭。
+    verbose:
+        是否输出 Stage 1 各阶段的关键日志。
     """
+    t_stage = time.time()
+
     for c in ("open_time", "high", "low", "close"):
         if c not in df.columns:
             raise ValueError("缺少必需列: %s" % c)
 
-    _warmup_jit()
+    if verbose:
+        _log("Stage1 启动 | numba=%s | 输入 %d 行 x %d 列"
+             % (_HAS_NUMBA, len(df), df.shape[1]), 1)
 
+    t = time.time()
+    _warmup_jit()
+    if verbose:
+        _log("JIT 预热完成 (%.2fs)" % (time.time() - t), 2)
+
+    # ---------------- 时间轴 ----------------
+    t = time.time()
     times_np = np.ascontiguousarray(df["open_time"].to_numpy(dtype=np.int64))
     n = int(times_np.shape[0])
     if n == 0:
@@ -619,7 +698,14 @@ def run_stage1(df,
             ok_inc = not bool(np.any(np.diff(times_np) <= 0))
         if not ok_inc:
             raise ValueError("open_time 必须严格递增(请先排序去重)")
+    if verbose:
+        _log("时间轴校验通过: %d 根 K 线 | %s ~ %s (%.2f 天) | 耗时 %.2fs"
+             % (n, pd.to_datetime(int(times_np[0]), unit="ms"),
+                pd.to_datetime(int(times_np[-1]), unit="ms"),
+                (times_np[-1] - times_np[0]) / 86400000.0, time.time() - t), 2)
 
+    # ---------------- OHLC ----------------
+    t = time.time()
     highs_np = np.ascontiguousarray(df["high"].to_numpy(dtype=np.float64))
     lows_np = np.ascontiguousarray(df["low"].to_numpy(dtype=np.float64))
     closes_np = np.ascontiguousarray(df["close"].to_numpy(dtype=np.float64))
@@ -629,8 +715,13 @@ def run_stage1(df,
         ok_fin = bool(np.all(np.isfinite(highs_np) & np.isfinite(lows_np) & np.isfinite(closes_np)))
     if not ok_fin:
         raise ValueError("high/low/close 存在 NaN/Inf")
+    if verbose:
+        _log("OHLC 数组就绪并校验完毕 (%.0f MB, 耗时 %.2fs)"
+             % ((highs_np.nbytes + lows_np.nbytes + closes_np.nbytes + times_np.nbytes) / 1048576.0,
+                time.time() - t), 2)
 
-    # 信号采集(允许同一 bar 同时出多空 -> 两个平行 Cycle)
+    # ---------------- 信号采集 ----------------
+    t = time.time()
     if long_col in df.columns:
         li = np.flatnonzero(df[long_col].to_numpy() != 0)
     else:
@@ -639,12 +730,21 @@ def run_stage1(df,
         si = np.flatnonzero(df[short_col].to_numpy() != 0)
     else:
         si = np.empty(0, dtype=np.int64)
+    n_li = int(li.shape[0])
+    n_si = int(si.shape[0])
     sig_idx = np.concatenate([li.astype(np.int64), si.astype(np.int64)])
-    sig_dir = np.concatenate([np.ones(li.shape[0]), -np.ones(si.shape[0])])
+    sig_dir = np.concatenate([np.ones(n_li), -np.ones(n_si)])
+    del li, si
     order = np.argsort(sig_idx, kind="stable")  # 同 bar: Long 先于 Short
     sig_idx = sig_idx[order]
     sig_dir = sig_dir[order]
+    del order
     m = int(sig_idx.shape[0])
+    if verbose:
+        _log("信号采集完成: 多 %d + 空 %d = %d 个 Cycle (信号率 %.4f%%) | 耗时 %.2fs"
+             % (n_li, n_si, m, 100.0 * m / max(n, 1), time.time() - t), 2)
+        if m == 0:
+            _log("警告: 本次没有任何信号, 将输出空 cycles 表", 2)
 
     add_mul_l = 1.0 - add_step
     tp_mul_l = 1.0 + tp_step
@@ -655,7 +755,8 @@ def run_stage1(df,
     dd_abort_f = float(dd_abort) if has_abort else 0.0
     max_layer_hard_i = int(max_layer_hard)
 
-    out_dir = np.empty(m, dtype=object)
+    # ---------------- 结果缓冲 (紧凑 dtype, 不再用 object 存方向/阶梯) ----------------
+    out_is_long = np.empty(m, dtype=bool)
     out_bar = np.empty(m, dtype=np.int64)
     out_s = np.empty(m, dtype=np.int64)
     out_e = np.empty(m, dtype=np.int64)
@@ -665,14 +766,26 @@ def run_stage1(df,
     out_fee = np.empty(m, dtype=np.float64)
     out_mdd = np.empty(m, dtype=np.float64)
     out_nst = np.empty(m, dtype=np.int32)
-    dd_times_col = np.empty(m, dtype=object)
-    dd_vals_col = np.empty(m, dtype=object)
+    if verbose:
+        _log("结果缓冲已分配 (%.1f MB)"
+             % ((out_is_long.nbytes + out_bar.nbytes + out_s.nbytes + out_e.nbytes
+                 + out_status.nbytes + out_layer.nbytes + out_net.nbytes + out_fee.nbytes
+                 + out_mdd.nbytes + out_nst.nbytes) / 1048576.0), 2)
 
     _lock = threading.Lock()
     _done = [0]
+    _blocks = [0]
+    _lastp = [0]
 
     def _run_range(k0, k1):
-        """处理 [k0, k1) 这一块 cycle; 结果按绝对下标 k 写入 -> 与串行版逐位一致"""
+        """
+        处理 [k0, k1) 这一块 cycle; 标量结果按绝对下标 k 写入 -> 与串行版逐位一致。
+        浮亏阶梯在块内先攒成"块级大数组", 让 numba 返回的百万个小数组尽早被回收,
+        块内合并后时间戳由 int64 ms 无损压成 int32 分钟 (阶梯点本就整分钟对齐)。
+        """
+        loc_t = []
+        loc_v = []
+        pend = 0
         for k in range(k0, k1):
             i0 = int(sig_idx[k])
             s = float(sig_dir[k])
@@ -685,7 +798,7 @@ def run_stage1(df,
                                       fee_rate, add_mul_s, tp_mul_s, multiplier,
                                       mtm_fee, dd_abort_f, has_abort, max_layer_hard_i)
             end_i, status, layer, net, tfee, dd_t, dd_v, mdd = res
-            out_dir[k] = "Long" if s > 0.0 else "Short"
+            out_is_long[k] = s > 0.0
             out_bar[k] = i0
             out_s[k] = times_np[i0]
             out_e[k] = times_np[end_i]
@@ -695,15 +808,29 @@ def run_stage1(df,
             out_fee[k] = tfee
             out_mdd[k] = mdd
             out_nst[k] = dd_t.shape[0]
-            dd_times_col[k] = dd_t
-            dd_vals_col[k] = dd_v
-        if progress:
+            loc_t.append(dd_t)
+            loc_v.append(dd_v)
+            pend += 1
+            if pend >= 32:  # 高频刷新计数, 保证心跳日志有粒度
+                with _lock:
+                    _done[0] += pend
+                pend = 0
+        if pend:
             with _lock:
-                prev = _done[0]
-                _done[0] = prev + (k1 - k0)
-                if _done[0] // progress > prev // progress:
-                    print("[stage1] %d / %d cycles" % (_done[0], m))
+                _done[0] += pend
+        with _lock:
+            _blocks[0] += 1
+            if progress and (_done[0] - _lastp[0]) >= progress:
+                _lastp[0] = _done[0]
+                print("[stage1] %d / %d cycles" % (_done[0], m), flush=True)
+        if not loc_t:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+        ct = loc_t[0] if len(loc_t) == 1 else np.concatenate(loc_t)
+        cv = loc_v[0] if len(loc_v) == 1 else np.concatenate(loc_v)
+        del loc_t, loc_v
+        return (ct // MS_MIN).astype(np.int32), cv
 
+    parts = None
     if m:
         if n_jobs is None:
             nj = os.cpu_count() or 1
@@ -714,22 +841,102 @@ def run_stage1(df,
         if not _HAS_NUMBA:
             nj = 1  # 纯 Python 下 GIL 未释放, 多线程无收益
         nj = min(nj, 32, m)
-        if nj <= 1:
-            _run_range(0, m)
-        else:
-            # 块数远多于线程数 => 天然工作窃取, 化解"长尾 Cycle"负载不均
-            chunk = (m + nj * 64 - 1) // (nj * 64)
-            if chunk < 1:
-                chunk = 1
-            if chunk > 4096:
-                chunk = 4096
-            bounds = [(k0, min(k0 + chunk, m)) for k0 in range(0, m, chunk)]
-            with ThreadPoolExecutor(max_workers=nj) as ex:
-                list(ex.map(lambda b: _run_range(b[0], b[1]), bounds))
+        # 块数远多于线程数 => 天然工作窃取, 化解"长尾 Cycle"负载不均
+        chunk = (m + nj * 64 - 1) // (nj * 64)
+        if chunk < 1:
+            chunk = 1
+        if chunk > 4096:
+            chunk = 4096
+        bounds = [(k0, min(k0 + chunk, m)) for k0 in range(0, m, chunk)]
+        nb = len(bounds)
+        if verbose:
+            _log("并发配置: 线程 %d | 块大小 %d | 块数 %d | 心跳 %s"
+                 % (nj, chunk, nb,
+                    ("%.0fs" % log_interval_sec) if (log_interval_sec and log_interval_sec > 0) else "off"), 2)
+            _log("开始模拟 %d 个平行宇宙 Cycle ..." % m, 2)
 
+        _stop = threading.Event()
+        _t_run0 = time.time()
+
+        def _heartbeat():
+            last_d = 0
+            stall = 0
+            while not _stop.wait(log_interval_sec):
+                with _lock:
+                    d = _done[0]
+                    bd = _blocks[0]
+                el = time.time() - _t_run0
+                rate = (d / el) if el > 0 else 0.0
+                eta = ((m - d) / rate) if rate > 0 else float("inf")
+                if d == last_d:
+                    stall += 1
+                else:
+                    stall = 0
+                last_d = d
+                _log("进度 %d/%d (%5.2f%%) | 块 %d/%d | %.0f cyc/s | 已用 %s | ETA %s%s"
+                     % (d, m, 100.0 * d / m, bd, nb, rate, _fmt_hms(el), _fmt_hms(eta),
+                        ("   <单个长尾 Cycle 正在长距离扫描, 连续 %d 次无新增>" % stall) if stall else ""), 3)
+
+        hb = None
+        if verbose and log_interval_sec and log_interval_sec > 0:
+            hb = threading.Thread(target=_heartbeat, name="stage1-hb", daemon=True)
+            hb.start()
+        try:
+            if nj <= 1:
+                parts = [_run_range(b[0], b[1]) for b in bounds]
+            else:
+                with ThreadPoolExecutor(max_workers=nj) as ex:
+                    parts = list(ex.map(lambda b: _run_range(b[0], b[1]), bounds))
+        finally:
+            _stop.set()
+            if hb is not None:
+                hb.join(timeout=0.2)
+        if verbose:
+            el = time.time() - _t_run0
+            _log("模拟循环结束: %d cycles | 耗时 %s | 均速 %.0f cyc/s"
+                 % (m, _fmt_hms(el), (m / el) if el > 0 else 0.0), 2)
+
+    del sig_idx, sig_dir
+
+    # ---------------- 浮亏阶梯: 合并为 CSR 扁平数组 ----------------
+    t = time.time()
+    if m:
+        cs = np.cumsum(out_nst.astype(np.int64))
+        dd_off = np.empty(m, dtype=np.int64)
+        dd_off[0] = 0
+        if m > 1:
+            dd_off[1:] = cs[:-1]
+        total_steps = int(cs[-1])
+        del cs
+    else:
+        dd_off = np.empty(0, dtype=np.int64)
+        total_steps = 0
+
+    ddt_flat = np.empty(total_steps, dtype=np.int32)
+    ddv_flat = np.empty(total_steps, dtype=np.float64)
+    pos = 0
+    if parts:
+        for _i in range(len(parts)):
+            pt, pv = parts[_i]
+            L = pt.shape[0]
+            if L:
+                ddt_flat[pos:pos + L] = pt
+                ddv_flat[pos:pos + L] = pv
+                pos += L
+            parts[_i] = None  # 尽早释放块级缓冲
+    del parts
+    gc.collect()
+    if verbose:
+        _log("浮亏阶梯汇总: %d 个台阶点 (均 %.2f/cycle, 最多 %d) | 扁平内存 %.1f MB | 耗时 %.2fs"
+             % (total_steps, total_steps / max(m, 1), int(out_nst.max()) if m else 0,
+                (ddt_flat.nbytes + ddv_flat.nbytes) / 1048576.0, time.time() - t), 2)
+
+    # ---------------- 组装 cycles_df ----------------
+    t = time.time()
     cycles = pd.DataFrame({
         "cycle_id": np.arange(m, dtype=np.int64),
-        "direction": out_dir,
+        "direction": pd.Categorical.from_codes(
+            np.where(out_is_long, 0, 1).astype(np.int8), categories=["Long", "Short"]),
         "start_time": pd.to_datetime(out_s, unit="ms"),
         "tp_time": pd.to_datetime(out_e, unit="ms"),
         "duration_hour": (out_e - out_s) / MS_HOUR,
@@ -740,25 +947,31 @@ def run_stage1(df,
         "max_dd": out_mdd,
         "n_dd_steps": out_nst,
         "status": pd.Categorical.from_codes(
-            np.where(out_status == 1, 0, np.where(out_status == 0, 1, 2)),
+            np.where(out_status == 1, 0, np.where(out_status == 0, 1, 2)).astype(np.int8),
             categories=["tp", "mtm", "truncated"]),
         "signal_bar": out_bar,
         "start_ms": out_s,
         "end_ms": out_e,
+        "dd_off": dd_off,
     })
-    cycles["dd_times"] = pd.Series(dd_times_col, index=cycles.index, dtype=object)
-    cycles["dd_vals"] = pd.Series(dd_vals_col, index=cycles.index, dtype=object)
-    if dd_format in ("list", "both"):
-        cycles["dd_steps"] = pd.Series(
-            [list(zip(dd_times_col[i].tolist(), dd_vals_col[i].tolist())) for i in range(m)],
-            index=cycles.index, dtype=object)
-    if dd_format == "list":
-        cycles.drop(columns=["dd_times", "dd_vals"], inplace=True)
+    n_tp = int(np.sum(out_status == 1))
+    n_mtm = int(np.sum(out_status == 0))
+    n_trunc = int(np.sum(out_status == -1))
+    layer_mean = float(out_layer.mean()) if m else float("nan")
+    layer_max = int(out_layer.max()) if m else 0
+    mdd_max = float(out_mdd.max()) if m else float("nan")
+    # 峰值削减: DataFrame 已持有副本, 立即释放中间缓冲
+    del out_is_long, out_bar, out_s, out_e, out_status, out_layer, out_net, out_fee, out_mdd
+    gc.collect()
+    if verbose:
+        _log("cycles_df 组装完成 (%.1f MB, 耗时 %.2fs)"
+             % (cycles.memory_usage(deep=False).sum() / 1048576.0, time.time() - t), 2)
 
     cycles.attrs.update({
         "data_start_ms": int(times_np[0]),
         "data_end_ms": int(times_np[-1]),
         "n_bars": int(n),
+        "n_cycles": int(m),
         "fee_rate": fee_rate,
         "add_step": add_step,
         "tp_step": tp_step,
@@ -766,7 +979,42 @@ def run_stage1(df,
         "dd_abort": dd_abort,
         "max_layer_hard": max_layer_hard,
         "mtm_charge_close_fee": bool(mtm_charge_close_fee),
+        "dd_times_flat": ddt_flat,
+        "dd_vals_flat": ddv_flat,
+        "dd_time_scale": MS_MIN,
+        "dd_total_steps": int(total_steps),
     })
+
+    if dd_format in ("list", "both"):
+        t = time.time()
+        if verbose:
+            _log("正在生成 dd_steps 可读列表 (极吃内存, 仅调试用) ...", 2)
+        _off = dd_off.tolist()
+        _cnt = out_nst.tolist()
+        cycles["dd_steps"] = pd.Series(
+            [list(zip((ddt_flat[o:o + c].astype(np.int64) * MS_MIN).tolist(),
+                      ddv_flat[o:o + c].tolist()))
+             for o, c in zip(_off, _cnt)],
+            index=cycles.index, dtype=object)
+        del _off, _cnt
+        if verbose:
+            _log("dd_steps 生成完毕 (%.2fs)" % (time.time() - t), 2)
+    if dd_format == "list":
+        cycles.drop(columns=["dd_off"], inplace=True)
+        cycles.attrs.pop("dd_times_flat", None)
+        cycles.attrs.pop("dd_vals_flat", None)
+        del ddt_flat, ddv_flat
+        gc.collect()
+
+    del out_nst, dd_off
+    gc.collect()
+
+    if verbose:
+        el = time.time() - t_stage
+        _log("Stage1 完成: %d cycles | 止盈 %d (%.2f%%) | 末端盯市 %d | 熔断 %d"
+             % (m, n_tp, 100.0 * n_tp / max(m, 1), n_mtm, n_trunc), 1)
+        _log("层数 均值 %.3f / 最大 %d | 最深浮亏 %.5f | 阶梯点 %d | 总耗时 %s"
+             % (layer_mean, layer_max, mdd_max, total_steps, _fmt_hms(el)), 1)
     return cycles
 
 
@@ -788,7 +1036,16 @@ class TimelineReplayer:
             d = d.sort_values(["start_ms", "cycle_id"], kind="mergesort")
         self.cycles = d
         self._cid = d["cycle_id"].to_numpy(np.int64)
-        self._dir = d["direction"].to_numpy(object)
+
+        # ---- direction: 优先走 Categorical codes, 避免生成 m 长度的 object 数组 ----
+        _dirs = d["direction"]
+        if isinstance(_dirs.dtype, pd.CategoricalDtype):
+            _cats = list(_dirs.cat.categories)
+            _code = _cats.index("Long") if "Long" in _cats else -1
+            self._is_long = np.ascontiguousarray(_dirs.cat.codes.to_numpy() == _code)
+        else:
+            self._is_long = np.ascontiguousarray(_dirs.to_numpy(object) == "Long")
+
         self._start = np.ascontiguousarray(d["start_ms"].to_numpy(np.int64))
         self._end = np.ascontiguousarray(d["end_ms"].to_numpy(np.int64))
         self._net = np.ascontiguousarray(d["net_pnl"].to_numpy(np.float64))
@@ -796,16 +1053,40 @@ class TimelineReplayer:
         self._mdd = np.ascontiguousarray(d["max_dd"].to_numpy(np.float64))
         self._layer = np.ascontiguousarray(d["max_layer"].to_numpy(np.int64))
         self._closed = np.ascontiguousarray(d["is_closed"].to_numpy(bool))
-        self._trunc = (d["status"].astype(str).to_numpy() == "truncated")
 
-        if "dd_times" in d.columns:
-            self._ddt = list(d["dd_times"].to_numpy())
-            self._ddv = list(d["dd_vals"].to_numpy())
-        else:  # dd_format == "list"
-            self._ddt = [np.fromiter((t for t, _ in s), np.int64, len(s)) for s in d["dd_steps"]]
-            self._ddv = [np.fromiter((v for _, v in s), np.float64, len(s)) for s in d["dd_steps"]]
+        _st = d["status"]
+        if isinstance(_st.dtype, pd.CategoricalDtype):
+            _cats = list(_st.cat.categories)
+            _code = _cats.index("truncated") if "truncated" in _cats else -1
+            self._trunc = np.ascontiguousarray(_st.cat.codes.to_numpy() == _code)
+        else:
+            self._trunc = np.ascontiguousarray(_st.astype(str).to_numpy() == "truncated")
 
+        # ---- 浮亏阶梯: 三种格式兼容 (新 CSR / 旧 dd_times+dd_vals / dd_steps) ----
         a = cycles_df.attrs
+        _tf = a.get("dd_times_flat", None)
+        _vf = a.get("dd_vals_flat", None)
+        if _tf is not None and _vf is not None and "dd_off" in d.columns:
+            self._csr = True
+            self._ddt_flat = _tf
+            self._ddv_flat = _vf
+            self._dd_off = np.ascontiguousarray(d["dd_off"].to_numpy(np.int64))
+            self._dd_cnt = np.ascontiguousarray(d["n_dd_steps"].to_numpy(np.int64))
+            self._dd_scale = int(a.get("dd_time_scale", 1))
+            self._ddt = None
+            self._ddv = None
+        else:
+            self._csr = False
+            self._dd_scale = 1
+            self._ddt_flat = None
+            self._ddv_flat = None
+            if "dd_times" in d.columns:
+                self._ddt = list(d["dd_times"].to_numpy())
+                self._ddv = list(d["dd_vals"].to_numpy())
+            else:  # dd_format == "list"
+                self._ddt = [np.fromiter((t for t, _ in s), np.int64, len(s)) for s in d["dd_steps"]]
+                self._ddv = [np.fromiter((v for _, v in s), np.float64, len(s)) for s in d["dd_steps"]]
+
         self.data_start_ms = int(data_start_ms if data_start_ms is not None
                                  else a.get("data_start_ms", self._start.min() if len(self._start) else 0))
         self.data_end_ms = int(data_end_ms if data_end_ms is not None
@@ -822,6 +1103,14 @@ class TimelineReplayer:
         b = self._bnd_l if is_long else self._bnd_s
         return int(np.searchsorted(b, dd, side="right"))
 
+    def _dd_arrays(self, j):
+        """返回 (times_ms_like, vals); CSR 下 times 需乘 self._dd_scale 还原 ms"""
+        if self._csr:
+            o = int(self._dd_off[j])
+            c = int(self._dd_cnt[j])
+            return self._ddt_flat[o:o + c], self._ddv_flat[o:o + c]
+        return self._ddt[j], self._ddv[j]
+
     def run(self, margin):
         """
         输入 Margin(单位 = 首单名义价值倍数), 输出真实连续交易记录 trades_df。
@@ -832,7 +1121,7 @@ class TimelineReplayer:
             raise ValueError("margin 必须 > 0")
         start, end, net = self._start, self._end, self._net
         mdd, closed, trunc = self._mdd, self._closed, self._trunc
-        ddt, ddv = self._ddt, self._ddv
+        scale = self._dd_scale
         n = start.shape[0]
 
         cur = self.data_start_ms
@@ -846,7 +1135,8 @@ class TimelineReplayer:
             if j >= n:
                 break
             last = j
-            is_long = self._dir[j] == "Long"
+            is_long = bool(self._is_long[j])
+            dir_str = "Long" if is_long else "Short"
             if margin > mdd[j]:
                 # ---------- 存活 ----------
                 if trunc[j]:
@@ -855,7 +1145,7 @@ class TimelineReplayer:
                         "结果不可信。请调大 dd_abort 或取消熔断。" % (self._cid[j], margin))
                 pnl = float(net[j])
                 cum += pnl
-                rows.append((self._cid[j], self._dir[j], int(start[j]), int(end[j]),
+                rows.append((self._cid[j], dir_str, int(start[j]), int(end[j]),
                              "tp" if closed[j] else "mtm", pnl, float(self._fee[j]),
                              int(self._layer[j]), float(mdd[j]), cum))
                 if not closed[j]:
@@ -863,12 +1153,12 @@ class TimelineReplayer:
                 cur = int(end[j])
             else:
                 # ---------- 爆仓(查表, dd_vals 严格单调 => 二分) ----------
-                v = ddv[j]
+                tj, v = self._dd_arrays(j)
                 k = int(np.searchsorted(v, margin, side="left"))
-                death = int(ddt[j][k])
+                death = int(tj[k]) * scale
                 pnl = -margin
                 cum += pnl
-                rows.append((self._cid[j], self._dir[j], int(start[j]), death,
+                rows.append((self._cid[j], dir_str, int(start[j]), death,
                              "blowup", pnl, np.nan,
                              self._death_layer(float(v[k]), is_long),
                              float(v[k]), cum))
@@ -1136,20 +1426,34 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
     cache_filename = f"stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl"
 
     if os.path.exists(cache_filename):
-        print(f"[缓存系统] 发现匹配的 Stage 1 缓存文件: {cache_filename}，正在跳过高昂计算，直接加载...")
+        _log("[缓存系统] 发现匹配的 Stage 1 缓存: %s (%.1f MB), 跳过高昂计算直接加载..."
+             % (cache_filename, os.path.getsize(cache_filename) / 1048576.0))
+        t = time.time()
         with open(cache_filename, 'rb') as f:
             cached_data = pickle.load(f)
             cycles = cached_data['df']
             cycles.attrs = cached_data['attrs']
+        del cached_data
+        gc.collect()
+        _log("[缓存系统] 加载完成: %d cycles, 耗时 %.1fs" % (len(cycles), time.time() - t))
     else:
-        print(f"[缓存系统] 未发现匹配缓存，开始运行 Stage 1 平行宇宙引擎，并将结果保存至: {cache_filename}")
+        _log("[缓存系统] 未发现匹配缓存, 开始运行 Stage 1, 结果将保存至: %s" % cache_filename)
         cycles = run_stage1(df, **stage1_kw)
+        t = time.time()
         with open(cache_filename, 'wb') as f:
             # Pandas 偶尔在序列化时丢弃 attrs，使用字典确保元数据一同保存
-            pickle.dump({'df': cycles, 'attrs': cycles.attrs}, f)
+            pickle.dump({'df': cycles, 'attrs': dict(cycles.attrs)}, f,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+        _log("[缓存系统] 已写盘: %s (%.1f MB, %.1fs)"
+             % (cache_filename, os.path.getsize(cache_filename) / 1048576.0, time.time() - t))
 
+    _log("Stage2 构建时间线重组器 ...")
+    t = time.time()
     rp = TimelineReplayer(cycles)
+    _log("Stage2 重组器就绪 (%.2fs), 开始扫描 %d 个 Margin ..." % (time.time() - t, len(margins)))
+    t = time.time()
     sweep = sweep_margins(rp, margins)
+    _log("Margin 扫描完成 (%.2fs)" % (time.time() - t))
     if report_margin is None and len(margins):
         report_margin = list(margins)[len(margins) // 2]
     trades = rp.run(report_margin)
@@ -1165,6 +1469,11 @@ if __name__ == "__main__":
     if not _HAS_NUMBA:
         print("[警告] 未检测到 numba, Stage 1 将退化为纯 Python 单线程 (慢 100 倍以上)。"
               "请执行: pip install numba")
+
+    _log("引擎启动 | Python %s | numpy %s | pandas %s | numba=%s | CPU %d"
+         % (sys.version.split()[0], np.__version__, pd.__version__, _HAS_NUMBA, os.cpu_count() or 1))
+    if _rss_mb() != _rss_mb():
+        _log("提示: 未安装 psutil, 日志中的 RSS 内存观测不可用 (pip install psutil 可开启)")
 
     symbols = [
         "BTCUSDT",
@@ -1197,75 +1506,116 @@ if __name__ == "__main__":
 
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
 
+    # 显式 dtype: 避免 read_csv 类型推断产生额外内存峰值
+    CSV_DTYPES = {"open_time": np.int64, "open": np.float64, "high": np.float64,
+                  "low": np.float64, "close": np.float64, "volume": np.float64}
+
+    total_task = len(symbols) * len(strategies) * 2
+    task_done = 0
+    t_all = time.time()
+
     # ==========================
     # 核心批量处理逻辑
     # ==========================
-    for symbol in symbols:
+    for sym_i, symbol in enumerate(symbols, 1):
         file_path = os.path.join(base_path, f"{symbol}_1s_2021-01-01_merged_6cols.csv")
 
         if not os.path.exists(file_path):
-            print(f"\n[警告] 找不到对应的 K 线文件，跳过该币种: {file_path}")
+            _log("[警告] 找不到对应的 K 线文件, 跳过该币种: %s" % file_path)
+            task_done += len(strategies) * 2
             continue
 
-        print(f"\n========== 正在加载本地 K 线数据: {symbol} ==========")
-        df_main = pd.read_csv(file_path)
+        _log("=" * 78)
+        _log("[币种 %d/%d] 正在加载本地 K 线数据: %s" % (sym_i, len(symbols), symbol))
+        t = time.time()
+        try:
+            df_main = pd.read_csv(file_path, dtype=CSV_DTYPES)
+        except Exception as _e:
+            _log("显式 dtype 读取失败 (%s), 回退默认解析" % _e, 1)
+            df_main = pd.read_csv(file_path)
+        gc.collect()
+        _log("加载完成: %d 行 x %d 列 | DataFrame %.0f MB | 耗时 %.1fs"
+             % (len(df_main), df_main.shape[1],
+                df_main.memory_usage(deep=False).sum() / 1048576.0, time.time() - t), 1)
 
         # 遍历 16 个策略进行处理
-        for strat_func in strategies:
+        for st_i, strat_func in enumerate(strategies, 1):
             strat_name = strat_func.__name__
-            print(f"\n--- 正在处理: {symbol} | 策略: {strat_name} ---")
+            _log("-" * 78)
+            _log("[%s | 策略 %d/%d] %s   (全局任务 %d/%d, 累计 %s)"
+                 % (symbol, st_i, len(strategies), strat_name, task_done, total_task,
+                    _fmt_hms(time.time() - t_all)))
 
-            # 使用副本提取信号防止污染原始数据
-            df_strat = strat_func(df_main.copy())
+            data_name_long = f"{symbol}_{strat_name}_Long"
+            data_name_short = f"{symbol}_{strat_name}_Short"
+            # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
+            cache_filename_long = f"stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+            cache_filename_short = f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+            has_long = os.path.exists(cache_filename_long)
+            has_short = os.path.exists(cache_filename_short)
 
+            if has_long and has_short:
+                _log("多空缓存均已存在, 连信号计算一起跳过", 1)
+                task_done += 2
+                continue
+
+            # ---- 信号计算: copy(deep=False) 共享底层数据块, 省掉一份整表拷贝 ----
+            t = time.time()
+            df_strat = strat_func(df_main.copy(deep=False))
             # 确保信号列被规范化为 0 或 1，且没有 NaN
             signal_np = df_strat['signal'].fillna(False).astype(np.int8).to_numpy()
             del df_strat  # 立刻释放整份策略副本, 压低内存峰值
+            gc.collect()
+            n_sig = int(signal_np.sum())
+            _log("信号计算完成: 耗时 %.1fs | 命中 %d / %d (%.4f%%)"
+                 % (time.time() - t, n_sig, signal_np.shape[0],
+                    100.0 * n_sig / max(signal_np.shape[0], 1)), 1)
+            if n_sig == 0:
+                _log("提示: 本策略在该币种上无任何信号, Stage 1 将输出空表", 1)
 
-            # Stage 1 只需要 open_time/high/low/close + 两个信号列。
-            # 这里按列装配(与 df_main 共享底层内存), 避免 df_main.copy() 的巨型拷贝。
-            df_sig = pd.DataFrame(index=df_main.index)
-            for _c in ("open_time", "high", "low", "close"):
-                df_sig[_c] = df_main[_c].to_numpy()
-            zero_np = np.zeros(signal_np.shape[0], dtype=np.int8)
+            # Stage 1 只需要 open_time/high/low/close + 信号列。
+            # 这里直接把信号列临时挂到 df_main 上(用完即 drop), 彻底避免再复制一份 K 线。
+            for tag, sig_col, cache_fn, exists in (
+                    ("做多", "long_signal", cache_filename_long, has_long),
+                    ("做空", "short_signal", cache_filename_short, has_short)):
+                task_done += 1
+                if exists:
+                    _log("> [%s] 缓存已存在, 跳过运算: %s" % (tag, cache_fn), 1)
+                    continue
 
-            # --------------------------------------------------
-            # 1. 策略信号作为 [开多] 进行一阶段运算
-            # --------------------------------------------------
-            data_name_long = f"{symbol}_{strat_name}_Long"
-            # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
-            cache_filename_long = f"stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+                # 清理上一轮残留信号列(run_stage1 对不存在的列视作"无信号", 无需 zeros 数组)
+                _drop = [c for c in ("long_signal", "short_signal") if c in df_main.columns]
+                if _drop:
+                    df_main.drop(columns=_drop, inplace=True)
+                df_main[sig_col] = signal_np
 
-            if os.path.exists(cache_filename_long):
-                print(f"  > [做多] 缓存已存在，跳过运算: {cache_filename_long}")
-            else:
-                print(f"  > [做多] 开始运行 Stage 1...")
-                df_sig['long_signal'] = signal_np
-                df_sig['short_signal'] = zero_np  # 做多测试不发做空信号
-                cycles_long = run_stage1(df_sig)
-                with open(cache_filename_long, 'wb') as f:
-                    pickle.dump({'df': cycles_long, 'attrs': cycles_long.attrs}, f)
-                print(f"  > [做多] 一阶段已保存: {cache_filename_long}")
-                del cycles_long
+                _log("> [%s] 开始运行 Stage 1 ... (全局任务 %d/%d)" % (tag, task_done, total_task), 1)
+                t1 = time.time()
+                cycles_tmp = run_stage1(df_main, log_interval_sec=15.0, verbose=True)
+                _log("> [%s] Stage 1 结束, 耗时 %s, 开始写盘 ..." % (tag, _fmt_hms(time.time() - t1)), 1)
 
-            # --------------------------------------------------
-            # 2. 策略信号作为 [开空] 进行一阶段运算
-            # --------------------------------------------------
-            data_name_short = f"{symbol}_{strat_name}_Short"
-            cache_filename_short = f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+                t2 = time.time()
+                with open(cache_fn, 'wb') as f:
+                    pickle.dump({'df': cycles_tmp, 'attrs': dict(cycles_tmp.attrs)}, f,
+                                protocol=pickle.HIGHEST_PROTOCOL)
+                _log("> [%s] 一阶段已保存: %s (%.1f MB, 写盘 %.1fs)"
+                     % (tag, cache_fn, os.path.getsize(cache_fn) / 1048576.0, time.time() - t2), 1)
 
-            if os.path.exists(cache_filename_short):
-                print(f"  > [做空] 缓存已存在，跳过运算: {cache_filename_short}")
-            else:
-                print(f"  > [做空] 开始运行 Stage 1...")
-                df_sig['long_signal'] = zero_np  # 做空测试不发做多信号
-                df_sig['short_signal'] = signal_np
-                cycles_short = run_stage1(df_sig)
-                with open(cache_filename_short, 'wb') as f:
-                    pickle.dump({'df': cycles_short, 'attrs': cycles_short.attrs}, f)
-                print(f"  > [做空] 一阶段已保存: {cache_filename_short}")
-                del cycles_short
+                del cycles_tmp
+                _drop = [c for c in ("long_signal", "short_signal") if c in df_main.columns]
+                if _drop:
+                    df_main.drop(columns=_drop, inplace=True)
+                gc.collect()
+                _log("> [%s] 内存已回收 | 全局进度 %d/%d | 累计耗时 %s"
+                     % (tag, task_done, total_task, _fmt_hms(time.time() - t_all)), 1)
 
-            del df_sig, signal_np, zero_np
+            del signal_np
+            gc.collect()
 
-    print("\n========== 所有币种(6个) x 策略(16个) x 多/空(2种) = 192 份一阶段文件已处理完毕！ ==========")
+        del df_main
+        gc.collect()
+        _log("%s 全部策略处理完毕, 已释放该币种 K 线内存" % symbol, 1)
+
+    _log("=" * 78)
+    _log("所有币种(6个) x 策略(16个) x 多/空(2种) = %d 份一阶段文件已处理完毕! 总耗时 %s"
+         % (total_task, _fmt_hms(time.time() - t_all)))
