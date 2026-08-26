@@ -32,10 +32,6 @@ DEFAULT_TP_STEP = 0.003  # 止盈间距(基于持仓均价)
 DEFAULT_MULT = 2.0  # 加仓倍数(数量翻倍)
 
 
-import numpy as np
-import pandas as pd
-
-
 # ---------------------------------------------------------
 # 维度一：统计偏离类（测度“均值引力”）
 # ---------------------------------------------------------
@@ -1039,28 +1035,101 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
 
 
 # =====================================================================
-# 4. Demo
+# 4. 执行入口 (按需批量化一阶段生成)
 # =====================================================================
 if __name__ == "__main__":
-    # 指定实际的数据文件路径
-    file_path = r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1s_2021-01-01_merged_6cols.csv"
-    print(f"正在加载本地 K 线数据: {file_path}")
-    df = pd.read_csv(file_path)
+    symbols = [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "LINKUSDT",
+        "AAVEUSDT",
+        "BNBUSDT"
+    ]
 
-    n = len(df)
-    close = df["close"].to_numpy()
+    # 将 16 个策略加入列表以供循环调用
+    strategies = [
+        strategy_1_vwap_zscore,
+        strategy_2_quantile_deviation,
+        strategy_3_periodic_open_deviation,
+        strategy_4_volume_price_absorption,
+        strategy_5_liquidity_vacuum,
+        strategy_6_volume_climax,
+        strategy_7_proxy_cvd_divergence,
+        strategy_8_rolling_stop_hunt,
+        strategy_9_wick_rejection_ratio,
+        strategy_10_close_position_bias,
+        strategy_11_tick_gap_reversion,
+        strategy_12_kaufman_efficiency_ratio,
+        strategy_13_run_length_streaks,
+        strategy_14_volatility_squeeze_expansion,
+        strategy_15_micro_autocorrelation,
+        strategy_16_clock_aligned_anomaly
+    ]
 
-    # 简单信号: 收盘跌破 60 周期均线 1% 做多, 突破 1% 做空(仅示例)
-    # 因为导入的 1s 级别数据极大，沿用原始 Demo 的示例逻辑构造策略信号
-    ma = pd.Series(close).rolling(60).mean().to_numpy()
-    df["long_signal"] = ((close < ma * 0.99) & (np.arange(n) % 30 == 0)).astype(np.int8)
-    df["short_signal"] = ((close > ma * 1.01) & (np.arange(n) % 30 == 0)).astype(np.int8)
+    base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
 
-    print(build_ladder(14).to_string(index=False))
+    # ==========================
+    # 核心批量处理逻辑
+    # ==========================
+    for symbol in symbols:
+        file_path = os.path.join(base_path, f"{symbol}_1s_2021-01-01_merged_6cols.csv")
 
-    # 提取纯文件名当作本批次数据的唯一 ID（防止同参数但是用在不同币种数据上时加载错乱）
-    data_name = os.path.splitext(os.path.basename(file_path))[0]
+        if not os.path.exists(file_path):
+            print(f"\n[警告] 找不到对应的 K 线文件，跳过该币种: {file_path}")
+            continue
 
-    # 引擎全面接管
-    cycles, rp, sweep, trades, rep = run_backtest(df, data_name=data_name)
-    print(sweep.to_string(index=False))
+        print(f"\n========== 正在加载本地 K 线数据: {symbol} ==========")
+        df_main = pd.read_csv(file_path)
+
+        # 遍历 16 个策略进行处理
+        for strat_func in strategies:
+            strat_name = strat_func.__name__
+            print(f"\n--- 正在处理: {symbol} | 策略: {strat_name} ---")
+
+            # 使用副本提取信号防止污染原始数据
+            df_strat = strat_func(df_main.copy())
+
+            # 确保信号列被规范化为 0 或 1，且没有 NaN
+            signal_col = df_strat['signal'].fillna(False).astype(np.int8)
+
+            # --------------------------------------------------
+            # 1. 策略信号作为 [开多] 进行一阶段运算
+            # --------------------------------------------------
+            df_long = df_main.copy()
+            df_long['long_signal'] = signal_col
+            df_long['short_signal'] = 0  # 做多测试不发做空信号
+
+            data_name_long = f"{symbol}_{strat_name}_Long"
+            # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
+            cache_filename_long = f"stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+
+            if os.path.exists(cache_filename_long):
+                print(f"  > [做多] 缓存已存在，跳过运算: {cache_filename_long}")
+            else:
+                print(f"  > [做多] 开始运行 Stage 1...")
+                cycles_long = run_stage1(df_long)
+                with open(cache_filename_long, 'wb') as f:
+                    pickle.dump({'df': cycles_long, 'attrs': cycles_long.attrs}, f)
+                print(f"  > [做多] 一阶段已保存: {cache_filename_long}")
+
+            # --------------------------------------------------
+            # 2. 策略信号作为 [开空] 进行一阶段运算
+            # --------------------------------------------------
+            df_short = df_main.copy()
+            df_short['long_signal'] = 0  # 做空测试不发做多信号
+            df_short['short_signal'] = signal_col
+
+            data_name_short = f"{symbol}_{strat_name}_Short"
+            cache_filename_short = f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+
+            if os.path.exists(cache_filename_short):
+                print(f"  > [做空] 缓存已存在，跳过运算: {cache_filename_short}")
+            else:
+                print(f"  > [做空] 开始运行 Stage 1...")
+                cycles_short = run_stage1(df_short)
+                with open(cache_filename_short, 'wb') as f:
+                    pickle.dump({'df': cycles_short, 'attrs': cycles_short.attrs}, f)
+                print(f"  > [做空] 一阶段已保存: {cache_filename_short}")
+
+    print("\n========== 所有币种(6个) x 策略(16个) x 多/空(2种) = 192 份一阶段文件已处理完毕！ ==========")
