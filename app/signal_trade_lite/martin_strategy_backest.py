@@ -16,12 +16,45 @@ Stage 3 : Free-Ride 指标评估      -> report
 Margin 的单位是"首单名义价值的倍数"(1 Unit = 首单 Notional)。
 例: margin=2.55 表示账户可承受 2.55 倍首单名义价值的资金缺口 (约撑到第 10 层)。
 用 build_ladder() 查表选 Margin。
+
+性能说明 (Stage 1)
+------------------
+1) _simulate_cycle 由 numba 编译为机器码 (njit, nogil, cache), 不开 fastmath,
+   表达式书写顺序与原纯 Python 版完全一致 => 浮点结果位级等价。
+2) 浮亏阶梯在 njit 内部用"倍增动态数组"记录 (不是定长预分配), 既不越界也不吃内存。
+   (定长 (n-i0)//60+2 在 bar 非严格 1s 等距时会越界写内存, 已废弃该思路)
+3) 外层按"块"提交到 ThreadPoolExecutor (非逐 cycle 提交), 依赖 nogil 真并行,
+   结果按下标写入预分配数组 => 与串行版逐位一致、可复现。
+4) 已删除 tolist() (fast_lists) 路径, K 线一律以连续 float64/int64 数组传入。
 """
 
 import os
 import pickle
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
+
+# ---------------------------------------------------------------------
+# numba 可选依赖: 缺失时自动退化为纯 Python (逻辑同源, 仅速度不同)
+# ---------------------------------------------------------------------
+try:
+    from numba import njit as _njit
+
+    _HAS_NUMBA = True
+except Exception:  # pragma: no cover
+    _HAS_NUMBA = False
+
+
+    def _njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(f):
+            return f
+
+        return _wrap
 
 MS_MIN = 60000
 MS_HOUR = 3600000.0
@@ -407,13 +440,33 @@ def build_ladder(max_layer=20, direction="Long",
 # =====================================================================
 # 1. Stage 1 : 单 Cycle 精确模拟 (归一化 / 纯数学推演)
 # =====================================================================
+@_njit(cache=True, nogil=True)
+def _times_strictly_increasing(t):
+    """单遍短路扫描, 零临时分配 (等价于 not np.any(np.diff(t) <= 0))"""
+    for i in range(1, t.shape[0]):
+        if t[i] <= t[i - 1]:
+            return False
+    return True
+
+
+@_njit(cache=True, nogil=True)
+def _all_finite3(a, b, c):
+    """单遍短路扫描, 零临时分配 (等价于 np.all(isfinite(a)&isfinite(b)&isfinite(c)))"""
+    for i in range(a.shape[0]):
+        if not (np.isfinite(a[i]) and np.isfinite(b[i]) and np.isfinite(c[i])):
+            return False
+    return True
+
+
+@_njit(cache=True, nogil=True)
 def _simulate_cycle(i0, n, adv, fav, closes, times, s,
                     fee, add_mul, tp_mul, mult, mtm_fee,
-                    dd_abort, max_layer_hard):
+                    dd_abort, has_abort, max_layer_hard):
     """
     s    : +1.0 = Long, -1.0 = Short
     adv  : 逆向价序列 (Long -> low , Short -> high)
     fav  : 顺向价序列 (Long -> high, Short -> low)
+    has_abort/dd_abort : 熔断开关 + 阈值 (拆成两参数是为了避免 Optional 类型污染 JIT)
     返回 : (end_i, status, layer, net_pnl, total_fees, dd_t, dd_v, max_dd)
            status: 1=止盈闭环, 0=数据耗尽MTM, -1=熔断截断
     剪枝依据(等价变换):
@@ -434,8 +487,14 @@ def _simulate_cycle(i0, n, adv, fav, closes, times, s,
     worst = 1.0  # Cycle 内最差(逆向)归一化价
     max_dd = fees  # 开仓瞬间的资金缺口 = 已付手续费
     t0 = times[i0]
-    dd_t = [t0 - t0 % MS_MIN]
-    dd_v = [max_dd]
+
+    # ---- 浮亏阶梯: 倍增动态数组 (不做定长预分配, 兼容非等距 bar 且不吃内存) ----
+    cap = 8
+    dd_t = np.empty(cap, dtype=np.int64)
+    dd_v = np.empty(cap, dtype=np.float64)
+    dd_t[0] = t0 - t0 % MS_MIN
+    dd_v[0] = max_dd
+    idx = 1
 
     for i in range(i0 + 1, n):
         a = adv[i] * inv
@@ -460,32 +519,53 @@ def _simulate_cycle(i0, n, adv, fav, closes, times, s,
             dd = s * (cost - vol * a) + fees
             if dd > max_dd:
                 max_dd = dd
-                m = times[i]
-                m -= m % MS_MIN
-                if m == dd_t[-1]:
-                    dd_v[-1] = dd  # 同分钟只留最大值
+                mm = times[i]
+                mm -= mm % MS_MIN
+                if mm == dd_t[idx - 1]:
+                    dd_v[idx - 1] = dd  # 同分钟只留最大值
                 else:
-                    dd_t.append(m)
-                    dd_v.append(dd)
+                    if idx == cap:
+                        cap = cap * 2
+                        nt = np.empty(cap, dtype=np.int64)
+                        nv = np.empty(cap, dtype=np.float64)
+                        nt[:idx] = dd_t[:idx]
+                        nv[:idx] = dd_v[:idx]
+                        dd_t = nt
+                        dd_v = nv
+                    dd_t[idx] = mm
+                    dd_v[idx] = dd
+                    idx += 1
             # ---- 3) 熔断(防御性, 仅当 dd_abort > 所有待测 Margin 时无影响) ----
-            if layer >= max_layer_hard or (dd_abort is not None and max_dd >= dd_abort):
+            if layer >= max_layer_hard or (has_abort and max_dd >= dd_abort):
                 pe = closes[i] * inv
                 cf = vol * pe * mtm_fee
                 return (i, -1, layer, s * (vol * pe - cost) - fees - cf,
-                        fees + cf, dd_t, dd_v, max_dd)
+                        fees + cf, dd_t[:idx].copy(), dd_v[:idx].copy(), max_dd)
         # ---- 4) 止盈 ----
         if fav[i] * inv * s >= p_tp * s:
             xn = vol * p_tp
             cf = xn * fee
             return (i, 1, layer, s * (xn - cost) - fees - cf,
-                    fees + cf, dd_t, dd_v, max_dd)
+                    fees + cf, dd_t[:idx].copy(), dd_v[:idx].copy(), max_dd)
 
     # ---- 5) 数据耗尽: 强制盯市结算 ----
     i = n - 1
     pe = closes[i] * inv
     cf = vol * pe * mtm_fee
     return (i, 0, layer, s * (vol * pe - cost) - fees - cf,
-            fees + cf, dd_t, dd_v, max_dd)
+            fees + cf, dd_t[:idx].copy(), dd_v[:idx].copy(), max_dd)
+
+
+def _warmup_jit():
+    """主线程内先把签名编译好, 避免多线程首次调用抢 numba 编译锁"""
+    if not _HAS_NUMBA:
+        return
+    f1 = np.ones(1, dtype=np.float64)
+    i1 = np.zeros(1, dtype=np.int64)
+    _times_strictly_increasing(i1)
+    _all_finite3(f1, f1, f1)
+    _simulate_cycle(0, 1, f1, f1, f1, i1, 1.0,
+                    0.0, 1.0, 1.0, 2.0, 0.0, 0.0, False, 1)
 
 
 def run_stage1(df,
@@ -500,7 +580,8 @@ def run_stage1(df,
                max_layer_hard=512,
                dd_format="array",
                fast_lists=None,
-               progress=0):
+               progress=0,
+               n_jobs=None):
     """
     第一阶段: 无限保证金平行宇宙生成。
 
@@ -511,22 +592,42 @@ def run_stage1(df,
     dd_abort:
         浮亏熔断阈值。None = 严格按方案(不熔断)。若设置, 必须 > 你要测试的最大 Margin,
         否则 Stage 2 会报错以防污染结论。
+        注意: 只要 dd_abort > 所有待测 Margin, Stage 2 的 trades 时间线与不熔断位级等价;
+              但 cycles_df 中被截断 Cycle 的 net_pnl / max_dd / is_closed 会变,
+              从而影响 Stage 3 "仅闭环 Cycle" 的横向统计表。
+    fast_lists:
+        【已废弃, 保留仅为向后兼容, 传什么都被忽略】
+        原 tolist() 路径在大数据上会产生数 GB Python 对象开销, 且与 JIT 不兼容。
+    n_jobs:
+        Stage 1 并发线程数 (None = os.cpu_count())。底层 K 线只读共享, 内存不随线程增长。
+        无 numba 时强制退化为 1 (GIL 无法释放, 多线程只会更慢)。
     """
     for c in ("open_time", "high", "low", "close"):
         if c not in df.columns:
             raise ValueError("缺少必需列: %s" % c)
 
+    _warmup_jit()
+
     times_np = np.ascontiguousarray(df["open_time"].to_numpy(dtype=np.int64))
-    n = times_np.shape[0]
+    n = int(times_np.shape[0])
     if n == 0:
         raise ValueError("空数据")
-    if n > 1 and np.any(np.diff(times_np) <= 0):
-        raise ValueError("open_time 必须严格递增(请先排序去重)")
+    if n > 1:
+        if _HAS_NUMBA:
+            ok_inc = bool(_times_strictly_increasing(times_np))
+        else:
+            ok_inc = not bool(np.any(np.diff(times_np) <= 0))
+        if not ok_inc:
+            raise ValueError("open_time 必须严格递增(请先排序去重)")
 
     highs_np = np.ascontiguousarray(df["high"].to_numpy(dtype=np.float64))
     lows_np = np.ascontiguousarray(df["low"].to_numpy(dtype=np.float64))
     closes_np = np.ascontiguousarray(df["close"].to_numpy(dtype=np.float64))
-    if not np.all(np.isfinite(highs_np) & np.isfinite(lows_np) & np.isfinite(closes_np)):
+    if _HAS_NUMBA:
+        ok_fin = bool(_all_finite3(highs_np, lows_np, closes_np))
+    else:
+        ok_fin = bool(np.all(np.isfinite(highs_np) & np.isfinite(lows_np) & np.isfinite(closes_np)))
+    if not ok_fin:
         raise ValueError("high/low/close 存在 NaN/Inf")
 
     # 信号采集(允许同一 bar 同时出多空 -> 两个平行 Cycle)
@@ -543,24 +644,16 @@ def run_stage1(df,
     order = np.argsort(sig_idx, kind="stable")  # 同 bar: Long 先于 Short
     sig_idx = sig_idx[order]
     sig_dir = sig_dir[order]
-    m = sig_idx.shape[0]
-
-    # 性能: list 索引比 numpy 标量索引快 2~3 倍(数值逐位一致)
-    if fast_lists is None:
-        fast_lists = n <= 3000000
-    if fast_lists:
-        highs = highs_np.tolist()
-        lows = lows_np.tolist()
-        closes = closes_np.tolist()
-        times = times_np.tolist()
-    else:
-        highs, lows, closes, times = highs_np, lows_np, closes_np, times_np
+    m = int(sig_idx.shape[0])
 
     add_mul_l = 1.0 - add_step
     tp_mul_l = 1.0 + tp_step
     add_mul_s = 1.0 + add_step
     tp_mul_s = 1.0 - tp_step
     mtm_fee = fee_rate if mtm_charge_close_fee else 0.0
+    has_abort = dd_abort is not None
+    dd_abort_f = float(dd_abort) if has_abort else 0.0
+    max_layer_hard_i = int(max_layer_hard)
 
     out_dir = np.empty(m, dtype=object)
     out_bar = np.empty(m, dtype=np.int64)
@@ -575,33 +668,64 @@ def run_stage1(df,
     dd_times_col = np.empty(m, dtype=object)
     dd_vals_col = np.empty(m, dtype=object)
 
-    for k in range(m):
-        i0 = int(sig_idx[k])
-        s = float(sig_dir[k])
-        if s > 0.0:
-            res = _simulate_cycle(i0, n, lows, highs, closes, times, 1.0,
-                                  fee_rate, add_mul_l, tp_mul_l, multiplier,
-                                  mtm_fee, dd_abort, max_layer_hard)
+    _lock = threading.Lock()
+    _done = [0]
+
+    def _run_range(k0, k1):
+        """处理 [k0, k1) 这一块 cycle; 结果按绝对下标 k 写入 -> 与串行版逐位一致"""
+        for k in range(k0, k1):
+            i0 = int(sig_idx[k])
+            s = float(sig_dir[k])
+            if s > 0.0:
+                res = _simulate_cycle(i0, n, lows_np, highs_np, closes_np, times_np, 1.0,
+                                      fee_rate, add_mul_l, tp_mul_l, multiplier,
+                                      mtm_fee, dd_abort_f, has_abort, max_layer_hard_i)
+            else:
+                res = _simulate_cycle(i0, n, highs_np, lows_np, closes_np, times_np, -1.0,
+                                      fee_rate, add_mul_s, tp_mul_s, multiplier,
+                                      mtm_fee, dd_abort_f, has_abort, max_layer_hard_i)
+            end_i, status, layer, net, tfee, dd_t, dd_v, mdd = res
+            out_dir[k] = "Long" if s > 0.0 else "Short"
+            out_bar[k] = i0
+            out_s[k] = times_np[i0]
+            out_e[k] = times_np[end_i]
+            out_status[k] = status
+            out_layer[k] = layer
+            out_net[k] = net
+            out_fee[k] = tfee
+            out_mdd[k] = mdd
+            out_nst[k] = dd_t.shape[0]
+            dd_times_col[k] = dd_t
+            dd_vals_col[k] = dd_v
+        if progress:
+            with _lock:
+                prev = _done[0]
+                _done[0] = prev + (k1 - k0)
+                if _done[0] // progress > prev // progress:
+                    print("[stage1] %d / %d cycles" % (_done[0], m))
+
+    if m:
+        if n_jobs is None:
+            nj = os.cpu_count() or 1
         else:
-            res = _simulate_cycle(i0, n, highs, lows, closes, times, -1.0,
-                                  fee_rate, add_mul_s, tp_mul_s, multiplier,
-                                  mtm_fee, dd_abort, max_layer_hard)
-        end_i, status, layer, net, tfee, dd_t, dd_v, mdd = res
-        out_dir[k] = "Long" if s > 0.0 else "Short"
-        out_bar[k] = i0
-        out_s[k] = times_np[i0]
-        out_e[k] = times_np[end_i]
-        out_status[k] = status
-        out_layer[k] = layer
-        out_net[k] = net
-        out_fee[k] = tfee
-        out_mdd[k] = mdd
-        nst = len(dd_t)
-        out_nst[k] = nst
-        dd_times_col[k] = np.fromiter(dd_t, dtype=np.int64, count=nst)
-        dd_vals_col[k] = np.fromiter(dd_v, dtype=np.float64, count=nst)
-        if progress and (k + 1) % progress == 0:
-            print("[stage1] %d / %d cycles" % (k + 1, m))
+            nj = int(n_jobs)
+        if nj < 1:
+            nj = 1
+        if not _HAS_NUMBA:
+            nj = 1  # 纯 Python 下 GIL 未释放, 多线程无收益
+        nj = min(nj, 32, m)
+        if nj <= 1:
+            _run_range(0, m)
+        else:
+            # 块数远多于线程数 => 天然工作窃取, 化解"长尾 Cycle"负载不均
+            chunk = (m + nj * 64 - 1) // (nj * 64)
+            if chunk < 1:
+                chunk = 1
+            if chunk > 4096:
+                chunk = 4096
+            bounds = [(k0, min(k0 + chunk, m)) for k0 in range(0, m, chunk)]
+            with ThreadPoolExecutor(max_workers=nj) as ex:
+                list(ex.map(lambda b: _run_range(b[0], b[1]), bounds))
 
     cycles = pd.DataFrame({
         "cycle_id": np.arange(m, dtype=np.int64),
@@ -1038,6 +1162,10 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
 # 4. 执行入口 (按需批量化一阶段生成)
 # =====================================================================
 if __name__ == "__main__":
+    if not _HAS_NUMBA:
+        print("[警告] 未检测到 numba, Stage 1 将退化为纯 Python 单线程 (慢 100 倍以上)。"
+              "请执行: pip install numba")
+
     symbols = [
         "BTCUSDT",
         "ETHUSDT",
@@ -1091,15 +1219,19 @@ if __name__ == "__main__":
             df_strat = strat_func(df_main.copy())
 
             # 确保信号列被规范化为 0 或 1，且没有 NaN
-            signal_col = df_strat['signal'].fillna(False).astype(np.int8)
+            signal_np = df_strat['signal'].fillna(False).astype(np.int8).to_numpy()
+            del df_strat  # 立刻释放整份策略副本, 压低内存峰值
+
+            # Stage 1 只需要 open_time/high/low/close + 两个信号列。
+            # 这里按列装配(与 df_main 共享底层内存), 避免 df_main.copy() 的巨型拷贝。
+            df_sig = pd.DataFrame(index=df_main.index)
+            for _c in ("open_time", "high", "low", "close"):
+                df_sig[_c] = df_main[_c].to_numpy()
+            zero_np = np.zeros(signal_np.shape[0], dtype=np.int8)
 
             # --------------------------------------------------
             # 1. 策略信号作为 [开多] 进行一阶段运算
             # --------------------------------------------------
-            df_long = df_main.copy()
-            df_long['long_signal'] = signal_col
-            df_long['short_signal'] = 0  # 做多测试不发做空信号
-
             data_name_long = f"{symbol}_{strat_name}_Long"
             # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
             cache_filename_long = f"stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
@@ -1108,18 +1240,17 @@ if __name__ == "__main__":
                 print(f"  > [做多] 缓存已存在，跳过运算: {cache_filename_long}")
             else:
                 print(f"  > [做多] 开始运行 Stage 1...")
-                cycles_long = run_stage1(df_long)
+                df_sig['long_signal'] = signal_np
+                df_sig['short_signal'] = zero_np  # 做多测试不发做空信号
+                cycles_long = run_stage1(df_sig)
                 with open(cache_filename_long, 'wb') as f:
                     pickle.dump({'df': cycles_long, 'attrs': cycles_long.attrs}, f)
                 print(f"  > [做多] 一阶段已保存: {cache_filename_long}")
+                del cycles_long
 
             # --------------------------------------------------
             # 2. 策略信号作为 [开空] 进行一阶段运算
             # --------------------------------------------------
-            df_short = df_main.copy()
-            df_short['long_signal'] = 0  # 做空测试不发做多信号
-            df_short['short_signal'] = signal_col
-
             data_name_short = f"{symbol}_{strat_name}_Short"
             cache_filename_short = f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
 
@@ -1127,9 +1258,14 @@ if __name__ == "__main__":
                 print(f"  > [做空] 缓存已存在，跳过运算: {cache_filename_short}")
             else:
                 print(f"  > [做空] 开始运行 Stage 1...")
-                cycles_short = run_stage1(df_short)
+                df_sig['long_signal'] = zero_np  # 做空测试不发做多信号
+                df_sig['short_signal'] = signal_np
+                cycles_short = run_stage1(df_sig)
                 with open(cache_filename_short, 'wb') as f:
                     pickle.dump({'df': cycles_short, 'attrs': cycles_short.attrs}, f)
                 print(f"  > [做空] 一阶段已保存: {cache_filename_short}")
+                del cycles_short
+
+            del df_sig, signal_np, zero_np
 
     print("\n========== 所有币种(6个) x 策略(16个) x 多/空(2种) = 192 份一阶段文件已处理完毕！ ==========")
