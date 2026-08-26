@@ -1549,8 +1549,8 @@ if __name__ == "__main__":
             data_name_long = f"{symbol}_{strat_name}_Long"
             data_name_short = f"{symbol}_{strat_name}_Short"
             # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
-            cache_filename_long = f"stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
-            cache_filename_short = f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+            cache_filename_long = f"backest/stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+            cache_filename_short = f"backest/stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
             has_long = os.path.exists(cache_filename_long)
             has_short = os.path.exists(cache_filename_short)
 
