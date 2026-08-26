@@ -1423,7 +1423,7 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
     max_l = stage1_kw.get('max_layer_hard', 512)
     mtm = stage1_kw.get('mtm_charge_close_fee', True)
 
-    cache_filename = f"stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl"
+    cache_filename = f"backest/stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl"
 
     if os.path.exists(cache_filename):
         _log("[缓存系统] 发现匹配的 Stage 1 缓存: %s (%.1f MB), 跳过高昂计算直接加载..."
