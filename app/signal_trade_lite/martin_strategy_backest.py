@@ -18,16 +18,18 @@ Margin 的单位是"首单名义价值的倍数"(1 Unit = 首单 Notional)。
 用 build_ladder() 查表选 Margin。
 """
 
+import os
+import pickle
 import numpy as np
 import pandas as pd
 
 MS_MIN = 60000
 MS_HOUR = 3600000.0
 
-DEFAULT_FEE = 0.0005      # 单边综合成本(手续费+滑点+资金费率折算)
+DEFAULT_FEE = 0.0005  # 单边综合成本(手续费+滑点+资金费率折算)
 DEFAULT_ADD_STEP = 0.002  # 加仓间距(基于持仓均价)
-DEFAULT_TP_STEP = 0.003   # 止盈间距(基于持仓均价)
-DEFAULT_MULT = 2.0        # 加仓倍数(数量翻倍)
+DEFAULT_TP_STEP = 0.003  # 止盈间距(基于持仓均价)
+DEFAULT_MULT = 2.0  # 加仓倍数(数量翻倍)
 
 
 # =====================================================================
@@ -98,17 +100,17 @@ def _simulate_cycle(i0, n, adv, fav, closes, times, s,
     p0 = closes[i0]
     inv = 1.0 / p0
 
-    vol = 1.0        # Total_Volume
-    last_q = 1.0     # 上一笔订单数量
-    cost = 1.0       # Total_Cost_Basis (按成交价累加的名义价值)
-    fees = fee       # Accumulated_Fees (首单名义价值 = 1.0)
+    vol = 1.0  # Total_Volume
+    last_q = 1.0  # 上一笔订单数量
+    cost = 1.0  # Total_Cost_Basis (按成交价累加的名义价值)
+    fees = fee  # Accumulated_Fees (首单名义价值 = 1.0)
     layer = 0
 
     p_add = add_mul  # = 1.0 * add_mul
     p_tp = tp_mul
 
-    worst = 1.0      # Cycle 内最差(逆向)归一化价
-    max_dd = fees    # 开仓瞬间的资金缺口 = 已付手续费
+    worst = 1.0  # Cycle 内最差(逆向)归一化价
+    max_dd = fees  # 开仓瞬间的资金缺口 = 已付手续费
     t0 = times[i0]
     dd_t = [t0 - t0 % MS_MIN]
     dd_v = [max_dd]
@@ -139,7 +141,7 @@ def _simulate_cycle(i0, n, adv, fav, closes, times, s,
                 m = times[i]
                 m -= m % MS_MIN
                 if m == dd_t[-1]:
-                    dd_v[-1] = dd          # 同分钟只留最大值
+                    dd_v[-1] = dd  # 同分钟只留最大值
                 else:
                     dd_t.append(m)
                     dd_v.append(dd)
@@ -216,7 +218,7 @@ def run_stage1(df,
         si = np.empty(0, dtype=np.int64)
     sig_idx = np.concatenate([li.astype(np.int64), si.astype(np.int64)])
     sig_dir = np.concatenate([np.ones(li.shape[0]), -np.ones(si.shape[0])])
-    order = np.argsort(sig_idx, kind="stable")   # 同 bar: Long 先于 Short
+    order = np.argsort(sig_idx, kind="stable")  # 同 bar: Long 先于 Short
     sig_idx = sig_idx[order]
     sig_dir = sig_dir[order]
     m = sig_idx.shape[0]
@@ -411,7 +413,7 @@ class TimelineReplayer:
                              "tp" if closed[j] else "mtm", pnl, float(self._fee[j]),
                              int(self._layer[j]), float(mdd[j]), cum))
                 if not closed[j]:
-                    break                     # 历史终点未平仓单 -> 回测强制结束
+                    break  # 历史终点未平仓单 -> 回测强制结束
                 cur = int(end[j])
             else:
                 # ---------- 爆仓(查表, dd_vals 严格单调 => 二分) ----------
@@ -518,11 +520,12 @@ def evaluate_free_ride(trades_df, cycles_df, margin,
         samples = np.diff(np.array([t0] + deaths, dtype=np.float64)) / MS_HOUR
         rep["expected_lifespan_hour"] = float(samples.mean())
         rep["blowup_interval_hour"] = (float(np.mean(np.diff(np.array(deaths,
-                                       dtype=np.float64)) / MS_HOUR)) if len(deaths) > 1 else np.nan)
+                                                                      dtype=np.float64)) / MS_HOUR)) if len(
+            deaths) > 1 else np.nan)
         rep["mean_life_hour"] = float(np.mean([(L[1] - L[0]) / MS_HOUR for L in done]))
         rep["blowups_per_year"] = (len(deaths) / span_y) if span_y > 0 else np.nan
     else:
-        rep["expected_lifespan_hour"] = np.inf   # 样本内未爆仓(右删失)
+        rep["expected_lifespan_hour"] = np.inf  # 样本内未爆仓(右删失)
         rep["blowup_interval_hour"] = np.nan
         rep["mean_life_hour"] = np.nan
         rep["blowups_per_year"] = 0.0
@@ -671,10 +674,34 @@ def sweep_margins(replayer, margins, verbose=False):
     return pd.DataFrame(rows)
 
 
-def run_backtest(df, margins=(0.02, 0.16, 0.6, 2.55, 10.0, 40.6),
+def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 10.0, 40.6),
                  report_margin=None, **stage1_kw):
-    """一站式: Stage1 -> Replayer -> 扫描 -> 详细报告"""
-    cycles = run_stage1(df, **stage1_kw)
+    """一站式: Stage1 -> Replayer -> 扫描 -> 详细报告 (已支持 Stage 1 结果本地缓存跳过)"""
+
+    # 抽取核心参数，组装缓存文件名
+    fee = stage1_kw.get('fee_rate', DEFAULT_FEE)
+    add = stage1_kw.get('add_step', DEFAULT_ADD_STEP)
+    tp = stage1_kw.get('tp_step', DEFAULT_TP_STEP)
+    mult = stage1_kw.get('multiplier', DEFAULT_MULT)
+    dd_abort = stage1_kw.get('dd_abort', 'None')
+    max_l = stage1_kw.get('max_layer_hard', 512)
+    mtm = stage1_kw.get('mtm_charge_close_fee', True)
+
+    cache_filename = f"stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl"
+
+    if os.path.exists(cache_filename):
+        print(f"[缓存系统] 发现匹配的 Stage 1 缓存文件: {cache_filename}，正在跳过高昂计算，直接加载...")
+        with open(cache_filename, 'rb') as f:
+            cached_data = pickle.load(f)
+            cycles = cached_data['df']
+            cycles.attrs = cached_data['attrs']
+    else:
+        print(f"[缓存系统] 未发现匹配缓存，开始运行 Stage 1 平行宇宙引擎，并将结果保存至: {cache_filename}")
+        cycles = run_stage1(df, **stage1_kw)
+        with open(cache_filename, 'wb') as f:
+            # Pandas 偶尔在序列化时丢弃 attrs，使用字典确保元数据一同保存
+            pickle.dump({'df': cycles, 'attrs': cycles.attrs}, f)
+
     rp = TimelineReplayer(cycles)
     sweep = sweep_margins(rp, margins)
     if report_margin is None and len(margins):
@@ -689,23 +716,25 @@ def run_backtest(df, margins=(0.02, 0.16, 0.6, 2.55, 10.0, 40.6),
 # 4. Demo
 # =====================================================================
 if __name__ == "__main__":
-    rng = np.random.default_rng(7)
-    n = 300000                                  # 1m K 线
-    t0 = pd.Timestamp("2024-01-01").value // 10 ** 6
-    ot = t0 + np.arange(n, dtype=np.int64) * 60000
-    ret = rng.standard_normal(n) * 0.0007
-    close = 30000.0 * np.exp(np.cumsum(ret))
-    op = np.concatenate([[30000.0], close[:-1]])
-    wig = np.abs(rng.standard_normal(n)) * 0.0006 * close
-    high = np.maximum(op, close) + wig
-    low = np.minimum(op, close) - wig
-    df = pd.DataFrame({"open_time": ot, "open": op, "high": high, "low": low,
-                       "close": close, "volume": rng.random(n) * 10})
+    # 指定实际的数据文件路径
+    file_path = r"W:\project\python_project\oke_auto_trade\kline_data\BTCUSDT_1s_2021-01-01_merged_6cols.csv"
+    print(f"正在加载本地 K 线数据: {file_path}")
+    df = pd.read_csv(file_path)
+
+    n = len(df)
+    close = df["close"].to_numpy()
+
     # 简单信号: 收盘跌破 60 周期均线 1% 做多, 突破 1% 做空(仅示例)
+    # 因为导入的 1s 级别数据极大，沿用原始 Demo 的示例逻辑构造策略信号
     ma = pd.Series(close).rolling(60).mean().to_numpy()
     df["long_signal"] = ((close < ma * 0.99) & (np.arange(n) % 30 == 0)).astype(np.int8)
     df["short_signal"] = ((close > ma * 1.01) & (np.arange(n) % 30 == 0)).astype(np.int8)
 
     print(build_ladder(14).to_string(index=False))
-    cycles, rp, sweep, trades, rep = run_backtest(df)
+
+    # 提取纯文件名当作本批次数据的唯一 ID（防止同参数但是用在不同币种数据上时加载错乱）
+    data_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    # 引擎全面接管
+    cycles, rp, sweep, trades, rep = run_backtest(df, data_name=data_name)
     print(sweep.to_string(index=False))
