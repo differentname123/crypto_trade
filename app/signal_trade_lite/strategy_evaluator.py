@@ -116,7 +116,6 @@ def analyze_all_strategies():
             del trades_df, report
 
         # ==================== 严格的单进程内存回收 ====================
-        # 显式删除大体积变量并强制回收内存，避免读取几百个 pkl 后 OOM
         del cycles_df, cached_data, replayer
         gc.collect()
 
@@ -131,11 +130,6 @@ def analyze_all_strategies():
     # =====================================================================
     # 数据清洗、排名与结果输出
     # =====================================================================
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', 200)
-    pd.set_option('display.unicode.east_asian_width', True)
-    pd.set_option('display.unicode.ambiguous_as_wide', True)
-
     for margin in TEST_MARGINS:
         if not results_by_margin[margin]:
             continue
@@ -152,7 +146,7 @@ def analyze_all_strategies():
         output_csv = f"strategy_leaderboard_margin_{margin}.csv"
         df_results.to_csv(output_csv, index=False, encoding='utf-8-sig')
 
-        # ---------------- 终端打印 Top 10 (强制完美对齐版) ----------------
+        # ---------------- 终端打印 Top 10 (终极完美对齐版) ----------------
         print(f"\n🏆 Margin = {margin} | 综合表现 TOP 10 策略 (按死前翻倍期望排名):")
 
         # 包含新增的核心评估字段
@@ -171,39 +165,41 @@ def analyze_all_strategies():
 
         print("-" * 155)
 
-        # 强制东亚字符宽度计算逻辑，解决中英文字符串排版错位问题
+        # 终极精确字符宽度计算逻辑
         def get_display_width(s):
             w = 0
             for c in str(s):
-                if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
+                # 剔除 'A' (Ambiguous)，在大部分 IDE 终端下它表现为单字节宽
+                if unicodedata.east_asian_width(c) in ('F', 'W'):
                     w += 2
                 else:
                     w += 1
             return w
 
+        def rpad(s, width):
+            """右对齐填充空格"""
+            s = str(s)
+            pad_len = width - get_display_width(s)
+            return " " * max(0, pad_len) + s
+
         cols = list(df_display.columns)
         col_widths = []
+        # 计算每一列所需的最大宽度，并加上 3 个空格作为统一间距
         for col in cols:
             max_w = get_display_width(col)
             for val in df_display[col]:
-                max_w = max(max_w, get_display_width(val))
-            col_widths.append(max_w)
+                max_w = max(max_w, get_display_width(str(val)))
+            col_widths.append(max_w + 3)
 
         # 打印表头 (右对齐)
-        header_str = ""
-        for i, col in enumerate(cols):
-            pad = col_widths[i] - get_display_width(col)
-            header_str += " " * pad + col + "  "
+        header_str = "".join(rpad(col, col_widths[i]) for i, col in enumerate(cols))
         print(header_str)
 
         # 打印数据 (右对齐)
         for _, row in df_display.iterrows():
-            row_str = ""
-            for i, col in enumerate(cols):
-                val_str = str(row[col])
-                pad = col_widths[i] - get_display_width(val_str)
-                row_str += " " * pad + val_str + "  "
+            row_str = "".join(rpad(str(row[col]), col_widths[i]) for i, col in enumerate(cols))
             print(row_str)
+
         print("-" * 155)
 
     print("\n💡 指标解读指南 (进阶版):")
