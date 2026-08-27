@@ -78,7 +78,6 @@ DEFAULT_ADD_STEP = 0.002  # 加仓间距(基于持仓均价)
 DEFAULT_TP_STEP = 0.003  # 止盈间距(基于持仓均价)
 DEFAULT_MULT = 2.0  # 加仓倍数(数量翻倍)
 
-
 # =====================================================================
 # 日志与内存观测工具 (轻量, 无强依赖)
 # =====================================================================
@@ -1424,6 +1423,11 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
     mtm = stage1_kw.get('mtm_charge_close_fee', True)
 
     cache_filename = f"backest/stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl"
+    # ---- 确保如果做空调用此函数时，也会自动将做空缓存导向目标目录 ----
+    if "Short" in data_name or "short" in data_name:
+        os.makedirs(r"G:\short_data", exist_ok=True)
+        cache_filename = os.path.join(r"G:\short_data",
+                                      f"stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl")
 
     if os.path.exists(cache_filename):
         _log("[缓存系统] 发现匹配的 Stage 1 缓存: %s (%.1f MB), 跳过高昂计算直接加载..."
@@ -1514,6 +1518,10 @@ if __name__ == "__main__":
     task_done = 0
     t_all = time.time()
 
+    # ---- 确保做空文件保存目录存在 ----
+    short_dir = r"G:\short_data"
+    os.makedirs(short_dir, exist_ok=True)
+
     # ==========================
     # 核心批量处理逻辑
     # ==========================
@@ -1550,7 +1558,10 @@ if __name__ == "__main__":
             data_name_short = f"{symbol}_{strat_name}_Short"
             # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
             cache_filename_long = f"backest/stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
-            cache_filename_short = f"backest/stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
+            # 将做空文件独立输出至指定目录 G:\short_data
+            cache_filename_short = os.path.join(short_dir,
+                                                f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl")
+
             has_long = os.path.exists(cache_filename_long)
             has_short = os.path.exists(cache_filename_short)
 

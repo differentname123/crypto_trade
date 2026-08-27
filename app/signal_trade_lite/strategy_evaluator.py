@@ -25,7 +25,8 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 # 参数配置
 # =====================================================================
 # 缓存文件所在的目录 (请与你生成数据时保持一致)
-CACHE_DIR = "./backest/"  # 如果在子目录，请修改，例如 "./backtest/"
+CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
+SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
 # 分别约对应: 5层(0.16), 7层(0.6), 10层(2.55), 11层濒死(10.0), 13层(40.6)
@@ -37,12 +38,17 @@ def analyze_all_strategies():
     print(f" 🚀 启动全局策略评估引擎 | 设定测试 Margins = {TEST_MARGINS}")
     print("=" * 80)
 
-    # 查找所有 stage1 缓存文件
-    search_pattern = os.path.join(CACHE_DIR, "stage1_*.pkl")
-    pkl_files = glob.glob(search_pattern)
+    # 查找所有 stage1 缓存文件 (合并原目录和做空专用目录)
+    search_pattern_main = os.path.join(CACHE_DIR, "stage1_*.pkl")
+    search_pattern_short = os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl")
+
+    pkl_files = glob.glob(search_pattern_main)
+    # 如果做空目录存在，则追加做空目录下的缓存文件
+    if os.path.exists(SHORT_CACHE_DIR):
+        pkl_files.extend(glob.glob(search_pattern_short))
 
     if not pkl_files:
-        print(f"[错误] 在 {CACHE_DIR} 目录下未找到任何 stage1_*.pkl 文件！")
+        print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl 文件！")
         return
 
     print(f"共发现 {len(pkl_files)} 个缓存文件，开启极致单进程内存回收模式...\n")
