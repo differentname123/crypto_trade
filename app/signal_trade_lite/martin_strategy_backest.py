@@ -172,6 +172,7 @@ def strategy_3_periodic_open_deviation(df):
     df['signal'] = deviation > threshold
     return df
 
+
 # ---------------------------------------------------------
 # 维度二：量价微观结构类（透视“订单簿博弈”）
 # ---------------------------------------------------------
@@ -240,6 +241,8 @@ def strategy_7_proxy_cvd_divergence(df):
 
     df['signal'] = bearish_div | bullish_div
     return df
+
+
 # ---------------------------------------------------------
 # 维度三：微观形态与猎杀类（捕捉“假突破”）
 # ---------------------------------------------------------
@@ -288,6 +291,7 @@ def strategy_10_close_position_bias(df):
     df['signal'] = long_trap | short_trap
     return df
 
+
 def strategy_11_tick_gap_reversion(df):
     # 放宽跳空阈值：从 0.0015 降至 0.001
     threshold = 0.001
@@ -335,6 +339,7 @@ def strategy_13_run_length_streaks(df):
     df['signal'] = ((up_streak == streak_threshold) & (ret_up > ret_threshold)) | \
                    ((down_streak == streak_threshold) & (ret_down > ret_threshold))
     return df
+
 
 def strategy_14_volatility_squeeze_expansion(df):
     """
@@ -385,7 +390,6 @@ def strategy_16_clock_aligned_anomaly(df):
 
     df['signal'] = time_node & vol_spike
     return df
-
 
 
 def strategy_17_sniper_combo_long(df):
@@ -502,7 +506,6 @@ def strategy_18_sniper_combo_short(df):
     # 生成最终信号
     df['signal'] = global_filter & (trigger_1 | trigger_2)
     return df
-
 
 
 def strategy_19_pulse_dryup_long(df):
@@ -1727,17 +1730,24 @@ if __name__ == "__main__":
         "BNBUSDT"
     ]
 
-    # 将 16 个策略加入列表以供循环调用
+    # 将 26 个策略加入列表，全部纳入且不过滤
     strategies = [
         strategy_1_vwap_zscore,
         strategy_2_quantile_deviation,
-
+        strategy_3_periodic_open_deviation,
         strategy_4_volume_price_absorption,
         strategy_5_liquidity_vacuum,
         strategy_6_volume_climax,
+        strategy_7_proxy_cvd_divergence,
         strategy_8_rolling_stop_hunt,
+        strategy_9_wick_rejection_ratio,
+        strategy_10_close_position_bias,
+        strategy_11_tick_gap_reversion,
         strategy_12_kaufman_efficiency_ratio,
+        strategy_13_run_length_streaks,
+        strategy_14_volatility_squeeze_expansion,
         strategy_15_micro_autocorrelation,
+        strategy_16_clock_aligned_anomaly,
         strategy_17_sniper_combo_long,
         strategy_18_sniper_combo_short,
         strategy_19_pulse_dryup_long,
@@ -1756,13 +1766,22 @@ if __name__ == "__main__":
     CSV_DTYPES = {"open_time": np.int64, "open": np.float32, "high": np.float32,
                   "low": np.float32, "close": np.float32, "volume": np.float32}
 
-    total_task = len(symbols) * len(strategies) * 2
+    # 新增三个参数搜索空间
+    search_add_steps = [0.001, 0.002, 0.005, 0.01]
+    search_tp_steps = [0.001, 0.002, 0.005, 0.01]
+    search_mults = [1.5, 2.0, 4.0, 8.0]
+
+    # 每个策略包含的多空和参数组合总数
+    combinations_per_strat = len(search_add_steps) * len(search_tp_steps) * len(search_mults) * 2
+
+    total_task = len(symbols) * len(strategies) * combinations_per_strat
     task_done = 0
     t_all = time.time()
 
-    # ---- 确保做空文件保存目录存在 ----
+    # ---- 确保做空文件保存目录和缓存目录存在 ----
     short_dir = r"G:\short_data"
     os.makedirs(short_dir, exist_ok=True)
+    os.makedirs("backest", exist_ok=True)
 
     # ==========================
     # 核心批量处理逻辑
@@ -1772,7 +1791,7 @@ if __name__ == "__main__":
 
         if not os.path.exists(file_path):
             _log("[警告] 找不到对应的 K 线文件, 跳过该币种: %s" % file_path)
-            task_done += len(strategies) * 2
+            task_done += len(strategies) * combinations_per_strat
             continue
 
         _log("=" * 78)
@@ -1788,7 +1807,7 @@ if __name__ == "__main__":
              % (len(df_main), df_main.shape[1],
                 df_main.memory_usage(deep=False).sum() / 1048576.0, time.time() - t), 1)
 
-        # 遍历 16 个策略进行处理
+        # 遍历全部策略进行处理
         for st_i, strat_func in enumerate(strategies, 1):
             strat_name = strat_func.__name__
             _log("-" * 78)
@@ -1798,18 +1817,30 @@ if __name__ == "__main__":
 
             data_name_long = f"{symbol}_{strat_name}_Long"
             data_name_short = f"{symbol}_{strat_name}_Short"
-            # 沿用原来的缓存命名方式，保证未来如果接入 run_backtest 也兼容
-            cache_filename_long = f"backest/stage1_{data_name_long}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl"
-            # 将做空文件独立输出至指定目录 G:\short_data
-            cache_filename_short = os.path.join(short_dir,
-                                                f"stage1_{data_name_short}_f{DEFAULT_FEE}_a{DEFAULT_ADD_STEP}_t{DEFAULT_TP_STEP}_m{DEFAULT_MULT}_daNone_ml512_mtmTrue.pkl")
 
-            has_long = os.path.exists(cache_filename_long)
-            has_short = os.path.exists(cache_filename_short)
+            # 提前检查所有参数组合的缓存是否全部存在，避免无意义的信号计算
+            all_caches_exist = True
+            for tag_temp, is_short_temp, data_name_dir_temp in (
+            ("做多", False, data_name_long), ("做空", True, data_name_short)):
+                for add_step_val in search_add_steps:
+                    for tp_step_val in search_tp_steps:
+                        for mult_val in search_mults:
+                            if is_short_temp:
+                                c_fn = os.path.join(short_dir,
+                                                    f"stage1_{data_name_dir_temp}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl")
+                            else:
+                                c_fn = f"backest/stage1_{data_name_dir_temp}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl"
 
-            if has_long and has_short:
-                _log("多空缓存均已存在, 连信号计算一起跳过", 1)
-                task_done += 2
+                            if not os.path.exists(c_fn):
+                                all_caches_exist = False
+                                break
+                        if not all_caches_exist: break
+                    if not all_caches_exist: break
+                if not all_caches_exist: break
+
+            if all_caches_exist:
+                _log("多空所有参数组合缓存均已存在, 连信号计算一起跳过", 1)
+                task_done += combinations_per_strat
                 continue
 
             # ---- 信号计算: copy(deep=False) 共享底层数据块, 省掉一份整表拷贝 ----
@@ -1828,7 +1859,7 @@ if __name__ == "__main__":
             # --- 增加剪枝：如果信号率超过 50%，直接跳过策略回测 ---
             if signal_rate > 50.0:
                 _log("提示: 信号率超过 50%%，该策略极大概率表现不佳或失效，直接跳过", 1)
-                task_done += 2
+                task_done += combinations_per_strat
                 del signal_np
                 continue
             elif n_sig == 0:
@@ -1836,39 +1867,69 @@ if __name__ == "__main__":
 
             # Stage 1 只需要 open_time/high/low/close + 信号列。
             # 这里直接把信号列临时挂到 df_main 上(用完即 drop), 彻底避免再复制一份 K 线。
-            for tag, sig_col, cache_fn, exists in (
-                    ("做多", "long_signal", cache_filename_long, has_long),
-                    ("做空", "short_signal", cache_filename_short, has_short)):
-                task_done += 1
-                if exists:
-                    _log("> [%s] 缓存已存在, 跳过运算: %s" % (tag, cache_fn), 1)
-                    continue
+            for tag, sig_col, data_name_dir, is_short in (
+                    ("做多", "long_signal", data_name_long, False),
+                    ("做空", "short_signal", data_name_short, True)):
 
-                # 清理上一轮残留信号列(run_stage1 对不存在的列视作"无信号", 无需 zeros 数组)
+                # 清理上一轮残留信号列
                 _drop = [c for c in ("long_signal", "short_signal") if c in df_main.columns]
                 if _drop:
                     df_main.drop(columns=_drop, inplace=True)
+
+                # 为当前方向挂载信号
                 df_main[sig_col] = signal_np
 
-                _log("> [%s] 开始运行 Stage 1 ... (全局任务 %d/%d)" % (tag, task_done, total_task), 1)
-                t1 = time.time()
-                cycles_tmp = run_stage1(df_main, log_interval_sec=15.0, verbose=True)
-                _log("> [%s] Stage 1 结束, 耗时 %s, 开始写盘 ..." % (tag, _fmt_hms(time.time() - t1)), 1)
+                for add_step_val in search_add_steps:
+                    for tp_step_val in search_tp_steps:
+                        for mult_val in search_mults:
+                            task_done += 1
 
-                t2 = time.time()
-                with open(cache_fn, 'wb') as f:
-                    pickle.dump({'df': cycles_tmp, 'attrs': dict(cycles_tmp.attrs)}, f,
-                                protocol=pickle.HIGHEST_PROTOCOL)
-                _log("> [%s] 一阶段已保存: %s (%.1f MB, 写盘 %.1fs)"
-                     % (tag, cache_fn, os.path.getsize(cache_fn) / 1048576.0, time.time() - t2), 1)
+                            if is_short:
+                                cache_fn = os.path.join(short_dir,
+                                                        f"stage1_{data_name_dir}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl")
+                            else:
+                                cache_fn = f"backest/stage1_{data_name_dir}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl"
 
-                del cycles_tmp
+                            if os.path.exists(cache_fn):
+                                _log("> [%s|a%g|t%g|m%g] 缓存已存在, 跳过运算: %s" % (
+                                tag, add_step_val, tp_step_val, mult_val, cache_fn), 1)
+                                continue
+
+                            _log("> [%s|a%g|t%g|m%g] 开始运行 Stage 1 ... (全局任务 %d/%d)" % (
+                            tag, add_step_val, tp_step_val, mult_val, task_done, total_task), 1)
+                            t1 = time.time()
+
+                            # 传入对应组合参数覆盖默认值
+                            cycles_tmp = run_stage1(
+                                df_main,
+                                fee_rate=DEFAULT_FEE,
+                                add_step=add_step_val,
+                                tp_step=tp_step_val,
+                                multiplier=mult_val,
+                                log_interval_sec=15.0,
+                                verbose=True
+                            )
+                            _log("> [%s|a%g|t%g|m%g] Stage 1 结束, 耗时 %s, 开始写盘 ..." % (
+                            tag, add_step_val, tp_step_val, mult_val, _fmt_hms(time.time() - t1)), 1)
+
+                            t2 = time.time()
+                            with open(cache_fn, 'wb') as f:
+                                pickle.dump({'df': cycles_tmp, 'attrs': dict(cycles_tmp.attrs)}, f,
+                                            protocol=pickle.HIGHEST_PROTOCOL)
+                            _log("> [%s|a%g|t%g|m%g] 一阶段已保存: %s (%.1f MB, 写盘 %.1fs)"
+                                 % (tag, add_step_val, tp_step_val, mult_val, cache_fn,
+                                    os.path.getsize(cache_fn) / 1048576.0, time.time() - t2), 1)
+
+                            del cycles_tmp
+                            gc.collect()
+                            _log("> [%s|a%g|t%g|m%g] 内存已回收 | 全局进度 %d/%d | 累计耗时 %s"
+                                 % (tag, add_step_val, tp_step_val, mult_val, task_done, total_task,
+                                    _fmt_hms(time.time() - t_all)), 1)
+
+                # 当前方向处理完毕后清理挂载的信号列
                 _drop = [c for c in ("long_signal", "short_signal") if c in df_main.columns]
                 if _drop:
                     df_main.drop(columns=_drop, inplace=True)
-                gc.collect()
-                _log("> [%s] 内存已回收 | 全局进度 %d/%d | 累计耗时 %s"
-                     % (tag, task_done, total_task, _fmt_hms(time.time() - t_all)), 1)
 
             del signal_np
             gc.collect()
@@ -1878,5 +1939,5 @@ if __name__ == "__main__":
         _log("%s 全部策略处理完毕, 已释放该币种 K 线内存" % symbol, 1)
 
     _log("=" * 78)
-    _log("所有币种(6个) x 策略(16个) x 多/空(2种) = %d 份一阶段文件已处理完毕! 总耗时 %s"
-         % (total_task, _fmt_hms(time.time() - t_all)))
+    _log("所有币种(%d个) x 策略(%d个) x 多空(2种) x 参数组合(%d组) = %d 份一阶段文件已处理完毕! 总耗时 %s"
+         % (len(symbols), len(strategies), combinations_per_strat // 2, total_task, _fmt_hms(time.time() - t_all)))

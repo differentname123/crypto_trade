@@ -145,7 +145,7 @@ def _shrink_dtypes(df):
     return df
 
 
-def _build_row(symbol, strategy_name, direction, report):
+def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult):
     holding_time = report.get("avg_holding_hour_traded", 0.0)
     expected_lifespan_hour = report.get("expected_lifespan_hour", np.inf)
     free_ride_win_rate = report.get("free_ride_win_rate", np.nan)
@@ -157,6 +157,9 @@ def _build_row(symbol, strategy_name, direction, report):
         "币种": symbol,
         "策略": strategy_name,
         "方向": direction,
+        "加仓间距": add_step,
+        "止盈间距": tp_step,
+        "加仓倍数": mult,
         "总信号数": n_cycles_total,
         "实际开仓数": report.get("n_trades", 0),
         "胜率(%)": round(report.get("win_rate", 0) * 100, 2) if pd.notnull(report.get("win_rate")) else 0.0,
@@ -191,6 +194,12 @@ def _process_one_file(file_path):
     cached_data.clear()
     del cached_data
     cycles_df.attrs = attrs
+
+    # 提取参数空间的具体参数
+    add_step = attrs.get("add_step", 0.002)
+    tp_step = attrs.get("tp_step", 0.003)
+    mult = attrs.get("multiplier", 2.0)
+
     gc.collect()
 
     if len(cycles_df) == 0:
@@ -212,7 +221,7 @@ def _process_one_file(file_path):
         trades_df = replayer.run(margin)
         report = evaluate_free_ride(trades_df, cycles_df, margin)
         del trades_df
-        rows_by_margin[margin] = _build_row(symbol, strategy_name, direction, report)
+        rows_by_margin[margin] = _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult)
         del report
         gc.collect()
 
@@ -330,7 +339,8 @@ def analyze_all_strategies():
     df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
     print(f"已将过滤后的结果保存至: {output_csv}")
 
-    display_cols = ["Margin", "币种", "方向", "实际开仓数", "胜率(%)", "爆仓次数",
+    # 将新提取的参数插入到展示列里
+    display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
                     "爆仓几率(%)", "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
                     "净利润(Margin倍数)"]
 
@@ -350,13 +360,14 @@ def analyze_all_strategies():
 
     def format_val(val):
         if isinstance(val, (float, np.float32, np.float64)):
-            return f"{val:.2f}"
+            return f"{val:.3f}" if val < 0.1 and val > 0 else f"{val:.2f}"
         return str(val)
 
     for strategy_name, df_strat in df_all.groupby("策略"):
         print(f"\n🏆 策略 = {strategy_name} | 多币种 & 不同 Margin 综合表现:")
 
-        df_display = df_strat.sort_values(by=["币种", "Margin"]).copy()
+        # 新增根据寻优参数进行排序
+        df_display = df_strat.sort_values(by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]).copy()
         df_display = df_display[display_cols]
 
         df_display.rename(columns={
