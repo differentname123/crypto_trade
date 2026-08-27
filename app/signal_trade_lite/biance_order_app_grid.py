@@ -950,27 +950,30 @@ def cancel_all_orders_for_symbol(exchange, symbol):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
-    current_symbol = "20260822"
+    current_symbol = "20260828"
     # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
     configs = [
 
         GridConfig(
             strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
-            min_price=2.5, max_price=8.25, price_ratio=1.3, quantity=12,
-        ),  # 消耗  1157  u 网格数量 92
+            min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
+        ),  # 消耗  1217  u 网格数量 95
+
+        GridConfig(
+            strategy_id=f"PYTH{current_symbol}", symbol="PYTH/USDT:USDT",
+            min_price=0.025, max_price=0.0573, price_ratio=1.8, quantity=1600,
+        ),  # 消耗  1191  u 网格数量 46
+
         GridConfig(
             strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
-            min_price=50000, max_price=82363, price_ratio=0.73, quantity=0.001,
-        ),  # 消耗  1194  u 网格数量 68
-
-        GridConfig(
-            strategy_id=f"SOL{current_symbol}", symbol="SOL/USDT:USDT",
-            min_price=25, max_price=103, price_ratio=1.2, quantity=1,
-        ),  # 消耗  1147  u 网格数量 118
+            min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
+        ),  # 消耗  1240  u 网格数量 67
 
 
 
-        # 总共节点和为 68 + 118 + 92 = 278 个节点，消耗资金约为 1157 + 1194 + 1147 = 3498 u
+
+
+        # 总共节点和为 95 + 46 + 67 = 208 个节点，消耗资金为 1217 + 1191 + 1240 = 3648 u
     ]
     processes = []
     for config in configs:
