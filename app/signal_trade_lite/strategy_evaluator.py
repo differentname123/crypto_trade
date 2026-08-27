@@ -28,6 +28,13 @@ SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 # 回测测试用的保证金深度 (Margin) 列表
 TEST_MARGINS = [2.55, 10.0]
 
+# === 新增：打印过滤与并行处理参数 ===
+# 最终打印时，过滤掉预期存活(天)小于此数值的结果
+MIN_LIFESPAN_DAYS = 30
+
+# 使用并行的加载，加快速度，并行度配置
+PARALLEL_WORKERS = 10
+
 # === 新增：需要被评估和展示的目标策略白名单（加上字符串引号） ===
 TARGET_STRATEGIES = [
     "strategy_1_vwap_zscore",
@@ -232,9 +239,10 @@ def _process_one_file(file_path):
 
 def _process_one_file_safe(file_path):
     try:
-        return {"ok": True, "rows": _process_one_file(file_path)}
+        # 新增将 file_path 原样带出，方便后续日志打印寻找文件名
+        return {"ok": True, "file_path": file_path, "rows": _process_one_file(file_path)}
     except BaseException as e:
-        return {"ok": False, "err": f"{type(e).__name__}: {e}"}
+        return {"ok": False, "file_path": file_path, "err": f"{type(e).__name__}: {e}"}
 
 
 def analyze_all_strategies():
@@ -270,7 +278,7 @@ def analyze_all_strategies():
         print(f"[提示] 未找到匹配目标列表 TARGET_STRATEGIES 的任何文件，请检查命名。")
         return
 
-    mode_desc = "单进程子进程池隔离 + dtype 瘦身" if USE_SUBPROCESS else "主进程 + dtype 瘦身"
+    mode_desc = f"子进程池隔离(并行度={PARALLEL_WORKERS}) + dtype 瘦身" if USE_SUBPROCESS else "主进程 + dtype 瘦身"
     print(f"共匹配到 {len(pkl_files)} 个属于目标列表的缓存文件，开启低内存模式({mode_desc})...\n")
 
     results_by_margin = {m: [] for m in TEST_MARGINS}
@@ -280,32 +288,30 @@ def analyze_all_strategies():
     if use_subprocess:
         try:
             ctx = mp.get_context("spawn")
-            pool = ctx.Pool(processes=1, maxtasksperchild=1)
+            # 这里的进程数改为使用刚刚在最上方定义的全局配置 PARALLEL_WORKERS
+            pool = ctx.Pool(processes=PARALLEL_WORKERS, maxtasksperchild=1)
         except Exception as e:
             print(f"[警告] 子进程池初始化失败，自动切换为主进程内处理...")
             use_subprocess = False
 
-    for idx, file_path in enumerate(pkl_files, 1):
+    # 根据配置，生成任务结果的迭代器（imap_unordered 用于高效并发加载，不会阻塞单一慢任务）
+    if use_subprocess:
+        results_iter = pool.imap_unordered(_process_one_file_safe, pkl_files)
+    else:
+        results_iter = map(_process_one_file_safe, pkl_files)
+
+    for idx, result in enumerate(results_iter, 1):
+        file_path = result.get("file_path", "Unknown")
         filename = os.path.basename(file_path)
-        result = None
 
-        try:
-            if use_subprocess:
-                result = pool.apply(_process_one_file_safe, args=(file_path,))
-            else:
-                result = _process_one_file_safe(file_path)
-        except Exception as e:
-            print(f"[警告] 处理失败，已跳过: {filename} | {type(e).__name__}: {e}")
-
-        if result is not None:
-            if result.get("ok"):
-                rows = result.get("rows") or {}
-                for margin in TEST_MARGINS:
-                    row = rows.get(margin)
-                    if row is not None:
-                        results_by_margin[margin].append(row)
-            else:
-                print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
+        if result.get("ok"):
+            rows = result.get("rows") or {}
+            for margin in TEST_MARGINS:
+                row = rows.get(margin)
+                if row is not None:
+                    results_by_margin[margin].append(row)
+        else:
+            print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
 
         gc.collect()
 
@@ -368,6 +374,23 @@ def analyze_all_strategies():
 
         # 新增根据寻优参数进行排序
         df_display = df_strat.sort_values(by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]).copy()
+
+        # === 新增：过滤预期存活天数 < MIN_LIFESPAN_DAYS 的记录 ===
+        def check_lifespan(val):
+            # 处理字符串 "999 (未爆仓)" 等情况
+            if isinstance(val, str) and "未爆仓" in val:
+                return True
+            try:
+                return float(val) >= MIN_LIFESPAN_DAYS
+            except:
+                return True
+
+        df_display = df_display[df_display["预期存活(天)"].apply(check_lifespan)]
+
+        if df_display.empty:
+            print(f"  [提示] 该策略所有结果的预期存活均小于 {MIN_LIFESPAN_DAYS} 天，已过滤隐藏。")
+            continue
+
         df_display = df_display[display_cols]
 
         df_display.rename(columns={
