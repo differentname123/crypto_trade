@@ -387,6 +387,123 @@ def strategy_16_clock_aligned_anomaly(df):
     return df
 
 
+
+def strategy_17_sniper_combo_long(df):
+    """
+    ======================================================================
+    Strategy 17: 马丁狙击手 - 专属做多 (Long Only)
+    逻辑：震荡环境过滤 + 右侧衰竭触发 (超卖 VWAP 缩量 + 假跌破支撑)
+    ======================================================================
+    """
+    is_green = df['close'] > df['open']
+
+    # ---------------------------------------------------------
+    # 第一层：环境过滤器 (决定当前是否是适合马丁的震荡环境)
+    # ---------------------------------------------------------
+    # A. KER 效率比过滤 (300秒)
+    window_er = 300
+    direction = np.abs(df['close'] - df['close'].shift(window_er))
+    volatility = np.abs(df['close'] - df['close'].shift(1)).rolling(window=window_er, min_periods=1).sum()
+    ker = direction / (volatility + 1e-8)
+
+    spread = df['high'] - df['low']
+    mean_spread = spread.rolling(window=window_er, min_periods=1).mean()
+    cond_a = (ker < 0.05) & (spread > mean_spread * 0.5)
+
+    # B. 微观自相关性 (60秒)
+    window_auto = 60
+    ret = df['close'].pct_change()
+    autocorr = ret.rolling(window=window_auto, min_periods=2).corr(ret.shift(1)).fillna(0)
+    cond_b = autocorr < -0.2
+
+    global_filter = cond_a & cond_b
+
+    # ---------------------------------------------------------
+    # 第二层：做多触发器 (寻找左侧极值后的右侧反转)
+    # ---------------------------------------------------------
+    # 触发器 1: VWAP 极度向下偏离 + 缩量 + 收阳
+    window_vwap = 1800
+    cv_sum = (df['close'] * df['volume']).rolling(window=window_vwap, min_periods=1).sum()
+    v_sum = df['volume'].rolling(window=window_vwap, min_periods=1).sum()
+    vwap = cv_sum / (v_sum + 1e-8)
+
+    dev = (df['close'] - vwap) / (vwap + 1e-8)
+    mean_dev = dev.rolling(window=window_vwap, min_periods=1).mean()
+    std_dev = dev.rolling(window=window_vwap, min_periods=1).std()
+    z_score = (dev - mean_dev) / (std_dev + 1e-8)
+
+    vol_mean = df['volume'].rolling(window=300, min_periods=1).mean()
+    vol_exhausted = df['volume'] < (vol_mean * 0.5)
+
+    trigger_1 = (z_score < -3.5) & vol_exhausted & is_green
+
+    # 触发器 2: 1小时级别向下假突破 (跌破前低后瞬间拉回)
+    window_ht = 3600
+    support_1h = df['low'].shift(2).rolling(window=window_ht, min_periods=1).min()
+    trigger_2 = (df['low'].shift(1) < support_1h) & (df['close'] > support_1h) & is_green
+
+    # 生成最终信号
+    df['signal'] = global_filter & (trigger_1 | trigger_2)
+    return df
+
+
+def strategy_18_sniper_combo_short(df):
+    """
+    ======================================================================
+    Strategy 18: 马丁狙击手 - 专属做空 (Short Only)
+    逻辑：震荡环境过滤 + 右侧衰竭触发 (超买 VWAP 缩量 + 假突破阻力)
+    ======================================================================
+    """
+    is_red = df['close'] < df['open']
+
+    # ---------------------------------------------------------
+    # 第一层：环境过滤器 (与做多保持一致，要求无方向震荡)
+    # ---------------------------------------------------------
+    window_er = 300
+    direction = np.abs(df['close'] - df['close'].shift(window_er))
+    volatility = np.abs(df['close'] - df['close'].shift(1)).rolling(window=window_er, min_periods=1).sum()
+    ker = direction / (volatility + 1e-8)
+
+    spread = df['high'] - df['low']
+    mean_spread = spread.rolling(window=window_er, min_periods=1).mean()
+    cond_a = (ker < 0.05) & (spread > mean_spread * 0.5)
+
+    window_auto = 60
+    ret = df['close'].pct_change()
+    autocorr = ret.rolling(window=window_auto, min_periods=2).corr(ret.shift(1)).fillna(0)
+    cond_b = autocorr < -0.2
+
+    global_filter = cond_a & cond_b
+
+    # ---------------------------------------------------------
+    # 第二层：做空触发器 (寻找左侧极值后的右侧反转)
+    # ---------------------------------------------------------
+    # 触发器 1: VWAP 极度向上偏离 + 缩量 + 收阴
+    window_vwap = 1800
+    cv_sum = (df['close'] * df['volume']).rolling(window=window_vwap, min_periods=1).sum()
+    v_sum = df['volume'].rolling(window=window_vwap, min_periods=1).sum()
+    vwap = cv_sum / (v_sum + 1e-8)
+
+    dev = (df['close'] - vwap) / (vwap + 1e-8)
+    mean_dev = dev.rolling(window=window_vwap, min_periods=1).mean()
+    std_dev = dev.rolling(window=window_vwap, min_periods=1).std()
+    z_score = (dev - mean_dev) / (std_dev + 1e-8)
+
+    vol_mean = df['volume'].rolling(window=300, min_periods=1).mean()
+    vol_exhausted = df['volume'] < (vol_mean * 0.5)
+
+    trigger_1 = (z_score > 3.5) & vol_exhausted & is_red
+
+    # 触发器 2: 1小时级别向上假突破 (突破前高后瞬间砸回)
+    window_ht = 3600
+    resist_1h = df['high'].shift(2).rolling(window=window_ht, min_periods=1).max()
+    trigger_2 = (df['high'].shift(1) > resist_1h) & (df['close'] < resist_1h) & is_red
+
+    # 生成最终信号
+    df['signal'] = global_filter & (trigger_1 | trigger_2)
+    return df
+
+
 # =====================================================================
 # 0. 纯数学马丁阶梯表 (与行情无关, 用于选 Margin / 反推死亡层数)
 # =====================================================================
@@ -1452,7 +1569,9 @@ if __name__ == "__main__":
         strategy_13_run_length_streaks,
         strategy_14_volatility_squeeze_expansion,
         strategy_15_micro_autocorrelation,
-        strategy_16_clock_aligned_anomaly
+        strategy_16_clock_aligned_anomaly,
+        strategy_17_sniper_combo_long,
+        strategy_18_sniper_combo_short
     ]
 
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
