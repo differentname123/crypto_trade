@@ -233,63 +233,51 @@ def _fmt_hms(sec):
 
 def strategy_1_vwap_zscore(df):
     """
-    1. 微观 VWAP 偏离度 (VWAP Z-Score)
-    参数: 1分钟(60秒)计算VWAP, 5分钟(300秒)计算Z-Score
-    信号: 偏离度超过2个标准差
+    调整时间窗口，并将 Z-Score 阈值从 2.0 提高到 4.0。
+    由于 1s 级别数据分布具有尖峰胖尾特征，Z-score=2 触发较为频繁，设定 >4.0 以更准确地捕捉异常偏离信号。
     """
-    vwap_window = 60
-    z_window = 300
+    vwap_window = 300  # 5分钟
+    z_window = 1800  # 30分钟
 
     cv_sum = (df['close'] * df['volume']).rolling(window=vwap_window, min_periods=1).sum()
     v_sum = df['volume'].rolling(window=vwap_window, min_periods=1).sum()
     vwap = cv_sum / (v_sum + 1e-8)
-
     deviation = (df['close'] - vwap) / (vwap + 1e-8)
 
     mean_dev = deviation.rolling(window=z_window, min_periods=1).mean()
     std_dev = deviation.rolling(window=z_window, min_periods=1).std()
     z_score = (deviation - mean_dev) / (std_dev + 1e-8)
 
-    # Z-Score绝对值大于2.0触发信号
-    df['signal'] = np.abs(z_score) > 2.0
+    df['signal'] = np.abs(z_score) > 4.0  # 严格偏离阈值
     return df
 
 
 def strategy_2_quantile_deviation(df):
     """
-    2. 稳健分位数偏离 (Quantile Deviation)
-    参数: 过去5分钟(300秒)的价格分布
-    信号: 当前价格突破了99%或1%的分位数
+    要求价格不仅处于 99.9% 的极端分位数位置，还需向外刺穿至少 0.2%，以防止价格贴轨运行导致的连续误触发。
     """
-    window = 300
+    window = 3600
+    q_high = df['close'].rolling(window=window, min_periods=1).quantile(0.999)
+    q_low = df['close'].rolling(window=window, min_periods=1).quantile(0.001)
 
-    q_high = df['close'].rolling(window=window, min_periods=1).quantile(0.99)
-    q_low = df['close'].rolling(window=window, min_periods=1).quantile(0.01)
-
-    # 向上突破极高值 或 向下突破极低值
-    df['signal'] = (df['close'] > q_high) | (df['close'] < q_low)
+    # 向外刺穿千分之二
+    df['signal'] = (df['close'] > q_high * 1.002) | (df['close'] < q_low * 0.998)
     return df
 
 
 def strategy_3_periodic_open_deviation(df):
     """
-    3. 自然周期开盘价偏离 (Periodic Open Deviation)
-    参数: 1分钟周期的开盘价，偏离阈值设为0.15% (加密市场1s内千分之1.5算剧烈偏离)
+    提升偏离阈值设定，从 0.005 提高至 0.008。
+    将 5 分钟周期内开盘价偏离 0.8% 作为日内局部大幅波动的判定标准。
     """
-    threshold = 0.0015
-
-    # 将时间戳转换为datetime，提取每分钟的起始
+    threshold = 0.008
     time_series = pd.to_datetime(df['open_time'], unit='ms')
-    minute_blocks = time_series.dt.floor('1min')
-
-    # 获取当前所在1分钟周期的开盘价 (利用groupby的first)
+    minute_blocks = time_series.dt.floor('5min')
     period_open = df.groupby(minute_blocks)['open'].transform('first')
 
     deviation = np.abs(df['close'] - period_open) / (period_open + 1e-8)
-
     df['signal'] = deviation > threshold
     return df
-
 
 # ---------------------------------------------------------
 # 维度二：量价微观结构类（透视“订单簿博弈”）
@@ -297,11 +285,10 @@ def strategy_3_periodic_open_deviation(df):
 
 def strategy_4_volume_price_absorption(df):
     """
-    4. 量价吸收/滞涨滞跌 (Volume-Price Absorption)
-    参数: 过去1分钟(60秒)成交量，Z-Score > 2.5 (天量)，实体占比 < 0.2 (价格没动)
+    增加成交量极端值要求（Z > 4），且限制 K 线实体比例较小（< 0.1）。
+    主要用于过滤常规小级别震荡，识别显著放量但价格波动受限的阻力区间。
     """
-    window = 60
-
+    window = 300  # 5分钟窗口算均量
     vol_mean = df['volume'].rolling(window=window, min_periods=1).mean()
     vol_std = df['volume'].rolling(window=window, min_periods=1).std()
     vol_zscore = (df['volume'] - vol_mean) / (vol_std + 1e-8)
@@ -310,41 +297,34 @@ def strategy_4_volume_price_absorption(df):
     spread = df['high'] - df['low']
     body_ratio = body / (spread + 1e-8)
 
-    df['signal'] = (vol_zscore > 2.5) & (body_ratio < 0.2)
+    df['signal'] = (vol_zscore > 4.0) & (body_ratio < 0.1) & (spread > df['close'] * 0.0005)  # 增加绝对波动过滤，避免低波期触发
     return df
 
 
 def strategy_5_liquidity_vacuum(df):
     """
-    5. 缩量真空滑行 (Liquidity Vacuum)
-    参数: 过去15秒净位移 / 过去15秒总成交量，当这个“虚假滑行”效率处于过去5分钟的95%分位时触发
+    分位数阈值从 95% 提高到 99.9%，重点提取显著的流动性真空和价格急剧波动事件。
     """
     window = 15
-    eval_window = 300
-
+    eval_window = 1800  # 评估窗口设定为30分钟
     net_price_move = np.abs(df['close'] - df['close'].shift(window))
     total_volume = df['volume'].rolling(window=window, min_periods=1).sum()
 
     vacuum_ratio = net_price_move / (total_volume + 1e-8)
+    q999 = vacuum_ratio.rolling(window=eval_window, min_periods=1).quantile(0.999)
 
-    # 判断当前的真空比例是否处于极端水平
-    q95 = vacuum_ratio.rolling(window=eval_window, min_periods=1).quantile(0.95)
-
-    df['signal'] = vacuum_ratio > q95
+    df['signal'] = vacuum_ratio > q999
     return df
 
 
 def strategy_6_volume_climax(df):
     """
-    6. 巨量高潮极值 (Volume Climax)
-    参数: 过去5分钟(300秒)统计，当前1s成交量突破99.5%分位，且单根振幅也突破99.5%分位
+    评估窗口设定为 1 小时，提取小时级别的 99.9% 极值信号。
     """
-    window = 300
-
-    vol_q = df['volume'].rolling(window=window, min_periods=1).quantile(0.995)
-
+    window = 3600
+    vol_q = df['volume'].rolling(window=window, min_periods=1).quantile(0.999)
     spread = df['high'] - df['low']
-    spread_q = spread.rolling(window=window, min_periods=1).quantile(0.995)
+    spread_q = spread.rolling(window=window, min_periods=1).quantile(0.999)
 
     df['signal'] = (df['volume'] > vol_q) & (spread > spread_q)
     return df
@@ -352,32 +332,24 @@ def strategy_6_volume_climax(df):
 
 def strategy_7_proxy_cvd_divergence(df):
     """
-    7. 近似量价背离 (Proxy CVD Divergence)
-    参数: 过去1分钟(60秒)。价格创60秒新高，但CVD未创新高（或相反）
+    要求价格形成有效突破（> 0.1%），同时伴随 CVD 明显衰竭（不足历史峰值的 20%）。
     """
-    window = 60
-
-    # 伪CVD：阳线成交量为正，阴线为负
+    window = 300
     sign = np.where(df['close'] >= df['open'], 1, -1)
     pseudo_vol = df['volume'] * sign
     cvd_window = pseudo_vol.rolling(window=window, min_periods=1).sum()
 
-    # 价格创N秒新高/新低
     highest_close = df['close'].rolling(window=window, min_periods=1).max()
     lowest_close = df['close'].rolling(window=window, min_periods=1).min()
-
-    # CVD创N秒新高/新低
     highest_cvd = cvd_window.rolling(window=window, min_periods=1).max()
     lowest_cvd = cvd_window.rolling(window=window, min_periods=1).min()
 
-    # 顶背离：价格平齐或新高，但CVD没跟上极值
-    bearish_div = (df['close'] == highest_close) & (cvd_window < highest_cvd)
-    # 底背离：价格平齐或新低，但CVD没跟上极低
-    bullish_div = (df['close'] == lowest_close) & (cvd_window > lowest_cvd)
+    # 价格突破前高至少千分之1，且累计资金量不足前期高点的20%（量价背离）
+    bearish_div = (df['close'] > highest_close.shift(1) * 1.001) & (cvd_window < highest_cvd.shift(1) * 0.2)
+    bullish_div = (df['close'] < lowest_close.shift(1) * 0.999) & (cvd_window > lowest_cvd.shift(1) * 0.2)
 
     df['signal'] = bearish_div | bullish_div
     return df
-
 
 # ---------------------------------------------------------
 # 维度三：微观形态与猎杀类（捕捉“假突破”）
@@ -385,19 +357,14 @@ def strategy_7_proxy_cvd_divergence(df):
 
 def strategy_8_rolling_stop_hunt(df):
     """
-    8. 滚动极值假突破 (Rolling Stop Hunt)
-    参数: 过去1分钟(60秒)高低点。瞬间刺穿前高/前低，但收盘收回。
+    考察过去 15 分钟 (900 秒) 的极值作为流动性测试的参考基准，并要求具备一定幅度的价格回抽。
     """
-    window = 60
-
-    # 使用 shift(1) 避免把当前这根K线算作前高
+    window = 900
     prev_high = df['high'].shift(1).rolling(window=window, min_periods=1).max()
     prev_low = df['low'].shift(1).rolling(window=window, min_periods=1).min()
 
-    # 向上假突破：最高价刺穿前高，但收盘价低于前高
-    hunt_up = (df['high'] > prev_high) & (df['close'] < prev_high)
-    # 向下假突破：最低价刺穿前低，但收盘价高于前低
-    hunt_down = (df['low'] < prev_low) & (df['close'] > prev_low)
+    hunt_up = (df['high'] > prev_high) & (df['close'] < prev_high) & (df['high'] > df['close'] * 1.002)  # 设定最小刺穿幅度
+    hunt_down = (df['low'] < prev_low) & (df['close'] > prev_low) & (df['low'] < df['close'] * 0.998)
 
     df['signal'] = hunt_up | hunt_down
     return df
@@ -405,39 +372,33 @@ def strategy_8_rolling_stop_hunt(df):
 
 def strategy_9_wick_rejection_ratio(df):
     """
-    9. 极端影线拒绝度 (Wick Rejection Ratio)
-    参数: 影线占比 > 0.75。需过滤掉价格几乎没动的死水行情（振幅需大于过去60秒均值）
+    影线比例阈值设定为 0.85，且绝对振幅需大于均值的 3 倍，以确认显著的长影线形态。
     """
-    window = 60
-    threshold = 0.75
-
+    window = 300
+    threshold = 0.85
     spread = df['high'] - df['low']
     spread_mean = spread.rolling(window=window, min_periods=1).mean()
 
     upper_wick = df['high'] - np.maximum(df['open'], df['close'])
     lower_wick = np.minimum(df['open'], df['close']) - df['low']
-
     upper_ratio = upper_wick / (spread + 1e-8)
     lower_ratio = lower_wick / (spread + 1e-8)
 
-    # 有效拒接：单侧影线占比极高，且该K线并非一潭死水
-    df['signal'] = ((upper_ratio > threshold) | (lower_ratio > threshold)) & (spread > spread_mean)
+    df['signal'] = ((upper_ratio > threshold) | (lower_ratio > threshold)) & (spread > spread_mean * 3.0)
     return df
 
 
 def strategy_10_close_position_bias(df):
     """
-    10. 极端收盘位置 (Close Position Bias)
-    参数: 连续2根K线收盘位置极值(>0.8 或 <0.2)，随后当前这根发生逆转
+    增加绝对波动过滤，确保在价格具有一定真实波动率的前提下才触发形态信号。
     """
     spread = df['high'] - df['low']
     pos = (df['close'] - df['low']) / (spread + 1e-8)
 
-    # 前两秒收盘都在绝对高位，这秒突然收在绝对低位 (微观多头破位)
-    long_trap = (pos.shift(2) > 0.8) & (pos.shift(1) > 0.8) & (pos < 0.2)
-
-    # 前两秒收盘都在绝对低位，这秒突然收在绝对高位 (微观空头破位)
-    short_trap = (pos.shift(2) < 0.2) & (pos.shift(1) < 0.2) & (pos > 0.8)
+    # 要求位置指标达到极值，且当前K线具有较大波动
+    large_candle = spread > df['close'] * 0.001
+    long_trap = (pos.shift(2) > 0.9) & (pos.shift(1) > 0.9) & (pos < 0.1) & large_candle
+    short_trap = (pos.shift(2) < 0.1) & (pos.shift(1) < 0.1) & (pos > 0.9) & large_candle
 
     df['signal'] = long_trap | short_trap
     return df
@@ -445,13 +406,10 @@ def strategy_10_close_position_bias(df):
 
 def strategy_11_tick_gap_reversion(df):
     """
-    11. 秒级跳空断层 (Tick Gap Reversion)
-    参数: 1s跳空幅度大于万分之1 (对于1s级别，0.0001 的价格断裂已属流动性瞬间衰竭)
+    跳空阈值设定为千分之 1.5 (0.15%)，以过滤 1s 级别的高频常态跳空，锁定较显著的价格断层。
     """
-    threshold = 0.0001
-
+    threshold = 0.0015
     gap = np.abs(df['open'] - df['close'].shift(1)) / (df['close'].shift(1) + 1e-8)
-
     df['signal'] = gap > threshold
     return df
 
@@ -462,72 +420,66 @@ def strategy_11_tick_gap_reversion(df):
 
 def strategy_12_kaufman_efficiency_ratio(df):
     """
-    12. 路径效率比 (Kaufman Efficiency Ratio - ER)
-    参数: N=30秒。ER < 0.15 代表极度无序震荡（马丁吃肉开仓区）
+    增加绝对波动过滤，重点识别成交活跃且波动加剧条件下的低效率比率 (ER) 环境，过滤低波动平缓期的低 ER。
     """
-    window = 30
-    threshold = 0.15
+    window = 300
+    threshold = 0.02
 
     direction = np.abs(df['close'] - df['close'].shift(window))
     volatility = np.abs(df['close'] - df['close'].shift(1)).rolling(window=window, min_periods=1).sum()
-
     er = direction / (volatility + 1e-8)
 
-    # 这里我们只取无序震荡作为信号（ER低），因为这是马丁策略的天然温床
-    df['signal'] = er < threshold
-    return df
+    # 附加条件：过去 5 分钟的总波动路径需达到过去 1 小时平均值的 2 倍以上
+    vol_mean = volatility.rolling(window=3600, min_periods=1).mean()
 
+    df['signal'] = (er < threshold) & (volatility > vol_mean * 2.0)
+    return df
 
 def strategy_13_run_length_streaks(df):
     """
-    13. 连续单边极值 (Run-Length / Streaks)
-    参数: 连续 7 秒同向（收阳或收阴），作为概率极端的反转搏杀点
+    连续 K 线要求提高至 10 根，并增加累计涨跌幅需大于 0.3% 的条件，以过滤微幅的连续波动。
     """
-    streak_threshold = 7
+    streak_threshold = 10
 
-    # 连续收阳
     is_up = (df['close'] > df['open']).astype(int)
     up_streak = is_up.rolling(window=streak_threshold).sum()
+    ret_up = (df['close'] - df['close'].shift(streak_threshold)) / df['close'].shift(streak_threshold)
 
-    # 连续收阴
     is_down = (df['close'] < df['open']).astype(int)
     down_streak = is_down.rolling(window=streak_threshold).sum()
+    ret_down = (df['close'].shift(streak_threshold) - df['close']) / df['close'].shift(streak_threshold)
 
-    df['signal'] = (up_streak == streak_threshold) | (down_streak == streak_threshold)
+    df['signal'] = ((up_streak == streak_threshold) & (ret_up > 0.003)) | \
+                   ((down_streak == streak_threshold) & (ret_down > 0.003))
     return df
 
 
 def strategy_14_volatility_squeeze_expansion(df):
     """
-    14. 波幅挤压/扩张率 (Volatility Squeeze/Expansion)
-    参数: 当前振幅达到过去2分钟(120秒)中位数的 5 倍（暴走） 或 低于 0.1倍（死水）
+    移除低波动前置条件，避免因中位数振幅极小导致信号频繁误触。
+    仅保留波动爆发判定，并将爆发倍数阈值调整至 10 倍。
     """
-    window = 120
-
+    window = 300
     spread = df['high'] - df['low']
     median_spread = spread.rolling(window=window, min_periods=1).median()
 
-    ratio = spread / (median_spread + 1e-8)
+    # 剔除中位数为0导致的除以0错误，要求基准中位数具备合理的下限
+    median_spread = np.where(median_spread < df['close'] * 0.0001, df['close'] * 0.0001, median_spread)
+    ratio = spread / median_spread
 
-    df['signal'] = (ratio > 5.0) | (ratio < 0.1)
+    df['signal'] = ratio > 10.0  # 针对显著波动爆发情况提取信号
     return df
 
 
 def strategy_15_micro_autocorrelation(df):
     """
-    15. 微观收益率自相关性 (Micro Autocorrelation)
-    参数: 过去60秒 1s收益率的一阶自相关系数。相关系数 < -0.3 意味着强烈的来回震荡(负相关)
+    将自相关系数阈值调整为 -0.5，并延长对应计算窗口。
     """
-    window = 60
-
-    # 1s收益率
+    window = 300
     ret = df['close'].pct_change()
-
-    # 滚动计算滞后1阶的自相关系数 (使用 pandas 内置的高效 corr 方法)
     autocorr = ret.rolling(window=window).corr(ret.shift(1))
 
-    # 当自相关性呈现显著负值时，代表此时行情每走一步就想回头，适合马丁
-    df['signal'] = autocorr < -0.3
+    df['signal'] = autocorr < -0.5
     return df
 
 
@@ -537,17 +489,20 @@ def strategy_15_micro_autocorrelation(df):
 
 def strategy_16_clock_aligned_anomaly(df):
     """
-    16. 时钟节点微观冲击 (Clock-Aligned Anomaly)
-    参数: 取整分(00秒)和换线前(59秒)，这些节点通常是高频做市商撤单或TWAP算法集中下单的时刻。
+    调整时间对齐逻辑：锁定每小时的关键分钟节点（如 00, 15, 30, 45 分），并要求该节点伴随显著的成交量放大。
     """
-    # 提取毫秒时间戳对应的秒数 (0-59)
-    # open_time // 1000 得到秒级时间戳，再 % 60 得到当前所在秒
     seconds = (df['open_time'] // 1000) % 60
+    minutes = ((df['open_time'] // 1000) // 60) % 60
 
-    # 在 59秒（抢跑）或 00秒（整点爆发）时标记信号
-    df['signal'] = (seconds == 59) | (seconds == 0)
+    # 关键时间节点：每 15 分钟的整数周期
+    time_node = (minutes % 15 == 0) & ((seconds == 0) | (seconds == 59))
+
+    # 必须伴随显著放量（大于过去 5 分钟均值的 5 倍）
+    vol_mean = df['volume'].rolling(window=300, min_periods=1).mean()
+    vol_spike = df['volume'] > vol_mean * 5.0
+
+    df['signal'] = time_node & vol_spike
     return df
-
 
 # =====================================================================
 # 0. 纯数学马丁阶梯表 (与行情无关, 用于选 Margin / 反推死亡层数)
@@ -1619,7 +1574,7 @@ if __name__ == "__main__":
 
 
     # 测试参数
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT", "AAVEUSDT", "BNBUSDT"]
+    symbols = ["BTCUSDT"]
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
 
     # 调用上方提供的函数，单独输出信号率报告
