@@ -26,7 +26,7 @@ CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
-TEST_MARGINS = [0.16, 0.6, 2.55, 10.0, 40.6]
+TEST_MARGINS = [2.55, 10.0]
 
 # === 新增：需要被评估和展示的目标策略白名单（加上字符串引号） ===
 TARGET_STRATEGIES = [

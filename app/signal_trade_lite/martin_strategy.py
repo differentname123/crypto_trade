@@ -468,7 +468,7 @@ def strategy_15_micro_autocorrelation(df):
     ret = df['close'].pct_change()
     autocorr = ret.rolling(window=window).corr(ret.shift(1))
 
-    df['signal'] = autocorr < -0.5
+    df['signal'] = autocorr < -0.3
     return df
 
 
@@ -1842,15 +1842,8 @@ if __name__ == "__main__":
 
     # 将 16 个策略加入列表以供循环调用
     strategies = [
-        strategy_18_sniper_combo_short,
-        strategy_19_pulse_dryup_long,
-        strategy_20_pulse_dryup_short,
-        strategy_21_squeeze_snapback_long,
-        strategy_22_squeeze_snapback_short,
-        strategy_23_volume_climax_absorption_long,
-        strategy_24_volume_climax_absorption_short,
-        strategy_25_flash_crash_rebound_long,
-        strategy_26_flash_crash_rebound_short
+        strategy_15_micro_autocorrelation,
+
 
     ]
 
