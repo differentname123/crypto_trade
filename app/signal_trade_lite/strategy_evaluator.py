@@ -352,15 +352,16 @@ def analyze_all_strategies():
         output_csv = f"strategy_leaderboard_margin_{margin}.csv"
         df_results.to_csv(output_csv, index=False, encoding='utf-8-sig')
 
+        head_count = 50
         # ---------------- 终端打印 Top 10 (终极完美对齐版) ----------------
-        print(f"\n🏆 Margin = {margin} | 综合表现 TOP 10 策略 (按死前翻倍期望排名):")
+        print(f"\n🏆 Margin = {margin} | 综合表现 TOP {head_count} 策略 (按死前翻倍期望排名):")
 
         # 包含新增的核心评估字段
         display_cols = ["币种", "策略", "方向", "实际开仓数", "胜率(%)", "爆仓次数",
                         "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
                         "死前翻倍期望 (Doubles/Blowup)", "净利润(Margin倍数)"]
 
-        df_display = df_results[display_cols].head(10).copy()
+        df_display = df_results[display_cols].head(head_count).copy()
 
         # 精简表头
         df_display.rename(columns={
