@@ -33,7 +33,7 @@ TEST_MARGINS = [2.55, 10.0]
 MIN_LIFESPAN_DAYS = 30
 
 # 使用并行的加载，加快速度，并行度配置
-PARALLEL_WORKERS = 10
+PARALLEL_WORKERS = 20
 
 # === 新增：需要被评估和展示的目标策略白名单（加上字符串引号） ===
 TARGET_STRATEGIES = [
@@ -315,7 +315,7 @@ def analyze_all_strategies():
 
         gc.collect()
 
-        if idx % 5 == 0 or idx == len(pkl_files):
+        if idx % 50 == 0 or idx == len(pkl_files):
             print(f"进度: {idx}/{len(pkl_files)} 个策略文件已处理完成...")
 
     if pool is not None:
