@@ -609,6 +609,189 @@ def strategy_18_sniper_combo_short(df):
     df['signal'] = global_filter & (trigger_1 | trigger_2)
     return df
 
+
+import numpy as np
+import pandas as pd
+
+
+# =====================================================================
+# 新策略组 1：极端脉冲与量能骤缩反转 (Pulse & Volume Dry-up Fade)
+# =====================================================================
+
+def strategy_19_pulse_dryup_long(df):
+    """
+    方案 1 - 做多: 3秒内极速下刺 + 1s量能骤缩 + 下影线/收阳反转
+    """
+    # 1. 20秒 EMA 及标准差
+    ema20 = df['close'].ewm(span=20, adjust=False).mean()
+    std20 = df['close'].rolling(window=20, min_periods=1).std()
+
+    # 2. 3秒向下脉冲偏离 (偏离 EMA20 超过 3 个标准差)
+    z_score = (df['close'] - ema20) / (std20 + 1e-8)
+    pulse_down = z_score < -3.0
+
+    # 3. 量能枯竭: 当前 1s Volume < 过去 5 秒平均 Volume 的 30%
+    vol_5s_avg = df['volume'].rolling(window=5, min_periods=1).mean().shift(1)
+    vol_dryup = df['volume'] < (vol_5s_avg * 0.3)
+
+    # 4. 形态确认: 收阳线 或 留有显著下影线 (下影线占比 > 50%)
+    spread = df['high'] - df['low']
+    lower_wick = np.minimum(df['open'], df['close']) - df['low']
+    wick_confirm = (lower_wick / (spread + 1e-8)) > 0.5
+    is_green = df['close'] > df['open']
+
+    df['signal'] = pulse_down & vol_dryup & (is_green | wick_confirm)
+    return df
+
+
+def strategy_20_pulse_dryup_short(df):
+    """
+    方案 1 - 做空: 3秒内极速冲高 + 1s量能骤缩 + 上影线/收阴反转
+    """
+    ema20 = df['close'].ewm(span=20, adjust=False).mean()
+    std20 = df['close'].rolling(window=20, min_periods=1).std()
+
+    z_score = (df['close'] - ema20) / (std20 + 1e-8)
+    pulse_up = z_score > 3.0
+
+    vol_5s_avg = df['volume'].rolling(window=5, min_periods=1).mean().shift(1)
+    vol_dryup = df['volume'] < (vol_5s_avg * 0.3)
+
+    spread = df['high'] - df['low']
+    upper_wick = df['high'] - np.maximum(df['open'], df['close'])
+    wick_confirm = (upper_wick / (spread + 1e-8)) > 0.5
+    is_red = df['close'] < df['open']
+
+    df['signal'] = pulse_up & vol_dryup & (is_red | wick_confirm)
+    return df
+
+
+# =====================================================================
+# 新策略组 2：静水假突破扫损回归 (Squeeze Sweep & Snap-back)
+# =====================================================================
+
+def strategy_21_squeeze_snapback_long(df):
+    """
+    方案 2 - 做多: 处于 1h 极低波动区 + 刺穿 5m 低点后下一秒极速收回
+    """
+    # 1. 计算 1s 真实波幅 ATR(5m) 与 1h ATR 10% 分位
+    tr = np.maximum(df['high'] - df['low'],
+                    np.maximum(np.abs(df['high'] - df['close'].shift(1)),
+                               np.abs(df['low'] - df['close'].shift(1))))
+    atr_5m = tr.rolling(window=300, min_periods=1).mean()
+    atr_1h_q10 = atr_5m.rolling(window=3600, min_periods=1).quantile(0.10)
+    is_squeeze = atr_5m < atr_1h_q10
+
+    # 2. 5分钟前低点 (不含当前线)
+    low_5m = df['low'].shift(2).rolling(window=300, min_periods=1).min()
+
+    # 3. 扫损与极速收回: 前 1s 跌破前低，当前 1s 重新收盘在前低之上
+    pierced = df['low'].shift(1) < low_5m
+    snapped_back = df['close'] > low_5m
+
+    df['signal'] = is_squeeze & pierced & snapped_back
+    return df
+
+
+def strategy_22_squeeze_snapback_short(df):
+    """
+    方案 2 - 做空: 处于 1h 极低波动区 + 刺穿 5m 高点后下一秒极速收回
+    """
+    tr = np.maximum(df['high'] - df['low'],
+                    np.maximum(np.abs(df['high'] - df['close'].shift(1)),
+                               np.abs(df['low'] - df['close'].shift(1))))
+    atr_5m = tr.rolling(window=300, min_periods=1).mean()
+    atr_1h_q10 = atr_5m.rolling(window=3600, min_periods=1).quantile(0.10)
+    is_squeeze = atr_5m < atr_1h_q10
+
+    high_5m = df['high'].shift(2).rolling(window=300, min_periods=1).max()
+
+    pierced = df['high'].shift(1) > high_5m
+    snapped_back = df['close'] < high_5m
+
+    df['signal'] = is_squeeze & pierced & snapped_back
+    return df
+
+
+# =====================================================================
+# 新策略组 3：量价死锁 / 冰山单吸收 (Volume Climax Iceberg Absorption)
+# =====================================================================
+
+def strategy_23_volume_climax_absorption_long(df):
+    """
+    策略 A - 做多: 1s 量能 > 5m 均量 10 倍，且振幅受限，收盘位于底部 (空头砸盘撞到冰山买单)
+    """
+    # 1. 1s 成交量爆发 (大于 5 分钟均量的 10 倍)
+    vol_5m_mean = df['volume'].rolling(window=300, min_periods=1).mean()
+    vol_climax = df['volume'] > (vol_5m_mean * 10.0)
+
+    # 2. 振幅极小 (低于 5 分钟平均振幅)
+    spread = df['high'] - df['low']
+    spread_5m_mean = spread.rolling(window=300, min_periods=1).mean()
+    spread_locked = spread < spread_5m_mean
+
+    # 3. 价格砸不动: 收盘价落在 K 线下半部分或为阴线，但打不出空间，证明下方有冰山买单吸收
+    pos = (df['close'] - df['low']) / (spread + 1e-8)
+    absorbed_at_bottom = pos < 0.4
+
+    df['signal'] = vol_climax & spread_locked & absorbed_at_bottom
+    return df
+
+
+def strategy_24_volume_climax_absorption_short(df):
+    """
+    策略 A - 做空: 1s 量能 > 5m 均量 10 倍，且振幅受限，收盘位于顶部 (多头拉升撞到冰山卖单)
+    """
+    vol_5m_mean = df['volume'].rolling(window=300, min_periods=1).mean()
+    vol_climax = df['volume'] > (vol_5m_mean * 10.0)
+
+    spread = df['high'] - df['low']
+    spread_5m_mean = spread.rolling(window=300, min_periods=1).mean()
+    spread_locked = spread < spread_5m_mean
+
+    pos = (df['close'] - df['low']) / (spread + 1e-8)
+    absorbed_at_top = pos > 0.6
+
+    df['signal'] = vol_climax & spread_locked & absorbed_at_top
+    return df
+
+
+# =====================================================================
+# 新策略组 4：胖手指闪崩与极速真空回弹 (Flash-Crash Vacuum Rebound)
+# =====================================================================
+
+def strategy_25_flash_crash_rebound_long(df):
+    """
+    策略 B - 做多: 15 秒内单边暴跌 > 0.6%，且最后 3 秒成交量剧烈衰竭 (市价抛盘耗尽，真空回弹)
+    """
+    # 1. 15 秒内直线暴跌幅度 > 0.6%
+    ret_15s = (df['close'] - df['close'].shift(15)) / (df['close'].shift(15) + 1e-8)
+    flash_crash = ret_15s < -0.006
+
+    # 2. 运动最后 3 秒成交量显著萎缩 (小于前 12 秒平均量能的 40%)
+    vol_last3s = df['volume'].rolling(window=3, min_periods=1).mean()
+    vol_prev12s = df['volume'].shift(3).rolling(window=12, min_periods=1).mean()
+    vol_exhausted = vol_last3s < (vol_prev12s * 0.4)
+
+    df['signal'] = flash_crash & vol_exhausted
+    return df
+
+
+def strategy_26_flash_crash_rebound_short(df):
+    """
+    策略 B - 做空: 15 秒内单边暴涨 > 0.6%，且最后 3 秒成交量剧烈衰竭 (追涨买盘耗尽，真空回弹)
+    """
+    ret_15s = (df['close'] - df['close'].shift(15)) / (df['close'].shift(15) + 1e-8)
+    flash_spike = ret_15s > 0.006
+
+    vol_last3s = df['volume'].rolling(window=3, min_periods=1).mean()
+    vol_prev12s = df['volume'].shift(3).rolling(window=12, min_periods=1).mean()
+    vol_exhausted = vol_last3s < (vol_prev12s * 0.4)
+
+    df['signal'] = flash_spike & vol_exhausted
+    return df
+
+
 # =====================================================================
 # 0. 纯数学马丁阶梯表 (与行情无关, 用于选 Margin / 反推死亡层数)
 # =====================================================================
@@ -1659,9 +1842,16 @@ if __name__ == "__main__":
 
     # 将 16 个策略加入列表以供循环调用
     strategies = [
+        strategy_18_sniper_combo_short,
+        strategy_19_pulse_dryup_long,
+        strategy_20_pulse_dryup_short,
+        strategy_21_squeeze_snapback_long,
+        strategy_22_squeeze_snapback_short,
+        strategy_23_volume_climax_absorption_long,
+        strategy_24_volume_climax_absorption_short,
+        strategy_25_flash_crash_rebound_long,
+        strategy_26_flash_crash_rebound_short
 
-        strategy_17_sniper_combo_long,
-        strategy_18_sniper_combo_short
     ]
 
 
