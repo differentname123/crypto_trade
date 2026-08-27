@@ -947,6 +947,125 @@ def cancel_all_orders_for_symbol(exchange, symbol):
         logger.error(f"[紧急清理] 撤销 【{symbol}】 挂单时发生未知异常 | 错误: {e}")
         return False
 
+def query_all_open_orders_stats(exchange, symbols=None):
+    """
+    查询并统计所有挂单数量及每个币种的挂单情况。
+
+    :param exchange: 已初始化的 ccxt 交易所实例
+    :param symbols: 列表类型，指定要查询的币种 (例: ["BTC/USDT:USDT", "PYTH/USDT:USDT"])。
+                    若为 None，则尝试拉取账户全量挂单 (需交易所API支持)。
+    """
+    logger.info("[挂单统计] 开始查询账户挂单信息...")
+    try:
+        open_orders = []
+
+        # 1. 获取挂单数据
+        if symbols:
+            for sym in symbols:
+                try:
+                    orders = exchange.fetch_open_orders(sym)
+                    open_orders.extend(orders)
+                    time.sleep(0.1)  # 防止触发限频
+                except Exception as e:
+                    logger.error(f"[挂单统计] 拉取 {sym} 挂单失败: {e}")
+        else:
+            # 兜底：尝试全局拉取（Binance 合约通常支持不带 symbol 拉取全部挂单）
+            open_orders = exchange.fetch_open_orders()
+
+        total_orders = len(open_orders)
+        if total_orders == 0:
+            logger.info("[挂单统计] 当前账户没有任何活动挂单。")
+            return None
+
+        # 2. 数据聚合与统计
+        # 结构: { "BTC/USDT": {"total": 0, "buy": 0, "sell": 0, "buy_qty": 0.0, "sell_qty": 0.0} }
+        stats_by_symbol = defaultdict(lambda: {"total": 0, "buy": 0, "sell": 0, "buy_qty": 0.0, "sell_qty": 0.0})
+        total_buy = 0
+        total_sell = 0
+
+        for order in open_orders:
+            sym = order.get('symbol', 'UNKNOWN')
+            side = str(order.get('side', '')).lower()
+            # 取 remaining (未成交数量)，若无则取 amount (总数量)
+            remaining = float(order.get('remaining') or order.get('amount') or 0.0)
+
+            stats_by_symbol[sym]["total"] += 1
+            if side == 'buy':
+                stats_by_symbol[sym]["buy"] += 1
+                stats_by_symbol[sym]["buy_qty"] += remaining
+                total_buy += 1
+            elif side == 'sell':
+                stats_by_symbol[sym]["sell"] += 1
+                stats_by_symbol[sym]["sell_qty"] += remaining
+                total_sell += 1
+
+        # 3. 打印统计看板
+        logger.info(f"\n========== [账户全局挂单统计看板] ==========")
+        logger.info(f" 📦 总计挂单数: {total_orders} 笔 (买单: {total_buy} | 卖单: {total_sell})")
+        logger.info(f" --- 各币种挂单明细 ---")
+
+        for sym, data in stats_by_symbol.items():
+            base_coin = sym.split('/')[0] if '/' in sym else sym
+            logger.info(
+                f" 🔹 {sym: <16} | 共 {data['total']: <3} 笔 "
+                f"[买: {data['buy']: <2} 笔, 待买量: {data['buy_qty']:.4f} {base_coin}] - "
+                f"[卖: {data['sell']: <2} 笔, 待卖量: {data['sell_qty']:.4f} {base_coin}]"
+            )
+        logger.info(f"============================================\n")
+
+        return stats_by_symbol
+
+    except Exception as e:
+        logger.error(f"[挂单统计] 挂单统计查询发生严重异常 | 错误: {e}")
+        return None
+
+
+def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
+    """
+    精准排查多余挂单：找出哪些挂单属于脱管孤儿单、哪些节点出现了重复挂单。
+    """
+    prefix = f"GD_{strategy_id}_"
+    orders = exchange.fetch_open_orders(symbol)
+
+    node_orders = defaultdict(list)
+    orphans = []
+    others = []
+
+    for o in orders:
+        cid = o.get('clientOrderId') or ''
+        if cid.startswith(prefix):
+            parts = cid.split('_')
+            node_id = parts[2] if len(parts) >= 3 else "UNKNOWN"
+            node_orders[node_id].append(o)
+        elif cid.startswith("GD_"):
+            orphans.append(o)
+        else:
+            others.append(o)
+
+    logger.info(f"\n========== 【挂单深度诊断: {symbol}】 ==========")
+    logger.info(
+        f" 挂单总数: {len(orders)} | 本策略在管单: {sum(len(v) for v in node_orders.values())} | 历史/孤儿单: {len(orphans)} | 非网格单: {len(others)}")
+
+    # 1. 检查重复挂单节点
+    has_duplicate = False
+    for node_id, o_list in sorted(node_orders.items()):
+        if len(o_list) > 1:
+            has_duplicate = True
+            logger.warning(f" ⚠️ 节点【{node_id}】存在 {len(o_list)} 笔重复挂单:")
+            for o in o_list:
+                logger.warning(f"    - CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
+
+    if not has_duplicate:
+        logger.info(" ✅ 未发现同一节点重复挂单。")
+
+    # 2. 检查脱管孤儿单
+    if orphans:
+        logger.warning(f" ⚠️ 发现 {len(orphans)} 笔非本策略 ID 的孤儿网格单:")
+        for o in orphans:
+            logger.warning(
+                f"    - ID: {o.get('id')} | CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
+
+    logger.info("==============================================\n")
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
@@ -994,12 +1113,65 @@ def main_app():
         pass
 
 
+
 if __name__ == "__main__":
     main_app()
 
     #
-    # # 取消 STX 的挂单
     # api_key = get_config("nana_biance_api_copy_key")
     # secret_key = get_config("nana_biance_api_copy_secret")
     # proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
-    # cancel_all_orders_for_symbol(safe_init_exchange(api_key, secret_key, proxies), "STX/USDT:USDT")
+    # exchange_instance = safe_init_exchange(api_key, secret_key, proxies)
+    #
+    # # # 取消 STX 的挂单
+    # # cancel_all_orders_for_symbol(exchange_instance, "SKY/USDT:USDT")
+    #
+    #
+    # # # 查询指定挂单
+    # # target_symbols = ["AVAX/USDT:USDT", "PYTH/USDT:USDT", "BTC/USDT:USDT"]
+    # # query_all_open_orders_stats(exchange_instance, symbols=target_symbols)
+    #
+    #
+    #
+    # # # 精准排查指定交易对的孤儿单和重复挂单
+    # # target_symbol = "AVAX/USDT:USDT"
+    # # target_strategy_id = "AVAX20260828"
+    # #
+    # # # 3. 调用排查函数
+    # # inspect_orphan_and_duplicate_orders(
+    # #     exchange=exchange_instance,
+    # #     symbol=target_symbol,
+    # #     strategy_id=target_strategy_id
+    # # )
+    #
+    #
+    # # 取消指定订单
+    # ghost_oid = "GD_AVAX20260828_N035_B_0_50729966"
+    # symbol = "AVAX/USDT:USDT"
+    #
+    # logger.info(f"正在寻找并精准撤销节点 N035 的幽灵单: {ghost_oid}")
+    #
+    # try:
+    #     # 1. 先拉取当前盘口该币种的所有挂单
+    #     open_orders = exchange_instance.fetch_open_orders(symbol)
+    #
+    #     # 2. 遍历找出目标 clientOrderId 对应的真实交易所 ID
+    #     target_order = None
+    #     for order in open_orders:
+    #         if order.get('clientOrderId') == ghost_oid:
+    #             target_order = order
+    #             break
+    #
+    #     # 3. 执行物理撤销
+    #     if target_order:
+    #         exchange_id = target_order.get('id')
+    #         logger.info(f"找到目标订单！交易所内部 ID: [{exchange_id}]，正在执行撤销...")
+    #
+    #         # 使用交易所原生 ID 进行撤单
+    #         exchange_instance.cancel_order(exchange_id, symbol)
+    #         logger.info("✅ 幽灵单清理成功！盘口数量已恢复正常。")
+    #     else:
+    #         logger.error("❌ 盘口未找到该幽灵单，可能已被成交或人工撤销。")
+    #
+    # except Exception as e:
+    #     logger.error(f"❌ 清理过程发生异常: {e}")

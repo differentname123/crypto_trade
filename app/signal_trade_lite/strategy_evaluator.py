@@ -176,6 +176,8 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
             expected_lifespan_hour) else "999 (未爆仓)",
         "平均持仓(h)": round(holding_time, 2) if pd.notnull(holding_time) else 0.0,
         "死前翻倍胜率(%)": round(free_ride_win_rate * 100, 2) if pd.notnull(free_ride_win_rate) else 0.0,
+        "总收益(Margin倍数)": round(report.get("_extracted_gross_profit", 0), 2),
+        "总亏损(Margin倍数)": round(report.get("_extracted_gross_loss", 0), 2),
         "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
         "年化爆仓次数": round(report.get("blowups_per_year", 0), 2),
         "翻倍所需时间(小时)": round(report.get("time_to_double_hour", 0), 2),
@@ -227,6 +229,30 @@ def _process_one_file(file_path):
     for margin in TEST_MARGINS:
         trades_df = replayer.run(margin)
         report = evaluate_free_ride(trades_df, cycles_df, margin)
+
+        # === 新增：解析每一笔闭环，智能提取总收益和总亏损 ===
+        pnl_col = next((c for c in ["net_pnl_in_margin", "pnl_in_margin", "net_pnl", "pnl", "profit", "net_profit"] if
+                        c in trades_df.columns), None)
+        if pnl_col:
+            gross_profit = float(trades_df.loc[trades_df[pnl_col] > 0, pnl_col].sum())
+            gross_loss = float(trades_df.loc[trades_df[pnl_col] < 0, pnl_col].sum())
+
+            # 若原始闭环收益列与最终报告净利润做了除以本金等换算操作，此处进行等比缩放对齐
+            net_pnl_sum = gross_profit + gross_loss
+            report_net = float(report.get("total_net_pnl_in_margin", 0.0))
+            if abs(net_pnl_sum) > 1e-6 and abs(report_net) > 1e-6 and abs(net_pnl_sum - report_net) > 1e-6:
+                ratio = report_net / net_pnl_sum
+                gross_profit *= ratio
+                gross_loss *= ratio
+
+            report["_extracted_gross_profit"] = gross_profit
+            report["_extracted_gross_loss"] = gross_loss
+        else:
+            # 防御性回退：如果找不到对应列名，尝试读取报告可能内置的字段
+            report["_extracted_gross_profit"] = report.get("gross_profit_in_margin", report.get("total_profit", 0.0))
+            report["_extracted_gross_loss"] = report.get("gross_loss_in_margin", report.get("total_loss", 0.0))
+        # =====================================================
+
         del trades_df
         rows_by_margin[margin] = _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult)
         del report
@@ -345,10 +371,10 @@ def analyze_all_strategies():
     df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
     print(f"已将过滤后的结果保存至: {output_csv}")
 
-    # 将新提取的参数插入到展示列里
+    # 将新提取的参数插入到展示列里 (新增: 总收益与总亏损)
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
                     "爆仓几率(%)", "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
-                    "净利润(Margin倍数)"]
+                    "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)"]
 
     def get_display_width(s):
         w = 0
@@ -393,8 +419,11 @@ def analyze_all_strategies():
 
         df_display = df_display[display_cols]
 
+        # 为了控制台排版整洁，对新增长字段进行简称化
         df_display.rename(columns={
             "死前翻倍胜率(%)": "翻倍胜率(%)",
+            "总收益(Margin倍数)": "总收益(M倍)",
+            "总亏损(Margin倍数)": "总亏损(M倍)",
             "净利润(Margin倍数)": "净利润(M倍)"
         }, inplace=True)
 
