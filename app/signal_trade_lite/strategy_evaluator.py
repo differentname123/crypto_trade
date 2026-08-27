@@ -32,6 +32,9 @@ TEST_MARGINS = [2.55, 10.0]
 # 最终打印时，过滤掉预期存活(天)小于此数值的结果
 MIN_LIFESPAN_DAYS = 30
 
+# 最终打印时，过滤掉 净利润(Margin倍数) 小于此数值的结果
+MIN_NET_PROFIT = -1
+
 # 使用并行的加载，加快速度，并行度配置
 PARALLEL_WORKERS = 20
 
@@ -413,8 +416,11 @@ def analyze_all_strategies():
 
         df_display = df_display[df_display["预期存活(天)"].apply(check_lifespan)]
 
+        # === 新增：过滤 净利润(Margin倍数) >= MIN_NET_PROFIT 的记录 ===
+        df_display = df_display[df_display["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
+
         if df_display.empty:
-            print(f"  [提示] 该策略所有结果的预期存活均小于 {MIN_LIFESPAN_DAYS} 天，已过滤隐藏。")
+            print(f"  [提示] 该策略所有结果未达到预期存活({MIN_LIFESPAN_DAYS}天)或净利润({MIN_NET_PROFIT})标准，已过滤隐藏。")
             continue
 
         df_display = df_display[display_cols]
