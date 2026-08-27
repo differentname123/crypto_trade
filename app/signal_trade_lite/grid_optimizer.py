@@ -337,16 +337,17 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
                 if btc_up_req_margin > 0:
                     btc_up_target_new_score = (btc_avg_score / btc_up_req_margin * 10000)
 
-    # 2. 动态计分评估（仅保留新分数逻辑线核心指标）
+    # 2. 动态计分评估
     metrics = {
         '最新价格': [],
         '距新理论底价跌幅(%)': [],
         '新所需保证金': [],
         '新最终分数': [],
-        '基于当前BTC的理论底价': [],     # 修正：补充"底"字以明确含义并与下方顶价对应
-        '现价偏离理论底价(%)': [],       # 修正：补充"底"字
-        '基于当前BTC的理论顶价': [],     # 新增：记录理论顶价
-        '现价偏离理论顶价(%)': [],       # 新增：记录偏离理论顶价百分比
+        '基于当前BTC的理论底价': [],
+        '现价偏离理论底价(%)': [],
+        '基于当前BTC的理论顶价': [],
+        '现价偏离理论顶价(%)': [],
+        '底顶偏离比(绝对值)': [],  # 新增：记录偏离底价与顶价的比值绝对值
         '对标BTC当前分数所需涨跌幅(%)': [],
         '对标BTC当前分数所需目标价': [],
         f'上涨{up_pct_target}%目标价': [],
@@ -360,7 +361,7 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
         avg_score = row['平均网格得分']
         new_theory_lowest = row['新理论底价']
         max_ratio = row.get('相对BTC最大比例', None)
-        min_ratio = row.get('相对BTC最小比例', None)  # 新增：提取最小比例用于计算顶价
+        min_ratio = row.get('相对BTC最小比例', None)
 
         price = latest_prices_dict.get(coin)
         metrics['最新价格'].append(price)
@@ -403,7 +404,7 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
             metrics['新所需保证金'].append(None)
             metrics['新最终分数'].append(None)
 
-        # 基于当前BTC最新价的反推理论底价及偏差 (原有的理论底价)
+        # 基于当前BTC最新价的反推理论底价及偏差
         ltp = None
         dev_pct = None
 
@@ -412,10 +413,10 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
             if price and pd.notna(ltp) and ltp > 0:
                 dev_pct = (price - ltp) / ltp * 100
 
-        metrics['基于当前BTC的理论底价'].append(ltp)       # 修正
-        metrics['现价偏离理论底价(%)'].append(dev_pct)     # 修正
+        metrics['基于当前BTC的理论底价'].append(ltp)
+        metrics['现价偏离理论底价(%)'].append(dev_pct)
 
-        # 新增：基于当前BTC最新价的反推理论顶价（基于最强比例）及偏差
+        # 基于当前BTC最新价的反推理论顶价及偏差
         htp = None
         dev_htp_pct = None
 
@@ -426,6 +427,22 @@ def calculate_final_score(df, margin_info, up_pct_target=10):
 
         metrics['基于当前BTC的理论顶价'].append(htp)
         metrics['现价偏离理论顶价(%)'].append(dev_htp_pct)
+
+        # ================= 新增核心逻辑：计算底顶偏离比(绝对值) =================
+        dev_ratio_abs = None
+        if dev_pct is not None and dev_htp_pct is not None:
+            # 避免除以 0 的异常报错
+            if dev_htp_pct != 0:
+                dev_ratio_abs = abs(dev_pct / dev_htp_pct)
+            elif dev_pct != 0:
+                # 若刚好处于顶价但未处于底价，数学上趋于无穷大，这里可根据业务需求设为极大值或None
+                dev_ratio_abs = float('inf')
+            else:
+                # 极端情况：底价=顶价=现价
+                dev_ratio_abs = 1.0
+
+        metrics['底顶偏离比(绝对值)'].append(dev_ratio_abs)
+        # ========================================================================
 
         # 反推同等 BTC 当前分数所需的理论涨跌幅及具体价格
         req_pct = None
