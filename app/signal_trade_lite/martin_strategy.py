@@ -331,9 +331,6 @@ def strategy_6_volume_climax(df):
 
 
 def strategy_7_proxy_cvd_divergence(df):
-    """
-    要求价格形成有效突破（> 0.1%），同时伴随 CVD 明显衰竭（不足历史峰值的 20%）。
-    """
     window = 300
     sign = np.where(df['close'] >= df['open'], 1, -1)
     pseudo_vol = df['volume'] * sign
@@ -344,27 +341,24 @@ def strategy_7_proxy_cvd_divergence(df):
     highest_cvd = cvd_window.rolling(window=window, min_periods=1).max()
     lowest_cvd = cvd_window.rolling(window=window, min_periods=1).min()
 
-    # 价格突破前高至少千分之1，且累计资金量不足前期高点的20%（量价背离）
-    bearish_div = (df['close'] > highest_close.shift(1) * 1.001) & (cvd_window < highest_cvd.shift(1) * 0.2)
-    bullish_div = (df['close'] < lowest_close.shift(1) * 0.999) & (cvd_window > lowest_cvd.shift(1) * 0.2)
+    # 稍微放宽：突破万分之五，CVD衰竭至前高的30%以下
+    bearish_div = (df['close'] > highest_close.shift(1) * 1.0005) & (cvd_window < highest_cvd.shift(1) * 0.3)
+    bullish_div = (df['close'] < lowest_close.shift(1) * 0.9995) & (cvd_window > lowest_cvd.shift(1) * 0.3)
 
     df['signal'] = bearish_div | bullish_div
     return df
-
 # ---------------------------------------------------------
 # 维度三：微观形态与猎杀类（捕捉“假突破”）
 # ---------------------------------------------------------
 
 def strategy_8_rolling_stop_hunt(df):
-    """
-    考察过去 15 分钟 (900 秒) 的极值作为流动性测试的参考基准，并要求具备一定幅度的价格回抽。
-    """
     window = 900
     prev_high = df['high'].shift(1).rolling(window=window, min_periods=1).max()
     prev_low = df['low'].shift(1).rolling(window=window, min_periods=1).min()
 
-    hunt_up = (df['high'] > prev_high) & (df['close'] < prev_high) & (df['high'] > df['close'] * 1.002)  # 设定最小刺穿幅度
-    hunt_down = (df['low'] < prev_low) & (df['close'] > prev_low) & (df['low'] < df['close'] * 0.998)
+    # 刺穿幅度要求从 1.002 降至 1.001 (千分之一)
+    hunt_up = (df['high'] > prev_high) & (df['close'] < prev_high) & (df['high'] > df['close'] * 1.001)
+    hunt_down = (df['low'] < prev_low) & (df['close'] > prev_low) & (df['low'] < df['close'] * 0.999)
 
     df['signal'] = hunt_up | hunt_down
     return df
@@ -389,26 +383,22 @@ def strategy_9_wick_rejection_ratio(df):
 
 
 def strategy_10_close_position_bias(df):
-    """
-    增加绝对波动过滤，确保在价格具有一定真实波动率的前提下才触发形态信号。
-    """
     spread = df['high'] - df['low']
     pos = (df['close'] - df['low']) / (spread + 1e-8)
 
-    # 要求位置指标达到极值，且当前K线具有较大波动
-    large_candle = spread > df['close'] * 0.001
+    # K线最低振幅过滤从 0.001 降至 0.0008
+    large_candle = spread > df['close'] * 0.0008
+
     long_trap = (pos.shift(2) > 0.9) & (pos.shift(1) > 0.9) & (pos < 0.1) & large_candle
     short_trap = (pos.shift(2) < 0.1) & (pos.shift(1) < 0.1) & (pos > 0.9) & large_candle
 
     df['signal'] = long_trap | short_trap
     return df
 
-
 def strategy_11_tick_gap_reversion(df):
-    """
-    跳空阈值设定为千分之 1.5 (0.15%)，以过滤 1s 级别的高频常态跳空，锁定较显著的价格断层。
-    """
-    threshold = 0.0015
+    # 放宽跳空阈值：从 0.0015 降至 0.001
+    threshold = 0.001
+
     gap = np.abs(df['open'] - df['close'].shift(1)) / (df['close'].shift(1) + 1e-8)
     df['signal'] = gap > threshold
     return df
@@ -435,11 +425,11 @@ def strategy_12_kaufman_efficiency_ratio(df):
     df['signal'] = (er < threshold) & (volatility > vol_mean * 2.0)
     return df
 
+
 def strategy_13_run_length_streaks(df):
-    """
-    连续 K 线要求提高至 10 根，并增加累计涨跌幅需大于 0.3% 的条件，以过滤微幅的连续波动。
-    """
-    streak_threshold = 10
+    # 从 10根 降至 9根，涨跌幅阈值从 0.003 降至 0.002
+    streak_threshold = 9
+    ret_threshold = 0.002
 
     is_up = (df['close'] > df['open']).astype(int)
     up_streak = is_up.rolling(window=streak_threshold).sum()
@@ -449,10 +439,9 @@ def strategy_13_run_length_streaks(df):
     down_streak = is_down.rolling(window=streak_threshold).sum()
     ret_down = (df['close'].shift(streak_threshold) - df['close']) / df['close'].shift(streak_threshold)
 
-    df['signal'] = ((up_streak == streak_threshold) & (ret_up > 0.003)) | \
-                   ((down_streak == streak_threshold) & (ret_down > 0.003))
+    df['signal'] = ((up_streak == streak_threshold) & (ret_up > ret_threshold)) | \
+                   ((down_streak == streak_threshold) & (ret_down > ret_threshold))
     return df
-
 
 def strategy_14_volatility_squeeze_expansion(df):
     """
