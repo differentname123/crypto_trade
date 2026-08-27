@@ -499,7 +499,7 @@ def query_google_ai_studio(prompt, file_path=None, user_data_dir=USER_DATA_DIR,
 
 
 def generate_gemini_content_playwright(prompt, file_path=None, wait_timeout=600,
-                                       model_name="gemini-flash-latest", fallback_model="gemini-flash-latest"):
+                                       model_name="gemini-flash-latest", fallback_model="gemini-3.6-flash"):
     """
     对外总入口: 安全申请账号并调用 Gemini, 支持备用模型(活跃池更大者优先)。
 

@@ -615,7 +615,8 @@ def _warmup_jit():
     """主线程内先把签名编译好, 避免多线程首次调用抢 numba 编译锁"""
     if not _HAS_NUMBA:
         return
-    f1 = np.ones(1, dtype=np.float64)
+    # 配合外部改为 float32 传入，预热签名保持一致
+    f1 = np.ones(1, dtype=np.float32)
     i1 = np.zeros(1, dtype=np.int64)
     _times_strictly_increasing(i1)
     _all_finite3(f1, f1, f1)
@@ -705,9 +706,10 @@ def run_stage1(df,
 
     # ---------------- OHLC ----------------
     t = time.time()
-    highs_np = np.ascontiguousarray(df["high"].to_numpy(dtype=np.float64))
-    lows_np = np.ascontiguousarray(df["low"].to_numpy(dtype=np.float64))
-    closes_np = np.ascontiguousarray(df["close"].to_numpy(dtype=np.float64))
+    # 为节省内存，提取数组时采用 float32，足够满足量化回测的精度要求
+    highs_np = np.ascontiguousarray(df["high"].to_numpy(dtype=np.float32))
+    lows_np = np.ascontiguousarray(df["low"].to_numpy(dtype=np.float32))
+    closes_np = np.ascontiguousarray(df["close"].to_numpy(dtype=np.float32))
     if _HAS_NUMBA:
         ok_fin = bool(_all_finite3(highs_np, lows_np, closes_np))
     else:
@@ -1510,9 +1512,9 @@ if __name__ == "__main__":
 
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
 
-    # 显式 dtype: 避免 read_csv 类型推断产生额外内存峰值
-    CSV_DTYPES = {"open_time": np.int64, "open": np.float64, "high": np.float64,
-                  "low": np.float64, "close": np.float64, "volume": np.float64}
+    # 显式 dtype: 避免 read_csv 类型推断产生额外内存峰值，使用 float32 足以满足回测精度且节省一半内存
+    CSV_DTYPES = {"open_time": np.int64, "open": np.float32, "high": np.float32,
+                  "low": np.float32, "close": np.float32, "volume": np.float32}
 
     total_task = len(symbols) * len(strategies) * 2
     task_done = 0
@@ -1577,11 +1579,19 @@ if __name__ == "__main__":
             signal_np = df_strat['signal'].fillna(False).astype(np.int8).to_numpy()
             del df_strat  # 立刻释放整份策略副本, 压低内存峰值
             gc.collect()
+
             n_sig = int(signal_np.sum())
+            signal_rate = 100.0 * n_sig / max(signal_np.shape[0], 1)
             _log("信号计算完成: 耗时 %.1fs | 命中 %d / %d (%.4f%%)"
-                 % (time.time() - t, n_sig, signal_np.shape[0],
-                    100.0 * n_sig / max(signal_np.shape[0], 1)), 1)
-            if n_sig == 0:
+                 % (time.time() - t, n_sig, signal_np.shape[0], signal_rate), 1)
+
+            # --- 增加剪枝：如果信号率超过 50%，直接跳过策略回测 ---
+            if signal_rate > 50.0:
+                _log("提示: 信号率超过 50%%，该策略极大概率表现不佳或失效，直接跳过", 1)
+                task_done += 2
+                del signal_np
+                continue
+            elif n_sig == 0:
                 _log("提示: 本策略在该币种上无任何信号, Stage 1 将输出空表", 1)
 
             # Stage 1 只需要 open_time/high/low/close + 信号列。

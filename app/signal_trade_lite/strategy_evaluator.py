@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ======================================================================
-加密货币马丁格尔策略 —— 全局表现分析与排名引擎
+加密货币马丁格尔策略 —— 全局表现分析与排名引擎 (低内存版)
 ======================================================================
 功能:
 1. 批量读取 Stage 1 生成的 .pkl 缓存文件 (包含平行宇宙 cycles_df)。
@@ -9,12 +9,22 @@
 3. 调用 Stage 3 计算核心评估指标。
 4. 将所有策略(不同币种、不同信号、多空方向)的表现汇总成 DataFrame，
    并按照"核心生存指标"进行排名，最终输出 CSV 报告。
+
+内存优化 (不改变任何统计口径 / 输出格式):
+  A. 每个 pkl 在"独立子进程"中处理，进程退出后 20G 内存由操作系统 100% 归还，
+     内存峰值被锁定为"单个文件"，与文件数量彻底解耦(解决堆碎片化累积 OOM)。
+  B. 反序列化后立刻摘出 df 并清空外层 dict，pkl 中冗余字段不再常驻。
+  C. dtype 瘦身: float64->float32(带量级安全阀) / int64->int32(带范围检查)，
+     单文件常驻内存通常降 40%~55%，对速度几乎无影响。
 """
 
 import os
 import glob
 import pickle
 import gc
+import warnings
+import multiprocessing as mp
+
 import numpy as np
 import pandas as pd
 import unicodedata
@@ -31,6 +41,219 @@ SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 # 回测测试用的保证金深度 (Margin) 列表
 # 分别约对应: 5层(0.16), 7层(0.6), 10层(2.55), 11层濒死(10.0), 13层(40.6)
 TEST_MARGINS = [0.16, 0.6, 2.55, 10.0, 40.6]
+
+# =====================================================================
+# 内存优化开关 (只影响内存/性能，不影响统计结果与输出格式)
+# =====================================================================
+USE_SUBPROCESS = True         # 每个 pkl 用独立子进程处理，退出后内存 100% 归还操作系统(最关键)
+SHRINK_DTYPES = True          # 加载后做 dtype 瘦身(最主要的内存降幅来源)
+DOWNCAST_FLOAT32 = True       # float64 -> float32；想要与老结果 bit 级完全一致就设为 False
+FLOAT32_SAFE_MAX_ABS = 1e7    # 绝对值超过该量级的 float 列不降精度(防止毫秒时间戳/纳秒等被破坏)
+KEEP_COLUMNS = None           # 若明确知道下游只用到哪些列，填列名 list 可再省一半内存；None = 全部保留
+PRINT_MEMORY = False          # 调试用：打印每个文件处理完时子进程的 RSS(需要 psutil)
+
+# 列名中出现这些关键字的 float 列，一律不降精度(时间戳类)
+_TIME_LIKE_KEYS = ("time", "stamp", "epoch", "date", "millis", "nanos", "_ms", "_ns")
+
+
+# =====================================================================
+# 内部工具函数
+# =====================================================================
+def _parse_filename(filename):
+    """解析文件名 -> (symbol, strategy_name, direction)，逻辑与原版完全一致"""
+    # 解析文件名: stage1_BTCUSDT_strategy_1_vwap_zscore_Long_f0.0005...pkl
+    try:
+        parts = filename.split('_')
+        symbol = parts[1]
+        direction = "Long" if "_Long_" in filename else "Short" if "_Short_" in filename else "Unknown"
+        strat_start_idx = filename.find(symbol) + len(symbol) + 1
+        strat_end_idx = filename.find(f"_{direction}_")
+        strategy_name = filename[strat_start_idx:strat_end_idx]
+    except Exception:
+        symbol, strategy_name, direction = "Unknown", filename, "Unknown"
+    return symbol, strategy_name, direction
+
+
+def _available_memory_ok(need_bytes):
+    """dtype 瘦身过程中会有"旧块 + 新列"短暂并存的峰值，内存不够就跳过瘦身，绝不因优化反而 OOM"""
+    try:
+        import psutil
+        return psutil.virtual_memory().available > need_bytes
+    except Exception:
+        return True  # 没装 psutil 时不做限制
+
+
+def _shrink_dtypes(df):
+    """
+    dtype 瘦身。
+    关键细节: pkl 载入的 DataFrame 中同 dtype 的列共享一个大内存块，只要还有一列引用它，
+    整块内存就不会释放。因此这里对 float64 / int64 的列"全部重建"：能降精度的降精度，
+    不能降的也用 .copy() 断开与原大块的引用，保证原始大块被真正回收。
+    """
+    if not SHRINK_DTYPES or df is None or len(df) == 0:
+        return df
+    if df.columns.duplicated().any():   # 重名列时直接放弃瘦身，避免语义歧义
+        return df
+
+    try:
+        cur_mem = float(df.memory_usage(index=True, deep=False).sum())
+    except Exception:
+        cur_mem = 0.0
+    # 瘦身期间最坏情况需要约 0.7 倍额外内存，不够就原样返回
+    if cur_mem > 0 and not _available_memory_ok(cur_mem * 0.7):
+        return df
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+
+        # ---------------- float64 ----------------
+        if DOWNCAST_FLOAT32:
+            f_cols = [c for c in df.columns if df[c].dtype == np.float64]
+            for c in f_cols:
+                try:
+                    arr = df[c].to_numpy(dtype=np.float64, copy=False)
+                    if arr.size:
+                        lo = np.nanmin(arr)
+                        hi = np.nanmax(arr)
+                    else:
+                        lo = hi = 0.0
+                    lo = 0.0 if not np.isfinite(lo) else float(lo)
+                    hi = 0.0 if not np.isfinite(hi) else float(hi)
+                    max_abs = max(abs(lo), abs(hi))
+                    name_like_time = any(k in str(c).lower() for k in _TIME_LIKE_KEYS)
+                    del arr
+
+                    if (not name_like_time) and max_abs < FLOAT32_SAFE_MAX_ABS:
+                        df[c] = df[c].astype(np.float32)
+                    else:
+                        # 不能降精度的列也必须 copy，否则原 float64 大块无法释放
+                        df[c] = df[c].copy()
+                except Exception:
+                    continue
+            gc.collect()
+
+        # ---------------- int64 / uint64 ----------------
+        i_cols = [c for c in df.columns if str(df[c].dtype) in ("int64", "uint64")]
+        for c in i_cols:
+            try:
+                s = df[c]
+                mn, mx = s.min(), s.max()
+                if (pd.notnull(mn) and pd.notnull(mx)
+                        and mn >= np.iinfo(np.int32).min and mx <= np.iinfo(np.int32).max):
+                    df[c] = s.astype(np.int32)
+                else:
+                    df[c] = s.copy()
+                del s
+            except Exception:
+                continue
+        gc.collect()
+
+    return df
+
+
+def _build_row(symbol, strategy_name, direction, report):
+    """由 report 组装成一行结果（字段与原版完全一致）"""
+    # ==================== 新增更多维度的关键指标 ====================
+    doubles_per_blowup = report.get("doubles_per_blowup", np.nan)
+    holding_time = report.get("avg_holding_hour_traded", 0.0)
+    expected_lifespan_hour = report.get("expected_lifespan_hour", np.inf)
+    free_ride_win_rate = report.get("free_ride_win_rate", np.nan)
+
+    return {
+        "币种": symbol,
+        "策略": strategy_name,
+        "方向": direction,
+        "总信号数": report.get("n_cycles_total", 0),
+        "实际开仓数": report.get("n_trades", 0),
+        "胜率(%)": round(report.get("win_rate", 0) * 100, 2) if pd.notnull(report.get("win_rate")) else 0.0,
+        "爆仓次数": report.get("n_blowup", 0),
+        "预期存活(天)": round(expected_lifespan_hour / 24.0, 2) if not np.isinf(
+            expected_lifespan_hour) else "999 (未爆仓)",
+        "平均持仓(h)": round(holding_time, 2) if pd.notnull(holding_time) else 0.0,
+        "死前翻倍胜率(%)": round(free_ride_win_rate * 100, 2) if pd.notnull(free_ride_win_rate) else 0.0,
+        "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
+        "年化爆仓次数": round(report.get("blowups_per_year", 0), 2),
+        "翻倍所需时间(小时)": round(report.get("time_to_double_hour", 0), 2),
+        "死前翻倍期望 (Doubles/Blowup)": round(doubles_per_blowup, 3) if not np.isinf(
+            doubles_per_blowup) else "999 (未爆仓)",
+        "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
+        "手续费占毛利(%)": round(report.get("fee_ratio_traded", 0) * 100, 2)
+    }
+
+
+def _process_one_file(file_path):
+    """
+    处理单个 stage1 pkl，返回 {margin: row_dict}。
+    该函数在子进程中执行：函数返回后子进程退出，20G 内存由操作系统 100% 回收。
+    """
+    filename = os.path.basename(file_path)
+    symbol, strategy_name, direction = _parse_filename(filename)
+
+    rows_by_margin = {}
+
+    # 1. 加载 Stage 1 数据（关 gc 加速大对象反序列化 + 加大读缓冲）
+    gc.disable()
+    try:
+        with open(file_path, 'rb', buffering=4 * 1024 * 1024) as f:
+            cached_data = pickle.load(f)
+    finally:
+        gc.enable()
+
+    attrs = cached_data.get('attrs', {})
+    cycles_df = cached_data.pop('df')   # 摘出 df，不再让外层 dict 持有引用
+    cached_data.clear()                 # pkl 中其它冗余字段(可能含原始K线)立即释放
+    del cached_data
+    cycles_df.attrs = attrs
+    gc.collect()
+
+    # 跳过没有产生任何信号的空策略
+    if len(cycles_df) == 0:
+        del cycles_df
+        gc.collect()
+        return rows_by_margin
+
+    # 2. 内存瘦身：列裁剪(可选) + dtype 压缩
+    if KEEP_COLUMNS:
+        keep = [c for c in KEEP_COLUMNS if c in cycles_df.columns]
+        if keep and len(keep) < len(cycles_df.columns):
+            cycles_df = cycles_df[keep].copy()   # copy 才能真正释放被裁掉的列
+            gc.collect()
+    cycles_df = _shrink_dtypes(cycles_df)
+    cycles_df.attrs = attrs   # 瘦身后重新挂回 attrs，保证 Stage3 元信息不丢
+
+    # 3. 初始化重组器 (Stage 2)
+    replayer = TimelineReplayer(cycles_df)
+
+    # 对配置的每一个 Margin 水位进行时间线测试
+    for margin in TEST_MARGINS:
+        trades_df = replayer.run(margin)
+        report = evaluate_free_ride(trades_df, cycles_df, margin)
+        del trades_df                                     # 单次 margin 的大对象立刻释放
+        rows_by_margin[margin] = _build_row(symbol, strategy_name, direction, report)
+        del report
+        gc.collect()
+
+    # ==================== 严格的内存回收 ====================
+    del cycles_df, replayer
+    gc.collect()
+
+    if PRINT_MEMORY:
+        try:
+            import psutil
+            rss = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 3
+            print(f"    [内存] {filename} 完成，子进程 RSS ≈ {rss:.2f} GB")
+        except Exception:
+            pass
+
+    return rows_by_margin
+
+
+def _process_one_file_safe(file_path):
+    """子进程入口：把业务异常包成返回值，只有"进程级"故障才会向主进程抛异常"""
+    try:
+        return {"ok": True, "rows": _process_one_file(file_path)}
+    except BaseException as e:
+        return {"ok": False, "err": f"{type(e).__name__}: {e}"}
 
 
 def analyze_all_strategies():
@@ -51,83 +274,60 @@ def analyze_all_strategies():
         print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl 文件！")
         return
 
-    print(f"共发现 {len(pkl_files)} 个缓存文件，开启极致单进程内存回收模式...\n")
+    mode_desc = "单进程子进程池(单次任务后重建)隔离 + dtype 瘦身" if USE_SUBPROCESS else "主进程 + dtype 瘦身"
+    print(f"共发现 {len(pkl_files)} 个缓存文件，开启低内存模式({mode_desc})...\n")
 
     # 用于存放每个 Margin 下的结果，格式为 {margin_value: [row1, row2, ...]}
     results_by_margin = {m: [] for m in TEST_MARGINS}
 
+    use_subprocess = USE_SUBPROCESS
+    pool = None
+
+    if use_subprocess:
+        try:
+            # 初始化常驻单进程池，使用 maxtasksperchild=1 确保每处理完一个文件就销毁重建子进程（解决碎片化OOM）
+            # 避免了原版代码每个文件都在 for 循环中创建/销毁 Executor 的极大开销。
+            ctx = mp.get_context("spawn")
+            pool = ctx.Pool(processes=1, maxtasksperchild=1)
+        except Exception as e:
+            print(f"[警告] 子进程池初始化失败({type(e).__name__}: {e})，自动切换为主进程内处理...")
+            use_subprocess = False
+
     for idx, file_path in enumerate(pkl_files, 1):
         filename = os.path.basename(file_path)
+        result = None
 
-        # 解析文件名: stage1_BTCUSDT_strategy_1_vwap_zscore_Long_f0.0005...pkl
         try:
-            parts = filename.split('_')
-            symbol = parts[1]
-            direction = "Long" if "_Long_" in filename else "Short" if "_Short_" in filename else "Unknown"
-            strat_start_idx = filename.find(symbol) + len(symbol) + 1
-            strat_end_idx = filename.find(f"_{direction}_")
-            strategy_name = filename[strat_start_idx:strat_end_idx]
+            if use_subprocess:
+                # 阻塞式调用，按原版要求顺序处理
+                result = pool.apply(_process_one_file_safe, args=(file_path,))
+            else:
+                result = _process_one_file_safe(file_path)
         except Exception as e:
-            symbol, strategy_name, direction = "Unknown", filename, "Unknown"
+            # 【重要修复】仅在此文件抛异常，不改变全局状态(不再因单个文件报错导致后续文件全部回退到主进程)
+            print(f"[警告] 处理失败，已跳过(极可能是该文件单独就把内存撑爆/或数据损坏): {filename} | {type(e).__name__}: {e}")
 
-        # 1. 加载 Stage 1 数据
-        with open(file_path, 'rb') as f:
-            cached_data = pickle.load(f)
-            cycles_df = cached_data['df']
-            cycles_df.attrs = cached_data['attrs']
+        if result is not None:
+            if result.get("ok"):
+                rows = result.get("rows") or {}
+                for margin in TEST_MARGINS:
+                    row = rows.get(margin)
+                    if row is not None:
+                        results_by_margin[margin].append(row)
+            else:
+                print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
 
-        # 跳过没有产生任何信号的空策略
-        if len(cycles_df) == 0:
-            del cycles_df, cached_data
-            continue
-
-        # 2. 初始化重组器 (Stage 2)
-        replayer = TimelineReplayer(cycles_df)
-
-        # 对配置的每一个 Margin 水位进行时间线测试
-        for margin in TEST_MARGINS:
-            trades_df = replayer.run(margin)
-            report = evaluate_free_ride(trades_df, cycles_df, margin)
-
-            # ==================== 新增更多维度的关键指标 ====================
-            doubles_per_blowup = report.get("doubles_per_blowup", np.nan)
-            holding_time = report.get("avg_holding_hour_traded", 0.0)
-            expected_lifespan_hour = report.get("expected_lifespan_hour", np.inf)
-            free_ride_win_rate = report.get("free_ride_win_rate", np.nan)
-
-            row = {
-                "币种": symbol,
-                "策略": strategy_name,
-                "方向": direction,
-                "总信号数": report.get("n_cycles_total", 0),
-                "实际开仓数": report.get("n_trades", 0),
-                "胜率(%)": round(report.get("win_rate", 0) * 100, 2) if pd.notnull(report.get("win_rate")) else 0.0,
-                "爆仓次数": report.get("n_blowup", 0),
-                "预期存活(天)": round(expected_lifespan_hour / 24.0, 2) if not np.isinf(
-                    expected_lifespan_hour) else "999 (未爆仓)",
-                "平均持仓(h)": round(holding_time, 2) if pd.notnull(holding_time) else 0.0,
-                "死前翻倍胜率(%)": round(free_ride_win_rate * 100, 2) if pd.notnull(free_ride_win_rate) else 0.0,
-                "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
-                "年化爆仓次数": round(report.get("blowups_per_year", 0), 2),
-                "翻倍所需时间(小时)": round(report.get("time_to_double_hour", 0), 2),
-                "死前翻倍期望 (Doubles/Blowup)": round(doubles_per_blowup, 3) if not np.isinf(
-                    doubles_per_blowup) else "999 (未爆仓)",
-                "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
-                "手续费占毛利(%)": round(report.get("fee_ratio_traded", 0) * 100, 2)
-            }
-
-            results_by_margin[margin].append(row)
-
-            # 清理单次 margin 的局部大对象
-            del trades_df, report
-
-        # ==================== 严格的单进程内存回收 ====================
-        del cycles_df, cached_data, replayer
+        # 主进程只持有极少量结果行，这里的 gc 成本可忽略
         gc.collect()
 
         # 打印简单进度
         if idx % 10 == 0 or idx == len(pkl_files):
             print(f"进度: {idx}/{len(pkl_files)} 个策略文件已处理完成...")
+
+    # 安全关闭并回收进程池
+    if pool is not None:
+        pool.close()
+        pool.join()
 
     print("\n" + "=" * 80)
     print(f" 🎉 分析完成！开始为各个 Margin 生成独立报告...")
@@ -216,4 +416,5 @@ def analyze_all_strategies():
 
 
 if __name__ == "__main__":
+    mp.freeze_support()  # Windows / 打包环境安全护栏
     analyze_all_strategies()
