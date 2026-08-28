@@ -506,7 +506,7 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=6000, min_net_profit=1):
+def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=60, min_net_profit=-1000, min_total_profit=20):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -551,6 +551,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     if "净利润(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
+    if "总收益(Margin倍数)" in df_all.columns:
+        df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
+
     if df_all.empty:
         print(f"[提示] 根据条件过滤后，无匹配数据。")
         return
@@ -580,7 +583,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
                     "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "平均持仓(h)",
                     "翻倍胜率(%)", "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)",
-                    "日均收益(M)", "日中位收益(M)"]
+                    # "日均收益(M)", "日中位收益(M)"
+
+                    ]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
     # ========== 内部辅助排版函数 ==========
