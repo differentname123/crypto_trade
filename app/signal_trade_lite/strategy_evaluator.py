@@ -523,19 +523,15 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file=None, direction="both"):
+def show_leaderboard_csv(csv_file=None, direction="both", min_trades=0, min_net_profit=0):
     """
     专门用于读取并展示 CSV 文件的函数。
-
-    :param csv_file: CSV文件的相对或绝对路径，如果不传，默认自动读取同目录下最新的匹配文件。
-    :param direction: 筛选方向，可选值：'long' (仅做多), 'short' (仅做空), 'both' (全部展示)
+    【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
     """
-    # 动态匹配由于改名导致的未过滤文件读取
     if csv_file is None or csv_file == "strategy_leaderboard_filtered.csv":
         import glob
         files = glob.glob("strategy_leaderboard_*_files.csv")
         if files:
-            # 根据修改时间倒序排列找最新的
             csv_file = sorted(files, key=os.path.getmtime, reverse=True)[0]
         else:
             csv_file = "strategy_leaderboard_filtered.csv"
@@ -544,7 +540,6 @@ def show_leaderboard_csv(csv_file=None, direction="both"):
         print(f"[错误] 未找到文件: {csv_file}")
         return
 
-    # 读取 CSV 文件
     try:
         df_all = pd.read_csv(csv_file)
     except Exception as e:
@@ -555,29 +550,55 @@ def show_leaderboard_csv(csv_file=None, direction="both"):
         print("[提示] CSV 文件为空，无数据可展示。")
         return
 
-    # 根据传入参数过滤方向
+    # 1. 过滤方向
     d_filter = direction.strip().lower()
     if d_filter == 'long':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Long']
     elif d_filter == 'short':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Short']
-    elif d_filter != 'both':
-        print(f"[警告] 未知的方向参数 '{direction}'，将默认展示全部(Both)。")
+
+    # 2. 过滤交易次数
+    if "实际开仓数" in df_all.columns:
+        df_all = df_all[df_all["实际开仓数"] >= min_trades]
+
+    # 3. 过滤净利润
+    if "净利润(Margin倍数)" in df_all.columns:
+        df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
     if df_all.empty:
-        print(f"[提示] 根据条件 '{direction}' 筛选后，无匹配的数据。")
+        print(f"[提示] 根据条件过滤后，无匹配数据。")
         return
 
-    # 定义要展示的列（仅保留 CSV 中实际存在的列，避免 KeyError）
+    # 提前缩写部分表头名称，方便后续计算和展示
+    df_all.rename(columns={
+        "死前翻倍胜率(%)": "翻倍胜率(%)",
+        "总收益(Margin倍数)": "总收益(M倍)",
+        "总亏损(Margin倍数)": "总亏损(M倍)",
+        "净利润(Margin倍数)": "净利润(M倍)",
+        "平均每天收益(M倍)": "日均收益(M)",
+        "每天中位数收益(M倍)": "日中位收益(M)"
+    }, inplace=True)
+
+    # === 核心调整 1：计算每个策略的最高总收益，用于策略间的赛区排名 ===
+    strategy_max_profits = {}
+    for strategy_name, df_strat in df_all.groupby("策略"):
+        if "总收益(M倍)" in df_strat.columns:
+            strategy_max_profits[strategy_name] = df_strat["总收益(M倍)"].max()
+        else:
+            strategy_max_profits[strategy_name] = -float('inf')
+
+    # 根据最高收益对策略名称进行降序排序
+    sorted_strategies = sorted(strategy_max_profits.keys(), key=lambda k: strategy_max_profits[k], reverse=True)
+
+    # 定义要展示的列（分组展示，因此不包含"策略"列，省空间）
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
                     "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "平均持仓(h)",
-                    "死前翻倍胜率(%)", "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)",
-                    "平均每天收益(M倍)", "每天中位数收益(M倍)"]
+                    "翻倍胜率(%)", "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)",
+                    "日均收益(M)", "日中位收益(M)"]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
     # ========== 内部辅助排版函数 ==========
     def get_display_width(s):
-        """计算包含中文字符的字符串显示宽度"""
         w = 0
         for c in str(s):
             if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
@@ -587,50 +608,47 @@ def show_leaderboard_csv(csv_file=None, direction="both"):
         return w
 
     def right_align(s, width):
-        """控制台右对齐"""
         s = str(s)
         pad_len = width - get_display_width(s)
         return " " * max(0, pad_len) + s
 
     def format_val(val):
-        """格式化浮点数"""
         if isinstance(val, (float, np.float32, np.float64)):
             return f"{val:.3f}" if 0 < val < 0.1 else f"{val:.2f}"
         return str(val)
 
-    # ====================================
+    # === 核心调整 2：按照排好序的策略列表依次打印 ===
     index_count = 0
-    # 按策略分组打印
-    for strategy_name, df_strat in df_all.groupby("策略"):
+    for strategy_name in sorted_strategies:
         index_count += 1
-        print(f"\n🏆 策略{index_count} | 方向过滤: {direction.upper()} | 综合表现:")
+        # 提取当前策略的数据
+        df_strat = df_all[df_all["策略"] == strategy_name].copy()
 
-        # 排序
-        sort_cols = [c for c in ["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"] if c in df_strat.columns]
-        df_display = df_strat.sort_values(by=sort_cols).copy()
-        df_display = df_display[display_cols]
+        # 组内排序：按 总收益(M倍) 降序
+        if "总收益(M倍)" in df_strat.columns:
+            secondary_cols = [c for c in ["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"] if
+                              c in df_strat.columns]
+            sort_cols = ["总收益(M倍)"] + secondary_cols
+            ascendings = [False] + [True] * len(secondary_cols)
+            df_strat.sort_values(by=sort_cols, ascending=ascendings, inplace=True)
 
-        # 缩写部分表头名称以节省控制台空间
-        df_display.rename(columns={
-            "死前翻倍胜率(%)": "翻倍胜率(%)",
-            "总收益(Margin倍数)": "总收益(M倍)",
-            "总亏损(Margin倍数)": "总亏损(M倍)",
-            "净利润(Margin倍数)": "净利润(M倍)",
-            "平均每天收益(M倍)": "日均收益(M)",
-            "每天中位数收益(M倍)": "日中位收益(M)"
-        }, inplace=True)
+        df_display = df_strat[display_cols]
+
+        # 打印表头，附带展示该策略的最高收益，一目了然
+        max_p = strategy_max_profits[strategy_name]
+        print(
+            f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
 
-        # 计算每列最宽的字符长度，用于对齐
+        # 计算列宽
         for col in cols:
             max_w = get_display_width(col)
             for val in df_display[col]:
                 max_w = max(max_w, get_display_width(format_val(val)))
             col_widths.append(max_w)
 
-        # 构建并打印表头
         header_cells = [right_align(col, col_widths[i]) for i, col in enumerate(cols)]
         header_str = " | ".join(header_cells)
         sep_line = "-" * len(header_str)
@@ -639,7 +657,7 @@ def show_leaderboard_csv(csv_file=None, direction="both"):
         print(header_str)
         print(sep_line)
 
-        # 打印每一行数据
+        # 打印数据
         for _, row in df_display.iterrows():
             row_cells = [right_align(format_val(row[col]), col_widths[i]) for i, col in enumerate(cols)]
             print(" | ".join(row_cells))
