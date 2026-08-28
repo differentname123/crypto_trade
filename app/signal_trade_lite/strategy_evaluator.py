@@ -187,6 +187,8 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "总收益(Margin倍数)": round(report.get("_extracted_gross_profit", 0), 2),
         "总亏损(Margin倍数)": round(report.get("_extracted_gross_loss", 0), 2),
         "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
+        "平均每天收益(M倍)": round(report.get("_avg_daily_profit", 0), 4),
+        "每天中位数收益(M倍)": round(report.get("_median_daily_profit", 0), 4),
         "年化爆仓次数": round(report.get("blowups_per_year", 0), 2),
         "翻倍所需时间(小时)": round(report.get("time_to_double_hour", 0), 2),
         "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
@@ -246,6 +248,10 @@ def _process_one_file(file_path):
         # === 新增：解析每一笔闭环，智能提取总收益和总亏损 ===
         pnl_col = next((c for c in ["net_pnl_in_margin", "pnl_in_margin", "net_pnl", "pnl", "profit", "net_profit"] if
                         c in trades_df.columns), None)
+
+        avg_daily = 0.0
+        median_daily = 0.0
+
         if pnl_col:
             gross_profit = float(trades_df.loc[trades_df[pnl_col] > 0, pnl_col].sum())
             gross_loss = float(trades_df.loc[trades_df[pnl_col] < 0, pnl_col].sum())
@@ -253,6 +259,7 @@ def _process_one_file(file_path):
             # 若原始闭环收益列与最终报告净利润做了除以本金等换算操作，此处进行等比缩放对齐
             net_pnl_sum = gross_profit + gross_loss
             report_net = float(report.get("total_net_pnl_in_margin", 0.0))
+            ratio = 1.0
             if abs(net_pnl_sum) > 1e-6 and abs(report_net) > 1e-6 and abs(net_pnl_sum - report_net) > 1e-6:
                 ratio = report_net / net_pnl_sum
                 gross_profit *= ratio
@@ -260,10 +267,60 @@ def _process_one_file(file_path):
 
             report["_extracted_gross_profit"] = gross_profit
             report["_extracted_gross_loss"] = gross_loss
+
+            # --- 新增：计算不考虑爆仓亏损时的平均每天收益和中位数收益 ---
+            try:
+                time_col = None
+                for col in trades_df.columns:
+                    if any(k in str(col).lower() for k in ("time", "date", "stamp")):
+                        time_col = col
+                        # 优先取包含 close/end 的时间列
+                        if "close" in str(col).lower() or "end" in str(col).lower():
+                            break
+
+                if time_col is not None and not trades_df.empty:
+                    # 获取时间序列
+                    if pd.api.types.is_numeric_dtype(trades_df[time_col]):
+                        if trades_df[time_col].max() > 1e11:
+                            dt_series = pd.to_datetime(trades_df[time_col], unit='ms')
+                        else:
+                            dt_series = pd.to_datetime(trades_df[time_col], unit='s')
+                    else:
+                        dt_series = pd.to_datetime(trades_df[time_col])
+
+                    dates = dt_series.dt.date
+
+                    # 仅保留大于0的收益（即不考虑爆仓情况下的盈利闭环）
+                    win_mask = trades_df[pnl_col] > 0
+                    valid_pnl = trades_df.loc[win_mask, pnl_col] * ratio
+
+                    if not dates.empty:
+                        min_date = dates.min()
+                        max_date = dates.max()
+
+                        if pd.notnull(min_date) and pd.notnull(max_date):
+                            # 重建首单至末单的完整日期索引，保证未开仓或全亏损的天数算作0
+                            full_dates = pd.date_range(start=min_date, end=max_date).date
+
+                            if not valid_pnl.empty:
+                                daily_pnl = valid_pnl.groupby(dates[win_mask]).sum()
+                                daily_pnl = daily_pnl.reindex(full_dates, fill_value=0.0)
+                            else:
+                                daily_pnl = pd.Series(0.0, index=full_dates)
+
+                            avg_daily = float(daily_pnl.mean()) if not daily_pnl.empty else 0.0
+                            median_daily = float(daily_pnl.median()) if not daily_pnl.empty else 0.0
+            except Exception as e:
+                pass
+            # ------------------------------------------------------------
+
         else:
             # 防御性回退：如果找不到对应列名，尝试读取报告可能内置的字段
             report["_extracted_gross_profit"] = report.get("gross_profit_in_margin", report.get("total_profit", 0.0))
             report["_extracted_gross_loss"] = report.get("gross_loss_in_margin", report.get("total_loss", 0.0))
+
+        report["_avg_daily_profit"] = avg_daily
+        report["_median_daily_profit"] = median_daily
         # =====================================================
 
         del trades_df
@@ -378,7 +435,13 @@ def analyze_all_strategies():
 
     df_all = pd.DataFrame(all_results)
 
-    # === 修复点 2：将过滤逻辑提前，保证导出的 CSV 也是干净的 ===
+    # === 修改点：1. 最终保存的这个csv文件不要进行过滤，且包含文件数量信息 ===
+    num_files = len(pkl_files)
+    output_csv = f"strategy_leaderboard_{num_files}_files.csv"
+    df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
+    print(f"已将未过滤的完整结果保存至: {output_csv}\n")
+
+    # 为了控制台打印依然清爽，控制台展示仍保留原有过滤逻辑
     def check_lifespan(val):
         if isinstance(val, str) and "未爆仓" in val:
             return True
@@ -387,17 +450,14 @@ def analyze_all_strategies():
         except:
             return True
 
-    df_all = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
-    df_all = df_all[df_all["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
+    df_filtered = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
+    df_filtered = df_filtered[df_filtered["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
 
-    # 输出完整结果 CSV 报告
-    output_csv = "strategy_leaderboard_filtered.csv"
-    df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
-    print(f"已将过滤后的结果保存至: {output_csv}\n")
-
+    # === 增加新增的两列至展示列表 ===
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
                     "爆仓几率(%)", "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
-                    "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)"]
+                    "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)",
+                    "平均每天收益(M倍)", "每天中位数收益(M倍)"]
 
     def get_display_width(s):
         w = 0
@@ -418,13 +478,13 @@ def analyze_all_strategies():
             return f"{val:.3f}" if val < 0.1 and val > 0 else f"{val:.2f}"
         return str(val)
 
-    for strategy_name, df_strat in df_all.groupby("策略"):
+    # 注意这里使用 df_filtered 做打印展示，防止刷屏
+    for strategy_name, df_strat in df_filtered.groupby("策略"):
         print(f"\n🏆 策略 = {strategy_name} | 多币种 & 不同 Margin 综合表现:")
 
         # 排序
         df_display = df_strat.sort_values(by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]).copy()
 
-        # === 修复点 3：此处无需重复过滤，已被提前 ===
         if df_display.empty:
             continue
 
@@ -434,7 +494,9 @@ def analyze_all_strategies():
             "死前翻倍胜率(%)": "翻倍胜率(%)",
             "总收益(Margin倍数)": "总收益(M倍)",
             "总亏损(Margin倍数)": "总亏损(M倍)",
-            "净利润(Margin倍数)": "净利润(M倍)"
+            "净利润(Margin倍数)": "净利润(M倍)",
+            "平均每天收益(M倍)": "日均收益(M)",
+            "每天中位数收益(M倍)": "日中位收益(M)"
         }, inplace=True)
 
         cols = list(df_display.columns)
@@ -461,13 +523,23 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction="both"):
+def show_leaderboard_csv(csv_file=None, direction="both"):
     """
-    专门用于读取并展示 strategy_leaderboard_filtered.csv 的函数。
+    专门用于读取并展示 CSV 文件的函数。
 
-    :param csv_file: CSV文件的相对或绝对路径
+    :param csv_file: CSV文件的相对或绝对路径，如果不传，默认自动读取同目录下最新的匹配文件。
     :param direction: 筛选方向，可选值：'long' (仅做多), 'short' (仅做空), 'both' (全部展示)
     """
+    # 动态匹配由于改名导致的未过滤文件读取
+    if csv_file is None or csv_file == "strategy_leaderboard_filtered.csv":
+        import glob
+        files = glob.glob("strategy_leaderboard_*_files.csv")
+        if files:
+            # 根据修改时间倒序排列找最新的
+            csv_file = sorted(files, key=os.path.getmtime, reverse=True)[0]
+        else:
+            csv_file = "strategy_leaderboard_filtered.csv"
+
     if not os.path.exists(csv_file):
         print(f"[错误] 未找到文件: {csv_file}")
         return
@@ -499,7 +571,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction
     # 定义要展示的列（仅保留 CSV 中实际存在的列，避免 KeyError）
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
                     "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "平均持仓(h)",
-                    "死前翻倍胜率(%)", "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)"]
+                    "死前翻倍胜率(%)", "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)",
+                    "平均每天收益(M倍)", "每天中位数收益(M倍)"]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
     # ========== 内部辅助排版函数 ==========
@@ -542,7 +615,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction
             "死前翻倍胜率(%)": "翻倍胜率(%)",
             "总收益(Margin倍数)": "总收益(M倍)",
             "总亏损(Margin倍数)": "总亏损(M倍)",
-            "净利润(Margin倍数)": "净利润(M倍)"
+            "净利润(Margin倍数)": "净利润(M倍)",
+            "平均每天收益(M倍)": "日均收益(M)",
+            "每天中位数收益(M倍)": "日中位收益(M)"
         }, inplace=True)
 
         cols = list(df_display.columns)
@@ -571,8 +646,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction
 
         print(sep_line)
 
+
 if __name__ == "__main__":
     mp.freeze_support()
     analyze_all_strategies()
 
-    # show_leaderboard_csv("strategy_leaderboard_filtered.csv", direction="long")
+    # show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
