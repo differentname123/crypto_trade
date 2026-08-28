@@ -2272,9 +2272,9 @@ if __name__ == "__main__":
                   "low": np.float32, "close": np.float32, "volume": np.float32}
 
     # 新增三个参数搜索空间
-    search_add_steps = [0.001, 0.002, 0.005, 0.01, 0.015]
-    search_tp_steps = [0.0015, 0.002, 0.005, 0.01, 0.015]
-    search_mults = [1.5, 2.0, 3]
+    search_add_steps = [ 0.002, 0.005, 0.01, 0.015]
+    search_tp_steps = [0.002, 0.005, 0.01, 0.015]
+    search_mults = [1.5, 2.0]
 
     # 每个策略包含的多空和参数组合总数
     combinations_per_strat = len(search_add_steps) * len(search_tp_steps) * len(search_mults) * 2

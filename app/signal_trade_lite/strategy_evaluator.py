@@ -45,24 +45,6 @@ PARALLEL_WORKERS = 20
 
 # === 新增：需要被评估和展示的目标策略白名单（加上字符串引号） ===
 TARGET_STRATEGIES = [
-    "strategy_1_vwap_zscore",
-    "strategy_2_quantile_deviation",
-    "strategy_4_volume_price_absorption",
-    "strategy_5_liquidity_vacuum",
-    "strategy_6_volume_climax",
-    "strategy_8_rolling_stop_hunt",
-    "strategy_12_kaufman_efficiency_ratio",
-    "strategy_15_micro_autocorrelation",
-    "strategy_17_sniper_combo_long",
-    "strategy_18_sniper_combo_short",
-    "strategy_19_pulse_dryup_long",
-    "strategy_20_pulse_dryup_short",
-    "strategy_21_squeeze_snapback_long",
-    "strategy_22_squeeze_snapback_short",
-    "strategy_23_volume_climax_absorption_long",
-    "strategy_24_volume_climax_absorption_short",
-    "strategy_25_flash_crash_rebound_long",
-    "strategy_26_flash_crash_rebound_short"
 ]
 
 # =====================================================================
@@ -340,6 +322,14 @@ def _process_one_file_safe(file_path):
     except BaseException as e:
         return {"ok": False, "file_path": file_path, "err": f"{type(e).__name__}: {e}"}
 
+# 为了控制台打印依然清爽，控制台展示仍保留原有过滤逻辑
+def check_lifespan(val):
+    if isinstance(val, str) and "未爆仓" in val:
+        return True
+    try:
+        return float(val) >= MIN_LIFESPAN_DAYS
+    except:
+        return True
 
 def analyze_all_strategies():
     print("=" * 80)
@@ -441,14 +431,7 @@ def analyze_all_strategies():
     df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
     print(f"已将未过滤的完整结果保存至: {output_csv}\n")
 
-    # 为了控制台打印依然清爽，控制台展示仍保留原有过滤逻辑
-    def check_lifespan(val):
-        if isinstance(val, str) and "未爆仓" in val:
-            return True
-        try:
-            return float(val) >= MIN_LIFESPAN_DAYS
-        except:
-            return True
+
 
     df_filtered = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
     df_filtered = df_filtered[df_filtered["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
@@ -523,7 +506,7 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file=None, direction="both", min_trades=0, min_net_profit=0):
+def show_leaderboard_csv(csv_file=None, direction="both", min_trades=6000, min_net_profit=1):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -560,6 +543,9 @@ def show_leaderboard_csv(csv_file=None, direction="both", min_trades=0, min_net_
     # 2. 过滤交易次数
     if "实际开仓数" in df_all.columns:
         df_all = df_all[df_all["实际开仓数"] >= min_trades]
+
+    df_all = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
+
 
     # 3. 过滤净利润
     if "净利润(Margin倍数)" in df_all.columns:
@@ -637,7 +623,9 @@ def show_leaderboard_csv(csv_file=None, direction="both", min_trades=0, min_net_
         # 打印表头，附带展示该策略的最高收益，一目了然
         max_p = strategy_max_profits[strategy_name]
         print(
-            f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+            f"\n🏆 策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+        # print(
+        #     f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
