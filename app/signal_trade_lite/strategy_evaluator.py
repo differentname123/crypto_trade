@@ -624,6 +624,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         max_p = strategy_max_profits[strategy_name]
         print(
             f"\n🏆 策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+        # print(
+        #     f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
