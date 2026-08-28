@@ -825,8 +825,10 @@ def factor_050(df):
     up_ret = ret.where(ret > 0, np.nan)
     down_ret = ret.where(ret < 0, np.nan)
 
-    up_std = up_ret.rolling(window_240).std()
-    down_std = down_ret.rolling(window_240).std()
+    # 增加 min_periods，只要过去240分钟内有60根上涨/下跌K线即可计算标准差
+    min_p = window_240 // 4
+    up_std = up_ret.rolling(window_240, min_periods=min_p).std()
+    down_std = down_ret.rolling(window_240, min_periods=min_p).std()
     ratio = up_std / down_std.replace(0, np.nan)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
@@ -844,8 +846,9 @@ def factor_051(df):
     up_ret = ret.where(ret > 0, np.nan)
     down_ret = ret.where(ret < 0, np.nan)
 
-    up_std = up_ret.rolling(window_240).std()
-    down_std = down_ret.rolling(window_240).std()
+    min_p = window_240 // 4
+    up_std = up_ret.rolling(window_240, min_periods=min_p).std()
+    down_std = down_ret.rolling(window_240, min_periods=min_p).std()
     ratio = up_std / down_std.replace(0, np.nan)
 
     q_val = ratio.rolling(window_1440).quantile(q_low)
