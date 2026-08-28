@@ -461,6 +461,118 @@ def analyze_all_strategies():
         print(sep_line)
 
 
+def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction="both"):
+    """
+    专门用于读取并展示 strategy_leaderboard_filtered.csv 的函数。
+
+    :param csv_file: CSV文件的相对或绝对路径
+    :param direction: 筛选方向，可选值：'long' (仅做多), 'short' (仅做空), 'both' (全部展示)
+    """
+    if not os.path.exists(csv_file):
+        print(f"[错误] 未找到文件: {csv_file}")
+        return
+
+    # 读取 CSV 文件
+    try:
+        df_all = pd.read_csv(csv_file)
+    except Exception as e:
+        print(f"[错误] 读取 CSV 失败: {e}")
+        return
+
+    if df_all.empty:
+        print("[提示] CSV 文件为空，无数据可展示。")
+        return
+
+    # 根据传入参数过滤方向
+    d_filter = direction.strip().lower()
+    if d_filter == 'long':
+        df_all = df_all[df_all["方向"].str.capitalize() == 'Long']
+    elif d_filter == 'short':
+        df_all = df_all[df_all["方向"].str.capitalize() == 'Short']
+    elif d_filter != 'both':
+        print(f"[警告] 未知的方向参数 '{direction}'，将默认展示全部(Both)。")
+
+    if df_all.empty:
+        print(f"[提示] 根据条件 '{direction}' 筛选后，无匹配的数据。")
+        return
+
+    # 定义要展示的列（仅保留 CSV 中实际存在的列，避免 KeyError）
+    display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
+                    "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "平均持仓(h)",
+                    "死前翻倍胜率(%)", "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)"]
+    display_cols = [c for c in display_cols if c in df_all.columns]
+
+    # ========== 内部辅助排版函数 ==========
+    def get_display_width(s):
+        """计算包含中文字符的字符串显示宽度"""
+        w = 0
+        for c in str(s):
+            if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
+                w += 2
+            else:
+                w += 1
+        return w
+
+    def right_align(s, width):
+        """控制台右对齐"""
+        s = str(s)
+        pad_len = width - get_display_width(s)
+        return " " * max(0, pad_len) + s
+
+    def format_val(val):
+        """格式化浮点数"""
+        if isinstance(val, (float, np.float32, np.float64)):
+            return f"{val:.3f}" if 0 < val < 0.1 else f"{val:.2f}"
+        return str(val)
+
+    # ====================================
+    index_count = 0
+    # 按策略分组打印
+    for strategy_name, df_strat in df_all.groupby("策略"):
+        index_count += 1
+        print(f"\n🏆 策略{index_count} | 方向过滤: {direction.upper()} | 综合表现:")
+
+        # 排序
+        sort_cols = [c for c in ["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"] if c in df_strat.columns]
+        df_display = df_strat.sort_values(by=sort_cols).copy()
+        df_display = df_display[display_cols]
+
+        # 缩写部分表头名称以节省控制台空间
+        df_display.rename(columns={
+            "死前翻倍胜率(%)": "翻倍胜率(%)",
+            "总收益(Margin倍数)": "总收益(M倍)",
+            "总亏损(Margin倍数)": "总亏损(M倍)",
+            "净利润(Margin倍数)": "净利润(M倍)"
+        }, inplace=True)
+
+        cols = list(df_display.columns)
+        col_widths = []
+
+        # 计算每列最宽的字符长度，用于对齐
+        for col in cols:
+            max_w = get_display_width(col)
+            for val in df_display[col]:
+                max_w = max(max_w, get_display_width(format_val(val)))
+            col_widths.append(max_w)
+
+        # 构建并打印表头
+        header_cells = [right_align(col, col_widths[i]) for i, col in enumerate(cols)]
+        header_str = " | ".join(header_cells)
+        sep_line = "-" * len(header_str)
+
+        print(sep_line)
+        print(header_str)
+        print(sep_line)
+
+        # 打印每一行数据
+        for _, row in df_display.iterrows():
+            row_cells = [right_align(format_val(row[col]), col_widths[i]) for i, col in enumerate(cols)]
+            print(" | ".join(row_cells))
+
+        print(sep_line)
+
 if __name__ == "__main__":
-    mp.freeze_support()
-    analyze_all_strategies()
+    # mp.freeze_support()
+    # analyze_all_strategies()
+
+    show_leaderboard_csv("strategy_leaderboard_filtered.csv", direction="long")
