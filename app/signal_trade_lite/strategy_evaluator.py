@@ -572,7 +572,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_filtered.csv", direction
         print(sep_line)
 
 if __name__ == "__main__":
-    # mp.freeze_support()
-    # analyze_all_strategies()
+    mp.freeze_support()
+    analyze_all_strategies()
 
-    show_leaderboard_csv("strategy_leaderboard_filtered.csv", direction="long")
+    # show_leaderboard_csv("strategy_leaderboard_filtered.csv", direction="long")
