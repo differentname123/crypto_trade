@@ -35,7 +35,7 @@ TEST_MARGINS = [2.55, 10.0]
 
 # === 新增：打印过滤与并行处理参数 ===
 # 最终打印时，过滤掉预期存活(天)小于此数值的结果
-MIN_LIFESPAN_DAYS = 30
+MIN_LIFESPAN_DAYS = 60
 
 # 最终打印时，过滤掉 净利润(Margin倍数) 小于此数值的结果
 MIN_NET_PROFIT = -1
@@ -506,7 +506,7 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file=None, direction="both", min_trades=6000, min_net_profit=1):
+def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=6000, min_net_profit=1):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -624,8 +624,6 @@ def show_leaderboard_csv(csv_file=None, direction="both", min_trades=6000, min_n
         max_p = strategy_max_profits[strategy_name]
         print(
             f"\n🏆 策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
-        # print(
-        #     f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
@@ -654,7 +652,7 @@ def show_leaderboard_csv(csv_file=None, direction="both", min_trades=6000, min_n
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
-    analyze_all_strategies()
+    # mp.freeze_support()
+    # analyze_all_strategies()
 
-    # show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
+    show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
