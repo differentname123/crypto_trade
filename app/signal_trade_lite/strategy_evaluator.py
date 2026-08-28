@@ -12,6 +12,7 @@ import gc
 import re
 import warnings
 import multiprocessing as mp
+import gzip  # === 兼容新老文件修改点 1：引入 gzip ===
 
 import numpy as np
 import pandas as pd
@@ -200,8 +201,13 @@ def _process_one_file(file_path):
 
     gc.disable()
     try:
-        with open(file_path, 'rb', buffering=4 * 1024 * 1024) as f:
-            cached_data = pickle.load(f)
+        # === 兼容新老文件修改点 2：根据后缀动态判断读取方式 ===
+        if file_path.endswith(".gz"):
+            with gzip.open(file_path, 'rb') as f:
+                cached_data = pickle.load(f)
+        else:
+            with open(file_path, 'rb', buffering=4 * 1024 * 1024) as f:
+                cached_data = pickle.load(f)
     finally:
         gc.enable()
 
@@ -283,16 +289,20 @@ def analyze_all_strategies():
     print(f" 🚀 启动全局策略评估引擎 | 设定测试 Margins = {TEST_MARGINS}")
     print("=" * 80)
 
-    search_pattern_main = os.path.join(CACHE_DIR, "stage1_*.pkl")
-    search_pattern_short = os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl")
+    # === 兼容新老文件修改点 3：让 glob 同时搜索 .pkl 和 .pkl.gz 文件 ===
+    files_main = glob.glob(os.path.join(CACHE_DIR, "stage1_*.pkl")) + \
+                 glob.glob(os.path.join(CACHE_DIR, "stage1_*.pkl.gz"))
 
-    # === 修复点 1：使用 set 对文件路径去重，防止目录相同时数据翻倍 ===
-    files_main = glob.glob(search_pattern_main)
-    files_short = glob.glob(search_pattern_short) if os.path.exists(SHORT_CACHE_DIR) else []
+    if os.path.exists(SHORT_CACHE_DIR):
+        files_short = glob.glob(os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl")) + \
+                      glob.glob(os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl.gz"))
+    else:
+        files_short = []
+
     pkl_files = list(set(files_main + files_short))
 
     if not pkl_files:
-        print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl 文件！")
+        print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl(或.gz) 文件！")
         return
 
     # 文件前置过滤逻辑，仅保留属于白名单策略的文件
@@ -300,6 +310,7 @@ def analyze_all_strategies():
     for filepath in pkl_files:
         filename = os.path.basename(filepath)
         _, strategy_name, _ = _parse_filename(filename)
+        # 如果需要过滤特定的策略，可以取消下面这行的注释
         # if strategy_name in TARGET_STRATEGIES:
         filtered_pkl_files.append(filepath)
 
@@ -448,6 +459,7 @@ def analyze_all_strategies():
             print(" | ".join(row_cells))
 
         print(sep_line)
+
 
 if __name__ == "__main__":
     mp.freeze_support()
