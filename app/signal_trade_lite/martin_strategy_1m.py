@@ -4,7 +4,8 @@ import time
 
 import pandas as pd
 import numpy as np
-
+import gzip
+import pickle # 原本就有的
 
 # ==================== 一、价格偏离与位置类 ====================
 # ==================== 一、价格偏离与位置类 ====================
@@ -2197,60 +2198,9 @@ def sweep_margins(replayer, margins, verbose=False):
     return pd.DataFrame(rows)
 
 
-def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 10.0, 40.6),
-                 report_margin=None, **stage1_kw):
-    """一站式: Stage1 -> Replayer -> 扫描 -> 详细报告 (已支持 Stage 1 结果本地缓存跳过)"""
-
-    # 抽取核心参数，组装缓存文件名
-    fee = stage1_kw.get('fee_rate', DEFAULT_FEE)
-    add = stage1_kw.get('add_step', DEFAULT_ADD_STEP)
-    tp = stage1_kw.get('tp_step', DEFAULT_TP_STEP)
-    mult = stage1_kw.get('multiplier', DEFAULT_MULT)
-    dd_abort = stage1_kw.get('dd_abort', 'None')
-    max_l = stage1_kw.get('max_layer_hard', 512)
-    mtm = stage1_kw.get('mtm_charge_close_fee', True)
-
-    os.makedirs(r"E:\backtest_data_1m", exist_ok=True)
-    cache_filename = os.path.join(r"E:\backtest_data_1m",
-                                  f"stage1_{data_name}_f{fee}_a{add}_t{tp}_m{mult}_da{dd_abort}_ml{max_l}_mtm{mtm}.pkl")
-
-    if os.path.exists(cache_filename):
-        _log("[缓存系统] 发现匹配的 Stage 1 缓存: %s (%.1f MB), 跳过高昂计算直接加载..."
-             % (cache_filename, os.path.getsize(cache_filename) / 1048576.0))
-        t = time.time()
-        with open(cache_filename, 'rb') as f:
-            cached_data = pickle.load(f)
-            cycles = cached_data['df']
-            cycles.attrs = cached_data['attrs']
-        del cached_data
-        gc.collect()
-        _log("[缓存系统] 加载完成: %d cycles, 耗时 %.1fs" % (len(cycles), time.time() - t))
-    else:
-        _log("[缓存系统] 未发现匹配缓存, 开始运行 Stage 1, 结果将保存至: %s" % cache_filename)
-        cycles = run_stage1(df, **stage1_kw)
-        t = time.time()
-        with open(cache_filename, 'wb') as f:
-            # Pandas 偶尔在序列化时丢弃 attrs，使用字典确保元数据一同保存
-            pickle.dump({'df': cycles, 'attrs': dict(cycles.attrs)}, f,
-                        protocol=pickle.HIGHEST_PROTOCOL)
-        _log("[缓存系统] 已写盘: %s (%.1f MB, %.1fs)"
-             % (cache_filename, os.path.getsize(cache_filename) / 1048576.0, time.time() - t))
-
-    _log("Stage2 构建时间线重组器 ...")
-    t = time.time()
-    rp = TimelineReplayer(cycles)
-    _log("Stage2 重组器就绪 (%.2fs), 开始扫描 %d 个 Margin ..." % (time.time() - t, len(margins)))
-    t = time.time()
-    sweep = sweep_margins(rp, margins)
-    _log("Margin 扫描完成 (%.2fs)" % (time.time() - t))
-    if report_margin is None and len(margins):
-        report_margin = list(margins)[len(margins) // 2]
-    trades = rp.run(report_margin)
-    report = evaluate_free_ride(trades, cycles, report_margin)
-    print_report(report)
-    return cycles, rp, sweep, trades, report
-
-
+# =====================================================================
+# 4. 执行入口 (按需批量化一阶段生成)
+# =====================================================================
 # =====================================================================
 # 4. 执行入口 (按需批量化一阶段生成)
 # =====================================================================
@@ -2378,8 +2328,9 @@ if __name__ == "__main__":
                 for add_step_val in search_add_steps:
                     for tp_step_val in search_tp_steps:
                         for mult_val in search_mults:
+                            # 修改 1：缓存检查后缀改为 .pkl.gz
                             c_fn = os.path.join(output_dir,
-                                                f"stage1_{data_name_dir_temp}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl")
+                                                f"stage1_{data_name_dir_temp}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl.gz")
 
                             if not os.path.exists(c_fn):
                                 all_caches_exist = False
@@ -2434,16 +2385,17 @@ if __name__ == "__main__":
                         for mult_val in search_mults:
                             task_done += 1
 
+                            # 修改 2：后缀改为 .pkl.gz，确保能够正确触发缓存跳过逻辑
                             cache_fn = os.path.join(output_dir,
-                                                    f"stage1_{data_name_dir}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl")
+                                                    f"stage1_{data_name_dir}_f{DEFAULT_FEE}_a{add_step_val}_t{tp_step_val}_m{mult_val}_daNone_ml512_mtmTrue.pkl.gz")
 
                             if os.path.exists(cache_fn):
                                 _log("> [%s|a%g|t%g|m%g] 缓存已存在, 跳过运算: %s" % (
-                                tag, add_step_val, tp_step_val, mult_val, cache_fn), 1)
+                                    tag, add_step_val, tp_step_val, mult_val, cache_fn), 1)
                                 continue
 
                             _log("> [%s|a%g|t%g|m%g] 开始运行 Stage 1 ... (全局任务 %d/%d)" % (
-                            tag, add_step_val, tp_step_val, mult_val, task_done, total_task), 1)
+                                tag, add_step_val, tp_step_val, mult_val, task_done, total_task), 1)
                             t1 = time.time()
 
                             # 传入对应组合参数覆盖默认值
@@ -2457,12 +2409,15 @@ if __name__ == "__main__":
                                 verbose=True
                             )
                             _log("> [%s|a%g|t%g|m%g] Stage 1 结束, 耗时 %s, 开始写盘 ..." % (
-                            tag, add_step_val, tp_step_val, mult_val, _fmt_hms(time.time() - t1)), 1)
+                                tag, add_step_val, tp_step_val, mult_val, _fmt_hms(time.time() - t1)), 1)
 
                             t2 = time.time()
-                            with open(cache_fn, 'wb') as f:
+                            # 修改 3：统一用同一个文件路径 cache_fn 保存，并加入 compresslevel=3
+                            with gzip.open(cache_fn, 'wb', compresslevel=3) as f:
                                 pickle.dump({'df': cycles_tmp, 'attrs': dict(cycles_tmp.attrs)}, f,
                                             protocol=pickle.HIGHEST_PROTOCOL)
+
+                            # 因为路径保持统一了，这里的 getsize 不会再报 FileNotFoundError 错误
                             _log("> [%s|a%g|t%g|m%g] 一阶段已保存: %s (%.1f MB, 写盘 %.1fs)"
                                  % (tag, add_step_val, tp_step_val, mult_val, cache_fn,
                                     os.path.getsize(cache_fn) / 1048576.0, time.time() - t2), 1)

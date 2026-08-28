@@ -26,8 +26,8 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 
-CACHE_DIR = r"E:\backtest_data_1m"  # 做多策略默认缓存目录
-SHORT_CACHE_DIR = r"E:\backtest_data_1m"  # 新增：做空策略缓存目录
+# CACHE_DIR = r"E:\backtest_data_1m"  # 做多策略默认缓存目录
+# SHORT_CACHE_DIR = r"E:\backtest_data_1m"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
 TEST_MARGINS = [2.55, 10.0]
@@ -342,7 +342,7 @@ def analyze_all_strategies():
         else:
             print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
 
-        if idx % 50 == 0 or idx == len(pkl_files):
+        if idx % 500 == 0 or idx == len(pkl_files):
             print(f"进度: {idx}/{len(pkl_files)} 个策略文件已处理完成...")
 
     if pool is not None:
