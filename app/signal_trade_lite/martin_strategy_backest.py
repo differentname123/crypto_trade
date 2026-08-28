@@ -1725,8 +1725,6 @@ if __name__ == "__main__":
         "BTCUSDT",
         "ETHUSDT",
         "SOLUSDT",
-        "LINKUSDT",
-        "AAVEUSDT",
         "BNBUSDT"
     ]
 
