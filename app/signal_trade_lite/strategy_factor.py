@@ -205,21 +205,31 @@ def factor_013(df):
     return df
 
 
-def factor_014(df):
+def factor_014_high(df):
     df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
+
+    ret_1 = df['close'].pct_change()
+    autocorr = ret_1.rolling(window_60).corr(ret_1.shift(1))
+
+    q_val = autocorr.rolling(window_1440).quantile(q_high)
+    df['signal'] = (autocorr > q_val).fillna(False).astype(bool)
+    return df
+
+
+def factor_014_low(df):
+    df = df.copy()
+    window_60 = 60
+    window_1440 = 1440
     q_low = 0.05
 
     ret_1 = df['close'].pct_change()
     autocorr = ret_1.rolling(window_60).corr(ret_1.shift(1))
 
-    q_val_high = autocorr.rolling(window_1440).quantile(q_high)
-    q_val_low = autocorr.rolling(window_1440).quantile(q_low)
-
-    cond = (autocorr > q_val_high) | (autocorr < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+    q_val = autocorr.rolling(window_1440).quantile(q_low)
+    df['signal'] = (autocorr < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -273,11 +283,27 @@ def factor_017(df):
 
 # ==================== 三、波动率与振幅类 ====================
 
-def factor_018(df):
+def factor_018_high(df):
     df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
+
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift(1)).abs()
+    tr3 = (df['low'] - df['close'].shift(1)).abs()
+    tr = tr1.combine(tr2, max).combine(tr3, max)
+
+    atr_pct = tr.rolling(window_60).mean() / df['close']
+    q_val = atr_pct.rolling(window_1440).quantile(q_high)
+    df['signal'] = (atr_pct > q_val).fillna(False).astype(bool)
+    return df
+
+
+def factor_018_low(df):
+    df = df.copy()
+    window_60 = 60
+    window_1440 = 1440
     q_low = 0.05
 
     tr1 = df['high'] - df['low']
@@ -286,37 +312,40 @@ def factor_018(df):
     tr = tr1.combine(tr2, max).combine(tr3, max)
 
     atr_pct = tr.rolling(window_60).mean() / df['close']
-    q_val_high = atr_pct.rolling(window_1440).quantile(q_high)
-    q_val_low = atr_pct.rolling(window_1440).quantile(q_low)
-
-    cond = (atr_pct > q_val_high) | (atr_pct < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+    q_val = atr_pct.rolling(window_1440).quantile(q_low)
+    df['signal'] = (atr_pct < q_val).fillna(False).astype(bool)
     return df
 
 
-def factor_019(df):
+def factor_019_high(df):
     df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
-    q_low = 0.05
 
     ret_std = df['close'].pct_change().rolling(window_60).std()
-
-    q_val_high = ret_std.rolling(window_1440).quantile(q_high)
-    q_val_low = ret_std.rolling(window_1440).quantile(q_low)
-
-    cond = (ret_std > q_val_high) | (ret_std < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+    q_val = ret_std.rolling(window_1440).quantile(q_high)
+    df['signal'] = (ret_std > q_val).fillna(False).astype(bool)
     return df
 
 
-def factor_020(df):
+def factor_019_low(df):
+    df = df.copy()
+    window_60 = 60
+    window_1440 = 1440
+    q_low = 0.05
+
+    ret_std = df['close'].pct_change().rolling(window_60).std()
+    q_val = ret_std.rolling(window_1440).quantile(q_low)
+    df['signal'] = (ret_std < q_val).fillna(False).astype(bool)
+    return df
+
+
+def factor_020_high(df):
     df = df.copy()
     window_15 = 15
     window_240 = 240
     window_1440 = 1440
-    q_low = 0.05
     q_high = 0.95
 
     ret = df['close'].pct_change()
@@ -324,11 +353,25 @@ def factor_020(df):
     std_240 = ret.rolling(window_240).std()
     ratio = std_15 / std_240
 
-    q_val_low = ratio.rolling(window_1440).quantile(q_low)
-    q_val_high = ratio.rolling(window_1440).quantile(q_high)
+    q_val = ratio.rolling(window_1440).quantile(q_high)
+    df['signal'] = (ratio > q_val).fillna(False).astype(bool)
+    return df
 
-    cond = (ratio < q_val_low) | (ratio > q_val_high)
-    df['signal'] = cond.fillna(False).astype(bool)
+
+def factor_020_low(df):
+    df = df.copy()
+    window_15 = 15
+    window_240 = 240
+    window_1440 = 1440
+    q_low = 0.05
+
+    ret = df['close'].pct_change()
+    std_15 = ret.rolling(window_15).std()
+    std_240 = ret.rolling(window_240).std()
+    ratio = std_15 / std_240
+
+    q_val = ratio.rolling(window_1440).quantile(q_low)
+    df['signal'] = (ratio < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -491,22 +534,33 @@ def factor_030(df):
 
 # ==================== 五、成交量与流动性类 ====================
 
-def factor_031(df):
+def factor_031_high(df):
     df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
+
+    v_mean = df['volume'].rolling(window_60).mean()
+    v_std = df['volume'].rolling(window_60).std()
+    v_z = (df['volume'] - v_mean) / v_std
+
+    q_val = v_z.rolling(window_1440).quantile(q_high)
+    df['signal'] = (v_z > q_val).fillna(False).astype(bool)
+    return df
+
+
+def factor_031_low(df):
+    df = df.copy()
+    window_60 = 60
+    window_1440 = 1440
     q_low = 0.05
 
     v_mean = df['volume'].rolling(window_60).mean()
     v_std = df['volume'].rolling(window_60).std()
     v_z = (df['volume'] - v_mean) / v_std
 
-    q_val_high = v_z.rolling(window_1440).quantile(q_high)
-    q_val_low = v_z.rolling(window_1440).quantile(q_low)
-
-    cond = (v_z > q_val_high) | (v_z < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+    q_val = v_z.rolling(window_1440).quantile(q_low)
+    df['signal'] = (v_z < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -559,21 +613,31 @@ def factor_034(df):
     return df
 
 
-def factor_035(df):
+def factor_035_high(df):
     df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
+
+    ret = df['close'].pct_change()
+    corr = ret.rolling(window_60).corr(df['volume'])
+
+    q_val = corr.rolling(window_1440).quantile(q_high)
+    df['signal'] = (corr > q_val).fillna(False).astype(bool)
+    return df
+
+
+def factor_035_low(df):
+    df = df.copy()
+    window_60 = 60
+    window_1440 = 1440
     q_low = 0.05
 
     ret = df['close'].pct_change()
     corr = ret.rolling(window_60).corr(df['volume'])
 
-    q_val_high = corr.rolling(window_1440).quantile(q_high)
-    q_val_low = corr.rolling(window_1440).quantile(q_low)
-
-    cond = (corr > q_val_high) | (corr < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+    q_val = corr.rolling(window_1440).quantile(q_low)
+    df['signal'] = (corr < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -645,22 +709,33 @@ def factor_039(df):
 
 # ==================== 七、区间、压缩与突破类 ====================
 
-def factor_040(df):
+def factor_040_high(df):
     df = df.copy()
     window_240 = 240
     window_1440 = 1440
-    q_low = 0.05
     q_high = 0.95
 
     high_240 = df['high'].rolling(window_240).max()
     low_240 = df['low'].rolling(window_240).min()
     width = (high_240 - low_240) / df['close']
 
-    q_val_low = width.rolling(window_1440).quantile(q_low)
-    q_val_high = width.rolling(window_1440).quantile(q_high)
+    q_val = width.rolling(window_1440).quantile(q_high)
+    df['signal'] = (width > q_val).fillna(False).astype(bool)
+    return df
 
-    cond = (width < q_val_low) | (width > q_val_high)
-    df['signal'] = cond.fillna(False).astype(bool)
+
+def factor_040_low(df):
+    df = df.copy()
+    window_240 = 240
+    window_1440 = 1440
+    q_low = 0.05
+
+    high_240 = df['high'].rolling(window_240).max()
+    low_240 = df['low'].rolling(window_240).min()
+    width = (high_240 - low_240) / df['close']
+
+    q_val = width.rolling(window_1440).quantile(q_low)
+    df['signal'] = (width < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -735,12 +810,11 @@ def factor_044(df):
     return df
 
 
-def factor_045(df):
+def factor_045_high(df):
     df = df.copy()
     base_240 = 240
     window_1440 = 1440
     q_high = 0.95
-    q_low = 0.05
 
     # argmax返回窗口内最大值的相对索引(0到239)
     # 距离当前的分钟数即为 (窗口大小 - 1) - 相对索引
@@ -748,11 +822,23 @@ def factor_045(df):
     dist_min = (base_240 - 1) - df['low'].rolling(base_240).apply(np.argmin, raw=True)
     min_dist = np.minimum(dist_max, dist_min)
 
-    q_val_high = min_dist.rolling(window_1440).quantile(q_high)
-    q_val_low = min_dist.rolling(window_1440).quantile(q_low)
+    q_val = min_dist.rolling(window_1440).quantile(q_high)
+    df['signal'] = (min_dist > q_val).fillna(False).astype(bool)
+    return df
 
-    cond = (min_dist > q_val_high) | (min_dist < q_val_low)
-    df['signal'] = cond.fillna(False).astype(bool)
+
+def factor_045_low(df):
+    df = df.copy()
+    base_240 = 240
+    window_1440 = 1440
+    q_low = 0.05
+
+    dist_max = (base_240 - 1) - df['high'].rolling(base_240).apply(np.argmax, raw=True)
+    dist_min = (base_240 - 1) - df['low'].rolling(base_240).apply(np.argmin, raw=True)
+    min_dist = np.minimum(dist_max, dist_min)
+
+    q_val = min_dist.rolling(window_1440).quantile(q_low)
+    df['signal'] = (min_dist < q_val).fillna(False).astype(bool)
     return df
 
 
@@ -1104,27 +1190,27 @@ if __name__ == "__main__":
 
         # 二、动量与路径结构类
         factor_009, factor_010, factor_011, factor_012,
-        factor_013, factor_014, factor_015, factor_016,
+        factor_013, factor_014_high, factor_014_low, factor_015, factor_016,
         factor_017,
 
         # 三、波动率与振幅类
-        factor_018, factor_019, factor_020, factor_021,
-        factor_022,
+        factor_018_high, factor_018_low, factor_019_high, factor_019_low,
+        factor_020_high, factor_020_low, factor_021, factor_022,
 
         # 四、K 线微观结构类
         factor_023, factor_024, factor_025, factor_026,
         factor_027, factor_028, factor_029, factor_030,
 
         # 五、成交量与流动性类
-        factor_031, factor_032,
+        factor_031_high, factor_031_low, factor_032,
 
         # 六、量价关系类
-        factor_033, factor_034, factor_035, factor_036,
-        factor_037, factor_038, factor_039,
+        factor_033, factor_034, factor_035_high, factor_035_low,
+        factor_036, factor_037, factor_038, factor_039,
 
         # 七、区间、压缩与突破类
-        factor_040, factor_041, factor_042, factor_043,
-        factor_044, factor_045,
+        factor_040_high, factor_040_low, factor_041, factor_042,
+        factor_043, factor_044, factor_045_high, factor_045_low,
 
         # 八、尾部风险与分布类
         factor_046, factor_047, factor_048, factor_049,
@@ -1147,5 +1233,3 @@ if __name__ == "__main__":
 
     # 调用上方提供的函数，单独输出信号率报告
     df_rates = evaluate_all_signal_rates(symbols, strategies, base_path)
-
-    # 这样你可以直观决定是否要在主循环里把某些表现拉跨的策略剔除掉
