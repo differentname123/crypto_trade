@@ -2272,7 +2272,7 @@ if __name__ == "__main__":
                   "low": np.float32, "close": np.float32, "volume": np.float32}
 
     # 新增三个参数搜索空间
-    search_add_steps = [0.005, 0.01, 0.015]
+    search_add_steps = [ 0.002, 0.005, 0.01, 0.015]
     search_tp_steps = [0.002, 0.005, 0.01, 0.015]
     search_mults = [1.5, 2.0]
 
@@ -2283,7 +2283,7 @@ if __name__ == "__main__":
     task_done = 0
     t_all = time.time()
 
-    output_dir = r"E:\backtest_data_1m"
+    output_dir = r"W:\backtest_data_1m"
     os.makedirs(output_dir, exist_ok=True)
 
     # ==========================
