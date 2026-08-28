@@ -9,6 +9,7 @@ import os
 import glob
 import pickle
 import gc
+import re
 import warnings
 import multiprocessing as mp
 
@@ -24,6 +25,9 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 # 缓存文件所在的目录 (请与你生成数据时保持一致)
 CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
+
+CACHE_DIR = r"E:\backtest_data_1m"  # 做多策略默认缓存目录
+SHORT_CACHE_DIR = r"E:\backtest_data_1m"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
 TEST_MARGINS = [2.55, 10.0]
@@ -77,15 +81,15 @@ _TIME_LIKE_KEYS = ("time", "stamp", "epoch", "date", "millis", "nanos", "_ms", "
 # 内部工具函数
 # =====================================================================
 def _parse_filename(filename):
-    """解析文件名 -> (symbol, strategy_name, direction)，逻辑与原版完全一致"""
-    try:
-        parts = filename.split('_')
-        symbol = parts[1]
-        direction = "Long" if "_Long_" in filename else "Short" if "_Short_" in filename else "Unknown"
-        strat_start_idx = filename.find(symbol) + len(symbol) + 1
-        strat_end_idx = filename.find(f"_{direction}_")
-        strategy_name = filename[strat_start_idx:strat_end_idx]
-    except Exception:
+    """解析文件名 -> (symbol, strategy_name, direction)，使用正则匹配增强鲁棒性"""
+    # 匹配规范如: stage1_BTCUSDT_strategy_1_vwap_zscore_Long_xxxxx.pkl
+    pattern = r"^stage1_([A-Z0-9]+)_(.+?)_(Long|Short)_"
+    match = re.search(pattern, filename)
+    if match:
+        symbol = match.group(1)
+        strategy_name = match.group(2)
+        direction = match.group(3)
+    else:
         symbol, strategy_name, direction = "Unknown", filename, "Unknown"
     return symbol, strategy_name, direction
 
@@ -282,25 +286,23 @@ def analyze_all_strategies():
     search_pattern_main = os.path.join(CACHE_DIR, "stage1_*.pkl")
     search_pattern_short = os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl")
 
-    pkl_files = glob.glob(search_pattern_main)
-    if os.path.exists(SHORT_CACHE_DIR):
-        pkl_files.extend(glob.glob(search_pattern_short))
+    # === 修复点 1：使用 set 对文件路径去重，防止目录相同时数据翻倍 ===
+    files_main = glob.glob(search_pattern_main)
+    files_short = glob.glob(search_pattern_short) if os.path.exists(SHORT_CACHE_DIR) else []
+    pkl_files = list(set(files_main + files_short))
 
     if not pkl_files:
         print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl 文件！")
         return
 
-    # === 新增：文件前置过滤逻辑，仅保留属于白名单策略的文件 ===
+    # 文件前置过滤逻辑，仅保留属于白名单策略的文件
     filtered_pkl_files = []
     for filepath in pkl_files:
         filename = os.path.basename(filepath)
-        # 获取该文件的策略名
         _, strategy_name, _ = _parse_filename(filename)
-        # 仅保留存在于白名单中的策略文件
-        if strategy_name in TARGET_STRATEGIES:
-            filtered_pkl_files.append(filepath)
+        # if strategy_name in TARGET_STRATEGIES:
+        filtered_pkl_files.append(filepath)
 
-    # 替换原本的文件列表，过滤掉不相干的缓存
     pkl_files = filtered_pkl_files
 
     if not pkl_files:
@@ -317,13 +319,11 @@ def analyze_all_strategies():
     if use_subprocess:
         try:
             ctx = mp.get_context("spawn")
-            # 这里的进程数改为使用刚刚在最上方定义的全局配置 PARALLEL_WORKERS
             pool = ctx.Pool(processes=PARALLEL_WORKERS, maxtasksperchild=1)
         except Exception as e:
             print(f"[警告] 子进程池初始化失败，自动切换为主进程内处理...")
             use_subprocess = False
 
-    # 根据配置，生成任务结果的迭代器（imap_unordered 用于高效并发加载，不会阻塞单一慢任务）
     if use_subprocess:
         results_iter = pool.imap_unordered(_process_one_file_safe, pkl_files)
     else:
@@ -341,8 +341,6 @@ def analyze_all_strategies():
                     results_by_margin[margin].append(row)
         else:
             print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
-
-        gc.collect()
 
         if idx % 50 == 0 or idx == len(pkl_files):
             print(f"进度: {idx}/{len(pkl_files)} 个策略文件已处理完成...")
@@ -369,12 +367,23 @@ def analyze_all_strategies():
 
     df_all = pd.DataFrame(all_results)
 
-    # 输出完整结果 CSV 报告
-    output_csv = "strategy_leaderboard_filtered.csv"  # === 更改了导出文件名 ===
-    df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
-    print(f"已将过滤后的结果保存至: {output_csv}")
+    # === 修复点 2：将过滤逻辑提前，保证导出的 CSV 也是干净的 ===
+    def check_lifespan(val):
+        if isinstance(val, str) and "未爆仓" in val:
+            return True
+        try:
+            return float(val) >= MIN_LIFESPAN_DAYS
+        except:
+            return True
 
-    # 将新提取的参数插入到展示列里 (新增: 总收益与总亏损)
+    df_all = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
+    df_all = df_all[df_all["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
+
+    # 输出完整结果 CSV 报告
+    output_csv = "strategy_leaderboard_filtered.csv"
+    df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
+    print(f"已将过滤后的结果保存至: {output_csv}\n")
+
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
                     "爆仓几率(%)", "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
                     "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)"]
@@ -401,31 +410,15 @@ def analyze_all_strategies():
     for strategy_name, df_strat in df_all.groupby("策略"):
         print(f"\n🏆 策略 = {strategy_name} | 多币种 & 不同 Margin 综合表现:")
 
-        # 新增根据寻优参数进行排序
+        # 排序
         df_display = df_strat.sort_values(by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]).copy()
 
-        # === 新增：过滤预期存活天数 < MIN_LIFESPAN_DAYS 的记录 ===
-        def check_lifespan(val):
-            # 处理字符串 "999 (未爆仓)" 等情况
-            if isinstance(val, str) and "未爆仓" in val:
-                return True
-            try:
-                return float(val) >= MIN_LIFESPAN_DAYS
-            except:
-                return True
-
-        df_display = df_display[df_display["预期存活(天)"].apply(check_lifespan)]
-
-        # === 新增：过滤 净利润(Margin倍数) >= MIN_NET_PROFIT 的记录 ===
-        df_display = df_display[df_display["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
-
+        # === 修复点 3：此处无需重复过滤，已被提前 ===
         if df_display.empty:
-            print(f"  [提示] 该策略所有结果未达到预期存活({MIN_LIFESPAN_DAYS}天)或净利润({MIN_NET_PROFIT})标准，已过滤隐藏。")
             continue
 
         df_display = df_display[display_cols]
 
-        # 为了控制台排版整洁，对新增长字段进行简称化
         df_display.rename(columns={
             "死前翻倍胜率(%)": "翻倍胜率(%)",
             "总收益(Margin倍数)": "总收益(M倍)",
@@ -455,7 +448,6 @@ def analyze_all_strategies():
             print(" | ".join(row_cells))
 
         print(sep_line)
-
 
 if __name__ == "__main__":
     mp.freeze_support()
