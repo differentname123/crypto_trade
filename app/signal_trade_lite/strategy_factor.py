@@ -9,14 +9,13 @@ import numpy as np
 # ==================== 一、价格偏离与位置类 ====================
 
 def factor_001(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
     mean_60 = df['close'].rolling(window_60).mean()
     std_60 = df['close'].rolling(window_60).std()
-    z_score = (df['close'] - mean_60) / std_60
+    z_score = (df['close'] - mean_60) / std_60.replace(0, 1e-9)
 
     q_val = z_score.rolling(window_1440).quantile(q_low)
     df['signal'] = (z_score < q_val).fillna(False).astype(bool)
@@ -24,14 +23,13 @@ def factor_001(df):
 
 
 def factor_002(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
     mean_60 = df['close'].rolling(window_60).mean()
     std_60 = df['close'].rolling(window_60).std()
-    z_score = (df['close'] - mean_60) / std_60
+    z_score = (df['close'] - mean_60) / std_60.replace(0, 1e-9)
 
     q_val = z_score.rolling(window_1440).quantile(q_high)
     df['signal'] = (z_score > q_val).fillna(False).astype(bool)
@@ -39,39 +37,36 @@ def factor_002(df):
 
 
 def factor_003(df):
-    df = df.copy()
     window_240 = 240
     p_low = 0.05
 
     high_240 = df['high'].rolling(window_240).max()
     low_240 = df['low'].rolling(window_240).min()
-    position = (df['close'] - low_240) / (high_240 - low_240)
+    position = (df['close'] - low_240) / (high_240 - low_240).replace(0, 1e-9)
 
     df['signal'] = (position <= p_low).fillna(False).astype(bool)
     return df
 
 
 def factor_004(df):
-    df = df.copy()
     window_240 = 240
     p_high = 0.95
 
     high_240 = df['high'].rolling(window_240).max()
     low_240 = df['low'].rolling(window_240).min()
-    position = (df['close'] - low_240) / (high_240 - low_240)
+    position = (df['close'] - low_240) / (high_240 - low_240).replace(0, 1e-9)
 
     df['signal'] = (position >= p_high).fillna(False).astype(bool)
     return df
 
 
 def factor_005(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
-    vwap_60 = (df['close'] * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
-    dev = (df['close'] - vwap_60) / vwap_60
+    vwap_60 = (df['close'] * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
+    dev = (df['close'] - vwap_60) / vwap_60.replace(0, 1e-9)
 
     q_val = dev.rolling(window_1440).quantile(q_low)
     df['signal'] = (dev < q_val).fillna(False).astype(bool)
@@ -79,13 +74,12 @@ def factor_005(df):
 
 
 def factor_006(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
-    vwap_60 = (df['close'] * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
-    dev = (df['close'] - vwap_60) / vwap_60
+    vwap_60 = (df['close'] * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
+    dev = (df['close'] - vwap_60) / vwap_60.replace(0, 1e-9)
 
     q_val = dev.rolling(window_1440).quantile(q_high)
     df['signal'] = (dev > q_val).fillna(False).astype(bool)
@@ -93,7 +87,6 @@ def factor_006(df):
 
 
 def factor_007(df):
-    df = df.copy()
     window_60 = 60
     lag_15 = 15
     window_1440 = 1440
@@ -101,7 +94,7 @@ def factor_007(df):
 
     mean_60 = df['close'].rolling(window_60).mean()
     std_60 = df['close'].rolling(window_60).std()
-    z_score = (df['close'] - mean_60) / std_60
+    z_score = (df['close'] - mean_60) / std_60.replace(0, 1e-9)
 
     z_q = z_score.rolling(window_1440).quantile(q_low)
     cond1 = z_score < z_q
@@ -112,7 +105,6 @@ def factor_007(df):
 
 
 def factor_008(df):
-    df = df.copy()
     window_60 = 60
     lag_15 = 15
     window_1440 = 1440
@@ -120,7 +112,7 @@ def factor_008(df):
 
     mean_60 = df['close'].rolling(window_60).mean()
     std_60 = df['close'].rolling(window_60).std()
-    z_score = (df['close'] - mean_60) / std_60
+    z_score = (df['close'] - mean_60) / std_60.replace(0, 1e-9)
 
     z_q = z_score.rolling(window_1440).quantile(q_high)
     cond1 = z_score > z_q
@@ -133,12 +125,11 @@ def factor_008(df):
 # ==================== 二、动量与路径结构类 ====================
 
 def factor_009(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
-    ret_60 = df['close'] / df['close'].shift(window_60) - 1
+    ret_60 = df['close'] / df['close'].shift(window_60).replace(0, 1e-9) - 1
     q_val = ret_60.rolling(window_1440).quantile(q_low)
 
     df['signal'] = (ret_60 < q_val).fillna(False).astype(bool)
@@ -146,12 +137,11 @@ def factor_009(df):
 
 
 def factor_010(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
-    ret_60 = df['close'] / df['close'].shift(window_60) - 1
+    ret_60 = df['close'] / df['close'].shift(window_60).replace(0, 1e-9) - 1
     q_val = ret_60.rolling(window_1440).quantile(q_high)
 
     df['signal'] = (ret_60 > q_val).fillna(False).astype(bool)
@@ -159,14 +149,13 @@ def factor_010(df):
 
 
 def factor_011(df):
-    df = df.copy()
     window_15 = 15
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
-    ret_60 = df['close'] / df['close'].shift(window_60) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
+    ret_60 = df['close'] / df['close'].shift(window_60).replace(0, 1e-9) - 1
     accel = ret_15 - ret_60
 
     q_val = ret_60.rolling(window_1440).quantile(q_low)
@@ -175,14 +164,13 @@ def factor_011(df):
 
 
 def factor_012(df):
-    df = df.copy()
     window_15 = 15
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
-    ret_60 = df['close'] / df['close'].shift(window_60) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
+    ret_60 = df['close'] / df['close'].shift(window_60).replace(0, 1e-9) - 1
     accel = ret_15 - ret_60
 
     q_val = ret_60.rolling(window_1440).quantile(q_high)
@@ -191,14 +179,13 @@ def factor_012(df):
 
 
 def factor_013(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
     net_disp = (df['close'] - df['close'].shift(window_60)).abs()
     path_len = df['close'].diff().abs().rolling(window_60).sum()
-    path_eff = net_disp / path_len
+    path_eff = net_disp / path_len.replace(0, 1e-9)
 
     q_val = path_eff.rolling(window_1440).quantile(q_high)
     df['signal'] = (path_eff > q_val).fillna(False).astype(bool)
@@ -206,7 +193,6 @@ def factor_013(df):
 
 
 def factor_014_high(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -220,7 +206,6 @@ def factor_014_high(df):
 
 
 def factor_014_low(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
@@ -234,7 +219,6 @@ def factor_014_low(df):
 
 
 def factor_015(df):
-    df = df.copy()
     window_1440 = 1440
     q_high = 0.95
 
@@ -249,7 +233,6 @@ def factor_015(df):
 
 
 def factor_016(df):
-    df = df.copy()
     window_1440 = 1440
     q_high = 0.95
 
@@ -263,7 +246,6 @@ def factor_016(df):
 
 
 def factor_017(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -284,7 +266,6 @@ def factor_017(df):
 # ==================== 三、波动率与振幅类 ====================
 
 def factor_018_high(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -294,14 +275,13 @@ def factor_018_high(df):
     tr3 = (df['low'] - df['close'].shift(1)).abs()
     tr = tr1.combine(tr2, max).combine(tr3, max)
 
-    atr_pct = tr.rolling(window_60).mean() / df['close']
+    atr_pct = tr.rolling(window_60).mean() / df['close'].replace(0, 1e-9)
     q_val = atr_pct.rolling(window_1440).quantile(q_high)
     df['signal'] = (atr_pct > q_val).fillna(False).astype(bool)
     return df
 
 
 def factor_018_low(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
@@ -311,14 +291,13 @@ def factor_018_low(df):
     tr3 = (df['low'] - df['close'].shift(1)).abs()
     tr = tr1.combine(tr2, max).combine(tr3, max)
 
-    atr_pct = tr.rolling(window_60).mean() / df['close']
+    atr_pct = tr.rolling(window_60).mean() / df['close'].replace(0, 1e-9)
     q_val = atr_pct.rolling(window_1440).quantile(q_low)
     df['signal'] = (atr_pct < q_val).fillna(False).astype(bool)
     return df
 
 
 def factor_019_high(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -330,7 +309,6 @@ def factor_019_high(df):
 
 
 def factor_019_low(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
@@ -342,7 +320,6 @@ def factor_019_low(df):
 
 
 def factor_020_high(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
     window_1440 = 1440
@@ -351,7 +328,7 @@ def factor_020_high(df):
     ret = df['close'].pct_change()
     std_15 = ret.rolling(window_15).std()
     std_240 = ret.rolling(window_240).std()
-    ratio = std_15 / std_240
+    ratio = std_15 / std_240.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
@@ -359,7 +336,6 @@ def factor_020_high(df):
 
 
 def factor_020_low(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
     window_1440 = 1440
@@ -368,7 +344,7 @@ def factor_020_low(df):
     ret = df['close'].pct_change()
     std_15 = ret.rolling(window_15).std()
     std_240 = ret.rolling(window_240).std()
-    ratio = std_15 / std_240
+    ratio = std_15 / std_240.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_low)
     df['signal'] = (ratio < q_val).fillna(False).astype(bool)
@@ -376,14 +352,13 @@ def factor_020_low(df):
 
 
 def factor_021(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
     amplitude = df['high'] - df['low']
     mean_amp = amplitude.rolling(window_60).mean()
-    ratio = amplitude / mean_amp
+    ratio = amplitude / mean_amp.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
@@ -391,16 +366,15 @@ def factor_021(df):
 
 
 def factor_022(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
-    amp_pct = (df['high'] - df['low']) / df['close']
+    amp_pct = (df['high'] - df['low']) / df['close'].replace(0, 1e-9)
     mean_amp_pct = amp_pct.rolling(window_60).mean()
     ret_std = df['close'].pct_change().rolling(window_60).std()
 
-    ratio = mean_amp_pct / ret_std
+    ratio = mean_amp_pct / ret_std.replace(0, 1e-9)
     q_val = ratio.rolling(window_1440).quantile(q_high)
 
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
@@ -410,12 +384,11 @@ def factor_022(df):
 # ==================== 四、K 线微观结构类 ====================
 
 def factor_023(df):
-    df = df.copy()
     window_5 = 5
     window_1440 = 1440
     q_low = 0.05
 
-    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, np.nan)
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
     mean_pos = k_pos.rolling(window_5).mean()
 
     q_val = mean_pos.rolling(window_1440).quantile(q_low)
@@ -424,12 +397,11 @@ def factor_023(df):
 
 
 def factor_024(df):
-    df = df.copy()
     window_5 = 5
     window_1440 = 1440
     q_high = 0.95
 
-    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, np.nan)
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
     mean_pos = k_pos.rolling(window_5).mean()
 
     q_val = mean_pos.rolling(window_1440).quantile(q_high)
@@ -438,13 +410,12 @@ def factor_024(df):
 
 
 def factor_025(df):
-    df = df.copy()
     window_15 = 15
     window_1440 = 1440
     q_high = 0.95
 
     body = (df['close'] - df['open']).abs()
-    amp = (df['high'] - df['low']).replace(0, np.nan)
+    amp = (df['high'] - df['low']).replace(0, 1e-9)
     body_ratio = body / amp
 
     mean_ratio = body_ratio.rolling(window_15).mean()
@@ -455,14 +426,13 @@ def factor_025(df):
 
 
 def factor_026(df):
-    df = df.copy()
     window_15 = 15
     window_1440 = 1440
     q_low = 0.05
 
     upper = df['high'] - df[['open', 'close']].max(axis=1)
     lower = df[['open', 'close']].min(axis=1) - df['low']
-    amp = (df['high'] - df['low']).replace(0, np.nan)
+    amp = (df['high'] - df['low']).replace(0, 1e-9)
 
     imb = (upper - lower) / amp
     mean_imb = imb.rolling(window_15).mean()
@@ -473,14 +443,13 @@ def factor_026(df):
 
 
 def factor_027(df):
-    df = df.copy()
     window_15 = 15
     window_1440 = 1440
     q_high = 0.95
 
     upper = df['high'] - df[['open', 'close']].max(axis=1)
     lower = df[['open', 'close']].min(axis=1) - df['low']
-    amp = (df['high'] - df['low']).replace(0, np.nan)
+    amp = (df['high'] - df['low']).replace(0, 1e-9)
 
     imb = (upper - lower) / amp
     mean_imb = imb.rolling(window_15).mean()
@@ -491,11 +460,10 @@ def factor_027(df):
 
 
 def factor_028(df):
-    df = df.copy()
     window_1440 = 1440
     q_low = 0.05
 
-    gap = df['open'] / df['close'].shift(1) - 1
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
     q_val = gap.rolling(window_1440).quantile(q_low)
 
     df['signal'] = (gap < q_val).fillna(False).astype(bool)
@@ -503,11 +471,10 @@ def factor_028(df):
 
 
 def factor_029(df):
-    df = df.copy()
     window_1440 = 1440
     q_high = 0.95
 
-    gap = df['open'] / df['close'].shift(1) - 1
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
     q_val = gap.rolling(window_1440).quantile(q_high)
 
     df['signal'] = (gap > q_val).fillna(False).astype(bool)
@@ -515,7 +482,6 @@ def factor_029(df):
 
 
 def factor_030(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -525,7 +491,7 @@ def factor_030(df):
 
     jump_sum = jump.rolling(window_60).sum()
     amp_sum = amp.rolling(window_60).sum()
-    ratio = jump_sum / amp_sum.replace(0, np.nan)
+    ratio = jump_sum / amp_sum.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
@@ -535,14 +501,13 @@ def factor_030(df):
 # ==================== 五、成交量与流动性类 ====================
 
 def factor_031_high(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
     v_mean = df['volume'].rolling(window_60).mean()
     v_std = df['volume'].rolling(window_60).std()
-    v_z = (df['volume'] - v_mean) / v_std
+    v_z = (df['volume'] - v_mean) / v_std.replace(0, 1e-9)
 
     q_val = v_z.rolling(window_1440).quantile(q_high)
     df['signal'] = (v_z > q_val).fillna(False).astype(bool)
@@ -550,14 +515,13 @@ def factor_031_high(df):
 
 
 def factor_031_low(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
     v_mean = df['volume'].rolling(window_60).mean()
     v_std = df['volume'].rolling(window_60).std()
-    v_z = (df['volume'] - v_mean) / v_std
+    v_z = (df['volume'] - v_mean) / v_std.replace(0, 1e-9)
 
     q_val = v_z.rolling(window_1440).quantile(q_low)
     df['signal'] = (v_z < q_val).fillna(False).astype(bool)
@@ -565,14 +529,13 @@ def factor_031_low(df):
 
 
 def factor_032(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
     mean_amp = (df['high'] - df['low']).rolling(window_60).mean()
     mean_vol = df['volume'].rolling(window_60).mean()
-    impact = mean_amp / mean_vol.replace(0, np.nan)
+    impact = mean_amp / mean_vol.replace(0, 1e-9)
 
     q_val = impact.rolling(window_1440).quantile(q_high)
     df['signal'] = (impact > q_val).fillna(False).astype(bool)
@@ -582,7 +545,6 @@ def factor_032(df):
 # ==================== 六、量价关系类 ====================
 
 def factor_033(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -590,7 +552,7 @@ def factor_033(df):
     is_up = df['close'] > df['open']
     up_vol = df['volume'].where(is_up, 0)
 
-    up_vol_ratio = up_vol.rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
+    up_vol_ratio = up_vol.rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
     q_val = up_vol_ratio.rolling(window_1440).quantile(q_high)
 
     df['signal'] = (up_vol_ratio > q_val).fillna(False).astype(bool)
@@ -598,7 +560,6 @@ def factor_033(df):
 
 
 def factor_034(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
@@ -606,7 +567,7 @@ def factor_034(df):
     is_up = df['close'] > df['open']
     up_vol = df['volume'].where(is_up, 0)
 
-    up_vol_ratio = up_vol.rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
+    up_vol_ratio = up_vol.rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
     q_val = up_vol_ratio.rolling(window_1440).quantile(q_low)
 
     df['signal'] = (up_vol_ratio < q_val).fillna(False).astype(bool)
@@ -614,7 +575,6 @@ def factor_034(df):
 
 
 def factor_035_high(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
@@ -628,7 +588,6 @@ def factor_035_high(df):
 
 
 def factor_035_low(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
@@ -642,14 +601,13 @@ def factor_035_low(df):
 
 
 def factor_036(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_low = 0.05
 
     # 压力用 (High - Close)/(High - Low) 表示
-    k_pressure = (df['high'] - df['close']) / (df['high'] - df['low']).replace(0, np.nan)
-    vw_pressure = (k_pressure * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
+    k_pressure = (df['high'] - df['close']) / (df['high'] - df['low']).replace(0, 1e-9)
+    vw_pressure = (k_pressure * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
 
     q_val = vw_pressure.rolling(window_1440).quantile(q_low)
     df['signal'] = (vw_pressure < q_val).fillna(False).astype(bool)
@@ -657,13 +615,12 @@ def factor_036(df):
 
 
 def factor_037(df):
-    df = df.copy()
     window_60 = 60
     window_1440 = 1440
     q_high = 0.95
 
-    k_pressure = (df['high'] - df['close']) / (df['high'] - df['low']).replace(0, np.nan)
-    vw_pressure = (k_pressure * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum()
+    k_pressure = (df['high'] - df['close']) / (df['high'] - df['low']).replace(0, 1e-9)
+    vw_pressure = (k_pressure * df['volume']).rolling(window_60).sum() / df['volume'].rolling(window_60).sum().replace(0, 1e-9)
 
     q_val = vw_pressure.rolling(window_1440).quantile(q_high)
     df['signal'] = (vw_pressure > q_val).fillna(False).astype(bool)
@@ -671,13 +628,12 @@ def factor_037(df):
 
 
 def factor_038(df):
-    df = df.copy()
     window_15 = 15
     window_dist_240 = 240
     window_vol_60 = 60
     q_high = 0.95
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
     mean_vol_15 = df['volume'].rolling(window_15).mean()
 
     ret_q = ret_15.rolling(window_dist_240).quantile(q_high)
@@ -689,14 +645,13 @@ def factor_038(df):
 
 
 def factor_039(df):
-    df = df.copy()
     window_15 = 15
     window_dist_240 = 240
     window_vol_60 = 60
     q_low = 0.05
     q_high = 0.95
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
     mean_vol_15 = df['volume'].rolling(window_15).mean()
 
     ret_q = ret_15.rolling(window_dist_240).quantile(q_low)
@@ -710,14 +665,13 @@ def factor_039(df):
 # ==================== 七、区间、压缩与突破类 ====================
 
 def factor_040_high(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_high = 0.95
 
     high_240 = df['high'].rolling(window_240).max()
     low_240 = df['low'].rolling(window_240).min()
-    width = (high_240 - low_240) / df['close']
+    width = (high_240 - low_240) / df['close'].replace(0, 1e-9)
 
     q_val = width.rolling(window_1440).quantile(q_high)
     df['signal'] = (width > q_val).fillna(False).astype(bool)
@@ -725,14 +679,13 @@ def factor_040_high(df):
 
 
 def factor_040_low(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_low = 0.05
 
     high_240 = df['high'].rolling(window_240).max()
     low_240 = df['low'].rolling(window_240).min()
-    width = (high_240 - low_240) / df['close']
+    width = (high_240 - low_240) / df['close'].replace(0, 1e-9)
 
     q_val = width.rolling(window_1440).quantile(q_low)
     df['signal'] = (width < q_val).fillna(False).astype(bool)
@@ -740,7 +693,6 @@ def factor_040_low(df):
 
 
 def factor_041(df):
-    df = df.copy()
     window_60 = 60
     base_240 = 240
     window_1440 = 1440
@@ -760,7 +712,6 @@ def factor_041(df):
 
 
 def factor_042(df):
-    df = df.copy()
     window_60 = 60
     base_240 = 240
     window_1440 = 1440
@@ -780,7 +731,6 @@ def factor_042(df):
 
 
 def factor_043(df):
-    df = df.copy()
     window_15 = 15
     base_240 = 240
 
@@ -797,7 +747,6 @@ def factor_043(df):
 
 
 def factor_044(df):
-    df = df.copy()
     window_15 = 15
     base_240 = 240
 
@@ -811,7 +760,6 @@ def factor_044(df):
 
 
 def factor_045_high(df):
-    df = df.copy()
     base_240 = 240
     window_1440 = 1440
     q_high = 0.95
@@ -828,7 +776,6 @@ def factor_045_high(df):
 
 
 def factor_045_low(df):
-    df = df.copy()
     base_240 = 240
     window_1440 = 1440
     q_low = 0.05
@@ -845,7 +792,6 @@ def factor_045_low(df):
 # ==================== 八、尾部风险与分布类 ====================
 
 def factor_046(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_high = 0.95
@@ -858,7 +804,6 @@ def factor_046(df):
 
 
 def factor_047(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_low = 0.05
@@ -871,7 +816,6 @@ def factor_047(df):
 
 
 def factor_048(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_high = 0.95
@@ -884,7 +828,6 @@ def factor_048(df):
 
 
 def factor_049(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_high_k = 0.95
@@ -902,7 +845,6 @@ def factor_049(df):
 
 
 def factor_050(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_high = 0.95
@@ -915,7 +857,7 @@ def factor_050(df):
     min_p = window_240 // 4
     up_std = up_ret.rolling(window_240, min_periods=min_p).std()
     down_std = down_ret.rolling(window_240, min_periods=min_p).std()
-    ratio = up_std / down_std.replace(0, np.nan)
+    ratio = up_std / down_std.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
@@ -923,7 +865,6 @@ def factor_050(df):
 
 
 def factor_051(df):
-    df = df.copy()
     window_240 = 240
     window_1440 = 1440
     q_low = 0.05
@@ -935,7 +876,7 @@ def factor_051(df):
     min_p = window_240 // 4
     up_std = up_ret.rolling(window_240, min_periods=min_p).std()
     down_std = down_ret.rolling(window_240, min_periods=min_p).std()
-    ratio = up_std / down_std.replace(0, np.nan)
+    ratio = up_std / down_std.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_low)
     df['signal'] = (ratio < q_val).fillna(False).astype(bool)
@@ -945,7 +886,6 @@ def factor_051(df):
 # ==================== 九、时间结构类 ====================
 
 def factor_052(df):
-    df = df.copy()
     # 默认选出每天 0 点（UTC）作为信号触发，方便测试，可自行更改
     target_hour = 0
 
@@ -955,7 +895,6 @@ def factor_052(df):
 
 
 def factor_053(df):
-    df = df.copy()
     # 默认选出周一 (0=周一, 6=周日) 作为信号触发
     target_weekday = 0
 
@@ -965,7 +904,6 @@ def factor_053(df):
 
 
 def factor_054(df):
-    df = df.copy()
     threshold_min = 15
     period_hours = 4
 
@@ -982,7 +920,6 @@ def factor_054(df):
 
 
 def factor_055(df):
-    df = df.copy()
     threshold_min = 15
     period_hours = 8
 
@@ -1000,12 +937,11 @@ def factor_055(df):
 # ==================== 十、跨周期一致性类 ====================
 
 def factor_056(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
-    ret_240 = df['close'] / df['close'].shift(window_240) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
+    ret_240 = df['close'] / df['close'].shift(window_240).replace(0, 1e-9) - 1
 
     cond = (ret_15 > 0) & (ret_240 > 0)
     df['signal'] = cond.fillna(False).astype(bool)
@@ -1013,12 +949,11 @@ def factor_056(df):
 
 
 def factor_057(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
-    ret_240 = df['close'] / df['close'].shift(window_240) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
+    ret_240 = df['close'] / df['close'].shift(window_240).replace(0, 1e-9) - 1
 
     cond = (ret_15 < 0) & (ret_240 < 0)
     df['signal'] = cond.fillna(False).astype(bool)
@@ -1028,12 +963,11 @@ def factor_057(df):
 # ==================== 十一、短周期异常类 ====================
 
 def factor_058(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
     q_high = 0.95
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
     q_val = ret_15.rolling(window_240).quantile(q_high)
 
     df['signal'] = (ret_15 > q_val).fillna(False).astype(bool)
@@ -1041,12 +975,11 @@ def factor_058(df):
 
 
 def factor_059(df):
-    df = df.copy()
     window_15 = 15
     window_240 = 240
     q_low = 0.05
 
-    ret_15 = df['close'] / df['close'].shift(window_15) - 1
+    ret_15 = df['close'] / df['close'].shift(window_15).replace(0, 1e-9) - 1
     q_val = ret_15.rolling(window_240).quantile(q_low)
 
     df['signal'] = (ret_15 < q_val).fillna(False).astype(bool)
@@ -1054,7 +987,6 @@ def factor_059(df):
 
 
 def factor_060(df):
-    df = df.copy()
     window_15 = 15
     window_60 = 60
     window_1440 = 1440
@@ -1065,12 +997,11 @@ def factor_060(df):
     amp_15 = high_15 - low_15
 
     mean_amp_60 = (df['high'] - df['low']).rolling(window_60).mean()
-    ratio = amp_15 / mean_amp_60.replace(0, np.nan)
+    ratio = amp_15 / mean_amp_60.replace(0, 1e-9)
 
     q_val = ratio.rolling(window_1440).quantile(q_high)
     df['signal'] = (ratio > q_val).fillna(False).astype(bool)
     return df
-
 
 def evaluate_all_signal_rates(symbols, strategies, base_path, file_suffix="_1m_2021-01-01_merged.csv"):
     """
