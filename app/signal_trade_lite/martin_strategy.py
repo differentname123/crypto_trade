@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 
 
-def evaluate_all_signal_rates(symbols, strategies, base_path, file_suffix="_1s_2021-01-01_merged_6cols.csv"):
+def evaluate_all_signal_rates(symbols, strategies, base_path, file_suffix="_1m_2021-01-01_merged.csv"):
     """
     独立计算并客观打印每个策略在各个币种上的信号率。
 
