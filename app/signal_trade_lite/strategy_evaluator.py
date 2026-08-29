@@ -148,7 +148,10 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
     free_ride_win_rate = report.get("free_ride_win_rate", np.nan)
     n_cycles_total = report.get("n_cycles_total", 0)
     n_blowup = report.get("n_blowup", 0)
-    blowup_prob = (n_blowup / n_cycles_total * 100) if n_cycles_total > 0 else 0.0
+    n_trades_actual = report.get("n_trades", 0)  # 获取实际开仓数
+
+    # 修复：使用实际开仓数计算爆仓几率
+    blowup_prob = (n_blowup / n_trades_actual * 100) if n_trades_actual > 0 else 0.0
 
     return {
         "币种": symbol,
@@ -158,10 +161,10 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "止盈间距": tp_step,
         "加仓倍数": mult,
         "总信号数": n_cycles_total,
-        "实际开仓数": report.get("n_trades", 0),
+        "实际开仓数": n_trades_actual,
         "胜率(%)": round(report.get("win_rate", 0) * 100, 2) if pd.notnull(report.get("win_rate")) else 0.0,
         "爆仓次数": n_blowup,
-        "爆仓几率(%)": round(blowup_prob, 2),
+        "爆仓几率(%)": round(blowup_prob, 2),  # 现在这里计算准确了
         "预期存活(天)": round(expected_lifespan_hour / 24.0, 2) if not np.isinf(
             expected_lifespan_hour) else "999 (未爆仓)",
         "中位存活(天)": round(report.get("_median_survival", 0), 2),
@@ -186,7 +189,6 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
         "手续费占毛利(%)": round(report.get("fee_ratio_traded", 0) * 100, 2)
     }
-
 
 def _process_one_file(file_path):
     filename = os.path.basename(file_path)
