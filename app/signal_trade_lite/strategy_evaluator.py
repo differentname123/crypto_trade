@@ -688,7 +688,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     if "实际开仓数" in df_all.columns:
         df_all = df_all[df_all["实际开仓数"] >= min_trades]
 
-    df_all = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
+    df_all = df_all[df_all["中位存活(天)"].apply(check_lifespan)]
 
     # 3. 过滤净利润
     if "净利润(Margin倍数)" in df_all.columns:
@@ -814,4 +814,6 @@ if __name__ == "__main__":
     # mp.freeze_support()
     # analyze_all_strategies()
     csv_file = "strategy_leaderboard_16384_files.csv"
-    show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
+    # csv_file = "strategy_leaderboard_15600_files.csv"
+
+    show_leaderboard_csv(csv_file=csv_file, direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
