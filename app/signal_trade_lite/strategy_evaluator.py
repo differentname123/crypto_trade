@@ -164,13 +164,23 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "爆仓几率(%)": round(blowup_prob, 2),
         "预期存活(天)": round(expected_lifespan_hour / 24.0, 2) if not np.isinf(
             expected_lifespan_hour) else "999 (未爆仓)",
+        "中位存活(天)": round(report.get("_median_survival", 0), 2),
+        "最大存活(天)": round(report.get("_max_survival", 0), 2),
+        "最小存活(天)": round(report.get("_min_survival", 0), 2),
         "平均持仓(h)": round(holding_time, 2) if pd.notnull(holding_time) else 0.0,
+        "中位数持仓(h)": round(report.get("_median_holding", 0), 2),
+        "最大持仓(h)": round(report.get("_max_holding", 0), 2),
+        "持仓时间占比(%)": round(report.get("_holding_ratio", 0), 2),
         "死前翻倍胜率(%)": round(free_ride_win_rate * 100, 2) if pd.notnull(free_ride_win_rate) else 0.0,
+        "平均回撤(M倍)": round(report.get("_avg_mdd", 0), 4),
+        "中位回撤(M倍)": round(report.get("_median_mdd", 0), 4),
         "总收益(Margin倍数)": round(report.get("_extracted_gross_profit", 0), 2),
         "总亏损(Margin倍数)": round(report.get("_extracted_gross_loss", 0), 2),
         "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
         "平均每天收益(M倍)": round(report.get("_avg_daily_profit", 0), 4),
         "每天中位数收益(M倍)": round(report.get("_median_daily_profit", 0), 4),
+        "最长无盈利(天)": report.get("_max_consecutive_no_profit", 0),
+        "无盈利占比(%)": round(report.get("_no_profit_ratio", 0), 2),
         "年化爆仓次数": round(report.get("blowups_per_year", 0), 2),
         "翻倍所需时间(小时)": round(report.get("time_to_double_hour", 0), 2),
         "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
@@ -233,6 +243,16 @@ def _process_one_file(file_path):
 
         avg_daily = 0.0
         median_daily = 0.0
+        max_consecutive_no_profit = 0
+        no_profit_ratio = 0.0
+        median_holding = 0.0
+        max_holding = 0.0
+        holding_ratio = 0.0
+        avg_mdd = 0.0
+        median_mdd = 0.0
+        median_survival = 0.0
+        max_survival = 0.0
+        min_survival = 0.0
 
         if pnl_col:
             gross_profit = float(trades_df.loc[trades_df[pnl_col] > 0, pnl_col].sum())
@@ -250,20 +270,31 @@ def _process_one_file(file_path):
             report["_extracted_gross_profit"] = gross_profit
             report["_extracted_gross_loss"] = gross_loss
 
-            # --- 新增：计算不考虑爆仓亏损时的平均每天收益和中位数收益 ---
+            # --- 新增：计算不考虑爆仓亏损时的平均每天收益和中位数收益，及最长连亏 ---
             try:
                 time_col = None
+                start_col = None
+                end_col = None
                 for col in trades_df.columns:
-                    if any(k in str(col).lower() for k in ("time", "date", "stamp")):
-                        time_col = col
-                        # 优先取包含 close/end 的时间列
-                        if "close" in str(col).lower() or "end" in str(col).lower():
-                            break
+                    c_lower = str(col).lower()
+                    if any(k in c_lower for k in _TIME_LIKE_KEYS):
+                        if any(k in c_lower for k in ("close", "end", "finish")):
+                            end_col = col
+                            if time_col is None: time_col = col
+                        elif any(k in c_lower for k in ("open", "start", "begin")):
+                            start_col = col
+                        else:
+                            if time_col is None: time_col = col
+
+                if end_col is None: end_col = time_col
+                if start_col is None: start_col = end_col
 
                 if time_col is not None and not trades_df.empty:
                     # 获取时间序列
                     if pd.api.types.is_numeric_dtype(trades_df[time_col]):
-                        if trades_df[time_col].max() > 1e11:
+                        if trades_df[time_col].max() > 1e15:
+                            dt_series = pd.to_datetime(trades_df[time_col], unit='ns')
+                        elif trades_df[time_col].max() > 1e11:
                             dt_series = pd.to_datetime(trades_df[time_col], unit='ms')
                         else:
                             dt_series = pd.to_datetime(trades_df[time_col], unit='s')
@@ -292,9 +323,107 @@ def _process_one_file(file_path):
 
                             avg_daily = float(daily_pnl.mean()) if not daily_pnl.empty else 0.0
                             median_daily = float(daily_pnl.median()) if not daily_pnl.empty else 0.0
+
+                            # --- 新增：最长连续无盈利天数及占比 ---
+                            all_pnl = trades_df[pnl_col] * ratio
+                            daily_net_pnl = all_pnl.groupby(dates).sum()
+                            daily_net_pnl = daily_net_pnl.reindex(full_dates, fill_value=0.0)
+
+                            no_profit_mask = daily_net_pnl <= 0
+                            no_profit_days = int(no_profit_mask.sum())
+                            total_days = len(full_dates)
+                            no_profit_ratio = (no_profit_days / total_days * 100) if total_days > 0 else 0.0
+
+                            if not no_profit_mask.empty:
+                                is_profit = ~no_profit_mask
+                                groups = is_profit.cumsum()
+                                max_consecutive_no_profit = int(no_profit_mask.groupby(groups).sum().max())
             except Exception as e:
                 pass
-            # ------------------------------------------------------------
+
+            # --- 新增：回撤统计、持仓时间以及存活时间 ---
+            try:
+                if not trades_df.empty:
+                    # 1. 回撤统计
+                    mdd_col = next((c for c in ["max_drawdown", "max_drawdown_in_margin", "max_dd", "max_loss",
+                                                "max_loss_in_margin", "mdd", "max_floating_loss"] if
+                                    c in trades_df.columns), None)
+                    if mdd_col:
+                        mdds = trades_df[mdd_col].abs()
+                        avg_mdd = float(mdds.mean()) if not mdds.empty else 0.0
+                        median_mdd = float(mdds.median()) if not mdds.empty else 0.0
+
+                    # 2. 持仓和存活时间
+                    if start_col and end_col:
+                        def to_dt(s):
+                            if pd.api.types.is_numeric_dtype(s):
+                                if s.max() > 1e15:
+                                    return pd.to_datetime(s, unit='ns')
+                                elif s.max() > 1e11:
+                                    return pd.to_datetime(s, unit='ms')
+                                else:
+                                    return pd.to_datetime(s, unit='s')
+                            return pd.to_datetime(s)
+
+                        st_series = to_dt(trades_df[start_col])
+                        ed_series = to_dt(trades_df[end_col])
+
+                        dur_h = (ed_series - st_series).dt.total_seconds() / 3600.0
+                        dur_h = dur_h[dur_h >= 0]
+                        if not dur_h.empty:
+                            median_holding = float(dur_h.median())
+                            max_holding = float(dur_h.max())
+
+                        # 持仓时间占比
+                        intervals = list(zip(st_series, ed_series))
+                        intervals.sort(key=lambda x: x[0])
+                        merged = []
+                        for interval in intervals:
+                            if not merged:
+                                merged.append(interval)
+                            else:
+                                last = merged[-1]
+                                if interval[0] <= last[1]:
+                                    merged[-1] = (last[0], max(last[1], interval[1]))
+                                else:
+                                    merged.append(interval)
+
+                        total_holding_s = sum((m[1] - m[0]).total_seconds() for m in merged)
+                        span_s = (merged[-1][1] - merged[0][0]).total_seconds() if merged else 0
+                        holding_ratio = (total_holding_s / span_s * 100) if span_s > 0 else 0.0
+
+                        # 存活时间统计
+                        blowup_col = next((c for c in trades_df.columns if
+                                           "blowup" in str(c).lower() or "is_liquidated" in str(c).lower()), None)
+                        if blowup_col:
+                            is_blow = trades_df[blowup_col] == True
+                        elif pnl_col:
+                            is_blow = trades_df[pnl_col] < -0.8 * margin
+                        else:
+                            is_blow = pd.Series(False, index=trades_df.index)
+
+                        blow_indices = trades_df.index[is_blow].tolist()
+
+                        survival_days = []
+                        last_time = st_series.iloc[0]
+                        for b_idx in blow_indices:
+                            blow_time = ed_series.loc[b_idx]
+                            days = (blow_time - last_time).total_seconds() / 86400.0
+                            if days > 0:
+                                survival_days.append(days)
+                            last_time = blow_time
+
+                        if last_time < ed_series.iloc[-1]:
+                            days = (ed_series.iloc[-1] - last_time).total_seconds() / 86400.0
+                            if days > 0:
+                                survival_days.append(days)
+
+                        if survival_days:
+                            median_survival = float(np.median(survival_days))
+                            max_survival = float(np.max(survival_days))
+                            min_survival = float(np.min(survival_days))
+            except Exception as e:
+                pass
 
         else:
             # 防御性回退：如果找不到对应列名，尝试读取报告可能内置的字段
@@ -303,6 +432,16 @@ def _process_one_file(file_path):
 
         report["_avg_daily_profit"] = avg_daily
         report["_median_daily_profit"] = median_daily
+        report["_max_consecutive_no_profit"] = max_consecutive_no_profit
+        report["_no_profit_ratio"] = no_profit_ratio
+        report["_median_holding"] = median_holding
+        report["_max_holding"] = max_holding
+        report["_holding_ratio"] = holding_ratio
+        report["_avg_mdd"] = avg_mdd
+        report["_median_mdd"] = median_mdd
+        report["_median_survival"] = median_survival
+        report["_max_survival"] = max_survival
+        report["_min_survival"] = min_survival
         # =====================================================
 
         del trades_df
@@ -322,6 +461,7 @@ def _process_one_file_safe(file_path):
     except BaseException as e:
         return {"ok": False, "file_path": file_path, "err": f"{type(e).__name__}: {e}"}
 
+
 # 为了控制台打印依然清爽，控制台展示仍保留原有过滤逻辑
 def check_lifespan(val):
     if isinstance(val, str) and "未爆仓" in val:
@@ -330,6 +470,7 @@ def check_lifespan(val):
         return float(val) >= MIN_LIFESPAN_DAYS
     except:
         return True
+
 
 def analyze_all_strategies():
     print("=" * 80)
@@ -431,16 +572,16 @@ def analyze_all_strategies():
     df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
     print(f"已将未过滤的完整结果保存至: {output_csv}\n")
 
-
-
     df_filtered = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
     df_filtered = df_filtered[df_filtered["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
 
     # === 增加新增的两列至展示列表 ===
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
-                    "爆仓几率(%)", "预期存活(天)", "平均持仓(h)", "死前翻倍胜率(%)",
+                    "爆仓几率(%)", "预期存活(天)", "中位存活(天)", "最大存活(天)", "最小存活(天)",
+                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)", "死前翻倍胜率(%)",
+                    "平均回撤(M倍)", "中位回撤(M倍)",
                     "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)",
-                    "平均每天收益(M倍)", "每天中位数收益(M倍)"]
+                    "平均每天收益(M倍)", "每天中位数收益(M倍)", "最长无盈利(天)", "无盈利占比(%)"]
 
     def get_display_width(s):
         w = 0
@@ -506,7 +647,8 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=60, min_net_profit=-1000, min_total_profit=20):
+def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=60,
+                         min_net_profit=-1000, min_total_profit=20):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -546,7 +688,6 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
     df_all = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
 
-
     # 3. 过滤净利润
     if "净利润(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
@@ -581,10 +722,12 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
     # 定义要展示的列（分组展示，因此不包含"策略"列，省空间）
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
-                    "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "平均持仓(h)",
-                    "翻倍胜率(%)", "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)",
-                    # "日均收益(M)", "日中位收益(M)"
-
+                    "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "中位存活(天)", "最大存活(天)",
+                    "最小存活(天)",
+                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)",
+                    "翻倍胜率(%)", "平均回撤(M倍)", "中位回撤(M倍)",
+                    "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)",
+                    "最长无盈利(天)", "无盈利占比(%)"
                     ]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
@@ -628,7 +771,6 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         # 打印表头，附带展示该策略的最高收益，一目了然
         max_p = strategy_max_profits[strategy_name]
         print(f"\n🏆 开仓策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
-        # print(f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
@@ -657,7 +799,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
 
 if __name__ == "__main__":
-    # mp.freeze_support()
-    # analyze_all_strategies()
+    mp.freeze_support()
+    analyze_all_strategies()
 
-    show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
+    # show_leaderboard_csv(direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
