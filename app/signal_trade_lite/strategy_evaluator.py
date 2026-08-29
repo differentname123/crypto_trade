@@ -721,9 +721,10 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     sorted_strategies = sorted(strategy_max_profits.keys(), key=lambda k: strategy_max_profits[k], reverse=True)
 
     # 定义要展示的列（分组展示，因此不包含"策略"列，省空间）
+    # 修改 show_leaderboard_csv 中的 display_cols
     display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
-                    "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)", "中位存活(天)", "最大存活(天)",
-                    "最小存活(天)",
+                    "胜率(%)", "0-1层解决战斗比例(%)", "手续费占毛利(%)",
+                    "爆仓次数", "爆仓几率(%)", "预期存活(天)", "中位存活(天)", "最大存活(天)", "最小存活(天)",
                     "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)",
                     "翻倍胜率(%)", "平均回撤(M倍)", "中位回撤(M倍)",
                     "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)",
