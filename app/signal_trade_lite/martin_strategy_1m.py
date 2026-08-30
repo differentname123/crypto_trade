@@ -7,6 +7,418 @@ import numpy as np
 import gzip
 import pickle # 原本就有的
 
+
+import numpy as np
+import pandas as pd
+
+# ==================== factor_023 (做多：K线微观位置极低) ====================
+# _1: 更敏感(3根K线), _2: 原版, _3: 更平滑(10根K线), _4: 极端罕见(1分位), _5: 较高频(10分位)
+
+def factor_023_1(df):
+    win_short, win_long, q_low = 3, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_2(df):
+    win_short, win_long, q_low = 5, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_3(df):
+    win_short, win_long, q_low = 10, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_4(df):
+    win_short, win_long, q_low = 5, 1440, 0.01
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_5(df):
+    win_short, win_long, q_low = 5, 1440, 0.10
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_029 (做多：跳空幅度极大) ====================
+# _1: 半天窗口, _2: 原版, _3: 两天窗口, _4: 99极端分位, _5: 90较宽分位
+
+def factor_029_1(df):
+    win_long, q_high = 720, 0.95
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
+    df['signal'] = (gap > gap.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_029_2(df):
+    win_long, q_high = 1440, 0.95
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
+    df['signal'] = (gap > gap.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_029_3(df):
+    win_long, q_high = 2880, 0.95
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
+    df['signal'] = (gap > gap.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_029_4(df):
+    win_long, q_high = 1440, 0.99
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
+    df['signal'] = (gap > gap.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_029_5(df):
+    win_long, q_high = 1440, 0.90
+    gap = df['open'] / df['close'].shift(1).replace(0, 1e-9) - 1
+    df['signal'] = (gap > gap.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_043 (做多：假突破均值回归) ====================
+# _1: 超短回落(5/60), _2: 原版(15/240), _3: 中级回落(15/120), _4: 宽容突破(30/240), _5: 大级别(30/480)
+
+def factor_043_1(df):
+    win_break, win_base = 5, 60
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_2(df):
+    win_break, win_base = 15, 240
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_3(df):
+    win_break, win_base = 15, 120
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_4(df):
+    win_break, win_base = 30, 240
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_5(df):
+    win_break, win_base = 30, 480
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_049 (做多：极端波动率簇集) ====================
+# _1: 短期聚集(60), _2: 原版(240), _3: 长时聚集(480), _4: 放宽幅度(0.90), _5: 极端要求(0.99)
+
+def factor_049_1(df):
+    win_eval, win_long, q_k, q_f = 60, 1440, 0.95, 0.95
+    ret_abs = df['close'].pct_change().abs()
+    is_ext = (ret_abs > ret_abs.rolling(win_long).quantile(q_k)).astype(int)
+    ext_cnt = is_ext.rolling(win_eval).sum()
+    df['signal'] = (ext_cnt > ext_cnt.rolling(win_long).quantile(q_f)).fillna(False).astype(bool)
+    return df
+
+def factor_049_2(df):
+    win_eval, win_long, q_k, q_f = 240, 1440, 0.95, 0.95
+    ret_abs = df['close'].pct_change().abs()
+    is_ext = (ret_abs > ret_abs.rolling(win_long).quantile(q_k)).astype(int)
+    ext_cnt = is_ext.rolling(win_eval).sum()
+    df['signal'] = (ext_cnt > ext_cnt.rolling(win_long).quantile(q_f)).fillna(False).astype(bool)
+    return df
+
+def factor_049_3(df):
+    win_eval, win_long, q_k, q_f = 480, 1440, 0.95, 0.95
+    ret_abs = df['close'].pct_change().abs()
+    is_ext = (ret_abs > ret_abs.rolling(win_long).quantile(q_k)).astype(int)
+    ext_cnt = is_ext.rolling(win_eval).sum()
+    df['signal'] = (ext_cnt > ext_cnt.rolling(win_long).quantile(q_f)).fillna(False).astype(bool)
+    return df
+
+def factor_049_4(df):
+    win_eval, win_long, q_k, q_f = 240, 1440, 0.90, 0.95
+    ret_abs = df['close'].pct_change().abs()
+    is_ext = (ret_abs > ret_abs.rolling(win_long).quantile(q_k)).astype(int)
+    ext_cnt = is_ext.rolling(win_eval).sum()
+    df['signal'] = (ext_cnt > ext_cnt.rolling(win_long).quantile(q_f)).fillna(False).astype(bool)
+    return df
+
+def factor_049_5(df):
+    win_eval, win_long, q_k, q_f = 240, 1440, 0.99, 0.99
+    ret_abs = df['close'].pct_change().abs()
+    is_ext = (ret_abs > ret_abs.rolling(win_long).quantile(q_k)).astype(int)
+    ext_cnt = is_ext.rolling(win_eval).sum()
+    df['signal'] = (ext_cnt > ext_cnt.rolling(win_long).quantile(q_f)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_051 (做多：非对称波动率) ====================
+# _1: 1小时不对称, _2: 原版4小时, _3: 8小时不对称, _4: 极端非对称(0.01), _5: 宽容(0.10)
+
+def factor_051_1(df):
+    win_eval, win_long, q_low = 60, 1440, 0.05
+    ret = df['close'].pct_change()
+    up_std = ret.where(ret > 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    dn_std = ret.where(ret < 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    ratio = up_std / dn_std.replace(0, 1e-9)
+    df['signal'] = (ratio < ratio.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_051_2(df):
+    win_eval, win_long, q_low = 240, 1440, 0.05
+    ret = df['close'].pct_change()
+    up_std = ret.where(ret > 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    dn_std = ret.where(ret < 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    ratio = up_std / dn_std.replace(0, 1e-9)
+    df['signal'] = (ratio < ratio.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_051_3(df):
+    win_eval, win_long, q_low = 480, 1440, 0.05
+    ret = df['close'].pct_change()
+    up_std = ret.where(ret > 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    dn_std = ret.where(ret < 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    ratio = up_std / dn_std.replace(0, 1e-9)
+    df['signal'] = (ratio < ratio.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_051_4(df):
+    win_eval, win_long, q_low = 240, 1440, 0.01
+    ret = df['close'].pct_change()
+    up_std = ret.where(ret > 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    dn_std = ret.where(ret < 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    ratio = up_std / dn_std.replace(0, 1e-9)
+    df['signal'] = (ratio < ratio.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_051_5(df):
+    win_eval, win_long, q_low = 240, 1440, 0.10
+    ret = df['close'].pct_change()
+    up_std = ret.where(ret > 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    dn_std = ret.where(ret < 0, np.nan).rolling(win_eval, min_periods=win_eval//4).std()
+    ratio = up_std / dn_std.replace(0, 1e-9)
+    df['signal'] = (ratio < ratio.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_003 (做多：通道低位) ====================
+# _1: 60窗5%, _2: 原版240窗5%, _3: 480窗5%, _4: 240窗1%极限, _5: 240窗10%较宽
+
+def factor_003_1(df):
+    win, p_low = 60, 0.05
+    rng = df['high'].rolling(win).max() - df['low'].rolling(win).min()
+    pos = (df['close'] - df['low'].rolling(win).min()) / rng.replace(0, 1e-9)
+    df['signal'] = (pos <= p_low).fillna(False).astype(bool)
+    return df
+
+def factor_003_2(df):
+    win, p_low = 240, 0.05
+    rng = df['high'].rolling(win).max() - df['low'].rolling(win).min()
+    pos = (df['close'] - df['low'].rolling(win).min()) / rng.replace(0, 1e-9)
+    df['signal'] = (pos <= p_low).fillna(False).astype(bool)
+    return df
+
+def factor_003_3(df):
+    win, p_low = 480, 0.05
+    rng = df['high'].rolling(win).max() - df['low'].rolling(win).min()
+    pos = (df['close'] - df['low'].rolling(win).min()) / rng.replace(0, 1e-9)
+    df['signal'] = (pos <= p_low).fillna(False).astype(bool)
+    return df
+
+def factor_003_4(df):
+    win, p_low = 240, 0.01
+    rng = df['high'].rolling(win).max() - df['low'].rolling(win).min()
+    pos = (df['close'] - df['low'].rolling(win).min()) / rng.replace(0, 1e-9)
+    df['signal'] = (pos <= p_low).fillna(False).astype(bool)
+    return df
+
+def factor_003_5(df):
+    win, p_low = 240, 0.10
+    rng = df['high'].rolling(win).max() - df['low'].rolling(win).min()
+    pos = (df['close'] - df['low'].rolling(win).min()) / rng.replace(0, 1e-9)
+    df['signal'] = (pos <= p_low).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_002 (做空：Z-Score 超买区) ====================
+# _1: 15窗超短, _2: 30窗, _3: 原版60窗, _4: 120窗较平滑, _5: 60窗极端(0.99)
+
+def factor_002_1(df):
+    win_short, win_long, q_high = 15, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = (z > z.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_002_2(df):
+    win_short, win_long, q_high = 30, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = (z > z.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_002_3(df):
+    win_short, win_long, q_high = 60, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = (z > z.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_002_4(df):
+    win_short, win_long, q_high = 120, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = (z > z.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_002_5(df):
+    win_short, win_long, q_high = 60, 1440, 0.99
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = (z > z.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_024 (做空：K线微观位置极高) ====================
+# _1: 3窗高频, _2: 原版5窗, _3: 10窗平滑, _4: 99分位极罕见, _5: 90分位较宽
+
+def factor_024_1(df):
+    win_short, win_long, q_high = 3, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_2(df):
+    win_short, win_long, q_high = 5, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_3(df):
+    win_short, win_long, q_high = 10, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_4(df):
+    win_short, win_long, q_high = 5, 1440, 0.99
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_5(df):
+    win_short, win_long, q_high = 5, 1440, 0.90
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_007 (做多：Z-score触底回升) ====================
+# _1: 30窗/5落后, _2: 原版60窗/15落后, _3: 120窗/30落后, _4: 原版(0.01极值), _5: 原版(0.10宽松)
+
+def factor_007_1(df):
+    win_short, lag, win_long, q_low = 30, 5, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_2(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_3(df):
+    win_short, lag, win_long, q_low = 120, 30, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_4(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.01
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_5(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.10
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_008 (做空：Z-score触顶回落) ====================
+# _1: 30窗/5落后, _2: 原版60窗/15落后, _3: 120窗/30落后, _4: 原版(0.99极值), _5: 原版(0.90宽松)
+
+def factor_008_1(df):
+    win_short, lag, win_long, q_high = 30, 5, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_2(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_3(df):
+    win_short, lag, win_long, q_high = 120, 30, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_4(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.99
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_5(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.90
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+
+# ==================== factor_052 (定时器特征 - 不同时区切换) ====================
+# _1: UTC 0 (亚盘午夜/日切), _2: UTC 4 (亚盘早市), _3: UTC 8 (欧盘早市), _4: UTC 13 (美盘早市), _5: UTC 20 (美盘尾盘)
+
+def factor_052_1(df):
+    target = 0
+    df['signal'] = (pd.to_datetime(df['open_time'], unit='ms').dt.hour == target).fillna(False).astype(bool)
+    return df
+
+def factor_052_2(df):
+    target = 4
+    df['signal'] = (pd.to_datetime(df['open_time'], unit='ms').dt.hour == target).fillna(False).astype(bool)
+    return df
+
+def factor_052_3(df):
+    target = 8
+    df['signal'] = (pd.to_datetime(df['open_time'], unit='ms').dt.hour == target).fillna(False).astype(bool)
+    return df
+
+def factor_052_4(df):
+    target = 13
+    df['signal'] = (pd.to_datetime(df['open_time'], unit='ms').dt.hour == target).fillna(False).astype(bool)
+    return df
+
+def factor_052_5(df):
+    target = 20
+    df['signal'] = (pd.to_datetime(df['open_time'], unit='ms').dt.hour == target).fillna(False).astype(bool)
+    return df
+
 # ==================== 一、价格偏离与位置类 ====================
 # ==================== 一、价格偏离与位置类 ====================
 
@@ -2221,48 +2633,40 @@ if __name__ == "__main__":
         "BNBUSDT"
     ]
 
-    # 将 26 个策略加入列表，全部纳入且不过滤
+
     strategies = [
-        # 一、价格偏离与位置类
-        factor_001, factor_002, factor_003, factor_004,
-        factor_005, factor_006, factor_007, factor_008,
+        # factor_023 (做多：K线微观位置极低)
+        factor_023_1, factor_023_2, factor_023_3, factor_023_4, factor_023_5,
 
-        # 二、动量与路径结构类
-        factor_009, factor_010, factor_011, factor_012,
-        factor_013, factor_014_high, factor_014_low, factor_015, factor_016,
-        factor_017,
+        # factor_029 (做多：跳空幅度极大)
+        factor_029_1, factor_029_2, factor_029_3, factor_029_4, factor_029_5,
 
-        # 三、波动率与振幅类
-        factor_018_high, factor_018_low, factor_019_high, factor_019_low,
-        factor_020_high, factor_020_low, factor_021, factor_022,
+        # factor_043 (做多：假突破均值回归)
+        factor_043_1, factor_043_2, factor_043_3, factor_043_4, factor_043_5,
 
-        # 四、K 线微观结构类
-        factor_023, factor_024, factor_025, factor_026,
-        factor_027, factor_028, factor_029, factor_030,
+        # factor_049 (做多：极端波动率簇集)
+        factor_049_1, factor_049_2, factor_049_3, factor_049_4, factor_049_5,
 
-        # 五、成交量与流动性类
-        factor_031_high, factor_031_low, factor_032,
+        # factor_051 (做多：非对称波动率)
+        factor_051_1, factor_051_2, factor_051_3, factor_051_4, factor_051_5,
 
-        # 六、量价关系类
-        factor_033, factor_034, factor_035_high, factor_035_low,
-        factor_036, factor_037, factor_038, factor_039,
+        # factor_003 (做多：通道低位)
+        factor_003_1, factor_003_2, factor_003_3, factor_003_4, factor_003_5,
 
-        # 七、区间、压缩与突破类
-        factor_040_high, factor_040_low, factor_041, factor_042,
-        factor_043, factor_044, factor_045_high, factor_045_low,
+        # factor_002 (做空：Z-Score 超买区)
+        factor_002_1, factor_002_2, factor_002_3, factor_002_4, factor_002_5,
 
-        # 八、尾部风险与分布类
-        factor_046, factor_047, factor_048, factor_049,
-        factor_050, factor_051,
+        # factor_024 (做空：K线微观位置极高)
+        factor_024_1, factor_024_2, factor_024_3, factor_024_4, factor_024_5,
 
-        # 九、时间结构类
-        factor_052, factor_053, factor_054, factor_055,
+        # factor_007 (做多：Z-score触底回升)
+        factor_007_1, factor_007_2, factor_007_3, factor_007_4, factor_007_5,
 
-        # 十、跨周期一致性类
-        factor_056, factor_057,
+        # factor_008 (做空：Z-score触顶回落)
+        factor_008_1, factor_008_2, factor_008_3, factor_008_4, factor_008_5,
 
-        # 十一、短周期异常类
-        factor_058, factor_059, factor_060
+        # factor_052 (定时器特征 - 不同时区切换)
+        factor_052_1, factor_052_2, factor_052_3, factor_052_4, factor_052_5
     ]
 
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
@@ -2272,8 +2676,53 @@ if __name__ == "__main__":
                   "low": np.float32, "close": np.float32, "volume": np.float32}
 
     # 新增三个参数搜索空间
-    search_add_steps = [ 0.002, 0.005, 0.01, 0.015]
-    search_tp_steps = [0.002, 0.005, 0.01, 0.015]
+    # ==========================================
+    # 1. 加仓间距/幅度 (Add Steps)
+    # 作用：决定扛单空间与资金占用速度。间距越小，成交越频繁但越容易在单边行情中打满仓位；间距越大，越安全但资金利用率低。
+    # 原有基准：0.010, 0.015 (1% ~ 1.5%)
+    # ==========================================
+    search_add_steps = [
+        # --- 激进/超短线 (适合低波动率标的，如大饼/以太周末盘) ---
+        0.005,  # 0.5%
+        0.008,  # 0.8%
+        0.010,  # 1.0% (原有参数)
+
+        # --- 常规/标准参数 (兼顾收益与回撤，适合大部分主流币) ---
+        0.012,  # 1.2%
+        0.015,  # 1.5% (原有核心参数)
+        0.018,  # 1.8%
+
+        # --- 防守/宽网格 (适合高波动山寨币，或大趋势发生时的防守) ---
+        0.020,  # 2.0%
+        0.025,  # 2.5%
+        0.030,  # 3.0%
+    ]
+
+    # ==========================================
+    # 2. 止盈间距/幅度 (Take Profit Steps)
+    # 作用：决定胜率和资金回笼速度。马丁类策略的核心是“止盈间距要小于或等于加仓间距”，这样均价拉回后只要一点反弹就能跑路。
+    # 原有基准：0.005 (0.5%)
+    # ==========================================
+    search_tp_steps = [
+        # --- 高频快进快出 (胜率极高，吃毛利，适合配合高倍数) ---
+        0.003,  # 0.3% (需扣除手续费，仅适合VIP费率或Maker)
+        0.004,  # 0.4%
+        0.005,  # 0.5% (原有核心参数)
+
+        # --- 常规波段 (盈亏比更好，适合做 15m/1H 的波动) ---
+        0.008,  # 0.8%
+        0.010,  # 1.0%
+        0.012,  # 1.2%
+
+        # --- 趋势跟随 (需要单边行情配合，通常配合较小的加仓倍数) ---
+        0.015,  # 1.5%
+        0.020  # 2.0%
+    ]
+
+    # ==========================================
+    # 3. 加仓倍数 (Multipliers)
+    # 作用：决定仓位爆炸速度和拉低均价的能力。倍数越大，拉均价越快，但面临单边行情时爆仓风险呈指数级上升。
+    # 原有基准：1.5, 2.0
     search_mults = [1.5, 2.0]
 
     # 每个策略包含的多空和参数组合总数
