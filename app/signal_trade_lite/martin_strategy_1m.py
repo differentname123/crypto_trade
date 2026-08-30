@@ -2630,9 +2630,10 @@ if __name__ == "__main__":
         "BTCUSDT",
         "ETHUSDT",
         "SOLUSDT",
+        "LINKUSDT",
+        "AAVEUSDT",
         "BNBUSDT"
     ]
-
 
     strategies = [
         # factor_023 (做多：K线微观位置极低)
