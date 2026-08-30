@@ -149,7 +149,7 @@ def predict_follow_back(user_info):
     if modify_time_ms == 0:
         return {"is_recommended": False, "probability": 10, "reason": "无活跃时间戳"}
     days_inactive = (time.time() * 1000 - modify_time_ms) / (1000 * 3600 * 24)
-    if days_inactive > 3:
+    if days_inactive > 7:
         return {"is_recommended": False, "probability": 10, "reason": "超3天未活跃"}
     if (post_count + like_count) < 5 or follower_count < 20:
         return {"is_recommended": False, "probability": 10, "reason": "数据极低疑似脚本"}
