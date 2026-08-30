@@ -549,7 +549,13 @@ def install_overlay_guard(page):
     ).filter(has_text=RE_DISMISS).first
 
     def _on_overlay():
-        _dismiss_overlays(page, aggressive=False, desc="locator_handler")
+        # 🚀 [核心修复] 兜底防死锁：如果常规点击没能关掉浮层，直接用 JS 强制将其物理隐藏
+        acted = _dismiss_overlays(page, aggressive=False, desc="locator_handler")
+        if not acted:
+            try:
+                trigger.evaluate("el => el.style.display = 'none'")
+            except Exception:
+                pass
 
     try:
         page.add_locator_handler(trigger, _on_overlay, no_wait_after=True)
@@ -566,7 +572,6 @@ def install_overlay_guard(page):
         logger.info("[守卫/Guard] 浮层免疫已武装（兼容模式：无 no_wait_after）")
     except Exception as e:
         logger.warning(f"[守卫/Guard] locator_handler 挂载失败，退化为手动清障 | 原因: 【{str(e)[:120]}】")
-
 
 def report_guard_hits(page, stage=""):
     """读取 JS 看门狗战果，便于事后定位"到底自动关掉了什么浮层"。"""
@@ -1307,17 +1312,24 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
+    # 🚀 [核心修复] 彻底禁止 Chrome 恢复上次崩溃/未关闭的会话，从底层斩断假死
+    anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
+
     offscreen_args = [
-        '--disable-blink-features=AutomationControlled', '--disable-gpu',
-        '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
-        '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
-        '--disable-breakpad',
-        '--force-device-scale-factor=1',   # 防离屏窗口 DPI 漂移导致坐标点击偏移
-        '--hide-scrollbars',
-    ]
-    debug_args = ['--disable-blink-features=AutomationControlled', '--start-maximized',
-                  '--disable-gpu', '--window-position=0,0']
+                         '--disable-blink-features=AutomationControlled', '--disable-gpu',
+                         '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
+                         '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+                         '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
+                         '--disable-breakpad',
+                         '--force-device-scale-factor=1',  # 防离屏窗口 DPI 漂移导致坐标点击偏移
+                         '--hide-scrollbars',
+                     ] + anti_freeze_args
+
+    # 🚀 [核心修复] 去掉可见模式下的 --disable-gpu，防止 Windows 有头模式下渲染死锁白屏
+    debug_args = [
+                     '--disable-blink-features=AutomationControlled', '--start-maximized',
+                     '--window-position=0,0'
+                 ] + anti_freeze_args
 
     try:
         with sync_playwright() as p:
@@ -1330,13 +1342,23 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 )
                 context.set_default_timeout(60000)
                 context.set_default_navigation_timeout(60000)
-                page = context.pages[0] if context.pages else context.new_page()
+
+                # 🚀 [核心修复] 绝对不复用 context.pages[0]，强制创建崭新页面，并关闭所有历史垃圾页面
+                page = context.new_page()
+                for old_page in context.pages:
+                    if old_page != page:
+                        try:
+                            old_page.close()
+                        except Exception:
+                            pass
+                page.bring_to_front()
 
                 # 🚀 必须在 goto 之前武装守卫：init_script 只对之后的导航生效
                 install_overlay_guard(page)
 
-                response = page.goto(post_url, timeout=60000)
-                page.wait_for_load_state("domcontentloaded", timeout=60000)
+                # 🚀 [核心修复] 等待级别降级为 domcontentloaded，避免被第三方死链卡死
+                response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
+
                 _dismiss_overlays(page, aggressive=False, desc="post-nav")
                 report_guard_hits(page, "post-nav")
 
@@ -1361,7 +1383,8 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 check_for_crash(page)
 
                 comment_id = _submit_comment(page, editor_container, comment, image_path, url_info_list)
-                logger.info(f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
+                logger.info(
+                    f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
                 return None, True, comment_id
 
             except BusinessErrorException as biz_e:

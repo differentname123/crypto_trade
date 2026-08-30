@@ -695,7 +695,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
     if "Margin" in df_all.columns:
-        df_all = df_all[df_all["Margin"] >= 10]
+        df_all = df_all[df_all["Margin"] == 2.55]
 
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
@@ -784,8 +784,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
         # 打印表头，附带展示该策略的最高收益，一目了然
         max_p = strategy_max_profits[strategy_name]
-        print(f"\n🏆 开仓策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
-        # print(f"\n🏆 策略排名 {index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+        # print(f"\n🏆 开仓策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+        print(f"\n🏆 开仓策略编号{index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
