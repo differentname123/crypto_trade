@@ -660,12 +660,14 @@ def get_all_non_empty_logic_mul_with_clean_text():
         if logic_mul:
             # 1. 按照既有数据结构，安全地获取原始正文文本
             raw_text = post.get("content", {}).get("text_content", "")
+            post_id = post.get("post_id", "UNKNOWN_ID")
 
             # 2. 文本清洗：利用项目原生正则，去除 [插图: http...] / [视频: http...] 等占位符
             cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
 
             # 3. 将清洗后的文本和 logic_mul 组合存入列表
             valid_data_list.append({
+                # "post_id":post_id,
                 "text_content": cleaned_text,
                 "logic_mul": logic_mul
             })
@@ -683,7 +685,7 @@ def get_all_non_empty_logic_mul_with_clean_text():
 if __name__ == "__main__":
     valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
-    # clear_all_media_format_batch()
+    clear_all_media_format_batch()
 
     # post_manager = UniversalPostManager(gen_db_object())
 
