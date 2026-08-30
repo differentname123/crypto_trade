@@ -261,7 +261,7 @@ def normalize_post_media(post_data):
 def check_format_info(json_data, placeholders):
     """
     防御性校验大模型返回的 JSON 数据结构，确保核心业务字段完整、枚举正确且图片映射无误。
-    [入参 Shape]: json_data 解析出的外部数据结构 (Dict), placeholders 文章中真实的图片占位符列表 (如 ['[IMAGE_1]', '[IMAGE_2]'])
+    [入参 Shape]: json_data 解析出的外部数据结构 (Dict), placeholders 文章中真实的图片占位符列表 (如 ['[IMAGE_1]', '[IMAGE_2]']，无图传入 [])
     [出参 Shape]: 元组 (是否合法校验布尔值, 错误详情文本)
     """
     # ================= 1. 最外层结构校验 =================
@@ -277,14 +277,12 @@ def check_format_info(json_data, placeholders):
         return False, "'evidences' 节点必须是列表(List)"
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
-    # 【修改点】：加入了新增的 'raw_golden_quote'
+    # 严格对齐 Prompt 要求的 8 个核心字段
     evidence_expected_keys = {
-        'claim', 'support', 'raw_golden_quote', 'support_type',
+        'claim', 'support', 'raw_golden_quote',
         'dimension', 'coins', 'stance', 'shelf_life', 'images'
     }
 
-    # 【注意】：严格按照上一版 Prompt，保留了 '泛泛而谈'
-    valid_support_types = {'具体数据', '具体事件', '图表形态', '泛泛而谈'}
     valid_dimensions = {'K线形态', '技术指标', '链上数据', '资金流', '消息面', '基本面', '情绪判断'}
     valid_evidence_stances = {'看多', '看空', '震荡'}
     valid_shelf_lives = {'hours', 'days', 'weeks', 'long', 'unknown'}
@@ -298,19 +296,20 @@ def check_format_info(json_data, placeholders):
         if not isinstance(ev, dict):
             return False, f"evidences 序列第【{i + 1}】项数据异常，不是标准的字典对象"
 
-        # 核心字段完整性检查
+        # 核心字段完整性与冗余检查
         missing_ev_keys = evidence_expected_keys - ev.keys()
         if missing_ev_keys:
             return False, f"evidences 序列第【{i + 1}】项缺失核心字段: 【{', '.join(missing_ev_keys)}】"
 
-        # 数据类型检查（针对新增金句字段的防御）
+        extra_ev_keys = ev.keys() - evidence_expected_keys
+        if extra_ev_keys:
+            return False, f"evidences 序列第【{i + 1}】项存在未定义的冗余字段: 【{', '.join(extra_ev_keys)}】"
+
+        # 数据类型检查
         if not isinstance(ev.get('raw_golden_quote'), str):
             return False, f"evidences 序列第【{i + 1}】项的 raw_golden_quote 必须是字符串(String)"
 
         # 枚举值检查
-        if ev.get('support_type') not in valid_support_types:
-            return False, f"evidences 第【{i + 1}】项 support_type【{ev.get('support_type')}】不在允许枚举值内"
-
         if ev.get('dimension') not in valid_dimensions:
             return False, f"evidences 第【{i + 1}】项 dimension【{ev.get('dimension')}】不在允许枚举值内"
 
@@ -339,9 +338,10 @@ def check_format_info(json_data, placeholders):
                 return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项缺失字段: 【{', '.join(missing_img_keys)}】"
 
             # 严格映射：校验引用的图片占位符是否真的存在于原文中
+            # 修复：直接判断 img_id 是否在 placeholders 集合中，防止原文无图时大模型捏造图片
             img_id = img.get('image_id')
-            if placeholders and (img_id not in placeholders):
-                return False, f"evidences 第【{i + 1}】项引用的 image_id【{img_id}】非法，只能使用原文存在的真实占位符"
+            if img_id not in placeholders:
+                return False, f"evidences 第【{i + 1}】项引用的 image_id【{img_id}】非法，只能使用原文真实存在的占位符"
 
             if img.get('image_type') not in valid_image_types:
                 return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 image_type【{img.get('image_type')}】不在枚举值内"
@@ -353,11 +353,10 @@ def check_format_info(json_data, placeholders):
 
             for risk in risks:
                 if risk not in valid_risks:
-                    return False, f"evidences 第【{i + 1}】项的 risk 包含了非法枚举值【{risk}】"
+                    return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 risk 包含了非法枚举值【{risk}】"
 
     # 全部校验通过
     return True, ""
-
 
 def gen_media_format_info(post):
     """
