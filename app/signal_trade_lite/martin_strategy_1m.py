@@ -2724,7 +2724,7 @@ if __name__ == "__main__":
     # 3. 加仓倍数 (Multipliers)
     # 作用：决定仓位爆炸速度和拉低均价的能力。倍数越大，拉均价越快，但面临单边行情时爆仓风险呈指数级上升。
     # 原有基准：1.5, 2.0
-    search_mults = [1.5, 2.0]
+    search_mults = [2.0]
 
     # 每个策略包含的多空和参数组合总数
     combinations_per_strat = len(search_add_steps) * len(search_tp_steps) * len(search_mults) * 2
