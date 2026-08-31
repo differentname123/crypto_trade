@@ -279,7 +279,7 @@ def check_format_info(json_data, placeholders):
     # ================= 2. 校验 evidences (逻辑论据单元) =================
     # 严格对齐 Prompt 要求的 8 个核心字段
     evidence_expected_keys = {
-        'claim', 'support', 'raw_golden_quote',
+        'claim', 'support',
         'dimension', 'coins', 'stance', 'shelf_life', 'images'
     }
 
@@ -305,9 +305,6 @@ def check_format_info(json_data, placeholders):
         if extra_ev_keys:
             return False, f"evidences 序列第【{i + 1}】项存在未定义的冗余字段: 【{', '.join(extra_ev_keys)}】"
 
-        # 数据类型检查
-        if not isinstance(ev.get('raw_golden_quote'), str):
-            return False, f"evidences 序列第【{i + 1}】项的 raw_golden_quote 必须是字符串(String)"
 
         # 枚举值检查
         if ev.get('dimension') not in valid_dimensions:
@@ -683,9 +680,12 @@ def get_all_non_empty_logic_mul_with_clean_text():
 
 
 if __name__ == "__main__":
+    # clear_all_media_format_batch()
+
+
+
     valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
-    # clear_all_media_format_batch()
 
     # post_manager = UniversalPostManager(gen_db_object())
 
