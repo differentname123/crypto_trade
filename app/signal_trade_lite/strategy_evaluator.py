@@ -24,11 +24,11 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 # 参数配置
 # =====================================================================
 # 缓存文件所在的目录 (请与你生成数据时保持一致)
-CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
-SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
+# CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
+# SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 
-# CACHE_DIR = r"E:\backtest_data_1m"  # 做多策略默认缓存目录
-# SHORT_CACHE_DIR = r"E:\backtest_data_1m"  # 新增：做空策略缓存目录
+CACHE_DIR = r"W:\backtest_data_1m"  # 做多策略默认缓存目录
+SHORT_CACHE_DIR = r"W:\backtest_data_1m"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
 TEST_MARGINS = [2.55, 10.0]
@@ -814,8 +814,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
 
 if __name__ == "__main__":
-    # mp.freeze_support()
-    # analyze_all_strategies()
+    mp.freeze_support()
+    analyze_all_strategies()
     csv_file = "strategy_leaderboard_16384_files.csv"
     # csv_file = "strategy_leaderboard_15600_files.csv"
 
