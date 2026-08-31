@@ -2808,7 +2808,7 @@ if __name__ == "__main__":
                  % (time.time() - t, n_sig, signal_np.shape[0], signal_rate), 1)
 
             # --- 增加剪枝：如果信号率超过 10%，直接跳过策略回测 ---
-            if signal_rate > 10.0:
+            if signal_rate > 15.0:
                 _log("提示: 信号率超过 10%%，该策略极大概率表现不佳或失效，直接跳过", 1)
                 task_done += combinations_per_strat
                 del signal_np

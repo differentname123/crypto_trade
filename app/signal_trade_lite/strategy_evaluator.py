@@ -649,7 +649,7 @@ def analyze_all_strategies():
         print(sep_line)
 
 
-def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=60,
+def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=1000,
                          min_net_profit=-1000, min_total_profit=20):
     """
     专门用于读取并展示 CSV 文件的函数。
@@ -736,12 +736,13 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
                     "最长无盈利(天)", "无盈利占比(%)"
                     ]
 
-    display_cols = ["Margin", "币种", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
-                    "0-1层解决战斗比例(%)",
+    display_cols = [ "币种", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
+                    # "0-1层解决战斗比例(%)",
                     "爆仓次数", "预期存活(天)", "中位存活(天)", "最大存活(天)",
-                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)",
+                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)",
+                    # "持仓时间占比(%)",
                     "翻倍胜率(%)",
-                    "总收益(M倍)", "总亏损(M倍)", "净利润(M倍)"
+                    "总收益(M倍)", "净利润(M倍)"
                     ]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
@@ -814,9 +815,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
 
 if __name__ == "__main__":
-    # mp.freeze_support()
-    # analyze_all_strategies()
-    csv_file = "strategy_leaderboard_43633_files.csv"
-    # csv_file = "strategy_leaderboard_15600_files.csv"
-
-    show_leaderboard_csv(csv_file=csv_file, direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
+    mp.freeze_support()
+    analyze_all_strategies()
+    # csv_file = "strategy_leaderboard_43633_files.csv"
+    # # csv_file = "strategy_leaderboard_15600_files.csv"
+    #
+    # show_leaderboard_csv(csv_file=csv_file, direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
