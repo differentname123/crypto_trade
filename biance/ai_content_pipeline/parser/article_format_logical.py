@@ -685,7 +685,7 @@ def get_all_non_empty_logic_mul_with_clean_text():
 if __name__ == "__main__":
     valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
-    clear_all_media_format_batch()
+    # clear_all_media_format_batch()
 
     # post_manager = UniversalPostManager(gen_db_object())
 
