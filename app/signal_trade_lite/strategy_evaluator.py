@@ -695,7 +695,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
     if "Margin" in df_all.columns:
-        df_all = df_all[df_all["Margin"] == 2.55]
+        df_all = df_all[df_all["Margin"] == 10]
 
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
@@ -814,9 +814,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
 
 if __name__ == "__main__":
-    mp.freeze_support()
-    analyze_all_strategies()
-    csv_file = "strategy_leaderboard_16384_files.csv"
+    # mp.freeze_support()
+    # analyze_all_strategies()
+    csv_file = "strategy_leaderboard_43633_files.csv"
     # csv_file = "strategy_leaderboard_15600_files.csv"
 
     show_leaderboard_csv(csv_file=csv_file, direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
