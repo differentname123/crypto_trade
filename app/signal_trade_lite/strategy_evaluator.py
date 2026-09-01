@@ -32,7 +32,7 @@ CACHE_DIR = r"W:\backtest_data_1m"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"W:\backtest_data_1m"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
-TEST_MARGINS = [2.55, 10.0]
+TEST_MARGINS = [2,3,4,5,6,7,8,9,10]
 
 # === 新增：打印过滤与并行处理参数 ===
 # 最终打印时，过滤掉预期存活(天)小于此数值的结果
