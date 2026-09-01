@@ -10,6 +10,7 @@ import glob
 import pickle
 import gc
 import re
+import time
 import warnings
 import multiprocessing as mp
 import gzip  # === 兼容新老文件修改点 1：引入 gzip ===
@@ -815,6 +816,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
 
 if __name__ == "__main__":
+    # time.sleep(3600 * 4)
     mp.freeze_support()
     analyze_all_strategies()
     # csv_file = "strategy_leaderboard_43633_files.csv"
