@@ -698,6 +698,9 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     # if "Margin" in df_all.columns:
     #     df_all = df_all[df_all["Margin"] == 10]
 
+    if "最大持仓(h)" in df_all.columns:
+        df_all = df_all[df_all["最大持仓(h)"] <= 10 * 24]
+
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
 
@@ -821,6 +824,5 @@ if __name__ == "__main__":
     # analyze_all_strategies()
 
     csv_file = "strategy_leaderboard_47520_files.csv"
-    # csv_file = "strategy_leaderboard_15600_files.csv"
 
-    show_leaderboard_csv(csv_file=csv_file, direction="long")  # 默认不传文件路径会自动搜索刚才生成的未过滤的新文件
+    show_leaderboard_csv(csv_file=csv_file, direction="long")
