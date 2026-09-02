@@ -698,8 +698,11 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     # if "Margin" in df_all.columns:
     #     df_all = df_all[df_all["Margin"] == 10]
 
+    # if "最小存活(天)" in df_all.columns:
+    #     df_all = df_all[df_all["最小存活(天)"] >= 30]
+
     if "最大持仓(h)" in df_all.columns:
-        df_all = df_all[df_all["最大持仓(h)"] <= 10 * 24]
+        df_all = df_all[df_all["最大持仓(h)"] <= 20 * 24]
 
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
@@ -740,12 +743,11 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
                     "最长无盈利(天)", "无盈利占比(%)"
                     ]
 
-    display_cols = ["Margin",  "币种", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数",
+    display_cols = ["Margin",  "币种", "加仓间距", "止盈间距", "实际开仓数",
                     # "0-1层解决战斗比例(%)",
-                    "爆仓次数", "预期存活(天)", "中位存活(天)", "最大存活(天)",
-                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)",
+                    "爆仓次数", "预期存活(天)",
+                    "平均持仓(h)",
                     # "持仓时间占比(%)",
-                    "翻倍胜率(%)",
                     "总收益(M倍)", "净利润(M倍)"
                     ]
     display_cols = [c for c in display_cols if c in df_all.columns]
