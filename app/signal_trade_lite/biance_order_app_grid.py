@@ -1079,20 +1079,13 @@ def main_app():
         ),  # 消耗  1217  u 网格数量 95
 
         GridConfig(
-            strategy_id=f"PYTH{current_symbol}", symbol="PYTH/USDT:USDT",
-            min_price=0.025, max_price=0.0573, price_ratio=1.8, quantity=1600,
-        ),  # 消耗  1191  u 网格数量 46
-
-        GridConfig(
             strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
             min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
         ),  # 消耗  1240  u 网格数量 67
 
 
 
-
-
-        # 总共节点和为 95 + 46 + 67 = 208 个节点，消耗资金为 1217 + 1191 + 1240 = 3648 u
+        # 总共节点和为 95 + 67 = 162 个节点，消耗约 1217 + 1240 = 2457 u
     ]
     processes = []
     for config in configs:
