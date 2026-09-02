@@ -1263,7 +1263,7 @@ def main_app():
             strategy_id=f"SHORT-UNI{current_symbol}", symbol="UNI/USDT:USDT",
             min_price=5, max_price=10, price_ratio=1.54, quantity=1,
             direction=GridDirection.SHORT,
-        ),
+        ),# 消耗  133  u 网格数量 45
 
         # 总共节点和为 45
     ]
