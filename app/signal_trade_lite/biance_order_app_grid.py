@@ -197,7 +197,7 @@ class StatisticsThread(threading.Thread):
             if latest_price > 0:
                 self.ctx.latest_price = latest_price  # 线程安全更新(GIL保障)
         except Exception as e:
-            logger.warning(f"[看板] 尝试拉取最新价格失败，将使用被动缓存价格 | 错误:[{e}]")
+            logger.info(f"[看板] 尝试拉取最新价格失败，将使用被动缓存价格 | 错误:[{e}]")
 
         current_price = self.ctx.latest_price
         if current_price <= 0:
@@ -442,7 +442,7 @@ def guard_direction_consistency(config):
     except SystemExit:
         raise
     except Exception as e:
-        logger.warning(f"[方向锁] 方向一致性校验文件读写异常, 已跳过本次校验(不影响交易) | 错误:[{e}]")
+        logger.info(f"[方向锁] 方向一致性校验文件读写异常, 已跳过本次校验(不影响交易) | 错误:[{e}]")
 
 
 class ExchangeBroker:
@@ -612,7 +612,7 @@ class GridNode:
             return  # ERROR / INIT 不参与自动重挂
         self.ctx.ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED",
                                self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
-        logger.warning(f"[自愈] 【{self.node_id}】第[{self.cycle_count}]轮 在管订单被撤销/拒单"
+        logger.info(f"[自愈] 【{self.node_id}】第[{self.cycle_count}]轮 在管订单被撤销/拒单"
                        f"(可能被手工撤单或交易所清理), 正换新单号按网格价重挂 | 旧CID:[{self.active_client_oid}]")
 
         # 开仓单触发越价保护计算, 让错误恢复的节点能按现价边界重挂
@@ -663,7 +663,7 @@ class GridNode:
                 # 依靠 5 秒 (ORDER_GRACE_PERIOD) 后看门狗发现盘口无单，投递 CANCELED 事件交由主循环自动重试
                 self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                        self.active_client_oid, price, self.quantity, "WARN", msg="触发限频")
-                logger.warning(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
+                logger.info(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
                                f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
                                f"交易所回执:[{res.error_msg}]")
             else:
@@ -698,7 +698,7 @@ def build_geometric_grid(config, broker, ctx):
 
         # 精度碰撞: 修约后下沿 >= 上沿, 说明等比价差已小于最小刻度, 终止下沿生成
         if fmt_low >= fmt_high:
-            logger.warning(f"[网格] 价位[{current_high}]处 [{config.price_ratio}%] 等比价差已小于交易所最小报价刻度"
+            logger.info(f"[网格] 价位[{current_high}]处 [{config.price_ratio}%] 等比价差已小于交易所最小报价刻度"
                            f"(上/下沿价修约后同为[{fmt_high}]), 低价区无法继续细分, 网格生成提前收口")
             break
         if fmt_low < config.min_price:
@@ -714,6 +714,27 @@ def build_geometric_grid(config, broker, ctx):
                 f"区间:[{config.min_price}-{config.max_price}] 间距:[{config.price_ratio}%] 单笔数量:[{fmt_qty}]")
     return nodes
 
+class TimeSyncThread(threading.Thread):
+    """
+    周期性刷新 CCXT 与币安服务器的时间差。
+    彻底对抗本地服务器因长期运行造成的系统时钟持续漂移。
+    """
+    def __init__(self, exchange, interval_sec=3600):
+        super().__init__(daemon=True)
+        self.exchange = exchange
+        self.interval_sec = interval_sec
+
+    def run(self):
+        logger.info(f"[时间同步] 后台自动校时线程启动 | 周期:[{self.interval_sec}秒]")
+        while True:
+            time.sleep(self.interval_sec)
+            try:
+                self.exchange.load_time_difference()
+                offset = self.exchange.options.get('timeDifference', 0)
+                # 使用 debug 级别，避免打扰主业务的日志流
+                logger.debug(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
+            except Exception as e:
+                logger.info(f"[时间同步] 获取服务器时间异常, 本次忽略，保持旧偏差 | 错误:[{e}]")
 
 # ==========================================
 # 4. 对账引擎 (只读产事件, 冷启动例外)
@@ -775,7 +796,7 @@ class ReconciliationEngine:
                 self._align_and_emit(node, truth_cid, truth_order, via="账本回溯")
                 aligned += 1
             else:
-                logger.warning(f"[对账] 【{node_id}】最近[{len(candidates)}]笔历史单号在交易所均查无实据(幽灵单), "
+                logger.info(f"[对账] 【{node_id}】最近[{len(candidates)}]笔历史单号在交易所均查无实据(幽灵单), "
                                f"该节点将按全新节点重新铺单")
 
         # ── 第3层: 孤儿单巡检 (不归属任何节点; 仅高密度报警, 不执行物理撤单) ──
@@ -785,7 +806,7 @@ class ReconciliationEngine:
             if cid in managed_cids:
                 continue
             orphan_count += 1
-            logger.warning(f"[对账] 发现脱管孤儿单(保留未撤销, 请人工核查是否为历史遗留) | "
+            logger.info(f"[对账] 发现脱管孤儿单(保留未撤销, 请人工核查是否为历史遗留) | "
                            f"CID:[{cid}] 交易所ID:[{order.get('id', 'N/A')}] "
                            f"[{str(order.get('side', 'N/A')).upper()}] @[{order.get('price', 0)}] x[{order.get('amount', 0)}]")
 
@@ -810,7 +831,7 @@ class ReconciliationEngine:
 
         if not suspects:
             return
-        logger.warning(f"[看门狗] 发现[{len(suspects)}]个节点的在管订单从盘口消失(疑似已成交或被撤), "
+        logger.info(f"[看门狗] 发现[{len(suspects)}]个节点的在管订单从盘口消失(疑似已成交或被撤), "
                        f"逐一点查确认真实状态...")
         for _node, cid in suspects:
             try:
@@ -818,7 +839,7 @@ class ReconciliationEngine:
                 if info:
                     self._emit_from_order(cid, info)
                 else:
-                    logger.warning(f"[看门狗] 点查无果: 该单从未抵达交易所(多为下单瞬间网络中断的幽灵单), "
+                    logger.info(f"[看门狗] 点查无果: 该单从未抵达交易所(多为下单瞬间网络中断的幽灵单), "
                                    f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
                     self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
                 time.sleep(POINT_CHECK_DELAY_RUNTIME)
@@ -860,7 +881,7 @@ class ReconciliationEngine:
         """冷启动专用: 依真相拨正节点指针, 输出单条锚定日志, 并按订单状态补发事件。"""
         parsed = OidCodec.parse(truth_cid)
         if parsed is None:
-            logger.warning(f"[对账] 真相单号解析失败, 放弃拨正节点【{node.node_id}】"
+            logger.info(f"[对账] 真相单号解析失败, 放弃拨正节点【{node.node_id}】"
                            f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
             return
         node.align(parsed.cycle, truth_cid, truth_order.get('id', ''), parsed.action)
@@ -908,7 +929,7 @@ class GridStrategy:
         self.engine = ReconciliationEngine(broker, ledger, config.strategy_id, self.event_queue)
 
         if not config.is_long:
-            logger.warning(
+            logger.info(
                 f"[策略] 【做空网格】已装配 | 策略:[{self.strategy_id}] 交易对:[{config.symbol}]\n"
                 f"        请务必确认: 1) 合约账户已开启【双向持仓 Hedge Mode】, 否则 positionSide=SHORT 会被拒单;\n"
                 f"                    2) 亏损方向在上方且理论无界, max_price[{config.max_price}] 必须远离强平价并留足保证金;\n"
@@ -982,7 +1003,7 @@ class GridStrategy:
         """按 OID 解析定位目标节点并投喂事件。"""
         parsed = OidCodec.parse(event.client_oid)
         if parsed is None or parsed.strategy_id != self.strategy_id:
-            logger.warning(
+            logger.info(
                 f"[主循环] 收到无法路由的订单事件(格式非法或不属于本策略), 已忽略 | OID:[{event.client_oid}]")
             return
 
@@ -997,7 +1018,7 @@ class GridStrategy:
 
         node = self.nodes.get(parsed.node_id)
         if node is None:
-            logger.warning(f"[主循环] 事件目标节点不存在(网格区间可能已变更), 已忽略 | "
+            logger.info(f"[主循环] 事件目标节点不存在(网格区间可能已变更), 已忽略 | "
                            f"节点:[{parsed.node_id}] OID:[{event.client_oid}]")
             return
         node.process_event(event)
@@ -1064,7 +1085,8 @@ def run_single_strategy(config):
 
     # 启动日志统计看板
     StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=120).start()
-
+    TimeSyncThread(exchange, interval_sec=3600).start()
+    
     strategy.run_main_loop()
 
 
@@ -1089,7 +1111,7 @@ def cancel_all_orders_for_symbol(exchange, symbol):
             return True
 
         # 2. 兜底方案：如果 API 不支持批量撤单，则拉取当前挂单并逐个撤销
-        logger.warning(f"[紧急清理] 当前交易所不支持一键撤单，自动降级为逐个撤销模式...")
+        logger.info(f"[紧急清理] 当前交易所不支持一键撤单，自动降级为逐个撤销模式...")
         open_orders = exchange.fetch_open_orders(symbol)
 
         if not open_orders:
@@ -1219,18 +1241,18 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
     for node_id, o_list in sorted(node_orders.items()):
         if len(o_list) > 1:
             has_duplicate = True
-            logger.warning(f" ⚠️ 节点【{node_id}】存在 {len(o_list)} 笔重复挂单:")
+            logger.info(f" ⚠️ 节点【{node_id}】存在 {len(o_list)} 笔重复挂单:")
             for o in o_list:
-                logger.warning(f"    - CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
+                logger.info(f"    - CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
 
     if not has_duplicate:
         logger.info(" ✅ 未发现同一节点重复挂单。")
 
     # 2. 检查脱管孤儿单
     if orphans:
-        logger.warning(f" ⚠️ 发现 {len(orphans)} 笔非本策略 ID 的孤儿网格单:")
+        logger.info(f" ⚠️ 发现 {len(orphans)} 笔非本策略 ID 的孤儿网格单:")
         for o in orphans:
-            logger.warning(
+            logger.info(
                 f"    - ID: {o.get('id')} | CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
 
     logger.info("==============================================\n")
