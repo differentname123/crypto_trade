@@ -1260,7 +1260,7 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
-    current_symbol = "0902"
+    current_symbol = "0903"
     # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
     # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
     configs = [
