@@ -388,7 +388,7 @@ class GridLedger:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(self.filename, 'a', newline='', encoding='utf-8') as f:
             csv.writer(f).writerow([ts, node_id, cycle, action, client_oid, price, amount, status, msg])
-        logger.debug(f"[账本] {action} 【{node_id}】 CID:[{client_oid}] 状态:[{status}] {msg}")
+        logger.info(f"[账本] {action} 【{node_id}】 CID:[{client_oid}] 状态:[{status}] {msg}")
 
     def load_node_oid_history(self):
         """冷启动读取: 返回 {node_id: [client_oid,...]} (按出现序去重), 供多级回溯定位真相。"""
@@ -567,7 +567,7 @@ class GridNode:
         """状态机唯一入口: 幂等过滤后按 (状态, 事件) 分发到具体处理器。"""
         # 幂等拦截: 非当前期待的 OID 一律丢弃 (历史延迟 / 重复 / 已过时的对账事件)
         if event.client_oid != self.active_client_oid:
-            logger.debug(f"[节点] 【{self.node_id}】幂等拦截过时事件, 已丢弃 | "
+            logger.info(f"[节点] 【{self.node_id}】幂等拦截过时事件, 已丢弃 | "
                          f"期待CID:[{self.active_client_oid}] 收到CID:[{event.client_oid}]")
             return
 
@@ -732,7 +732,7 @@ class TimeSyncThread(threading.Thread):
                 self.exchange.load_time_difference()
                 offset = self.exchange.options.get('timeDifference', 0)
                 # 使用 debug 级别，避免打扰主业务的日志流
-                logger.debug(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
+                logger.info(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
             except Exception as e:
                 logger.info(f"[时间同步] 获取服务器时间异常, 本次忽略，保持旧偏差 | 错误:[{e}]")
 
@@ -874,7 +874,7 @@ class ReconciliationEngine:
                 if info:
                     return cid, info
             except Exception as e:
-                logger.debug(f"[对账] 回溯点查失败, 继续尝试更早单号 | CID:[{cid}] 错误:[{e}]")
+                logger.info(f"[对账] 回溯点查失败, 继续尝试更早单号 | CID:[{cid}] 错误:[{e}]")
         return None, None
 
     def _align_and_emit(self, node, truth_cid, truth_order, via):
@@ -1013,7 +1013,7 @@ class GridStrategy:
             if (now_ms - event.update_ts) < 300000:
                 self.ctx.latest_price = event.fill_price
             else:
-                logger.debug(
+                logger.info(
                     f"[主循环] 拦截到历史陈旧成交事件，跳过价格更新 | 滞后时长:{(now_ms - event.update_ts) / 1000:.1f}秒")
 
         node = self.nodes.get(parsed.node_id)
@@ -1124,7 +1124,7 @@ def cancel_all_orders_for_symbol(exchange, symbol):
             if order_id:
                 exchange.cancel_order(order_id, symbol)
                 cancel_count += 1
-                logger.debug(f"[紧急清理] 已撤销订单 ID:[{order_id}]")
+                logger.info(f"[紧急清理] 已撤销订单 ID:[{order_id}]")
 
         logger.info(f"[紧急清理] 【{symbol}】 成功逐个撤销了 {cancel_count} 张挂单")
         return True
