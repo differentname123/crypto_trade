@@ -1817,7 +1817,369 @@ def run_backtest(df, data_name="default_data", margins=(0.02, 0.16, 0.6, 2.55, 1
     print_report(report)
     return cycles, rp, sweep, trades, report
 
+# 1-3: 原有经典参数（短平滑，1日基准，5%极值）
+def factor_023_1(df):
+    win_short, win_long, q_low = 3, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
 
+def factor_023_2(df):
+    win_short, win_long, q_low = 5, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_3(df):
+    win_short, win_long, q_low = 10, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+# 4-5: 增加中短期平滑周期（对应15分钟、30分钟级别的异动）
+def factor_023_4(df):
+    win_short, win_long, q_low = 15, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_5(df):
+    win_short, win_long, q_low = 30, 1440, 0.05
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+# 6-7: 敏感度测试（原有：极端的1%，宽松的10%）
+def factor_023_6(df):
+    win_short, win_long, q_low = 5, 1440, 0.01
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_7(df):
+    win_short, win_long, q_low = 5, 1440, 0.10
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+# 8-10: 基准窗口(win_long)维度扩展（半日、两日分布）
+def factor_023_8(df):
+    win_short, win_long, q_low = 5, 720, 0.05  # 与过去半日(12h)相比，反应更敏捷
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_9(df):
+    win_short, win_long, q_low = 5, 2880, 0.05 # 与过去两日(48h)相比，信号更稳健
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+def factor_023_10(df):
+    win_short, win_long, q_low = 15, 2880, 0.05 # 15分钟平滑 + 两天级别分布 (适合作为波段因子)
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos < mean_pos.rolling(win_long).quantile(q_low)).fillna(False).astype(bool)
+    return df
+
+
+# 1-3: 原有经典参数（短平滑，1日基准，95%极值）
+def factor_024_1(df):
+    win_short, win_long, q_high = 3, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_2(df):
+    win_short, win_long, q_high = 5, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_3(df):
+    win_short, win_long, q_high = 10, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+# 4-5: 增加中短期平滑周期（对应15分钟、30分钟级别的拉升异动）
+def factor_024_4(df):
+    win_short, win_long, q_high = 15, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_5(df):
+    win_short, win_long, q_high = 30, 1440, 0.95
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+# 6-7: 敏感度测试（原有：极端的99%，宽松的90%）
+def factor_024_6(df):
+    win_short, win_long, q_high = 5, 1440, 0.99
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_7(df):
+    win_short, win_long, q_high = 5, 1440, 0.90
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+# 8-10: 基准窗口(win_long)维度扩展（半日、两日分布）
+def factor_024_8(df):
+    win_short, win_long, q_high = 5, 720, 0.95  # 与过去半日(12h)相比，用于捕捉短促的轧空拉升
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_9(df):
+    win_short, win_long, q_high = 5, 2880, 0.95 # 与过去两日(48h)相比，有效过滤假突破
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+def factor_024_10(df):
+    win_short, win_long, q_high = 15, 2880, 0.95 # 15分钟平滑 + 两天级别分布 (适合动量跟踪)
+    k_pos = (df['close'] - df['low']) / (df['high'] - df['low']).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    df['signal'] = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+    return df
+
+import pandas as pd
+def factor_007_1(df):
+    win_short, lag, win_long, q_low = 30, 5, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_2(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_3(df):
+    win_short, lag, win_long, q_low = 120, 30, 1440, 0.05
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_4(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.01
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_007_5(df):
+    win_short, lag, win_long, q_low = 60, 15, 1440, 0.10
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+
+def factor_008_1(df):
+    win_short, lag, win_long, q_high = 30, 5, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_2(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_3(df):
+    win_short, lag, win_long, q_high = 120, 30, 1440, 0.95
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_4(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.99
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+def factor_008_5(df):
+    win_short, lag, win_long, q_high = 60, 15, 1440, 0.90
+    z = (df['close'] - df['close'].rolling(win_short).mean()) / df['close'].rolling(win_short).std().replace(0, 1e-9)
+    df['signal'] = ((z > z.rolling(win_long).quantile(q_high)) & (z < z.shift(lag))).fillna(False).astype(bool)
+    return df
+
+# ==========================================
+# 策略 043: 向上假突破 (做空/看跌信号)
+# ==========================================
+
+# ==========================================
+# 策略 043: 向上假突破 (做空/看跌信号)
+# ==========================================
+
+def factor_043_1(df):
+    """梯度1: 超短线高频 (预期信号率: 8.0% - 9.0%)"""
+    win_break, win_base = 4, 40
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_2(df):
+    """梯度2: 短线活跃 (预期信号率: 7.0% - 8.0%)"""
+    win_break, win_base = 5, 50
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_3(df):
+    """梯度3: 短线常规 (预期信号率: 6.0% - 7.0%)"""
+    win_break, win_base = 5, 60
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_4(df):
+    """梯度4: 中短线平滑 (预期信号率: 5.0% - 6.0%)"""
+    win_break, win_base = 8, 120
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_5(df):
+    """梯度5: 中线标准 (预期信号率: 4.0% - 5.0%)"""
+    win_break, win_base = 10, 180
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_6(df):
+    """梯度6: 中线过滤 (预期信号率: 3.0% - 4.0%)"""
+    win_break, win_base = 10, 240
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_7(df):
+    """梯度7: 中长线稳健 (预期信号率: 2.0% - 3.0%)"""
+    win_break, win_base = 12, 360
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_8(df):
+    """梯度8: 长线低频 (预期信号率: 1.5% - 2.5%)"""
+    win_break, win_base = 15, 480
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_9(df):
+    """梯度9: 大周期关键位猎杀 (预期信号率: 1.0% - 1.8%)"""
+    win_break, win_base = 15, 720
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_043_10(df):
+    """梯度10: 极低频重要结构反转 (预期信号率: 0.5% - 1.2%)"""
+    win_break, win_base = 15, 1200
+    boundary = df['high'].shift(win_break).rolling(win_base).max()
+    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(bool)
+    return df
+
+
+# ==========================================
+# 策略 044: 向下假突破 (做多/看涨信号)
+# ==========================================
+
+def factor_044_1(df):
+    """梯度1: 超短线高频 (预期信号率: 8.0% - 9.0%)"""
+    win_break, win_base = 4, 40
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_2(df):
+    """梯度2: 短线活跃 (预期信号率: 7.0% - 8.0%)"""
+    win_break, win_base = 5, 50
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_3(df):
+    """梯度3: 短线常规 (预期信号率: 6.0% - 7.0%)"""
+    win_break, win_base = 5, 60
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_4(df):
+    """梯度4: 中短线平滑 (预期信号率: 5.0% - 6.0%)"""
+    win_break, win_base = 8, 120
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_5(df):
+    """梯度5: 中线标准 (预期信号率: 4.0% - 5.0%)"""
+    win_break, win_base = 10, 180
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_6(df):
+    """梯度6: 中线过滤 (预期信号率: 3.0% - 4.0%)"""
+    win_break, win_base = 10, 240
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_7(df):
+    """梯度7: 中长线稳健 (预期信号率: 2.0% - 3.0%)"""
+    win_break, win_base = 12, 360
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_8(df):
+    """梯度8: 长线低频 (预期信号率: 1.5% - 2.5%)"""
+    win_break, win_base = 15, 480
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_9(df):
+    """梯度9: 大周期关键位猎杀 (预期信号率: 1.0% - 1.8%)"""
+    win_break, win_base = 15, 720
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
+
+def factor_044_10(df):
+    """梯度10: 极低频重要结构反转 (预期信号率: 0.5% - 1.2%)"""
+    win_break, win_base = 15, 1200
+    boundary = df['low'].shift(win_break).rolling(win_base).min()
+    df['signal'] = ((df['low'].rolling(win_break).min() < boundary) & (df['close'] > boundary)).fillna(False).astype(bool)
+    return df
 # =====================================================================
 # 4. 执行入口 (按需批量化一阶段生成)
 # =====================================================================
@@ -1842,14 +2204,37 @@ if __name__ == "__main__":
 
     # 将 16 个策略加入列表以供循环调用
     strategies = [
-        strategy_15_micro_autocorrelation,
-
-
+        factor_043_1,
+        factor_043_2,
+        factor_043_3,
+        factor_043_4,
+        factor_043_5,
+        factor_043_6,
+        factor_043_7,
+        factor_043_8,
+        factor_043_9,
+        factor_043_10,
+        factor_044_1,
+        factor_044_2,
+        factor_044_3,
+        factor_044_4,
+        factor_044_5,
+        factor_044_6,
+        factor_044_7,
+        factor_044_8,
+        factor_044_9,
+        factor_044_10
     ]
 
-
     # 测试参数
-    symbols = ["BTCUSDT"]
+    symbols = [
+        "BTCUSDT",
+        "ETHUSDT",
+        "SOLUSDT",
+        "LINKUSDT",
+        "AAVEUSDT",
+        "BNBUSDT"
+    ]
     base_path = r"W:\project\python_project\oke_auto_trade\kline_data"
 
     # 调用上方提供的函数，单独输出信号率报告
