@@ -649,6 +649,185 @@ def analyze_all_strategies():
 
         print(sep_line)
 
+def compute_parameter_plateau(
+        csv_file: str,
+        output_csv: str = None,
+        neighbor_radius: int = 1,
+        min_survival_days: float = 60.0
+):
+    """
+    对回测结果宽表计算切比雪夫参数平原统计指标，并将结果保存为新的 CSV 文件。
+
+    :param csv_file: 原始宽表路径，例如 "strategy_leaderboard_47520_files.csv"
+    :param output_csv: 输出宽表路径，若为 None 则自动命名为 *_with_plateau.csv
+    :param neighbor_radius: 切比雪夫距离半径，默认 1 (即 3x3x3=27 个邻居网格)
+    :param min_survival_days: 计算“平原存活率”的阈值天数，默认 60 天
+    """
+    print("=" * 80)
+    print(f" 🏔️ 启动参数平原分析引擎 | 邻域切比雪夫半径 = {neighbor_radius}")
+    print("=" * 80)
+
+    # 1. 加载数据
+    print(f"正在读取数据文件: {csv_file} ...")
+    df = pd.read_csv(csv_file)
+    print(f"原始数据总行数: {len(df):,}")
+
+    # 列名标准化处理（兼顾可能的缩写列名）
+    col_map = {
+        "净利润(Margin倍数)": "净利_val",
+        "净利润(M倍)": "净利_val",
+        "总收益(Margin倍数)": "总收益_val",
+        "总收益(M倍)": "总收益_val",
+        "预期存活(天)": "预期存活_val",
+        "中位存活(天)": "中位存活_val",
+        "最长无盈利(天)": "最长无盈利_val",
+    }
+    for old_col, new_col in col_map.items():
+        if old_col in df.columns and new_col not in df.columns:
+            df[new_col] = df[old_col]
+
+    # 数值类型清洗与转换
+    # 预期存活可能包含 "999 (未爆仓)" 字符串
+    def parse_survival(v):
+        if isinstance(v, str):
+            if "未爆仓" in v:
+                return 999.0
+            try:
+                return float(v.split()[0])
+            except:
+                return 999.0
+        return float(v) if pd.notnull(v) else 0.0
+
+    df["_clean_预期存活"] = df["预期存活_val"].apply(parse_survival)
+    df["_clean_中位存活"] = pd.to_numeric(df["中位存活_val"], errors="coerce").fillna(0.0)
+    df["_clean_净利"] = pd.to_numeric(df["净利_val"], errors="coerce").fillna(0.0)
+    df["_clean_总收益"] = pd.to_numeric(df["总收益_val"], errors="coerce").fillna(0.0)
+    df["_clean_最长无盈利"] = pd.to_numeric(df["最长无盈利_val"], errors="coerce").fillna(0.0)
+
+    # 2. 自动识别维度参数的不重复离散值并构建网格索引 (Grid Rank)
+    # 平原空间坐标轴：Margin, 加仓间距, 止盈间距
+    dim_cols = ["Margin", "加仓间距", "止盈间距"]
+    idx_cols = [f"{c}_idx" for c in dim_cols]
+
+    for c, idx_c in zip(dim_cols, idx_cols):
+        unique_vals = sorted(df[c].dropna().unique())
+        val_to_idx = {val: i for i, val in enumerate(unique_vals)}
+        df[idx_c] = df[c].map(val_to_idx)
+        print(f"维度 [{c}] 识别到 {len(unique_vals)} 个离散档位: {unique_vals}")
+
+    # 分组键：同一策略、方向、加仓倍数内寻找平原，跨所有测试币种
+    group_keys = [c for c in ["策略", "方向", "加仓倍数"] if c in df.columns]
+    print(f"切片分组键: {group_keys}")
+
+    # 3. 提取所有唯一的网格配置（极大压缩计算量）
+    unique_params_keys = group_keys + dim_cols + idx_cols
+    unique_grids = df[unique_params_keys].drop_duplicates().reset_index(drop=True)
+    print(f"全量数据收敛为 {len(unique_grids):,} 个唯一参数网格点，开始并行/向量化计算邻域...")
+
+    plateau_records = []
+
+    # 按策略 + 方向 + 加仓倍数分块处理
+    grouped_data = df.groupby(group_keys)
+
+    for g_val, g_df in grouped_data:
+        # 当前组下的网格点
+        if len(group_keys) == 1:
+            g_mask = unique_grids[group_keys[0]] == g_val
+        else:
+            g_mask = np.ones(len(unique_grids), dtype=bool)
+            for k, v in zip(group_keys, g_val):
+                g_mask &= (unique_grids[k] == v)
+
+        sub_grids = unique_grids[g_mask]
+
+        # 将本组所有币种数据的坐标提取为 numpy 数组加速匹配
+        m_arr = g_df["Margin_idx"].values
+        add_arr = g_df["加仓间距_idx"].values
+        tp_arr = g_df["止盈间距_idx"].values
+
+        pnl_arr = g_df["_clean_净利"].values
+        gross_arr = g_df["_clean_总收益"].values
+        median_surv_arr = g_df["_clean_中位存活"].values
+        exp_surv_arr = g_df["_clean_预期存活"].values
+        no_profit_arr = g_df["_clean_最长无盈利"].values
+
+        # 对当前组下的每个唯一参数网格点求其邻域
+        for _, row in sub_grids.iterrows():
+            target_m = row["Margin_idx"]
+            target_add = row["加仓间距_idx"]
+            target_tp = row["止盈间距_idx"]
+
+            # 切比雪夫距离：max(|x1-x2|, |y1-y2|, |z1-z2|) <= neighbor_radius
+            neighbor_mask = (
+                    (np.abs(m_arr - target_m) <= neighbor_radius) &
+                    (np.abs(add_arr - target_add) <= neighbor_radius) &
+                    (np.abs(tp_arr - target_tp) <= neighbor_radius)
+            )
+
+            n_neighbors = int(np.sum(neighbor_mask))
+
+            if n_neighbors > 0:
+                nb_pnl = pnl_arr[neighbor_mask]
+                nb_gross = gross_arr[neighbor_mask]
+                nb_median_surv = median_surv_arr[neighbor_mask]
+                nb_exp_surv = exp_surv_arr[neighbor_mask]
+                nb_no_profit = no_profit_arr[neighbor_mask]
+
+                mean_pnl = float(np.mean(nb_pnl))
+                mean_gross = float(np.mean(nb_gross))
+                # 中位存活的 P10 分位数
+                surv_cushion = float(np.percentile(nb_median_surv, 10))
+                # 预期存活 > 阈值的比例
+                surv_rate = float(np.mean(nb_exp_surv > min_survival_days) * 100.0)
+                # 净利 > 0 的百分比
+                win_pnl_rate = float(np.mean(nb_pnl > 0) * 100.0)
+                # 最长无盈利的 90 分位数
+                p90_no_profit = float(np.percentile(nb_no_profit, 90))
+            else:
+                mean_pnl = 0.0
+                mean_gross = 0.0
+                surv_cushion = 0.0
+                surv_rate = 0.0
+                win_pnl_rate = 0.0
+                p90_no_profit = 0.0
+
+            res = {c: row[c] for c in (group_keys + dim_cols)}
+            res.update({
+                "全币邻居数": n_neighbors,
+                "平原均净利(M倍)": round(mean_pnl, 2),
+                "平原均总收益(M倍)": round(mean_gross, 2),
+                "平原存活安全垫(天)": round(surv_cushion, 2),
+                "平原存活率(%)": round(surv_rate, 2),
+                "平原盈利%": round(win_pnl_rate, 2),
+                "平原90%分位无盈利(天)": round(p90_no_profit, 2)
+            })
+            plateau_records.append(res)
+
+    df_plateau = pd.DataFrame(plateau_records)
+
+    # 4. 将网格平原指标合并回原始每一行数据
+    print("正在合并平原指标到全量数据...")
+    merge_keys = group_keys + dim_cols
+    df_final = pd.merge(df, df_plateau, on=merge_keys, how="left")
+
+    # 清理过程生成的临时列
+    drop_temp_cols = ["净利_val", "总收益_val", "预期存活_val", "中位存活_val", "最长无盈利_val",
+                      "_clean_预期存活", "_clean_中位存活", "_clean_净利", "_clean_总收益",
+                      "_clean_最长无盈利"] + idx_cols
+    df_final.drop(columns=[c for c in drop_temp_cols if c in df_final.columns], inplace=True)
+
+    # 5. 存储为新的 CSV 文件
+    if output_csv is None:
+        if csv_file.endswith(".csv"):
+            output_csv = csv_file.replace(".csv", f"_plateau_r{neighbor_radius}.csv")
+        else:
+            output_csv = f"{csv_file}_plateau_r{neighbor_radius}.csv"
+
+    print(f"正在保存最终结果到: {output_csv} ...")
+    df_final.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"✅ 平原分析完成！新文件已包含平原维度指标，总行数: {len(df_final):,}\n")
+    return df_final
+
 
 def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=1000,
                          min_net_profit=-1000, min_total_profit=20):
@@ -824,7 +1003,15 @@ if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
     # analyze_all_strategies()
-
     csv_file = "strategy_leaderboard_47520_files.csv"
+    output_csv = csv_file.replace(".csv", "_plateau.csv")
 
-    show_leaderboard_csv(csv_file=csv_file, direction="long")
+    # df_with_plateau = compute_parameter_plateau(
+    #     csv_file=csv_file,
+    #     output_csv=output_csv,
+    #     neighbor_radius=1,  # 切比雪夫半径
+    #     min_survival_days=60.0  # 存活周期阈值
+    # )
+
+
+    show_leaderboard_csv(csv_file=output_csv, direction="long")
