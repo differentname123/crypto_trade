@@ -35,7 +35,7 @@ GEMINI_MODEL = "gemini-3-flash-thinking"
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt'
 USER_DATA_DIR = r"W:\temp\biance_ruru"
-LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/copy-trading/lead-details/5123703650401459968?timeRange=7D"
+LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/square/post/362858558969979"
 
 FILTER_CONFIG = {
     # 1. 黑名单机制

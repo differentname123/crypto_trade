@@ -45,7 +45,7 @@ logger = setup_logger(app_name="biance_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_jie"
+USER_DATA_DIR = r"W:\temp\biance_ruru"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -1563,7 +1563,7 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
     # login_and_save_session()                                  # 初次手动登录并固化 Session
-    # open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
+    open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
     # cookies, csrf = get_auth_tokens_robust(USER_DATA_DIR)     # 提取脱机 API 凭证
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
