@@ -337,20 +337,22 @@ def clear_all_promo_comments_batch():
 
 def send_single_promo_comment(post):
     """
-    为单帖组装引流参数并调用外部接口发帖，无论成败都把发布状态闭环写回 post。
-    [入参 Shape]: post(dict) 必须含 post_id 与 promo_comment.trader_perspective.(comment_text, link_text)。
-    [出参 Shape]: 触发过发帖动作则返回注入了 promo_comment_info 的 post；因不符合条件被跳过则返回 None。
+    为单帖组装引流参数并调用外部接口发帖。
+    [返回值约定]:
+      - (post, "SUCCESS") : 发帖成功，已写入成功状态
+      - (post, "FAILED")  : 正常业务失败（如帖子真被删），已写入失败状态
+      - (None, "CAPTCHA") : 触发人机验证/风控，未写入状态（保留本帖供下次重试），通知外层中断
+      - (None, "SKIPPED") : 缺字段或不满足发帖条件
     """
-    # 卫语句：无评论 / 已处理过 直接跳过
     comment_info = post.get("promo_comment")
     if not comment_info or "promo_comment_info" in post:
-        return None
+        return None, "SKIPPED"
 
     post_id = post.get("post_id")
     if not post_id:
-        return None  # 防御：缺 post_id 会拼出残缺 URL，直接拦截
+        return None, "SKIPPED"
 
-    trader_perspective = comment_info.get("trader_perspective", {})
+    trader_perspective = comment_info.get("follower_perspective", {})
     comment_text = trader_perspective.get("comment_text")
     link_text = trader_perspective.get("link_text")
 
@@ -364,7 +366,29 @@ def send_single_promo_comment(post):
         user_data_dir=USER_DATA_DIR
     )
 
-    # 无论成败，统一把发布结果闭环回写
+    err_str = str(err or "")
+
+    # ================= 健壮的风控 / 人机验证拦截特征 =================
+    # 结合截图中的标题、文案特征及日志中暴露的 405 状态码进行全方位匹配
+    captcha_signals = [
+        "我们需要确认您是人类",
+        "Human Verification",
+        "安全检查",
+        "HTTP 状态码: 405",
+        "405",
+        "geetest",
+        "cf-turnstile"
+    ]
+    is_captcha = any(signal in err_str for signal in captcha_signals)
+
+    if is_captcha:
+        logger.error(
+            f"🚨 [发布链路/风控触发] 检测到【人机验证/WAF阻断】！"
+            f"| 帖子ID: 【{post_id}】 | 拦截详情: 【{err_str}】 | 决策: 【不记录失败状态，保留帖子，准备紧急熔断本轮】"
+        )
+        return None, "CAPTCHA"
+
+    # 正常成败处理：闭环回写数据库
     post["promo_comment_info"] = {
         "comment_id": c_id,
         "comment_time": int(time.time() * 1000),
@@ -374,43 +398,66 @@ def send_single_promo_comment(post):
 
     if success:
         logger.info(f"[发布链路/发帖] 推广评论发布成功 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【评论ID: {c_id}】")
+        return post, "SUCCESS"
     else:
         logger.error(
-            f"[发布链路/发帖] 发帖失败，可能是网络波动或触发账号风控 "
-            f"| 关键参数: 【帖子ID: {post_id}】 | 结果: 【已记录失败 | 错误详情: {err}】")
-
-    return post
+            f"[发布链路/发帖] 发帖失败，已记录淘汰 | 关键参数: 【帖子ID: {post_id}】 | 错误详情: 【{err}】"
+        )
+        return post, "FAILED"
 
 
 def send_promo_comments():
     """
-    发布链路总入口：周期性拉取带评论的帖子并逐条发布，回写发布状态。
-    【无出入参】，直接产生副作用：读写 MongoDB 与调用外部发帖接口。
+    发布链路总入口：周期性拉取带评论的帖子并逐条发布，遭遇人机验证时自动熔断本轮回合。
     """
     while True:
         post_manager = UniversalPostManager(gen_db_object())
         existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
         logger.info(
-            f"[发布链路/启动] 拉取待发布帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始逐条发布】")
+            f"[发布链路/启动] 拉取待处理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始逐条发布】"
+        )
 
-        sent = skipped = 0
+        sent = skipped = failed = 0
+        hit_captcha = False
+
         for post in existing_posts:
             if not is_valid_post_for_promo(post):
                 skipped += 1
                 continue
 
-            post_result = send_single_promo_comment(post)
-            if post_result:
+            post_result, status = send_single_promo_comment(post)
+
+            # 遇到人机验证：直接熔断跳出，不再继续访问下一条帖子
+            if status == "CAPTCHA":
+                hit_captcha = True
+                logger.warning(
+                    f"🛑 [发布链路/熔断保护] 由于触发安全验证，立即跳过本轮回合的所有剩余任务，等待冷却！"
+                )
+                break
+
+            if status == "SUCCESS":
                 post_manager.upsert_posts([post_result])
                 sent += 1
+            elif status == "FAILED":
+                post_manager.upsert_posts([post_result])
+                failed += 1
             else:
                 skipped += 1
 
-        logger.info(
-            f"[发布链路/本轮小结] 发布完毕，进入休眠 "
-            f"| 关键参数: 【已发布: {sent} | 跳过: {skipped}】 | 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】")
-        time.sleep(SCHEDULE_INTERVAL_SEC)
+        if hit_captcha:
+            logger.warning(
+                f"[发布链路/本轮异常终止] 因人机验证提前终止 "
+                f"| 本轮成效: 【已成功: {sent} | 业务失败: {failed} | 其它跳过: {skipped}】 "
+                f"| 结果: 【进入风控避险冷却，休眠 {SCHEDULE_INTERVAL_SEC} 秒】"
+            )
+        else:
+            logger.info(
+                f"[发布链路/本轮小结] 正常轮询完毕 "
+                f"| 关键参数: 【已发布: {sent} | 失败: {failed} | 跳过: {skipped}】 "
+                f"| 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】"
+            )
 
+        time.sleep(SCHEDULE_INTERVAL_SEC)
 
 # ==========================================
 # 运行入口：生成链路与发布链路各起一个守护线程并行运行
