@@ -187,7 +187,7 @@ def gen_promo_comment(post):
             #     prompt=full_prompt,
             #     model_name=GEMINI_MODEL
             # )
-            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.6-flash")
+            error_detail, raw_response = generate_gemini_content_playwright(full_prompt, model_name="gemini-3.7-flash")
 
             # raw_response = get_llm_content(prompt=full_prompt)
             comment_info = string_to_object(raw_response)
