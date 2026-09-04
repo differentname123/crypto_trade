@@ -1,0 +1,1392 @@
+帮我深度分析下面的网格交易代码，现在我想实现一个择时的马丁策略，大概的功能如下：
+1.信号来自于get_signal这个外部函数，参数就是symbol，不用关注它的实现，返回的就是一个df，里面有当前时间是否应该开仓的标志，以及开仓的方向和开仓限价价格。
+2.然后根据相应的参数设置执行相应的马丁策略，比如加仓间距 2%，止盈 0.8%。加仓倍数为2.直到完成这个马丁周期。然后又是进行不断的循环获取开仓信号。这个择时马丁策略还有一个比较重要的点，那就是还会设置止损，也就是说开始的时候会有一个最大亏损金额，当达到这个就会止损平仓
+3.我当前只是构思的大概的功能，请你帮我完善方案，以应对各种各样的情况，因为金融系统容不得一点马虎。所以你要帮我完善方案，能够应对大多数的问题
+4.先梳理常见的问题，不需要吹毛求疵，只统计常见的问题，以及这个系统需要注意的地方，然后方案架构要尽量的简单可靠
+5.我对方案的要求至少有：
+    1.能够应对同样币种的持仓情况，不会被干扰，专注自己的一亩三分地。
+    2.高内聚，低耦合，设计得更加的灵活，方便后续的修改，比如当前做的就是biance的交易，后续要做欧易的交易或者其它平台，除了平台不一样，其它核心逻辑都是一样的，到时候需要比较简单的就完成适配。而且能够考虑到最小下单金额和价格精度
+    3.防御性设计，保守性设计，一定不能够出现疯狂加仓的情况，出现了问题，或者情况不清楚的情况下，不加仓是更好的选择
+    4.我认为每一个马丁周期核心架构如下，你如果有更好的方案可以提出来：
+        1.初始就把所有的开仓单都挂上，因为每个价位以及数量在信号收到的时候就知道了
+        2.实时监控，一旦出现了加仓成交，马上就进行计算，挂上相应的止盈单，以及计算出相应的紧急熔断价格，然后开一个条件单（因为紧急熔断价格肯定更低，如果设置为限价单，马上就会成交）。
+        3.一旦止盈成交或者紧急熔断成交，这个周期就结束了。
+        4.当然如何处理历史挂单也是非常重要的，但是我这里只说了大体的步骤
+请给我完整的方案架构，暂时不需要代码
+
+
+
+
+
+
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+等比网格交易引擎 (事件驱动 + 单写者状态机 + WAL账本 + 三层对账自愈)
+[本版新增] 支持做多网格(低买高卖) / 做空网格(高卖低买) 双向运行
+================================================================================
+[功能摘要]
+  为每个交易对拉起独立子进程, 在指定价格区间内等比切分网格节点, 全自动执行
+  做多: "低买 -> 高卖 -> 回落再买" / 做空: "高卖 -> 低买 -> 反弹再卖" 的循环套利;
+  依靠 WAL 账本与对账引擎实现断电/掉单/重启自愈。
+
+[输入数据]
+  1. 静态配置  : main_app 内声明的 GridConfig(策略ID/交易对/价格区间/等比间距/单笔数量/网格方向);
+  2. 交易所实时: 经 CCXT 拉取的最新价、市场精度、在线挂单快照、单笔订单点查结果;
+  3. 本地账本  : grid_ledger_{策略ID}.csv 按节点归集的历史 client_oid 序列(冷启动回溯用)。
+
+[数据流转/交互]
+  配置 --> build_geometric_grid: 按交易所精度修约, 自 max_price 向下等比切分出价格区间;
+            做多 -> 区间下沿为开仓买价、上沿为平仓卖价;
+            做空 -> 区间上沿为开仓卖价、下沿为平仓买价;
+  冷启动 --> ReconciliationEngine.recover_on_startup: 以「在线单反向认领 -> 账本回溯点查 ->
+            孤儿单巡检」三层比对定位每个节点的"真相订单", 直接拨正节点内存指针,
+            已终结的订单则合成 OrderEvent 补投 event_queue;
+  运行时 --> GridNode 经 ExchangeBroker 挂限价单(先 WAL 落账再发单);
+            ReconcilerThread 看门狗周期性只读比对盘口, 掉单节点逐一点查后
+            仅向 event_queue 投递 OrderEvent, 绝不直接改写节点;
+  主循环 --> GridStrategy.run_main_loop(全系统唯一写者): 消费 OrderEvent, 经 OidCodec 解析
+            路由到目标 GridNode, 幂等过滤后串行驱动状态机:
+            [WAIT_OPEN 开仓成交->挂平仓 | WAIT_CLOSE 平仓成交->轮次+1回挂开仓 | 撤单->换新OID原价重挂]。
+
+[输出数据]
+  1. 交易所侧: 持续滚动维护的限价买/卖挂单 (核心业务副作用);
+  2. 本地侧  : 追加式 CSV 领域事件账本(审计真相 + 冷启动依据) + 按进程隔离的日志文件
+              + 方向锁文件 grid_direction_{策略ID}.lock (防多空语义互换);
+  3. 常驻进程, 无函数返回值, 直至进程被终止。
+
+并发安全基石 —— 单一写者原则:
+  节点内存的一切修改只发生在主线程 process_event 中; 看门狗线程只「读 + 查 +投递事件」,
+  过时 OID 产出的事件在主线程被幂等拦截丢弃, 从根源消除竞态。
+
+做空网格前置条件(务必确认):
+  1. 合约账户需为【双向持仓 / Hedge Mode】, 否则 positionSide=SHORT 会被交易所拒单;
+  2. 做空的亏损方向在上方且理论无界, max_price 必须远离强平价并预留充足保证金;
+  3. 做空网格请使用全新的 strategy_id(独立账本), 严禁复用曾跑过做多的 strategy_id。
+================================================================================
+"""
+import os
+import csv
+import platform
+import time
+import queue
+import logging
+import threading
+import multiprocessing
+from enum import Enum
+from datetime import datetime
+from collections import defaultdict
+
+from common_utils_lite import setup_logger, get_config
+
+logger = setup_logger(app_name="grid_trader")
+
+from biance_order_lite import (
+    safe_init_exchange, fetch_market_precision, format_price_amount,
+    execute_order, ExecStatus, fetch_single_order,
+)
+
+
+# ==========================================
+# 0. 全局可调参数 (集中管理, 消灭魔术数字)
+# ==========================================
+POINT_CHECK_DELAY_COLD = 0.05     # 冷启动逐单点查的限流间隔(秒)
+POINT_CHECK_DELAY_RUNTIME = 0.1   # 运行时看门狗点查的限流间隔(秒)
+PLACE_THROTTLE_SEC = 0.05         # 批量铺单时相邻两单的限流间隔(秒)
+INIT_SETTLE_WAIT_SEC = 1.0        # 铺单完成后等待撮合/网络传播的缓冲(秒)
+COLD_START_BACKTRACK = 3          # 冷启动时每个节点向前回溯的历史单号数量
+ORDER_GRACE_PERIOD = 5.0          # 新单冷静期(秒): 期内看门狗不判定掉单, 容忍撮合与传播延迟
+TAKER_PRICE_MARKUP = 1.03         # 【买入开仓】吃单封顶系数(现价+3%), 规避越价拒单与插针滑点
+TAKER_PRICE_MARKDOWN = 0.97       # 【卖出开仓】吃单保底系数(现价-3%), 做空网格的镜像保护
+WATCHDOG_INTERVAL_SEC = 1         # 看门狗巡检周期(秒); 多进程并发若触发交易所限频, 建议调大(如5秒)
+
+
+# ==========================================
+# 1. 枚举与值对象 (类型安全 + 去魔法字符串)
+# ==========================================
+class NodeState(Enum):
+    INIT = "INIT"
+    WAIT_OPEN = "WAIT_OPEN"
+    WAIT_CLOSE = "WAIT_CLOSE"
+    ERROR = "ERROR"
+
+
+class OrderAction(Enum):
+    BUY = "B"
+    SELL = "S"
+
+
+class GridDirection(Enum):
+    """网格方向: 决定"开仓/平仓"分别对应哪一侧价格与哪一个买卖动作。"""
+    LONG = "LONG"    # 做多网格: 区间下沿买入开多 -> 区间上沿卖出平多
+    SHORT = "SHORT"  # 做空网格: 区间上沿卖出开空 -> 区间下沿买入平空
+
+
+class OrderStatus(Enum):
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+
+
+class ParsedOid:
+    """client_oid 解析结果的结构化载体。"""
+
+    def __init__(self, strategy_id, node_id, action, cycle):
+        self.strategy_id = strategy_id
+        self.node_id = node_id
+        self.action = action
+        self.cycle = cycle
+
+
+class OrderEvent:
+    """事件总线上流转的标准订单事件 (取代原始 dict, 语义收敛)。"""
+
+    def __init__(self, client_oid, status, fill_price=0.0, fill_qty=0.0, update_ts=0):
+        self.client_oid = client_oid
+        self.status = status
+        self.fill_price = fill_price
+        self.fill_qty = fill_qty
+        self.update_ts = update_ts  # 事件在交易所发生的真实时间(毫秒)
+
+
+class GridConfig:
+    """
+    策略静态配置: 一个实例对应一个独立子进程。
+    direction 默认 LONG, 老配置无需任何改动即保持原做多语义。
+    """
+
+    def __init__(self, strategy_id, symbol, min_price, max_price, price_ratio, quantity,
+                 direction=GridDirection.LONG):
+        self.strategy_id = strategy_id
+        self.symbol = symbol
+        self.min_price = min_price
+        self.max_price = max_price
+        self.price_ratio = price_ratio
+        self.quantity = quantity
+        # 兼容传入 "LONG"/"SHORT" 字符串或 GridDirection 枚举
+        self.direction = GridDirection(direction)
+
+    @property
+    def is_long(self):
+        return self.direction == GridDirection.LONG
+
+
+class NodeContext:
+    """注入给每个 Node 的运行环境, 让状态机方法保持干净签名。"""
+
+    def __init__(self, broker, ledger, strategy_id, direction=GridDirection.LONG):
+        self.broker = broker
+        self.ledger = ledger
+        self.strategy_id = strategy_id
+        self.direction = direction          # 新增: 网格方向, 供节点派生开平仓动作
+        # 全局共享的市场最新价与精度缓存
+        self.latest_price = 0.0
+        self.precision = None
+
+
+class StatisticsThread(threading.Thread):
+    """
+    心跳数据看板线程: 周期性统计当前网格的快照信息。
+    特性:
+      1. 原子化多行输出，防并发插队打乱。
+      2. 主动低频拉取现价，反哺全局 NodeContext，保持现价缓存的鲜活性。
+      3. 盘口距离计算 & 网格上下限破网预警(多空语义自动反转)。
+    """
+
+    def __init__(self, ctx, nodes, config, interval_sec=60):
+        super().__init__(daemon=True)
+        self.ctx = ctx
+        self.nodes = nodes
+        self.config = config
+        self.interval = interval_sec
+        self.start_time = time.time()  # 记录启动时间，用于计算 Uptime
+
+    def run(self):
+        logger.info(f"[看板] 统计心跳线程启动 | 播报周期:[{self.interval}s]")
+        while True:
+            time.sleep(self.interval)
+            try:
+                self._report()
+            except Exception as e:
+                logger.error(f"[看板] 数据聚合异常 (不影响交易) | 错误:[{e}]")
+
+    def _report(self):
+        # ---------------------------------------------------------
+        # 主动拉取最新价格，并反哺给 NodeContext
+        # ---------------------------------------------------------
+        try:
+            latest_price = self.ctx.broker.fetch_last_price()
+            if latest_price > 0:
+                self.ctx.latest_price = latest_price  # 线程安全更新(GIL保障)
+        except Exception as e:
+            logger.info(f"[看板] 尝试拉取最新价格失败，将使用被动缓存价格 | 错误:[{e}]")
+
+        current_price = self.ctx.latest_price
+        if current_price <= 0:
+            return  # 如果冷启动且接口一直挂掉，没获取到价格，暂不播报
+
+        nodes = list(self.nodes.values())
+        total_nodes = len(nodes)
+        if total_nodes == 0:
+            return
+
+        is_long = self.config.is_long
+
+        # 1. 节点构成统计 & 理论持仓与总套利次数
+        state_counts = defaultdict(int)
+        for n in nodes:
+            state_counts[n.state.value] += 1
+
+        wait_open_cnt = state_counts.get(NodeState.WAIT_OPEN.value, 0)
+        wait_close_cnt = state_counts.get(NodeState.WAIT_CLOSE.value, 0)
+        error_cnt = state_counts.get(NodeState.ERROR.value, 0)
+        init_cnt = state_counts.get(NodeState.INIT.value, 0)
+
+        theoretical_pos = wait_close_cnt * self.config.quantity
+        total_cycles = sum(n.cycle_count for n in nodes)
+
+        # 2. 寻找相邻节点 (方向无关: 直接按"挂单动作"归集在管挂单)
+        pending_buys, pending_sells = [], []
+        for n in nodes:
+            if n.state == NodeState.WAIT_OPEN:
+                price, action = n.target_open_price, n.open_action
+            elif n.state == NodeState.WAIT_CLOSE:
+                price, action = n.target_close_price, n.close_action
+            else:
+                continue
+            (pending_buys if action == OrderAction.BUY else pending_sells).append((price, n.node_id))
+
+        closest_buy = max(pending_buys, key=lambda x: x[0]) if pending_buys else None
+        closest_sell = min(pending_sells, key=lambda x: x[0]) if pending_sells else None
+
+        uptime_sec = int(time.time() - self.start_time)
+        hours, remainder = divmod(uptime_sec, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours}h {minutes}m {seconds}s"
+        base_coin = self.config.symbol.split('/')[0]
+
+        # 3. 方向化文案
+        if is_long:
+            dir_cn, pos_cn = "做多网格(低买高卖)", "多头"
+            open_label, close_label = "待买入开多", "持多待卖出"
+        else:
+            dir_cn, pos_cn = "做空网格(高卖低买)", "空头"
+            open_label, close_label = "待卖出开空", "持空待买入"
+
+        lines = [
+            f"\n========== [网格运行看板] {self.config.strategy_id} | {dir_cn} ==========",
+            f" 📊 市场现价: {current_price:.6f} | 运行耗时: {uptime_str}",
+            f" 📦 节点总计: {total_nodes} 个 | 构成: {open_label}[{wait_open_cnt}] "
+            f"{close_label}[{wait_close_cnt}] 异常[{error_cnt}] 初始[{init_cnt}]",
+            f" 💰 理论持仓: {theoretical_pos:.4f} {base_coin} ({pos_cn}, 可用于核对账户真实仓位)",
+            f" 🔄 累计套利: {total_cycles} 趟 (代表已赚取利润的网格跨度总和)",
+            " --- 盘口与边界追踪 ---"
+        ]
+
+        # ---------------------------------------------------------
+        # 相邻接单节点距离现价的百分比
+        # ---------------------------------------------------------
+        if closest_buy:
+            buy_price, buy_nid = closest_buy
+            drop_pct = (current_price - buy_price) / current_price * 100
+            lines.append(
+                f" ⬇️ 最近买单: 【{buy_nid}】 挂单价 @[{buy_price:.6f}] (需下跌 {drop_pct:.2f}%)")
+        else:
+            hint = "已满仓待涨，或价格已跌穿网格下限" if is_long else "当前无空头持仓，或价格已跌穿网格下限"
+            lines.append(f" ⬇️ 最近买单: 无 ({hint})")
+
+        if closest_sell:
+            sell_price, sell_nid = closest_sell
+            rise_pct = (sell_price - current_price) / current_price * 100
+            lines.append(
+                f" ⬆️ 最近卖单: 【{sell_nid}】 挂单价 @[{sell_price:.6f}] (需上涨 {rise_pct:.2f}%)")
+        else:
+            hint = "已空仓待跌，或价格已突破网格上限" if is_long else "已满仓待跌，或价格已突破网格上限"
+            lines.append(f" ⬆️ 最近卖单: 无 ({hint})")
+
+        # ---------------------------------------------------------
+        # 现价距离网格上下限位置, 常驻展示并辅助破网预警(多空语义反转)
+        # ---------------------------------------------------------
+        drop_to_min_pct = (current_price - self.config.min_price) / current_price * 100
+        rise_to_max_pct = (self.config.max_price - current_price) / current_price * 100
+
+        min_str = f"距下限跌幅 {drop_to_min_pct:.2f}%" if drop_to_min_pct >= 0 else f"已跌穿下限 {-drop_to_min_pct:.2f}%"
+        max_str = f"距上限涨幅 {rise_to_max_pct:.2f}%" if rise_to_max_pct >= 0 else f"已突破上限 {-rise_to_max_pct:.2f}%"
+
+        if is_long:
+            near_min_txt = " ⚠️ 【破网预警】即将跌破下限，面临满仓套牢风险！"
+            break_min_txt = " 🚨 【击穿下限】已跌穿下限！停止买入，等待反弹。"
+            near_max_txt = " ⚠️ 【飞天预警】即将突破上限，面临全部踏空风险！"
+            break_max_txt = " 🚨 【突破上限】已突破上限！停止卖出，等待回调。"
+        else:
+            near_min_txt = " ⚠️ 【见底预警】即将跌破下限，空头利润充分兑现，面临全部踏空风险！"
+            break_min_txt = " 🚨 【击穿下限】已跌穿下限！空头已全部平完，停止低位追空，等待反弹。"
+            near_max_txt = " ⚠️ 【破网预警】即将突破上限，面临满仓空头浮亏套牢与强平风险！"
+            break_max_txt = " 🚨 【突破上限】已突破上限！空头满仓浮亏，请立即人工评估强平风险！"
+
+        status_icon = "🟢"
+        warnings = []
+
+        if 0 <= drop_to_min_pct <= 5.0:
+            warnings.append(near_min_txt)
+            status_icon = "⚠️"
+        elif drop_to_min_pct < 0:
+            warnings.append(break_min_txt)
+            status_icon = "🚨"
+
+        if 0 <= rise_to_max_pct <= 5.0:
+            warnings.append(near_max_txt)
+            status_icon = "⚠️"
+        elif rise_to_max_pct < 0:
+            warnings.append(break_max_txt)
+            status_icon = "🚨"
+
+        lines.append(
+            f" {status_icon} 网格区间: {self.config.min_price} ~ {self.config.max_price} ({min_str}, {max_str})")
+
+        if warnings:
+            lines.extend(warnings)
+
+        lines.append("==========================================================\n")
+
+        # 一次性完整输出
+        logger.info("\n".join(lines))
+
+
+class OidCodec:
+    """
+    client_oid 编解码中枢
+    [升级版] 采用倒序切片解析，完美支持 strategy_id 中包含任意下划线 (_)
+    格式约定: GD_{strategy}_{node}_{action}_{cycle}_{ms后缀}
+    """
+    PREFIX = "GD"
+
+    @classmethod
+    def build(cls, strategy_id, node_id, action, cycle):
+        ts_suffix = str(int(time.time() * 1000))[-8:]
+        return f"{cls.PREFIX}_{strategy_id}_{node_id}_{action.value}_{cycle}_{ts_suffix}"
+
+    @classmethod
+    def parse(cls, oid):
+        parts = oid.split('_')
+        # 至少需要 6 个部分 (GD, 策略(至少1截), 节点, 动作, 轮次, 时间戳)
+        if len(parts) < 6 or parts[0] != cls.PREFIX:
+            return None
+        try:
+            # 采用从后往前的负索引，避免 strategy_id 内部下划线干扰
+            node_id = parts[-4]
+            action = OrderAction(parts[-3])
+            cycle = int(parts[-2])
+
+            # 中间剩下的部分，全部用下划线重新拼回原状，还原 strategy_id
+            strategy_id = "_".join(parts[1:-4])
+
+            return ParsedOid(strategy_id, node_id, action, cycle)
+        except ValueError:
+            return None
+
+    @classmethod
+    def prefix_for(cls, strategy_id):
+        return f"{cls.PREFIX}_{strategy_id}_"
+
+# ==========================================
+# 2. 基础设施层 (Ledger / Broker / 方向锁)
+# ==========================================
+class GridLedger:
+    """
+    追加式领域事件账本 (Append-Only / WAL)。
+    每次 append 独立 open, 以崩溃安全换取句柄复用; 逐行细节仅落 DEBUG, 避免 INFO 噪音。
+    """
+    COLUMNS = ["ts", "node_id", "cycle", "action", "client_oid", "price", "amount", "status", "msg"]
+
+    def __init__(self, strategy_id):
+        self.filename = f"grid_ledger_{strategy_id}.csv"
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(self.COLUMNS)
+
+    def append(self, node_id, cycle, action, client_oid, price, amount, status, msg=""):
+        """同步写入一行领域事件 (先落盘再动作), 并留 DEBUG 级细粒度轨迹。"""
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with open(self.filename, 'a', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow([ts, node_id, cycle, action, client_oid, price, amount, status, msg])
+        logger.info(f"[账本] {action} 【{node_id}】 CID:[{client_oid}] 状态:[{status}] {msg}")
+
+    def load_node_oid_history(self):
+        """冷启动读取: 返回 {node_id: [client_oid,...]} (按出现序去重), 供多级回溯定位真相。"""
+        history, seen = {}, {}
+        if not os.path.exists(self.filename):
+            return history
+        try:
+            with open(self.filename, 'r', newline='', encoding='utf-8') as f:
+                for row in csv.DictReader(f):
+                    nid, cid = row.get('node_id', ''), row.get('client_oid', '')
+                    if not nid or not cid or cid in seen.setdefault(nid, set()):
+                        continue
+                    seen[nid].add(cid)
+                    history.setdefault(nid, []).append(cid)
+        except Exception as e:
+            logger.error(f"[账本] 冷启动读取本地账本失败, 无法回溯历史进度, 本次仅能依赖交易所在线单反向认领 | "
+                         f"文件:[{self.filename}] 错误:[{e}]")
+        return history
+
+
+def guard_direction_consistency(config):
+    """
+    【新增安全防线: 方向锁】
+    以 sidecar 文件记录某个 strategy_id 首次运行时的网格方向。
+    若本次配置方向与历史不一致, 立即终止该子进程。
+
+    为什么必须有这道锁:
+      账本与 client_oid 里只记录「买/卖动作」, 开平语义由方向推导。
+      若把跑过做多的 strategy_id 直接改成做空(或反之), 冷启动回溯会把
+      历史「买入开多单」误判为「买入平空单」, 从而 cycle+1 并再挂一张开仓卖单,
+      造成方向错误的连环开仓 —— 这是资金层面的灾难, 必须在启动前物理阻断。
+    切换方向的正确做法: 使用全新的 strategy_id (独立账本 + 独立 OID 命名空间)。
+    """
+    path = f"grid_direction_{config.strategy_id}.lock"
+    want = config.direction.value
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                saved = f.read().strip().upper()
+            if saved and saved != want:
+                logger.critical(
+                    f"[方向锁] 启动被拒绝: 策略ID[{config.strategy_id}]历史方向为[{saved}], "
+                    f"本次配置却为[{want}]! 同一账本内多空语义互换会导致冷启动误判并反向开仓。"
+                    f" 正确做法: 换一个全新的 strategy_id; 如确认账本已作废, 请手工删除 "
+                    f"[{path}] 与 [grid_ledger_{config.strategy_id}.csv] 后再启动")
+                raise SystemExit(1)
+        else:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(want)
+            logger.info(f"[方向锁] 已写入方向锁文件 | 策略:[{config.strategy_id}] 方向:[{want}]")
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.info(f"[方向锁] 方向一致性校验文件读写异常, 已跳过本次校验(不影响交易) | 错误:[{e}]")
+
+
+class ExchangeBroker:
+    """
+    交易所网关: 收拢所有 CCXT / 网络调用。
+    上层(领域/对账)仅依赖本接口, 切换 OKX / 模拟盘 / 回测只需替换本类, 零改动上层。
+    """
+
+    def __init__(self, exchange, symbol):
+        self.exchange = exchange
+        self.symbol = symbol
+
+    def fetch_precision(self):
+        return fetch_market_precision(self.exchange, self.symbol)
+
+    def fetch_last_price(self):
+        return self.exchange.fetch_ticker(self.symbol)['last']
+
+    def fetch_open_orders(self):
+        return self.exchange.fetch_open_orders(self.symbol)
+
+    def fetch_order(self, client_oid):
+        return fetch_single_order(self.exchange, self.symbol, client_oid)
+
+    def place_limit(self, action, amount, price, client_oid, position_side):
+        """
+        注: reduce_only 恒为 False。
+        双向持仓(Hedge Mode)下由 position_side 决定归属:
+          LONG 仓: buy=开多, sell=平多;  SHORT 仓: sell=开空, buy=平空。
+        Hedge Mode 不支持 reduceOnly, 置 True 会被交易所拒单, 严禁改动。
+        """
+        side = "buy" if action == OrderAction.BUY else "sell"
+        return execute_order(
+            exchange=self.exchange, symbol=self.symbol, side=side, amount=amount,
+            client_oid=client_oid, order_type='limit', price=price,
+            reduce_only=False, position_side=position_side,
+        )
+
+
+# ==========================================
+# 3. 领域层 (GridNode 状态机)
+# ==========================================
+class GridNode:
+    """
+    独立网格节点状态机 (最小业务单元)。
+    纯内存推演, 副作用经注入的 broker/ledger 落地;
+    状态迁移仅由主线程经 process_event 触发, 天然单写者、无需加锁。
+
+    方向抽象:
+      做多 -> open_action=BUY(区间下沿),  close_action=SELL(区间上沿), position_side=LONG
+      做空 -> open_action=SELL(区间上沿), close_action=BUY(区间下沿),  position_side=SHORT
+    构造时一次性派生, 运行期所有状态迁移代码保持方向无关。
+    """
+
+    def __init__(self, node_id, open_price, close_price, quantity, ctx):
+        # 静态属性 (价格/数量已由拓扑工厂完成精度修约, Node 不再关心精度)
+        self.node_id = node_id
+        self.target_open_price = open_price
+        self.target_close_price = close_price
+        self.quantity = quantity
+        self.ctx = ctx
+
+        # 方向派生属性 (唯一的多空分叉点)
+        self.direction = ctx.direction
+        if self.direction == GridDirection.LONG:
+            self.position_side = "LONG"
+            self.open_action = OrderAction.BUY
+            self.close_action = OrderAction.SELL
+        else:
+            self.position_side = "SHORT"
+            self.open_action = OrderAction.SELL
+            self.close_action = OrderAction.BUY
+
+        # 动态状态
+        self.state = NodeState.INIT
+        self.cycle_count = 0
+        self.active_client_oid = ""
+        self.active_exchange_oid = ""
+        self.last_update_ts = time.time()
+
+    @staticmethod
+    def _cn(action):
+        return "买" if action == OrderAction.BUY else "卖"
+
+    def calc_safe_open_price(self):
+        """
+        利用全局缓存的现价, 计算防越界/插针的安全开仓价:
+          买入开仓(做多): 不高于 现价*TAKER_PRICE_MARKUP   (封顶)
+          卖出开仓(做空): 不低于 现价*TAKER_PRICE_MARKDOWN (保底)
+        正常行情下该保护为空操作(返回原网格价), 仅在极端跳空/插针时生效;
+        现价或精度缓存缺失时退化为原始网格价, 与旧版行为完全一致。
+        """
+        if self.ctx.latest_price > 0 and self.ctx.precision is not None:
+            if self.open_action == OrderAction.BUY:
+                raw_price = min(self.target_open_price, self.ctx.latest_price * TAKER_PRICE_MARKUP)
+            else:
+                raw_price = max(self.target_open_price, self.ctx.latest_price * TAKER_PRICE_MARKDOWN)
+            price, _ = format_price_amount(raw_price, 0, self.ctx.precision)
+            return price
+        return self.target_open_price
+
+    # ---------- 对外能力 ----------
+    def open_as_new(self, override_price=None):
+        """初始铺位: 进入开仓等待并挂出开仓限价单; override_price 用于需吃单成交节点的保护价。"""
+        self.state = NodeState.WAIT_OPEN
+        self.active_client_oid = self._new_oid(self.open_action)
+        price_to_place = override_price if override_price is not None else self.target_open_price
+        self._place_limit_order(self.open_action, price_to_place)
+
+    def align(self, cycle, client_oid, exchange_oid, action):
+        """
+        依对账真相拨正内存指针 (仅冷启动、单线程环境下调用)。
+        注意: 状态判定必须以本节点的 open_action 为基准, 不能硬编码 BUY,
+              否则做空网格会把"卖出开空单"误判为平仓单, 引发反向连环开仓。
+        """
+        self.cycle_count = cycle
+        self.active_client_oid = client_oid
+        self.active_exchange_oid = exchange_oid
+        self.state = NodeState.WAIT_OPEN if action == self.open_action else NodeState.WAIT_CLOSE
+
+    def process_event(self, event):
+        """状态机唯一入口: 幂等过滤后按 (状态, 事件) 分发到具体处理器。"""
+        # 幂等拦截: 非当前期待的 OID 一律丢弃 (历史延迟 / 重复 / 已过时的对账事件)
+        if event.client_oid != self.active_client_oid:
+            logger.info(f"[节点] 【{self.node_id}】幂等拦截过时事件, 已丢弃 | "
+                         f"期待CID:[{self.active_client_oid}] 收到CID:[{event.client_oid}]")
+            return
+
+        if event.status == OrderStatus.FILLED:
+            if self.state == NodeState.WAIT_OPEN:
+                self._on_open_filled(event)
+            elif self.state == NodeState.WAIT_CLOSE:
+                self._on_close_filled(event)
+        elif event.status == OrderStatus.CANCELED:
+            self._on_canceled()
+
+    # ---------- 状态处理器 ----------
+    def _on_open_filled(self, event):
+        """开仓成交 -> 状态反转, 挂出对应平仓单。"""
+        self.ctx.ledger.append(self.node_id, self.cycle_count, "OPEN_FILLED",
+                               self.active_client_oid, event.fill_price, event.fill_qty, "OK")
+        logger.info(f"[成交] 【{self.node_id}】第[{self.cycle_count}]轮 开仓{self._cn(self.open_action)}单成交 "
+                    f"@[{event.fill_price}] x[{event.fill_qty}] | 状态:[WAIT_OPEN]->[WAIT_CLOSE], "
+                    f"转挂平仓{self._cn(self.close_action)}单 @[{self.target_close_price}]")
+        self.state = NodeState.WAIT_CLOSE
+        self.active_client_oid = self._new_oid(self.close_action)
+        self._place_limit_order(self.close_action, self.target_close_price)
+
+    def _on_close_filled(self, event):
+        """平仓成交 -> 轮次+1, 状态反转, 重挂开仓单 (完成一次套利闭环)。"""
+        self.ctx.ledger.append(self.node_id, self.cycle_count, "CLOSE_FILLED",
+                               self.active_client_oid, event.fill_price, event.fill_qty, "OK", msg="套利完成")
+        logger.info(f"[成交] 【{self.node_id}】第[{self.cycle_count}]轮 平仓{self._cn(self.close_action)}单成交 "
+                    f"@[{event.fill_price}] x[{event.fill_qty}] | 套利闭环+1, 状态:[WAIT_CLOSE]->[WAIT_OPEN], "
+                    f"回挂开仓{self._cn(self.open_action)}单 @[{self.target_open_price}]")
+        self.cycle_count += 1
+        self.state = NodeState.WAIT_OPEN
+        self.active_client_oid = self._new_oid(self.open_action)
+
+        # 利用共享的现价缓存计算安全吃单边界, 防极端行情瞬间插针越界
+        safe_open_price = self.calc_safe_open_price()
+        self._place_limit_order(self.open_action, safe_open_price)
+
+    def _on_canceled(self):
+        """撤销/拒单 -> 保持状态, 换全新单号按网格价原样重挂 (自愈外部干扰)。"""
+        if self.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
+            return  # ERROR / INIT 不参与自动重挂
+        self.ctx.ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED",
+                               self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
+        logger.info(f"[自愈] 【{self.node_id}】第[{self.cycle_count}]轮 在管订单被撤销/拒单"
+                       f"(可能被手工撤单或交易所清理), 正换新单号按网格价重挂 | 旧CID:[{self.active_client_oid}]")
+
+        # 开仓单触发越价保护计算, 让错误恢复的节点能按现价边界重挂
+        if self.state == NodeState.WAIT_OPEN:
+            action = self.open_action
+            price = self.calc_safe_open_price()
+        else:
+            action, price = self.close_action, self.target_close_price
+
+        self.active_client_oid = self._new_oid(action)
+        self._place_limit_order(action, price)
+
+    # ---------- 内部工具 ----------
+    def _new_oid(self, action):
+        return OidCodec.build(self.ctx.strategy_id, self.node_id, action, self.cycle_count)
+
+    def _place_limit_order(self, action, price):
+        """WAL 预写意向 -> 发送挂单 -> 按结果落账, 输出单条高密度日志。
+        注: broker 调用前后各刷新一次 last_update_ts, 防止看门狗在慢网络调用期间误判掉单。"""
+        self.ctx.ledger.append(self.node_id, self.cycle_count, "INTENT",
+                               self.active_client_oid, price, self.quantity, "PENDING", msg="待发送")
+
+        self.last_update_ts = time.time()
+        res = self.ctx.broker.place_limit(action, self.quantity, price, self.active_client_oid, self.position_side)
+        self.last_update_ts = time.time()
+
+        direction = "买入" if action == OrderAction.BUY else "卖出"
+        tag = (f"【{self.node_id}】{direction}({self.position_side}) @[{price}] x[{self.quantity}] "
+               f"| CID:[{self.active_client_oid}]")
+
+        if res.status == ExecStatus.OK:
+            self.active_exchange_oid = res.exchange_oid
+            self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                   self.active_client_oid, price, self.quantity, "OK")
+            logger.info(f"[挂单] {tag} | 结果:[OK] 交易所单号:[{res.exchange_oid}]")
+        elif res.status == ExecStatus.UNKNOWN:
+            self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                   self.active_client_oid, price, self.quantity, "UNKNOWN")
+            logger.critical(f"[挂单] {tag} | 结果:[UNKNOWN] 请求发出后未收到交易所回执(疑似网络中断), "
+                            f"无法确认是否已受理; 节点转入防御, 等待看门狗点查对账修复")
+        else:
+            # 提取报错信息，判断是否为交易所的临时系统风控/限频
+            error_msg_lower = str(res.error_msg).lower()
+            is_transient = "-1008" in error_msg_lower or "throttled" in error_msg_lower or "-1001" in error_msg_lower
+
+            if is_transient:
+                # 瞬态错误：不将节点置为 ERROR，维持当前的 WAIT_OPEN 或 WAIT_CLOSE 状态
+                # 依靠 5 秒 (ORDER_GRACE_PERIOD) 后看门狗发现盘口无单，投递 CANCELED 事件交由主循环自动重试
+                self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                       self.active_client_oid, price, self.quantity, "WARN", msg="触发限频")
+                logger.info(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
+                               f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
+                               f"交易所回执:[{res.error_msg}]")
+            else:
+                # 真正的致命错误（余额不足、精度错误、持仓模式不匹配等）：必须挂起(ERROR)，防止死循环疯狂发单
+                self.state = NodeState.ERROR
+                self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
+                                       self.active_client_oid, price, self.quantity, "ERROR", msg=res.error_msg)
+                logger.error(f"[挂单] {tag} | 结果:[明确拒单] 节点已挂起(ERROR)停止自动交易 | "
+                             f"可能原因: 保证金不足/价格触发限制/数量精度不合法/持仓模式非双向(-4061) | "
+                             f"交易所回执:[{res.error_msg}]")
+
+
+def build_geometric_grid(config, broker, ctx):
+    """
+    等比生成网格节点; 低价位处若等比价差 < tickSize 则精度塌陷, 提前收口。
+    先算出每个价格区间的 (下沿 low, 上沿 high), 再按网格方向分配开/平仓角色:
+      做多 -> open=low(买),  close=high(卖)
+      做空 -> open=high(卖), close=low(买)
+    """
+    precision = broker.fetch_precision()
+    _, fmt_qty = format_price_amount(0, config.quantity, precision)
+    ratio_factor = 1.0 + config.price_ratio / 100.0
+    is_long = config.direction == GridDirection.LONG
+
+    nodes = {}
+    current_high = config.max_price
+    i = 0
+    while current_high > config.min_price:
+        raw_low = current_high / ratio_factor
+        fmt_high, _ = format_price_amount(current_high, 0, precision)
+        fmt_low, _ = format_price_amount(raw_low, 0, precision)
+
+        # 精度碰撞: 修约后下沿 >= 上沿, 说明等比价差已小于最小刻度, 终止下沿生成
+        if fmt_low >= fmt_high:
+            logger.info(f"[网格] 价位[{current_high}]处 [{config.price_ratio}%] 等比价差已小于交易所最小报价刻度"
+                           f"(上/下沿价修约后同为[{fmt_high}]), 低价区无法继续细分, 网格生成提前收口")
+            break
+        if fmt_low < config.min_price:
+            break
+
+        node_id = f"N{i:03d}"
+        open_price, close_price = (fmt_low, fmt_high) if is_long else (fmt_high, fmt_low)
+        nodes[node_id] = GridNode(node_id, open_price, close_price, fmt_qty, ctx)
+        current_high = fmt_low  # 以当前下沿作为下一节点上沿, 无缝拼合
+        i += 1
+
+    logger.info(f"[网格] 等比网格生成完成 | 方向:[{config.direction.value}] 节点数:[{len(nodes)}] "
+                f"区间:[{config.min_price}-{config.max_price}] 间距:[{config.price_ratio}%] 单笔数量:[{fmt_qty}]")
+    return nodes
+
+class TimeSyncThread(threading.Thread):
+    """
+    周期性刷新 CCXT 与币安服务器的时间差。
+    彻底对抗本地服务器因长期运行造成的系统时钟持续漂移。
+    """
+    def __init__(self, exchange, interval_sec=3600):
+        super().__init__(daemon=True)
+        self.exchange = exchange
+        self.interval_sec = interval_sec
+
+    def run(self):
+        logger.info(f"[时间同步] 后台自动校时线程启动 | 周期:[{self.interval_sec}秒]")
+        while True:
+            time.sleep(self.interval_sec)
+            try:
+                self.exchange.load_time_difference()
+                offset = self.exchange.options.get('timeDifference', 0)
+                # 使用 debug 级别，避免打扰主业务的日志流
+                logger.info(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
+            except Exception as e:
+                logger.info(f"[时间同步] 获取服务器时间异常, 本次忽略，保持旧偏差 | 错误:[{e}]")
+
+# ==========================================
+# 4. 对账引擎 (只读产事件, 冷启动例外)
+# ==========================================
+class ReconciliationEngine:
+    """
+    对账引擎: 比对"交易所真相"与"本地状态", 产出标准事件推入总线。
+    本层完全方向无关: 只认 client_oid 里的买卖动作, 开平语义由节点自行判定。
+
+    单一写者原则(并发安全核心):
+      冷启动 recover_on_startup —— 主循环/看门狗未启动, 单线程直接拨正节点并补发事件;
+      运行时 repair_runtime    —— 看门狗线程只读节点(GIL 保证原子读)、仅投递事件,
+                                 真正的状态迁移交回主线程串行执行;
+                                 即便读到过时 OID, 产出的事件也会在主线程被幂等拦截丢弃。
+    """
+
+    def __init__(self, broker, ledger, strategy_id, event_queue):
+        self.broker = broker
+        self.ledger = ledger
+        self.strategy_id = strategy_id
+        self.event_queue = event_queue
+
+    # ---------- 冷启动: 允许直接拨正节点 (单线程安全) ----------
+    def recover_on_startup(self, nodes):
+        """三层回溯保障准确恢复: 在线单反向认领 -> 账本回溯点查 -> 孤儿单巡检(仅记录不干预)。"""
+        order_map = self._snapshot()
+        if order_map is None:
+            return
+
+        history = self.ledger.load_node_oid_history()
+        aligned = 0
+
+        # ── 第1层: 交易所在线单反向认领 (不依赖本地账本, 账本丢失也能兜住活单) ──
+        node_live_orders = defaultdict(list)
+        for cid in order_map:
+            parsed = OidCodec.parse(cid)
+            if parsed and parsed.strategy_id == self.strategy_id and parsed.node_id in nodes:
+                node_live_orders[parsed.node_id].append((parsed.cycle, cid))
+
+        for node_id, orders in node_live_orders.items():
+            node = nodes[node_id]
+            if node.state != NodeState.INIT:
+                continue
+            # 复合主键排序: 首按 cycle 降序(防跨轮次乱序), 次按 ms后缀 降序(同轮取最新)
+            orders.sort(key=lambda x: (x[0], x[1].split('_')[-1]), reverse=True)
+            truth_cid = orders[0][1]
+            self._align_and_emit(node, truth_cid, order_map[truth_cid], via="在线单反向认领")
+            aligned += 1
+
+        # ── 第2层: 本地账本多级回溯 (覆盖已成交/已撤销等不在盘口的订单) ──
+        for node_id, node in nodes.items():
+            if node.state != NodeState.INIT:
+                continue
+            candidates = list(reversed(history.get(node_id, [])[-COLD_START_BACKTRACK:]))
+            if not candidates:
+                continue
+            truth_cid, truth_order = self._resolve_truth(candidates, order_map, POINT_CHECK_DELAY_COLD)
+            if truth_order is not None:
+                self._align_and_emit(node, truth_cid, truth_order, via="账本回溯")
+                aligned += 1
+            else:
+                logger.info(f"[对账] 【{node_id}】最近[{len(candidates)}]笔历史单号在交易所均查无实据(幽灵单), "
+                               f"该节点将按全新节点重新铺单")
+
+        # ── 第3层: 孤儿单巡检 (不归属任何节点; 仅高密度报警, 不执行物理撤单) ──
+        managed_cids = {n.active_client_oid for n in nodes.values() if n.active_client_oid}
+        orphan_count = 0
+        for cid, order in order_map.items():
+            if cid in managed_cids:
+                continue
+            orphan_count += 1
+            logger.info(f"[对账] 发现脱管孤儿单(保留未撤销, 请人工核查是否为历史遗留) | "
+                           f"CID:[{cid}] 交易所ID:[{order.get('id', 'N/A')}] "
+                           f"[{str(order.get('side', 'N/A')).upper()}] @[{order.get('price', 0)}] x[{order.get('amount', 0)}]")
+
+        logger.info(f"[对账] 冷启动对账完成 | 节点恢复:[{aligned}/{len(nodes)}] | 脱管孤儿单:[{orphan_count}]张(未干预)")
+
+    # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
+    def repair_runtime(self, nodes):
+        """只读比对锁定掉单悬挂 -> 点查确认 -> 投递事件; 全程不修改任何节点内存。"""
+        order_map = self._snapshot()
+        if order_map is None:
+            return
+
+        suspects = []  # 检测点固定 (node, cid) 二元组, 规避与主线程写入的数据竞态
+        for node in nodes.values():
+            if time.time() - node.last_update_ts < ORDER_GRACE_PERIOD:
+                continue
+            if node.state not in (NodeState.WAIT_OPEN, NodeState.WAIT_CLOSE):
+                continue
+            cid = node.active_client_oid
+            if cid not in order_map:
+                suspects.append((node, cid))
+
+        if not suspects:
+            return
+        logger.info(f"[看门狗] 发现[{len(suspects)}]个节点的在管订单从盘口消失(疑似已成交或被撤), "
+                       f"逐一点查确认真实状态...")
+        for _node, cid in suspects:
+            try:
+                info = self.broker.fetch_order(cid)
+                if info:
+                    self._emit_from_order(cid, info)
+                else:
+                    logger.info(f"[看门狗] 点查无果: 该单从未抵达交易所(多为下单瞬间网络中断的幽灵单), "
+                                   f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
+                    self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
+                time.sleep(POINT_CHECK_DELAY_RUNTIME)
+            except Exception as e:
+                logger.error(f"[看门狗] 点查订单状态时接口异常, 该单留待下一轮巡检复查 | CID:[{cid}] 错误:[{e}]")
+
+    # ---------- 内部工具 ----------
+    def _snapshot(self):
+        """拉取本策略前缀的在线挂单快照 -> {client_oid: 订单原文}; 失败返回 None 供上层短路。"""
+        prefix = OidCodec.prefix_for(self.strategy_id)
+        try:
+            open_orders = self.broker.fetch_open_orders()
+        except Exception as e:
+            logger.error(f"[对账] 拉取交易所挂单快照失败, 本轮对账中止(已有状态不受影响, 稍后自动重试) | "
+                         f"可能原因: 网络抖动/交易所限频 | 错误:[{e}]")
+            return None
+        order_map = {}
+        for o in open_orders:
+            cid = o.get('clientOrderId') or ''  # 兜底 None 值, 防止 startswith 崩溃
+            if cid.startswith(prefix):
+                order_map[cid] = o
+        return order_map
+
+    def _resolve_truth(self, candidates, order_map, point_delay):
+        """按新->旧尝试候选单号: 快照命中免 API 直取, 否则点查兜底; 返回首个命中的 (cid, order)。"""
+        for cid in candidates:
+            if cid in order_map:
+                return cid, order_map[cid]
+            try:
+                info = self.broker.fetch_order(cid)
+                time.sleep(point_delay)
+                if info:
+                    return cid, info
+            except Exception as e:
+                logger.info(f"[对账] 回溯点查失败, 继续尝试更早单号 | CID:[{cid}] 错误:[{e}]")
+        return None, None
+
+    def _align_and_emit(self, node, truth_cid, truth_order, via):
+        """冷启动专用: 依真相拨正节点指针, 输出单条锚定日志, 并按订单状态补发事件。"""
+        parsed = OidCodec.parse(truth_cid)
+        if parsed is None:
+            logger.info(f"[对账] 真相单号解析失败, 放弃拨正节点【{node.node_id}】"
+                           f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
+            return
+        node.align(parsed.cycle, truth_cid, truth_order.get('id', ''), parsed.action)
+        raw = str(truth_order.get('status', '')).upper()
+        direction = "买" if parsed.action == OrderAction.BUY else "卖"
+        semantic = "开仓" if parsed.action == node.open_action else "平仓"
+        logger.info(f"[对账] 锚定真相({via}) | 【{node.node_id}】第[{parsed.cycle}]轮 [{direction}]单({semantic}) "
+                    f"交易所状态:[{raw}] -> 节点状态:[{node.state.value}] | CID:[{truth_cid}]")
+        self._emit_from_order(truth_cid, truth_order)
+
+    def _emit_from_order(self, cid, order):
+        """交易所原始订单状态 -> 标准事件 (仅终结态产出; 在盘 / 部分成交不产出)。"""
+        raw = str(order.get('status', '')).upper()
+
+        # 提取交易所时间(毫秒): 优先拿最后成交时间，次选订单更新时间，兜底使用本地当前时间
+        ts = order.get('lastTradeTimestamp') or order.get('lastUpdateTimestamp') or order.get('timestamp') or int(
+            time.time() * 1000)
+
+        if raw in ("CLOSED", "FILLED"):
+            self.event_queue.put(OrderEvent(
+                cid, OrderStatus.FILLED,
+                fill_price=float(order.get('average') or order.get('price') or 0),
+                fill_qty=float(order.get('filled') or 0),
+                update_ts=ts  # 注入时间戳
+            ))
+        elif raw in ("CANCELED", "EXPIRED", "REJECTED"):
+            self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED, update_ts=ts))
+
+
+# ==========================================
+# 5. 主控与调度 (GridStrategy / Watchdog)
+# ==========================================
+class GridStrategy:
+    """策略主控: 组装依赖, 持有节点集合, 负责初始铺单与事件主循环(路由)。"""
+
+    def __init__(self, config, broker, ledger):
+        self.config = config
+        self.strategy_id = config.strategy_id
+        self.broker = broker
+        self.event_queue = queue.Queue()
+
+        # 将 ctx 保存为实例属性, 以便后续注入实时价格; direction 随之下沉给每个节点
+        self.ctx = NodeContext(broker, ledger, config.strategy_id, config.direction)
+        self.nodes = build_geometric_grid(config, broker, self.ctx)
+        self.engine = ReconciliationEngine(broker, ledger, config.strategy_id, self.event_queue)
+
+        if not config.is_long:
+            logger.info(
+                f"[策略] 【做空网格】已装配 | 策略:[{self.strategy_id}] 交易对:[{config.symbol}]\n"
+                f"        请务必确认: 1) 合约账户已开启【双向持仓 Hedge Mode】, 否则 positionSide=SHORT 会被拒单;\n"
+                f"                    2) 亏损方向在上方且理论无界, max_price[{config.max_price}] 必须远离强平价并留足保证金;\n"
+                f"                    3) 该 strategy_id 为做空专用, 严禁与做多策略共用账本。")
+
+    def recover(self):
+        """冷启动对账 (须在主循环/看门狗启动前、单线程执行): 防重启爆铺 / 断电掉单。"""
+        self.engine.recover_on_startup(self.nodes)
+
+    def initialize_market_placement(self):
+        """
+        铺单初始化: 所有新节点统一挂"开仓"限价单。
+        做多(开仓=买):
+          开仓价 <= 现价 -> 正常挂盘等待; 开仓价 > 现价 -> 取 min(网格价, 现价*1.03) 吃单瞬时成交;
+        做空(开仓=卖):
+          开仓价 >= 现价 -> 正常挂盘等待; 开仓价 < 现价 -> 取 max(网格价, 现价*0.97) 吃单瞬时成交;
+        随后即时对账接管越价成交, 闭环驱动挂出对应平仓单。
+        """
+        current_price = self.broker.fetch_last_price()
+        precision = self.broker.fetch_precision()
+
+        # 将初始化拉取到的价格和精度写入全局上下文 (节点的越价保护依赖此缓存)
+        self.ctx.latest_price = current_price
+        self.ctx.precision = precision
+
+        is_long = self.config.is_long
+        init_count, taker_count = 0, 0
+        for node in self.nodes.values():
+            if node.state != NodeState.INIT:
+                continue  # 已由冷启动对账恢复的老节点跳过, 杜绝重复铺单
+            init_count += 1
+
+            # 需要瞬时吃单成交的判定: 做多看开仓买价是否高于现价, 做空看开仓卖价是否低于现价
+            need_taker = (node.target_open_price > current_price) if is_long \
+                else (node.target_open_price < current_price)
+
+            if need_taker:
+                node.open_as_new(override_price=node.calc_safe_open_price())
+                taker_count += 1
+            else:
+                node.open_as_new()
+            time.sleep(PLACE_THROTTLE_SEC)
+
+        if init_count == 0:
+            logger.info(f"[铺单] 全部节点均已从历史恢复进度, 无需新增铺位 | 参考现价:[{current_price}]")
+            return
+
+        open_dir_cn = "买单(开多)" if is_long else "卖单(开空)"
+        taker_side_cn = "现价上方" if is_long else "现价下方"
+        logger.info(f"[铺单] 初始{open_dir_cn}铺设完成 | 新铺节点:[{init_count}]个"
+                    f"(其中{taker_side_cn}吃单:[{taker_count}]个) | 参考现价:[{current_price}] | "
+                    f"即将由对账引擎接管越价瞬时成交...")
+        time.sleep(INIT_SETTLE_WAIT_SEC)  # 给撮合与网络传播极短缓冲
+        self.engine.repair_runtime(self.nodes)
+
+    def run_main_loop(self):
+        """单线程主循环 (全系统唯一写者): 消费事件 -> 路由到节点 -> 串行推演状态机。"""
+        logger.info("[主循环] 事件主循环启动(全系统唯一写者), 开始监听订单事件...")
+        while True:
+            try:
+                event = self.event_queue.get(timeout=1.0)
+                self._route(event)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                logger.error(f"[主循环] 处理订单事件时异常, 1秒后继续消费"
+                             f"(若有状态遗漏, 看门狗会兜底修复) | 错误:[{e}]")
+                time.sleep(1)
+
+    def _route(self, event):
+        """按 OID 解析定位目标节点并投喂事件。"""
+        parsed = OidCodec.parse(event.client_oid)
+        if parsed is None or parsed.strategy_id != self.strategy_id:
+            logger.info(
+                f"[主循环] 收到无法路由的订单事件(格式非法或不属于本策略), 已忽略 | OID:[{event.client_oid}]")
+            return
+
+        # 只采纳距离当前时间 5 分钟 (300000毫秒) 内的"新鲜成交价"
+        now_ms = int(time.time() * 1000)
+        if event.status == OrderStatus.FILLED and event.fill_price > 0:
+            if (now_ms - event.update_ts) < 300000:
+                self.ctx.latest_price = event.fill_price
+            else:
+                logger.info(
+                    f"[主循环] 拦截到历史陈旧成交事件，跳过价格更新 | 滞后时长:{(now_ms - event.update_ts) / 1000:.1f}秒")
+
+        node = self.nodes.get(parsed.node_id)
+        if node is None:
+            logger.info(f"[主循环] 事件目标节点不存在(网格区间可能已变更), 已忽略 | "
+                           f"节点:[{parsed.node_id}] OID:[{event.client_oid}]")
+            return
+        node.process_event(event)
+
+
+class ReconcilerThread(threading.Thread):
+    """REST 看门狗线程: 周期性只读对账; 异常仅向总线投递事件, 从不直接改动节点状态。"""
+
+    def __init__(self, engine, nodes, interval_sec=30):
+        super().__init__(daemon=True)
+        self.engine = engine
+        self.nodes = nodes
+        self.interval = interval_sec
+
+    def run(self):
+        logger.info(f"[看门狗] 对账巡检线程启动 | 巡检周期:[{self.interval}s]")
+        while True:
+            time.sleep(self.interval)
+            try:
+                self.engine.repair_runtime(self.nodes)
+            except Exception as e:
+                logger.error(f"[看门狗] 本轮巡检对账异常(不影响主循环运行, 下一轮自动重试) | 错误:[{e}]")
+
+
+# ==========================================
+# 6. 进程编排 (每个交易对一个独立子进程)
+# ==========================================
+def run_single_strategy(config):
+    """子进程入口: 独立日志 -> 方向锁 -> 孤儿自杀看门狗 -> 组装依赖 -> 冷启动对账 -> 铺单 -> 看门狗 -> 主循环。"""
+    # 子进程第一件事: 强制重置日志, 清理父进程遗留句柄, 绑定到 {策略ID}_{币种}.log 独立文件
+    safe_symbol = config.symbol.replace('/', '_').replace(':', '_')
+    log_filename = f"{config.strategy_id}_{safe_symbol}"
+    setup_logger(app_name=log_filename, force_reset=True)
+    logging.getLogger().info(f"[进程] 子进程独立日志就绪 | 策略:[{config.strategy_id}] "
+                             f"交易对:[{config.symbol}] 方向:[{config.direction.value}] "
+                             f"日志文件:[{log_filename}.log]")
+
+    # 方向锁: 严防同一 strategy_id 的账本/OID 命名空间被多空语义互换复用 (会导致反向连环开仓)
+    guard_direction_consistency(config)
+
+    # 防极端强杀: 主进程暴毙后本进程父ID会变为 init(1), 此时物理自杀, 杜绝孤儿进程裸奔下单
+    def _parent_watchdog():
+        while True:
+            if os.getppid() in (1, 0):
+                os._exit(0)
+            time.sleep(2)
+
+    threading.Thread(target=_parent_watchdog, daemon=True).start()
+
+    api_key = get_config("myself_biance_api_key")
+    secret_key = get_config("myself_biance_api_secret")
+    proxies = None if platform.system().lower() == "linux" else {
+        "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
+    }
+    # 每个进程独享 exchange/broker/ledger/strategy 实例, 账本按 strategy_id 物理隔离
+    exchange = safe_init_exchange(api_key, secret_key, proxies)
+    broker = ExchangeBroker(exchange, config.symbol)
+    ledger = GridLedger(config.strategy_id)
+    strategy = GridStrategy(config, broker, ledger)
+
+    strategy.recover()
+    strategy.initialize_market_placement()
+    ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=WATCHDOG_INTERVAL_SEC).start()
+
+    # 启动日志统计看板
+    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=120).start()
+    TimeSyncThread(exchange, interval_sec=3600).start()
+
+    strategy.run_main_loop()
+
+
+def cancel_all_orders_for_symbol(exchange, symbol):
+    """
+    一键取消指定交易对的所有未成交挂单。
+    优先尝试交易所的高效原生批量撤单接口；若不支持，则自动降级为遍历撤单。
+
+    参数:
+      - exchange: 已初始化 API Key 和 Secret 的 ccxt 交易所实例
+      - symbol: 交易对名称, 例如 "STX/USDT:USDT" (合约) 或 "STX/USDT" (现货)
+
+    返回:
+      - bool: 执行是否成功
+    """
+    logger.info(f"[紧急清理] 开始撤销 【{symbol}】 的所有活动挂单...")
+    try:
+        # 1. 优先尝试 ccxt 的批量撤单接口 (币安等主流交易所均支持，单次网络请求即可完成)
+        if exchange.has.get('cancelAllOrders'):
+            exchange.cancel_all_orders(symbol)
+            logger.info(f"[紧急清理] 【{symbol}】 批量撤单指令下发成功 (调用了 cancelAllOrders 接口)")
+            return True
+
+        # 2. 兜底方案：如果 API 不支持批量撤单，则拉取当前挂单并逐个撤销
+        logger.info(f"[紧急清理] 当前交易所不支持一键撤单，自动降级为逐个撤销模式...")
+        open_orders = exchange.fetch_open_orders(symbol)
+
+        if not open_orders:
+            logger.info(f"[紧急清理] 【{symbol}】 当前盘口没有活动挂单，无需撤销")
+            return True
+
+        cancel_count = 0
+        for order in open_orders:
+            order_id = order.get('id')
+            if order_id:
+                exchange.cancel_order(order_id, symbol)
+                cancel_count += 1
+                logger.info(f"[紧急清理] 已撤销订单 ID:[{order_id}]")
+
+        logger.info(f"[紧急清理] 【{symbol}】 成功逐个撤销了 {cancel_count} 张挂单")
+        return True
+
+    except Exception as ne:
+        logger.error(f"[紧急清理] 网络异常导致撤单失败，请检查网络或代理设置 | 错误: {ne}")
+        return False
+    except Exception as e:
+        logger.error(f"[紧急清理] 撤销 【{symbol}】 挂单时发生未知异常 | 错误: {e}")
+        return False
+
+
+def query_all_open_orders_stats(exchange, symbols=None):
+    """
+    查询并统计所有挂单数量及每个币种的挂单情况。
+
+    :param exchange: 已初始化的 ccxt 交易所实例
+    :param symbols: 列表类型，指定要查询的币种 (例: ["BTC/USDT:USDT", "PYTH/USDT:USDT"])。
+                    若为 None，则尝试拉取账户全量挂单 (需交易所API支持)。
+    """
+    logger.info("[挂单统计] 开始查询账户挂单信息...")
+    try:
+        open_orders = []
+
+        # 1. 获取挂单数据
+        if symbols:
+            for sym in symbols:
+                try:
+                    orders = exchange.fetch_open_orders(sym)
+                    open_orders.extend(orders)
+                    time.sleep(0.1)  # 防止触发限频
+                except Exception as e:
+                    logger.error(f"[挂单统计] 拉取 {sym} 挂单失败: {e}")
+        else:
+            # 兜底：尝试全局拉取（Binance 合约通常支持不带 symbol 拉取全部挂单）
+            open_orders = exchange.fetch_open_orders()
+
+        total_orders = len(open_orders)
+        if total_orders == 0:
+            logger.info("[挂单统计] 当前账户没有任何活动挂单。")
+            return None
+
+        # 2. 数据聚合与统计
+        # 结构: { "BTC/USDT": {"total": 0, "buy": 0, "sell": 0, "buy_qty": 0.0, "sell_qty": 0.0} }
+        stats_by_symbol = defaultdict(lambda: {"total": 0, "buy": 0, "sell": 0, "buy_qty": 0.0, "sell_qty": 0.0})
+        total_buy = 0
+        total_sell = 0
+
+        for order in open_orders:
+            sym = order.get('symbol', 'UNKNOWN')
+            side = str(order.get('side', '')).lower()
+            # 取 remaining (未成交数量)，若无则取 amount (总数量)
+            remaining = float(order.get('remaining') or order.get('amount') or 0.0)
+
+            stats_by_symbol[sym]["total"] += 1
+            if side == 'buy':
+                stats_by_symbol[sym]["buy"] += 1
+                stats_by_symbol[sym]["buy_qty"] += remaining
+                total_buy += 1
+            elif side == 'sell':
+                stats_by_symbol[sym]["sell"] += 1
+                stats_by_symbol[sym]["sell_qty"] += remaining
+                total_sell += 1
+
+        # 3. 打印统计看板
+        logger.info(f"\n========== [账户全局挂单统计看板] ==========")
+        logger.info(f" 📦 总计挂单数: {total_orders} 笔 (买单: {total_buy} | 卖单: {total_sell})")
+        logger.info(f" --- 各币种挂单明细 ---")
+
+        for sym, data in stats_by_symbol.items():
+            base_coin = sym.split('/')[0] if '/' in sym else sym
+            logger.info(
+                f" 🔹 {sym: <16} | 共 {data['total']: <3} 笔 "
+                f"[买: {data['buy']: <2} 笔, 待买量: {data['buy_qty']:.4f} {base_coin}] - "
+                f"[卖: {data['sell']: <2} 笔, 待卖量: {data['sell_qty']:.4f} {base_coin}]"
+            )
+        logger.info(f"============================================\n")
+
+        return stats_by_symbol
+
+    except Exception as e:
+        logger.error(f"[挂单统计] 挂单统计查询发生严重异常 | 错误: {e}")
+        return None
+
+
+def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
+    """
+    精准排查多余挂单：找出哪些挂单属于脱管孤儿单、哪些节点出现了重复挂单。
+    """
+    prefix = f"GD_{strategy_id}_"
+    orders = exchange.fetch_open_orders(symbol)
+
+    node_orders = defaultdict(list)
+    orphans = []
+    others = []
+
+    for o in orders:
+        cid = o.get('clientOrderId') or ''
+        if cid.startswith(prefix):
+            parts = cid.split('_')
+            node_id = parts[2] if len(parts) >= 3 else "UNKNOWN"
+            node_orders[node_id].append(o)
+        elif cid.startswith("GD_"):
+            orphans.append(o)
+        else:
+            others.append(o)
+
+    logger.info(f"\n========== 【挂单深度诊断: {symbol}】 ==========")
+    logger.info(
+        f" 挂单总数: {len(orders)} | 本策略在管单: {sum(len(v) for v in node_orders.values())} | 历史/孤儿单: {len(orphans)} | 非网格单: {len(others)}")
+
+    # 1. 检查重复挂单节点
+    has_duplicate = False
+    for node_id, o_list in sorted(node_orders.items()):
+        if len(o_list) > 1:
+            has_duplicate = True
+            logger.info(f" ⚠️ 节点【{node_id}】存在 {len(o_list)} 笔重复挂单:")
+            for o in o_list:
+                logger.info(f"    - CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
+
+    if not has_duplicate:
+        logger.info(" ✅ 未发现同一节点重复挂单。")
+
+    # 2. 检查脱管孤儿单
+    if orphans:
+        logger.info(f" ⚠️ 发现 {len(orphans)} 笔非本策略 ID 的孤儿网格单:")
+        for o in orphans:
+            logger.info(
+                f"    - ID: {o.get('id')} | CID: {o.get('clientOrderId')} | 价格: {o.get('price')} | 方向: {o.get('side')}")
+
+    logger.info("==============================================\n")
+
+
+def main_app():
+    """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
+    current_symbol = "0903"
+    # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
+    # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
+    configs = [
+
+        # GridConfig(
+        #     strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
+        #     min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
+        # ),  # 消耗  1217  u 网格数量 95
+        #
+        # GridConfig(
+        #     strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
+        #     min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
+        # ),  # 消耗  1240  u 网格数量 67
+
+        # ---------------- 做空网格示例 (需要时再解除注释) ----------------
+        # 做空要点:
+        #   1) strategy_id 必须全新(独立账本), 严禁复用做多用过的 ID;
+        #   2) 保证金占用按 "min_price 上涨到 max_price" 的最坏情形估算, 上方无界, 务必留足缓冲;
+        #   3) 启动瞬间会把【现价下方】的所有节点吃单开空(镜像做多时买上方), 请确认这是你想要的初始仓位;
+        #   4) 账户必须为双向持仓 Hedge Mode。
+        GridConfig(
+            strategy_id=f"SHORT-UNI{current_symbol}", symbol="UNI/USDT:USDT",
+            min_price=5, max_price=10, price_ratio=1.54, quantity=1,
+            direction=GridDirection.SHORT,
+        ),# 消耗  133  u 网格数量 45
+
+        # 总共节点和为 45
+    ]
+    processes = []
+    for config in configs:
+        p = multiprocessing.Process(target=run_single_strategy, args=(config,))
+        p.daemon = True  # 守护进程: 主进程退出/崩溃时自动带走子进程
+        p.start()
+        processes.append(p)
+        logger.info(f"[系统] 已拉起独立策略进程 | 策略:[{config.strategy_id}] 交易对:[{config.symbol}] "
+                    f"方向:[{config.direction.value}] PID:[{p.pid}]")
+
+    logger.info(f"[系统] 全部策略进程启动完毕, 主进程进入守护模式 | 进程数:[{len(processes)}]")
+
+    # 捕获终端断开或 kill 的异常, 防止 join 变成死锁
+    try:
+        for p in processes:
+            p.join()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+
+
+if __name__ == "__main__":
+    main_app()
+
+    #
+    # api_key = get_config("nana_biance_api_copy_key")
+    # secret_key = get_config("nana_biance_api_copy_secret")
+    # proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+    # exchange_instance = safe_init_exchange(api_key, secret_key, proxies)
+    #
+    # # # 取消 STX 的挂单
+    # # cancel_all_orders_for_symbol(exchange_instance, "SKY/USDT:USDT")
+    #
+    #
+    # # # 查询指定挂单
+    # # target_symbols = ["AVAX/USDT:USDT", "PYTH/USDT:USDT", "BTC/USDT:USDT"]
+    # # query_all_open_orders_stats(exchange_instance, symbols=target_symbols)
+    #
+    #
+    #
+    # # # 精准排查指定交易对的孤儿单和重复挂单
+    # # target_symbol = "AVAX/USDT:USDT"
+    # # target_strategy_id = "AVAX20260828"
+    # #
+    # # # 3. 调用排查函数
+    # # inspect_orphan_and_duplicate_orders(
+    # #     exchange=exchange_instance,
+    # #     symbol=target_symbol,
+    # #     strategy_id=target_strategy_id
+    # # )
+    #
+    #
+    # # 取消指定订单
+    # ghost_oid = "GD_AVAX20260828_N035_B_0_50729966"
+    # symbol = "AVAX/USDT:USDT"
+    #
+    # logger.info(f"正在寻找并精准撤销节点 N035 的幽灵单: {ghost_oid}")
+    #
+    # try:
+    #     # 1. 先拉取当前盘口该币种的所有挂单
+    #     open_orders = exchange_instance.fetch_open_orders(symbol)
+    #
+    #     # 2. 遍历找出目标 clientOrderId 对应的真实交易所 ID
+    #     target_order = None
+    #     for order in open_orders:
+    #         if order.get('clientOrderId') == ghost_oid:
+    #             target_order = order
+    #             break
+    #
+    #     # 3. 执行物理撤销
+    #     if target_order:
+    #         exchange_id = target_order.get('id')
+    #         logger.info(f"找到目标订单！交易所内部 ID: [{exchange_id}]，正在执行撤销...")
+    #
+    #         # 使用交易所原生 ID 进行撤单
+    #         exchange_instance.cancel_order(exchange_id, symbol)
+    #         logger.info("✅ 幽灵单清理成功！盘口数量已恢复正常。")
+    #     else:
+    #         logger.error("❌ 盘口未找到该幽灵单，可能已被成交或人工撤销。")
+    #
+    # except Exception as e:
+    #     logger.error(f"❌ 清理过程发生异常: {e}")
