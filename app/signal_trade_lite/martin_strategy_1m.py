@@ -11,6 +11,9 @@ import pickle # 原本就有的
 import numpy as np
 import pandas as pd
 
+from app.signal_trade_lite.strategy_evaluator import compute_marting
+
+
 # ==================== factor_023 (做多：K线微观位置极低) ====================
 # _1: 更敏感(3根K线), _2: 原版, _3: 更平滑(10根K线), _4: 极端罕见(1分位), _5: 较高频(10分位)
 
@@ -2890,6 +2893,8 @@ def sweep_margins(replayer, margins, verbose=False):
 # 4. 执行入口 (按需批量化一阶段生成)
 # =====================================================================
 if __name__ == "__main__":
+
+
     if not _HAS_NUMBA:
         print("[警告] 未检测到 numba, Stage 1 将退化为纯 Python 单线程 (慢 100 倍以上)。"
               "请执行: pip install numba")
@@ -3193,3 +3198,5 @@ if __name__ == "__main__":
     _log("=" * 78)
     _log("所有币种(%d个) x 策略(%d个) x 多空(2种) x 参数组合(%d组) = %d 份一阶段文件已处理完毕! 总耗时 %s"
          % (len(symbols), len(strategies), combinations_per_strat // 2, total_task, _fmt_hms(time.time() - t_all)))
+
+    compute_marting()

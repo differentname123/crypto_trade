@@ -28,8 +28,8 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 # CACHE_DIR = "./backest/"  # 做多策略默认缓存目录
 # SHORT_CACHE_DIR = r"G:\short_data"  # 新增：做空策略缓存目录
 
-CACHE_DIR = r"W:\backtest_data_1m"  # 做多策略默认缓存目录
-SHORT_CACHE_DIR = r"W:\backtest_data_1m"  # 新增：做空策略缓存目录
+CACHE_DIR = r"W:\backtest_data_1m_detail"  # 做多策略默认缓存目录
+SHORT_CACHE_DIR = r"W:\backtest_data_1m_detail"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
 TEST_MARGINS = [2,3,4,5,6,7,8,9,10]
@@ -1018,6 +1018,10 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
             print(" | ".join(row_cells))
 
         print(sep_line)
+
+def compute_marting():
+    mp.freeze_support()
+    analyze_all_strategies()
 
 
 if __name__ == "__main__":
