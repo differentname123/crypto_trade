@@ -548,19 +548,61 @@ class BinanceGateway(ExchangeGateway):
             return None
 
     def fetch_open_orders(self, coid_prefix: str) -> Optional[Dict[str, UniOrder]]:
+        """
+        拉取在线挂单快照 (普通限价单 + 算法条件止损单)。
+        【终极健壮版】：
+        1. 普通订单是绝对生命线，失败则返回 None (信息不全不动手)。
+        2. 算法条件单作为辅助增强，若偶发异常仅报警降级，绝不阻断主循环，杜绝假死！
+        """
+        out = {}
+
+        # ---------------- 1. 普通挂单 (核心基础) ----------------
         try:
             self._throttle()
             orders = self.ex.fetch_open_orders(self.symbol)
+            for o in orders or []:
+                u = self._to_uni(o)
+                if u.coid and u.coid.startswith(coid_prefix):
+                    out[u.coid] = u
         except Exception as e:
-            logger.error(f"[网关] 拉取在线挂单快照失败, 本轮不做任何动作(信息不全不动手) | 错误:[{e}]")
-            return None
-        out = {}
-        for o in orders or []:
-            u = self._to_uni(o)
-            if u.coid and u.coid.startswith(coid_prefix):
-                out[u.coid] = u
-        return out
+            logger.error(f"[网关] 拉取普通在线挂单失败, 本轮跳过决策 | 错误:[{e}]")
+            return None  # 普通单是核心，失败必须跳过
 
+        # ---------------- 2. 算法条件单 (Algo Orders, 弹性增强) ----------------
+        try:
+            self._throttle()
+            market_id = self.symbol.replace("/", "").split(":")[0]  # 兼容 "BTC/USDT:USDT" -> "BTCUSDT"
+            algo_res = self.ex.fapiPrivateGetOpenAlgoOrders({"symbol": market_id})
+            for a in algo_res or []:
+                # 兼容币安不同 payload 的字段名
+                coid = a.get("clientAlgoId") or a.get("clientOrderId") or ""
+                if not coid or not coid.startswith(coid_prefix):
+                    continue
+
+                stop_px = float(a.get("triggerPrice") or a.get("stopPrice") or 0.0)
+                amount = float(a.get("quantity") or a.get("origQty") or 0.0)
+                filled = float(a.get("executedQty") or 0.0)
+                eid = str(a.get("algoId") or a.get("orderId") or "")
+
+                out[coid] = UniOrder(
+                    coid=coid,
+                    ex_id=eid,
+                    status="OPEN",
+                    price=0.0,
+                    stop_price=stop_px,
+                    amount=amount,
+                    filled=filled,
+                    avg_price=0.0,
+                    side=str(a.get("side") or "").lower(),
+                    ts=int(a.get("bookTime") or a.get("time") or 0),
+                    raw=a,
+                )
+        except Exception as e:
+            # 关键修改：算法单拉取失败只打印日志，不 return None！
+            # 即使算法单暂时没查到，普通单依然正常处理，且本地有 _bottom_guard 软熔断兜底！
+            logger.info(f"[网关] 拉取算法条件单接口异常(已安全降级，不影响主状态机): {e}")
+
+        return out
     def fetch_order(self, coid: str) -> Optional[UniOrder]:
         try:
             self._throttle()
@@ -630,39 +672,71 @@ class BinanceGateway(ExchangeGateway):
                           working_type="MARK_PRICE") -> PlaceResult:
         """
         条件止损单(STOP_MARKET)。
-        【禁忌】绝不使用 closePosition=true: 它会平掉该 positionSide 的全部仓位,
-                在同币多策略场景下会连带平掉别人的仓位, 属于跨策略资金事故。
+        【修复】：1. 订单类型必须为 "STOP_MARKET"
+                 2. 严格按精度格式化 stopPrice 与 amount
         """
         try:
             self._throttle()
+            formatted_stop_price = self.ex.price_to_precision(self.symbol, stop_price)
+            formatted_qty = float(self.ex.amount_to_precision(self.symbol, qty))
+
             params = {
-                "stopPrice": self.ex.price_to_precision(self.symbol, stop_price),
+                "stopPrice": formatted_stop_price,
                 "workingType": working_type,
                 "positionSide": position_side,
                 "newClientOrderId": coid,
-                "priceProtect": "false",
+                "priceProtect": "FALSE",  # 必须大写
             }
-            o = self.ex.create_order(self.symbol, "market", side,
-                                     float(self.ex.amount_to_precision(self.symbol, qty)),
-                                     None, params)
+
+            # 核心修复：type 必须是 "STOP_MARKET"，绝不能是 "market"
+            o = self.ex.create_order(
+                symbol=self.symbol,
+                type="STOP_MARKET",
+                side=side,
+                amount=formatted_qty,
+                price=None,
+                params=params,
+            )
             return PlaceResult(ok=True, ex_id=str((o or {}).get("id") or ""))
         except Exception as e:
             return PlaceResult(err=str(e), kind=classify_error(e))
 
     def cancel(self, coid: str) -> bool:
+        """
+        双轨自适应撤单。
+        先尝试标准撤单；若提示查无此单(-2011/unknown order)，自动尝试算法单撤销。
+        """
         try:
             self._throttle()
+            # 1. 尝试普通撤单
             self.ex.cancel_order(coid, self.symbol, {"origClientOrderId": coid})
             return True
         except Exception as e:
             msg = str(e).lower()
-            # 单子本来就不存在/已终结, 视为撤销成功(幂等)
-            if any(k in msg for k in ("-2011", "unknown order", "does not exist",
-                                      "order not found", "-2013")):
+            # 单子本来就不存在/已终结，直接视为撤单成功(幂等)
+            if any(k in msg for k in ("-2013", "order not found", "does not exist")):
                 return True
+
+            # 2. 如果普通接口提示 -2011 (Unknown order)，说明是未触发的算法条件单
+            if "-2011" in msg or "unknown order" in msg:
+                try:
+                    self._throttle()
+                    market_id = self.symbol.replace("/", "").split(":")[0]
+                    self.ex.fapiPrivateDeleteAlgoOrder({
+                        "symbol": market_id,
+                        "clientAlgoId": coid
+                    })
+                    logger.info(f"[网关] 算法条件单成功撤销 | CID:[{coid}]")
+                    return True
+                except Exception as algo_err:
+                    a_msg = str(algo_err).lower()
+                    if any(k in a_msg for k in ("-2011", "unknown", "not exist", "does not exist")):
+                        return True  # 确实已经没有了，目标达成
+                    logger.info(f"[网关] 算法条件单撤销亦失败(留待下一轮对账) | CID:[{coid}] 错误:[{algo_err}]")
+                    return False
+
             logger.info(f"[网关] 撤单失败(下一轮自动复查) | CID:[{coid}] 错误:[{e}]")
             return False
-
 
 # ==============================================================================
 # 5. WAL 账本
@@ -1405,7 +1479,10 @@ class MartinCycle:
     def _after_place(self, res: PlaceResult, layer: int, role: OrderRole, coid: str,
                      price: float, qty: float, lp_ref: Optional[LayerPlan] = None,
                      ex_ref: Optional[ExitOrder] = None):
-        """统一处理挂单三态与错误分类, 决定 life 与退避。"""
+        """
+        统一处理挂单三态与错误分类，决定 life 与退避。
+        【修复】：出场单(TP/SL)失败重试退避死锁在 3 秒以内，绝不长休眠 300 秒，杜绝持仓裸奔！
+        """
         holder = lp_ref or ex_ref
         tag = f"层[{layer}] 角色[{role.value}] 价[{price}] 量[{qty}] CID[{coid}]"
         if res.ok:
@@ -1418,7 +1495,6 @@ class MartinCycle:
             return
 
         if res.unknown or res.kind == ErrKind.DUPLICATE:
-            # 铁律: 结果未知绝不换号重发, 保持原 OID 交给下一轮点查裁决
             if holder is not None:
                 holder.life = Life.UNKNOWN
             self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role.value,
@@ -1431,13 +1507,18 @@ class MartinCycle:
         self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role.value,
                                MartinLedger.A_PLACE_FAIL, coid, price, qty,
                                res.kind.value, res.err)
-        backoff = RETRY_BACKOFF_SEC[min(len(RETRY_BACKOFF_SEC) - 1,
-                                        max(0, (holder.attempts if holder else 1) - 1))]
+
+        # 核心修复：止盈止损单命悬一线，最大退避绝不超过 3 秒；加仓单才允许按梯度长休眠
+        if role in (OrderRole.TP, OrderRole.SL):
+            backoff = 3.0
+        else:
+            backoff = RETRY_BACKOFF_SEC[min(len(RETRY_BACKOFF_SEC) - 1,
+                                            max(0, (holder.attempts if holder else 1) - 1))]
 
         if res.kind == ErrKind.PRICE_BAND:
             if holder is not None:
                 holder.life = Life.DEFERRED
-                holder.attempts = max(0, holder.attempts - 1)   # 价格带不算"故障", 不消耗次数
+                holder.attempts = max(0, holder.attempts - 1)
                 holder.next_retry_ts = time.time() + 3
             logger.info(f"[挂单] {tag} | 结果:[价格带拒单] 该层暂缓, 待现价进入 "
                         f"{DEFER_PLACE_WINDOW_PCT}% 窗口内自动补挂 | 回执:[{res.err}]")
@@ -1452,8 +1533,7 @@ class MartinCycle:
                 holder.life = Life.NOT_PLACED
                 holder.coid = ""
                 holder.next_retry_ts = time.time() + max(backoff, 30)
-            logger.critical(f"[挂单] {tag} | 结果:[保证金不足] 已退避, 请立即检查账户可用余额! "
-                            f"绝不无脑重试 | 回执:[{res.err}]")
+            logger.critical(f"[挂单] {tag} | 结果:[保证金不足] 已退避, 请立即检查账户可用余额! | 回执:[{res.err}]")
         elif res.kind == ErrKind.IMMEDIATE_TRIGGER:
             if holder is not None:
                 holder.life = Life.NOT_PLACED
@@ -1465,16 +1545,13 @@ class MartinCycle:
                 holder.life = Life.NOT_PLACED
                 holder.coid = ""
                 holder.next_retry_ts = time.time() + 5
-            logger.critical(f"[挂单] {tag} | 结果:[平仓数量超持仓] 本策略仓位疑似被外部平掉! "
-                            f"已暂停加仓, 下一轮将用交易所真实仓位夹逼后重试 | 回执:[{res.err}]")
+            logger.critical(f"[挂单] {tag} | 结果:[平仓数量超持仓] 本策略仓位疑似被外部平掉! | 回执:[{res.err}]")
             self.suspend_add("平仓单被拒(仓位被外部改动)")
         else:  # INVALID / FATAL
             if holder is not None:
                 holder.life = Life.DEFERRED
                 holder.attempts = MAX_PLACE_ATTEMPTS
-            logger.critical(f"[挂单] {tag} | 结果:[明确拒单-{res.kind.value}] 该单永久停挂 | "
-                            f"可能原因: 精度/最小量非法, 持仓模式非双向(-4061) | 回执:[{res.err}]")
-
+            logger.critical(f"[挂单] {tag} | 结果:[明确拒单-{res.kind.value}] 该单永久停挂 | 回执:[{res.err}]")
     # ---------------------- C. 出场单同步 ----------------------
     def _sync_exit(self, ex: ExitOrder, snapshot: Dict[str, UniOrder], now: float):
         if not ex.coid or ex.life in (Life.FILLED, Life.NOT_PLACED):
@@ -1526,9 +1603,14 @@ class MartinCycle:
         return (price <= sl_price) if self.direction is Direction.LONG else (price >= sl_price)
 
     def _check_end(self, price: float, now: float) -> Optional[EndReason]:
+        """
+        终结判定。
+        【修复】：增加行情反向脱轨检测。首单若未成交但行情已起飞，提前撤单作废，不再傻等 15 分钟！
+        """
         if self.end_reason:
             return self.end_reason
         spec = self.ctx.spec
+
         # 1) 仓位归零(含碎屑) 且已经开过仓 -> 按最后一张终结的出场单定性
         if self._has_fill() and spec.qty_is_dust(self.book.open_qty):
             if self.sl.life == Life.FILLED:
@@ -1541,17 +1623,29 @@ class MartinCycle:
             logger.info(f"[周期] 终结 | 原因:[{self.end_reason.value}] "
                         f"已实现盈亏:[{self.book.realized:+.4f}U]")
             return self.end_reason
-        # 2) 入场超时: 一手未成 -> 作废周期(避免被过期信号长期锁死)
+
+        # 2) 核心修复：入场反向起飞检测 (做多时暴涨，或做空时暴跌)
+        if not self._has_fill() and price > 0 and self.bp.base_price > 0:
+            runaway_pct = self.direction.sign * (price / self.bp.base_price - 1) * 100
+            # 偏离超过加仓间距的 1.5 倍(或至少 2%)，直接作废周期
+            if runaway_pct > max(self.ctx.cfg.step_pct * 1.5, 2.0):
+                self.end_reason = EndReason.NO_FILL
+                logger.info(f"[周期] 首单未成且行情已反向脱轨起飞 (偏离:[{runaway_pct:.2f}%]), 提前作废本周期")
+                return self.end_reason
+
+        # 3) 入场硬超时: 一手未成 -> 作废周期
         if not self._has_fill() and now - self.created_ts > self.ctx.cfg.entry_timeout_sec:
             self.end_reason = EndReason.NO_FILL
             logger.info(f"[周期] 入场超时[{self.ctx.cfg.entry_timeout_sec}s]仍无任何成交, "
                         f"撤单作废本周期, 回到空闲态等新信号")
             return self.end_reason
-        # 3) 周期总超时(可选)
+
+        # 4) 周期总超时(可选)
         if (self.ctx.cfg.max_cycle_sec > 0 and self._has_fill()
                 and now - self.created_ts > self.ctx.cfg.max_cycle_sec):
             self.force_close(f"周期超时{self.ctx.cfg.max_cycle_sec}s", EndReason.TIMEOUT)
             return self.end_reason
+
         return None
 
     def _bottom_guard(self, price: float, now: float):

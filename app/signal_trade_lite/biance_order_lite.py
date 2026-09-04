@@ -307,7 +307,111 @@ def fetch_single_order(exchange, symbol, client_oid):
     except Exception as e:
         logger.error(f"[FETCH_ORDER] 查询失败 | CID:{client_oid} | {e}")
         return None
+# ==========================================
+# 5. 终极兼容：统一撤单与统一快照接口
+# ==========================================
 
+def cancel_order_universal(exchange, symbol, client_oid=None, order_id=None):
+    """
+    通用撤单执行器：自动适配【普通挂单】与【算法条件单 (STOP_MARKET)】。
+    优先尝试普通撤单，若提示查无此单，自动使用算法单接口进行二次撤销。
+    """
+    t0 = time.perf_counter()
+    clean_symbol = symbol.replace(":USDT", "")  # 币安原生接口喜欢 "BTCUSDT"
+    market_id = exchange.market(symbol)['id']   # 例如 "BTCUSDT"
+
+    # ---------------- 1. 尝试撤销普通订单 ----------------
+    try:
+        params = {}
+        if client_oid:
+            params['origClientOrderId'] = client_oid
+        res = exchange.cancel_order(order_id, symbol, params=params)
+        latency = int((time.perf_counter() - t0) * 1000)
+        logger.info(f"[CANCEL_OK] 普通订单撤单成功 | ID:{client_oid or order_id} | 耗时:{latency}ms")
+        return ExecResult(ExecStatus.OK, client_oid or "", exchange_oid=str(order_id or ""), latency_ms=latency, raw_data=res)
+
+    except InvalidOrder as e:
+        # 普通接口查无此单，说明它极有可能是未触发的【算法条件单】，进入二次撤销
+        logger.info(f"[CANCEL_RETRY] 普通接口未找到订单，尝试通过算法单 (Algo Order) 接口撤销 | ID:{client_oid or order_id}")
+
+    except Exception as e:
+        logger.error(f"[CANCEL_REJECT] 普通撤单网络或业务异常: {e}")
+
+    # ---------------- 2. 尝试撤销算法条件单 (Algo Order) ----------------
+    try:
+        algo_params = {'symbol': market_id}
+        if client_oid:
+            algo_params['clientAlgoId'] = client_oid
+        if order_id:
+            algo_params['algoId'] = int(order_id)
+
+        # 调用币安合约原生算法单撤销接口: DELETE /fapi/v1/algoOrder
+        res = exchange.fapiPrivateDeleteAlgoOrder(algo_params)
+        latency = int((time.perf_counter() - t0) * 1000)
+        logger.info(f"[CANCEL_OK] 算法条件单撤单成功！ | ID:{client_oid or order_id} | 耗时:{latency}ms")
+        return ExecResult(ExecStatus.OK, client_oid or "", exchange_oid=str(order_id or ""), latency_ms=latency, raw_data=res)
+
+    except Exception as algo_err:
+        latency = int((time.perf_counter() - t0) * 1000)
+        err_msg = str(algo_err).lower()
+        if "unknown" in err_msg or "-2011" in err_msg or "not exist" in err_msg:
+            # 两套接口都确认没有，才是真的已经不存在了
+            logger.info(f"[CANCEL_CONFIRMED] 两套接口均确认无此订单，撤单目的达成 | ID:{client_oid or order_id}")
+            return ExecResult(ExecStatus.OK, client_oid or "", exchange_oid=str(order_id or ""), latency_ms=latency)
+
+        logger.error(f"[CANCEL_ALGO_FAIL] 算法单撤销也失败: {algo_err}")
+        return ExecResult(ExecStatus.REJECT, client_oid or "", latency_ms=latency, error_msg=str(algo_err))
+
+
+def fetch_all_open_orders_unified(exchange, symbol):
+    """
+    统一获取指定交易对的全部活动挂单（普通限价单 + 止盈止损算法条件单）
+    返回格式收敛为标准的 UniOrder 字典列表
+    """
+    market_id = exchange.market(symbol)['id']
+    unified_orders = []
+
+    # 1. 获取普通挂单 (REST)
+    try:
+        normal_orders = exchange.fapiPrivateGetOpenOrders({'symbol': market_id})
+        for o in normal_orders:
+            unified_orders.append({
+                'client_oid': o.get('clientOrderId', ''),
+                'exchange_oid': str(o.get('orderId', '')),
+                'symbol': symbol,
+                'side': o.get('side', '').lower(),
+                'type': o.get('type', ''),
+                'price': float(o.get('price', 0.0)),
+                'stop_price': float(o.get('stopPrice', 0.0)),
+                'amount': float(o.get('origQty', 0.0)),
+                'filled': float(o.get('executedQty', 0.0)),
+                'status': 'OPEN',
+                'source': 'NORMAL'
+            })
+    except Exception as e:
+        logger.error(f"[FETCH_ALL] 获取普通挂单失败: {e}")
+
+    # 2. 获取算法条件单 (Algo Orders)
+    try:
+        algo_orders = exchange.fapiPrivateGetOpenAlgoOrders({'symbol': market_id})
+        for o in algo_orders:
+            unified_orders.append({
+                'client_oid': o.get('clientAlgoId', ''),
+                'exchange_oid': str(o.get('algoId', '')),
+                'symbol': symbol,
+                'side': o.get('side', '').lower(),
+                'type': o.get('algoType', o.get('orderType', 'STOP_MARKET')),
+                'price': float(o.get('price', 0.0)),
+                'stop_price': float(o.get('triggerPrice', o.get('stopPrice', 0.0))),
+                'amount': float(o.get('quantity', o.get('origQty', 0.0))),
+                'filled': float(o.get('executedQty', 0.0)),
+                'status': 'OPEN',
+                'source': 'ALGO'
+            })
+    except Exception as e:
+        logger.error(f"[FETCH_ALL] 获取算法条件单失败: {e}")
+
+    return unified_orders
 # ==========================================
 # 5. 上层应用模拟 (Main 演示)
 # ==========================================
