@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
     # analyze_all_strategies()
-    csv_file = "strategy_leaderboard_47520_files.csv"
+    csv_file = "strategy_leaderboard_57600_files.csv"
     output_csv = csv_file.replace(".csv", "_plateau.csv")
 
     # df_with_plateau = compute_parameter_plateau(

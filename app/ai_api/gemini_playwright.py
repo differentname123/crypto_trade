@@ -21,6 +21,7 @@
 # [输出数据]
 #   - 返回 (error_info, response_text)；同时产生副作用: 更新 stats.json、崩溃/错误截图 png、浏览器缓存瘦身。
 # ==============================================================================
+import subprocess
 
 import os
 import re
@@ -42,7 +43,7 @@ logger = setup_logger(app_name="gemini_playwright")
 # ==============================================================================
 # 配置区域
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\new_taobao15"  # 浏览器登录态(cookies等)持久化目录, 需可写
+USER_DATA_DIR = r"W:\temp\new_taobao12"  # 浏览器登录态(cookies等)持久化目录, 需可写
 TARGET_URL_BASE = 'https://aistudio.google.com/prompts/new_chat'
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -153,6 +154,41 @@ def check_for_crash_and_abort(page):
 # 浏览器启动
 # ==============================================================================
 
+def login_and_save_session_direct(model_name="gemini-flash-latest"):
+    """打开浏览器供用户手动登录, 登录态自动持久化到 USER_DATA_DIR。"""
+    logger.info(f"[手动登录] 启动浏览器等待登录 | 会话保存目录: [{USER_DATA_DIR}]")
+    clean_browser_cache(USER_DATA_DIR)
+
+    # --- 开始修改部分：使用本地真实 Chrome 替换 Playwright 启动逻辑 ---
+    chrome_exe_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    target_url = f"{TARGET_URL_BASE}?model={model_name}"
+
+    cmd = [
+        chrome_exe_path,
+        f"--user-data-dir={USER_DATA_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized",
+        target_url
+    ]
+
+    # 使用 Popen 启动非阻塞子进程，让代码可以顺利执行到下方的 input()
+    process = subprocess.Popen(cmd)
+    # --- 修改部分结束 ---
+
+    logger.info(
+        "[手动登录] 浏览器已就绪 | 操作指引: 请在浏览器中完成登录并进入 AI Studio 主界面, "
+        "然后回到命令行按 [Enter] 继续..."
+    )
+    input()  # 阻塞等待用户确认登录完成
+
+    # 对应原代码的 context.close()，捕获异常以防你提前手动关闭了窗口
+    try:
+        process.terminate()
+    except Exception:
+        pass
+
+    logger.info("[手动登录] 会话已保存成功 | 现在可使用 query 相关能力运行任务")
 
 def login_and_save_session(model_name="gemini-flash-latest"):
     """打开浏览器供用户手动登录, 登录态自动持久化到 USER_DATA_DIR。"""
