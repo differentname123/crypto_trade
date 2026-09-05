@@ -1031,6 +1031,114 @@ def compute_marting():
     analyze_all_strategies()
 
 
+
+def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=15):
+    """
+    根据给定的平原分析CSV文件，过滤出真正处于安全平原内、抗风险、收益高的强健参数组合。
+    """
+    print("=" * 80)
+    print(f" 🛡️ 启动策略参数组合评分工具 | 过滤门槛: 开仓>{min_opens}, 安全垫>{min_safety_days}")
+    print("=" * 80)
+
+    if not os.path.exists(csv_file):
+        print(f"[错误] 未找到文件: {csv_file}")
+        return
+
+    df = pd.read_csv(csv_file)
+    if "方向" in df.columns:
+        d_filter = direction.strip().lower()
+        if d_filter == 'long':
+            df = df[df["方向"].str.capitalize() == 'Long']
+        elif d_filter == 'short':
+            df = df[df["方向"].str.capitalize() == 'Short']
+    # 兼容中英文列名
+    col_total = "总收益(M倍)" if "总收益(M倍)" in df.columns else "总收益(Margin倍数)"
+    col_net = "净利润(M倍)" if "净利润(M倍)" in df.columns else "净利润(Margin倍数)"
+
+    req_cols = [
+        "策略", "币种", "Margin", "加仓间距", "止盈间距", "实际开仓数", "爆仓次数",
+        "预期存活(天)", col_total, col_net, "平原均净利(M倍)", "平原均总收益(M倍)", "平原存活安全垫(天)"
+    ]
+    missing = [c for c in req_cols if c not in df.columns]
+    if missing:
+        print(f"[提示] 数据缺少计算稳健性的必要列（可能未执行平原计算）: {missing}")
+        return
+
+    def parse_survival(v):
+        if isinstance(v, str):
+            if "未爆仓" in v: return 999.0
+            try: return float(v.split()[0])
+            except: return 999.0
+        return float(v) if pd.notnull(v) else 0.0
+
+    df["_surv_days"] = df["预期存活(天)"].apply(parse_survival)
+
+    # 1. 计算 Margin 单调平滑度 (Smoothness)
+    smooth_keys = set()
+    for name, grp in df.groupby(["策略", "币种", "加仓间距", "止盈间距"]):
+        if len(grp) < 4: continue
+        grp = grp.sort_values("Margin")
+        diffs = grp["_surv_days"].diff().dropna().tolist()
+        signs = [1 if d > 0 else -1 for d in diffs]
+        flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
+        if flips <= 1:
+            smooth_keys.add(name)
+
+    # 2. 遍历过滤与评分
+    passed = []
+    for _, row in df.iterrows():
+        opens = row["实际开仓数"]
+        plat_total = row["平原均总收益(M倍)"]
+        tot_ret = row[col_total]
+        saf_days = row["平原存活安全垫(天)"]
+
+        if opens < min_opens: continue
+        if plat_total <= 0: continue
+        spike = tot_ret / plat_total
+        if spike > max_spike_ratio: continue
+        if saf_days < min_safety_days: continue
+
+        score = (plat_total * 0.5) + (row["_surv_days"] * 0.15) + (saf_days * 0.25) - (row["爆仓次数"] * 0.5)
+        passed.append({
+            "score": score,
+            "spike": spike,
+            "row": row,
+            "smooth": "Y" if (row["策略"], row["币种"], row["加仓间距"], row["止盈间距"]) in smooth_keys else ""
+        })
+
+    if not passed:
+        print(f"[提示] 没有组合通过当前的稳健性门槛。可尝试放宽要求。")
+        return
+
+    # 3. 生成两大榜单并打印
+    by_robust = sorted(passed, key=lambda x: x["score"], reverse=True)
+    by_return = sorted(passed, key=lambda x: x["row"][col_total], reverse=True)
+
+    def print_top(title, data_list):
+        print(f"\n=== {title} ===")
+        # 使用排版控制格式齐整
+        header = f"{'币种':<10} | {'策略':<16} | {'Margin':<6} | {'加仓':<6} | {'止盈':<6} | {'总收益':<8} | {'平原总收':<9} | {'Spike':<6} | {'预期存活':<9} | {'安全垫':<9} | {'Smooth'}"
+        print("-" * len(header))
+        print(header)
+        print("-" * len(header))
+        for item in data_list[:top_n]:
+            r = item["row"]
+            coin = str(r["币种"]).ljust(10)
+            fac = str(r["策略"]).ljust(16)
+            m = f"{r['Margin']:.0f}".ljust(6)
+            add = f"{r['加仓间距']:.3f}".ljust(6)
+            tp = f"{r['止盈间距']:.3f}".ljust(6)
+            tot = f"{r[col_total]:.2f}".ljust(8)
+            plat = f"{r['平原均总收益(M倍)']:.2f}".ljust(9)
+            spk = f"{item['spike']:.2f}".ljust(6)
+            srv = f"{r['_surv_days']:.1f}".ljust(9)
+            saf = f"{r['平原存活安全垫(天)']:.1f}".ljust(9)
+            print(f"{coin} | {fac} | {m} | {add} | {tp} | {tot} | {plat} | {spk} | {srv} | {saf} | {item['smooth']}")
+
+    print_top("稳健优先（跨币种/跨margin证据更充分）", by_robust)
+    print_top("进攻优先（通过稳健门槛后总收益最高）", by_return)
+    print("\n注：Spike(总收益/平原均总收益)越接近1，说明越不是单币运气；Smooth=Y表示相邻Margin生存天数变化平滑。")
+
 if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
@@ -1046,4 +1154,5 @@ if __name__ == "__main__":
     # )
 
 
-    show_leaderboard_csv(csv_file=output_csv, direction="long")
+    # show_leaderboard_csv(csv_file=output_csv, direction="long")
+    show_robust_leaderboard(csv_file=output_csv, direction="short", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=150)
