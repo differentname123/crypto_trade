@@ -1032,12 +1032,17 @@ def compute_marting():
 
 
 
-def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=15):
+def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45,
+                             min_opens_per_year=200, max_avg_hold_h=12, backtest_years=5.0, top_n=15):
     """
     根据给定的平原分析CSV文件，过滤出真正处于安全平原内、抗风险、收益高的强健参数组合。
+    min_opens_per_year: 年化开仓次数下限，太低说明交易太少，样本也不够扎实
+    max_avg_hold_h: 平均持仓小时数上限，太长说明更接近波段而不是高频节奏
+    backtest_years: 回测跨度（年），用于把总开仓数换算成年化交易频率，如跨度不是5年请传入实际值
     """
     print("=" * 80)
-    print(f" 🛡️ 启动策略参数组合评分工具 | 过滤门槛: 开仓>{min_opens}, 安全垫>{min_safety_days}")
+    print(f" 🛡️ 启动策略参数组合评分工具 | 过滤门槛: 开仓>{min_opens}, 安全垫>{min_safety_days}, "
+          f"年化交易>{min_opens_per_year}, 平均持仓<{max_avg_hold_h}h")
     print("=" * 80)
 
     if not os.path.exists(csv_file):
@@ -1057,7 +1062,7 @@ def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spik
 
     req_cols = [
         "策略", "币种", "Margin", "加仓间距", "止盈间距", "实际开仓数", "爆仓次数",
-        "预期存活(天)", col_total, col_net, "平原均净利(M倍)", "平原均总收益(M倍)", "平原存活安全垫(天)"
+        "预期存活(天)", "平均持仓(h)", col_total, col_net, "平原均净利(M倍)", "平原均总收益(M倍)", "平原存活安全垫(天)"
     ]
     missing = [c for c in req_cols if c not in df.columns]
     if missing:
@@ -1091,8 +1096,11 @@ def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spik
         plat_total = row["平原均总收益(M倍)"]
         tot_ret = row[col_total]
         saf_days = row["平原存活安全垫(天)"]
+        avg_hold = row["平均持仓(h)"]
 
         if opens < min_opens: continue
+        if (opens / backtest_years) < min_opens_per_year: continue
+        if avg_hold > max_avg_hold_h: continue
         if plat_total <= 0: continue
         spike = tot_ret / plat_total
         if spike > max_spike_ratio: continue
@@ -1117,7 +1125,7 @@ def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spik
     def print_top(title, data_list):
         print(f"\n=== {title} ===")
         # 使用排版控制格式齐整
-        header = f"{'币种':<10} | {'策略':<16} | {'Margin':<6} | {'加仓':<6} | {'止盈':<6} | {'总收益':<8} | {'平原总收':<9} | {'Spike':<6} | {'预期存活':<9} | {'安全垫':<9} | {'Smooth'}"
+        header = f"{'币种':<10} | {'策略':<16} | {'Margin':<6} | {'加仓':<6} | {'止盈':<6} | {'总收益':<8} | {'平原总收':<9} | {'Spike':<6} | {'预期存活':<9} | {'安全垫':<9} | {'开仓数':<8} | {'交易/天':<8} | {'持仓h':<7} | {'Smooth'}"
         print("-" * len(header))
         print(header)
         print("-" * len(header))
@@ -1133,12 +1141,15 @@ def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spik
             spk = f"{item['spike']:.2f}".ljust(6)
             srv = f"{r['_surv_days']:.1f}".ljust(9)
             saf = f"{r['平原存活安全垫(天)']:.1f}".ljust(9)
-            print(f"{coin} | {fac} | {m} | {add} | {tp} | {tot} | {plat} | {spk} | {srv} | {saf} | {item['smooth']}")
+            opens_disp = f"{r['实际开仓数']:.0f}".ljust(8)
+            trd_per_day = f"{(r['实际开仓数'] / (backtest_years * 365)):.2f}".ljust(8)
+            hold_h = f"{r['平均持仓(h)']:.2f}".ljust(7)
+            print(f"{coin} | {fac} | {m} | {add} | {tp} | {tot} | {plat} | {spk} | {srv} | {saf} | {opens_disp} | {trd_per_day} | {hold_h} | {item['smooth']}")
 
     print_top("稳健优先（跨币种/跨margin证据更充分）", by_robust)
     print_top("进攻优先（通过稳健门槛后总收益最高）", by_return)
-    print("\n注：Spike(总收益/平原均总收益)越接近1，说明越不是单币运气；Smooth=Y表示相邻Margin生存天数变化平滑。")
-
+    print("\n注：Spike(总收益/平原均总收益)越接近1，说明越不是单币运气；Smooth=Y表示相邻Margin生存天数变化平滑；"
+          "交易/天与持仓h用于避免选到交易过少或持仓过长的组合。")
 if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
@@ -1155,4 +1166,4 @@ if __name__ == "__main__":
 
 
     # show_leaderboard_csv(csv_file=output_csv, direction="long")
-    show_robust_leaderboard(csv_file=output_csv, direction="short", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=150)
+    show_robust_leaderboard(csv_file=output_csv, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=150)
