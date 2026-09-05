@@ -912,134 +912,71 @@ class MartinConfig:
 
 class SignalGate:
     """
-    信号闸门: 把"外部函数返回的任意 df"净化成"要么是一个绝对可信的 Signal, 要么什么都没有"。
-    设计原则: 任何一处不确定 -> 直接丢弃信号。宁可错过, 不可做错。
+    极简版信号闸门：专为干净标准化的 DataFrame 设计
+    明确期望字段: timestamp(ms), event(OPEN/CLOSE), direction(LONG/SHORT), price(float)
     """
-    CANDIDATES = {
-        "flag": ["signal", "open_signal", "should_open", "flag", "is_open", "entry", "trigger"],
-        "direction": ["direction", "side", "dir", "position_side", "pos_side", "trade_side"],
-        "price": ["limit_price", "entry_price", "open_price", "signal_price", "price"],
-        "ts": ["signal_ts", "signal_time", "open_ts", "timestamp", "ts", "time"],
-    }
-    TRUE_SET = {"1", "1.0", "true", "yes", "y", "buy", "sell", "long", "short", "open"}
-    LONG_SET = {"long", "buy", "1", "1.0", "多", "做多", "l", "b"}
-    SHORT_SET = {"short", "sell", "-1", "-1.0", "空", "做空", "s"}
 
     def __init__(self, cfg: MartinConfig):
         self.cfg = cfg
         self.func = SIGNAL_REGISTRY[cfg.signal_name]
-        self.watermark_ts = 0          # 已消费信号时间戳水位线(单调递增, 用于去重)
-        self._logged_mapping = False
+        self.watermark_ts = 0  # 已消费信号时间戳水位线(去重防刷)
 
     def set_watermark(self, ts: int):
         self.watermark_ts = max(self.watermark_ts, int(ts or 0))
 
-    def _pick_col(self, df: pd.DataFrame, key: str) -> Optional[str]:
-        override = self.cfg.signal_columns.get(key)
-        if override:
-            return override if override in df.columns else None
-        lower = {str(c).lower(): c for c in df.columns}
-        for cand in self.CANDIDATES[key]:
-            if cand in lower:
-                return lower[cand]
-        return None
-
-    @staticmethod
-    def _to_ms(v) -> int:
-        if isinstance(v, (pd.Timestamp, datetime)):
-            return int(pd.Timestamp(v).value // 1_000_000)
-        f = float(v)
-        if f <= 0:
-            return 0
-        if f < 1e11:          # 秒级
-            return int(f * 1000)
-        if f > 1e14:          # 微秒/纳秒级
-            while f > 1e14:
-                f /= 1000.0
-            return int(f)
-        return int(f)
-
     def poll(self, market_price: float) -> Optional[Signal]:
-        """返回一个可用信号, 或 None。永不抛异常。"""
         try:
             df = self.func(self.cfg.symbol)
-        except Exception as e:
-            logger.error(f"[信号] 调用 {self.cfg.signal_name} 抛异常(按无信号处理) | 错误:[{e}]")
-            return None
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-
-        try:
-            c_flag = self._pick_col(df, "flag")
-            c_dir = self._pick_col(df, "direction")
-            c_px = self._pick_col(df, "price")
-            c_ts = self._pick_col(df, "ts")
-            if not self._logged_mapping:
-                logger.info(f"[信号] 列名映射确认 | flag={c_flag} direction={c_dir} "
-                            f"price={c_px} ts={c_ts} | 全部列:{list(df.columns)}")
-                self._logged_mapping = True
-            if c_dir is None or c_px is None or c_ts is None:
-                logger.info("[信号] df 缺少 方向/限价/时间戳 关键列, 丢弃(不做猜测)")
+            if df is None or df.empty:
                 return None
 
-            row = df.iloc[-1]     # 只认最后一行(最新)
+            # 1. 取最后一行信号
+            row = df.iloc[-1]
 
-            # 1) 开仓标志
-            if c_flag is not None:
-                fv = row[c_flag]
-                if pd.isna(fv) or str(fv).strip().lower() not in self.TRUE_SET:
-                    return None
+            # 2. 只处理开仓信号 (马丁策略依靠内部止盈止损平仓，忽略外部 CLOSE)
+            if str(row['event']).upper() != "OPEN":
+                return None
 
-            # 2) 方向
-            dv = str(row[c_dir]).strip().lower()
-            if dv in self.LONG_SET:
+            # 3. 提取方向
+            direction_str = str(row['direction']).upper()
+            if direction_str == "LONG":
                 direction = Direction.LONG
-            elif dv in self.SHORT_SET:
+            elif direction_str == "SHORT":
                 direction = Direction.SHORT
             else:
-                logger.info(f"[信号] 方向字段无法识别, 丢弃 | 原值:[{row[c_dir]}]")
                 return None
+
+            # 检查方向是否在配置的白名单中
             if direction.value not in self.cfg.allowed_directions:
-                logger.info(f"[信号] 方向[{direction.value}]不在白名单{self.cfg.allowed_directions}, 丢弃")
                 return None
 
-            # 3) 限价
-            px = float(row[c_px])
-            if not (px > 0) or math.isnan(px) or math.isinf(px):
-                logger.info(f"[信号] 限价非法, 丢弃 | 原值:[{row[c_px]}]")
-                return None
+            # 4. 提取价格和时间戳
+            px = float(row['price'])
+            ts = int(row['timestamp'])
 
-            # 4) 时间戳 + 去重 + 新鲜度
-            ts = self._to_ms(row[c_ts])
-            if ts <= 0:
-                logger.info(f"[信号] 时间戳非法, 丢弃 | 原值:[{row[c_ts]}]")
-                return None
+            # 5. 风控校验 1：去重与过期作废
             if ts <= self.watermark_ts:
-                return None       # 老信号, 静默丢弃(避免刷屏)
-            age = (time.time() * 1000 - ts) / 1000.0
-            if age > self.cfg.max_signal_age_sec:
-                logger.info(f"[信号] 信号已过期, 拒绝追单 | 滞后:[{age:.1f}s] "
-                            f"上限:[{self.cfg.max_signal_age_sec}s] ts:[{ts}]")
-                self.set_watermark(ts)   # 过期信号也推高水位, 避免反复打印
-                return None
-            if age < -60:
-                logger.info(f"[信号] 信号时间戳位于未来[{-age:.1f}s], 疑似时钟错误, 丢弃")
+                return None  # 老信号，静默跳过
+
+            age_sec = (time.time() * 1000 - ts) / 1000.0
+            if age_sec > self.cfg.max_signal_age_sec:
+                logger.info(f"[信号] 信号已过期，拒绝追单 | 滞后:[{age_sec:.1f}s]")
+                self.set_watermark(ts)
                 return None
 
-            # 5) 信号价与现价偏离
+            # 6. 风控校验 2：信号价与现价偏离不能过大
             if market_price > 0:
                 dev = abs(px / market_price - 1) * 100
                 if dev > self.cfg.max_signal_deviation_pct:
-                    logger.info(f"[信号] 信号价与现价偏离过大, 丢弃 | 信号价:[{px}] 现价:[{market_price}] "
-                                f"偏离:[{dev:.3f}%] 上限:[{self.cfg.max_signal_deviation_pct}%]")
+                    logger.info(f"[信号] 信号偏离现价过大，丢弃 | 偏离:[{dev:.3f}%]")
                     self.set_watermark(ts)
                     return None
 
             return Signal(direction, px, ts, self.cfg.signal_name)
-        except Exception as e:
-            logger.error(f"[信号] 解析 df 异常(按无信号处理) | 错误:[{e}]")
-            return None
 
+        except Exception as e:
+            logger.error(f"[信号] 读取标准信号失败: {e}")
+            return None
 
 # ==============================================================================
 # 7. 马丁蓝图 (层数 / 价格 / 数量 / 风控上限)
