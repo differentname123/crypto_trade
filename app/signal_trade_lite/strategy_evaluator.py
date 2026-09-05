@@ -973,8 +973,15 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         return str(val)
 
     # === 核心调整 2：按照排好序的策略列表依次打印 ===
+    target_strategy_name_list = ["factor_007", "factor_008"]
+
     index_count = 0
     for strategy_name in sorted_strategies:
+        # strategy_name必须要包含目标列表，比如 "factor_007_01" 就应该打印
+        if not any(target in strategy_name for target in target_strategy_name_list):
+            continue
+
+
         index_count += 1
         # 提取当前策略的数据
         df_strat = df_all[df_all["策略"] == strategy_name].copy()
