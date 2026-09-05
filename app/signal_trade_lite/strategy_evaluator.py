@@ -1084,7 +1084,7 @@ def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spik
         if len(grp) < 4: continue
         grp = grp.sort_values("Margin")
         diffs = grp["_surv_days"].diff().dropna().tolist()
-        signs = [1 if d > 0 else -1 for d in diffs]
+        signs = [1 if d >= 0 else -1 for d in diffs]
         flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
         if flips <= 1:
             smooth_keys.add(name)
@@ -1166,4 +1166,4 @@ if __name__ == "__main__":
 
 
     # show_leaderboard_csv(csv_file=output_csv, direction="long")
-    show_robust_leaderboard(csv_file=output_csv, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45, top_n=150)
+    show_robust_leaderboard(csv_file=output_csv, direction="long", min_opens=3000, max_spike_ratio=2.4, min_safety_days=45, top_n=150)
