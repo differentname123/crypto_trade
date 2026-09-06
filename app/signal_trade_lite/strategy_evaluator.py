@@ -848,6 +848,24 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     if df_all.empty:
         print("[提示] CSV 文件为空，无数据可展示。")
         return
+
+    # ===== 输出说明（仅看日志者必读）=====
+    print("=" * 90)
+    print(" 📖 核心术语与过滤说明")
+    print("-" * 90)
+    print(" [平原 Plateau]   : 同(策略+方向+加仓倍数)下，以(Margin,加仓间距,止盈间距)为坐标。")
+    print("                    平原样本数 = 邻域网格(3×3×3=27格) × 测试币种数量，衡量全局稳健性。")
+    print(" [平滑 Smooth]    : 存活时间平滑度验证。同等参数下，随保证金(Margin)加深，预期存活")
+    print("                    必须呈平稳单调递增(允许0次波动)，排除因行情巧合导致的虚假存活。")
+    print(" [收益单位 M倍]   : 榜单收益、亏损、回撤均以投入的保证金为基准1。净利5.0即赚5倍本金。")
+    print(" [存活安全垫]     : 该平原内所有样本中最差的 10% 分位存活天数，反映极端行情的兜底能力。")
+    print(" [全币邻居数]     : 实际聚合成平原的有效样本数，例如测试3个币，满邻居即为 3×27 = 81。")
+    print("-" * 90)
+    print(" ⚙️ 榜单已施加以下严格过滤:")
+    print("  • 基础与容量 : Smooth=Y | 实际开仓≥1000 | 最大持仓≤20天 | 全币邻居数≥81")
+    print("  • 收益与回撤 : 总收益≥20 M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
+    print("  • 存活与风控 : 中位存活≥60天 | 平原安全垫≥30天")
+    print("=" * 90)
     # 1. 过滤方向
     d_filter = direction.strip().lower()
     if d_filter == 'long':
@@ -872,7 +890,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         diffs = grp["_surv_days"].diff().dropna().tolist()
         signs = [1 if d >= 0 else -1 for d in diffs]
         flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
-        if flips <= 1:
+        if flips < 1:
             smooth_keys.add(name)
 
     df_all["Smooth"] = df_all.apply(
