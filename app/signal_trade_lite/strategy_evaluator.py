@@ -835,14 +835,6 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
     """
-    if csv_file is None or csv_file == "strategy_leaderboard_filtered.csv":
-        import glob
-        files = glob.glob("strategy_leaderboard_*_files.csv")
-        if files:
-            csv_file = sorted(files, key=os.path.getmtime, reverse=True)[0]
-        else:
-            csv_file = "strategy_leaderboard_filtered.csv"
-
     if not os.path.exists(csv_file):
         print(f"[错误] 未找到文件: {csv_file}")
         return
@@ -856,13 +848,54 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     if df_all.empty:
         print("[提示] CSV 文件为空，无数据可展示。")
         return
-
     # 1. 过滤方向
     d_filter = direction.strip().lower()
     if d_filter == 'long':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Long']
     elif d_filter == 'short':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Short']
+    # ================== 新增 Spike 和 Smooth 的计算与过滤 ==================
+    def parse_survival(v):
+        if isinstance(v, str):
+            if "未爆仓" in v: return 999.0
+            try: return float(v.split()[0])
+            except: return 999.0
+        return float(v) if pd.notnull(v) else 0.0
+
+    df_all["_surv_days"] = df_all["预期存活(天)"].apply(parse_survival)
+
+    # 1. 计算 Margin 单调平滑度 (Smoothness)
+    smooth_keys = set()
+    for name, grp in df_all.groupby(["策略", "币种", "加仓间距", "止盈间距"]):
+        if len(grp) < 4: continue
+        grp = grp.sort_values("Margin")
+        diffs = grp["_surv_days"].diff().dropna().tolist()
+        signs = [1 if d >= 0 else -1 for d in diffs]
+        flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
+        if flips <= 1:
+            smooth_keys.add(name)
+
+    df_all["Smooth"] = df_all.apply(
+        lambda row: "Y" if (row["策略"], row["币种"], row["加仓间距"], row["止盈间距"]) in smooth_keys else "",
+        axis=1
+    )
+
+    # 2. 计算 Spike
+    col_total = "总收益(M倍)" if "总收益(M倍)" in df_all.columns else "总收益(Margin倍数)"
+    df_all["Spike"] = df_all.apply(
+        lambda row: row[col_total] / row["平原均总收益(M倍)"] if "平原均总收益(M倍)" in df_all.columns and pd.notnull(row.get("平原均总收益(M倍)")) and row["平原均总收益(M倍)"] > 0 else 0.0,
+        axis=1
+    )
+
+    # 3. 过滤 Smooth 不为 Y 的行
+    df_all = df_all[df_all["Smooth"] == "Y"]
+
+    if df_all.empty:
+        print(f"[提示] 根据 Smooth 过滤后，无匹配数据。")
+        return
+    # =======================================================================
+
+
 
     # 2. 过滤交易次数
     if "实际开仓数" in df_all.columns:
@@ -874,10 +907,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     if "净利润(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
-
     if "平原存活安全垫(天)" in df_all.columns:
         df_all = df_all[df_all["平原存活安全垫(天)"] >= 30]
-
 
     if "平原90%分位无盈利(天)" in df_all.columns:
         df_all = df_all[df_all["平原90%分位无盈利(天)"] <= 20]
@@ -948,7 +979,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
                     "平原存活安全垫(天)",
                     # "平原存活率(%)",
                     # "平原盈利%",
-                    # "平原90%分位无盈利(天)"
+                    # "平原90%分位无盈利(天)",
+                    # "Spike", "Smooth"
                     ]
     display_cols = [c for c in display_cols if c in df_all.columns]
 
@@ -981,7 +1013,6 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         if not any(target in strategy_name for target in target_strategy_name_list):
             continue
 
-
         index_count += 1
         # 提取当前策略的数据
         df_strat = df_all[df_all["策略"] == strategy_name].copy()
@@ -998,13 +1029,11 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
         # 打印表头，附带展示该策略的最高收益，一目了然
         max_p = strategy_max_profits[strategy_name]
-        # print(f"\n🏆 开仓策略编号{index_count} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
         print(f"\n🏆 开仓策略编号{index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
 
-        # 计算列宽
         for col in cols:
             max_w = get_display_width(col)
             for val in df_display[col]:
@@ -1019,7 +1048,6 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         print(header_str)
         print(sep_line)
 
-        # 打印数据
         for _, row in df_display.iterrows():
             row_cells = [right_align(format_val(row[col]), col_widths[i]) for i, col in enumerate(cols)]
             print(" | ".join(row_cells))
@@ -1032,124 +1060,6 @@ def compute_marting():
 
 
 
-def show_robust_leaderboard(csv_file, direction="long", min_opens=3000, max_spike_ratio=1.4, min_safety_days=45,
-                             min_opens_per_year=200, max_avg_hold_h=12, backtest_years=5.0, top_n=15):
-    """
-    根据给定的平原分析CSV文件，过滤出真正处于安全平原内、抗风险、收益高的强健参数组合。
-    min_opens_per_year: 年化开仓次数下限，太低说明交易太少，样本也不够扎实
-    max_avg_hold_h: 平均持仓小时数上限，太长说明更接近波段而不是高频节奏
-    backtest_years: 回测跨度（年），用于把总开仓数换算成年化交易频率，如跨度不是5年请传入实际值
-    """
-    print("=" * 80)
-    print(f" 🛡️ 启动策略参数组合评分工具 | 过滤门槛: 开仓>{min_opens}, 安全垫>{min_safety_days}, "
-          f"年化交易>{min_opens_per_year}, 平均持仓<{max_avg_hold_h}h")
-    print("=" * 80)
-
-    if not os.path.exists(csv_file):
-        print(f"[错误] 未找到文件: {csv_file}")
-        return
-
-    df = pd.read_csv(csv_file)
-    if "方向" in df.columns:
-        d_filter = direction.strip().lower()
-        if d_filter == 'long':
-            df = df[df["方向"].str.capitalize() == 'Long']
-        elif d_filter == 'short':
-            df = df[df["方向"].str.capitalize() == 'Short']
-    # 兼容中英文列名
-    col_total = "总收益(M倍)" if "总收益(M倍)" in df.columns else "总收益(Margin倍数)"
-    col_net = "净利润(M倍)" if "净利润(M倍)" in df.columns else "净利润(Margin倍数)"
-
-    req_cols = [
-        "策略", "币种", "Margin", "加仓间距", "止盈间距", "实际开仓数", "爆仓次数",
-        "预期存活(天)", "平均持仓(h)", col_total, col_net, "平原均净利(M倍)", "平原均总收益(M倍)", "平原存活安全垫(天)"
-    ]
-    missing = [c for c in req_cols if c not in df.columns]
-    if missing:
-        print(f"[提示] 数据缺少计算稳健性的必要列（可能未执行平原计算）: {missing}")
-        return
-
-    def parse_survival(v):
-        if isinstance(v, str):
-            if "未爆仓" in v: return 999.0
-            try: return float(v.split()[0])
-            except: return 999.0
-        return float(v) if pd.notnull(v) else 0.0
-
-    df["_surv_days"] = df["预期存活(天)"].apply(parse_survival)
-
-    # 1. 计算 Margin 单调平滑度 (Smoothness)
-    smooth_keys = set()
-    for name, grp in df.groupby(["策略", "币种", "加仓间距", "止盈间距"]):
-        if len(grp) < 4: continue
-        grp = grp.sort_values("Margin")
-        diffs = grp["_surv_days"].diff().dropna().tolist()
-        signs = [1 if d >= 0 else -1 for d in diffs]
-        flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
-        if flips <= 1:
-            smooth_keys.add(name)
-
-    # 2. 遍历过滤与评分
-    passed = []
-    for _, row in df.iterrows():
-        opens = row["实际开仓数"]
-        plat_total = row["平原均总收益(M倍)"]
-        tot_ret = row[col_total]
-        saf_days = row["平原存活安全垫(天)"]
-        avg_hold = row["平均持仓(h)"]
-
-        if opens < min_opens: continue
-        if (opens / backtest_years) < min_opens_per_year: continue
-        if avg_hold > max_avg_hold_h: continue
-        if plat_total <= 0: continue
-        spike = tot_ret / plat_total
-        if spike > max_spike_ratio: continue
-        if saf_days < min_safety_days: continue
-
-        score = (plat_total * 0.5) + (row["_surv_days"] * 0.15) + (saf_days * 0.25) - (row["爆仓次数"] * 0.5)
-        passed.append({
-            "score": score,
-            "spike": spike,
-            "row": row,
-            "smooth": "Y" if (row["策略"], row["币种"], row["加仓间距"], row["止盈间距"]) in smooth_keys else ""
-        })
-
-    if not passed:
-        print(f"[提示] 没有组合通过当前的稳健性门槛。可尝试放宽要求。")
-        return
-
-    # 3. 生成两大榜单并打印
-    by_robust = sorted(passed, key=lambda x: x["score"], reverse=True)
-    by_return = sorted(passed, key=lambda x: x["row"][col_total], reverse=True)
-
-    def print_top(title, data_list):
-        print(f"\n=== {title} ===")
-        # 使用排版控制格式齐整
-        header = f"{'币种':<10} | {'策略':<16} | {'Margin':<6} | {'加仓':<6} | {'止盈':<6} | {'总收益':<8} | {'平原总收':<9} | {'Spike':<6} | {'预期存活':<9} | {'安全垫':<9} | {'开仓数':<8} | {'交易/天':<8} | {'持仓h':<7} | {'Smooth'}"
-        print("-" * len(header))
-        print(header)
-        print("-" * len(header))
-        for item in data_list[:top_n]:
-            r = item["row"]
-            coin = str(r["币种"]).ljust(10)
-            fac = str(r["策略"]).ljust(16)
-            m = f"{r['Margin']:.0f}".ljust(6)
-            add = f"{r['加仓间距']:.3f}".ljust(6)
-            tp = f"{r['止盈间距']:.3f}".ljust(6)
-            tot = f"{r[col_total]:.2f}".ljust(8)
-            plat = f"{r['平原均总收益(M倍)']:.2f}".ljust(9)
-            spk = f"{item['spike']:.2f}".ljust(6)
-            srv = f"{r['_surv_days']:.1f}".ljust(9)
-            saf = f"{r['平原存活安全垫(天)']:.1f}".ljust(9)
-            opens_disp = f"{r['实际开仓数']:.0f}".ljust(8)
-            trd_per_day = f"{(r['实际开仓数'] / (backtest_years * 365)):.2f}".ljust(8)
-            hold_h = f"{r['平均持仓(h)']:.2f}".ljust(7)
-            print(f"{coin} | {fac} | {m} | {add} | {tp} | {tot} | {plat} | {spk} | {srv} | {saf} | {opens_disp} | {trd_per_day} | {hold_h} | {item['smooth']}")
-
-    print_top("稳健优先（跨币种/跨margin证据更充分）", by_robust)
-    print_top("进攻优先（通过稳健门槛后总收益最高）", by_return)
-    print("\n注：Spike(总收益/平原均总收益)越接近1，说明越不是单币运气；Smooth=Y表示相邻Margin生存天数变化平滑；"
-          "交易/天与持仓h用于避免选到交易过少或持仓过长的组合。")
 if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
@@ -1165,5 +1075,4 @@ if __name__ == "__main__":
     # )
 
 
-    # show_leaderboard_csv(csv_file=output_csv, direction="long")
-    show_robust_leaderboard(csv_file=output_csv, direction="long", min_opens=3000, max_spike_ratio=2.4, min_safety_days=45, top_n=150)
+    show_leaderboard_csv(csv_file=output_csv, direction="long")
