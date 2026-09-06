@@ -830,7 +830,7 @@ def compute_parameter_plateau(
 
 
 def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=1000,
-                         min_net_profit=-1000, min_total_profit=10):
+                         min_net_profit=-1000, min_total_profit=20):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -863,7 +863,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     print("-" * 90)
     print(" ⚙️ 榜单已施加以下严格过滤:")
     print("  • 基础与容量 : Smooth=Y | 实际开仓≥1000 | 最大持仓≤20天 | 全币邻居数≥81")
-    print(f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
+    print("  • 收益与回撤 : 总收益≥20 M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
     print("  • 存活与风控 : 中位存活≥60天 | 平原安全垫≥30天")
     print("=" * 90)
     # 1. 过滤方向
@@ -938,13 +938,13 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     #     df_all = df_all[df_all["最小存活(天)"] >= 30]
 
     if "平原均净利(M倍)" in df_all.columns:
-        df_all = df_all[df_all["平原均净利(M倍)"] > -1]
+        df_all = df_all[df_all["平原均净利(M倍)"] > 0]
 
     if "最大持仓(h)" in df_all.columns:
         df_all = df_all[df_all["最大持仓(h)"] <= 20 * 24]
 
     if "全币邻居数" in df_all.columns:
-        df_all = df_all[df_all["全币邻居数"] >= 2 * 27]
+        df_all = df_all[df_all["全币邻居数"] >= 3 * 27]
 
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
@@ -1023,7 +1023,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         return str(val)
 
     # === 核心调整 2：按照排好序的策略列表依次打印 ===
-    target_strategy_name_list = ["factor"]
+    target_strategy_name_list = ["factor_007_2", "factor_007_1", "factor_023_6", "factor_023_6", "factor_044_10"]
 
     index_count = 0
     for strategy_name in sorted_strategies:
@@ -1093,4 +1093,4 @@ if __name__ == "__main__":
     # )
 
 
-    show_leaderboard_csv(csv_file=output_csv, direction="short")
+    show_leaderboard_csv(csv_file=output_csv, direction="long")
