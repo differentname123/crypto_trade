@@ -504,7 +504,7 @@ const Finale=({ onViewRadar })=>{
 };
 
 const SignalRadar = ({ onBack }) => {
-  const WECHAT_ID = 'easyeverything98';
+  const WECHAT_ID = 'YYY0704827';
 
   const [showWarningModal, setShowWarningModal] = useState(false);
   const [modalStep, setModalStep] = useState(1);
