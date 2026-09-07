@@ -634,7 +634,11 @@ def _submit_prompt(page, prompt):
     human_like_input(page, prompt_input, prompt)
 
     # 精准结构定位运行按钮, 不依赖 "Run"/"Ctrl" 等易变文本
-    run_button = page.locator("ms-run-button button[type='submit']")
+    run_button = (
+        page.locator("ms-run-button button[type='submit']")  # 兼容老样式
+        .or_(page.locator("ms-run-button button"))  # 兼容你提供的最新样式
+    ).first
+
     # 长超时: 附件上传完成后 aria-disabled 才会变为可用
     expect(run_button).to_be_enabled(timeout=300000)
 
@@ -1093,11 +1097,11 @@ if __name__ == '__main__':
     # validate_all_accounts()
 
     open_browser_for_manual_use(USER_DATA_DIR, 'https://aistudio.google.com/prompts/new_chat')
-    #
-    # test_file = r"W:\project\python_project\watermark_remove\common_utils\video_scene\test.jpg"
-    # test_prompt = "图片内容是什么"
-    # err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
-    # if err:
-    #     logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
-    # else:
-    #     logger.info(f"[示例任务] 成功 ✅ | 模型回复: [{response}]")
+
+    test_file = r"C:\Users\zxh\Desktop\temp\test.jpg"
+    test_prompt = "图片内容是什么"
+    err, response = query_google_ai_studio(prompt=test_prompt, file_path=test_file)
+    if err:
+        logger.error(f"【示例任务】失败 ❌ | 错误信息: [{err}]")
+    else:
+        logger.info(f"[示例任务] 成功 ✅ | 模型回复: [{response}]")
