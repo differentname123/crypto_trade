@@ -862,8 +862,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     print(" [全币邻居数]     : 实际聚合成平原的有效样本数，例如测试3个币，满邻居即为 3×27 = 81。")
     print("-" * 90)
     print(" ⚙️ 榜单已施加以下严格过滤:")
-    print("  • 基础与容量 : Smooth=Y | 实际开仓≥1000 | 最大持仓≤20天 | 全币邻居数≥81")
-    print("  • 收益与回撤 : 总收益≥20 M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
+    print(f"  • 基础与容量 : Smooth=Y | 实际开仓≥{min_trades} | 最大持仓≤20天 | 全币邻居数≥81")
+    print(f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
     print("  • 存活与风控 : 中位存活≥60天 | 平原安全垫≥30天")
     print("=" * 90)
     # 1. 过滤方向
