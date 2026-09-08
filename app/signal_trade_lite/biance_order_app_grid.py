@@ -65,18 +65,19 @@ from biance_order_lite import (
     execute_order, ExecStatus, fetch_single_order,
 )
 
+
 # ==========================================
 # 0. 全局可调参数 (集中管理, 消灭魔术数字)
 # ==========================================
-POINT_CHECK_DELAY_COLD = 0.05  # 冷启动逐单点查的限流间隔(秒)
-POINT_CHECK_DELAY_RUNTIME = 0.1  # 运行时看门狗点查的限流间隔(秒)
-PLACE_THROTTLE_SEC = 0.05  # 批量铺单时相邻两单的限流间隔(秒)
-INIT_SETTLE_WAIT_SEC = 1.0  # 铺单完成后等待撮合/网络传播的缓冲(秒)
-COLD_START_BACKTRACK = 3  # 冷启动时每个节点向前回溯的历史单号数量
-ORDER_GRACE_PERIOD = 5.0  # 新单冷静期(秒): 期内看门狗不判定掉单, 容忍撮合与传播延迟
-TAKER_PRICE_MARKUP = 1.03  # 【买入开仓】吃单封顶系数(现价+3%), 规避越价拒单与插针滑点
-TAKER_PRICE_MARKDOWN = 0.97  # 【卖出开仓】吃单保底系数(现价-3%), 做空网格的镜像保护
-WATCHDOG_INTERVAL_SEC = 1  # 看门狗巡检周期(秒); 多进程并发若触发交易所限频, 建议调大(如5秒)
+POINT_CHECK_DELAY_COLD = 0.05     # 冷启动逐单点查的限流间隔(秒)
+POINT_CHECK_DELAY_RUNTIME = 0.1   # 运行时看门狗点查的限流间隔(秒)
+PLACE_THROTTLE_SEC = 0.05         # 批量铺单时相邻两单的限流间隔(秒)
+INIT_SETTLE_WAIT_SEC = 1.0        # 铺单完成后等待撮合/网络传播的缓冲(秒)
+COLD_START_BACKTRACK = 3          # 冷启动时每个节点向前回溯的历史单号数量
+ORDER_GRACE_PERIOD = 5.0          # 新单冷静期(秒): 期内看门狗不判定掉单, 容忍撮合与传播延迟
+TAKER_PRICE_MARKUP = 1.03         # 【买入开仓】吃单封顶系数(现价+3%), 规避越价拒单与插针滑点
+TAKER_PRICE_MARKDOWN = 0.97       # 【卖出开仓】吃单保底系数(现价-3%), 做空网格的镜像保护
+WATCHDOG_INTERVAL_SEC = 1         # 看门狗巡检周期(秒); 多进程并发若触发交易所限频, 建议调大(如5秒)
 
 
 # ==========================================
@@ -96,7 +97,7 @@ class OrderAction(Enum):
 
 class GridDirection(Enum):
     """网格方向: 决定"开仓/平仓"分别对应哪一侧价格与哪一个买卖动作。"""
-    LONG = "LONG"  # 做多网格: 区间下沿买入开多 -> 区间上沿卖出平多
+    LONG = "LONG"    # 做多网格: 区间下沿买入开多 -> 区间上沿卖出平多
     SHORT = "SHORT"  # 做空网格: 区间上沿卖出开空 -> 区间下沿买入平空
 
 
@@ -155,7 +156,7 @@ class NodeContext:
         self.broker = broker
         self.ledger = ledger
         self.strategy_id = strategy_id
-        self.direction = direction  # 新增: 网格方向, 供节点派生开平仓动作
+        self.direction = direction          # 新增: 网格方向, 供节点派生开平仓动作
         # 全局共享的市场最新价与精度缓存
         self.latest_price = 0.0
         self.precision = None
@@ -366,7 +367,6 @@ class OidCodec:
     def prefix_for(cls, strategy_id):
         return f"{cls.PREFIX}_{strategy_id}_"
 
-
 # ==========================================
 # 2. 基础设施层 (Ledger / Broker / 方向锁)
 # ==========================================
@@ -568,7 +568,7 @@ class GridNode:
         # 幂等拦截: 非当前期待的 OID 一律丢弃 (历史延迟 / 重复 / 已过时的对账事件)
         if event.client_oid != self.active_client_oid:
             logger.info(f"[节点] 【{self.node_id}】幂等拦截过时事件, 已丢弃 | "
-                        f"期待CID:[{self.active_client_oid}] 收到CID:[{event.client_oid}]")
+                         f"期待CID:[{self.active_client_oid}] 收到CID:[{event.client_oid}]")
             return
 
         if event.status == OrderStatus.FILLED:
@@ -613,7 +613,7 @@ class GridNode:
         self.ctx.ledger.append(self.node_id, self.cycle_count, "ORDER_CANCELED",
                                self.active_client_oid, 0, 0, "WARN", msg="触发补挂")
         logger.info(f"[自愈] 【{self.node_id}】第[{self.cycle_count}]轮 在管订单被撤销/拒单"
-                    f"(可能被手工撤单或交易所清理), 正换新单号按网格价重挂 | 旧CID:[{self.active_client_oid}]")
+                       f"(可能被手工撤单或交易所清理), 正换新单号按网格价重挂 | 旧CID:[{self.active_client_oid}]")
 
         # 开仓单触发越价保护计算, 让错误恢复的节点能按现价边界重挂
         if self.state == NodeState.WAIT_OPEN:
@@ -664,8 +664,8 @@ class GridNode:
                 self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                        self.active_client_oid, price, self.quantity, "WARN", msg="触发限频")
                 logger.info(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
-                            f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
-                            f"交易所回执:[{res.error_msg}]")
+                               f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
+                               f"交易所回执:[{res.error_msg}]")
             else:
                 # 真正的致命错误（余额不足、精度错误、持仓模式不匹配等）：必须挂起(ERROR)，防止死循环疯狂发单
                 self.state = NodeState.ERROR
@@ -699,7 +699,7 @@ def build_geometric_grid(config, broker, ctx):
         # 精度碰撞: 修约后下沿 >= 上沿, 说明等比价差已小于最小刻度, 终止下沿生成
         if fmt_low >= fmt_high:
             logger.info(f"[网格] 价位[{current_high}]处 [{config.price_ratio}%] 等比价差已小于交易所最小报价刻度"
-                        f"(上/下沿价修约后同为[{fmt_high}]), 低价区无法继续细分, 网格生成提前收口")
+                           f"(上/下沿价修约后同为[{fmt_high}]), 低价区无法继续细分, 网格生成提前收口")
             break
         if fmt_low < config.min_price:
             break
@@ -714,13 +714,11 @@ def build_geometric_grid(config, broker, ctx):
                 f"区间:[{config.min_price}-{config.max_price}] 间距:[{config.price_ratio}%] 单笔数量:[{fmt_qty}]")
     return nodes
 
-
 class TimeSyncThread(threading.Thread):
     """
     周期性刷新 CCXT 与币安服务器的时间差。
     彻底对抗本地服务器因长期运行造成的系统时钟持续漂移。
     """
-
     def __init__(self, exchange, interval_sec=3600):
         super().__init__(daemon=True)
         self.exchange = exchange
@@ -737,7 +735,6 @@ class TimeSyncThread(threading.Thread):
                 logger.info(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
             except Exception as e:
                 logger.info(f"[时间同步] 获取服务器时间异常, 本次忽略，保持旧偏差 | 错误:[{e}]")
-
 
 # ==========================================
 # 4. 对账引擎 (只读产事件, 冷启动例外)
@@ -800,7 +797,7 @@ class ReconciliationEngine:
                 aligned += 1
             else:
                 logger.info(f"[对账] 【{node_id}】最近[{len(candidates)}]笔历史单号在交易所均查无实据(幽灵单), "
-                            f"该节点将按全新节点重新铺单")
+                               f"该节点将按全新节点重新铺单")
 
         # ── 第3层: 孤儿单巡检 (不归属任何节点; 仅高密度报警, 不执行物理撤单) ──
         managed_cids = {n.active_client_oid for n in nodes.values() if n.active_client_oid}
@@ -810,11 +807,10 @@ class ReconciliationEngine:
                 continue
             orphan_count += 1
             logger.info(f"[对账] 发现脱管孤儿单(保留未撤销, 请人工核查是否为历史遗留) | "
-                        f"CID:[{cid}] 交易所ID:[{order.get('id', 'N/A')}] "
-                        f"[{str(order.get('side', 'N/A')).upper()}] @[{order.get('price', 0)}] x[{order.get('amount', 0)}]")
+                           f"CID:[{cid}] 交易所ID:[{order.get('id', 'N/A')}] "
+                           f"[{str(order.get('side', 'N/A')).upper()}] @[{order.get('price', 0)}] x[{order.get('amount', 0)}]")
 
-        logger.info(
-            f"[对账] 冷启动对账完成 | 节点恢复:[{aligned}/{len(nodes)}] | 脱管孤儿单:[{orphan_count}]张(未干预)")
+        logger.info(f"[对账] 冷启动对账完成 | 节点恢复:[{aligned}/{len(nodes)}] | 脱管孤儿单:[{orphan_count}]张(未干预)")
 
     # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
     def repair_runtime(self, nodes):
@@ -836,7 +832,7 @@ class ReconciliationEngine:
         if not suspects:
             return
         logger.info(f"[看门狗] 发现[{len(suspects)}]个节点的在管订单从盘口消失(疑似已成交或被撤), "
-                    f"逐一点查确认真实状态...")
+                       f"逐一点查确认真实状态...")
         for _node, cid in suspects:
             try:
                 info = self.broker.fetch_order(cid)
@@ -844,7 +840,7 @@ class ReconciliationEngine:
                     self._emit_from_order(cid, info)
                 else:
                     logger.info(f"[看门狗] 点查无果: 该单从未抵达交易所(多为下单瞬间网络中断的幽灵单), "
-                                f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
+                                   f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
                     self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
                 time.sleep(POINT_CHECK_DELAY_RUNTIME)
             except Exception as e:
@@ -886,7 +882,7 @@ class ReconciliationEngine:
         parsed = OidCodec.parse(truth_cid)
         if parsed is None:
             logger.info(f"[对账] 真相单号解析失败, 放弃拨正节点【{node.node_id}】"
-                        f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
+                           f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
             return
         node.align(parsed.cycle, truth_cid, truth_order.get('id', ''), parsed.action)
         raw = str(truth_order.get('status', '')).upper()
@@ -1023,7 +1019,7 @@ class GridStrategy:
         node = self.nodes.get(parsed.node_id)
         if node is None:
             logger.info(f"[主循环] 事件目标节点不存在(网格区间可能已变更), 已忽略 | "
-                        f"节点:[{parsed.node_id}] OID:[{event.client_oid}]")
+                           f"节点:[{parsed.node_id}] OID:[{event.client_oid}]")
             return
         node.process_event(event)
 
@@ -1072,8 +1068,8 @@ def run_single_strategy(config):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("myself_biance_api_key")
-    secret_key = get_config("myself_biance_api_secret")
+    api_key = get_config("nana_biance_api_copy_key")
+    secret_key = get_config("nana_biance_api_copy_secret")
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
     }
@@ -1269,15 +1265,15 @@ def main_app():
     # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
     configs = [
 
-        # GridConfig(
-        #     strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
-        #     min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
-        # ),  # 消耗  1217  u 网格数量 95
-        #
-        # GridConfig(
-        #     strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
-        #     min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
-        # ),  # 消耗  1240  u 网格数量 67
+        GridConfig(
+            strategy_id=f"AVAX{20260828}", symbol="AVAX/USDT:USDT",
+            min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
+        ),  # 消耗  1217  u 网格数量 95
+
+        GridConfig(
+            strategy_id=f"BTC{20260828}", symbol="BTC/USDT:USDT",
+            min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
+        ),  # 消耗  1240  u 网格数量 67
 
         # ---------------- 做空网格示例 (需要时再解除注释) ----------------
         # 做空要点:
@@ -1287,11 +1283,11 @@ def main_app():
         #   4) 账户必须为双向持仓 Hedge Mode。
         GridConfig(
             strategy_id=f"SHORT-UNI{current_symbol}", symbol="UNI/USDT:USDT",
-            min_price=5, max_price=10, price_ratio=1.54, quantity=1,
+            min_price=5, max_price=15, price_ratio=1.54, quantity=3,
             direction=GridDirection.SHORT,
-        ),  # 消耗  133  u 网格数量 45
+        ),# 消耗  1306  u 网格数量 71
 
-        # 总共节点和为 45
+        # 总共节点和为 95 + 67 + 71 = 233 个节点, 预估总消耗约 1217 + 1240 + 1306 = 3763 u
     ]
     processes = []
     for config in configs:
