@@ -1068,8 +1068,8 @@ def run_single_strategy(config):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("myself_biance_api_key")
-    secret_key = get_config("myself_biance_api_secret")
+    api_key = get_config("nana_biance_api_copy_key")
+    secret_key = get_config("nana_biance_api_copy_secret")
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
     }
@@ -1086,7 +1086,7 @@ def run_single_strategy(config):
     # 启动日志统计看板
     StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=120).start()
     TimeSyncThread(exchange, interval_sec=3600).start()
-    
+
     strategy.run_main_loop()
 
 
@@ -1265,15 +1265,15 @@ def main_app():
     # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
     configs = [
 
-        # GridConfig(
-        #     strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
-        #     min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
-        # ),  # 消耗  1217  u 网格数量 95
-        #
-        # GridConfig(
-        #     strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
-        #     min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
-        # ),  # 消耗  1240  u 网格数量 67
+        GridConfig(
+            strategy_id=f"AVAX{20260828}", symbol="AVAX/USDT:USDT",
+            min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
+        ),  # 消耗  1217  u 网格数量 95
+
+        GridConfig(
+            strategy_id=f"BTC{20260828}", symbol="BTC/USDT:USDT",
+            min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
+        ),  # 消耗  1240  u 网格数量 67
 
         # ---------------- 做空网格示例 (需要时再解除注释) ----------------
         # 做空要点:
@@ -1283,11 +1283,11 @@ def main_app():
         #   4) 账户必须为双向持仓 Hedge Mode。
         GridConfig(
             strategy_id=f"SHORT-UNI{current_symbol}", symbol="UNI/USDT:USDT",
-            min_price=5, max_price=10, price_ratio=1.54, quantity=1,
+            min_price=5, max_price=15, price_ratio=1.54, quantity=3,
             direction=GridDirection.SHORT,
-        ),# 消耗  133  u 网格数量 45
+        ),# 消耗  1306  u 网格数量 71
 
-        # 总共节点和为 45
+        # 总共节点和为 95 + 67 + 71 = 233 个节点, 预估总消耗约 1217 + 1240 + 1306 = 3763 u
     ]
     processes = []
     for config in configs:
