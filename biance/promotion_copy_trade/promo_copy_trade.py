@@ -41,7 +41,7 @@ USER_DATA_DIR_LIST = [
     r"W:\temp\biance_zhouling",
 
 ]
-USER_ACCOUNT_USAGE_FILE = r"W:\temp\biance_account_usage.json"
+USER_ACCOUNT_USAGE_FILE = r"W:\project\python_project\crypto_trade\biance\promotion_copy_trade\biance_account_usage.json"
 LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/square/post/362858558969979"
 
 FILTER_CONFIG = {
