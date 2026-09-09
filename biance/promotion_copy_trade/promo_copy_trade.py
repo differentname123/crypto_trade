@@ -30,7 +30,7 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 SCHEDULE_INTERVAL_SEC = 3600
-COMMENT_SEND_INTERVAL_SEC = 60 * 5  # 同一账号两次发送评论的最小间隔（秒），实际发送间隔必须大于该值
+COMMENT_SEND_INTERVAL_SEC = 60 * 1  # 同一账号两次发送评论的最小间隔（秒），实际发送间隔必须大于该值
 LLM_MAX_RETRIES = 3
 
 GEMINI_MODEL = "gemini-3-flash-thinking"
