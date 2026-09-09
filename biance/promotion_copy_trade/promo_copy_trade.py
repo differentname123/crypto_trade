@@ -10,6 +10,8 @@
 # [输出数据]: 副作用为主 —— 向 MongoDB 帖子文档追加 promo_comment(生成结果) 与 promo_comment_info(发布状态)。
 # ==========================================
 import datetime
+import json
+import os
 import re
 import time
 import threading
@@ -34,7 +36,12 @@ GEMINI_MODEL = "gemini-3-flash-thinking"
 
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt'
-USER_DATA_DIR = r"W:\temp\biance_ruru"
+USER_DATA_DIR_LIST = [
+    r"W:\temp\biance_qiqi",
+    r"W:\temp\biance_zhouling",
+
+]
+USER_ACCOUNT_USAGE_FILE = r"W:\temp\biance_account_usage.json"
 LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/square/post/362858558969979"
 
 FILTER_CONFIG = {
@@ -54,6 +61,133 @@ FILTER_CONFIG = {
     "cold_post_hours": 20,      # 判定"死帖"的时间界限(小时)
     "cold_post_min_views": 20   # 死帖最低浏览量要求(超时且低于此值即淘汰)
 }
+
+
+# 账号使用信息仅在当前进程内并发访问，使用线程锁保证“选择账号 + 占用次数”原子化
+_user_account_usage_lock = threading.Lock()
+
+
+def _get_account_name(user_data_dir):
+    """从用户数据目录路径中提取账号名称，例如 W:\\temp\\biance_ruru -> biance_ruru。"""
+    return os.path.basename(os.path.normpath(user_data_dir))
+
+
+def _get_account_usage_update_time():
+    """返回账号使用信息的更新时间。"""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _save_user_account_usage_unlocked(usage_data):
+    """原子写入账号使用信息 JSON。调用方必须已持有 _user_account_usage_lock。"""
+    usage_dir = os.path.dirname(USER_ACCOUNT_USAGE_FILE)
+    if usage_dir:
+        os.makedirs(usage_dir, exist_ok=True)
+
+    temp_file = f"{USER_ACCOUNT_USAGE_FILE}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(usage_data, f, ensure_ascii=False, indent=2)
+    os.replace(temp_file, USER_ACCOUNT_USAGE_FILE)
+
+
+def _load_user_account_usage_unlocked():
+    """读取并补齐账号使用信息。调用方必须已持有 _user_account_usage_lock。"""
+    if not USER_DATA_DIR_LIST:
+        raise ValueError("USER_DATA_DIR_LIST 不能为空")
+
+    if os.path.exists(USER_ACCOUNT_USAGE_FILE):
+        try:
+            with open(USER_ACCOUNT_USAGE_FILE, "r", encoding="utf-8") as f:
+                usage_data = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"读取账号使用信息失败: {USER_ACCOUNT_USAGE_FILE} | {e}") from e
+
+        if not isinstance(usage_data, dict):
+            raise ValueError(f"账号使用信息文件顶层必须是 dict: {USER_ACCOUNT_USAGE_FILE}")
+    else:
+        usage_data = {}
+
+    changed = False
+    for user_data_dir in USER_DATA_DIR_LIST:
+        account_name = _get_account_name(user_data_dir)
+        if not account_name:
+            raise ValueError(f"无法从 USER_DATA_DIR_LIST 中提取账号名称: {user_data_dir}")
+
+        account_usage = usage_data.get(account_name)
+        if not isinstance(account_usage, dict):
+            account_usage = {}
+            usage_data[account_name] = account_usage
+            changed = True
+
+        default_fields = {
+            "total_count": 0,
+            "success_count": 0,
+            "failure_count": 0,
+            "last_failure_reason": None,
+            "update_time": None
+        }
+        for field, default_value in default_fields.items():
+            if field not in account_usage:
+                account_usage[field] = default_value
+                changed = True
+
+    if changed:
+        _save_user_account_usage_unlocked(usage_data)
+
+    return usage_data
+
+
+def acquire_user_account_for_send():
+    """
+    优先选择 total_count 最少的账号，并在返回前先占用一次 total_count。
+    total_count 相同时按 USER_DATA_DIR_LIST 中的顺序选择。
+    [出参 Shape]: (user_data_dir(str), account_name(str))。
+    """
+    with _user_account_usage_lock:
+        usage_data = _load_user_account_usage_unlocked()
+
+        _, selected_dir, selected_name, _ = min(
+            [
+                (
+                    index,
+                    user_data_dir,
+                    _get_account_name(user_data_dir),
+                    int(usage_data[_get_account_name(user_data_dir)].get("total_count", 0) or 0)
+                )
+                for index, user_data_dir in enumerate(USER_DATA_DIR_LIST)
+            ],
+            key=lambda item: (item[3], item[0])
+        )
+
+        account_usage = usage_data[selected_name]
+        account_usage["total_count"] = int(account_usage.get("total_count", 0) or 0) + 1
+        account_usage["update_time"] = _get_account_usage_update_time()
+        _save_user_account_usage_unlocked(usage_data)
+
+        return selected_dir, selected_name
+
+
+def record_user_account_send_result(account_name, success, error_info=None):
+    """记录账号本次实际发送调用的成功/失败结果。"""
+    with _user_account_usage_lock:
+        usage_data = _load_user_account_usage_unlocked()
+        if account_name not in usage_data:
+            usage_data[account_name] = {
+                "total_count": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "last_failure_reason": None,
+                "update_time": None
+            }
+
+        account_usage = usage_data[account_name]
+        if success:
+            account_usage["success_count"] = int(account_usage.get("success_count", 0) or 0) + 1
+        else:
+            account_usage["failure_count"] = int(account_usage.get("failure_count", 0) or 0) + 1
+            account_usage["last_failure_reason"] = str(error_info or "未知失败原因")
+
+        account_usage["update_time"] = _get_account_usage_update_time()
+        _save_user_account_usage_unlocked(usage_data)
 
 
 def is_valid_post_for_promo(post):
@@ -359,12 +493,18 @@ def send_single_promo_comment(post):
     post_url = f"https://www.binance.com/zh-CN/square/post/{post_id}"
     my_urls = [{"text": link_text, "url": LEAD_DETAIL_URL}]
 
-    err, success, c_id = comment_on_binance_post(
-        post_url=post_url,
-        comment=comment_text,
-        url_info_list=my_urls,
-        user_data_dir=USER_DATA_DIR
-    )
+    user_data_dir, account_name = acquire_user_account_for_send()
+
+    try:
+        err, success, c_id = comment_on_binance_post(
+            post_url=post_url,
+            comment=comment_text,
+            url_info_list=my_urls,
+            user_data_dir=user_data_dir
+        )
+    except Exception as e:
+        record_user_account_send_result(account_name, success=False, error_info=e)
+        raise
 
     err_str = str(err or "")
 
@@ -382,6 +522,7 @@ def send_single_promo_comment(post):
     is_captcha = any(signal in err_str for signal in captcha_signals)
 
     if is_captcha:
+        record_user_account_send_result(account_name, success=False, error_info=err_str)
         logger.error(
             f"🚨 [发布链路/风控触发] 检测到【人机验证/WAF阻断】！"
             f"| 帖子ID: 【{post_id}】 | 拦截详情: 【{err_str}】 | 决策: 【不记录失败状态，保留帖子，准备紧急熔断本轮】"
@@ -389,11 +530,13 @@ def send_single_promo_comment(post):
         return None, "CAPTCHA"
 
     # 正常成败处理：闭环回写数据库
+    record_user_account_send_result(account_name, success=success, error_info=err)
     post["promo_comment_info"] = {
         "comment_id": c_id,
         "comment_time": int(time.time() * 1000),
         "status": "success" if success else "failed",
-        "error_info": err if not success else None
+        "error_info": err if not success else None,
+        "account_name": account_name
     }
 
     if success:
