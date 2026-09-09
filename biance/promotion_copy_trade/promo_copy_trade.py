@@ -30,6 +30,7 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 SCHEDULE_INTERVAL_SEC = 3600
+COMMENT_SEND_INTERVAL_SEC = 60 * 5  # 同一账号两次发送评论的最小间隔（秒），实际发送间隔必须大于该值
 LLM_MAX_RETRIES = 3
 
 GEMINI_MODEL = "gemini-3-flash-thinking"
@@ -123,6 +124,7 @@ def _load_user_account_usage_unlocked():
             "success_count": 0,
             "failure_count": 0,
             "last_failure_reason": None,
+            "last_send_time": 0,
             "update_time": None
         }
         for field, default_value in default_fields.items():
@@ -138,32 +140,56 @@ def _load_user_account_usage_unlocked():
 
 def acquire_user_account_for_send():
     """
-    优先选择 total_count 最少的账号，并在返回前先占用一次 total_count。
+    优先从已满足发送间隔的账号中选择 total_count 最少的账号，并在返回前先占用一次 total_count。
     total_count 相同时按 USER_DATA_DIR_LIST 中的顺序选择。
+    若所有账号均未满足发送间隔，则等待最短剩余时间后重新选择。
     [出参 Shape]: (user_data_dir(str), account_name(str))。
     """
-    with _user_account_usage_lock:
-        usage_data = _load_user_account_usage_unlocked()
+    while True:
+        wait_seconds = 0
 
-        _, selected_dir, selected_name, _ = min(
-            [
-                (
-                    index,
-                    user_data_dir,
-                    _get_account_name(user_data_dir),
-                    int(usage_data[_get_account_name(user_data_dir)].get("total_count", 0) or 0)
+        with _user_account_usage_lock:
+            usage_data = _load_user_account_usage_unlocked()
+            now = time.time()
+            available_accounts = []
+            min_remaining_seconds = None
+
+            for index, user_data_dir in enumerate(USER_DATA_DIR_LIST):
+                account_name = _get_account_name(user_data_dir)
+                account_usage = usage_data[account_name]
+                total_count = int(account_usage.get("total_count", 0) or 0)
+                last_send_time = float(account_usage.get("last_send_time", 0) or 0)
+                elapsed_seconds = now - last_send_time
+
+                if last_send_time <= 0 or elapsed_seconds > COMMENT_SEND_INTERVAL_SEC:
+                    available_accounts.append((index, user_data_dir, account_name, total_count))
+                else:
+                    remaining_seconds = COMMENT_SEND_INTERVAL_SEC - elapsed_seconds
+                    if min_remaining_seconds is None or remaining_seconds < min_remaining_seconds:
+                        min_remaining_seconds = remaining_seconds
+
+            if available_accounts:
+                _, selected_dir, selected_name, _ = min(
+                    available_accounts,
+                    key=lambda item: (item[3], item[0])
                 )
-                for index, user_data_dir in enumerate(USER_DATA_DIR_LIST)
-            ],
-            key=lambda item: (item[3], item[0])
+
+                account_usage = usage_data[selected_name]
+                account_usage["total_count"] = int(account_usage.get("total_count", 0) or 0) + 1
+                account_usage["last_send_time"] = time.time()
+                account_usage["update_time"] = _get_account_usage_update_time()
+                _save_user_account_usage_unlocked(usage_data)
+
+                return selected_dir, selected_name
+
+            wait_seconds = max(min_remaining_seconds or COMMENT_SEND_INTERVAL_SEC, 0) + 0.05
+
+        logger.info(
+            f"[发布链路/账号冷却] 所有账号均未满足发送间隔 "
+            f"| 关键参数: 【同账号最小间隔: {COMMENT_SEND_INTERVAL_SEC} 秒】 "
+            f"| 结果: 【等待 {wait_seconds:.2f} 秒后重新选择账号】"
         )
-
-        account_usage = usage_data[selected_name]
-        account_usage["total_count"] = int(account_usage.get("total_count", 0) or 0) + 1
-        account_usage["update_time"] = _get_account_usage_update_time()
-        _save_user_account_usage_unlocked(usage_data)
-
-        return selected_dir, selected_name
+        time.sleep(wait_seconds)
 
 
 def record_user_account_send_result(account_name, success, error_info=None):
@@ -176,6 +202,7 @@ def record_user_account_send_result(account_name, success, error_info=None):
                 "success_count": 0,
                 "failure_count": 0,
                 "last_failure_reason": None,
+                "last_send_time": 0,
                 "update_time": None
             }
 
