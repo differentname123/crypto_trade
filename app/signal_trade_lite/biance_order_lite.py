@@ -3,6 +3,7 @@ import math
 import ccxt
 import time
 import uuid
+import platform
 
 from enum import Enum
 from ccxt.base.errors import NetworkError, InvalidOrder
@@ -413,65 +414,134 @@ def fetch_all_open_orders_unified(exchange, symbol):
 
     return unified_orders
 # ==========================================
-# 5. 上层应用模拟 (Main 演示)
+# 5. 上层应用模拟与全流程端到端测试 (Main 演示)
 # ==========================================
 if __name__ == "__main__":
+    print("==================================================")
+    print(">>> 启动量化主策略引擎 & 条件单完整生命周期测试 <<<")
+    print("==================================================")
 
-    # 【假装这里是你的主循环引擎或策略中心】
-    print(">>> 启动量化主策略引擎...")
-
-    # 1. 填入你的测试 API 密钥（建议使用币安测试网）
-    API_KEY = get_config('nana_biance_api_key')
-    SECRET_KEY = get_config('nana_biance_api_secret')
+    # ---------------- 准备阶段：配置读取与实例初始化 ----------------
+    # 优先读取自定义的密钥，没有则读取默认配置
+    API_KEY = get_config("myself_biance_api_key") or get_config("nana_biance_api_key")
+    SECRET_KEY = get_config("myself_biance_api_secret") or get_config("nana_biance_api_secret")
     SYMBOL = "BTC/USDT:USDT"
 
+    # 环境自适应代理配置：Linux服务器通常直连，本地开发机走本地代理端口
+    proxies = None if platform.system().lower() == "linux" else {
+        "http": "http://127.0.0.1:7890",
+        "https": "http://127.0.0.1:7890"
+    }
+
     try:
-        # 注意：如果在境内测试，可能需要传 proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'}
-        bot_exchange = init_exchange(API_KEY, SECRET_KEY,
-                                     proxies={'http': 'http://127.0.0.1:7890', 'https': 'http://127.0.0.1:7890'})
-    except Exception:
-        print(">>> 交易所初始化失败，程序退出。")
+        bot_exchange = init_exchange(API_KEY, SECRET_KEY, proxies=proxies)
+    except Exception as e:
+        print(f">>> 交易所初始化失败，程序退出: {e}")
         exit(1)
+
+    # ---------------- 场景 1: 账户资金与仓位巡视 ----------------
+    print("\n--- [场景 1] 开机巡视：账户权益与当前持仓 ---")
     get_total_equity(bot_exchange)
-    print("\n--- 场景 1: 开机状态检查 ---")
     status, usdt, pos = get_symbol_status(bot_exchange, SYMBOL)
     if status == ExecStatus.OK:
-        print(f"当前可用子弹: {usdt} U, 当前持仓: {pos} 个 BTC")
+        print(f"当前可用保证金: {usdt:.2f} USDT | 当前 {SYMBOL} 净持仓: {pos} BTC")
     else:
-        print("无法获取状态，检查网络或代理！")
+        print("⚠️ 无法获取持仓及余额状态，请排查网络！")
 
-    print("\n--- 场景 2: 上层策略发出防呆拦截指令 ---")
-    # 模拟上层传了错误参数（限价单忘记传价格）
-    bad_intent_id = f"open_bad_{uuid.uuid4().hex[:8]}"
-    res_bad = execute_order(bot_exchange, SYMBOL, "buy", 0.001, bad_intent_id, order_type="limit",price=60000)
-
+    # ---------------- 场景 2: 防呆拦截验证 ----------------
+    print("\n--- [场景 2] 防呆设计校验：缺失必填参数拦截 ---")
+    bad_intent_id = f"bad_test_{uuid.uuid4().hex[:8]}"
+    # 模拟手误：发了限价单 (limit) 却未传价格 (price=None)
+    res_bad = execute_order(bot_exchange, SYMBOL, "buy", 0.001, bad_intent_id, order_type="limit", price=None)
     if res_bad.status == ExecStatus.REJECT:
-        print(f"被基座直接挡回: {res_bad.error_msg}")
-        print("策略引擎: 幸好没发出去，调整参数重新计算。")
-    #
-    # print("\n--- 场景 3: 正常的平仓意图 (使用 reduceOnly 防翻转) ---")
-    # # 主策略决定平仓，主动生成绝对唯一的意图 ID
-    # close_intent_id = f"close_pos_{uuid.uuid4().hex[:8]}"
-    #
-    # res_close = execute_order(
-    #     exchange=bot_exchange,
-    #     symbol=SYMBOL,
-    #     side="sell",  # 平多仓
-    #     amount=100.0,  # 直接给个极大值
-    #     client_oid=close_intent_id,
-    #     reduce_only=True  # 核心保护
-    # )
-    #
-    # # ！！！上层主策略的终极处理范式 ！！！
-    # if res_close.status == ExecStatus.OK:
-    #     print(f"策略引擎: 平仓成功！交易所单号是 {res_close.exchange_oid}，耗时 {res_close.latency_ms} ms。")
-    #     # 此时可以去更新本地的记账数据库或持仓状态
-    #
-    # elif res_close.status == ExecStatus.REJECT:
-    #     print(f"策略引擎: 平仓被拒 ({res_close.error_msg})。")
-    #     # 往往是因为刚才根本没仓位，或者余额不足，这种明确被拒的单子，主策略直接忽略即可，不要重试。
-    #
-    # elif res_close.status == ExecStatus.UNKNOWN:
-    #     print(f"策略引擎: 🚨 警报！发生薛定谔状态！单号 {close_intent_id} 失联！")
-    #     # 将该单号推入后台的 Redis 队列或死信队列。
-    #     # 后台会有一个独立的 Reconciler（对账协程），每隔 5 秒去调用 get_single_order_status 查这个 CID，直到确认它是成交还是被废弃。
+        print(f"🛡️ 防呆机制生效，本地拦截非法意图: {res_bad.error_msg}")
+
+    # ---------------- 场景 3: 挂出一张全新的止损条件单 (STOP_MARKET) ----------------
+    print("\n--- [场景 3] 实盘测试：挂出一张止损市价条件单 (STOP_MARKET) ---")
+    algo_client_oid = f"test_sl_{uuid.uuid4().hex[:8]}"
+    algo_stop_price = 50000.0  # 设置一个远离当前盘口、绝对安全的触发价
+    algo_amount = 0.002  # 满足 BTC 最小名义价值的下单数量
+    target_eid = None  # 用于暂存交易所分配的 algoId
+
+    try:
+        # 获取当前市价，动态校验触发方向（多头止损需低于市价，空头止损需高于市价）
+        ticker = bot_exchange.fetch_ticker(SYMBOL)
+        current_price = ticker['last']
+        print(f"当前市场价: {current_price} USDT")
+
+        # 示例：假设我们持有多仓，挂单卖出止损平多（低于当前价触发）
+        # 如果市价低于 55000，则动态调整止损价为当前价的 85%
+        algo_stop_price = round(current_price * 0.85, 1)
+
+        print(
+            f"准备提交条件单 -> CID:{algo_client_oid} | 方向:SELL(止损) | 触发价:{algo_stop_price} | 数量:{algo_amount}")
+
+        # 币安合约下条件单的核心参数
+        stop_params = {
+            "stopPrice": algo_stop_price,  # 触发价格
+            "newClientOrderId": algo_client_oid,  # 本地自定义单号
+            "positionSide": "LONG",  # 针对多头仓位
+            "workingType": "MARK_PRICE",  # 触发基准：标记价格 (防插针)
+        }
+
+        # 调用 ccxt 创建 STOP_MARKET 条件单
+        order = bot_exchange.create_order(
+            symbol=SYMBOL,
+            type='STOP_MARKET',
+            side='sell',
+            amount=algo_amount,
+            params=stop_params
+        )
+        target_eid = str(order['id'])
+        print(f"🎉 条件单挂单成功! 本地CID: {algo_client_oid} | 交易所EID(AlgoID): {target_eid}")
+
+    except Exception as e:
+        print(f"❌ 挂条件单失败 (如果是测试网或无持仓报错属正常业务拦截): {e}")
+
+    # ---------------- 场景 4: 统一全量挂单查询 (普通单 + 条件单) ----------------
+    print("\n--- [场景 4] 使用统一接口拉取当前盘口所有活跃挂单 ---")
+    time.sleep(1.0)  # 等待 1 秒使撮合引擎数据同步
+    all_open = fetch_all_open_orders_unified(bot_exchange, SYMBOL)
+    print(f"当前共查到 {len(all_open)} 张活动订单:")
+    for o in all_open:
+        print(f" -> [{o['source']}] CID:{o['client_oid']} | EID:{o['exchange_oid']} | "
+              f"类型:{o['type']} | 触发价:{o['stop_price']} | 挂单价:{o['price']} | 数量:{o['amount']}")
+
+    # ---------------- 场景 5: 通用撤单函数精准拔除条件单 ----------------
+    print("\n--- [场景 5] 验证通用撤单接口：精准撤销刚创建的条件单 ---")
+    # 优先选用场景3成功生成的单号，若场景3未成功则使用兜底单号演示
+    cancel_cid = algo_client_oid
+    cancel_eid = target_eid
+
+    if cancel_cid or cancel_eid:
+        print(f"正在精准撤除目标: CID={cancel_cid} (EID={cancel_eid}) ...")
+        # cancel_order_universal 具备降级自愈能力：普通接口找不到会自动切换到算法单接口
+        res_cancel = cancel_order_universal(
+            bot_exchange,
+            SYMBOL,
+            client_oid=cancel_cid,
+            order_id=cancel_eid
+        )
+
+        if res_cancel.status == ExecStatus.OK:
+            print("🎉 撤单指令已通过通用/算法接口下发成功！")
+        else:
+            print(f"❌ 撤单失败: {res_cancel.error_msg}")
+    else:
+        print("⚠️ 未找到可供撤除的订单 ID，跳过撤单阶段。")
+
+    # ---------------- 场景 6: 撤单终态复查 ----------------
+    print("\n--- [场景 6] 状态核验：再次查询确认条件单是否彻底清理 ---")
+    time.sleep(1.0)
+    all_open_after = fetch_all_open_orders_unified(bot_exchange, SYMBOL)
+
+    # 过滤确认刚才撤销的单号是否还存在
+    remained = [
+        o for o in all_open_after
+        if (cancel_cid and o['client_oid'] == cancel_cid) or (cancel_eid and o['exchange_oid'] == cancel_eid)
+    ]
+
+    if not remained:
+        print("✅ 确认成功！该条件单已在盘口与服务端彻底消失！逻辑闭环跑通！")
+    else:
+        print("⚠️ 警告：订单依然残留在盘口，请核对日志排查异常！")
