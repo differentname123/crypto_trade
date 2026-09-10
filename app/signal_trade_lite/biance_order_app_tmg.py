@@ -92,6 +92,7 @@ SIGNAL_REGISTRY = {
 API_THROTTLE_SEC = 0.08          # 相邻两次 API 调用的最小间隔(限流保护)
 ORDER_GRACE_SEC = 4.0            # 新单冷静期: 期内不因"盘口查不到"判定掉单(容忍撮合与传播延迟)
 CANCEL_CONFIRM_SEC = 1.5         # 撤单后多久开始点查确认终态(非阻塞, 交给下一轮主循环)
+CANCEL_RELEASE_SEC = 20.0        # 撤单终态点查持续未知, 且盘口确认已无该单 -> 安全释放重挂
 MAX_PLACE_ATTEMPTS = 5           # 单层挂单的最大尝试次数, 超出则永久 DEFERRED + 告警(防疯狂发单)
 RETRY_BACKOFF_SEC = (2, 5, 15, 60, 300)   # 各次失败后的退避秒数(按尝试次数索引)
 TEARDOWN_MAX_ROUND = 4           # 清理阶段最多轮询撤单几轮
@@ -104,6 +105,7 @@ HARD_MAX_LAYERS = 50             # 【物理硬顶】纯防死循环底线; 真�
 FORCE_CLOSE_MAX_ATTEMPTS = 3     # 市价强平最大尝试次数, 超出转 STOPPED 等人工介入
 SL_IMM_TRIG_MAX_DEV_PCT = 50.0   # "会立即触发"回执的本地核验: 止损价与现价偏离超此阈值判定为算错
 IDLE_ERROR_SLEEP_SEC = (15.0, 30.0)  # IDLE 态连续异常的长休眠退避区间(绝不停机)
+IDLE_NO_PRICE_SLEEP_SEC = 5.0    # IDLE 态拉不到现价时的额外退避(防断网高频空转刷屏)
 RECOVER_RETRY_SEC = 10.0         # 断点续传接管失败后的重试间隔
 RECOVER_MAX_ATTEMPTS = 30        # 接管重试上限, 超出转 STOPPED(但绝不清场)
 
@@ -985,7 +987,12 @@ class MartinConfig:
     def __init__(self, strategy_id, symbol, signal_name,
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_usdt=50.0,
-                 layer_loss_budget_ratio=0.80,         # 层数亏损预算比例, 给止损留缓冲
+                 layer_loss_budget_ratio=0.80,
+                 # ↑ 最深层满仓浮亏预算比例, 必须 < 1, 它决定"最深层成交价 → 止损价"的生存空间:
+                 #   P_sl - P_last = sign * (max_loss - loss_last) / Q_full
+                 #   若设为 1.0, 最深层成交瞬间浮亏就 ≈ max_loss, 止损价会贴死在最深层成交价上,
+                 #   最后一仓刚成交就被扫止损(甚至条件单被交易所拒为 -2021 立即触发)。
+                 #   想提高资金利用率就调到 0.85~0.90, 绝不要设成 1。
                  max_signal_age_sec=90,
                  entry_timeout_sec=900,                # 入场超时: 一手未成则作废周期
                  max_cycle_sec=0,                      # 0=不限, 周期总超时强平
@@ -1029,7 +1036,8 @@ class MartinConfig:
         if self.max_loss_usdt <= 0:
             errs.append("max_loss_usdt 必须 > 0")
         if not (0.1 <= self.layer_loss_budget_ratio <= 0.95):
-            errs.append("layer_loss_budget_ratio 必须在 [0.1,0.95](必须<1, 否则止损贴在最后成交价上)")
+            errs.append("layer_loss_budget_ratio 必须在 [0.1,0.95]"
+                        "(必须<1, 否则止损价会贴死在最深层成交价上, 最后一仓刚成交就被扫止损)")
         if errs:
             for e in errs:
                 logger.critical(f"[配置] 校验失败: {e}")
@@ -1145,7 +1153,8 @@ class BlueprintBuilder:
       * 止盈价: 第 i 层止盈 = 第 i 层【理论持仓均价】的等比偏离 (avg * (1 + sign*tp_pct%))
       * 止损价: 按最后一层满仓时恰好亏 max_loss_usdt 反解, 全周期唯一固定
     层数判定: 只有当"下一层成交后的浮亏 <= max_loss * layer_loss_budget_ratio"时才允许挂该层。
-      (若取"止损价刚好在下一层之下"作为边界, 最深层一成交浮亏就已≈最大亏损, 会被立刻扫止损)
+      ratio 必须 < 1: 由 P_sl - P_last = sign*(max_loss - loss_last)/Q_full 可知,
+      若让 loss_last 顶到 max_loss, 止损价就会贴死在最深层成交价上, 最后一仓刚成交即被扫止损。
     唯一的层数硬顶是 HARD_MAX_LAYERS, 纯粹作为防死循环的物理安全底线。
     """
 
@@ -1247,7 +1256,8 @@ class BlueprintBuilder:
             f"{r[0]:>3} {r[1]:>14.8g} {r[2]:>12.8g} {r[3]:>12.8g} {r[4]:>12.2f} "
             f"{r[5]:>14.8g} {r[6]:>14.8g} {r[7]:>10.2f}" for r in rows)
         tail = (f"\n最大名义价值:[{acc_cost:.2f}U] 满仓均价:[{final_avg:.8g}] "
-                f"全局固定止损价:[{sl:.8g}](距满仓均价 {abs(sl / final_avg - 1) * 100:.3f}%)\n"
+                f"全局固定止损价:[{sl:.8g}](距满仓均价 {abs(sl / final_avg - 1) * 100:.3f}%, "
+                f"距最深层成交价 {abs(sl / layers[-1].price - 1) * 100:.3f}%)\n"
                 f"最大亏损设定:[{cfg.max_loss_usdt}U] 止盈:[{cfg.tp_pct}%] "
                 f"间距:[{cfg.step_pct}% 相对当层理论均价等比] 倍数:[{cfg.qty_mult}]\n"
                 f"=======================================================================")
@@ -1261,48 +1271,65 @@ class BlueprintBuilder:
 class PositionBook:
     """
     本策略的虚拟仓位账。只由"本策略 OID 的成交增量"驱动, 与交易所仓位完全解耦。
-    【价格刚性】持仓均价仅由 add_open 决定; 任何平仓(TP/SL/部分成交)绝不改变均价,
-    因此同一周期内只要没有新的加仓, 止盈价与止损价绝对不动。
+
+    【会计模型: 标准库存移动平均法】
+      avg = cost / open_qty
+      * 加仓: open_qty += q, cost += p*q                  -> 均价按加权移动
+      * 平仓: 按【当前均价】等比扣减成本 cost -= avg*q      -> 数学上均价恒定不变
+      因此"只要没有新的加仓, 均价/止盈价/止损价绝对不动"(I5 价格刚性), 同时 cost 与
+      open_qty 始终一一对应, 绝不会被历史已平仓部分污染。
     realized 仅作统计口径, 绝不参与任何价格计算。
+    total_open_* / total_close_* 为只增统计量, 供 I4 总量硬闸与事后复盘使用。
     """
 
     def __init__(self, direction: Direction):
         self.direction = direction
         self.open_qty = 0.0            # 当前虚拟持仓数量
-        self.open_cost = 0.0           # 累计开仓成本(只增不减, 平仓绝不污染)
-        self.total_open_filled = 0.0   # 累计开仓成交量
-        self.total_close_filled = 0.0  # 累计平仓成交量
+        self.cost = 0.0                # 当前持仓对应的总成本(与 open_qty 严格配对)
+        self.total_open_filled = 0.0   # 累计开仓成交量(只增, I4 硬闸依据)
+        self.total_open_cost = 0.0     # 累计开仓成本(只增, 仅复盘用)
+        self.total_close_filled = 0.0  # 累计平仓成交量(只增)
         self.realized = 0.0            # 已实现盈亏(仅统计用)
 
     @property
     def avg(self) -> float:
-        """建仓均价: 仅由实际加仓(OPEN)决定。"""
-        return (self.open_cost / self.total_open_filled
+        """当前持仓均价: 只由实际加仓(OPEN)决定, 平仓绝不改变它。"""
+        return self.cost / self.open_qty if self.open_qty > 1e-12 else 0.0
+
+    @property
+    def entry_avg(self) -> float:
+        """本周期加权入场均价(含已平仓部分), 仅用于日志与事后复盘。"""
+        return (self.total_open_cost / self.total_open_filled
                 if self.total_open_filled > 1e-12 else 0.0)
 
     def add_open(self, price: float, qty: float):
         if qty <= 0:
             return
         self.open_qty += qty
-        self.open_cost += price * qty
+        self.cost += price * qty
         self.total_open_filled += qty
+        self.total_open_cost += price * qty
 
     def add_close(self, price: float, qty: float):
-        """只同步持仓数量与统计盈亏, 绝不触碰 open_cost(即绝不改变均价)。"""
+        """平仓只扣减持仓数量与对应比例的成本, 均价数学恒定(价格刚性)。"""
         if qty <= 0:
             return
+        self.total_close_filled += qty          # 统计口径: 交易所实际成交多少就记多少
         eff = min(qty, self.open_qty)
-        self.total_close_filled += qty
         if eff <= 1e-12:
-            return      # 持仓已归零, 忽略滞后事件, 杜绝除零与天量虚假利润
-        self.realized += self.direction.sign * (price - self.avg) * eff
+            return      # 库存已空, 忽略滞后事件, 杜绝除零与天量虚假利润
+        cur_avg = self.avg
+        self.realized += self.direction.sign * (price - cur_avg) * eff
+        self.cost -= cur_avg * eff              # 按当前均价等比扣减 -> avg 保持不变
         self.open_qty -= eff
-        if self.open_qty <= 1e-12:
+        if self.open_qty <= 1e-12:              # 彻底归零, 杜绝浮点残余
             self.open_qty = 0.0
+            self.cost = 0.0
 
     def force_flat(self):
         """交易所实际持仓已归零时的强制同步(打破收尾死锁)。"""
         self.open_qty = 0.0
+        self.cost = 0.0
 
     def unrealized(self, price: float) -> float:
         if self.open_qty <= 1e-12:
@@ -1310,8 +1337,9 @@ class PositionBook:
         return self.direction.sign * (price - self.avg) * self.open_qty
 
     def snapshot(self) -> dict:
-        return {"open_qty": self.open_qty, "avg": self.avg, "realized": self.realized,
-                "open_filled": self.total_open_filled, "close_filled": self.total_close_filled}
+        return {"open_qty": self.open_qty, "avg": self.avg, "entry_avg": self.entry_avg,
+                "realized": self.realized, "open_filled": self.total_open_filled,
+                "close_filled": self.total_close_filled}
 
 
 # ==============================================================================
@@ -1478,8 +1506,16 @@ class MartinCycle:
         if lp.life in (Life.FILLED, Life.DEAD):
             return
 
-        # 撤单待确认: 只认点查终态(撤单瞬间可能刚好成交), 主循环绝对非阻塞
+        # 撤单待确认: 盘口快照是权威全量信息 ——
+        #   仍在盘口 => 撤单未生效, 重发撤单(绝不重挂新单, 严守 I3 单一出场)
+        #   已不在盘口 => 点查裁决终态; 点查长期未知则安全释放(盘口已确认无单, 不可能出现两张)
         if lp.life == Life.CANCEL_PENDING:
+            if lp.coid in snapshot:
+                self._observe(lp.coid, snapshot[lp.coid])
+                if now - lp.last_action_ts >= CANCEL_CONFIRM_SEC:
+                    if self._cancel(lp.coid, "撤单未生效(仍在盘口), 重发撤单"):
+                        lp.last_action_ts = time.time()
+                return
             self._confirm_layer_cancel(lp, price, now)
             return
 
@@ -1535,7 +1571,10 @@ class MartinCycle:
             lp.life = Life.LIVE      # 快照滞后, 下一轮再看
 
     def _confirm_layer_cancel(self, lp: LayerPlan, price: float, now: float):
-        """撤单终态确认: 撤单请求发出瞬间订单可能刚好成交, 必须点查裁决。"""
+        """
+        撤单终态确认(前置条件: 该单已不在盘口快照中)。
+        撤单请求发出的瞬间订单可能刚好成交, 必须点查裁决, 绝不凭 cancel() 返回值定终态。
+        """
         if now - lp.last_action_ts < CANCEL_CONFIRM_SEC:
             return
         o = self.ctx.gw.fetch_order(lp.coid)
@@ -1544,7 +1583,13 @@ class MartinCycle:
             self._try_place_layer(lp, price, now)
             return
         if not isinstance(o, UniOrder):
-            return          # 结果未知: 保留原OID, 下一轮继续确认
+            # 点查持续未知: 盘口已确认无该单, 重挂不会出现两张; 超时后释放以防永久死锁
+            if now - lp.last_action_ts >= CANCEL_RELEASE_SEC:
+                logger.critical(f"[层] 第[{lp.layer}]层撤单终态点查持续未知超[{CANCEL_RELEASE_SEC}s], "
+                                f"但盘口快照已确认无该单, 安全释放状态允许重挂 | CID:[{lp.coid}]")
+                lp.coid, lp.life = "", Life.NOT_PLACED
+                self._try_place_layer(lp, price, now)
+            return
         self._observe(lp.coid, o)
         if o.status == "FILLED":
             lp.life = Life.FILLED
@@ -1560,7 +1605,7 @@ class MartinCycle:
                 lp.coid, lp.life = "", Life.NOT_PLACED
                 self._try_place_layer(lp, price, now)
             return
-        # 仍活跃: 重发撤单请求
+        # 仍活跃: 重发撤单
         if self._cancel(lp.coid, "撤单确认发现仍活跃, 重发撤单"):
             lp.last_action_ts = time.time()
 
@@ -1705,9 +1750,19 @@ class MartinCycle:
     def _sync_exit(self, ex: ExitOrder, snapshot: Dict[str, UniOrder], now: float):
         if not ex.coid or ex.life in (Life.FILLED, Life.NOT_PLACED):
             return
+
+        # 撤单待确认: 与开仓层同构 —— 仍在盘口就重发撤单(严守 I3),
+        # 已不在盘口才点查裁决; 点查长期未知则安全释放(盘口无单 + 出场数量被实际持仓夹逼)
         if ex.life == Life.CANCEL_PENDING:
+            if ex.coid in snapshot:
+                self._observe(ex.coid, snapshot[ex.coid])
+                if now - ex.last_action_ts >= CANCEL_CONFIRM_SEC:
+                    if self._cancel(ex.coid, f"{ex.role.value}撤单未生效(仍在盘口), 重发撤单"):
+                        ex.last_action_ts = time.time()
+                return
             self._confirm_exit_cancel(ex, now)
             return
+
         if ex.coid in snapshot:
             o = snapshot[ex.coid]
             self._observe(ex.coid, o)
@@ -1739,7 +1794,7 @@ class MartinCycle:
             ex.live_price = o.stop_price if ex.role is OrderRole.SL and o.stop_price > 0 else o.price
 
     def _confirm_exit_cancel(self, ex: ExitOrder, now: float):
-        """出场单撤单终态确认: 撤单瞬间可能刚好成交, 必须点查裁决后才允许重挂。"""
+        """出场单撤单终态确认(前置条件: 该单已不在盘口快照中)。"""
         if now - ex.last_action_ts < CANCEL_CONFIRM_SEC:
             return
         o = self.ctx.gw.fetch_order(ex.coid)
@@ -1747,6 +1802,16 @@ class MartinCycle:
             ex.reset()
             return
         if not isinstance(o, UniOrder):
+            # 点查持续未知会让出场单永久卡死 -> 仓位失去保护。
+            # 安全释放的双保险: ① 盘口快照已确认无该单(不可能出现两张)
+            #                  ② 新单数量恒取 min(虚拟持仓, 交易所实际持仓), 绝不超量
+            if now - ex.last_action_ts >= CANCEL_RELEASE_SEC:
+                logger.critical(f"[出场] {ex.role.value} 单撤单终态点查持续未知超[{CANCEL_RELEASE_SEC}s], "
+                                f"但盘口已确认无该单, 安全释放以便重挂保护单 | CID:[{ex.coid}]")
+                self.ctx.ledger.append(self.cycle_id, self.signal_ts, 0, ex.role.value,
+                                       MartinLedger.A_ALERT, ex.coid, 0, 0, "CANCEL_RELEASE",
+                                       "撤单终态未知但盘口无该单, 释放状态重挂出场单")
+                ex.reset()
             return
         self._observe(ex.coid, o)
         if o.status == "FILLED":
@@ -1879,8 +1944,8 @@ class MartinCycle:
         elif res.unknown:
             self.ctx.ledger.append(self.cycle_id, self.signal_ts, 99, OrderRole.SL.value,
                                    MartinLedger.A_PLACE_UNKNOWN, coid, 0, qty, "UNKNOWN", why)
-            logger.critical(f"[强平] 市价平仓结果未知, 保留原OID, 收尾阶段将点查确认后再决定是否重发 | "
-                            f"CID:[{coid}]")
+            logger.critical(f"[强平] 市价平仓结果未知, 保留原OID, 收尾阶段将点查+核对实际持仓后"
+                            f"再决定是否重发 | CID:[{coid}]")
             self.end_reason = self.end_reason or reason
         else:
             self.ctx.ledger.append(self.cycle_id, self.signal_ts, 99, OrderRole.SL.value,
@@ -1937,8 +2002,10 @@ class MartinCycle:
                 self.force_close("击穿止损且盘口无单", EndReason.SL_FORCED, ex_pos_qty)
             return  # 盘口确实有 LIVE 单时, 才交给 _bottom_guard 等待交易所撮合触发
 
+        # 撤单终态未确认: 由 _sync_exit 阶段负责推进(重发撤单 / 点查裁决 / 超时安全释放),
+        # 此处绝不越过它挂新单, 严守 I3 单一出场
         if self.sl.life == Life.CANCEL_PENDING:
-            return    # 撤单终态待确认, 绝不允许同时存在两张止损单(I3)
+            return
         if self._exit_is_aligned(self.sl, target, qty):
             return
         if now < self.sl.next_retry_ts:
@@ -1990,7 +2057,7 @@ class MartinCycle:
         if target <= 0:
             return
         if self.tp.life == Life.CANCEL_PENDING:
-            return
+            return                            # 同上: 交由 _sync_exit 推进
         if self._exit_is_aligned(self.tp, target, qty):
             return
         if now < self.tp.next_retry_ts:
@@ -2415,6 +2482,9 @@ class MartinEngine:
         time.sleep(self.cfg.idle_poll_interval_sec)
         price = self.gw.fetch_last_price()
         if price is None:
+            # 拉不到现价属可预期瞬态(不抛异常污染 err_streak), 但必须额外退避,
+            # 否则断网期间会以 idle 周期高频空转刷屏并徒增 API 压力
+            time.sleep(IDLE_NO_PRICE_SLEEP_SEC)
             return
         self.last_price = price
 
@@ -2504,7 +2574,17 @@ class MartinEngine:
         residual = self.spec.round_qty(cyc.book.open_qty, "down")
         if not self.spec.qty_is_dust(residual):
             real = self.gw.fetch_position_qty(cyc.direction.position_side)
-            if real is not None and self.spec.qty_is_dust(real):
+
+            # 【安全铁律】拉不到交易所实际持仓(网络未知)时, 绝不盲目重发市价平仓单!
+            # 上一张 unknown 的市价单可能其实已成交, Hedge 模式下不带 reduceOnly,
+            # 重发会导致超量平仓 -> 直接开出反向仓位。此时只能原地等待网络恢复。
+            if real is None:
+                logger.critical("[清理] 无法获取交易所实际持仓(结果未知), 暂缓重发市价平仓单, "
+                                "防范双重平仓造成反向开仓! 原地等待网络恢复")
+                time.sleep(3.0)
+                return
+
+            if self.spec.qty_is_dust(real):
                 # 交易所已无仓 -> 强制同步本地归零, 打破 TEARDOWN 死循环
                 logger.critical(f"[清理] 本地虚拟残余[{residual}] 但交易所实际持仓已归零, "
                                 f"强制同步本地账本归零(打破收尾死锁)")
@@ -2521,7 +2601,7 @@ class MartinEngine:
                 self.state = EngineState.STOPPED
                 return
             else:
-                logger.critical(f"[清理] 周期结束仍有残余持仓[{residual}], 市价平掉"
+                logger.critical(f"[清理] 周期结束仍有残余持仓[{residual}](交易所实际[{real}]), 市价平掉"
                                 f"(第[{cyc.close_attempts + 1}]次尝试)")
                 cyc.forced_close_sent = False        # 允许换新 OID 重发, 打破防重锁死
                 cyc.force_close("周期收尾残余平仓", reason, ex_pos_qty=real)
@@ -2552,6 +2632,7 @@ class MartinEngine:
         self.pnl_total += cyc.book.realized
         logger.info(f"[周期] 周期[{cyc.cycle_id}]清算完成 | 原因:[{reason.value}] "
                     f"成交层数:[{snap['layers_filled']}/{snap['layers_total']}] "
+                    f"入场均价:[{snap['entry_avg']:.8g}] "
                     f"本周期盈亏:[{cyc.book.realized:+.4f}U] 累计:[{self.pnl_total:+.4f}U] "
                     f"耗时:[{snap['duration_sec']}s]")
 
