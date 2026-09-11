@@ -1107,8 +1107,8 @@ class MartinConfig:
             errs.append("tp_pct 必须在 (0,50] 区间")
         if self.max_loss_usdt <= 0:
             errs.append("max_loss_usdt 必须 > 0")
-        if not (0.1 <= self.layer_loss_budget_ratio <= 0.95):
-            errs.append("layer_loss_budget_ratio 必须在 [0.1,0.95](必须<1, 否则止损价会贴死在"
+        if not (0.1 <= self.layer_loss_budget_ratio <= 1):
+            errs.append("layer_loss_budget_ratio 必须在 [0.1,1](必须<1, 否则止损价会贴死在"
                         "最深层成交价上, 最后一仓刚成交就被扫止损)")
         if not errs:
             return
@@ -2452,7 +2452,41 @@ class MartinEngine:
             self.gw.cancel(coid)
         return False
 
+    def _preview_blueprint(self):
+        """【新增】参数启动时触发，以当前最新价格模拟展示蓝图，并休眠 60 秒供排查"""
+        logger.info("[预览] 正在获取最新价格以生成参数预览蓝图...")
+        price = self.gw.fetch_last_price()
+        if not price:
+            logger.warning("[预览] 无法获取最新价格，跳过参数预览。")
+            return
+
+        logger.info(f"[预览] 当前最新价:[{price}]，将以此模拟【做多】和【做空】蓝图供您核对参数:")
+
+        # 模拟做多信号 (BlueprintBuilder 内部会自动将蓝图表格输出到日志)
+        sig_long = Signal(Direction.LONG, price, int(time.time() * 1000), "PREVIEW")
+        BlueprintBuilder.build(self.cfg, self.spec, sig_long)
+
+        # 模拟做空信号
+        sig_short = Signal(Direction.SHORT, price, int(time.time() * 1000), "PREVIEW")
+        BlueprintBuilder.build(self.cfg, self.spec, sig_short)
+
+        logger.info("\n"
+                    "========================================================\n"
+                    "[预览] 请仔细核对上方蓝图参数（层数、仓位、止损金额、止盈价等）。\n"
+                    "[预览] 程序将暂停 60 秒，若发现参数设置有误请立即终止进程 (Ctrl+C)！\n"
+                    "========================================================")
+
+        # 加入倒计时提醒，避免 60 秒内无日志导致误以为程序卡死
+        for i in range(60, 0, -10):
+            logger.info(f"[预览] 距离正式启动还有 {i} 秒...")
+            time.sleep(10)
+
+        logger.info("[预览] 60秒结束，继续执行后续真实启动流程...")
+
     # ---------------- 启动 ----------------
+    # ==========================================================================
+    # 修改 MartinEngine 类中原有的 boot 函数
+    # ==========================================================================
     def boot(self):
         """冷启动: 校验配置/规格/持仓模式 -> 读账本 -> 损坏则 fail-closed / 有活周期则接管 / 否则清场进 IDLE。"""
         self.cfg.validate()
@@ -2467,6 +2501,10 @@ class MartinEngine:
             logger.critical("[启动] 账户非【双向持仓 Hedge Mode】, positionSide 会被交易所拒单, 拒绝启动 | "
                             "处置: 请在币安合约设置中切换为双向持仓")
             return False
+
+        # ================= 新增：参数预览与强制等待 60 秒 =================
+        self._preview_blueprint()
+        # ==================================================================
 
         status, meta, rows, watermark = self.ledger.load_state()
         self.gate.set_watermark(watermark)
