@@ -35,7 +35,7 @@ def set_all_futures_max_leverage(api_key, secret_key, proxies=None):
         config['proxies'] = proxies
 
     exchange = ccxt.binance(config)
-
+    exchange.load_time_difference()
     try:
         # 1. 加载所有市场信息
         exchange.load_markets()
@@ -97,8 +97,8 @@ def set_all_futures_max_leverage(api_key, secret_key, proxies=None):
 
 
 if __name__ == "__main__":
-    YOUR_API_KEY = get_config("nana_biance_api_copy_key")
-    YOUR_SECRET_KEY = get_config("nana_biance_api_copy_secret")
+    YOUR_API_KEY = get_config("myself_biance_api_copy_key")
+    YOUR_SECRET_KEY = get_config("myself_biance_api_copy_secret")
     # 国内运行需要配置代理，海外服务器可传 None
     YOUR_PROXIES = {
         'http': 'http://127.0.0.1:7890',
