@@ -2971,8 +2971,8 @@ def run_single_strategy(cfg):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("myself_biance_api_key")
-    secret_key = get_config("myself_biance_api_secret")
+    api_key = get_config("myself_biance_api_copy_key")
+    secret_key = get_config("myself_biance_api_copy_secret")
 
     # ================= 修改开始 =================
     # 使用你要求的代理规则配置给 ccxt 交易所实例
