@@ -1068,8 +1068,8 @@ def run_single_strategy(config):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("nana_biance_api_copy_key")
-    secret_key = get_config("nana_biance_api_copy_secret")
+    api_key = get_config("myself_biance_api_copy_key")
+    secret_key = get_config("myself_biance_api_copy_secret")
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
     }
@@ -1260,7 +1260,7 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
 
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
-    current_symbol = "0903"
+    current_symbol = "0912"
     # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
     # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
     configs = [
