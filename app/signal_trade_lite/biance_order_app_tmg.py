@@ -67,7 +67,6 @@ from enum import Enum
 
 import pandas as pd
 
-from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow_factor_044_1
 from common_utils_lite import setup_logger, get_config
 
 logger = setup_logger(app_name="martin_trader")
@@ -81,16 +80,38 @@ from biance_order_lite import (
 # 外部信号源: 名称 -> 函数。子进程按配置里的字符串名解析, 保证跨进程可 pickle。
 # 约定: get_signal_x(symbol) -> pd.DataFrame, 永不抛异常, 至少返回空 df。
 # ------------------------------------------------------------------------------
-try:
-    from signal_lib import get_signal_1, get_signal_2, get_signal_3  # noqa
-except Exception:  # 缺失时给出安全占位, 保证本文件可独立导入
-    def get_signal_1(symbol): return pd.DataFrame()
-    def get_signal_2(symbol): return pd.DataFrame()
-    def get_signal_3(symbol): return pd.DataFrame()
+# ------------------------------------------------------------------------------
+# 外部信号源: 名称 -> 函数。
+# ------------------------------------------------------------------------------
+from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow_factor_044_1
+
+
+def get_signal_factor_044_1(symbol):
+    """
+    信号适配器函数：
+    将底层的单 symbol 查询包装为目标函数需要的 symbol_list=[symbol]，
+    并在此处处理请求所需的 proxy_url。
+    """
+    # 按照要求配置代理 URL 字符串
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+
+    # 调用新的信号函数
+    # 注意：确保该函数返回的 df 包含 timestamp, event, direction, price 列
+    try:
+        df = execute_trading_bot_workflow_factor_044_1(
+            target_time=None,
+            symbol_list=[symbol],
+            proxy_url=proxy_url
+        )
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_044_1 发生异常: {e}")
+        return pd.DataFrame()
+
+
+# 注册新的信号源
 SIGNAL_REGISTRY = {
-    "get_signal_1": get_signal_1,
-    "get_signal_2": get_signal_2,
-    "get_signal_3": get_signal_3,
+    "factor_044_1": get_signal_factor_044_1,
 }
 
 # ==============================================================================
@@ -2894,7 +2915,7 @@ def run_single_strategy(cfg):
     # 单实例锁(固定绝对目录): 同一 strategy_id 绝不允许两个进程同时跑, 也不允许换目录绕过
     lock_path = data_path(f"martin_{cfg.strategy_id}.lock")
     try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)     # 故意不关闭: 进程存活期间持锁
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)  # 故意不关闭: 进程存活期间持锁
         if platform.system().lower() != "windows":
             import fcntl
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2907,22 +2928,31 @@ def run_single_strategy(cfg):
     def _parent_watchdog():
         while True:
             if os.getppid() in (1, 0):
-                os._exit(0)      # 主进程暴毙 -> 物理自杀, 杜绝孤儿进程裸奔下单
+                os._exit(0)  # 主进程暴毙 -> 物理自杀, 杜绝孤儿进程裸奔下单
             time.sleep(2)
+
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
     api_key = get_config("myself_biance_api_key")
     secret_key = get_config("myself_biance_api_secret")
+
+    # ================= 修改开始 =================
+    # 使用你要求的代理规则配置给 ccxt 交易所实例
     proxies = None if platform.system().lower() == "linux" else {
-        "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        "http": "http://127.0.0.1:7890",
+        "https": "http://127.0.0.1:7890",
+    }
+    # ================= 修改结束 =================
+
     exchange = safe_init_exchange(api_key, secret_key, proxies)
 
-    gw = BinanceGateway(exchange, cfg.symbol)          # ← 换 OKX 只需替换这一行
+    gw = BinanceGateway(exchange, cfg.symbol)  # ← 换 OKX 只需替换这一行
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
     def _on_term(signum, frame):
         logger.critical(f"[进程] 收到信号[{signum}], 优雅退出(不平仓, 保留交易所止盈止损单)")
         engine.stop_flag = True
+
     for s in (sysignal.SIGTERM, sysignal.SIGINT):
         try:
             sysignal.signal(s, _on_term)
@@ -2935,17 +2965,19 @@ def run_single_strategy(cfg):
     DashboardThread(engine, interval_sec=120).start()
     engine.run_forever()
 
-
 def main_app():
     configs = [
         # strategy_id 最长不能超过 8 个字符，并且只能由纯字母和数字组成
         # 层数不再配置, 由 max_loss_usdt × layer_loss_budget_ratio 自动推导
         MartinConfig(
-            strategy_id="AAVE0912", symbol="AAVE/USDT:USDT", signal_name="get_signal_1",
+            strategy_id="AAVE0912",
+            symbol="AAVE/USDT:USDT",
+            # ===== 修改此处 =====
+            signal_name="factor_044_1",
+            # ===================
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
             max_loss_usdt=120, layer_loss_budget_ratio=1,
         )
-
     ]
 
     ids = [c.strategy_id for c in configs]
@@ -2969,7 +3001,6 @@ def main_app():
             p.join()
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统] 主进程收到中断, 子进程为 daemon 将随之退出")
-
 
 # ==============================================================================
 # 16. 运维工具 (人工排障用, 与主流程解耦)
