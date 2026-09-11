@@ -13,13 +13,16 @@
 [唯一主循环: 5 步单向流水线 (每 2 秒一个 Tick, 绝不东一块西一块打补丁)]
   1. Sense     感知: 现价 + 挂单快照(普通单/算法条件单物理隔离) + 实际持仓(分级缓存)
                任一关键信息缺失 -> 本 Tick 立即安全空转, 绝不带残缺世界观决策。
-  2. Reconcile 对账: 快照喂给 OrderRegistry; 不在快照且超冷静期的存活单主动点查(限额),
-               拿到确切回执才拨终态; 任何新增成交立刻入账 PositionBook。
-  3. Evaluate  决策: 纯内存判断(总量硬闸/外部平仓/超时/击穿止损/已平净归因),
-               只产出 "继续 / 停止加仓 / 进入收尾" 三种周期意图。
-  4. Align     对齐: 用统一夹逼入口 _clamp_exit_qty() 算出安全平仓量, 生成动作清单
-               (撤单 / 挂限价 / 挂条件单 / 挂市价), 停止加仓则持续撤开仓单直到终态。
-  5. Execute   执行: 集中下发网络请求, 所有 PlaceResult 走同一套错误映射与退避。
+  2. Reconcile 对账【全流水线唯一允许发起查询的环节】:
+               快照喂给 OrderRegistry -> 缺失的存活单点查(保护单优先 + 同级轮转防饥饿)
+               -> 新增成交立刻入账 PositionBook -> 本轮有新成交则集中强查一次真实持仓
+               -> 外部平仓三重确认(仅做库存校正, 终结归因交回 Evaluate)。
+  3. Evaluate  决策: 纯内存判断(总量硬闸/首轮越界/超时/击穿止损/已平净归因),
+               只产出 "继续 / 停止加仓 / 进入收尾" 三种周期意图, 绝不发起任何网络 IO。
+  4. Align     对齐: 【先出场, 再开仓】。统一夹逼入口 _clamp_exit_qty() 算出安全平仓量,
+               产出动作清单(撤单 / 挂限价 / 挂条件单 / 挂市价)。
+  5. Execute   执行: 唯一网络写入口。入口带【许可检查】: 收尾态只放行市价收尾单,
+               停止加仓态一律丢弃开仓动作; 所有 PlaceResult 走同一套错误映射与退避。
 
 [核心不变量 (代码中反复校验)]
   I1 记账唯一来源: 虚拟持仓 = Σ(本策略 client_oid 的成交增量)。永不用交易所仓位算均价。
@@ -33,10 +36,13 @@
                     才允许下发下一笔市价单; 卡死则停机等人工, 严禁盲目重发造成反向开仓。
   I8 平仓量统一夹逼: 一切平仓/强平路径都必须经过 _clamp_exit_qty(), 持仓查不到时
      退化为本地虚拟账本量, 绝不按 0 处理, 也绝不绕过夹逼。
+  I9 数量守恒     : 平仓入账超出已知库存(且非碎屑) => 账本自相矛盾, 立即停发单 + 记录证据 + 停机,
+     绝不静默截断掩盖。
 
-[并发安全] 全系统只有主线程会修改状态(单一写者)。看板线程与校时线程只读。
+[并发安全] 全系统只有主线程会修改状态(单一写者)。看板线程只读; 校时并入主循环维护。
 [前置条件] 1. 必须为【双向持仓 Hedge Mode】; 2. Hedge 下禁传 reduceOnly;
-          3. 每个 strategy_id 全局唯一(它同时是账本名与 OID 命名空间)。
+          3. 每个 strategy_id 全局唯一(它同时是账本名与 OID 命名空间);
+          4. 账本与单实例锁固定落在脚本同级 martin_data 绝对目录, 杜绝换目录双开。
 ================================================================================
 """
 import os
@@ -44,7 +50,6 @@ import csv
 import re
 import json
 import time
-import math
 import random
 import signal as sysignal
 import platform
@@ -91,26 +96,37 @@ SIGNAL_REGISTRY = {
 API_THROTTLE_SEC = 0.08          # 相邻两次 API 调用的最小间隔(限流保护)
 ORDER_GRACE_SEC = 4.0            # 新单冷静期: 期内不因"盘口查不到"发起点查(容忍撮合与传播延迟)
 CANCEL_CONFIRM_SEC = 1.5         # 撤单后多久允许重发撤单(仍在盘口说明撤单请求未生效)
-MAX_PROBE_PER_TICK = 4           # 单轮主动点查孤儿单的数量上限(防限频)
+MAX_PROBE_PER_TICK = 4           # 单轮主动点查孤儿单的数量上限(防限频, 同级按最久未查轮转)
 PROBE_ALERT_EVERY = 15           # 同一单据连续点查未知多少次告警一次
 MAX_PLACE_ATTEMPTS = 5           # 单个槽位的最大挂单尝试次数, 超出则永久放弃 + 告警
 RETRY_BACKOFF_SEC = (2, 5, 15, 60, 300)   # 开仓单各次失败后的退避秒数(按尝试次数索引)
 EXIT_BACKOFF_SEC = 3.0           # 止盈止损单退避上限: 保护单命悬一线, 绝不允许长退避
+FORCE_BACKOFF_SEC = 3.0          # 市价强平单被明确拒单后的强制冷却(防瞬秒耗尽次数直接停机)
 QTY_EPS_RATIO = 1e-9             # 浮点比较用的极小量
 OVERFILL_TOLERANCE = 1.02        # I4: 累计开仓成交 / 蓝图总量 的容忍上限
 SL_BREACH_CONFIRM_SEC = 5.0      # 现价击穿止损价后, 等条件单自己触发的宽限时间, 超时则主动强平
-POSITION_CACHE_SEC = 5.0         # 实际持仓轻量缓存(常规对齐用); 高危路径强制击穿
+POSITION_CACHE_SEC = 5.0         # 实际持仓轻量缓存(常规对齐用); 高危路径与新成交后强制击穿
 MAX_CONSECUTIVE_ERRORS = 20      # 主循环连续异常次数上限
 HARD_MAX_LAYERS = 50             # 【物理硬顶】纯防死循环底线; 真实层数由 max_loss_usdt 决定
 FORCE_CLOSE_MAX_ATTEMPTS = 3     # 市价强平最大尝试次数, 超出转 STOPPED 等人工介入
 SL_IMM_TRIG_MAX_DEV_PCT = 50.0   # "会立即触发"回执的本地核验: 止损价与现价偏离超此阈值判定为算错
 IDLE_ERROR_SLEEP_SEC = (15.0, 30.0)  # IDLE 态连续异常的长休眠退避区间(绝不停机)
-IDLE_NO_PRICE_SLEEP_SEC = 5.0    # IDLE 态拉不到现价时的额外退避(防断网高频空转刷屏)
+IDLE_NO_PRICE_SLEEP_SEC = 5.0    # IDLE 态拉不到世界快照时的额外退避(防断网高频空转刷屏)
 RECOVER_RETRY_SEC = 10.0         # 断点续传接管失败后的重试间隔
 RECOVER_MAX_ATTEMPTS = 30        # 接管重试上限, 超出转 STOPPED(但绝不清场)
 EXTERNAL_FLAT_CONFIRM_SEC = 6.0  # 交易所持仓归零后的二次确认宽限(防接口滞后误判外部平仓)
-CLOSING_STUCK_SEC = 120.0         # 收尾阶段单据持续卡在非终态的容忍时长, 超出停机等人工
+CLOSING_STUCK_SEC = 120.0        # 收尾阶段单据持续卡在非终态的容忍时长, 超出停机等人工
 POS_PROBE_MAX_UNKNOWN = 20       # 收尾阶段实际持仓连续查询失败的轮数上限, 超出转 STOPPED
+TIME_SYNC_SEC = 3600.0           # 主循环定时维护: 与交易所重新校时的间隔(对抗本地时钟漂移)
+
+# 账本与单实例锁的【固定绝对目录】: 无论从哪个工作目录启动, 同一 strategy_id 只可能有一个实例
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "martin_data")
+
+
+def data_path(name: str) -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, name)
+
 
 # ==============================================================================
 # 1. 枚举与值对象
@@ -167,7 +183,7 @@ class OrderState(Enum):
       FILLED     全部成交
       DEAD       残缺/不可重发(如开仓单部分成交后被撤、参数非法被永久拒)
       NOT_PLACED 该 OID 确定从未形成订单, 或已撤且零成交 -> 槽位允许换号重发
-    非终态只有三种, 且只要是 PENDING / CANCEL_PENDING 就一律原地锁定, 绝不换号重发。
+    非终态只有三种; 其中 PENDING / CANCEL_PENDING 真相未明, 一律原地锁定, 绝不换号重发。
     """
     PENDING = "PENDING"                # 请求已发但结果未确定(涵盖旧版 INTENT / UNKNOWN)
     LIVE = "LIVE"                      # 已确认在盘口
@@ -179,11 +195,6 @@ class OrderState(Enum):
     @property
     def alive(self) -> bool:
         return self in (OrderState.PENDING, OrderState.LIVE, OrderState.CANCEL_PENDING)
-
-    @property
-    def locked(self) -> bool:
-        """请求中/撤单中: 真相未明, 严禁换号重发。"""
-        return self in (OrderState.PENDING, OrderState.CANCEL_PENDING)
 
 
 class EngineState(Enum):
@@ -203,7 +214,7 @@ class EndReason(Enum):
     TP = "END_TP"                     # 止盈成交
     SL = "END_SL"                     # 止损条件单成交
     SL_FORCED = "END_SL_FORCED"       # 兜底强平(条件单未触发)
-    NO_FILL = "END_NO_FILL"           # 入场超时, 一手未成
+    NO_FILL = "END_NO_FILL"           # 入场超时/首轮越界, 一手未成
     TIMEOUT = "END_TIMEOUT"           # 周期超时强平
     MANUAL_FLAT = "END_MANUAL_FLAT"   # 仓位被外部平掉, 周期被动结束
 
@@ -217,7 +228,7 @@ class ErrKind(Enum):
     INSUFFICIENT = "INSUFFICIENT"    # 保证金/余额不足 -> 退避 + 告警
     REDUCE_REJECT = "REDUCE_REJECT"  # 平仓数量超过持仓 -> 仓位被外部动过
     DUPLICATE = "DUPLICATE"          # OID 重复 -> 单子已存在, 保持 PENDING 点查
-    INVALID = "INVALID"              # 精度/最小量等参数非法 -> 不可重试
+    INVALID = "INVALID"              # 精度/最小量/单号格式等参数非法 -> 不可重试
     FATAL = "FATAL"                  # 明确拒单但未归类 -> 保守停挂
 
 
@@ -243,10 +254,6 @@ class UniOrder:
     @property
     def remaining(self) -> float:
         return max(0.0, self.amount - self.filled)
-
-    @property
-    def is_open(self) -> bool:
-        return self.status == "OPEN"
 
     @property
     def is_terminal(self) -> bool:
@@ -282,9 +289,10 @@ class Signal:
 
 class World:
     """
-    一个 Tick 的【世界快照】(只读)。由 Sense 步骤一次性产出, 后续四步只读它。
-    price / orders 任一拉取失败, 整个 Tick 立即安全空转, 绝不带残缺世界观决策。
-      algo_ok=False 表示算法条件单接口本轮降级(普通单正常), 此时不采信"条件单不存在"的回执。
+    一个 Tick 的【世界快照】。由 Sense 步骤一次性产出;
+    其中 pos_qty 允许在 Reconcile 阶段被"强制刷新"覆盖一次(本轮有新成交时), 之后只读。
+      algo_ok=False 表示算法条件单接口本轮降级(普通单正常), 此时:
+        1. 不采信"条件单不存在"的回执; 2. 绝不宣告盘口已清场、绝不开启新周期。
     """
     __slots__ = ("ts", "price", "orders", "algo_ok", "pos_qty")
 
@@ -341,14 +349,13 @@ def _to_b36(n: int) -> str:
 
 
 class ParsedOid:
-    __slots__ = ("strategy_id", "cycle_id", "role", "layer", "ts")
+    __slots__ = ("strategy_id", "cycle_id", "role", "layer")
 
-    def __init__(self, strategy_id, cycle_id, role, layer, ts):
+    def __init__(self, strategy_id, cycle_id, role, layer):
         self.strategy_id = strategy_id
         self.cycle_id = cycle_id
         self.role = role
         self.layer = layer
-        self.ts = ts
 
 
 class OidCodec:
@@ -388,7 +395,7 @@ class OidCodec:
             layer = int(rl[1:])
             cycle_id = parts[-3]
             strategy_id = "_".join(parts[1:-3])  # 倒序切片, 容忍 S_ID 内含下划线
-            return ParsedOid(strategy_id, cycle_id, role, layer, parts[-1])
+            return ParsedOid(strategy_id, cycle_id, role, layer)
         except Exception:
             return None
 
@@ -520,7 +527,7 @@ _CODE_KIND = {
     -4005: ErrKind.INVALID,
     -4013: ErrKind.INVALID,
     -4014: ErrKind.INVALID,
-    -4015: ErrKind.DUPLICATE,
+    -4015: ErrKind.INVALID,         # 客户端单号格式/长度非法: 参数错误, 绝不是"重复单号"
     -4016: ErrKind.INVALID,
     -4131: ErrKind.PRICE_BAND,
     -4164: ErrKind.INVALID,
@@ -607,6 +614,10 @@ class ExchangeGateway(ABC):
         if gap < API_THROTTLE_SEC:
             time.sleep(API_THROTTLE_SEC - gap)
         self._last_call_ts = time.time()
+
+    def sync_time(self):
+        """定时校时(由主循环维护调用, 默认空实现)。"""
+        return
 
     @abstractmethod
     def load_instrument(self) -> Optional[InstrumentSpec]: ...
@@ -839,6 +850,14 @@ class BinanceGateway(ExchangeGateway):
             logger.info(f"[网关] 无法确认持仓模式(跳过校验) | 错误:[{e}]")
             return None
 
+    def sync_time(self):
+        try:
+            self._throttle()
+            self.ex.load_time_difference()
+            logger.info(f"[校时] 已重新校准 | 偏差:[{self.ex.options.get('timeDifference', 0)}ms]")
+        except Exception as e:
+            logger.info(f"[校时] 本次校时失败, 保持旧偏差 | 错误:[{e}]")
+
     # ---------- 下单 ----------
     def _wrap_exec(self, res) -> PlaceResult:
         st = getattr(res, "status", None)
@@ -965,15 +984,28 @@ class MartinLedger:
     A_ALERT = "ALERT"
     A_RECOVER_REPLAY = "RECOVER_REPLAY"   # 冷启动重放汇总(替代逐笔重复写 FILL)
 
+    # ---------- ALERT 的 status 语义分类 (断点续传据此完整还原周期标志) ----------
+    S_SUSPEND_ADD = "SUSPEND_ADD"          # 停止加仓
+    S_GIVEUP = "GIVEUP"                    # 某槽位永久放弃
+    S_EXTERNAL_FLAT = "EXTERNAL_FLAT"      # 外部平仓, 本地库存强制归零
+    S_FORCE_FLAT_SYNC = "FORCE_FLAT_SYNC"  # 收尾期实际持仓为0, 本地库存强制归零
+    # 需人工介入(重启后必须继续保持停机)的告警
+    HALT_STATUS = {
+        "CLOSING_STUCK": "收尾阶段单据卡死未终态",
+        "CLOSE_NOT_CONVERGED": "市价强平多次未收敛",
+        "POS_PROBE_UNKNOWN": "实际持仓连续查询失败",
+        "LEDGER_INCONSISTENT": "账本数量不守恒",
+    }
+
     # ---------- 冷启动读取结果码 (决定 fail-open 还是 fail-closed) ----------
     LOAD_FRESH = "FRESH"              # 账本文件不存在: 全新启动, 可清场后 IDLE
     LOAD_IDLE = "IDLE"                # 账本可读且无未收尾周期: 可清场后 IDLE
     LOAD_RECOVER = "RECOVER"          # 账本可读且存在未收尾周期(蓝图完整): 走断点续传
-    LOAD_CORRUPT = "CORRUPT"          # 账本存在但读不懂(权限/CSV损坏): fail-closed, 严禁清场
-    LOAD_BLUEPRINT_BAD = "BP_BAD"     # 找到未收尾周期但蓝图 JSON 损坏/关键字段缺失: fail-closed
+    LOAD_CORRUPT = "CORRUPT"          # 账本存在但结构损坏(权限/表头/字段不配对): fail-closed
+    LOAD_BLUEPRINT_BAD = "BP_BAD"     # 找到未收尾周期但蓝图 JSON 损坏/无效: fail-closed
 
     def __init__(self, strategy_id: str):
-        self.filename = f"martin_ledger_{strategy_id}.csv"
+        self.filename = data_path(f"martin_ledger_{strategy_id}.csv")
         if not os.path.exists(self.filename):
             with open(self.filename, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(self.COLUMNS)
@@ -993,34 +1025,52 @@ class MartinLedger:
         logger.info(f"[账本] {action} 周期[{cycle_id}] 层[{layer}] 角色[{role}] "
                     f"CID[{coid}] 价[{price}] 量[{qty}] {status} {msg}")
 
+    @staticmethod
+    def parse_ts(s) -> float:
+        """把账本首列的可读时间还原为 epoch 秒(用于恢复周期原始起始时间, 保证超时计算正确)。"""
+        try:
+            return datetime.strptime(str(s).strip(), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+        except Exception:
+            return 0.0
+
     # ---------- 冷启动读取 ----------
     def load_state(self) -> Tuple[str, Optional[dict], List[dict], int]:
         """
         返回 (状态码, 未收尾周期的 CYCLE_START 元数据 or None, 该周期所有历史行, 全局最大信号时间戳)。
 
         状态码语义决定 boot() 是 fail-open 还是 fail-closed:
-          FRESH / IDLE  -> 可以安全清场并进入空闲态;
-          RECOVER       -> 存在活周期且蓝图完整, 走断点续传;
-          CORRUPT       -> 账本文件在但读不懂: 此刻无法判断有无活仓与保护单, 必须 fail-closed;
-          BP_BAD        -> 蓝图损坏: 绝不用残缺蓝图运行, 交由 boot 做确定性核实后再决定。
+          FRESH / IDLE          -> 可以安全清场并进入空闲态;
+          RECOVER               -> 存在活周期且蓝图完整, 走断点续传;
+          CORRUPT / BP_BAD      -> 结构损坏 / 字段缺失 / 蓝图无效: 此刻无法判断有无活仓与保护单,
+                                   必须 fail-closed(保留原始账本与现场, 交人工处理)。
         全局最大信号时间戳作为信号去重水位线, 保证重启后不会重复消费旧信号。
         """
         if not os.path.exists(self.filename):
             return self.LOAD_FRESH, None, [], 0
         try:
             with open(self.filename, "r", newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
+                reader = csv.DictReader(f)
+                header = list(reader.fieldnames or [])
+                rows = list(reader)
         except Exception as e:
-            logger.critical(f"[账本] 文件存在但读取/解析失败, 无法断点续传! 判定为 CORRUPT, "
-                            f"将 fail-closed(绝不清场、绝不接新信号) | 错误:[{e}]")
+            logger.critical(f"[账本] 文件存在但读取/解析失败, 判定 CORRUPT, 将 fail-closed"
+                            f"(绝不清场、绝不接新信号) | 错误:[{e}]")
             return self.LOAD_CORRUPT, None, [], 0
 
+        # ---- 结构校验: 表头必须完全一致, 每行必须与表头严格配对(不缺列、不多列) ----
+        if header != self.COLUMNS:
+            logger.critical(f"[账本] 表头与预期不一致, 判定 CORRUPT | 期望:{self.COLUMNS} 实际:{header}")
+            return self.LOAD_CORRUPT, None, [], 0
         max_sig_ts = 0
-        for r in rows:
+        for i, r in enumerate(rows, start=2):
+            if None in r or any(r.get(c) is None for c in self.COLUMNS):
+                logger.critical(f"[账本] 第[{i}]行字段与表头不配对(缺列/多列), 判定 CORRUPT | 内容:{r}")
+                return self.LOAD_CORRUPT, None, [], 0
             try:
                 max_sig_ts = max(max_sig_ts, int(float(r.get("signal_ts") or 0)))
             except Exception:
-                pass
+                logger.critical(f"[账本] 第[{i}]行 signal_ts 非法, 判定 CORRUPT | 内容:{r}")
+                return self.LOAD_CORRUPT, None, [], 0
 
         # 找最后一个 CYCLE_START, 并检查其后是否有同周期 CYCLE_END
         last_start_idx, last_cycle = -1, None
@@ -1037,14 +1087,18 @@ class MartinLedger:
         cycle_rows = [r for r in rows[last_start_idx:] if r.get("cycle_id") == last_cycle]
         try:
             meta = json.loads(meta_row.get("msg") or "{}")
+            meta["cycle_id"] = meta_row.get("cycle_id")
+            layers = meta.get("layers") or []
+            valid = (meta.get("dir") in (Direction.LONG.value, Direction.SHORT.value)
+                     and len(layers) > 0
+                     and all(float(x["p"]) > 0 and float(x["q"]) > 0 and int(x["l"]) >= 0
+                             for x in layers))
         except Exception as e:
-            logger.critical(f"[账本] 未收尾周期[{last_cycle}]的蓝图 JSON 解析失败, 判定为 BP_BAD, "
-                            f"绝不使用残缺蓝图继续运行 | 错误:[{e}]")
+            logger.critical(f"[账本] 未收尾周期[{last_cycle}]的蓝图解析异常, 判定 BP_BAD | 错误:[{e}]")
             return self.LOAD_BLUEPRINT_BAD, {"cycle_id": last_cycle}, cycle_rows, max_sig_ts
-        meta["cycle_id"] = meta_row.get("cycle_id")
-        if not meta.get("layers") or not meta.get("dir"):
-            logger.critical(f"[账本] 未收尾周期[{last_cycle}]的蓝图缺少关键字段(layers/dir), "
-                            f"判定为 BP_BAD, 绝不使用残缺蓝图继续运行")
+        if not valid:
+            logger.critical(f"[账本] 未收尾周期[{last_cycle}]的蓝图无效(方向/层数/价量字段异常), "
+                            f"判定 BP_BAD, 绝不使用残缺蓝图继续运行")
             return self.LOAD_BLUEPRINT_BAD, meta, cycle_rows, max_sig_ts
         return self.LOAD_RECOVER, meta, cycle_rows, max_sig_ts
 
@@ -1327,7 +1381,7 @@ class BlueprintBuilder:
 
 
 # ==============================================================================
-# 8. 虚拟仓位账 (I1: 唯一记账来源 / I5: 价格刚性)
+# 8. 虚拟仓位账 (I1: 唯一记账来源 / I5: 价格刚性 / I9: 数量守恒)
 # ==============================================================================
 class PositionBook:
     """
@@ -1339,6 +1393,9 @@ class PositionBook:
       * 平仓: 按【当前均价】等比扣减成本 cost -= avg*q      -> 数学上均价恒定不变
     因此"只要没有新的加仓, 均价/止盈价/止损价绝对不动"(I5 价格刚性)。
     realized 仅作统计口径, 绝不参与任何价格计算。
+
+    【I9 数量守恒】add_close 不再静默截断超额部分, 而是把超额量原样返回给调用方裁决;
+    void_qty 记录"已被强制归零并已告警核销"的库存, 供后续滞后回执安全抵扣, 避免重复误报。
     """
 
     def __init__(self, direction: Direction):
@@ -1349,6 +1406,7 @@ class PositionBook:
         self.total_open_cost = 0.0     # 累计开仓成本(只增, 仅复盘用)
         self.total_close_filled = 0.0  # 累计平仓成交量(只增)
         self.realized = 0.0            # 已实现盈亏(仅统计用)
+        self.void_qty = 0.0            # 已核销(强制归零)的虚拟库存, 允许被滞后平仓回执抵扣
 
     @property
     def avg(self) -> float:
@@ -1369,24 +1427,36 @@ class PositionBook:
         self.total_open_filled += qty
         self.total_open_cost += price * qty
 
-    def add_close(self, price: float, qty: float):
-        """平仓只扣减持仓数量与对应比例的成本, 均价数学恒定(价格刚性)。"""
+    def add_close(self, price: float, qty: float) -> float:
+        """
+        平仓只扣减持仓数量与对应比例的成本, 均价数学恒定(价格刚性)。
+        返回【超额量】: >0 表示平仓成交超过本地已知库存 => 账本自相矛盾的硬证据(I9)。
+        """
         if qty <= 0:
-            return
+            return 0.0
         self.total_close_filled += qty          # 统计口径: 交易所实际成交多少就记多少
         eff = min(qty, self.open_qty)
-        if eff <= 1e-12:
-            return      # 库存已空, 忽略滞后事件, 杜绝除零与天量虚假利润
-        cur_avg = self.avg
-        self.realized += self.direction.sign * (price - cur_avg) * eff
-        self.cost -= cur_avg * eff              # 按当前均价等比扣减 -> avg 保持不变
-        self.open_qty -= eff
-        if self.open_qty <= 1e-12:              # 彻底归零, 杜绝浮点残余
-            self.open_qty = 0.0
-            self.cost = 0.0
+        excess = qty - eff
+        if eff > 1e-12:
+            cur_avg = self.avg
+            self.realized += self.direction.sign * (price - cur_avg) * eff
+            self.cost -= cur_avg * eff          # 按当前均价等比扣减 -> avg 保持不变
+            self.open_qty -= eff
+            if self.open_qty <= 1e-12:          # 彻底归零, 杜绝浮点残余
+                self.open_qty = 0.0
+                self.cost = 0.0
+        if excess > 0 and self.void_qty > 0:    # 已核销并已告警的量: 允许抵扣, 不重复报警
+            absorb = min(excess, self.void_qty)
+            self.void_qty -= absorb
+            excess -= absorb
+        return max(0.0, excess)
 
     def force_flat(self):
-        """交易所实际持仓已归零时的强制同步(打破收尾死锁 / 闭环外部平仓)。"""
+        """
+        交易所实际持仓已归零时的强制同步(打破收尾死锁 / 闭环外部平仓)。
+        被核销的库存记入 void_qty: 之后若收到滞后的平仓回执, 可安全抵扣而不误判不守恒。
+        """
+        self.void_qty += self.open_qty
         self.open_qty = 0.0
         self.cost = 0.0
 
@@ -1410,7 +1480,7 @@ class TrackedOrder:
     幂等入账所需的 acked_qty / acked_cost 也挂在这里 —— 一个订单的全部真相只有一处。
     """
     __slots__ = ("coid", "role", "layer", "price", "qty", "state", "ex_id",
-                 "acked_qty", "acked_cost", "act_ts", "seen_ts", "probes")
+                 "acked_qty", "acked_cost", "act_ts", "seen_ts", "probe_ts", "probes")
 
     def __init__(self, coid, role, layer, price, qty, state, ts):
         self.coid = coid
@@ -1424,6 +1494,7 @@ class TrackedOrder:
         self.acked_cost = 0.0     # 已入账累计金额(反求边际成交价)
         self.act_ts = float(ts)   # 最近一次写请求(挂单/撤单)的时间
         self.seen_ts = 0.0        # 最近一次在盘口快照中被看到的时间
+        self.probe_ts = 0.0       # 最近一次主动点查的时间(同优先级轮转依据, 防尾部饥饿)
         self.probes = 0           # 连续点查未知次数
 
     @property
@@ -1483,8 +1554,8 @@ class OrderRegistry:
 class CycleCtx:
     """
     注入给周期的运行环境。实际持仓的【分级缓存】也放在这里:
-      常规对齐用 POSITION_CACHE_SEC 轻量缓存防限频; 高危路径(强平裁决/外部平仓确认)
-      传 force=True 强制击穿缓存实时拉取。
+      常规对齐用 POSITION_CACHE_SEC 轻量缓存防限频; 高危路径(新成交后刷新/强平裁决/
+      外部平仓确认)传 force=True 强制击穿缓存实时拉取。
     """
 
     def __init__(self, cfg: MartinConfig, gw: ExchangeGateway, ledger: MartinLedger,
@@ -1505,15 +1576,16 @@ class CycleCtx:
 
 
 class ExitOrder:
-    """止盈 / 止损槽位: 只持有当前活跃 OID 指针 + 对齐所需的目标与在线值。"""
-    __slots__ = ("role", "coid", "target_price", "target_qty",
-                 "live_price", "live_remaining", "attempts", "next_retry_ts", "abandoned")
+    """
+    止盈 / 止损槽位: 只持有当前活跃 OID 指针 + 对齐所需的在线值。
+    目标价来自蓝图(固定)、目标量来自统一夹逼(动态), 都是现算现用, 因此绝不冗余存储 target_*。
+    """
+    __slots__ = ("role", "coid", "live_price", "live_remaining",
+                 "attempts", "next_retry_ts", "abandoned")
 
     def __init__(self, role: OrderRole):
         self.role = role
         self.coid = ""
-        self.target_price = 0.0
-        self.target_qty = 0.0
         self.live_price = 0.0
         self.live_remaining = 0.0
         self.attempts = 0
@@ -1524,7 +1596,7 @@ class ExitOrder:
 class MartinCycle:
     """
     一个马丁周期的完整状态机, 每个 Tick 执行一次单向流水线:
-        Reconcile(对账) -> Evaluate(决策) -> Align(对齐) -> Execute(执行)
+        Reconcile(对账) -> Evaluate(决策) -> Align(先出场后开仓) -> Execute(执行)
     一旦 end_reason 被置上, 流水线自动切换到【收尾两段式】: 先撤净, 全终态后才市价平残余。
     价格全静态(蓝图算死), 数量全动态(跟随 min(虚拟持仓, 交易所实际持仓))。
     所有状态修改只发生在主线程调用的 tick() 内, 天然单写者、无需加锁。
@@ -1547,12 +1619,26 @@ class MartinCycle:
         self.last_price = 0.0
         self.sl_breach_since = 0.0
         self.ext_flat_since = 0.0
+        self.ext_flat_done = False      # 已确认被外部平仓(供 Evaluate 精确归因)
         self.closing_since = 0.0
         self.stuck_since = 0.0
         self.force_attempts = 0
+        self.next_force_retry_ts = 0.0  # 强平被拒后的退避冷却截止时间
         self.pos_unknown = 0
+        self.book_error = ""             # I9: 账本不守恒证据, 非空即停发单并停机
+        self._fill_events = 0            # 本轮新增成交笔数(>0 则强刷真实持仓)
         self._clamp_log_ts = 0.0
-        self.next_force_retry_ts = 0.0  # 【新增】强平失败后的退避冷却截止时间
+
+    # ---------------------- WAL 记账 (统一填充周期上下文与占位符) ----------------------
+    def wal_order(self, action, coid, layer, role, price=0.0, qty=0.0, status="", msg=""):
+        """订单级事件: 周期 ID / 信号时间戳自动带上, 业务只传订单自身的增量价量。"""
+        self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role, action,
+                               coid, price, qty, status, msg)
+
+    def wal_cycle(self, action, status, msg="", price=0.0, qty=0.0):
+        """周期级事件(无归属订单): 层号/角色自动填占位符。"""
+        self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-", action,
+                               "", price, qty, status, msg)
 
     # ==========================================================================
     # 主入口: 5 步流水线的第 2~5 步
@@ -1560,20 +1646,27 @@ class MartinCycle:
     def tick(self, w: World) -> TickResult:
         if w.price > 0:
             self.last_price = w.price
-        actions = self._reconcile(w)                 # 第二步: 对账(含孤儿单点查、成交入账)
-        self._evaluate(w)                            # 第三步: 纯内存决策
+        actions = self._reconcile(w)                 # 2. 对账(全流水线唯一的查询环节)
+        if self.book_error:                          # I9: 账本矛盾 -> 立刻停发单, 交人工
+            logger.critical(f"[周期] 账本存在数量不守恒矛盾, 已中止本轮一切发单并停机 | "
+                            f"证据:[{self.book_error}]")
+            return TickResult.HALT
+        self._evaluate(w)                            # 3. 纯内存决策
         if self.end_reason:
             return self._closing(w, actions)         # 收尾: 先撤净 -> 全终态 -> 市价平残余
-        actions += self._plan_opens(w)               # 第四步: 目标对齐(开仓层)
-        actions += self._plan_exits(w)               #          目标对齐(止损优先, 再止盈)
-        self._execute(actions, w)                    # 第五步: 集中下发
+        actions += self._plan_exits(w)               # 4. 对齐: 先出场(保护单优先级最高)
+        if self.end_reason:
+            return self._closing(w, actions)         #    出场规划可能直接判定收尾
+        actions += self._plan_opens(w)               #    再开仓
+        self._execute(actions, w)                    # 5. 集中下发(带许可检查)
         return TickResult.CONTINUE
 
     # ==========================================================================
     # 第二步 Reconcile: 让登记表与交易所真相一致, 并把新增成交入账
     # ==========================================================================
-    def _reconcile(self, w: World, probe_budget: int = MAX_PROBE_PER_TICK) -> List[Action]:
+    def _reconcile(self, w: World, probe_budget: Optional[int] = MAX_PROBE_PER_TICK) -> List[Action]:
         now, actions = w.ts, []
+        self._fill_events = 0
 
         # ---- (1) 盘口快照 -> 登记表 ----
         for coid, o in w.orders.items():
@@ -1581,49 +1674,71 @@ class MartinCycle:
             if t is None:
                 actions += self._handle_foreign(coid, o)
                 continue
-            t.seen_ts = now
-            t.probes = 0
-            t.ex_id = o.ex_id or t.ex_id
-            self._book_fill(t, o)
+            self._absorb(t, o, now)
             if t.state is OrderState.PENDING:
                 t.state = OrderState.LIVE
-            elif t.state in (OrderState.NOT_PLACED, OrderState.DEAD):
+            elif not t.state.alive:
                 logger.critical(f"[对账] 角色[{t.role.value}]层[{t.layer}]曾被判定终态"
                                 f"[{t.state.value}]却重现盘口, 立即纠正为在盘并纳入对齐 | "
                                 f"CID:[{coid}]")
                 t.state = OrderState.LIVE
-            if t.role is not OrderRole.OPEN:
-                slot = self.tp if t.role is OrderRole.TP else self.sl
-                if slot.coid == coid:
-                    slot.live_price = (o.stop_price if (t.role is OrderRole.SL and o.stop_price > 0)
-                                       else o.price)
-                    slot.live_remaining = o.remaining
 
-        # ---- (2) 不在快照中的存活单: 主动点查裁决(保护单优先, 单轮限额防限频) ----
-        alive = sorted(self.registry.alive(),
-                       key=lambda t: 0 if t.role is not OrderRole.OPEN else 1)
-        for t in alive:
-            if probe_budget <= 0:
-                break
-            if t.coid in w.orders:
-                continue
+        # ---- (2) 不在快照中的存活单: 主动点查裁决(保护单优先 + 同级轮转, 单轮限额防限频) ----
+        self._probe_missing(w, probe_budget)
 
-            # 【修复】市价强平单，或实际有仓但本地未记账(秒成单)，直接穿透冷静期加速对账
-            is_fast_probe = t.is_force_market or (w.pos_qty and w.pos_qty > 0 and self.book.open_qty == 0)
-            if not is_fast_probe and (now - max(t.act_ts, t.seen_ts) < ORDER_GRACE_SEC):
-                continue
+        # ---- (3) 本轮有新成交 => 持仓缓存必然过期: 集中强查一次, 供决策与对齐用最新鲜的值 ----
+        if self._fill_events:
+            w.pos_qty = self.ctx.position(self.direction.position_side, force=True)
+            logger.info(f"[对账] 本轮新增[{self._fill_events}]笔成交入账, 已强制刷新真实持仓:"
+                        f"[{w.pos_qty}](防用旧缓存误撤保护单)")
 
-            probe_budget -= 1
-            self._probe(t, w)
+        # ---- (4) 外部平仓三重确认(本阶段允许网络 IO; 只做库存校正, 归因交回 Evaluate) ----
+        self._verify_external_flat(w)
         return actions
+
+    def _absorb(self, t: TrackedOrder, o: UniOrder, now: float):
+        """
+        吸收一次订单观察(快照与点查共用): 同步公共字段 + 幂等入账 + 同步出场槽位在线值。
+        状态跃迁刻意留给调用方: 快照代表"确认在盘", 点查代表"拿到确定回执", 语义不同不可合并。
+        """
+        t.seen_ts = now
+        t.probes = 0
+        t.ex_id = o.ex_id or t.ex_id
+        self._book_fill(t, o)
+        if t.role is not OrderRole.OPEN:
+            slot = self.tp if t.role is OrderRole.TP else self.sl
+            if slot.coid == t.coid:
+                slot.live_price = (o.stop_price if (t.role is OrderRole.SL and o.stop_price > 0)
+                                   else o.price)
+                slot.live_remaining = o.remaining
+
+    def _probe_missing(self, w: World, budget: Optional[int]):
+        """
+        点查所有"存活但不在快照"的单据。budget=None 表示全量(冷启动接管与外部平仓兜底用)。
+        排序: 保护单永远优先; 同优先级内按【最久未点查】轮转, 杜绝尾部单据连续多轮饥饿。
+        """
+        now = w.ts
+        cands = [t for t in self.registry.alive() if t.coid not in w.orders]
+        cands.sort(key=lambda t: (1 if t.role is OrderRole.OPEN else 0, t.probe_ts))
+        for t in cands:
+            if budget is not None and budget <= 0:
+                break
+            # 市价强平单, 或"实际有仓但本地未记账(秒成单)", 直接穿透冷静期加速对账
+            fast = t.is_force_market or (w.pos_qty and w.pos_qty > 0 and self.book.open_qty == 0)
+            if not fast and now - max(t.act_ts, t.seen_ts) < ORDER_GRACE_SEC:
+                continue
+            if budget is not None:
+                budget -= 1
+            t.probe_ts = time.time()
+            self._probe(t, w)
 
     def _probe(self, t: TrackedOrder, w: World):
         """单据点查裁决。只有拿到【确切回执】才允许拨到终态。"""
         o = self.ctx.gw.fetch_order(t.coid)
         if o is ORDER_NOT_FOUND:
             if t.role is OrderRole.SL and t.layer == 0 and not w.algo_ok:
-                logger.info(f"[对账] 条件单快照本轮降级, 暂不采信"
-                            f"'订单不存在'回执, 保持原状 | CID:[{t.coid}]")
+                logger.info(f"[对账] 条件单快照本轮降级, 暂不采信'订单不存在'回执, "
+                            f"保持原状 | CID:[{t.coid}]")
                 return
             t.state = OrderState.DEAD if t.acked_qty > 0 else OrderState.NOT_PLACED
             logger.info(f"[对账] {t} 交易所明确回执不存在 -> 置[{t.state.value}] | CID:[{t.coid}]")
@@ -1634,10 +1749,7 @@ class MartinCycle:
                 logger.critical(f"[对账] {t} 已连续[{t.probes}]次点查结果未知, 原地锁定不换号重发, "
                                 f"请留意网络/接口状态 | CID:[{t.coid}]")
             return
-        t.seen_ts = w.ts
-        t.probes = 0
-        t.ex_id = o.ex_id or t.ex_id
-        self._book_fill(t, o)
+        self._absorb(t, o, w.ts)
         if o.status == "FILLED":
             t.state = OrderState.FILLED
             logger.info(f"[对账] {t} 已确认完全成交 @[{o.avg_price or o.price}] x[{o.filled}]")
@@ -1649,16 +1761,7 @@ class MartinCycle:
             else:
                 t.state = OrderState.NOT_PLACED
         else:
-            t.state = OrderState.LIVE  # 仍在盘口(快照滞后/条件单未触发)
-
-            # 【修复】必须同步 slot 缓存，否则 Align 会误判数量不符而疯狂撤单重挂
-            if t.role is not OrderRole.OPEN:
-                slot = self.tp if t.role is OrderRole.TP else self.sl
-                if slot.coid == t.coid:
-                    slot.live_price = o.stop_price if (t.role is OrderRole.SL and o.stop_price > 0) else o.price
-                    slot.live_remaining = o.remaining
-
-
+            t.state = OrderState.LIVE      # 仍在盘口(快照滞后 / 条件单未触发)
 
     def _handle_foreign(self, coid: str, o: UniOrder) -> List[Action]:
         """盘口出现"带本策略前缀但不在登记表"的单: 旧周期残留 / 手工单 / 极端丢档。"""
@@ -1673,10 +1776,9 @@ class MartinCycle:
         logger.critical(f"[对账] 发现非本周期的本策略残留挂单, 立即撤销 | CID:[{coid}] "
                         f"所属周期:[{p.cycle_id if p else '?'}] 状态:[{o.status}] 成交:[{filled}]")
         if filled > 0:
-            self.ctx.ledger.append(self.cycle_id, self.signal_ts,
-                                   p.layer if p else -1, p.role.value if p else "?",
-                                   MartinLedger.A_ALERT, coid, o.avg_price or o.price, filled,
-                                   "CROSS_CYCLE_FILL", "上一代周期挂单发生成交, 未入本周期账本, 需人工核对")
+            self.wal_order(MartinLedger.A_ALERT, coid, p.layer if p else -1,
+                           p.role.value if p else "?", o.avg_price or o.price, filled,
+                           "CROSS_CYCLE_FILL", "上一代周期挂单发生成交, 未入本周期账本, 需人工核对")
         return [Action.cancel(coid, "非本周期残留挂单")]
 
     # ---------------------- 幂等入账 (I2) ----------------------
@@ -1698,20 +1800,28 @@ class MartinCycle:
         if marginal <= 0:
             marginal = cum_price
         # WAL 铁律: 先落盘成功, 再改内存。写盘失败抛 LedgerError -> 主循环硬停机
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, t.layer, t.role.value,
-                               MartinLedger.A_FILL, t.coid, marginal, delta, "OK",
-                               f"入账前持仓{self.book.open_qty:.8g} 均价{self.book.avg:.8g}")
+        self.wal_order(MartinLedger.A_FILL, t.coid, t.layer, t.role.value, marginal, delta, "OK",
+                       f"入账前持仓{self.book.open_qty:.8g} 均价{self.book.avg:.8g}")
         t.acked_qty = filled
         t.acked_cost = now_cost
+        self._fill_events += 1
         self._apply_fill(t, marginal, delta, tag="[成交]")
         return delta
 
     def _apply_fill(self, t: TrackedOrder, price: float, qty: float, tag: str):
-        """把成交增量落到虚拟账本(I1/I5)。WAL 重放与实时观测共用这一段。"""
+        """把成交增量落到虚拟账本(I1/I5/I9)。WAL 重放与实时观测共用这一段。"""
         if t.role is OrderRole.OPEN:
             self.book.add_open(price, qty)
         else:
-            self.book.add_close(price, qty)
+            excess = self.book.add_close(price, qty)
+            if excess > 0 and not self.ctx.spec.qty_is_dust(excess) and not self.book_error:
+                # I9: 平仓量超出本地已知库存 => 账本自相矛盾, 绝不静默截断掩盖
+                self.book_error = (f"平仓入账[{qty:.8g}]超出本地已知库存, 超额[{excess:.8g}] "
+                                   f"(CID[{t.coid}] 角色[{t.role.value}] 层[{t.layer}])")
+                logger.critical(f"[账本] 数量不守恒! 立即停止一切发单并停机等待人工核对 | "
+                                f"{self.book_error}")
+                self.wal_cycle(MartinLedger.A_ALERT, "LEDGER_INCONSISTENT", self.book_error,
+                               price, excess)
         logger.info(f"{tag} 角色[{t.role.value}] 层[{t.layer}] @[{price:.8g}] x[{qty:.8g}] "
                     f"=> 持仓[{self.book.open_qty:.8g}] 均价[{self.book.avg:.8g}] "
                     f"已实现[{self.book.realized:+.4f}U]")
@@ -1722,78 +1832,23 @@ class MartinCycle:
             return
         t.acked_qty += qty
         t.acked_cost += price * qty
-
-        # 【修复】数量满额直接推至终态，防止后续点查报 NOT_FOUND 误判
+        # 数量满额直接推至终态, 防止后续点查报 NOT_FOUND 被误判为"从未下单"
         if t.qty > 0 and t.acked_qty >= t.qty * (1 - 1e-6):
             t.state = OrderState.FILLED
-
         self._apply_fill(t, price, qty, tag="[重放]")
 
-
-    # ==========================================================================
-    # 第三步 Evaluate: 纯内存决策, 只产出"继续 / 停止加仓 / 进入收尾"
-    # ==========================================================================
-    def _evaluate(self, w: World):
-        if self.end_reason:
-            return
-        spec, cfg, now = self.ctx.spec, self.ctx.cfg, w.ts
-
-        # (1) I4 总量硬闸
-        if self.book.total_open_filled > self.bp.total_qty * OVERFILL_TOLERANCE:
-            self._suspend_add(f"I4 累计开仓成交[{self.book.total_open_filled:.8g}]"
-                              f"越界(蓝图总量{self.bp.total_qty:.8g})")
-
-        # (2) 一手未成: 反向脱轨 / 入场超时 -> 作废本周期
-        if self.book.total_open_filled <= 0:
-            if w.price > 0 and self.bp.base_price > 0:
-                runaway = self.direction.sign * (w.price / self.bp.base_price - 1) * 100
-                if runaway > max(cfg.step_pct * 1.5, 2.0):
-                    self._end(EndReason.NO_FILL,
-                              f"首单未成且行情反向脱轨起飞(偏离{runaway:.2f}%)")
-                    return
-            if now - self.created_ts > cfg.entry_timeout_sec:
-                self._end(EndReason.NO_FILL, f"入场超时{cfg.entry_timeout_sec}s仍无任何成交")
-            return
-
-        # (3) 外部干预识别 (I6): 交易所该方向持仓归零 => 本策略必然已无仓
-        self._detect_external_flat(w)
-        if self.end_reason:
-            return
-
-        # (4) 已平净 -> 按本周期出场单累计成交归因
-        if spec.qty_is_dust(self.book.open_qty):
-            tpq = self.registry.filled_qty(OrderRole.TP)
-            slq = self.registry.filled_qty(OrderRole.SL)
-            if slq > tpq:
-                self._end(EndReason.SL_FORCED if self.force_attempts > 0 else EndReason.SL,
-                          f"止损出场(止盈成交{tpq:.8g}/止损成交{slq:.8g})")
-            elif tpq > 0:
-                self._end(EndReason.TP, f"止盈出场(成交{tpq:.8g})")
-            else:
-                self._end(EndReason.MANUAL_FLAT,
-                          "仓位已归零但本周期出场单累计成交为0, 确认为被外部平仓")
-            return
-
-        # (5) 周期总超时
-        if cfg.max_cycle_sec > 0 and now - self.created_ts > cfg.max_cycle_sec:
-            self._end(EndReason.TIMEOUT, f"周期超时{cfg.max_cycle_sec}s, 强平收尾")
-            return
-
-        # (6) 止损击穿: 有条件单则给宽限等它触发, 无条件单立即收尾强平
-        self._check_sl_breach(w)
-
-    def _detect_external_flat(self, w: World):
+    # ---------------------- 外部平仓核验 (I6, 唯一的决策前置网络查询) ----------------------
+    def _verify_external_flat(self, w: World):
         """
         外部平仓闭环(手工平仓 / 交易所强平 / ADL / 其它工具误操作)。
         唯一安全推论: 双向持仓下 positionSide 持仓为 0 => 本策略必然也已无仓(>0 则什么都推不出)。
-        三重确认后才强制本地归零并【立即标记周期终结】, 杜绝僵尸周期, 也杜绝接口滞后误判。
+        三重确认(快照 -> 宽限计时 -> 强制实时核验 + 全量点查)后才强制本地归零;
+        归零后不在此处判定终结原因, 交由 Evaluate 用统一口径归因, 保持决策层单一。
         """
         spec = self.ctx.spec
-        if spec.qty_is_dust(self.book.open_qty):
-            self.ext_flat_since = 0.0
-            return
-        if w.pos_qty is None or not spec.qty_is_dust(w.pos_qty):
-            self.ext_flat_since = 0.0     # 信息不全 或 确实还有仓 -> 不做任何判定
+        if (self.end_reason or spec.qty_is_dust(self.book.open_qty)
+                or w.pos_qty is None or not spec.qty_is_dust(w.pos_qty)):
+            self.ext_flat_since = 0.0     # 已收尾 / 本地已空 / 信息不全 / 确实还有仓 -> 不做判定
             return
         if self.ext_flat_since == 0.0:
             self.ext_flat_since = w.ts
@@ -1813,9 +1868,9 @@ class MartinCycle:
             self.ext_flat_since = 0.0
             return
         # 兜底: 全量点查一遍存活单, 万一是本策略止盈/止损刚成交, 应归因为 TP/SL 而非外部平仓
-        self._reconcile(w, probe_budget=10 ** 6)
+        self._probe_missing(w, None)
         if spec.qty_is_dust(self.book.open_qty):
-            logger.info("[外部干预] 兜底对账后本地已归零, 判定为本策略出场单成交, 按正常出场归因")
+            logger.info("[外部干预] 兜底全量点查后本地已归零, 判定为本策略出场单成交, 按正常出场归因")
             self.ext_flat_since = 0.0
             return
 
@@ -1823,19 +1878,73 @@ class MartinCycle:
         logger.critical(f"[外部干预] 三重确认交易所[{self.direction.value}]持仓确已归零, "
                         f"判定本策略仓位被外部平掉, 强制本地账本归零 | 作废虚拟残余:[{residual:.8g}] "
                         f"均价:[{self.book.avg:.8g}]")
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-", MartinLedger.A_ALERT,
-                               "", self.book.avg, residual, "EXTERNAL_FLAT",
-                               "交易所实际持仓三重确认为0, 判定外部平仓, 本地强制归零")
+        self.wal_cycle(MartinLedger.A_ALERT, MartinLedger.S_EXTERNAL_FLAT,
+                       "交易所实际持仓三重确认为0, 判定外部平仓, 本地强制归零",
+                       self.book.avg, residual)
         self.book.force_flat()
         self.ext_flat_since = 0.0
-        # 归零的同一时刻立刻标记终结, 绝不让"持仓为0却仍在活跃态"的状态断层出现
-        self._end(EndReason.MANUAL_FLAT, "交易所持仓三重确认为0, 仓位被外部平掉, 周期被动结束")
+        self.ext_flat_done = True
+
+    # ==========================================================================
+    # 第三步 Evaluate: 纯内存决策(零网络 IO), 只产出"继续 / 停止加仓 / 进入收尾"
+    # ==========================================================================
+    def _evaluate(self, w: World):
+        if self.end_reason:
+            return
+        spec, cfg, now = self.ctx.spec, self.ctx.cfg, w.ts
+
+        # (1) I4 总量硬闸
+        if self.book.total_open_filled > self.bp.total_qty * OVERFILL_TOLERANCE:
+            self._suspend_add(f"I4 累计开仓成交[{self.book.total_open_filled:.8g}]"
+                              f"越界(蓝图总量{self.bp.total_qty:.8g})")
+
+        # (2) 一手未成: 越过止损线(跳空盲区) / 反向脱轨 / 入场超时 -> 直接作废本周期
+        if self.book.total_open_filled <= 0:
+            if self._crossed(w.price, self.bp.sl_price):
+                self._end(EndReason.NO_FILL,
+                          f"首单未成且现价[{w.price}]已越过全局止损价[{self.bp.sl_price}], "
+                          f"蓝图整体失效, 禁止铺单")
+                return
+            if w.price > 0 and self.bp.base_price > 0:
+                runaway = self.direction.sign * (w.price / self.bp.base_price - 1) * 100
+                if runaway > max(cfg.step_pct * 1.5, 2.0):
+                    self._end(EndReason.NO_FILL,
+                              f"首单未成且行情反向脱轨起飞(偏离{runaway:.2f}%)")
+                    return
+            if now - self.created_ts > cfg.entry_timeout_sec:
+                self._end(EndReason.NO_FILL, f"入场超时{cfg.entry_timeout_sec}s仍无任何成交")
+            return
+
+        # (3) 已平净 -> 按本周期出场单累计成交归因(外部平仓已由对账阶段置标记)
+        if spec.qty_is_dust(self.book.open_qty):
+            tpq = self.registry.filled_qty(OrderRole.TP)
+            slq = self.registry.filled_qty(OrderRole.SL)
+            if self.ext_flat_done:
+                self._end(EndReason.MANUAL_FLAT,
+                          "交易所持仓三重确认为0, 仓位被外部平掉, 周期被动结束")
+            elif slq > tpq:
+                self._end(EndReason.SL_FORCED if self.force_attempts > 0 else EndReason.SL,
+                          f"止损出场(止盈成交{tpq:.8g}/止损成交{slq:.8g})")
+            elif tpq > 0:
+                self._end(EndReason.TP, f"止盈出场(成交{tpq:.8g})")
+            else:
+                self._end(EndReason.MANUAL_FLAT,
+                          "仓位已归零但本周期出场单累计成交为0, 确认为被外部平仓")
+            return
+
+        # (4) 周期总超时
+        if cfg.max_cycle_sec > 0 and now - self.created_ts > cfg.max_cycle_sec:
+            self._end(EndReason.TIMEOUT, f"周期超时{cfg.max_cycle_sec}s, 强平收尾")
+            return
+
+        # (5) 止损击穿: 有条件单则给宽限等它触发, 无条件单立即收尾强平
+        self._check_sl_breach(w)
 
     def _check_sl_breach(self, w: World):
-        slp = self.bp.sl_price
-        if slp <= 0 or w.price <= 0 or not self._is_breached(w.price, slp):
+        if not self._crossed(w.price, self.bp.sl_price):
             self.sl_breach_since = 0.0
             return
+        slp = self.bp.sl_price
         if self.sl_breach_since == 0.0:
             self.sl_breach_since = w.ts
             logger.critical(f"[熔断] 现价[{w.price}]已击穿全局止损价[{slp}], "
@@ -1848,14 +1957,19 @@ class MartinCycle:
             self._end(EndReason.SL_FORCED,
                       f"击穿止损价已[{w.ts - self.sl_breach_since:.1f}s]条件单仍未成交, 兜底强平")
 
+    def _crossed(self, price: float, line: float) -> bool:
+        """现价是否已越过给定价格线(做多向下越过 / 做空向上越过)。含有效性前置校验。"""
+        if price <= 0 or line <= 0:
+            return False
+        return price <= line if self.direction is Direction.LONG else price >= line
+
     def _suspend_add(self, why: str):
         """停止加仓(只保留止盈止损收尾)。撤单不在这里做, 交由 Align 步骤每轮持续对齐直到终态。"""
         if self.add_suspended:
             return
         self.add_suspended = True
         logger.critical(f"[降级] 停止一切加仓, 仅维护止盈止损收尾 | 原因:[{why}]")
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-", MartinLedger.A_ALERT,
-                               "", 0, 0, "SUSPEND_ADD", why)
+        self.wal_cycle(MartinLedger.A_ALERT, MartinLedger.S_SUSPEND_ADD, why)
 
     def _end(self, reason: EndReason, why: str = ""):
         if self.end_reason:
@@ -1863,14 +1977,10 @@ class MartinCycle:
         self.end_reason = reason
         self.add_suspended = True
         logger.critical(f"[周期] 判定终结[{reason.value}], 进入收尾(先撤净, 再平残余) | 原因:[{why}]")
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-", MartinLedger.A_ALERT,
-                               "", 0, 0, reason.value, why)
-
-    def _is_breached(self, price: float, sl_price: float) -> bool:
-        return (price <= sl_price) if self.direction is Direction.LONG else (price >= sl_price)
+        self.wal_cycle(MartinLedger.A_ALERT, reason.value, why)
 
     # ==========================================================================
-    # 第四步 Align: 只产出动作意图, 不发任何网络请求
+    # 第四步 Align: 只产出动作意图, 不发任何网络请求。顺序: 先出场, 再开仓
     # ==========================================================================
     def _slot_state(self, slot) -> OrderState:
         """
@@ -1883,7 +1993,7 @@ class MartinCycle:
             slot.coid = ""
         return st
 
-    def _cancel_action(self, t: TrackedOrder, w: World, why: str,
+    def _cancel_action(self, t: Optional[TrackedOrder], w: World, why: str,
                        include_pending: bool = False) -> List[Action]:
         """
         按需生成撤单动作:
@@ -1909,42 +2019,13 @@ class MartinCycle:
         if slot.abandoned:
             return
         slot.abandoned = True
-        role = slot.role.value if isinstance(slot, ExitOrder) else OrderRole.OPEN.value
-        layer = 0 if isinstance(slot, ExitOrder) else slot.layer
+        is_exit = isinstance(slot, ExitOrder)
+        role = slot.role.value if is_exit else OrderRole.OPEN.value
+        layer = 0 if is_exit else slot.layer
         logger.critical(f"[放弃] 角色[{role}] 层[{layer}] 连续[{slot.attempts}]次挂单失败, "
                         f"永久停挂并告警 | 原因:[{why}]")
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role,
-                               MartinLedger.A_ALERT, slot.coid, 0, 0, "GIVEUP", why)
-
-    def _plan_opens(self, w: World) -> List[Action]:
-        """开仓层对齐: 停止加仓时【持续】撤单直到全部终态; 否则按蓝图补挂缺失的层。"""
-        if self.add_suspended:
-            acts = []
-            for t in self.registry.alive(OrderRole.OPEN):
-                acts += self._cancel_action(t, w, "停止加仓: 撤销开仓单", include_pending=True)
-            return acts
-
-        acts, now = [], w.ts
-        for lp in self.bp.layers:
-            if self._slot_state(lp) is not OrderState.NOT_PLACED:
-                continue        # FILLED / DEAD / 在盘 / 锁定中 -> 一律不动
-            if lp.abandoned or now < lp.next_retry_ts:
-                continue
-            if lp.attempts >= MAX_PLACE_ATTEMPTS:
-                self._abandon(lp, "超过最大尝试次数(该层放弃加仓, 周期用现有仓位收尾)")
-                continue
-            # I4 总量硬闸: 已成交 + 本层 不得超过蓝图总量
-            if self.book.total_open_filled + lp.qty > self.bp.total_qty * OVERFILL_TOLERANCE:
-                self._suspend_add(f"总量硬闸: 第{lp.layer}层将超出蓝图总量")
-                return self._plan_opens(w)      # 已降级 -> 立即转为撤单对齐
-            # 止损价已被击穿: 不再新增任何加仓单
-            if (self.book.open_qty > 0 and w.price > 0 and self.bp.sl_price > 0
-                    and self._is_breached(w.price, self.bp.sl_price)):
-                logger.info(f"[加仓] 现价[{w.price}]已击穿全局止损价[{self.bp.sl_price}], 停止一切加仓")
-                break
-            acts.append(Action.place("LIMIT", OrderRole.OPEN, lp.layer, lp.price, lp.qty, lp,
-                                     f"第{lp.layer}层加仓(蓝图固定价)"))
-        return acts
+        self.wal_order(MartinLedger.A_ALERT, slot.coid, layer, role,
+                       status=MartinLedger.S_GIVEUP, msg=why)
 
     def _plan_exits(self, w: World) -> List[Action]:
         """出场单对齐: 价格恒取蓝图固定值, 数量取统一夹逼结果。先止损(更要命)后止盈。"""
@@ -1968,9 +2049,16 @@ class MartinCycle:
             acts += self._cancel_action(r, w, f"{slot.role.value}上一代残留单(严守单一出场)")
 
         if st is OrderState.FILLED:
-            return acts                                # 已成交, 等 Evaluate 归因终结
-        if spec.qty_is_dust(qty):
+            if spec.qty_is_dust(qty):
+                return acts                            # 已成交且无残余: 等 Evaluate 归因终结
+            # 旧保护单已成交, 但账本仍有非粉尘残余(同 Tick 又有加仓成交):
+            # 必须允许规划下一代保护单, 绝不给残余仓位留下无保护空窗。
+            logger.critical(f"[出场] {slot.role.value}上一代已成交但账本仍有残余[{qty:.8g}], "
+                            f"立即补挂下一代保护单(绝不留保护空窗)")
+            slot.coid, st = "", OrderState.NOT_PLACED
+        elif spec.qty_is_dust(qty):
             return acts + self._cancel_action(t, w, f"{slot.role.value}无可平数量, 撤销残留保护单")
+
         if target <= 0:
             return acts
         if st is OrderState.PENDING:
@@ -1997,7 +2085,7 @@ class MartinCycle:
                 self._abandon(slot, "止盈单连续失败达上限, 停止更新(不构成风险敞口, "
                                     "仓位仍由止损单与本地击穿熔断保护)")
             return acts
-        if slot.role is OrderRole.SL and w.price > 0 and self._is_breached(w.price, target):
+        if slot.role is OrderRole.SL and self._crossed(w.price, target):
             return acts    # 现价已在触发价错误一侧, 挂条件单必被拒; 交由击穿逻辑走收尾强平
         kind = "STOP" if slot.role is OrderRole.SL else "LIMIT"
         why = (f"全局固定止损 均价{self.book.avg:.8g} 最大亏损{self.ctx.cfg.max_loss_usdt}"
@@ -2015,6 +2103,43 @@ class MartinCycle:
         step = self.ctx.spec.step_size or 1e-12
         return (abs(slot.live_price - target_price) <= tick * 0.6 and
                 abs(slot.live_remaining - target_qty) <= step * 0.6)
+
+    def _plan_opens(self, w: World) -> List[Action]:
+        """
+        开仓层对齐 —— 两条互斥的平铺分支, 无任何递归:
+          A. 正常铺单: 按蓝图补挂所有 NOT_PLACED 的层;
+             触发总量硬闸 -> 丢弃本轮尚未发出的开仓计划, 就地转入分支 B;
+             现价已越过全局止损线 -> 一律不再新增任何加仓(空仓场景 Evaluate 已判 NO_FILL)。
+          B. 停止加仓: 持续撤销所有存活开仓单, 直到全部拨到终态。
+        """
+        if not self.add_suspended:
+            acts, now, crossed = [], w.ts, self._crossed(w.price, self.bp.sl_price)
+            for lp in self.bp.layers:
+                if self._slot_state(lp) is not OrderState.NOT_PLACED:
+                    continue        # FILLED / DEAD / 在盘 / 锁定中 -> 一律不动
+                if lp.abandoned or now < lp.next_retry_ts:
+                    continue
+                if crossed:
+                    logger.info(f"[加仓] 现价[{w.price}]已越过全局止损价[{self.bp.sl_price}], "
+                                f"停止一切加仓(无论是否持仓)")
+                    break
+                if lp.attempts >= MAX_PLACE_ATTEMPTS:
+                    self._abandon(lp, "超过最大尝试次数(该层放弃加仓, 周期用现有仓位收尾)")
+                    continue
+                # I4 总量硬闸: 已成交 + 本层 不得超过蓝图总量
+                if self.book.total_open_filled + lp.qty > self.bp.total_qty * OVERFILL_TOLERANCE:
+                    self._suspend_add(f"总量硬闸: 第{lp.layer}层将超出蓝图总量")
+                    acts = []       # 本轮此前规划的开仓计划全部作废, 转入撤单分支
+                    break
+                acts.append(Action.place("LIMIT", OrderRole.OPEN, lp.layer, lp.price, lp.qty, lp,
+                                         f"第{lp.layer}层加仓(蓝图固定价)"))
+            if not self.add_suspended:
+                return acts
+
+        acts = []
+        for t in self.registry.alive(OrderRole.OPEN):
+            acts += self._cancel_action(t, w, "停止加仓: 撤销开仓单", include_pending=True)
+        return acts
 
     def _clamp_exit_qty(self, real: Optional[float]) -> float:
         """
@@ -2070,6 +2195,7 @@ class MartinCycle:
             logger.info(f"[收尾] 周期[{self.cycle_id}]进入收尾阶段[{self.end_reason.value}]: "
                         f"第一阶段只做全量撤单, 待所有单据确认终态后才处理残余仓位")
 
+        # ---- 第一阶段: 全量撤单(市价强平单天然豁免); Execute 会拦掉一切开仓动作 ----
         for t in self.registry.alive():
             actions += self._cancel_action(t, w, f"周期收尾({self.end_reason.value})",
                                            include_pending=True)
@@ -2083,14 +2209,14 @@ class MartinCycle:
                 logger.critical(f"[收尾] 已连续[{now - self.stuck_since:.0f}s]仍有本周期单据未终态, "
                                 f"无法证明它们不会成交, 绝不冒反向开仓风险下发市价单! "
                                 f"引擎停机等待人工介入 | 未终态:{stuck}")
-                self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-",
-                                       MartinLedger.A_ALERT, "", 0, self.book.open_qty,
-                                       "CLOSING_STUCK",
-                                       f"收尾卡死: 未终态{[t.coid for t in stuck]}")
+                self.wal_cycle(MartinLedger.A_ALERT, "CLOSING_STUCK",
+                               f"收尾卡死: 未终态{[t.coid for t in stuck]}",
+                               qty=self.book.open_qty)
                 return TickResult.HALT
             return TickResult.CONTINUE
         self.stuck_since = 0.0
 
+        # ---- 第二阶段: 所有单据已终态 -> 实时核实并平掉残余 ----
         if not spec.qty_is_dust(self.book.open_qty):
             real = self.ctx.position(self.direction.position_side, force=True)
             if real is None:
@@ -2099,10 +2225,9 @@ class MartinCycle:
                     logger.critical(f"[收尾] 实际持仓连续[{self.pos_unknown}]轮无法确认, 既不能证明"
                                     f"已平净也不敢盲目重发市价单, 停机等待人工介入 | "
                                     f"本地残余:[{self.book.open_qty:.8g}]")
-                    self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-",
-                                           MartinLedger.A_ALERT, "", 0, self.book.open_qty,
-                                           "POS_PROBE_UNKNOWN",
-                                           f"实际持仓连续{self.pos_unknown}轮查询失败, 需人工介入")
+                    self.wal_cycle(MartinLedger.A_ALERT, "POS_PROBE_UNKNOWN",
+                                   f"实际持仓连续{self.pos_unknown}轮查询失败, 需人工介入",
+                                   qty=self.book.open_qty)
                     return TickResult.HALT
                 logger.critical(f"[收尾] 无法获取实际持仓(第[{self.pos_unknown}]次), 暂缓市价平仓, "
                                 f"下一轮继续核实(防双重平仓造成反向开仓)")
@@ -2112,24 +2237,19 @@ class MartinCycle:
             if spec.qty_is_dust(real):
                 logger.critical(f"[收尾] 本地虚拟残余[{self.book.open_qty:.8g}] 但交易所实际持仓已归零, "
                                 f"强制同步本地账本归零(打破收尾死锁)")
-                self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-",
-                                       MartinLedger.A_ALERT, "", 0, self.book.open_qty,
-                                       "FORCE_FLAT_SYNC", "交易所实际持仓为0, 本地强制归零")
+                self.wal_cycle(MartinLedger.A_ALERT, MartinLedger.S_FORCE_FLAT_SYNC,
+                               "交易所实际持仓为0, 本地强制归零", qty=self.book.open_qty)
                 self.book.force_flat()
             else:
                 qty = self._clamp_exit_qty(real)
                 if not spec.qty_is_dust(qty):
-                    # 【修复】退避拦截：若处于强平拒单冷却中，则本轮跳过不下单
                     if now < self.next_force_retry_ts:
-                        return TickResult.CONTINUE
-
+                        return TickResult.CONTINUE      # 强平被拒后的冷却, 防瞬间耗尽次数
                     if self.force_attempts >= FORCE_CLOSE_MAX_ATTEMPTS:
                         logger.critical(f"[收尾] 已连续[{self.force_attempts}]次市价强平仍未归零"
                                         f"(残余[{qty}] 实际[{real}]), 停机等待人工介入")
-                        self.ctx.ledger.append(self.cycle_id, self.signal_ts, -1, "-",
-                                               MartinLedger.A_ALERT, "", 0, qty,
-                                               "CLOSE_NOT_CONVERGED",
-                                               f"市价强平{self.force_attempts}次未收敛, 需人工介入")
+                        self.wal_cycle(MartinLedger.A_ALERT, "CLOSE_NOT_CONVERGED",
+                                       f"市价强平{self.force_attempts}次未收敛, 需人工介入", qty=qty)
                         return TickResult.HALT
                     logger.critical(f"[收尾] 所有单据已终态且实时持仓确认仍有[{real:.8g}], "
                                     f"下发第[{self.force_attempts + 1}]次市价平仓 | 数量:[{qty}]")
@@ -2137,25 +2257,41 @@ class MartinCycle:
                                                 f"收尾残余平仓({self.end_reason.value})")], w)
                     return TickResult.CONTINUE
 
-        if 0 < self.book.open_qty:
+        if self.book.open_qty > 0:
             logger.info(f"[收尾] 剩余[{self.book.open_qty:.10g}]低于最小交易单位, 按碎屑账面归零")
             self.book.force_flat()
         if w.orders:
-            logger.info(f"[收尾] 盘口另有[{len(w.orders)}]张非本周期的本策略残留单"
-                        f"(已在对账阶段发出撤单), 不阻断本周期清算")
+            logger.info(f"[收尾] 本轮快照另有[{len(w.orders)}]张本策略挂单记录"
+                        f"(已在对账阶段处置), 不阻断本周期清算")
         if w.pos_qty is not None and not spec.qty_is_dust(w.pos_qty):
             logger.info(f"[收尾] 交易所[{self.direction.value}]仍有持仓[{w.pos_qty:.8g}], "
                         f"但本策略账本已平净且无任何存活单据, 判定该持仓不属于本策略(其它策略/手工仓位)")
         return TickResult.DONE
+
     # ==========================================================================
-    # 第五步 Execute: 唯一的网络写入口, 统一处理所有 PlaceResult
+    # 第五步 Execute: 唯一的网络写入口, 入口带许可检查, 统一处理所有 PlaceResult
     # ==========================================================================
     def _execute(self, actions: List[Action], w: World):
+        """
+        【许可检查 = 动作泄漏防线】动作清单可能是在本轮更早时刻生成的, 而生成之后周期状态
+        可能已经降级(如出场单被 -2022 拒单触发停止加仓、止损失败触发收尾)。因此每条动作
+        执行前必须重新核对当前周期意图:
+          * 收尾态   : 只放行撤单与市价收尾单, 其余新挂单一律作废;
+          * 停止加仓 : 一律作废开仓动作, 保护单照常维护。
+        """
         for a in actions:
             if a.kind == "CANCEL":
                 self._send_cancel(a.coid, a.why)
-            else:
-                self._send_place(a)
+                continue
+            blocked = ("收尾" if (self.end_reason and a.kind != "MARKET")
+                       else "停止加仓" if (self.add_suspended and a.role is OrderRole.OPEN)
+                       else "")
+            if blocked:
+                logger.critical(f"[执行] 周期已进入[{blocked}]态, 丢弃动作 {a.kind} "
+                                f"角色[{a.role.value}] 层[{a.layer}] 价[{a.price}] 量[{a.qty}] | "
+                                f"原意图:[{a.why}]")
+                continue
+            self._send_place(a)
 
     def _send_cancel(self, coid: str, why: str):
         """
@@ -2166,12 +2302,11 @@ class MartinCycle:
         p = OidCodec.parse(coid)
         layer = t.layer if t else (p.layer if p else -1)
         role = t.role.value if t else (p.role.value if p else "?")
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role,
-                               MartinLedger.A_INTENT_CANCEL, coid, 0, 0, "PENDING", why)
+        self.wal_order(MartinLedger.A_INTENT_CANCEL, coid, layer, role, status="PENDING", msg=why)
         ok = self.ctx.gw.cancel(coid)
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, layer, role,
-                               MartinLedger.A_CANCEL_OK if ok else MartinLedger.A_CANCEL_FAIL,
-                               coid, 0, 0, "ACCEPTED_PENDING_CONFIRM" if ok else "FAIL", why)
+        self.wal_order(MartinLedger.A_CANCEL_OK if ok else MartinLedger.A_CANCEL_FAIL,
+                       coid, layer, role,
+                       status="ACCEPTED_PENDING_CONFIRM" if ok else "FAIL", msg=why)
         if t:
             t.act_ts = time.time()
             if ok and t.state.alive:
@@ -2185,16 +2320,11 @@ class MartinCycle:
         if slot is not None:
             slot.coid = coid
             slot.attempts += 1
-            # 只有出场保护单需要记录"目标价量"用于后续对齐比对;
-            # 开仓层的目标恒等于蓝图 price/qty, 其 __slots__ 刻意不含这两个字段。
-            if isinstance(slot, ExitOrder):
-                slot.target_price, slot.target_qty = a.price, a.qty
         if a.kind == "MARKET":
             self.force_attempts += 1
 
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, a.layer, a.role.value,
-                               MartinLedger.A_INTENT_PLACE, coid, a.price, a.qty, "PENDING",
-                               a.why)
+        self.wal_order(MartinLedger.A_INTENT_PLACE, coid, a.layer, a.role.value,
+                       a.price, a.qty, "PENDING", a.why)
         gw, d, cfg = self.ctx.gw, self.direction, self.ctx.cfg
         if a.kind == "LIMIT":
             side = d.open_side if a.role is OrderRole.OPEN else d.close_side
@@ -2208,23 +2338,22 @@ class MartinCycle:
         self._after_place(a, t, res)
 
     def _after_place(self, a: Action, t: TrackedOrder, res: PlaceResult):
-        slot, tag = a.slot, f"角色[{a.role.value}] 层[{a.layer}] 价[{a.price}] 量[{a.qty}] CID[{t.coid}]"
+        slot = a.slot
+        tag = f"角色[{a.role.value}] 层[{a.layer}] 价[{a.price}] 量[{a.qty}] CID[{t.coid}]"
         if res.ok:
             t.state = OrderState.LIVE
             t.ex_id = res.ex_id
             if slot is not None and a.role is not OrderRole.OPEN:
                 slot.attempts = 0
-            self.ctx.ledger.append(self.cycle_id, self.signal_ts, a.layer, a.role.value,
-                                   MartinLedger.A_PLACE_OK, t.coid, a.price, a.qty, "OK",
-                                   res.ex_id)
+            self.wal_order(MartinLedger.A_PLACE_OK, t.coid, a.layer, a.role.value,
+                           a.price, a.qty, "OK", res.ex_id)
             logger.info(f"[挂单] {tag} | 结果:[OK] 交易所单号:[{res.ex_id}]")
             return
 
         if res.unknown or res.kind in (ErrKind.UNKNOWN_RESULT, ErrKind.DUPLICATE):
             t.state = OrderState.PENDING
-            self.ctx.ledger.append(self.cycle_id, self.signal_ts, a.layer, a.role.value,
-                                   MartinLedger.A_PLACE_UNKNOWN, t.coid, a.price, a.qty,
-                                   "UNKNOWN", res.err)
+            self.wal_order(MartinLedger.A_PLACE_UNKNOWN, t.coid, a.layer, a.role.value,
+                           a.price, a.qty, "UNKNOWN", res.err)
             logger.critical(f"[挂单] {tag} | 结果:[UNKNOWN/{res.kind.value}] 未收到确定回执, "
                             f"原地锁定等待点查裁决, 严禁换号重发 | 回执:[{res.err}]")
             return
@@ -2232,9 +2361,8 @@ class MartinCycle:
         t.state = OrderState.NOT_PLACED
         if slot is not None:
             slot.coid = ""
-        self.ctx.ledger.append(self.cycle_id, self.signal_ts, a.layer, a.role.value,
-                               MartinLedger.A_PLACE_FAIL, t.coid, a.price, a.qty,
-                               res.kind.value, res.err)
+        self.wal_order(MartinLedger.A_PLACE_FAIL, t.coid, a.layer, a.role.value,
+                       a.price, a.qty, res.kind.value, res.err)
 
         if a.role is OrderRole.OPEN:
             idx = min(len(RETRY_BACKOFF_SEC) - 1, max(0, (slot.attempts if slot else 1) - 1))
@@ -2256,7 +2384,7 @@ class MartinCycle:
         elif res.kind is ErrKind.IMMEDIATE_TRIGGER:
             px = self.last_price
             dev = (abs(a.price / px - 1) * 100) if (px > 0 and a.price > 0) else 999.9
-            if px > 0 and dev <= SL_IMM_TRIG_MAX_DEV_PCT and self._is_breached(px, a.price):
+            if px > 0 and dev <= SL_IMM_TRIG_MAX_DEV_PCT and self._crossed(px, a.price):
                 logger.critical(f"[挂单] {tag} | 结果:[条件单会立即触发] 本地现价[{px}]双重核验通过"
                                 f"(确已击穿, 偏离{dev:.2f}%), 转入收尾市价强平")
                 self._end(EndReason.SL_FORCED, "条件单立即触发且本地现价核验确已击穿")
@@ -2264,10 +2392,9 @@ class MartinCycle:
                 logger.critical(f"[挂单] {tag} | 结果:[条件单会立即触发] 但本地现价[{px}]核验不通过"
                                 f"(偏离[{dev:.2f}%]), 判定为止损价计算异常, 拒绝强平! "
                                 f"已转退避重挂, 请立即人工核查 | 回执:[{res.err}]")
-                self.ctx.ledger.append(self.cycle_id, self.signal_ts, a.layer, a.role.value,
-                                       MartinLedger.A_ALERT, t.coid, a.price, a.qty,
-                                       "SL_SANITY_FAIL",
-                                       f"立即触发回执与本地现价{px}不符, 已拒绝强平")
+                self.wal_order(MartinLedger.A_ALERT, t.coid, a.layer, a.role.value,
+                               a.price, a.qty, "SL_SANITY_FAIL",
+                               f"立即触发回执与本地现价{px}不符, 已拒绝强平")
         elif res.kind is ErrKind.REDUCE_REJECT:
             logger.critical(f"[挂单] {tag} | 结果:[平仓数量超持仓] 本策略仓位疑似被外部平掉! | "
                             f"回执:[{res.err}]")
@@ -2278,12 +2405,12 @@ class MartinCycle:
             logger.critical(f"[挂单] {tag} | 结果:[明确拒单-{res.kind.value}] 该 OID 永久停挂, "
                             f"处置交由下一轮对齐裁决 | 回执:[{res.err}]")
 
-        # 【修复】增加强平单失败的独立退避时间（无论遇到任何明确拒单，强制冷却 3 秒防瞬秒停机）
+        # 市价强平单没有槽位承载退避, 单独冷却: 防被连续拒单瞬间耗尽次数直接停机
         if a.kind == "MARKET":
-            self.next_force_retry_ts = time.time() + 3.0
-
+            self.next_force_retry_ts = time.time() + FORCE_BACKOFF_SEC
         if slot is not None:
             slot.next_retry_ts = time.time() + backoff
+
     # ---------------------- 只读辅助 ----------------------
     def layer_stats(self) -> Tuple[int, int, int]:
         filled = live = gave_up = 0
@@ -2327,6 +2454,7 @@ class MartinEngine:
         self.recover_attempts = 0
         self.cycles_done = 0
         self.pnl_total = 0.0
+        self._next_sync_ts = time.time() + TIME_SYNC_SEC
 
     # ---------------- 第一步 Sense: 世界快照 + 熔断 ----------------
     def _sense(self, position_side: Optional[str] = None) -> Optional[World]:
@@ -2347,9 +2475,15 @@ class MartinEngine:
         return World(time.time(), price, orders, algo_ok, pos)
 
     def _purge_orders(self, why: str) -> bool:
-        """撤销一切带本策略前缀的在线挂单(仅用于冷启动/空闲态清场)。True=盘口已确认干净。"""
-        orders, _ = self.gw.fetch_open_orders(OidCodec.strategy_prefix(self.cfg.strategy_id))
-        if orders is None:
+        """
+        撤销一切带本策略前缀的在线挂单(仅用于冷启动/空闲态清场)。
+        返回 True 仅代表【已确认盘口干净】: 必须两条通道都可信 —— 普通单快照成功
+        且算法条件单通道有效(algo_ok)。条件单接口降级时绝不宣告清场干净。
+        """
+        orders, algo_ok = self.gw.fetch_open_orders(OidCodec.strategy_prefix(self.cfg.strategy_id))
+        if orders is None or not algo_ok:
+            logger.info(f"[清场] 无法确认盘口干净(快照缺失或算法条件单通道降级), 不宣告清场完成 | "
+                        f"原因:[{why}]")
             return False
         if not orders:
             return True
@@ -2379,16 +2513,14 @@ class MartinEngine:
         self.gate.set_watermark(watermark)
         logger.info(f"[启动] 账本读取结果:[{status}] 信号去重水位线恢复为 [{watermark}]")
 
-        # ---- 账本存在但读不懂 -> fail-closed, 绝不清场(会撤掉活仓保护单) ----
-        if status == MartinLedger.LOAD_CORRUPT:
-            logger.critical("[启动] 账本(WAL)文件存在但无法读取/解析! 此刻无法判断: 哪个周期还活着 / "
-                            "哪些 OID 属于自己 / 有无持仓 / 哪些是保护性止损单。为防清场导致仓位裸奔, "
-                            "严禁 purge、严禁接新信号, 直接 STOPPED 等待人工检查账本文件")
+        # ---- 账本结构损坏 / 蓝图无效 -> fail-closed: 绝不猜、绝不清场、绝不接新信号 ----
+        if status in (MartinLedger.LOAD_CORRUPT, MartinLedger.LOAD_BLUEPRINT_BAD):
+            cid = (meta or {}).get("cycle_id") or "-"
+            logger.critical(f"[启动] 账本结构损坏或未收尾周期[{cid}]蓝图无效! 此刻无法判断: 哪个周期还活着 / "
+                            f"哪些 OID 属于自己 / 有无持仓 / 哪些是保护性止损单。绝不做任何推测式平账, "
+                            f"严禁 purge、严禁接新信号, 账本与现场原样保留, 直接 STOPPED 等待人工处理")
             self.state = EngineState.STOPPED
             return True
-
-        if status == MartinLedger.LOAD_BLUEPRINT_BAD:
-            return self._handle_broken_blueprint(meta)
 
         if status == MartinLedger.LOAD_RECOVER:
             self._pending_recover = (meta, rows)
@@ -2401,69 +2533,51 @@ class MartinEngine:
             return True
 
         # ---- 全新启动 / 账本可读且无未完成周期 -> 可安全清场后 IDLE ----
-        self._purge_orders("冷启动: 空闲态不应存在任何本策略挂单")
+        if not self._purge_orders("冷启动: 空闲态不应存在任何本策略挂单"):
+            logger.critical("[启动] 冷启动清场未能确认盘口干净(有残留单或算法通道降级), "
+                            "已进入空闲态; 开仓前会再次强制核实, 核实不通过绝不开新周期")
         self.state = EngineState.IDLE
         logger.info("[启动] 无未完成周期, 进入空闲监听态")
         return True
 
-    def _handle_broken_blueprint(self, meta: Optional[dict]) -> bool:
-        """
-        蓝图损坏的 fail-closed 处置。只有能【确定性证明】以下三点时才允许保守清理后回到空闲态:
-          ① 盘口快照拉取成功且无任何本策略残留挂单; ② 双向实际持仓都查询成功; ③ 都是碎屑。
-        任何一项无法证明 -> STOPPED, 原样保留现场等人工。
-        """
-        cid = (meta or {}).get("cycle_id") or "-"
-        logger.critical(f"[启动] 未收尾周期[{cid}]的蓝图 JSON 损坏或关键字段缺失。"
-                        f"绝不使用残缺蓝图继续交易, 现在核实是否存在活仓/残留挂单...")
-
-        snap, _ = self.gw.fetch_open_orders(OidCodec.strategy_prefix(self.cfg.strategy_id))
-        if snap is None:
-            logger.critical("[启动] 蓝图损坏且无法拉取盘口快照, 无法证明无仓无单, "
-                            "fail-closed 进入 STOPPED(不清场)")
-            self.state = EngineState.STOPPED
-            return True
-        if snap:
-            logger.critical(f"[启动] 蓝图损坏且盘口仍有[{len(snap)}]张本策略挂单(可能含保护性止损单), "
-                            f"绝不盲目撤销, fail-closed 进入 STOPPED | 挂单:{list(snap.keys())}")
-            self.state = EngineState.STOPPED
-            return True
-
-        pos = {}
-        for ps in (Direction.LONG.position_side, Direction.SHORT.position_side):
-            q = self.gw.fetch_position_qty(ps)
-            if q is None:
-                logger.critical(f"[启动] 蓝图损坏且无法确认[{ps}]方向实际持仓, "
-                                f"fail-closed 进入 STOPPED(不清场)")
-                self.state = EngineState.STOPPED
-                return True
-            pos[ps] = q
-        if any(not self.spec.qty_is_dust(v) for v in pos.values()):
-            logger.critical(f"[启动] 蓝图损坏且交易所仍有持仓 {pos}(无法区分是否属于本策略), "
-                            f"fail-closed 进入 STOPPED, 仓位与挂单原样保留")
-            self.state = EngineState.STOPPED
-            return True
-
-        logger.critical(f"[启动] 已确定性核实: 无本策略残留挂单 且 双向实际持仓均为0 {pos}。"
-                        f"判定该损坏周期实际早已了结, 补写 CYCLE_END 关闭它并回到空闲态")
-        self.ledger.append(cid, 0, -1, "-", MartinLedger.A_CYCLE_END, "", 0, 0,
-                           "BLUEPRINT_BAD_CLOSED",
-                           "蓝图损坏但已核实无挂单、无持仓, 关闭该周期以恢复正常运行")
-        self.state = EngineState.IDLE
-        return True
-
     # ---------------- WAL 断点续传: 时间序列重放 + 复用主流水线 ----------------
-    def _replay_wal(self, cyc: MartinCycle, rows: List[dict]) -> Tuple[bool, bool]:
+    def _replay_wal(self, cyc: MartinCycle, rows: List[dict]) -> dict:
         """
-        严格按 WAL 行顺序(时间序列)重建【登记表】与【虚拟账本】。
-        返回 (是否出现过市价强平记录, 重启前是否已停止加仓)。
+        严格按 WAL 行顺序(时间序)重建【登记表 / 虚拟账本 / 周期标志】。
+        返回 {'end': EndReason|None, 'halt': str, 'suspended': bool, 'force_seen': bool}
         绝不在这里写任何 FILL 行(会污染审计), 只重放到内存。
         """
-        force_seen = suspended = False
+        end_by_value = {e.value: e for e in EndReason}
+        info = {"end": None, "halt": "", "suspended": False, "force_seen": False}
+
         for r in rows or []:
             action = r.get("action") or ""
-            if action == MartinLedger.A_ALERT and str(r.get("status") or "") == "SUSPEND_ADD":
-                suspended = True
+            status = str(r.get("status") or "").strip()
+            price = float(r.get("price") or 0)
+            qty = float(r.get("qty") or 0)
+
+            # ---- 周期开始: 恢复原始起始时间, 否则入场超时/周期超时全算错 ----
+            if action == MartinLedger.A_CYCLE_START:
+                ts = MartinLedger.parse_ts(r.get("ts"))
+                if ts > 0:
+                    cyc.created_ts = ts
                 continue
+
+            # ---- 告警行: 严格按语义顺次应用周期级标志 ----
+            if action == MartinLedger.A_ALERT:
+                if status == MartinLedger.S_SUSPEND_ADD:
+                    info["suspended"] = True
+                elif status == MartinLedger.S_GIVEUP:
+                    self._replay_giveup(cyc, r)
+                elif status in (MartinLedger.S_EXTERNAL_FLAT, MartinLedger.S_FORCE_FLAT_SYNC):
+                    cyc.book.force_flat()          # 库存校正: 记入 void_qty 以吸收滞后回执
+                elif status in end_by_value:
+                    info["end"] = end_by_value[status]
+                elif status in MartinLedger.HALT_STATUS:
+                    info["halt"] = MartinLedger.HALT_STATUS[status]
+                continue
+
+            # ---- 订单行: 还原每个 OID 的状态与成交 ----
             coid = (r.get("coid") or "").strip()
             if not coid:
                 continue
@@ -2471,12 +2585,10 @@ class MartinEngine:
             if not p or p.cycle_id != cyc.cycle_id:
                 continue
             if p.role is OrderRole.SL and p.layer == 99:
-                force_seen = True
-
+                info["force_seen"] = True
             t = cyc.registry.get(coid)
             if t is None:
-                t = cyc.registry.open(coid, p.role, p.layer,
-                                      float(r.get("price") or 0), float(r.get("qty") or 0),
+                t = cyc.registry.open(coid, p.role, p.layer, price, qty,
                                       OrderState.PENDING, ts=0.0)
             if action == MartinLedger.A_PLACE_OK:
                 t.state = OrderState.LIVE
@@ -2487,21 +2599,40 @@ class MartinEngine:
             elif action in (MartinLedger.A_INTENT_CANCEL, MartinLedger.A_CANCEL_OK):
                 t.state = OrderState.CANCEL_PENDING
             elif action == MartinLedger.A_FILL:
-                cyc.replay_fill(t, float(r.get("price") or 0), float(r.get("qty") or 0))
+                cyc.replay_fill(t, price, qty)
 
-        # 指针还原: 每个槽位指向该 (角色,层) 的最新一代订单
+        # ---- 指针还原: 每个槽位指向该 (角色,层) 的最新一代订单 ----
         for lp in cyc.bp.layers:
             t = cyc.registry.newest(OrderRole.OPEN, lp.layer)
             if t is not None:
                 lp.coid = t.coid
                 lp.attempts = cyc.registry.count(OrderRole.OPEN, lp.layer)
-                lp.abandoned = lp.attempts >= MAX_PLACE_ATTEMPTS
+                lp.abandoned = lp.abandoned or lp.attempts >= MAX_PLACE_ATTEMPTS
         for slot in (cyc.tp, cyc.sl):
             t = cyc.registry.newest(slot.role, 0)
             if t is not None:
                 slot.coid = t.coid      # attempts 保持 0: 保护单必须能立即持续对齐
         cyc.force_attempts = cyc.registry.count(OrderRole.SL, 99)
-        return force_seen, suspended
+        if cyc.book_error:
+            info["halt"] = info["halt"] or MartinLedger.HALT_STATUS["LEDGER_INCONSISTENT"]
+        return info
+
+    @staticmethod
+    def _replay_giveup(cyc: MartinCycle, r: dict):
+        """还原"槽位永久放弃"标志: 避免恢复后重新去挂一个已判定放弃的槽位。"""
+        role = str(r.get("role") or "")
+        try:
+            layer = int(float(r.get("layer") or -1))
+        except Exception:
+            layer = -1
+        if role == OrderRole.TP.value:
+            cyc.tp.abandoned = True
+        elif role == OrderRole.SL.value:
+            cyc.sl.abandoned = True
+        elif role == OrderRole.OPEN.value:
+            for lp in cyc.bp.layers:
+                if lp.layer == layer:
+                    lp.abandoned = True
 
     def _recover_cycle(self, meta: dict, rows: List[dict]) -> bool:
         """断点续传: WAL 时间序重放 -> 复用主流水线的 Sense + Reconcile 向交易所求真相。"""
@@ -2527,8 +2658,8 @@ class MartinEngine:
             logger.info(f"[恢复] 检测到未收尾周期[{cycle_id}] {direction.value} 层数[{len(layers)}], "
                         f"开始按账本时间序重放并向交易所求证真相...")
 
-            # 1) 严格按行序重放(精确还原崩溃前那一刻的真实均价与盈亏)
-            force_seen, suspended = self._replay_wal(cyc, rows)
+            # 1) 严格按行序重放(精确还原崩溃前那一刻的真实均价、盈亏与所有周期标志)
+            info = self._replay_wal(cyc, rows)
             self.ledger.append(cycle_id, cyc.signal_ts, -1, "-", MartinLedger.A_RECOVER_REPLAY,
                                "", cyc.book.avg, cyc.book.open_qty, "OK",
                                json.dumps({"open_qty": cyc.book.open_qty, "avg": cyc.book.avg,
@@ -2536,7 +2667,11 @@ class MartinEngine:
                                            "close_filled": cyc.book.total_close_filled,
                                            "realized": round(cyc.book.realized, 8),
                                            "orders": len(cyc.registry.all()),
-                                           "force_orders": cyc.force_attempts},
+                                           "force_orders": cyc.force_attempts,
+                                           "suspended": info["suspended"],
+                                           "end": info["end"].value if info["end"] else "",
+                                           "halt": info["halt"],
+                                           "created_ts": round(cyc.created_ts, 3)},
                                           separators=(",", ":")))
 
             # 2) 复用主流水线: Sense + Reconcile(全量点查), 与实时对账 100% 同一套代码路径
@@ -2545,18 +2680,19 @@ class MartinEngine:
                 logger.critical("[恢复] 世界快照拉取失败, 本次放弃接管(稍后重试), "
                                 "绝不带着未知状态运行, 也绝不清场")
                 return False
-            cyc._reconcile(w, probe_budget=10 ** 6)
+            cyc._reconcile(w, probe_budget=None)
 
-            # 3) 历史强平记录 / 停止加仓标志 -> 恢复后只能收尾
-            if suspended:
+            # 3) 账本标志落地: 停止加仓 / 已判定终结 / 历史强平记录 -> 恢复后只能收尾
+            if info["suspended"]:
                 cyc.add_suspended = True
                 logger.critical("[恢复] 账本显示重启前已停止加仓, 继续保持(绝不重新铺加仓单)")
-            if force_seen:
+            if info["end"] is not None:
+                cyc._end(info["end"], "账本显示重启前已判定周期终结, 恢复后直接进入收尾")
+            elif info["force_seen"]:
                 cyc._end(EndReason.SL_FORCED,
                          f"账本存在[{cyc.force_attempts}]笔市价强平记录, 恢复后强制进入收尾态")
 
             self.cycle = cyc
-            self.state = EngineState.ACTIVE
             filled, live, gave_up = cyc.layer_stats()
             logger.info(f"[恢复] 周期[{cycle_id}]接管成功 | 虚拟持仓:[{cyc.book.open_qty:.8g}] "
                         f"均价:[{cyc.book.avg:.8g}] 全局止损:[{bp.sl_price:.8g}] "
@@ -2564,6 +2700,14 @@ class MartinEngine:
                         f"TP:[{cyc.registry.state_of(cyc.tp.coid).value}] "
                         f"SL:[{cyc.registry.state_of(cyc.sl.coid).value}] "
                         f"登记表:{ {t.coid: t.state.value for t in cyc.registry.alive()} }")
+
+            halt = info["halt"] or cyc.book_error
+            if halt:
+                logger.critical(f"[恢复] 账本显示重启前已因[{halt}]停机等待人工介入, 接管后继续保持 "
+                                f"STOPPED, 仓位与挂单原样保留, 不做任何自动处置")
+                self.state = EngineState.STOPPED
+            else:
+                self.state = EngineState.ACTIVE
             return True
         except LedgerError:
             raise
@@ -2578,6 +2722,7 @@ class MartinEngine:
                     f"交易对:[{self.cfg.symbol}] 信号:[{self.cfg.signal_name}]")
         while not self.stop_flag:
             try:
+                self._maintain()
                 if self.state == EngineState.STOPPED:
                     logger.critical("[主循环] 引擎处于 STOPPED 态, 已停止一切交易, 等待人工介入")
                     time.sleep(60)
@@ -2616,24 +2761,40 @@ class MartinEngine:
         logger.info("[主循环] 收到退出信号, 已停止。注意: 交易所的止盈/止损单被有意保留, "
                     "下次启动会自动断点续传接管")
 
+    def _maintain(self):
+        """主循环定时维护: 目前只有校时(并入主线程, 杜绝跨线程改共享客户端)。"""
+        if time.time() < self._next_sync_ts:
+            return
+        self._next_sync_ts = time.time() + TIME_SYNC_SEC
+        self.gw.sync_time()
+
+    def _drive(self, cyc: MartinCycle, w: World):
+        """把一次流水线结果落到引擎状态(IDLE 首轮铺单与 ACTIVE 轮询共用这一条路径)。"""
+        res = cyc.tick(w)
+        if res is TickResult.DONE:
+            self._finish_cycle(cyc)
+        elif res is TickResult.HALT:
+            logger.critical(f"[主循环] 周期[{cyc.cycle_id}]出现无法自动裁决的危险局面, "
+                            f"引擎转入 STOPPED 保留现场, 停止一切自动交易, 请立即人工介入")
+            self.state = EngineState.STOPPED
+
     # ---------------- IDLE ----------------
     def _idle_tick(self):
         time.sleep(self.cfg.idle_poll_interval_sec)
-        price = self.gw.fetch_last_price()
-        if price is None:
-            # 拉不到现价属可预期瞬态(不抛异常污染 err_streak), 但必须额外退避防高频空转刷屏
-            time.sleep(IDLE_NO_PRICE_SLEEP_SEC)
-            return
-        self.last_price = price
-
-        sig = self.gate.poll()
+        sig = self.gate.poll()          # 先查信号: 无信号则一次网络请求都不发
         if sig is None:
             return
-        logger.info(f"[信号] 收到有效开仓信号 {sig} | 现价:[{price}]")
+        logger.info(f"[信号] 收到有效开仓信号 {sig}")
 
-        w = self._sense()          # 开仓前必须确认盘口干净(信息不全不动手)
+        w = self._sense()               # 有信号才请求现价与盘口(开仓前必须世界观完整)
         if w is None:
-            logger.info("[信号] 无法确认盘口干净度, 本次放弃开仓(信号不消费, 下轮再看)")
+            logger.info("[信号] 世界快照不完整(现价/挂单拉取失败), 本次放弃开仓"
+                        "(信号不消费, 下轮再看)")
+            time.sleep(IDLE_NO_PRICE_SLEEP_SEC)
+            return
+        if not w.algo_ok:
+            logger.critical("[信号] 算法条件单查询通道本轮降级, 无法证明盘口不存在未触发条件单, "
+                            "绝不在此状态下开启新周期(信号不消费, 下轮再看)")
             return
         if w.orders:
             logger.critical(f"[信号] 空闲态却发现[{len(w.orders)}]张本策略残留挂单, 先清场再考虑开仓, "
@@ -2643,7 +2804,7 @@ class MartinEngine:
             return
 
         bp = BlueprintBuilder.build(self.cfg, self.spec, sig)
-        self.gate.set_watermark(sig.signal_ts)     # 无论是否成功, 该信号只消费一次
+        self.gate.set_watermark(sig.signal_ts)     # 蓝图成败与否, 该信号只消费一次
         if bp is None:
             return
 
@@ -2655,10 +2816,11 @@ class MartinEngine:
                            json.dumps(cyc.start_meta(), separators=(",", ":")))
         self.cycle = cyc
         self.state = EngineState.ACTIVE
-        logger.info(f"[周期] 开启新周期[{cycle_id}] {sig.direction.value} | 层数:[{len(bp.layers)}] "
-                    f"总量:[{bp.total_qty:.8g}] 最大名义:[{bp.total_notional:.2f}U] "
-                    f"全局止损:[{bp.sl_price:.8g}] | 由同一条流水线立即全量铺单")
-        cyc.tick(w)                # 复用主流水线完成首轮铺单, 绝不另写一套铺单代码
+        logger.info(f"[周期] 开启新周期[{cycle_id}] {sig.direction.value} | 现价:[{w.price}] "
+                    f"层数:[{len(bp.layers)}] 总量:[{bp.total_qty:.8g}] "
+                    f"最大名义:[{bp.total_notional:.2f}U] 全局止损:[{bp.sl_price:.8g}] | "
+                    f"由同一条流水线立即全量铺单")
+        self._drive(cyc, w)             # 复用主流水线完成首轮铺单, 绝不另写一套铺单代码
 
     # ---------------- RECOVER ----------------
     def _recover_tick(self):
@@ -2688,13 +2850,7 @@ class MartinEngine:
         w = self._sense(cyc.direction.position_side)
         if w is None:
             return                      # 熔断: 世界观残缺, 本 Tick 安全空转
-        res = cyc.tick(w)
-        if res is TickResult.DONE:
-            self._finish_cycle(cyc)
-        elif res is TickResult.HALT:
-            logger.critical(f"[主循环] 周期[{cyc.cycle_id}]出现无法自动裁决的危险局面, "
-                            f"引擎转入 STOPPED 保留现场, 停止一切自动交易, 请立即人工介入")
-            self.state = EngineState.STOPPED
+        self._drive(cyc, w)
 
     def _finish_cycle(self, cyc: MartinCycle):
         reason = cyc.end_reason or EndReason.MANUAL_FLAT
@@ -2719,7 +2875,7 @@ class MartinEngine:
 
 
 # ==============================================================================
-# 12. 只读辅助线程 (看板 / 校时) —— 绝不参与任何决策
+# 12. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
 # ==============================================================================
 class DashboardThread(threading.Thread):
     def __init__(self, engine: MartinEngine, interval_sec=120):
@@ -2755,7 +2911,8 @@ class DashboardThread(threading.Thread):
                 f" 🔁 周期:[{c.cycle_id}] 方向:[{c.direction.value}] "
                 f"加仓层:[成交{filled}/在挂{live}/放弃{gave_up}/共{len(c.bp.layers)}]"
                 + ("  ⚠️已停止加仓" if c.add_suspended else "")
-                + (f"  🧹收尾中[{c.end_reason.value}]" if c.end_reason else ""),
+                + (f"  🧹收尾中[{c.end_reason.value}]" if c.end_reason else "")
+                + (f"  ⛔账本异常[{c.book_error}]" if c.book_error else ""),
                 f" 💰 虚拟持仓:[{c.book.open_qty:.8g}] 均价:[{c.book.avg:.8g}] "
                 f"浮亏盈:[{c.book.unrealized(e.last_price):+.4f}U] 已实现:[{c.book.realized:+.4f}U]",
                 f" 🎯 固定止盈价:[{tpp:.8g}](第{c.tp_layer_idx()}层/{e.cfg.tp_pct}%) "
@@ -2773,24 +2930,6 @@ class DashboardThread(threading.Thread):
         logger.info("\n".join(lines))
 
 
-class TimeSyncThread(threading.Thread):
-    """周期性刷新与交易所的时间差, 对抗长期运行的本地时钟漂移(-1021 的根因)。"""
-
-    def __init__(self, exchange, interval_sec=3600):
-        super().__init__(daemon=True)
-        self.ex = exchange
-        self.interval = interval_sec
-
-    def run(self):
-        while True:
-            time.sleep(self.interval)
-            try:
-                self.ex.load_time_difference()
-                logger.info(f"[校时] 已重新校准 | 偏差:[{self.ex.options.get('timeDifference', 0)}ms]")
-            except Exception as e:
-                logger.info(f"[校时] 本次校时失败, 保持旧偏差 | 错误:[{e}]")
-
-
 # ==============================================================================
 # 13. 进程编排
 # ==============================================================================
@@ -2801,8 +2940,8 @@ def run_single_strategy(cfg: MartinConfig):
     logging.getLogger().info(f"[进程] 子进程日志就绪 | 策略:[{cfg.strategy_id}] "
                              f"交易对:[{cfg.symbol}] 信号:[{cfg.signal_name}]")
 
-    # 单实例锁: 同一 strategy_id 绝不允许两个进程同时跑(否则双写账本 + 重复下单)
-    lock_path = f"martin_{cfg.strategy_id}.lock"
+    # 单实例锁(固定绝对目录): 同一 strategy_id 绝不允许两个进程同时跑, 也不允许换目录绕过
+    lock_path = data_path(f"martin_{cfg.strategy_id}.lock")
     try:
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
         if platform.system().lower() != "windows":
@@ -2811,7 +2950,7 @@ def run_single_strategy(cfg: MartinConfig):
         os.write(lock_fd, str(os.getpid()).encode())
     except Exception as e:
         logger.critical(f"[进程] 获取单实例锁失败, 疑有同名策略正在运行, 拒绝启动 | "
-                        f"策略:[{cfg.strategy_id}] 错误:[{e}]")
+                        f"策略:[{cfg.strategy_id}] 锁:[{lock_path}] 错误:[{e}]")
         return
 
     def _parent_watchdog():
@@ -2844,7 +2983,6 @@ def run_single_strategy(cfg: MartinConfig):
         logger.critical("[进程] 冷启动检查未通过, 进程退出")
         return
     DashboardThread(engine, interval_sec=120).start()
-    TimeSyncThread(exchange, interval_sec=3600).start()
     engine.run_forever()
 
 
@@ -2885,7 +3023,8 @@ def main_app():
         procs.append(p)
         logger.info(f"[系统] 已拉起策略进程 | 策略:[{c.strategy_id}] 交易对:[{c.symbol}] "
                     f"信号:[{c.signal_name}] PID:[{p.pid}]")
-    logger.info(f"[系统] 全部进程启动完毕, 主进程进入守护模式 | 进程数:[{len(procs)}]")
+    logger.info(f"[系统] 全部进程启动完毕, 主进程进入守护模式 | 进程数:[{len(procs)}] "
+                f"数据目录:[{DATA_DIR}]")
     try:
         for p in procs:
             p.join()
