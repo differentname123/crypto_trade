@@ -130,12 +130,22 @@ class OrderEvent:
 class GridConfig:
     """
     策略静态配置: 一个实例对应一个独立子进程。
+    [本版新增] 引入 account_name 账号标识，底层自动隔离同名策略的账本与 OID。
     direction 默认 LONG, 老配置无需任何改动即保持原做多语义。
     """
 
     def __init__(self, strategy_id, symbol, min_price, max_price, price_ratio, quantity,
-                 direction=GridDirection.LONG):
-        self.strategy_id = strategy_id
+                 direction=GridDirection.LONG, account_name="myself"):
+        self.account_name = account_name
+
+        # [核心安全修改] 底层强制隔离：拼接账号名前缀
+        # 物理层面杜绝不同账号跑同名策略时产生的账本文件竞争与 OID 冲突
+        self.strategy_id = f"{account_name}_{strategy_id}"
+        # 强行截断只保留前12个字符
+        if len(self.strategy_id) > 12:
+            logger.warning(f"[配置] 策略ID过长，截断为前12字符: {self.strategy_id[:12]}")
+            self.strategy_id = self.strategy_id[:12]
+
         self.symbol = symbol
         self.min_price = min_price
         self.max_price = max_price
@@ -147,7 +157,6 @@ class GridConfig:
     @property
     def is_long(self):
         return self.direction == GridDirection.LONG
-
 
 class NodeContext:
     """注入给每个 Node 的运行环境, 让状态机方法保持干净签名。"""
@@ -251,8 +260,9 @@ class StatisticsThread(threading.Thread):
             dir_cn, pos_cn = "做空网格(高卖低买)", "空头"
             open_label, close_label = "待卖出开空", "持空待买入"
 
+        # [修改点] 看板标题中直观显示属于哪个账号
         lines = [
-            f"\n========== [网格运行看板] {self.config.strategy_id} | {dir_cn} ==========",
+            f"\n========== [网格运行看板] 账号:[{self.config.account_name}] | 策略:[{self.config.strategy_id}] | {dir_cn} ==========",
             f" 📊 市场现价: {current_price:.6f} | 运行耗时: {uptime_str}",
             f" 📦 节点总计: {total_nodes} 个 | 构成: {open_label}[{wait_open_cnt}] "
             f"{close_label}[{wait_close_cnt}] 异常[{error_cnt}] 初始[{init_cnt}]",
@@ -331,6 +341,7 @@ class StatisticsThread(threading.Thread):
         logger.info("\n".join(lines))
 
 
+
 class OidCodec:
     """
     client_oid 编解码中枢
@@ -378,7 +389,10 @@ class GridLedger:
     COLUMNS = ["ts", "node_id", "cycle", "action", "client_oid", "price", "amount", "status", "msg"]
 
     def __init__(self, strategy_id):
-        self.filename = f"grid_ledger_{strategy_id}.csv"
+        # [修改点] 确保 logs 目录存在，并将账本存入该目录
+        os.makedirs("logs", exist_ok=True)
+        self.filename = os.path.join("logs", f"grid_ledger_{strategy_id}.csv")
+
         if not os.path.exists(self.filename):
             with open(self.filename, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(self.COLUMNS)
@@ -414,16 +428,12 @@ def guard_direction_consistency(config):
     【新增安全防线: 方向锁】
     以 sidecar 文件记录某个 strategy_id 首次运行时的网格方向。
     若本次配置方向与历史不一致, 立即终止该子进程。
-
-    为什么必须有这道锁:
-      账本与 client_oid 里只记录「买/卖动作」, 开平语义由方向推导。
-      若把跑过做多的 strategy_id 直接改成做空(或反之), 冷启动回溯会把
-      历史「买入开多单」误判为「买入平空单」, 从而 cycle+1 并再挂一张开仓卖单,
-      造成方向错误的连环开仓 —— 这是资金层面的灾难, 必须在启动前物理阻断。
-    切换方向的正确做法: 使用全新的 strategy_id (独立账本 + 独立 OID 命名空间)。
     """
-    path = f"grid_direction_{config.strategy_id}.lock"
+    # [修改点] 确保 logs 目录存在，并将方向锁存入该目录
+    os.makedirs("logs", exist_ok=True)
+    path = os.path.join("logs", f"grid_direction_{config.strategy_id}.lock")
     want = config.direction.value
+
     try:
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
@@ -433,7 +443,7 @@ def guard_direction_consistency(config):
                     f"[方向锁] 启动被拒绝: 策略ID[{config.strategy_id}]历史方向为[{saved}], "
                     f"本次配置却为[{want}]! 同一账本内多空语义互换会导致冷启动误判并反向开仓。"
                     f" 正确做法: 换一个全新的 strategy_id; 如确认账本已作废, 请手工删除 "
-                    f"[{path}] 与 [grid_ledger_{config.strategy_id}.csv] 后再启动")
+                    f"[{path}] 与 [logs/grid_ledger_{config.strategy_id}.csv] 后再启动")
                 raise SystemExit(1)
         else:
             with open(path, 'w', encoding='utf-8') as f:
@@ -443,7 +453,6 @@ def guard_direction_consistency(config):
         raise
     except Exception as e:
         logger.info(f"[方向锁] 方向一致性校验文件读写异常, 已跳过本次校验(不影响交易) | 错误:[{e}]")
-
 
 class ExchangeBroker:
     """
@@ -1052,7 +1061,9 @@ def run_single_strategy(config):
     safe_symbol = config.symbol.replace('/', '_').replace(':', '_')
     log_filename = f"{config.strategy_id}_{safe_symbol}"
     setup_logger(app_name=log_filename, force_reset=True)
-    logging.getLogger().info(f"[进程] 子进程独立日志就绪 | 策略:[{config.strategy_id}] "
+
+    # [修改点] 进程启动日志增加账号信息
+    logging.getLogger().info(f"[进程] 子进程独立日志就绪 | 账号:[{config.account_name}] 策略:[{config.strategy_id}] "
                              f"交易对:[{config.symbol}] 方向:[{config.direction.value}] "
                              f"日志文件:[{log_filename}.log]")
 
@@ -1068,8 +1079,10 @@ def run_single_strategy(config):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("myself_biance_api_copy_key")
-    secret_key = get_config("myself_biance_api_copy_secret")
+    # [核心修改点] 动态读取不同账号的 API 密钥
+    api_key = get_config(f"{config.account_name}_biance_api_copy_key")
+    secret_key = get_config(f"{config.account_name}_biance_api_copy_secret")
+
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890",
     }
@@ -1088,7 +1101,6 @@ def run_single_strategy(config):
     TimeSyncThread(exchange, interval_sec=3600).start()
 
     strategy.run_main_loop()
-
 
 def cancel_all_orders_for_symbol(exchange, symbol):
     """
@@ -1261,33 +1273,55 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
 def main_app():
     """主进程: 只负责读取配置、拉起并守护各个策略子进程。"""
     current_symbol = "0912"
-    # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
-    # 注: GridConfig 的 direction 默认 GridDirection.LONG, 以下做多配置保持原样, 无需改动
-    configs = [
 
+    # 消耗都是按照 max_price 降低 到理论最低价回撤比例来计算的，杠杆都算的是100
+    configs = [
+        # myself 账号配置
         GridConfig(
-            strategy_id=f"AVAX{20260828}", symbol="AVAX/USDT:USDT",
+            account_name="myself",
+            strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
             min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
         ),  # 消耗  1217  u 网格数量 95
 
+        # myself 账号配置
         GridConfig(
-            strategy_id=f"BTC{20260828}", symbol="BTC/USDT:USDT",
+            account_name="myself",
+            strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
             min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
         ),  # 消耗  1240  u 网格数量 67
 
         # ---------------- 做空网格示例 (需要时再解除注释) ----------------
-        # 做空要点:
-        #   1) strategy_id 必须全新(独立账本), 严禁复用做多用过的 ID;
-        #   2) 保证金占用按 "min_price 上涨到 max_price" 的最坏情形估算, 上方无界, 务必留足缓冲;
-        #   3) 启动瞬间会把【现价下方】的所有节点吃单开空(镜像做多时买上方), 请确认这是你想要的初始仓位;
-        #   4) 账户必须为双向持仓 Hedge Mode。
         GridConfig(
+            account_name="myself",
+            strategy_id=f"S-UNI{current_symbol}", symbol="UNI/USDT:USDT",
+            min_price=5, max_price=15, price_ratio=1.54, quantity=3,
+            direction=GridDirection.SHORT,
+        ),  # 消耗  1306  u 网格数量 71
+        # 总共节点和为 95 + 67 + 71 = 233 个节点, 预估总消耗约 1217 + 1240 + 1306 = 3763 u
+
+        # mama 账号配置
+        GridConfig(
+            account_name="mama",
+            strategy_id=f"AVAX{current_symbol}", symbol="AVAX/USDT:USDT",
+            min_price=2.5, max_price=8.56, price_ratio=1.3, quantity=12,
+        ),  # 消耗  1217  u 网格数量 95
+
+        # mama 账号配置
+        GridConfig(
+            account_name="mama",
+            strategy_id=f"BTC{current_symbol}", symbol="BTC/USDT:USDT",
+            min_price=50000, max_price=82363, price_ratio=0.74, quantity=0.001,
+        ),  # 消耗  1240  u 网格数量 67
+
+        # ---------------- 做空网格示例 (需要时再解除注释) ----------------
+        GridConfig(
+            account_name="mama",
             strategy_id=f"SHORT-UNI{current_symbol}", symbol="UNI/USDT:USDT",
             min_price=5, max_price=15, price_ratio=1.54, quantity=3,
             direction=GridDirection.SHORT,
-        ),# 消耗  1306  u 网格数量 71
-
+        ),  # 消耗  1306  u 网格数量 71
         # 总共节点和为 95 + 67 + 71 = 233 个节点, 预估总消耗约 1217 + 1240 + 1306 = 3763 u
+
     ]
     processes = []
     for config in configs:
@@ -1295,8 +1329,10 @@ def main_app():
         p.daemon = True  # 守护进程: 主进程退出/崩溃时自动带走子进程
         p.start()
         processes.append(p)
-        logger.info(f"[系统] 已拉起独立策略进程 | 策略:[{config.strategy_id}] 交易对:[{config.symbol}] "
-                    f"方向:[{config.direction.value}] PID:[{p.pid}]")
+
+        # [修改点] 启动日志加上账号标记
+        logger.info(f"[系统] 已拉起独立策略进程 | 账号:[{config.account_name}] 策略:[{config.strategy_id}] "
+                    f"交易对:[{config.symbol}] 方向:[{config.direction.value}] PID:[{p.pid}]")
 
     logger.info(f"[系统] 全部策略进程启动完毕, 主进程进入守护模式 | 进程数:[{len(processes)}]")
 
@@ -1306,7 +1342,6 @@ def main_app():
             p.join()
     except (KeyboardInterrupt, SystemExit):
         pass
-
 
 if __name__ == "__main__":
     main_app()
@@ -1329,7 +1364,7 @@ if __name__ == "__main__":
     #
     # # # 精准排查指定交易对的孤儿单和重复挂单
     # # target_symbol = "AVAX/USDT:USDT"
-    # # target_strategy_id = "AVAX20260828"
+    # # target_strategy_id = "AVAXcurrent_symbol"
     # #
     # # # 3. 调用排查函数
     # # inspect_orphan_and_duplicate_orders(
@@ -1340,7 +1375,7 @@ if __name__ == "__main__":
     #
     #
     # # 取消指定订单
-    # ghost_oid = "GD_AVAX20260828_N035_B_0_50729966"
+    # ghost_oid = "GD_AVAXcurrent_symbol_N035_B_0_50729966"
     # symbol = "AVAX/USDT:USDT"
     #
     # logger.info(f"正在寻找并精准撤销节点 N035 的幽灵单: {ghost_oid}")
