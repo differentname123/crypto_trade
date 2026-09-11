@@ -1046,7 +1046,7 @@ class MartinConfig:
                  #   P_sl - P_last = sign * (max_loss - loss_last) / Q_full
                  #   若设为 1.0, 最深层成交瞬间浮亏就 ≈ max_loss, 止损价会贴死在最深层成交价上,
                  #   最后一仓刚成交就被扫止损(甚至条件单被交易所拒为 -2021 立即触发)。
-                 max_signal_age_sec=90,
+                 max_signal_age_sec=31,
                  entry_timeout_sec=900,                # 入场超时: 一手未成则作废周期
                  max_cycle_sec=0,                      # 0=不限, 周期总超时强平
                  poll_interval_sec=2.0,
@@ -1113,34 +1113,48 @@ class SignalGate:
 
     def poll(self):
         """返回 Signal 或 None。信号源故障不得打断引擎, 故此处刻意吞掉异常并告警。"""
-        #  只取最后一行, 且最新行非 OPEN 时不推进水位线 —— 若信号源尾行是 CLOSE,
-        #        其之前尚未消费的 OPEN 将永远无法被消费。原有行为保留, 请业务侧确认是否符合预期。
         try:
             df = self.func(self.cfg.symbol)
             if df is None or df.empty:
                 return None
-            row = df.iloc[-1]
-            if str(row['event']).upper() != "OPEN":
-                return None                       # 马丁靠内部止盈止损平仓, 忽略外部 CLOSE
+
+            # 1. 过滤得到全部 OPEN 信号 (忽略 CLOSE，防止有效开仓信号被尾部平仓信号覆盖)
+            open_df = df[df['event'].astype(str).str.upper() == "OPEN"].copy()
+            if open_df.empty:
+                return None
+
+            # 2. 拒绝未来时间戳 (仅保留 timestamp <= 当前时间的信号)
+            current_ts = int(time.time() * 1000)
+            open_df = open_df[open_df['timestamp'] <= current_ts]
+            if open_df.empty:
+                return None
+
+            # 3. 按照时间戳升序排序，确保使用 iloc[-1] 拿到的是【最新】的有效 OPEN 信号
+            open_df = open_df.sort_values(by='timestamp', ascending=True)
+            row = open_df.iloc[-1]
+
             direction_str = str(row['direction']).upper()
             if direction_str not in (Direction.LONG.value, Direction.SHORT.value):
                 logger.info(f"[信号] 方向字段无法识别, 丢弃该行 | direction:[{direction_str}]")
                 return None
+
             ts, px = int(row['timestamp']), float(row['price'])
             if ts <= self.watermark_ts:
-                return None                       # 老信号, 静默跳过
-            age_sec = (time.time() * 1000 - ts) / 1000.0
+                return None  # 老信号, 静默跳过
+
+            # 复用上方获取的 current_ts 计算信号滞后时间
+            age_sec = (current_ts - ts) / 1000.0
             if age_sec > self.cfg.max_signal_age_sec:
                 logger.info(f"[信号] 信号已过期, 拒绝追单(避免在错误价位铺马丁) | 滞后:[{age_sec:.1f}s] "
                             f"上限:[{self.cfg.max_signal_age_sec}s] 信号ts:[{ts}]")
                 self.set_watermark(ts)
                 return None
+
             return Signal(Direction(direction_str), px, ts, self.cfg.signal_name)
         except Exception as e:
             logger.error(f"[信号] 读取信号源失败, 本轮视为无信号(请检查 {self.cfg.signal_name} "
                          f"返回的列是否为 timestamp/event/direction/price) | 错误:[{e}]")
             return None
-
 
 # ==============================================================================
 # 9. 马丁蓝图 (价格全静态固化: 开仓价 / 每层止盈价 / 全局止损价)
