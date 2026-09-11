@@ -67,6 +67,7 @@ from enum import Enum
 
 import pandas as pd
 
+from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow_factor_044_1
 from common_utils_lite import setup_logger, get_config
 
 logger = setup_logger(app_name="martin_trader")
@@ -86,7 +87,6 @@ except Exception:  # 缺失时给出安全占位, 保证本文件可独立导入
     def get_signal_1(symbol): return pd.DataFrame()
     def get_signal_2(symbol): return pd.DataFrame()
     def get_signal_3(symbol): return pd.DataFrame()
-
 SIGNAL_REGISTRY = {
     "get_signal_1": get_signal_1,
     "get_signal_2": get_signal_2,
@@ -2938,25 +2938,14 @@ def run_single_strategy(cfg):
 
 def main_app():
     configs = [
-        # ── 示例: BTC 用 signal_1, 2% 间距 / 2 倍加仓 / 0.8% 止盈 / 最大亏损 50U ──
+        # strategy_id 最长不能超过 8 个字符，并且只能由纯字母和数字组成
         # 层数不再配置, 由 max_loss_usdt × layer_loss_budget_ratio 自动推导
         MartinConfig(
-            strategy_id="B1", symbol="BTC/USDT:USDT", signal_name="get_signal_1",
-            first_qty=0.002, step_pct=2.0, qty_mult=2.0, tp_pct=0.8,
-            max_loss_usdt=50, layer_loss_budget_ratio=0.8,
-        ),
-        # ── 同一个币, 不同信号 + 不同马丁参数, 通过 strategy_id 完全隔离, 互不干扰 ──
-        MartinConfig(
-            strategy_id="B2", symbol="BTC/USDT:USDT", signal_name="get_signal_2",
-            first_notional=20, step_pct=1.2, qty_mult=1.8, tp_pct=0.5,
-            max_loss_usdt=30,
-        ),
-        # ── 另一个币 ──
-        MartinConfig(
-            strategy_id="U1", symbol="UNI/USDT:USDT", signal_name="get_signal_3",
-            first_qty=1, step_pct=2.5, qty_mult=2.0, tp_pct=1.0,
-            max_loss_usdt=40,
-        ),
+            strategy_id="AAVE0912", symbol="AAVE/USDT:USDT", signal_name="get_signal_1",
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
+            max_loss_usdt=120, layer_loss_budget_ratio=1,
+        )
+
     ]
 
     ids = [c.strategy_id for c in configs]

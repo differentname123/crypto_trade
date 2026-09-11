@@ -1376,12 +1376,150 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
     return run_live_pipeline(fetched_raw_data, strategy_params_list, run_logger)
 
 
+def generate_factor_044_1_signals(df):
+    """
+    梯度1: 超短线高频 (预期信号率: 8.0% - 9.0%)
+    计算 1m K 线的买入信号，并按照指定的格式返回 DataFrame。
+    """
+    # 数据长度校验，至少需要 win_break + win_base = 44 根 K 线
+    if df is None or len(df) < 44:
+        return pd.DataFrame()
+
+    symbol, coin_name = _resolve_identity(df)
+
+    # 提取需要的列名，防止各交易所字段名不一致
+    tcol = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    # 转换为数值类型以防报错
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+
+    win_break, win_base = 4, 40
+    boundary = low.shift(win_break).rolling(win_base).min()
+
+    # 生成 bool 类型的信号序列
+    signal_series = ((low.rolling(win_break).min() < boundary) & (close > boundary)).fillna(False).astype(bool)
+
+    # 过滤出触发信号的行
+    signal_df = df[signal_series].copy()
+
+    if signal_df.empty:
+        return pd.DataFrame()
+
+    # 根据要求构造最终的输出 DataFrame
+    res_df = pd.DataFrame()
+
+    # K 线自带的 timestamp 通常是开盘时间，1分钟K线的结束时间(也就是生成信号的时间)需加上 60*1000 毫秒
+    res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
+    # 调用原框架内的 _fmt_bjt 函数转化为北京时间字符串
+    res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
+
+    res_df['event'] = 'SIGNAL'
+    res_df['direction'] = 'LONG'
+    res_df['price'] = signal_df['close'].astype(float)
+
+    # 增加额外的有用字段
+    res_df['symbol'] = symbol
+    res_df['coin_name'] = coin_name
+    res_df['strategy_name'] = 'factor_044_1'
+
+    return res_df
+
+
+def execute_trading_bot_workflow_factor_044_1(target_time=None, symbol_list=None, proxy_url=None):
+    """
+    Factor 044_1 工作流（1m 线）：
+    拉取至少 30 天的 1m 级别数据，执行超短线高频突破信号逻辑，返回包含历史及最新信号的 DataFrame。
+    """
+    # [智能兼容参数传法]
+    # 如果用户没传 target_time，把 symbol_list 放到了第一个参数位置
+    if isinstance(target_time, list):
+        proxy_url = symbol_list if isinstance(symbol_list, str) else proxy_url
+        symbol_list = target_time
+        target_time = None
+
+    # [自动设置 target_time]
+    if not target_time:
+        target_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+
+    if not symbol_list:
+        raise ValueError("symbol_list 不能为空，请提供需要推演的标的列表")
+
+    label = 'factor_044_1'
+    timeframe = '1m'
+    lookback_days = 30  # 满足至少 30 天的要求
+
+    logger = setup_logger()
+    expected_rows = lookback_days * 1440 + 1
+
+    logger.info(f"🚀 [{label}/启动] 超短线高频信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
+                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
+
+    # 1. 并发拉取 1m K线数据
+    kline_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    logger.info(
+        f"✅ [{label}/取数完成] K线到位: [{sum(1 for s in symbol_list if not _frame_of(kline_map, s).empty)}/{len(symbol_list)}]")
+
+    # 2. 遍历标的计算信号
+    frames = []
+    skipped = []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+
+        # 补全标识
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            # 3. 传入刚刚生成的信号计算函数
+            sig_df = generate_factor_044_1_signals(df_kline)
+            if not sig_df.empty:
+                frames.append(sig_df)
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 的信号计算中断 | 原因: [{exc}]", exc_info=True)
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的: {skipped}")
+
+    # 4. 结果聚合与落盘
+    if not frames:
+        logger.info(f"► [{label}/收官] 过去 {lookback_days} 天内未产生任何有效信号")
+        # 按照需求返回带列名的空表
+        return pd.DataFrame(columns=['timestamp', 'timestamp_str', 'event', 'direction',
+                                     'price', 'symbol', 'coin_name', 'strategy_name'])
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+
+    # 按照时间戳与币种进行排序以便阅读
+    final_signals_df = final_signals_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
+
+    output_path = f"{label}_signals.csv"
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
+
+    return final_signals_df
 # =============================================================================
 # 七、程序入口（本地联调用）
 # =============================================================================
 if __name__ == "__main__":
-    target_time = (datetime.now() - timedelta(minutes=60)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['AIOT/USDT:USDT']
+    target_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+    symbol_list = ['AAVE/USDT:USDT']
 
     # 测试你的新策略（如果需要）：
-    execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+    # execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, 'http://127.0.0.1:7890')
+    execute_trading_bot_workflow_factor_044_1(target_time, symbol_list, 'http://127.0.0.1:7890')
