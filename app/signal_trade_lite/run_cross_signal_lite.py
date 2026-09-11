@@ -1440,7 +1440,7 @@ def execute_trading_bot_workflow_factor_044_1(target_time=None, symbol_list=None
 
     # [自动设置 target_time]
     if not target_time:
-        target_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+        target_time = (datetime.now() - timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
 
     if not symbol_list:
         raise ValueError("symbol_list 不能为空，请提供需要推演的标的列表")
