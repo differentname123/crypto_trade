@@ -1569,9 +1569,11 @@ class CycleCtx:
     def position(self, position_side: str, force: bool = False) -> Optional[float]:
         ts, side, qty = self._pos_cache
         if (not force) and side == position_side and time.time() - ts < POSITION_CACHE_SEC:
-            return qty
+            if qty is not None:  # [修复] 只有缓存了有效值才直接返回，防 None 穿透
+                return qty
         q = self.gw.fetch_position_qty(position_side)
-        self._pos_cache = (time.time(), position_side, q)
+        if q is not None:  # [修复] 只有获取成功才更新缓存，绝不缓存失败结果
+            self._pos_cache = (time.time(), position_side, q)
         return q
 
 
@@ -2109,38 +2111,37 @@ class MartinCycle:
         开仓层对齐 —— 两条互斥的平铺分支, 无任何递归:
           A. 正常铺单: 按蓝图补挂所有 NOT_PLACED 的层;
              触发总量硬闸 -> 丢弃本轮尚未发出的开仓计划, 就地转入分支 B;
-             现价已越过全局止损线 -> 一律不再新增任何加仓(空仓场景 Evaluate 已判 NO_FILL)。
           B. 停止加仓: 持续撤销所有存活开仓单, 直到全部拨到终态。
         """
+        # [修复] 越界时直接触发停止加仓，使其自然落入下方的撤单分支，防止 break 漏撤单
+        if self._crossed(w.price, self.bp.sl_price) and not self.add_suspended:
+            self._suspend_add(f"现价[{w.price}]已越过全局止损价[{self.bp.sl_price}], 停止一切加仓")
+
         if not self.add_suspended:
-            acts, now, crossed = [], w.ts, self._crossed(w.price, self.bp.sl_price)
+            acts, now = [], w.ts
             for lp in self.bp.layers:
                 if self._slot_state(lp) is not OrderState.NOT_PLACED:
-                    continue        # FILLED / DEAD / 在盘 / 锁定中 -> 一律不动
+                    continue  # FILLED / DEAD / 在盘 / 锁定中 -> 一律不动
                 if lp.abandoned or now < lp.next_retry_ts:
                     continue
-                if crossed:
-                    logger.info(f"[加仓] 现价[{w.price}]已越过全局止损价[{self.bp.sl_price}], "
-                                f"停止一切加仓(无论是否持仓)")
-                    break
                 if lp.attempts >= MAX_PLACE_ATTEMPTS:
                     self._abandon(lp, "超过最大尝试次数(该层放弃加仓, 周期用现有仓位收尾)")
                     continue
                 # I4 总量硬闸: 已成交 + 本层 不得超过蓝图总量
                 if self.book.total_open_filled + lp.qty > self.bp.total_qty * OVERFILL_TOLERANCE:
                     self._suspend_add(f"总量硬闸: 第{lp.layer}层将超出蓝图总量")
-                    acts = []       # 本轮此前规划的开仓计划全部作废, 转入撤单分支
+                    acts = []  # [修复] 清空本轮未发出的加仓计划，转入撤单分支
                     break
                 acts.append(Action.place("LIMIT", OrderRole.OPEN, lp.layer, lp.price, lp.qty, lp,
                                          f"第{lp.layer}层加仓(蓝图固定价)"))
             if not self.add_suspended:
                 return acts
 
+        # 分支 B：停止加仓，持续撤销所有存活的开仓单
         acts = []
         for t in self.registry.alive(OrderRole.OPEN):
             acts += self._cancel_action(t, w, "停止加仓: 撤销开仓单", include_pending=True)
         return acts
-
     def _clamp_exit_qty(self, real: Optional[float]) -> float:
         """
         【I8 统一夹逼入口】任何平仓/强平路径都必须经过这里, 绝不允许绕过。
@@ -2405,11 +2406,16 @@ class MartinCycle:
             logger.critical(f"[挂单] {tag} | 结果:[明确拒单-{res.kind.value}] 该 OID 永久停挂, "
                             f"处置交由下一轮对齐裁决 | 回执:[{res.err}]")
 
+        # [修复] 止损单彻底失败，立即触发强平收尾，利用许可检查阻断同 Tick 队列中的后续加仓(OPEN)动作
+        if a.role is OrderRole.SL and (slot is not None and slot.attempts >= MAX_PLACE_ATTEMPTS):
+            self._end(EndReason.SL_FORCED, "止损单被明确永久拒单，仓位不可裸奔，立即强平收尾")
+
         # 市价强平单没有槽位承载退避, 单独冷却: 防被连续拒单瞬间耗尽次数直接停机
         if a.kind == "MARKET":
             self.next_force_retry_ts = time.time() + FORCE_BACKOFF_SEC
         if slot is not None:
             slot.next_retry_ts = time.time() + backoff
+
 
     # ---------------------- 只读辅助 ----------------------
     def layer_stats(self) -> Tuple[int, int, int]:
