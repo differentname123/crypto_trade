@@ -1682,13 +1682,328 @@ def get_signal_factor_024_6(symbol):
         return pd.DataFrame()
 
 # =============================================================================
+# factor_043_10: 梯度10 极低频重要结构反转 (假突破做空)
+# =============================================================================
+def generate_factor_043_10_signals(df):
+    """
+    梯度10: 极低频重要结构反转 (预期信号率: 0.5% - 1.2%)
+    逻辑: 价格向上突破前高界限后，收盘价却跌回界限之下，捕捉假突破做空信号。
+    """
+    # 数据长度校验，至少需要 win_break + win_base = 1215 根 K 线
+    if df is None or len(df) < 1215:
+        return pd.DataFrame()
+
+    symbol, coin_name = _resolve_identity(df)
+    tcol = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    high = df['high'].astype(float)
+    close = df['close'].astype(float)
+
+    win_break, win_base = 15, 1200
+    boundary = high.shift(win_break).rolling(win_base).max()
+
+    # 生成 bool 类型的信号序列
+    signal_series = ((high.rolling(win_break).max() > boundary) & (close < boundary)).fillna(False).astype(bool)
+    signal_df = df[signal_series].copy()
+
+    if signal_df.empty:
+        return pd.DataFrame()
+
+    res_df = pd.DataFrame()
+    res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
+    res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
+    res_df['event'] = 'OPEN'
+    res_df['direction'] = 'SHORT'  # 假突破，做空
+    res_df['price'] = signal_df['close'].astype(float)
+    res_df['symbol'] = symbol
+    res_df['coin_name'] = coin_name
+    res_df['strategy_name'] = 'factor_043_10'
+
+    return res_df
+
+
+def execute_trading_bot_workflow_factor_043_10(target_time=None, symbol_list=None, proxy_url=None):
+    if isinstance(target_time, list):
+        proxy_url = symbol_list if isinstance(symbol_list, str) else proxy_url
+        symbol_list = target_time
+        target_time = None
+
+    if not target_time:
+        target_time = (datetime.now() - timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+    if not symbol_list:
+        raise ValueError("symbol_list 不能为空，请提供需要推演的标的列表")
+
+    label = 'factor_043_10'
+    timeframe = '1m'
+    lookback_days = 30  # 30天的1m数据量涵盖1215根K线绰绰有余
+
+    logger = setup_logger()
+    expected_rows = lookback_days * 1440 + 1
+
+    logger.info(f"🚀 [{label}/启动] 极低频重要结构反转(做空)信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
+                f"预热天数: [{lookback_days}] | 目标时刻: [{target_time}]")
+
+    kline_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                                 target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
+
+    frames, skipped = [], []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            sig_df = generate_factor_043_10_signals(df_kline)
+            if not sig_df.empty:
+                frames.append(sig_df)
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 的信号计算中断 | 原因: [{exc}]", exc_info=True)
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的: {skipped}")
+    if not frames:
+        logger.info(f"► [{label}/收官] 过去 {lookback_days} 天内未产生任何有效信号")
+        return pd.DataFrame(columns=['timestamp', 'timestamp_str', 'event', 'direction',
+                                     'price', 'symbol', 'coin_name', 'strategy_name'])
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+    final_signals_df = final_signals_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
+    output_path = f"{label}_signals.csv"
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
+    return final_signals_df
+
+
+def get_signal_factor_043_10(symbol):
+    logger = setup_logger()
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+    try:
+        df = execute_trading_bot_workflow_factor_043_10(target_time=None, symbol_list=[symbol], proxy_url=proxy_url)
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_043_10 发生异常: {e}")
+        return pd.DataFrame()
+
+
+# =============================================================================
+# factor_043_9: 梯度9 大周期关键位猎杀 (假突破做空)
+# =============================================================================
+def generate_factor_043_9_signals(df):
+    """
+    梯度9: 大周期关键位猎杀 (预期信号率: 1.0% - 1.8%)
+    """
+    # 数据长度校验，至少需要 win_break + win_base = 735 根 K 线
+    if df is None or len(df) < 735:
+        return pd.DataFrame()
+
+    symbol, coin_name = _resolve_identity(df)
+    tcol = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    high = df['high'].astype(float)
+    close = df['close'].astype(float)
+
+    win_break, win_base = 15, 720
+    boundary = high.shift(win_break).rolling(win_base).max()
+
+    signal_series = ((high.rolling(win_break).max() > boundary) & (close < boundary)).fillna(False).astype(bool)
+    signal_df = df[signal_series].copy()
+
+    if signal_df.empty:
+        return pd.DataFrame()
+
+    res_df = pd.DataFrame()
+    res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
+    res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
+    res_df['event'] = 'OPEN'
+    res_df['direction'] = 'SHORT'  # 假突破，做空
+    res_df['price'] = signal_df['close'].astype(float)
+    res_df['symbol'] = symbol
+    res_df['coin_name'] = coin_name
+    res_df['strategy_name'] = 'factor_043_9'
+
+    return res_df
+
+
+def execute_trading_bot_workflow_factor_043_9(target_time=None, symbol_list=None, proxy_url=None):
+    if isinstance(target_time, list):
+        proxy_url = symbol_list if isinstance(symbol_list, str) else proxy_url
+        symbol_list = target_time
+        target_time = None
+
+    if not target_time:
+        target_time = (datetime.now() - timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+    if not symbol_list:
+        raise ValueError("symbol_list 不能为空")
+
+    label = 'factor_043_9'
+    timeframe = '1m'
+    lookback_days = 30
+
+    logger = setup_logger()
+    expected_rows = lookback_days * 1440 + 1
+    logger.info(f"🚀 [{label}/启动] 大周期关键位猎杀(做空)信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}]")
+
+    kline_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                                 target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
+
+    frames, skipped = [], []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            sig_df = generate_factor_043_9_signals(df_kline)
+            if not sig_df.empty:
+                frames.append(sig_df)
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 信号计算中断", exc_info=True)
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的")
+    if not frames:
+        return pd.DataFrame(columns=['timestamp', 'timestamp_str', 'event', 'direction',
+                                     'price', 'symbol', 'coin_name', 'strategy_name'])
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+    final_signals_df = final_signals_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
+    output_path = f"{label}_signals.csv"
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
+    return final_signals_df
+
+
+def get_signal_factor_043_9(symbol):
+    logger = setup_logger()
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+    try:
+        df = execute_trading_bot_workflow_factor_043_9(target_time=None, symbol_list=[symbol], proxy_url=proxy_url)
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_043_9 发生异常: {e}")
+        return pd.DataFrame()
+
+
+# =============================================================================
+# factor_044_10: 梯度10 极低频重要结构反转 (假跌破做多)
+# =============================================================================
+def generate_factor_044_10_signals(df):
+    """
+    梯度10: 极低频重要结构反转 (预期信号率: 0.5% - 1.2%)
+    逻辑: 价格向下跌破前低界限后，收盘价却收回界限之上，捕捉假跌破做多信号。
+    """
+    # 数据长度校验，至少需要 win_break + win_base = 1215 根 K 线
+    if df is None or len(df) < 1215:
+        return pd.DataFrame()
+
+    symbol, coin_name = _resolve_identity(df)
+    tcol = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+
+    win_break, win_base = 15, 1200
+    boundary = low.shift(win_break).rolling(win_base).min()
+
+    # 跌破界限，但收盘拉回界限之上
+    signal_series = ((low.rolling(win_break).min() < boundary) & (close > boundary)).fillna(False).astype(bool)
+    signal_df = df[signal_series].copy()
+
+    if signal_df.empty:
+        return pd.DataFrame()
+
+    res_df = pd.DataFrame()
+    res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
+    res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
+    res_df['event'] = 'OPEN'
+    res_df['direction'] = 'LONG'  # 假跌破，做多
+    res_df['price'] = signal_df['close'].astype(float)
+    res_df['symbol'] = symbol
+    res_df['coin_name'] = coin_name
+    res_df['strategy_name'] = 'factor_044_10'
+
+    return res_df
+
+
+def execute_trading_bot_workflow_factor_044_10(target_time=None, symbol_list=None, proxy_url=None):
+    if isinstance(target_time, list):
+        proxy_url = symbol_list if isinstance(symbol_list, str) else proxy_url
+        symbol_list = target_time
+        target_time = None
+
+    if not target_time:
+        target_time = (datetime.now() - timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+    if not symbol_list:
+        raise ValueError("symbol_list 不能为空")
+
+    label = 'factor_044_10'
+    timeframe = '1m'
+    lookback_days = 30
+
+    logger = setup_logger()
+    expected_rows = lookback_days * 1440 + 1
+    logger.info(f"🚀 [{label}/启动] 极低频重要结构反转(做多)信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}]")
+
+    kline_map = snipe_kline_data(symbol_list=symbol_list, timeframe=timeframe, days=lookback_days,
+                                 target_time_str=target_time, use_ws=True, use_rest=True, proxy_url=proxy_url)
+
+    frames, skipped = [], []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            sig_df = generate_factor_044_10_signals(df_kline)
+            if not sig_df.empty:
+                frames.append(sig_df)
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 信号计算中断", exc_info=True)
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的")
+    if not frames:
+        return pd.DataFrame(columns=['timestamp', 'timestamp_str', 'event', 'direction',
+                                     'price', 'symbol', 'coin_name', 'strategy_name'])
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+    final_signals_df = final_signals_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
+    output_path = f"{label}_signals.csv"
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
+    return final_signals_df
+
+
+def get_signal_factor_044_10(symbol):
+    logger = setup_logger()
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+    try:
+        df = execute_trading_bot_workflow_factor_044_10(target_time=None, symbol_list=[symbol], proxy_url=proxy_url)
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_044_10 发生异常: {e}")
+        return pd.DataFrame()
+
+# =============================================================================
 # 七、程序入口（本地联调用）
 # =============================================================================
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['SOL/USDT:USDT']
+    symbol_list = ['BNB/USDT:USDT']
 
     # 测试你的新策略（如果需要）：
     # execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, 'http://127.0.0.1:7890')
     # execute_trading_bot_workflow_factor_044_1(target_time, symbol_list, 'http://127.0.0.1:7890')
-    get_signal_factor_024_6(symbol_list[0])
+    get_signal_factor_044_10(symbol_list[0])

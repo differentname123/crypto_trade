@@ -83,13 +83,15 @@ from biance_order_lite import (
 # ------------------------------------------------------------------------------
 # 外部信号源: 名称 -> 函数。
 # ------------------------------------------------------------------------------
-from app.signal_trade_lite.run_cross_signal_lite import get_signal_factor_024_6, \
-    get_signal_factor_044_1
+from app.signal_trade_lite.run_cross_signal_lite import get_signal_factor_044_1, get_signal_factor_043_10, get_signal_factor_043_9, get_signal_factor_044_10
 
 # 注册新的信号源
 SIGNAL_REGISTRY = {
     "factor_044_1": get_signal_factor_044_1,
-    "factor_024_6": get_signal_factor_024_6,
+    "factor_043_10": get_signal_factor_043_10,
+    "factor_043_9":get_signal_factor_043_9,
+    "factor_044_10": get_signal_factor_044_10,
+
 }
 
 # ==============================================================================
@@ -3233,23 +3235,48 @@ def main_app():
     configs = [
         # strategy_id 最长不能超过 8 个字符，并且只能由纯字母和数字组成
         # 层数不再配置, 由 max_loss_usdt × layer_loss_budget_ratio 自动推导
+
+        # AAVE factor_044_1,多 (Long),a: 3.0% / tp: 0.6%,M6,"13,302",17.00 M,16 次,100.0%,39.4 天
         MartinConfig(
-            strategy_id="AAVE0912",
+            strategy_id="AAVEL12",
             symbol="AAVE/USDT:USDT",
             # ===== 修改此处 =====
             signal_name="factor_044_1",
             # ===================
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
-            max_loss_usdt=120, layer_loss_budget_ratio=1,
+            max_loss_usdt=12 * 6, layer_loss_budget_ratio=1,
         ),
+
+        # AAVE factor_043_10,空 (Short),a: 1.5% / tp: 0.7%,M7,"4,234",12.90 M,17 次,69.8%,35.2 天
+        MartinConfig(
+            strategy_id="AAVES12",
+            symbol="AAVE/USDT:USDT",
+            # ===== 修改此处 =====
+            signal_name="factor_043_10",
+            # ===================
+            first_qty=0.1, step_pct=1.5, qty_mult=2, tp_pct=0.7,
+            max_loss_usdt=12 * 7, layer_loss_budget_ratio=1,
+        ),
+        # SOL factor_043_9,空 (Short),a: 3.0% / tp: 0.8%,M9,"3,636",5.23 M,7 次,85.6%,75.0 天
         MartinConfig(
             strategy_id="SOL0912",
             symbol="SOL/USDT:USDT",
             # ===== 修改此处 =====
-            signal_name="factor_024_6",
+            signal_name="factor_043_9",
             # ===================
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
-            max_loss_usdt=100, layer_loss_budget_ratio=1,
+            max_loss_usdt=10 * 9, layer_loss_budget_ratio=1,
+        ),
+
+        # BNB factor_044_10,多 (Long),a: 2.0% / tp: 1.0%,M8,"1,778",13.56 M,8 次,71.7%,45.9 天
+        MartinConfig(
+            strategy_id="BNB0912",
+            symbol="BNB/USDT:USDT",
+            # ===== 修改此处 =====
+            signal_name="factor_044_10",
+            # ===================
+            first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
+            max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
         )
     ]
 
