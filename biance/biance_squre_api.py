@@ -1764,6 +1764,17 @@ if __name__ == "__main__":
 
     logger.info("========== 🚀 开始全量数据抓取测试 ==========")
 
+
+    # 0. 获取该帖子的评论数据 (例如拉取前 50 条热门评论，sort_by=1 表示热门)
+    target_post_id = "309692475255842"  # 替换为实际的帖子 ID
+    logger.info(f"⏳ 正在拉取帖子评论: {target_post_id} ...")
+    comments = fetch_binance_replies(
+        content_id=target_post_id,
+        sort_by=1,  # 1: 热门评论, 2: 最新评论
+        required_count=50  # 需要拉取的数量
+    )
+    logger.info(f"✅ 评论数据获取成功 | 实际拉取数量: {len(comments)} 条")
+
     # 1. 抓取推荐流
     logger.info("--- 1. 准备抓取: 推荐流 ---")
     recommend_data = fetch_binance_feed(count=100)
