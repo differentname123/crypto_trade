@@ -1610,7 +1610,7 @@ def execute_trading_bot_workflow_factor_024_6(target_time=None, symbol_list=None
     expected_rows = lookback_days * 1440 + 1
 
     logger.info(f"🚀 [{label}/启动] 因子信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
-                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
+                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}] 目标symbol_list：{symbol_list}")
 
     kline_map = snipe_kline_data(
         symbol_list=symbol_list,
