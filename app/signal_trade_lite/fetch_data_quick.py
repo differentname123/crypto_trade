@@ -108,8 +108,7 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
             misses += 1
 
     cost = time.time() - t0
-    logger.info(
-        f"{log_prefix} [CACHE] ♻️ 智能缓存装载 | hit={hits} miss={misses} load_cost={cost:.2f}s latest={latest_times}")
+    # logger.info(f"{log_prefix} [CACHE] ♻️ 智能缓存装载 | hit={hits} miss={misses} load_cost={cost:.2f}s latest={latest_times}")
 
     return memory_pool, fetch_since_map
 
@@ -273,8 +272,8 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
             phase = tracker.get('phase', 'HIST')
             prefix = tracker.get('log_prefix', '')
             latest_time_str = _format_bj_time(tracker['latest_ts']) if tracker['latest_ts'] > 0 else 'N/A'
-            logger.info(
-                f"{prefix} [{phase}] 📦 缺口历史补齐就绪 | done={tracker['done']}/{tracker['total']} fetched_rows={tracker['fetched_rows']} max_cost={tracker['max_cost']:.2f}s latest_time={latest_time_str}")
+            # logger.info(
+            #     f"{prefix} [{phase}] 📦 缺口历史补齐就绪 | done={tracker['done']}/{tracker['total']} fetched_rows={tracker['fetched_rows']} max_cost={tracker['max_cost']:.2f}s latest_time={latest_time_str}")
 
 
 async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=""):
@@ -287,7 +286,7 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(stream_url, proxy=proxy_url, heartbeat=10) as ws:
-                    logger.info(f"{log_prefix} [WSS] ✅ 数据总线已建连 | streams={len(ws_symbols)}")
+                    # logger.info(f"{log_prefix} [WSS] ✅ 数据总线已建连 | streams={len(ws_symbols)}")
                     attempt = 0  # 成功连接并准备接收数据，重置退避计数
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -444,13 +443,12 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
                     logger.error(f"{log_prefix} [INIT] load_markets 彻底失败，将抛出给上层接管: {e}")
                     raise
 
-        await check_time_sync(exchange, log_prefix)
+        # await check_time_sync(exchange, log_prefix)
         # 1. 计算时间参数
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
             exchange, timeframe, days, target_time_str)
 
-        logger.info(
-            f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={len(symbol_list)} days={days}")
+        # logger.info(f"{log_prefix} [INIT] 🚀 极速引擎发车 | target={_format_bj_time(target_time_ms)}(+0800) symbols={symbol_list} days={days}")
 
         # 2. 智能缓存装载 & 内存池初始化
         memory_pool, fetch_since_map = load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe,
@@ -502,8 +500,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         # 战术休眠第二阶段：死等最后 5 秒，再瞬间点爆无延迟脉冲 REST
         sleep_to_rest = target_close_time_ms - 5000 - exchange.milliseconds()
         if sleep_to_rest > 0:
-            logger.info(
-                f"{log_prefix} [SYNC] 💤 挂起等待收线冲刺(最后5s) | sleep={sleep_to_rest / 1000:.1f}s next_action=脉冲轮询兜底")
+            # logger.info(f"{log_prefix} [SYNC] 💤 挂起等待收线冲刺(最后5s) | sleep={sleep_to_rest / 1000:.1f}s next_action=脉冲轮询兜底")
             await asyncio.sleep(sleep_to_rest / 1000)
 
         if use_rest:

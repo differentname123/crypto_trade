@@ -1454,7 +1454,7 @@ def execute_trading_bot_workflow_factor_044_1(target_time=None, symbol_list=None
     expected_rows = lookback_days * 1440 + 1
 
     logger.info(f"🚀 [{label}/启动] 超短线高频信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
-                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
+                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}] 目标symbol_list：{symbol_list}")
 
     # 1. 并发拉取 1m K线数据
     kline_map = snipe_kline_data(
@@ -1467,8 +1467,7 @@ def execute_trading_bot_workflow_factor_044_1(target_time=None, symbol_list=None
         proxy_url=proxy_url
     )
 
-    logger.info(
-        f"✅ [{label}/取数完成] K线到位: [{sum(1 for s in symbol_list if not _frame_of(kline_map, s).empty)}/{len(symbol_list)}]")
+
 
     # 2. 遍历标的计算信号
     frames = []
@@ -1623,8 +1622,6 @@ def execute_trading_bot_workflow_factor_024_6(target_time=None, symbol_list=None
         proxy_url=proxy_url
     )
 
-    logger.info(
-        f"✅ [{label}/取数完成] K线到位: [{sum(1 for s in symbol_list if not _frame_of(kline_map, s).empty)}/{len(symbol_list)}]")
 
     frames = []
     skipped = []
