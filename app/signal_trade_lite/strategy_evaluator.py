@@ -1023,7 +1023,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         return str(val)
 
     # === 核心调整 2：按照排好序的策略列表依次打印 ===
-    target_strategy_name_list = ["factor_007_2", "factor_007_1", "factor_023_6", "factor_023_6", "factor_044_10"]
+    target_strategy_name_list = ["factor"]
 
     index_count = 0
     for strategy_name in sorted_strategies:
