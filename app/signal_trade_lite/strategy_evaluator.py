@@ -986,11 +986,11 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
                     ]
 
     display_cols = ["Margin",  "币种", "加仓间距", "止盈间距",
-                    # "实际开仓数",
+                    "实际开仓数",
                     # "0-1层解决战斗比例(%)",
-                    # "爆仓次数",
+                    "爆仓次数",
                     "预期存活(天)",
-                    # "平均持仓(h)",
+                    "平均持仓(h)",
                     # "持仓时间占比(%)",
                     "总收益(M倍)", "净利润(M倍)",
                     # "全币邻居数",
