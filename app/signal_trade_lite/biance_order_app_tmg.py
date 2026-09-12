@@ -2882,94 +2882,287 @@ class DashboardThread(threading.Thread):
                 logger.info(f"[看板] 聚合异常(绝不影响交易主流程) | 错误:[{e}]")
 
     def _get_account_snapshot(self):
-        """获取账户级别的快照信息：总权益，仓位个数，挂单数量"""
-        t0 = time.perf_counter()
-        total_equity = None
-        pos_count = None
-        order_count = None
-        try:
-            ex = self.eng.gw.ex
+        """只读采样 U 本位账户；任一挂单通道失败，总挂单数保持未知。"""
+        from math import isfinite
 
-            # 1. 获取总权益 (包含未实现盈亏的动态总权益)
+        started = time.perf_counter()
+        ex = self.eng.gw.ex
+        errors = []
+
+        def read(label, fetch):
             try:
-                balance = ex.fetch_balance()
-                total_equity = float(balance['info']['totalMarginBalance'])
-            except Exception as e:
-                logger.error(f"[快照] 获取总权益失败: {e}")
+                return fetch()
+            except Exception as exc:
+                detail = " ".join(str(exc).split())[:180]
+                errors.append(f"{label}失败({type(exc).__name__}: {detail})")
+                return None
 
-            # 2. 获取所有持仓，筛选出有实际仓位的 (positionAmt/contracts != 0)
-            try:
-                positions = ex.fetch_positions()
-                pos_count = sum(1 for p in positions if
-                                abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt', 0))) > 0)
-            except Exception as e:
-                logger.error(f"[快照] 获取持仓数量失败: {e}")
+        def equity():
+            balance = ex.fetch_balance(params={"type": "future"})
+            value = float(balance["info"]["totalMarginBalance"])
+            if not isfinite(value):
+                raise ValueError("总权益不是有效数值")
+            return value
 
-            # 3. 获取挂单数量 (全局所有挂单)
-            try:
-                # 【修复】：显式关闭 ccxt 对无 symbol 查询全账户挂单的拦截警告
-                ex.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
-                open_orders = ex.fetch_open_orders()
-                order_count = len(open_orders)
-            except Exception as e:
-                logger.error(f"[快照] 获取挂单数量失败: {e}")
+        def positions_count():
+            positions = ex.fetch_positions(params={"type": "future"})
+            if not isinstance(positions, list):
+                raise ValueError("持仓接口未返回列表")
+            count = 0
+            for p in positions:
+                qty = p.get("contracts")
+                if qty is None:
+                    qty = (p.get("info") or {})["positionAmt"]
+                qty = float(qty)
+                if not isfinite(qty):
+                    raise ValueError("持仓数量不是有效数值")
+                count += abs(qty) > 0
+            return count
 
-            latency = int((time.perf_counter() - t0) * 1000)
-            logger.info(
-                f"[快照] 账户拉取完成 耗时:{latency}ms | 总权益:{total_equity} USD | 仓位:{pos_count}个 | 挂单:{order_count}笔")
-            return total_equity, pos_count, order_count
-        except Exception as e:
-            latency = int((time.perf_counter() - t0) * 1000)
-            logger.error(f"[快照] 整体拉取失败 耗时:{latency}ms | {e}")
-            return None, None, None
+        def index_orders(fetch, id_key):
+            rows = fetch({})  # 不传 symbol：覆盖该 U 本位账户的所有交易对。
+            if not isinstance(rows, list):
+                raise ValueError("挂单接口未返回列表，不能视为零挂单")
+            return {(str(o["symbol"]), str(o[id_key])): o for o in rows}
 
+        total_equity = read("总权益", equity)
+        pos_count = read("持仓数量", positions_count)
+
+        # 分别使用两个原生接口，不依赖 ccxt 统一接口的条件单路由配置，
+        # 也不在看板线程修改交易线程共用的 ex.options。
+        normal = read("普通挂单", lambda: index_orders(
+            ex.fapiPrivateGetOpenOrders, "orderId"))
+        algo = read("条件挂单", lambda: index_orders(
+            ex.fapiPrivateGetOpenAlgoOrders, "algoId"))
+
+        normal_count = len(normal) if normal is not None else None
+        algo_count = None
+        if algo is not None:
+            # 只用明确的子订单关联去重；orderId 和 algoId 是不同编号空间。
+            # 条件单已生成普通单且该普通单仍在挂时，只在普通单中计一次。
+            algo_count = sum(
+                not (normal is not None and
+                     str(o.get("actualOrderId") or "") not in ("", "0") and
+                     (str(o["symbol"]), str(o["actualOrderId"])) in normal)
+                for o in algo.values()
+            )
+
+        return {
+            "equity": total_equity,
+            "positions": pos_count,
+            "normal_orders": normal_count,
+            "algo_orders": algo_count,
+            "orders": (normal_count + algo_count
+                       if normal_count is not None and algo_count is not None else None),
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "errors": errors,
+        }
 
     def _report(self):
-        """把引擎全部关键状态聚合为【单条】多行日志, 降低排查时的认知成本。"""
+        """聚合一条业务看板日志；只读引擎状态，不修改交易或记账逻辑。"""
+        from datetime import timedelta, timezone
+        from math import isfinite
+
+        beijing = timezone(timedelta(hours=8))
+
+        def duration(seconds):
+            seconds = max(0, int(seconds))
+            days, seconds = divmod(seconds, 86400)
+            hours, seconds = divmod(seconds, 3600)
+            minutes, seconds = divmod(seconds, 60)
+            return (f"{days}天" if days else "") + f"{hours}时{minutes}分{seconds}秒"
+
+        def bj_time(seconds, empty="暂无"):
+            try:
+                if not seconds or seconds <= 0:
+                    return empty
+                return datetime.fromtimestamp(
+                    seconds, beijing
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OverflowError, OSError):
+                return "时间无效"
+
+        def count_text(value):
+            return "未知" if value is None else str(value)
+
+        state_names = {
+            EngineState.IDLE: "等待开仓信号",
+            EngineState.RECOVER: "恢复接管中",
+            EngineState.ACTIVE: "周期运行中",
+            EngineState.STOPPED: "已停机，等待人工处理",
+        }
+        reason_names = {
+            EndReason.TP: "止盈完成",
+            EndReason.SL: "止损成交",
+            EndReason.SL_FORCED: "止损兜底平仓",
+            EndReason.NO_FILL: "未成交结束",
+            EndReason.TIMEOUT: "周期超时",
+            EndReason.MANUAL_FLAT: "外部平仓",
+        }
+        order_names = {
+            OrderState.PENDING: "提交待确认",
+            OrderState.LIVE: "已挂出",
+            OrderState.CANCEL_PENDING: "撤单待确认",
+            OrderState.FILLED: "已成交",
+            OrderState.DEAD: "已失效",
+            OrderState.NOT_PLACED: "未挂出",
+        }
+
+        account = self._get_account_snapshot()
+
+        # 慢速网络采样完成后，再读取本地状态；以下阶段不发网络请求。
+        # 这是跨线程只读观测，不宣称与交易线程构成原子快照。
         e = self.eng
-        up = int(time.time() - self.t0)
-
-        # 拉取并格式化快照信息
-        snap_equity, snap_pos, snap_orders = self._get_account_snapshot()
-        equity_str = f"{snap_equity:.2f} USD" if snap_equity is not None else "获取失败"
-        pos_str = f"{snap_pos}个" if snap_pos is not None else "获取失败"
-        order_str = f"{snap_orders}笔" if snap_orders is not None else "获取失败"
-        snapshot_str = f" 🏦 账户快照:[总权益 {equity_str} | 持仓 {pos_str} | 挂单 {order_str}]"
-
-        lines = [f"\n========== [择时马丁看板] 策略:[{e.cfg.strategy_id}] 交易对:[{e.cfg.symbol}] ==========",
-                 snapshot_str,
-                 f" 🧭 状态:[{e.state.value}] 现价:[{e.last_price}] "
-                 f"运行:[{up // 3600}h{up % 3600 // 60}m]",
-                 f" 📈 已完成周期:[{e.cycles_done}] 累计已实现:[{e.pnl_total:+.4f}U] "
-                 f"信号水位线:[{e.gate.watermark_ts}]"]
-
         c = e.cycle
+        state = e.state
+        now = time.time()
+        price = float(e.last_price or 0.0)
+        valid_price = isfinite(price) and price > 0
+        price_text = f"{price:.8g}" if valid_price else "暂无有效报价"
+        state_text = state_names.get(state, str(state))
+        if state is EngineState.ACTIVE and c is not None and c.end_reason:
+            state_text = "周期收尾中"
+
+        equity_text = (f"{account['equity']:.2f} USD"
+                       if account["equity"] is not None else "未知")
+        lines = [
+            f"\n========== [择时马丁看板] 策略:[{e.cfg.strategy_id}] "
+            f"交易对:[{e.cfg.symbol}] ==========",
+
+            f" 🏦 U本位账户:[总权益 {equity_text} | "
+            f"非零持仓 {count_text(account['positions'])}笔(多空分计) | "
+            f"挂单 {count_text(account['orders'])}笔 "
+            f"= 普通 {count_text(account['normal_orders'])} "
+            f"+ 条件 {count_text(account['algo_orders'])}]",
+
+            f" 🧭 状态:[{state_text}] 最近采样价:[{price_text}] "
+            f"本次运行:[{duration(now - self.t0)}]",
+
+            f" 📈 本次启动后结算:[已完成 {e.cycles_done}个周期 | "
+            f"已结算周期盈亏 {e.pnl_total:+.4f}U]",
+
+            f" 📡 信号已处理至:[{bj_time(e.gate.watermark_ts / 1000, '尚未处理信号')}] "
+            f"北京时间(UTC+8)",
+        ]
+
+        notices = list(account["errors"])
         if c is None:
-            lines.append(" 💤 当前无进行中周期, 空闲监听信号中")
+            if state is EngineState.IDLE:
+                lines.append(" 💤 当前无进行中周期，正在等待开仓信号")
+            elif state is EngineState.RECOVER:
+                lines.append(" 🔁 当前周期尚未接管，等待恢复；暂停接收新开仓信号")
+            else:
+                lines.append(" ⏸ 当前无已接管周期，请结合上述状态及最近主循环日志排查")
         else:
-            filled, live, gave_up = c.layer_stats()
-            slp, tpp = c.bp.sl_price, c.current_tp_price()
-            alive = c.registry.alive()
-            lines += [
-                f" 🔁 周期:[{c.cycle_id}] 方向:[{c.direction.value}] "
-                f"加仓层:[成交{filled}/在挂{live}/放弃{gave_up}/共{len(c.bp.layers)}]"
-                + ("  ⚠️已停止加仓" if c.add_suspended else "")
-                + (f"  🧹收尾中[{c.end_reason.value}]" if c.end_reason else "")
-                + (f"  ⛔账本异常[{c.book_error}]" if c.book_error else ""),
-                f" 💰 虚拟持仓:[{c.book.open_qty:.8g}] 均价:[{c.book.avg:.8g}] "
-                f"浮动盈亏:[{c.book.unrealized(e.last_price):+.4f}U] "
-                f"已实现:[{c.book.realized:+.4f}U]",
-                f" 🎯 固定止盈价:[{tpp:.8g}](第{c.tp_layer_idx()}层/{e.cfg.tp_pct}%) "
-                f"🛑 全局固定止损价:[{slp:.8g}](最大亏损{e.cfg.max_loss_usdt}U) | "
-                f"TP:[{c.registry.state_of(c.tp.coid).value}] "
-                f"SL:[{c.registry.state_of(c.sl.coid).value}]",
-                f" 📒 登记表: 总[{len(c.registry.all())}] 存活[{len(alive)}]"
-                + (f" {[f'{t.coid[-8:]}:{t.state.value}' for t in alive]}" if alive else "")
-                + (f" 强平次数:[{c.force_attempts}]" if c.force_attempts else ""),
-            ]
-            if e.last_price > 0 and slp > 0 and tpp > 0:
-                lines.append(f" 📏 现价距止损:[{abs(e.last_price / slp - 1) * 100:.3f}%] "
-                             f"距止盈:[{abs(e.last_price / tpp - 1) * 100:.3f}%]")
+            book = c.book.snapshot()
+
+            # 先复制登记表列表和关键字段，不在动态字典上反复遍历。
+            orders = {t.coid: (t.state, t.acked_qty, t.qty)
+                      for t in c.registry.all()}
+            qty, avg = book["open_qty"], book["avg"]
+            has_position = qty > 1e-12
+            pnl = c.direction.sign * (price - avg) * qty if has_position else 0.0
+            pnl_text = f"{pnl:+.4f}U" if valid_price or not has_position else "未知"
+            avg_text = f"{avg:.8g}" if has_position else "无持仓"
+
+            # 各层按当前阶段归入一类；部分成交、待确认不再统称“在挂”。
+            progress = {}
+            for lp in c.bp.layers:
+                st, filled_qty, _ = orders.get(
+                    lp.coid, (OrderState.NOT_PLACED, 0.0, 0.0)
+                )
+                if st is OrderState.FILLED:
+                    label = "全成"
+                elif lp.abandoned or st is OrderState.DEAD:
+                    label = "部分成交后停止补单" if filled_qty > 0 else "已放弃"
+                elif st is OrderState.CANCEL_PENDING:
+                    label = "部分成交撤单中" if filled_qty > 0 else "撤单中"
+                elif st is OrderState.PENDING:
+                    label = "部分成交待确认" if filled_qty > 0 else "待确认"
+                elif st is OrderState.LIVE:
+                    label = "部分成交" if filled_qty > 0 else "待成交"
+                else:
+                    label = "停止补单" if c.add_suspended or c.end_reason else "待挂"
+                progress[label] = progress.get(label, 0) + 1
+            progress_text = " / ".join(
+                f"{label}{n}层" for label, n in progress.items()
+            ) or "无计划"
+
+            def order_text(slot):
+                st = orders.get(
+                    slot.coid, (OrderState.NOT_PLACED, 0.0, 0.0)
+                )[0]
+                if st is OrderState.NOT_PLACED and not has_position:
+                    return "暂无持仓"
+                if slot.abandoned and not st.alive:
+                    return "已停止重挂"
+                return order_names.get(st, "状态未知")
+
+            def distance(target, is_tp):
+                if not valid_price or not isfinite(target) or target <= 0:
+                    return "距离未知"
+                # 沿用原口径：以目标价为分母。保留方向，避免 abs 掩盖已越价。
+                gap = c.direction.sign * (
+                    (target - price) if is_tp else (price - target)
+                )
+                name = "止盈" if is_tp else "止损"
+                pct = gap / target * 100
+                if gap > 0:
+                    return f"距{name} {pct:.3f}%"
+                if gap == 0:
+                    return f"已到{name}价"
+                return f"⚠已越过{name}价 {abs(pct):.3f}%"
+
+            tp_idx = c.tp_layer_idx()
+            tp_price = (c.bp.layers[min(tp_idx, len(c.bp.layers) - 1)].tp
+                        if c.bp.layers else 0.0)
+            sl_price = c.bp.sl_price
+            tp_layer = "首单" if tp_idx == 0 else f"加仓第{tp_idx}层"
+            direction = "做多" if c.direction is Direction.LONG else "做空"
+
+            lines.extend([
+                f" 🔁 当前周期:[{direction} | 运行 {duration(now - c.created_ts)} | "
+                f"开始于 {bj_time(c.created_ts)} 北京时间]",
+
+                f" 🪜 入场进度(含首单):[共{len(c.bp.layers)}层 | {progress_text}]",
+
+                f" 💰 本周期账面:[持仓 {qty:.8g} | 均价 {avg_text} | "
+                f"浮动盈亏 {pnl_text} | 本周期已实现 {book['realized']:+.4f}U]",
+
+                f" 🎯 固定止盈:[{tp_price:.8g} | {distance(tp_price, True)} | "
+                f"{tp_layer}/配置{e.cfg.tp_pct}% | {order_text(c.tp)}] "
+                f"🛑 全局固定止损:[{sl_price:.8g} | {distance(sl_price, False)} | "
+                f"蓝图亏损预算{e.cfg.max_loss_usdt:g}U | {order_text(c.sl)}]",
+            ])
+
+            if c.add_suspended:
+                notices.append("已停止加仓")
+            if c.end_reason:
+                notices.append(
+                    f"正在收尾：{reason_names.get(c.end_reason, c.end_reason.value)}"
+                )
+            if c.force_attempts:
+                notices.append(f"市价兜底平仓已尝试{c.force_attempts}次")
+            if c.book_error:
+                notices.append(f"账本异常：{c.book_error}")
+            if c.ext_flat_done:
+                notices.append("已检测到外部平仓，外部成交盈亏未纳入本策略账本")
+            if has_position and not c.end_reason:
+                for name, slot in (("止盈", c.tp), ("止损", c.sl)):
+                    st = orders.get(
+                        slot.coid, (OrderState.NOT_PLACED, 0.0, 0.0)
+                    )[0]
+                    if st is not OrderState.LIVE:
+                        notices.append(
+                            f"{name}单{order_text(slot)}，请关注保护单状态"
+                        )
+
+        if notices:
+            lines.append(" ⚠ 需关注:[" + "；".join(notices) + "]")
+        lines.append(
+            f" ℹ 盈亏为策略成交毛盈亏，未扣手续费/资金费；"
+            f"距离以目标价为基准；账户分次采样耗时{account['latency_ms']}ms"
+        )
         lines.append("=========================================================\n")
         logger.info("\n".join(lines))
 
