@@ -31,6 +31,7 @@
 # =============================================================================
 
 import os
+import platform
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -1513,13 +1514,184 @@ def execute_trading_bot_workflow_factor_044_1(target_time=None, symbol_list=None
     logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
 
     return final_signals_df
+
+
+
+def get_signal_factor_044_1(symbol):
+    """
+    信号适配器函数：
+    将底层的单 symbol 查询包装为目标函数需要的 symbol_list=[symbol]，
+    并在此处处理请求所需的 proxy_url。
+    """
+    logger = setup_logger()
+    # 按照要求配置代理 URL 字符串
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+
+    # 调用新的信号函数
+    # 注意：确保该函数返回的 df 包含 timestamp, event, direction, price 列
+    try:
+        df = execute_trading_bot_workflow_factor_044_1(
+            target_time=None,
+            symbol_list=[symbol],
+            proxy_url=proxy_url
+        )
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_044_1 发生异常: {e}")
+        return pd.DataFrame()
+
+
+def generate_factor_024_6_signals(df):
+    """
+    因子 024_6: 计算短窗口(5)内的 K线重心(收盘在最高最低间的相对位置)的移动平均，
+    当其突破长窗口(1440)分位数(99%)时发出信号。
+    """
+    # 策略依赖 win_long=1440 加上 win_short=5，至少需要 1440 根以上的 K 线
+    if df is None or len(df) < 1440:
+        return pd.DataFrame()
+
+    symbol, coin_name = _resolve_identity(df)
+    tcol = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    # 转为浮点数以防数据源带来字符串格式
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+
+    win_short, win_long, q_high = 5, 1440, 0.99
+
+    # 防止 (high - low) 为 0 导致除以零错误
+    k_pos = (close - low) / (high - low).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+
+    # 核心信号生成逻辑
+    signal_series = (mean_pos > mean_pos.rolling(win_long).quantile(q_high)).fillna(False).astype(bool)
+
+    signal_df = df[signal_series].copy()
+
+    if signal_df.empty:
+        return pd.DataFrame()
+
+    res_df = pd.DataFrame()
+    # 1分钟 K 线结束时间戳偏移
+    res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
+    res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
+    res_df['event'] = 'SIGNAL'
+    res_df['direction'] = 'LONG'  # 此处默认为做多信号，可根据业务真实逻辑调整 LONG/SHORT
+    res_df['price'] = signal_df['close'].astype(float)
+    res_df['symbol'] = symbol
+    res_df['coin_name'] = coin_name
+    res_df['strategy_name'] = 'factor_024_6'
+
+    return res_df
+
+
+def execute_trading_bot_workflow_factor_024_6(target_time=None, symbol_list=None, proxy_url=None):
+    """
+    Factor 024_6 工作流（1m 线）：
+    拉取 30 天 1m 级别数据，执行长短窗口分位数突破逻辑，返回包含信号的 DataFrame。
+    """
+    # 参数智能兼容
+    if isinstance(target_time, list):
+        proxy_url = symbol_list if isinstance(symbol_list, str) else proxy_url
+        symbol_list = target_time
+        target_time = None
+
+    if not target_time:
+        target_time = (datetime.now() - timedelta(minutes=0)).strftime("%Y-%m-%d %H:%M")
+
+    if not symbol_list:
+        raise ValueError("symbol_list 不能为空，请提供需要推演的标的列表")
+
+    label = 'factor_024_6'
+    timeframe = '1m'
+    lookback_days = 30  # 足以覆盖 1440 根 K 线的需求并留有冗余
+
+    logger = setup_logger()
+    expected_rows = lookback_days * 1440 + 1
+
+    logger.info(f"🚀 [{label}/启动] 因子信号生成 | 周期: [{timeframe}] | 标的数: [{len(symbol_list)}] | "
+                f"预热天数: [{lookback_days}] | 单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]")
+
+    kline_map = snipe_kline_data(
+        symbol_list=symbol_list,
+        timeframe=timeframe,
+        days=lookback_days,
+        target_time_str=target_time,
+        use_ws=True,
+        use_rest=True,
+        proxy_url=proxy_url
+    )
+
+    logger.info(
+        f"✅ [{label}/取数完成] K线到位: [{sum(1 for s in symbol_list if not _frame_of(kline_map, s).empty)}/{len(symbol_list)}]")
+
+    frames = []
+    skipped = []
+    for symbol in symbol_list:
+        df_kline = _frame_of(kline_map, symbol)
+
+        if df_kline.empty:
+            skipped.append(f"{symbol}(K线为空)")
+            continue
+
+        _warn_data_gap(logger, label, symbol, df_kline, expected_rows)
+
+        df_kline['coin_name'] = symbol.split('/')[0]
+        df_kline['symbol'] = symbol
+
+        try:
+            sig_df = generate_factor_024_6_signals(df_kline)
+            if not sig_df.empty:
+                frames.append(sig_df)
+        except Exception as exc:
+            logger.error(f"❌ [{label}/推演失败] 标的 [{symbol}] 的信号计算中断 | 原因: [{exc}]", exc_info=True)
+
+    if skipped:
+        logger.warning(f"⚠️ [{label}/数据缺口] 已跳过 [{len(skipped)}] 个标的: {skipped}")
+
+    if not frames:
+        logger.info(f"► [{label}/收官] 过去 {lookback_days} 天内未产生任何有效信号")
+        return pd.DataFrame(columns=['timestamp', 'timestamp_str', 'event', 'direction',
+                                     'price', 'symbol', 'coin_name', 'strategy_name'])
+
+    final_signals_df = pd.concat(frames, ignore_index=True)
+    final_signals_df = final_signals_df.sort_values(by=['timestamp', 'symbol']).reset_index(drop=True)
+
+    output_path = f"{label}_signals.csv"
+    final_signals_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录总数: [{len(final_signals_df)}]")
+
+    return final_signals_df
+
+
+def get_signal_factor_024_6(symbol):
+    """
+    信号适配器函数 (因子 024_6)：
+    将底层的单 symbol 查询包装并下发给推演流，适配并处理代理。
+    """
+    logger = setup_logger()
+    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
+
+    try:
+        df = execute_trading_bot_workflow_factor_024_6(
+            target_time=None,
+            symbol_list=[symbol],
+            proxy_url=proxy_url
+        )
+        return df
+    except Exception as e:
+        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_024_6 发生异常: {e}")
+        return pd.DataFrame()
+
 # =============================================================================
 # 七、程序入口（本地联调用）
 # =============================================================================
 if __name__ == "__main__":
     target_time = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
-    symbol_list = ['AAVE/USDT:USDT']
+    symbol_list = ['SOL/USDT:USDT']
 
     # 测试你的新策略（如果需要）：
     # execute_trading_bot_vwap_reclaim_long(target_time, symbol_list, 'http://127.0.0.1:7890')
-    execute_trading_bot_workflow_factor_044_1(target_time, symbol_list, 'http://127.0.0.1:7890')
+    # execute_trading_bot_workflow_factor_044_1(target_time, symbol_list, 'http://127.0.0.1:7890')
+    get_signal_factor_024_6(symbol_list[0])

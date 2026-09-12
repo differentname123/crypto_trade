@@ -83,35 +83,13 @@ from biance_order_lite import (
 # ------------------------------------------------------------------------------
 # 外部信号源: 名称 -> 函数。
 # ------------------------------------------------------------------------------
-from app.signal_trade_lite.run_cross_signal_lite import execute_trading_bot_workflow_factor_044_1
-
-
-def get_signal_factor_044_1(symbol):
-    """
-    信号适配器函数：
-    将底层的单 symbol 查询包装为目标函数需要的 symbol_list=[symbol]，
-    并在此处处理请求所需的 proxy_url。
-    """
-    # 按照要求配置代理 URL 字符串
-    proxy_url = None if platform.system().lower() == "linux" else "http://127.0.0.1:7890"
-
-    # 调用新的信号函数
-    # 注意：确保该函数返回的 df 包含 timestamp, event, direction, price 列
-    try:
-        df = execute_trading_bot_workflow_factor_044_1(
-            target_time=None,
-            symbol_list=[symbol],
-            proxy_url=proxy_url
-        )
-        return df
-    except Exception as e:
-        logger.error(f"[信号] 执行 execute_trading_bot_workflow_factor_044_1 发生异常: {e}")
-        return pd.DataFrame()
-
+from app.signal_trade_lite.run_cross_signal_lite import get_signal_factor_024_6, \
+    get_signal_factor_044_1
 
 # 注册新的信号源
 SIGNAL_REGISTRY = {
     "factor_044_1": get_signal_factor_044_1,
+    "factor_024_6": get_signal_factor_024_6,
 }
 
 # ==============================================================================
@@ -3070,6 +3048,15 @@ def main_app():
             # ===================
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
             max_loss_usdt=120, layer_loss_budget_ratio=1,
+        ),
+        MartinConfig(
+            strategy_id="SOL0912",
+            symbol="SOL/USDT:USDT",
+            # ===== 修改此处 =====
+            signal_name="factor_024_6",
+            # ===================
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
+            max_loss_usdt=100, layer_loss_budget_ratio=1,
         )
     ]
 
