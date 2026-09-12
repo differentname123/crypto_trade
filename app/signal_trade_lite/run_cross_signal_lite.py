@@ -1415,7 +1415,7 @@ def generate_factor_044_1_signals(df):
     # 调用原框架内的 _fmt_bjt 函数转化为北京时间字符串
     res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
 
-    res_df['event'] = 'SIGNAL'
+    res_df['event'] = 'OPEN'
     res_df['direction'] = 'LONG'
     res_df['price'] = signal_df['close'].astype(float)
 
@@ -1576,7 +1576,7 @@ def generate_factor_024_6_signals(df):
     # 1分钟 K 线结束时间戳偏移
     res_df['timestamp'] = signal_df[tcol].astype('int64') + 60 * 1000
     res_df['timestamp_str'] = res_df['timestamp'].apply(_fmt_bjt)
-    res_df['event'] = 'SIGNAL'
+    res_df['event'] = 'OPEN'
     res_df['direction'] = 'LONG'  # 此处默认为做多信号，可根据业务真实逻辑调整 LONG/SHORT
     res_df['price'] = signal_df['close'].astype(float)
     res_df['symbol'] = symbol
