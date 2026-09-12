@@ -2929,10 +2929,12 @@ class DashboardThread(threading.Thread):
 
             # 3. 获取挂单数量 (全局所有挂单)
             try:
+                # 【修复】：显式关闭 ccxt 对无 symbol 查询全账户挂单的拦截警告
+                ex.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
                 open_orders = ex.fetch_open_orders()
                 order_count = len(open_orders)
             except Exception as e:
-                logger.error(f"[快照] 获取挂单数量失败(部分交易所要求必须传symbol): {e}")
+                logger.error(f"[快照] 获取挂单数量失败: {e}")
 
             latency = int((time.perf_counter() - t0) * 1000)
             logger.info(
@@ -2942,6 +2944,7 @@ class DashboardThread(threading.Thread):
             latency = int((time.perf_counter() - t0) * 1000)
             logger.error(f"[快照] 整体拉取失败 耗时:{latency}ms | {e}")
             return None, None, None
+
 
     def _report(self):
         """把引擎全部关键状态聚合为【单条】多行日志, 降低排查时的认知成本。"""
