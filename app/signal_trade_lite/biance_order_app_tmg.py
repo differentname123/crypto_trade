@@ -2884,6 +2884,9 @@ class MartinEngine:
 # ==============================================================================
 # 14. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
 # ==============================================================================
+# ==============================================================================
+# 14. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
+# ==============================================================================
 class DashboardThread(threading.Thread):
     def __init__(self, engine, interval_sec=120):
         super().__init__(daemon=True)
@@ -2900,15 +2903,65 @@ class DashboardThread(threading.Thread):
             except Exception as e:
                 logger.info(f"[看板] 聚合异常(绝不影响交易主流程) | 错误:[{e}]")
 
+    def _get_account_snapshot(self):
+        """获取账户级别的快照信息：总权益，仓位个数，挂单数量"""
+        t0 = time.perf_counter()
+        total_equity = None
+        pos_count = None
+        order_count = None
+        try:
+            ex = self.eng.gw.ex
+
+            # 1. 获取总权益 (包含未实现盈亏的动态总权益)
+            try:
+                balance = ex.fetch_balance()
+                total_equity = float(balance['info']['totalMarginBalance'])
+            except Exception as e:
+                logger.error(f"[快照] 获取总权益失败: {e}")
+
+            # 2. 获取所有持仓，筛选出有实际仓位的 (positionAmt/contracts != 0)
+            try:
+                positions = ex.fetch_positions()
+                pos_count = sum(1 for p in positions if
+                                abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt', 0))) > 0)
+            except Exception as e:
+                logger.error(f"[快照] 获取持仓数量失败: {e}")
+
+            # 3. 获取挂单数量 (全局所有挂单)
+            try:
+                open_orders = ex.fetch_open_orders()
+                order_count = len(open_orders)
+            except Exception as e:
+                logger.error(f"[快照] 获取挂单数量失败(部分交易所要求必须传symbol): {e}")
+
+            latency = int((time.perf_counter() - t0) * 1000)
+            logger.info(
+                f"[快照] 账户拉取完成 耗时:{latency}ms | 总权益:{total_equity} USD | 仓位:{pos_count}个 | 挂单:{order_count}笔")
+            return total_equity, pos_count, order_count
+        except Exception as e:
+            latency = int((time.perf_counter() - t0) * 1000)
+            logger.error(f"[快照] 整体拉取失败 耗时:{latency}ms | {e}")
+            return None, None, None
+
     def _report(self):
         """把引擎全部关键状态聚合为【单条】多行日志, 降低排查时的认知成本。"""
         e = self.eng
         up = int(time.time() - self.t0)
+
+        # 拉取并格式化快照信息
+        snap_equity, snap_pos, snap_orders = self._get_account_snapshot()
+        equity_str = f"{snap_equity:.2f} USD" if snap_equity is not None else "获取失败"
+        pos_str = f"{snap_pos}个" if snap_pos is not None else "获取失败"
+        order_str = f"{snap_orders}笔" if snap_orders is not None else "获取失败"
+        snapshot_str = f" 🏦 账户快照:[总权益 {equity_str} | 持仓 {pos_str} | 挂单 {order_str}]"
+
         lines = [f"\n========== [择时马丁看板] 策略:[{e.cfg.strategy_id}] 交易对:[{e.cfg.symbol}] ==========",
+                 snapshot_str,
                  f" 🧭 状态:[{e.state.value}] 现价:[{e.last_price}] "
                  f"运行:[{up // 3600}h{up % 3600 // 60}m]",
                  f" 📈 已完成周期:[{e.cycles_done}] 累计已实现:[{e.pnl_total:+.4f}U] "
                  f"信号水位线:[{e.gate.watermark_ts}]"]
+
         c = e.cycle
         if c is None:
             lines.append(" 💤 当前无进行中周期, 空闲监听信号中")
@@ -2938,7 +2991,6 @@ class DashboardThread(threading.Thread):
                              f"距止盈:[{abs(e.last_price / tpp - 1) * 100:.3f}%]")
         lines.append("=========================================================\n")
         logger.info("\n".join(lines))
-
 
 # ==============================================================================
 # 15. 进程编排
