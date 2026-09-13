@@ -1723,7 +1723,7 @@ def like_and_bookmark(target_post_id_list):
     for acc in account_list:
         try:
             browser_session_dir = get_config(f"{acc}_browser_session_dir")
-            my_cookies, my_csrf_token = get_auth_tokens_robust(browser_session_dir)
+            my_cookies, my_csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
             if my_cookies and my_csrf_token:
                 cookie_map_info[acc] = {
                     "cookies": my_cookies,

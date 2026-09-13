@@ -400,7 +400,7 @@ def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     if needs_update:
         logger.info(
             f"[身份认证/凭证刷新] 账号凭证为空或过期 | 关键参数: 账号【{user_key}】 | 结果: 调用无头浏览器重置鉴权状态")
-        my_cookies, csrf_token = get_auth_tokens_robust(browser_session_dir)
+        my_cookies, csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
         with auth_cache_lock:
             ACCOUNT_AUTH_CACHE[user_key] = {
                 'cookies': my_cookies,

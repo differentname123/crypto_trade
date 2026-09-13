@@ -16,17 +16,17 @@ import re
 import time
 import threading
 from common.common_utils import read_file_to_str, string_to_object, setup_logger
+
 logger = setup_logger(app_name="promo_copy")
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
-from biance.biance_playwright import comment_on_binance_post
-from biance.biance_squre_api import fetch_binance_feed
-
+from biance.biance_playwright import comment_on_binance_post, get_auth_tokens_robust
+from biance.biance_squre_api import fetch_binance_feed, fetch_binance_square_replies, delete_binance_square_content
 
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
-
 # ---------------- 全局配置常量（集中管理硬编码，便于维护）----------------
+MAX_REPLAY_DAYS = 7  # 仅拉保留最近7天的评论，其它的会被删除
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 SCHEDULE_INTERVAL_SEC = 3600
@@ -40,6 +40,18 @@ PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\带单推广�
 USER_DATA_DIR_LIST = [
     r"W:\temp\biance_qiqi"
 ]
+
+DELETE_USER_DATA_DIR_LIST = [
+    r"W:\temp\biance_qiqi",
+    r"W:\temp\biance_nana",
+    r"W:\temp\biance_yang",
+    r"W:\temp\biance_daniang",
+    r"W:\temp\biance_mama",
+    r"W:\temp\biance_jie",
+    r"W:\temp\biance_zhouling",
+    r"W:\temp\biance_ruru"
+
+]
 USER_ACCOUNT_USAGE_FILE = r"W:\project\python_project\crypto_trade\biance\promotion_copy_trade\biance_account_usage.json"
 LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/square/post/362858558969979"
 
@@ -52,15 +64,14 @@ FILTER_CONFIG = {
     "blacklist_multi_words": ['follow', 'share', 'comment'],  # 三词同时出现才触发拦截
 
     # 2. 结构与时效底线
-    "min_text_length": 20,   # 去链接/标签后的纯文本最短字符数
-    "max_age_hours": 720,    # 帖子最长有效时间(小时)
+    "min_text_length": 20,  # 去链接/标签后的纯文本最短字符数
+    "max_age_hours": 720,  # 帖子最长有效时间(小时)
 
     # 3. 绝对值水位线防线
-    "max_comment_count": 100,   # 评论数上限(过高说明太拥挤,推广无曝光)
-    "cold_post_hours": 20,      # 判定"死帖"的时间界限(小时)
-    "cold_post_min_views": 20   # 死帖最低浏览量要求(超时且低于此值即淘汰)
+    "max_comment_count": 100,  # 评论数上限(过高说明太拥挤,推广无曝光)
+    "cold_post_hours": 20,  # 判定"死帖"的时间界限(小时)
+    "cold_post_min_views": 20  # 死帖最低浏览量要求(超时且低于此值即淘汰)
 }
-
 
 # 账号使用信息仅在当前进程内并发访问，使用线程锁保证“选择账号 + 占用次数”原子化
 _user_account_usage_lock = threading.Lock()
@@ -249,7 +260,8 @@ def is_valid_post_for_promo(post):
     # --- 第三步：绝对值水位线过滤 ---
     if engagement.get("comment_count", 0) > FILTER_CONFIG["max_comment_count"]:
         return False
-    if age_hours > FILTER_CONFIG["cold_post_hours"] and engagement.get("view_count", 0) < FILTER_CONFIG["cold_post_min_views"]:
+    if age_hours > FILTER_CONFIG["cold_post_hours"] and engagement.get("view_count", 0) < FILTER_CONFIG[
+        "cold_post_min_views"]:
         return False
 
     return True
@@ -471,6 +483,7 @@ def get_existing_promo_comments(limit=POST_QUERY_LIMIT, hours_ago=12):
     logger.info(f"[数据导出/完成] 聚合最近 {hours_ago} 小时内合规帖子 | 结果: 【聚合总数: {len(result_list)} 条】")
     return result_list
 
+
 def clear_all_promo_comments_batch():
     """
     数据清理入口：批量把存量帖子的 promo_comment 字段置空并回写。
@@ -599,7 +612,7 @@ def send_promo_comments():
             if status == "CAPTCHA":
                 hit_captcha = True
                 logger.warning(
-                    f"🛑 [发布链路/熔断保护] 由于触发安全验证，立即跳过本轮回合的所有剩余任务，等待冷却！"
+                    f"🛑 [发布链路/熔断保护] 由于触发安全验证，立即跳过本轮回合的所有剩余任务，准备进入心跳冷却！"
                 )
                 break
 
@@ -616,24 +629,102 @@ def send_promo_comments():
             logger.warning(
                 f"[发布链路/本轮异常终止] 因人机验证提前终止 "
                 f"| 本轮成效: 【已成功: {sent} | 业务失败: {failed} | 其它跳过: {skipped}】 "
-                f"| 结果: 【进入风控避险冷却，休眠 {SCHEDULE_INTERVAL_SEC} 秒】"
+                f"| 结果: 【进入风控避险冷却，总休眠时长 {SCHEDULE_INTERVAL_SEC} 秒】"
             )
+
+            # 冷却期间，每隔1分钟输出一次日志，避免假死现象让运维误判
+            remaining_sleep = SCHEDULE_INTERVAL_SEC
+            while remaining_sleep > 0:
+                logger.warning(
+                    f"🚨 [发布链路/风控冷却中] 触发【人机验证/WAF阻断】，程序暂停中... 距离下次恢复运行还剩 {remaining_sleep} 秒")
+                sleep_step = min(60, remaining_sleep)
+                time.sleep(sleep_step)
+                remaining_sleep -= sleep_step
         else:
             logger.info(
                 f"[发布链路/本轮小结] 正常轮询完毕 "
                 f"| 关键参数: 【已发布: {sent} | 失败: {failed} | 跳过: {skipped}】 "
                 f"| 结果: 【休眠 {SCHEDULE_INTERVAL_SEC} 秒】"
             )
+            time.sleep(SCHEDULE_INTERVAL_SEC)
 
-        time.sleep(SCHEDULE_INTERVAL_SEC)
+
+def delete_old_replay():
+    """
+    删除过期的评论回复，避免账号被封禁。
+    作为常驻任务运行，启动时执行一次，之后每隔1天(24小时)运行一次。
+    """
+    interval_sec = 24 * 60 * 60  # 1天的秒数
+    while True:
+        logger.info("[历史清理/启动] 开始执行过期评论清理任务")
+        try:
+            # 获取7天前的ms级别时间戳
+            seven_days_ago_ms = int((time.time() - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
+            time_offset = seven_days_ago_ms
+
+            total_deleted = 0
+            total_failed = 0
+
+            for browser_session_dir in DELETE_USER_DATA_DIR_LIST:
+                try:
+                    account_name = _get_account_name(browser_session_dir)
+                    cookies, token, user_info = get_auth_tokens_robust(browser_session_dir)
+
+                    if not user_info or "squareUid" not in user_info:
+                        logger.warning(f"[历史清理/异常] 账号: {account_name} 无法获取有效身份信息，跳过处理。")
+                        continue
+
+                    square_uid = user_info.get("squareUid")
+                    replies = fetch_binance_square_replies(
+                        target_square_uid=square_uid,
+                        cookies=cookies,
+                        csrf_token=token,
+                        limit=100,
+                        time_offset=time_offset
+                    )
+
+                    if not replies:
+                        continue
+
+                    for item in replies:
+                        reply_id = item.get("reply_id")
+                        if reply_id:
+                            try:
+                                success = delete_binance_square_content(
+                                    content_id=reply_id, cookies=cookies, csrf_token=token
+                                )
+                                if success:
+                                    total_deleted += 1
+                                    logger.info(
+                                        f"[历史清理/删除成功] 账号: {account_name} | reply_id={reply_id} | 内容: {item.get('reply_text', '')[:15]}...")
+                                else:
+                                    total_failed += 1
+                                    logger.warning(f"[历史清理/删除失败] 账号: {account_name} | reply_id={reply_id}")
+                            except Exception as e:
+                                total_failed += 1
+                                logger.error(
+                                    f"[历史清理/请求异常] 账号: {account_name} | reply_id={reply_id} | 报错信息: {e}")
+
+                except Exception as e:
+                    logger.error(f"[历史清理/账号异常] 处理账号 {browser_session_dir} 时发生未捕获异常: {e}")
+
+            logger.info(
+                f"[历史清理/本轮小结] 任务完成 | 成功删除: {total_deleted} 条 | 失败: {total_failed} 条 | 准备休眠 {interval_sec} 秒(1天)后再次执行")
+
+        except Exception as e:
+            logger.error(f"[历史清理/全局异常] 清理任务发生致命错误: {e}")
+
+        time.sleep(interval_sec)
+
 
 # ==========================================
-# 运行入口：生成链路与发布链路各起一个守护线程并行运行
+# 运行入口：生成链路、发布链路与历史清理 各起一个守护线程并行运行
 # ==========================================
 if __name__ == "__main__":
     tasks = [
         send_promo_comments,
         gen_all_promo_comments,  # 注释本行即可停用"评论生成"链路
+        delete_old_replay  # 定时清理过期评论(启动即执行，后续按天循环)
     ]
 
     threads = []
