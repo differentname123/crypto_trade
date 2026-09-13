@@ -20,7 +20,8 @@ from common.common_utils import read_file_to_str, string_to_object, setup_logger
 logger = setup_logger(app_name="promo_copy")
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from biance.biance_playwright import comment_on_binance_post, get_auth_tokens_robust
-from biance.biance_squre_api import fetch_binance_feed, fetch_binance_square_replies, delete_binance_square_content
+from biance.biance_squre_api import fetch_binance_feed, fetch_binance_square_replies, delete_binance_square_content, \
+    fetch_binance_replies
 
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
@@ -425,7 +426,7 @@ def gen_all_promo_comments():
                 skipped_invalid += 1
                 continue
 
-            # 幂等：已有推广评论直接跳过
+            # 幂等：已有推广评论直接跳过 (如果是因验证被删导致的重置，此处 promo_comment 为 None，会正常重新生成)
             if post.get("promo_comment"):
                 skipped_exists += 1
                 continue
@@ -518,8 +519,23 @@ def send_single_promo_comment(post):
       - (None, "SKIPPED") : 缺字段或不满足发帖条件
     """
     comment_info = post.get("promo_comment")
-    if not comment_info or "promo_comment_info" in post:
+    if not comment_info:
         return None, "SKIPPED"
+
+    promo_info = post.get("promo_comment_info")
+    if isinstance(promo_info, dict):
+        send_count = promo_info.get("send_count", 0)
+        # 控制全局最多尝试次数为 3 次
+        if send_count >= 3:
+            return None, "SKIPPED"
+
+        status = promo_info.get("status")
+        verify_status = promo_info.get("verify_status")
+
+        # 发帖放行条件：如果是已经处理过的，仅当上次发送成功 但 存活验证确认失败，才允许重新发送。
+        # 如果还在 pending 或是由于业务失败(failed)，一律跳过。
+        if not (status == "success" and verify_status == "failed"):
+            return None, "SKIPPED"
 
     post_id = post.get("post_id")
     if not post_id:
@@ -548,7 +564,6 @@ def send_single_promo_comment(post):
     err_str = str(err or "")
 
     # ================= 健壮的风控 / 人机验证拦截特征 =================
-    # 结合截图中的标题、文案特征及日志中暴露的 405 状态码进行全方位匹配
     captcha_signals = [
         "我们需要确认您是人类",
         "Human Verification",
@@ -570,16 +585,29 @@ def send_single_promo_comment(post):
 
     # 正常成败处理：闭环回写数据库
     record_user_account_send_result(account_name, success=success, error_info=err)
-    post["promo_comment_info"] = {
+
+    # 提取或初始化状态信息
+    promo_info = post.get("promo_comment_info", {})
+    if not isinstance(promo_info, dict):
+        promo_info = {}
+
+    if success:
+        promo_info["send_count"] = promo_info.get("send_count", 0) + 1
+
+    promo_info.update({
         "comment_id": c_id,
         "comment_time": int(time.time() * 1000),
         "status": "success" if success else "failed",
         "error_info": err if not success else None,
-        "account_name": account_name
-    }
+        "account_name": account_name,
+        "verify_status": "pending",  # 重置验证状态
+        "verify_time": None
+    })
+    post["promo_comment_info"] = promo_info
 
     if success:
-        logger.info(f"[发布链路/发帖] 推广评论发布成功 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【评论ID: {c_id}】")
+        logger.info(
+            f"[发布链路/发帖] 推广评论发布成功 | 关键参数: 【帖子ID: {post_id}】 | 结果: 【评论ID: {c_id} | 累计发送: {promo_info['send_count']} 次】")
         return post, "SUCCESS"
     else:
         logger.error(
@@ -655,7 +683,7 @@ def delete_old_replay():
     删除过期的评论回复，避免账号被封禁。
     作为常驻任务运行，启动时执行一次，之后每隔1天(24小时)运行一次。
     """
-    interval_sec = 24 * 60 * 60  # 1天的秒数
+    interval_sec = 1 * 60 * 60  # 1h的秒数
     while True:
         logger.info("[历史清理/启动] 开始执行过期评论清理任务")
         try:
@@ -718,14 +746,117 @@ def delete_old_replay():
         time.sleep(interval_sec)
 
 
+def verify_promo_comments_task():
+    """
+    [新增线程] 监控已发送评论的存活率：
+    对 10 分钟之前成功发送、且当前仍符合发帖标准、且未验证成功的帖子，
+    查询其评论列表并进行存在性验证。拉取数据后同步更新原帖 comments 字段。
+    发现被删时记录状态，如果重试未达上限（<3次），则清空已生成的评论内容让其再次进入生成、发送闭环。
+    """
+    verify_interval_sec = 300  # 每 5 分钟轮询一次
+    while True:
+        try:
+            post_manager = UniversalPostManager(gen_db_object())
+            existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+
+            verified_success = 0
+            verified_failed = 0
+
+            for post in existing_posts:
+                promo_info = post.get("promo_comment_info")
+                if not isinstance(promo_info, dict):
+                    continue
+
+                # 仅验证曾成功下发的
+                if promo_info.get("status") != "success":
+                    continue
+
+                # 已经验证确认存活的不再重复查
+                if promo_info.get("verify_status") == "success":
+                    continue
+
+                comment_time_ms = promo_info.get("comment_time", 0)
+                if not comment_time_ms:
+                    continue
+
+                # 时间需至少发布在 10 分钟以前
+                if time.time() * 1000 - comment_time_ms < 10 * 60 * 1000:
+                    continue
+
+                # 原帖要求判定，若自身已超龄、过载评论，则自动放弃重试
+                if not is_valid_post_for_promo(post):
+                    continue
+
+                post_id = post.get("post_id")
+                if not post_id:
+                    continue
+
+                # 拉取最新评论信息 (为了防止原帖评论多漏查我们自己的回复，适当增加 required_count=100)
+                try:
+                    comments = fetch_binance_replies(
+                        content_id=post_id,
+                        sort_by=1,  # 综合热门，兼顾后期更新DB的数据质量
+                        required_count=100
+                    )
+                except Exception as e:
+                    logger.error(f"[验证链路/查询异常] 拉取帖子评论失败 | 帖子ID: {post_id} | 错误: {e}")
+                    continue
+
+                if not isinstance(comments, list):
+                    continue
+
+                # 替换原数据库中的 comments
+                post["comments"] = comments
+
+                # 通过 reply_id 定位判断我们的回帖是否存在
+                my_comment_id = str(promo_info.get("comment_id", ""))
+                is_survived = False
+                for c in comments:
+                    if str(c.get("reply_id", "")) == my_comment_id:
+                        is_survived = True
+                        break
+
+                promo_info["verify_time"] = int(time.time() * 1000)
+
+                if is_survived:
+                    promo_info["verify_status"] = "success"
+                    verified_success += 1
+                    logger.info(f"[验证链路/成功] 帖子: {post_id} 的推广评论目前处于存活状态")
+                else:
+                    promo_info["verify_status"] = "failed"
+                    verified_failed += 1
+                    send_count = promo_info.get("send_count", 0)
+
+                    logger.warning(
+                        f"[验证链路/被删] 帖子: {post_id} 的推广评论不存在/被系统删除 (当前成功发送总计: {send_count}次)")
+
+                    # 联动补发机制：若验证失败且重试未达上限，清除已有生成内容，使其进入下一轮循环重新获取文案
+                    if send_count < 3:
+                        post["promo_comment"] = None
+                        logger.info(
+                            f"[验证链路/重置] 帖子: {post_id} 满足重新调度条件，promo_comment 已置空等待下一轮重试")
+
+                # 最终将修改(存活状态 + 最新覆盖的comments)写入数据库
+                post_manager.upsert_posts([post])
+
+            logger.info(
+                f"[验证链路/本轮小结] 验证存活: {verified_success} | 确认被删: {verified_failed} | 准备休眠 {verify_interval_sec} 秒")
+
+        except Exception as e:
+            logger.error(f"[验证链路/全局异常] 任务发生致命错误: {e}")
+
+        time.sleep(verify_interval_sec)
+
+
 # ==========================================
-# 运行入口：生成链路、发布链路与历史清理 各起一个守护线程并行运行
+# 运行入口：生成链路、发布链路、历史清理、存活验证 各起一个守护线程并行运行
 # ==========================================
 if __name__ == "__main__":
     tasks = [
         send_promo_comments,
         gen_all_promo_comments,  # 注释本行即可停用"评论生成"链路
-        delete_old_replay  # 定时清理过期评论(启动即执行，后续按天循环)
+        delete_old_replay,  # 定时清理过期评论(启动即执行，后续按天循环)
+        verify_promo_comments_task  # 监控已发评论的存活率与自动补发
     ]
 
     threads = []

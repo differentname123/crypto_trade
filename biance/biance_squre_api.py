@@ -1994,27 +1994,25 @@ def fetch_binance_square_replies(
 
 
 if __name__ == "__main__":
-    # 查询目标用户的回复列表 不需要cookie
-    target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
+    # # 查询目标用户的回复列表 不需要cookie
+    # target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
+    # cookies = ""
+    # csrf_token = ""
+    # replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
+    #                                        limit=10)
+    #
+    #
+    # # 删除指定的回复内容 需要cookie
     # cookies = """bnc-uuid=884e61f5-a044-4af1-b820-55dccc789ffb; se_gd=gAIVBTRsBEPVxVbZTVFQgZZUQXFsLBVW1RURfVURlRQWgVlNWWJc1; se_gsd=aDY1FSRVITI3MxEhNCY3BSIsCxMYBAUHVl1HWldVW1RWI1NT1; BNC_FV_KEY=33559d62a73ba3d08cfd60775684fbc93d6d0973; OptanonAlertBoxClosed=2026-07-31T10:30:28.727Z; r30t=1; BNC-Location=CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.1056723489.1785494357; g_state={"i_l":0,"i_ll":1785513332133,"i_b":"G+EsG6LEcCn6TzW7nUlhRgHKa2qzIa755oH36z8FYBk","i_e":{"enable_itp_optimization":24},"i_et":1785513332133}; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; _gid=GA1.2.1585322047.1788931810; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221236030903%22%2C%22first_id%22%3A%2219fb7b8e7f5136e-06c97fc11230be-26071951-921600-19fb7b8e7f62036%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%2C%22%24latest_utm_source%22%3A%22chat%22%2C%22%24latest_utm_campaign%22%3A%22app_square_share_link%22%2C%22%24latest_utm_content%22%3A%22OHu1R-tdGmvA5_c_Kk8h5w%22%2C%22%24latest_utm_medium%22%3A%22app_share%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmYjdiOGU3ZjUxMzZlLTA2Yzk3ZmMxMTIzMGJlLTI2MDcxOTUxLTkyMTYwMC0xOWZiN2I4ZTdmNjIwMzYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjM2MDMwOTAzIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221236030903%22%7D%7D; r20t=web.1236030903.E3BD0C3A0075DD599B036433E63F3B2D; cr00=99E4412C55E98143B3432191DC4DCBC3; d1og=web.1236030903.F521EC18290810ED91BAB9C31E4B9573; r2o1=web.1236030903.735A9645F4025481FD473A2AE3142F30; f30l=web.1236030903.6F2B701AAF0C7D93500855925639AB69; p20t=web.1236030903.FD7A639B63D02545DCB2FDA6A8D065C3; aws-waf-token=0ade320a-976b-4f2b-925e-48cd6052155a:AQoAsjBtSZgKAAAA:+VC85pCoSDMJoAl6ctI4F1eAZRJZW1ITmYuo/wY8EuAAgHftL0Mhr6eKZFh0OS8+8/UlVcCgPbzy0tf0tfXJf+aRql8SPLKHiIt0moipuyzrhsfa8ibAfAo4njVx74wRUGQ+X0LnnZaW2ZPJHs7dwiN4Y2dsVDlroeabmxxPpP4UozayvlEnoOU7I16bqx3njLwM6yR+TBcpjYxRXnzUf+3cBrIAm+czDj92z1s3o9XMb3jM+fIU8UljCKovea5AnoUB0737q280bf7UuC/oBXF8IEn74NSDCbCWT0CTBhsNaY6FecvU5RieWYGlfLxQy0Dnew==; _uetsid=962131f0aebf11f197d9ab0b84c69c63; _uetvid=1667c8208ccc11f1adbb577b422f31f8; BNC_FV_KEY_T=101-GPR%2B749u8njAdSkjB0o6EbT%2FGD1b0FqG0GrwEEBIFZBqdwt0iw9si5BHo3oFswpPuHip1AfTqoPSlhQ4ruxPbQ%3D%3D-7HKF5O5WhvJfQ0bFFFjlMQ%3D%3D-e4; BNC_FV_KEY_EXPIRE=1789326647726; theme=dark; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Sep+13+2026+21%3A53%3A13+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=9bff5e0c-0326-46cd-bb7c-b42b0b736326&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1785493828&intType=1&crTime=1785493830721&geolocation=KR%3B11&AwaitingReconsent=false; _gat_UA-162512367-1=1; _ga_3WP50LGEEC=GS2.1.s1789305048$o9$g1$t1789307596$j34$l0$h0; _ga=GA1.1.1768809681.1785493830"""
     # csrf_token = 'c4f79d48f01c536ad1107bf83620309d'
-    cookies = ""
-    csrf_token = ""
-    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
-                                           limit=10)
-
-
-    # 删除指定的回复内容 需要cookie
-    cookies = """bnc-uuid=884e61f5-a044-4af1-b820-55dccc789ffb; se_gd=gAIVBTRsBEPVxVbZTVFQgZZUQXFsLBVW1RURfVURlRQWgVlNWWJc1; se_gsd=aDY1FSRVITI3MxEhNCY3BSIsCxMYBAUHVl1HWldVW1RWI1NT1; BNC_FV_KEY=33559d62a73ba3d08cfd60775684fbc93d6d0973; OptanonAlertBoxClosed=2026-07-31T10:30:28.727Z; r30t=1; BNC-Location=CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.1056723489.1785494357; g_state={"i_l":0,"i_ll":1785513332133,"i_b":"G+EsG6LEcCn6TzW7nUlhRgHKa2qzIa755oH36z8FYBk","i_e":{"enable_itp_optimization":24},"i_et":1785513332133}; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; _gid=GA1.2.1585322047.1788931810; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221236030903%22%2C%22first_id%22%3A%2219fb7b8e7f5136e-06c97fc11230be-26071951-921600-19fb7b8e7f62036%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%2C%22%24latest_utm_source%22%3A%22chat%22%2C%22%24latest_utm_campaign%22%3A%22app_square_share_link%22%2C%22%24latest_utm_content%22%3A%22OHu1R-tdGmvA5_c_Kk8h5w%22%2C%22%24latest_utm_medium%22%3A%22app_share%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmYjdiOGU3ZjUxMzZlLTA2Yzk3ZmMxMTIzMGJlLTI2MDcxOTUxLTkyMTYwMC0xOWZiN2I4ZTdmNjIwMzYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjM2MDMwOTAzIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221236030903%22%7D%7D; r20t=web.1236030903.E3BD0C3A0075DD599B036433E63F3B2D; cr00=99E4412C55E98143B3432191DC4DCBC3; d1og=web.1236030903.F521EC18290810ED91BAB9C31E4B9573; r2o1=web.1236030903.735A9645F4025481FD473A2AE3142F30; f30l=web.1236030903.6F2B701AAF0C7D93500855925639AB69; p20t=web.1236030903.FD7A639B63D02545DCB2FDA6A8D065C3; aws-waf-token=0ade320a-976b-4f2b-925e-48cd6052155a:AQoAsjBtSZgKAAAA:+VC85pCoSDMJoAl6ctI4F1eAZRJZW1ITmYuo/wY8EuAAgHftL0Mhr6eKZFh0OS8+8/UlVcCgPbzy0tf0tfXJf+aRql8SPLKHiIt0moipuyzrhsfa8ibAfAo4njVx74wRUGQ+X0LnnZaW2ZPJHs7dwiN4Y2dsVDlroeabmxxPpP4UozayvlEnoOU7I16bqx3njLwM6yR+TBcpjYxRXnzUf+3cBrIAm+czDj92z1s3o9XMb3jM+fIU8UljCKovea5AnoUB0737q280bf7UuC/oBXF8IEn74NSDCbCWT0CTBhsNaY6FecvU5RieWYGlfLxQy0Dnew==; _uetsid=962131f0aebf11f197d9ab0b84c69c63; _uetvid=1667c8208ccc11f1adbb577b422f31f8; BNC_FV_KEY_T=101-GPR%2B749u8njAdSkjB0o6EbT%2FGD1b0FqG0GrwEEBIFZBqdwt0iw9si5BHo3oFswpPuHip1AfTqoPSlhQ4ruxPbQ%3D%3D-7HKF5O5WhvJfQ0bFFFjlMQ%3D%3D-e4; BNC_FV_KEY_EXPIRE=1789326647726; theme=dark; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Sep+13+2026+21%3A53%3A13+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=9bff5e0c-0326-46cd-bb7c-b42b0b736326&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1785493828&intType=1&crTime=1785493830721&geolocation=KR%3B11&AwaitingReconsent=false; _gat_UA-162512367-1=1; _ga_3WP50LGEEC=GS2.1.s1789305048$o9$g1$t1789307596$j34$l0$h0; _ga=GA1.1.1768809681.1785493830"""
-    csrf_token = 'c4f79d48f01c536ad1107bf83620309d'
-    for item in replies:
-        reply_id = item.get("reply_id")
-        if reply_id:
-            success = delete_binance_square_content(
-                content_id=reply_id, cookies=cookies, csrf_token=csrf_token
-            )
-            print(f"删除 reply_id={reply_id} 的结果: {'成功' if success else '失败'}")
-
+    # for item in replies:
+    #     reply_id = item.get("reply_id")
+    #     if reply_id:
+    #         success = delete_binance_square_content(
+    #             content_id=reply_id, cookies=cookies, csrf_token=csrf_token
+    #         )
+    #         print(f"删除 reply_id={reply_id} 的结果: {'成功' if success else '失败'}")
+    #
     master_feed_list = []
 
     logger.info("========== 🚀 开始全量数据抓取测试 ==========")
