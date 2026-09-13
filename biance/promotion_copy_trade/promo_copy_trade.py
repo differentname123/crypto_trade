@@ -680,7 +680,7 @@ def delete_old_replay():
                         target_square_uid=square_uid,
                         cookies=cookies,
                         csrf_token=token,
-                        limit=100,
+                        limit=1000,
                         time_offset=time_offset
                     )
 
@@ -700,7 +700,7 @@ def delete_old_replay():
                                         f"[历史清理/删除成功] 账号: {account_name} | reply_id={reply_id} | 内容: {item.get('reply_text', '')[:15]}...")
                                 else:
                                     total_failed += 1
-                                    logger.warning(f"[历史清理/删除失败] 账号: {account_name} | reply_id={reply_id}")
+                                    logger.warning(f"[🔴历史清理/删除失败] 账号: {account_name} | reply_id={reply_id}")
                             except Exception as e:
                                 total_failed += 1
                                 logger.error(

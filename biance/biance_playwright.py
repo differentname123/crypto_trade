@@ -1509,7 +1509,7 @@ def get_auth_tokens_robust(user_data_dir):
     user_api_keyword = "pgc/user?getFollowCount"  # 新增：目标用户接口的特征关键字
 
     logger.info(
-        f"[凭证/Auth] 启动浏览器提取凭证(Headed 必须可见) | 主拦截: <{api_keyword}> | 辅拦截: <{user_api_keyword}>")
+        f"[凭证/Auth] 启动浏览器提取凭证(Headed 必须可见) | 目录: <{user_data_dir}> | 主拦截: <{api_keyword}> | 辅拦截: <{user_api_keyword}>")
 
     with sync_playwright() as p:
         context = None
@@ -1553,13 +1553,13 @@ def get_auth_tokens_robust(user_data_dir):
                 source = "context-cookies(binance域)"
 
             if not cookie:
-                logger.warning(f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 请求: 【{req.method} {req.url}】 "
+                logger.warning(f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 目录: <{user_data_dir}> | 请求: 【{req.method} {req.url}】 "
                                f"| 排查方向: 【浏览器当前是否处于登录态】")
                 return None, None, None
 
             has_p20t = "p20t=" in cookie
             level = logger.info if (has_p20t and csrf) else logger.warning
-            level(f"[凭证/Auth] 凭证提取完成 | 来源: <{source}> | CSRF: 【{str(csrf)[:8]}...】 "
+            level(f"[凭证/Auth] 凭证提取完成 | 目录: <{user_data_dir}> | 来源: <{source}> | CSRF: 【{str(csrf)[:8]}...】 "
                   f"| Cookie长度: 【{len(cookie)}】 | 含核心 p20t: 【{has_p20t}】"
                   f"{'' if (has_p20t and csrf) else ' | 提醒: 缺失 p20t 或 CSRF，后续 API 很可能 401/400'}")
 
@@ -1574,21 +1574,21 @@ def get_auth_tokens_robust(user_data_dir):
                         if json_body and json_body.get("success"):
                             user_data = json_body.get("data")
                             logger.info(
-                                f"[凭证/Auth] 成功捕获用户信息 | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】")
+                                f"[凭证/Auth] 成功捕获用户信息 | 目录: <{user_data_dir}> | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】")
                             break
                 except Exception as e:
                     # 即使 JSON 解析崩溃也直接吞掉，绝不能影响凭证返回
-                    logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略): {e}")
+                    logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略) | 目录: <{user_data_dir}> | 详情: {e}")
 
             # 返回 3 个元素
             return cookie, csrf, user_data
 
         except PlaywrightTimeoutError:
             logger.warning(f"[凭证/Auth] 提取失败：20s 内未捕获到目标接口 <{api_keyword}> "
-                           f"| 排查方向: 【浏览器打开时是否已登录 / 页面是否被风控拦截】")
+                           f"| 目录: <{user_data_dir}> | 排查方向: 【浏览器打开时是否已登录 / 页面是否被风控拦截】")
             return None, None, None
         except Exception as e:
-            logger.error(f"[凭证/Auth] 提取过程发生未预期异常 | 详情: 【{e}】")
+            logger.error(f"[凭证/Auth] 提取过程发生未预期异常 | 目录: <{user_data_dir}> | 详情: 【{e}】")
             return None, None, None
         finally:
             if context:
@@ -1596,6 +1596,7 @@ def get_auth_tokens_robust(user_data_dir):
                     context.close()
                 except Exception:
                     pass
+
 
 def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN"):
     """启动可见浏览器交由人工自由操作（含 window-position 归零 + 置顶，防历史屏幕外坐标缓存）。"""
