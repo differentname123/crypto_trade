@@ -45,7 +45,7 @@ logger = setup_logger(app_name="biance_playwright")
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_mama"
+USER_DATA_DIR = r"W:\temp\biance_daniang"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -111,13 +111,43 @@ class BusinessErrorException(Exception):
 # ==============================================================================
 
 def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True):
-    """统一的持久化上下文启动口，收敛四处重复的 launch 配置（各调用方原有差异逐参保留）。"""
-    kwargs = {"channel": "chrome", "user_data_dir": user_data_dir, "headless": False, "args": args}
+    """统一的持久化上下文启动口，已修复 DevTools 快捷键失效问题"""
+    kwargs = {
+        "channel": "chrome",
+        "user_data_dir": user_data_dir,
+        "headless": False,
+        "args": args
+    }
+
+    # 🚀 核心修复 1：彻底关闭 Playwright 的内部视口模拟机制
     if viewport:
         kwargs["viewport"] = viewport
+    else:
+        # 必须显式传入 no_viewport=True，否则 Playwright 会默认 800x600 模拟并劫持输入
+        kwargs["no_viewport"] = True
+
+        # 🚀 核心修复 2：剔除那些会破坏 Chrome 原生快捷键的默认参数
+    ignored_args = []
     if hide_automation:
-        kwargs["ignore_default_args"] = ["--enable-automation"]
-    return p.chromium.launch_persistent_context(**kwargs)
+        ignored_args.append("--enable-automation")
+
+    # 恢复 Chrome 底层负责路由部分快捷键的组件
+    ignored_args.extend([
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-component-extensions-with-background-pages"
+    ])
+    kwargs["ignore_default_args"] = ignored_args
+
+    context = p.chromium.launch_persistent_context(**kwargs)
+
+    # 🚀 核心修复 3：主动赋予环境剪贴板读写权限，防止 Ctrl+C / Ctrl+V 被沙箱静默拦截
+    try:
+        context.grant_permissions(['clipboard-read', 'clipboard-write'])
+    except Exception as e:
+        logger.warning(f"[环境] 剪贴板权限授予失败，可能影响 F12 粘贴: {e}")
+
+    return context
 
 
 def clean_browser_cache(user_data_dir):
@@ -1464,18 +1494,22 @@ def login_and_save_session():
 
 def get_auth_tokens_robust(user_data_dir):
     """
-    以真实浏览器请求为样本提取脱机 API 凭证。
+    以真实浏览器请求为样本提取脱机 API 凭证，同时顺带提取 User Data。
     流程：Headed 打开广场作者页 → 拦截首个非 OPTIONS 的 `pgc/user/client` 请求 → 取其 csrftoken/cookie；
-    请求头无 Cookie 时，回退用 context.cookies("https://www.binance.com") 拼装（限定域名，避免带上
-    全站巨型 Cookie 触发 400）。返回 (cookie|None, csrf|None)。
+    请求头无 Cookie 时，回退用 context.cookies("https://www.binance.com") 拼装。
+    顺带后台监听 `pgc/user?getFollowCount` 接口来获取用户基本信息。
+    返回: (cookie|None, csrf|None, user_data|None)
     """
     if not os.path.exists(user_data_dir):
         logger.warning(f"[凭证/Auth] 环境目录不存在，无法提取 | 目录: <{user_data_dir}>")
-        return None, None
+        return None, None, None
 
     visit_url = "https://www.binance.com/zh-CN/square/profile/insights_anchor"
     api_keyword = "pgc/user/client"
-    logger.info(f"[凭证/Auth] 启动浏览器提取凭证(Headed 必须可见) | 拦截目标: <{api_keyword}>")
+    user_api_keyword = "pgc/user?getFollowCount"  # 新增：目标用户接口的特征关键字
+
+    logger.info(
+        f"[凭证/Auth] 启动浏览器提取凭证(Headed 必须可见) | 主拦截: <{api_keyword}> | 辅拦截: <{user_api_keyword}>")
 
     with sync_playwright() as p:
         context = None
@@ -1488,11 +1522,25 @@ def get_auth_tokens_robust(user_data_dir):
             )
             page = context.pages[0] if context.pages else context.new_page()
 
+            # ================= 新增块：后台非阻塞监听目标用户接口的响应 =================
+            user_api_responses = []
+
+            def on_response(res):
+                # 过滤出符合条件的 GET 响应
+                if user_api_keyword in res.url and res.request.method != "OPTIONS":
+                    user_api_responses.append(res)
+
+            # 挂载监听器（完全不会阻塞主线程）
+            page.on("response", on_response)
+            # ========================================================================
+
             with page.expect_request(
                     lambda req: api_keyword in req.url and req.method != "OPTIONS", timeout=20000
             ) as req_info:
+                # wait_until="networkidle" 能大概率保证页面请求加载完毕，此时 user 接口也跑完了
                 page.goto(visit_url, wait_until="networkidle")
 
+            # --- 第1步：提取原有的核心凭证（最重要，不作任何干预） ---
             req = req_info.value
             headers = req.headers  # Playwright 返回的 header key 恒为小写
             csrf = (headers.get("csrftoken") or "").strip() or None
@@ -1507,29 +1555,47 @@ def get_auth_tokens_robust(user_data_dir):
             if not cookie:
                 logger.warning(f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 请求: 【{req.method} {req.url}】 "
                                f"| 排查方向: 【浏览器当前是否处于登录态】")
-                return None, None
+                return None, None, None
 
             has_p20t = "p20t=" in cookie
             level = logger.info if (has_p20t and csrf) else logger.warning
             level(f"[凭证/Auth] 凭证提取完成 | 来源: <{source}> | CSRF: 【{str(csrf)[:8]}...】 "
                   f"| Cookie长度: 【{len(cookie)}】 | 含核心 p20t: 【{has_p20t}】"
                   f"{'' if (has_p20t and csrf) else ' | 提醒: 缺失 p20t 或 CSRF，后续 API 很可能 401/400'}")
-            return cookie, csrf
+
+            # --- 第2步：提取用户 data 字段（放在最后，容错处理） ---
+            user_data = None
+            for res in user_api_responses:
+                try:
+                    # 确保状态码 200 才去解析
+                    if res.ok:
+                        json_body = res.json()
+                        # 检查 success 为 true，然后取出 data
+                        if json_body and json_body.get("success"):
+                            user_data = json_body.get("data")
+                            logger.info(
+                                f"[凭证/Auth] 成功捕获用户信息 | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】")
+                            break
+                except Exception as e:
+                    # 即使 JSON 解析崩溃也直接吞掉，绝不能影响凭证返回
+                    logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略): {e}")
+
+            # 返回 3 个元素
+            return cookie, csrf, user_data
 
         except PlaywrightTimeoutError:
             logger.warning(f"[凭证/Auth] 提取失败：20s 内未捕获到目标接口 <{api_keyword}> "
                            f"| 排查方向: 【浏览器打开时是否已登录 / 页面是否被风控拦截】")
-            return None, None
+            return None, None, None
         except Exception as e:
             logger.error(f"[凭证/Auth] 提取过程发生未预期异常 | 详情: 【{e}】")
-            return None, None
+            return None, None, None
         finally:
             if context:
                 try:
                     context.close()
                 except Exception:
                     pass
-
 
 def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN"):
     """启动可见浏览器交由人工自由操作（含 window-position 归零 + 置顶，防历史屏幕外坐标缓存）。"""

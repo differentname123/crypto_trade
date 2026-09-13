@@ -42,12 +42,13 @@ USER_DATA_DIR_LIST = [
 ]
 
 DELETE_USER_DATA_DIR_LIST = [
-    r"W:\temp\biance_qiqi",
     r"W:\temp\biance_nana",
     r"W:\temp\biance_yang",
     r"W:\temp\biance_daniang",
     r"W:\temp\biance_mama",
     r"W:\temp\biance_jie",
+    r"W:\temp\biance_qiqi",
+
     r"W:\temp\biance_zhouling",
     r"W:\temp\biance_ruru"
 
