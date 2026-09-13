@@ -20,12 +20,14 @@ import requests
 from biance.biance_playwright import get_auth_tokens_robust
 from common.common_utils import get_config, setup_logger, save_json, read_json, download_web_media
 from urllib.parse import quote
+
 setup_logger()
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 # 拿到属于当前文件的专属 logger
 logger = logging.getLogger(__name__)
 import concurrent.futures
+
 # ============================================================
 # 全局常量：集中管理代理、分页、重试策略与正则，避免散落重复
 # ============================================================
@@ -149,7 +151,6 @@ def publish_to_binance_square(api_key, text_content):
     except requests.exceptions.RequestException as e:
         logger.error(f"🚨 发帖网络请求异常 | Key: {masked_key} | 异常信息: {e}")
         return False
-
 
 
 def toggle_binance_follow(target_uid, action, cookies, csrf_token, session=None):
@@ -815,7 +816,8 @@ def clean_universal_posts(final_clean_list):
             if result_list:
                 all_clean_list.extend(result_list)
 
-    logger.info(f"🗂️ [清洗分发] 完成 | 共处理:{unique_count}条 | 分布:{card_type_counts} | 有效产出:{len(all_clean_list)}条")
+    logger.info(
+        f"🗂️ [清洗分发] 完成 | 共处理:{unique_count}条 | 分布:{card_type_counts} | 有效产出:{len(all_clean_list)}条")
     return all_clean_list
 
 
@@ -920,7 +922,9 @@ def _enrich_single_post(item, session):
 
         for url in urls_to_download:
             try:
-                local_path = download_web_media(url=url, save_dir=r'W:\project\python_project\crypto_trade\biance\media_downloads', proxy=proxy_url)
+                local_path = download_web_media(url=url,
+                                                save_dir=r'W:\project\python_project\crypto_trade\biance\media_downloads',
+                                                proxy=proxy_url)
                 if local_path:
                     media_info['local_mapping'][url] = local_path
                     stats['total_download_success'] += 1
@@ -1004,6 +1008,7 @@ def update_posts_in_place(final_clean_list):
     )
 
     return final_clean_list
+
 
 def _extract_vos(res_data):
     """安全解析币安响应体，兼容 data 为 dict / list / 空 的多种结构"""
@@ -1269,10 +1274,12 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
 
     # 零数据阻断（Early Exit），极大减少不必要的日志和计算
     if len(filtered_feed_list) == 0:
-        logger.info(f"🛑 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理")
+        logger.info(
+            f"🛑 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理")
         return []
     else:
-        logger.info(f"📥 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖")
+        logger.info(
+            f"📥 [{task_label}] 探测完毕 | 抓取:{len(feed_list)}条 | 🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖")
     # ==========================================
 
     # 只有【纯净的新数据】才有资格进入下面极其耗时的清洗和下载流程
@@ -1333,6 +1340,7 @@ def fetch_binance_post_detail(post_id, session=None):
             time.sleep(random.uniform(0.5, 1.5))
 
     return None
+
 
 def clean_binance_replies(raw_replies):
     """
@@ -1607,6 +1615,7 @@ def fetch_binance_relations(target_username, relation_type, required_count, sess
 
     return all_items[:required_count]
 
+
 def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3):
     """
     获取币安广场用户的公开主页信息
@@ -1687,7 +1696,6 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
     return {}
 
 
-
 def like_and_bookmark(target_post_id_list):
     """
     执行核心点赞与收藏交互。
@@ -1756,14 +1764,260 @@ def like_and_bookmark(target_post_id_list):
             f"[互动任务/收尾] 持久化状态文件失败，可能导致下次重复点赞 | 关键参数: [文件路径: {processed_posts_id_file}] | 结果: [抛出异常] - 详情: {e}")
         raise
 
+
+def delete_binance_square_content(
+        content_id: str,
+        cookies: str,
+        csrf_token: str,
+        content_type: int = 1,
+) -> bool:
+    """删除币安广场的指定内容/回复
+
+    :param content_id: 要删除的内容/回复ID (即 query 出来的 reply_id)
+    :param cookies: 请求所需的完整 Cookie 字符串 (需含登录态与防爬token)
+    :param csrf_token: 请求所需的 CSRF Token
+    :param content_type: 内容类型，普通回复/帖子默认为 1
+    :return: 成功返回 True，失败返回 False
+    """
+    url = "https://www.binance.com/bapi/composite/v1/private/pgc/content/delete"
+
+    # 精简至必要的核心 Headers
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "cookie": cookies,
+        "csrftoken": csrf_token,
+        "origin": "https://www.binance.com",
+        "referer": "https://www.binance.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+        ),
+    }
+
+    # 请求载荷
+    payload = {"contentId": int(content_id), "contentType": content_type}
+
+    logger.info(f"正在尝试删除广场内容: contentId={content_id}...")
+
+    try:
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=10, proxies=PROXIES
+        )
+
+        # 1. 校验 HTTP 状态
+        if response.status_code != 200:
+            logger.error(
+                f"删除请求失败! HTTP 状态码: {response.status_code}, 响应: {response.text[:150]}"
+            )
+            return False
+
+        # 2. 校验 JSON 解析
+        try:
+            res_json = response.json()
+        except Exception:
+            logger.error(
+                f"响应无法解析为 JSON，可能触发了 WAF 拦截: {response.text[:200]}"
+            )
+            return False
+
+        # 3. 校验业务 Code
+        biz_code = res_json.get("code")
+        if biz_code == "000000" and res_json.get("success") is True:
+            logger.info(f"内容 contentId={content_id} 删除成功！")
+            return True
+        else:
+            logger.warning(
+                f"删除失败: code={biz_code}, message={res_json.get('message')}, "
+                f"detail={res_json.get('messageDetail')}"
+            )
+            return False
+
+    except Exception as e:
+        logger.exception(
+            f"删除操作执行期间发生未捕获异常 (contentId={content_id}): {e}"
+        )
+        return False
+
+
+def fetch_binance_square_replies(
+        target_square_uid: str,
+        cookies: str,
+        csrf_token: str,
+        limit: int = 0,
+        time_offset: int = -1,
+) -> list:
+    """查询币安广场指定用户的回复列表并精简数据"""
+    base_url = "https://www.binance.com/bapi/composite/v2/friendly/pgc/content/queryUserProfilePageContentsWithFilter"
+
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "cookie": cookies,
+        "csrftoken": csrf_token,
+        "origin": "https://www.binance.com",
+        "referer": "https://www.binance.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        ),
+    }
+
+    results = []
+    current_offset = time_offset
+    page = 1
+
+    try:
+        while True:
+            params = {
+                "targetSquareUid": target_square_uid,
+                "timeOffset": current_offset,
+                "filterType": "REPLY",
+            }
+
+            logger.info(
+                f"正在拉取第 {page} 页数据, timeOffset={current_offset}..."
+            )
+
+            try:
+                response = requests.get(
+                    base_url, headers=headers, params=params, timeout=10, proxies=PROXIES
+                )
+            except requests.exceptions.RequestException as e:
+                logger.error(f"网络请求发生异常: {e}")
+                break
+
+            # 1. HTTP 状态码校验
+            if response.status_code != 200:
+                logger.warning(
+                    f"HTTP 请求失败! 状态码: {response.status_code}, 响应: {response.text[:150]}"
+                )
+                break
+
+            # 2. JSON 解析校验
+            try:
+                res_json = response.json()
+            except Exception:
+                logger.error(
+                    f"响应解析 JSON 失败，返回内容: {response.text[:200]}"
+                )
+                break
+
+            # 3. 业务状态码校验
+            biz_code = res_json.get("code")
+            if biz_code != "000000":
+                logger.warning(
+                    f"币安接口业务报错: code={biz_code}, msg={res_json.get('message')}"
+                )
+                break
+
+            data = res_json.get("data") or {}
+            contents = data.get("contents") or []
+
+            if not contents:
+                logger.info(
+                    f"第 {page} 页没有查询到回复内容 (contents 为空)，停止翻页。"
+                )
+                break
+
+            logger.info(f"第 {page} 页成功获取到 {len(contents)} 组回复互动。")
+
+            # 4. 数据解析与精简（强化空指针防护）
+            for item in contents:
+                # 使用 or [] 防止 NoneType 出现
+                reply_post_list = item.get("replyPostList") or []
+
+                origin_post = (
+                    reply_post_list[0] if len(reply_post_list) > 0 else {}
+                )
+                my_reply = (
+                    reply_post_list[1]
+                    if len(reply_post_list) > 1
+                    else (reply_post_list[0] if reply_post_list else {})
+                )
+
+                # 确保取出的对象是字典类型
+                origin_post = origin_post or {}
+                my_reply = my_reply or {}
+
+                # 关键修复点：使用 (my_reply.get("hyperlinkList") or [])
+                raw_hyperlinks = my_reply.get("hyperlinkList") or []
+                clean_links = [
+                    link.get("url")
+                    for link in raw_hyperlinks
+                    if isinstance(link, dict) and link.get("url")
+                ]
+
+                simplified_item = {
+                    "reply_id": my_reply.get("id"),
+                    "reply_text": my_reply.get("bodyTextOnly") or "",
+                    "reply_time": my_reply.get("firstReleaseTime"),
+                    "reply_links": clean_links,
+                    "parent_post_id": my_reply.get("parentContentId")
+                                      or origin_post.get("id"),
+                    "parent_post_author": origin_post.get("displayName")
+                                          or origin_post.get("username")
+                                          or "",
+                    "parent_post_text": origin_post.get("bodyTextOnly") or "",
+                }
+
+                results.append(simplified_item)
+
+                if 0 < limit <= len(results):
+                    logger.info(
+                        f"已达到设定的拉取限制 limit={limit}，停止抓取。"
+                    )
+                    return results
+
+            # 5. 分页游标校验
+            next_offset = data.get("timeOffset")
+            if not next_offset or next_offset == current_offset:
+                logger.info("已无下一页游标 (timeOffset 耗尽)，拉取完毕。")
+                break
+
+            current_offset = next_offset
+            page += 1
+            time.sleep(0.5)
+
+    except Exception as e:
+        logger.exception(f"处理数据时发生意外错误: {e}")
+        return results
+
+    logger.info(f"抓取完成，共提取到 {len(results)} 条精简数据。")
+    return results
+
+
 if __name__ == "__main__":
+    # 查询目标用户的回复列表 不需要cookie
+    target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
+    # cookies = """bnc-uuid=884e61f5-a044-4af1-b820-55dccc789ffb; se_gd=gAIVBTRsBEPVxVbZTVFQgZZUQXFsLBVW1RURfVURlRQWgVlNWWJc1; se_gsd=aDY1FSRVITI3MxEhNCY3BSIsCxMYBAUHVl1HWldVW1RWI1NT1; BNC_FV_KEY=33559d62a73ba3d08cfd60775684fbc93d6d0973; OptanonAlertBoxClosed=2026-07-31T10:30:28.727Z; r30t=1; BNC-Location=CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.1056723489.1785494357; g_state={"i_l":0,"i_ll":1785513332133,"i_b":"G+EsG6LEcCn6TzW7nUlhRgHKa2qzIa755oH36z8FYBk","i_e":{"enable_itp_optimization":24},"i_et":1785513332133}; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; _gid=GA1.2.1585322047.1788931810; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221236030903%22%2C%22first_id%22%3A%2219fb7b8e7f5136e-06c97fc11230be-26071951-921600-19fb7b8e7f62036%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%2C%22%24latest_utm_source%22%3A%22chat%22%2C%22%24latest_utm_campaign%22%3A%22app_square_share_link%22%2C%22%24latest_utm_content%22%3A%22OHu1R-tdGmvA5_c_Kk8h5w%22%2C%22%24latest_utm_medium%22%3A%22app_share%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmYjdiOGU3ZjUxMzZlLTA2Yzk3ZmMxMTIzMGJlLTI2MDcxOTUxLTkyMTYwMC0xOWZiN2I4ZTdmNjIwMzYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjM2MDMwOTAzIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221236030903%22%7D%7D; r20t=web.1236030903.E3BD0C3A0075DD599B036433E63F3B2D; cr00=99E4412C55E98143B3432191DC4DCBC3; d1og=web.1236030903.F521EC18290810ED91BAB9C31E4B9573; r2o1=web.1236030903.735A9645F4025481FD473A2AE3142F30; f30l=web.1236030903.6F2B701AAF0C7D93500855925639AB69; p20t=web.1236030903.FD7A639B63D02545DCB2FDA6A8D065C3; aws-waf-token=0ade320a-976b-4f2b-925e-48cd6052155a:AQoAsjBtSZgKAAAA:+VC85pCoSDMJoAl6ctI4F1eAZRJZW1ITmYuo/wY8EuAAgHftL0Mhr6eKZFh0OS8+8/UlVcCgPbzy0tf0tfXJf+aRql8SPLKHiIt0moipuyzrhsfa8ibAfAo4njVx74wRUGQ+X0LnnZaW2ZPJHs7dwiN4Y2dsVDlroeabmxxPpP4UozayvlEnoOU7I16bqx3njLwM6yR+TBcpjYxRXnzUf+3cBrIAm+czDj92z1s3o9XMb3jM+fIU8UljCKovea5AnoUB0737q280bf7UuC/oBXF8IEn74NSDCbCWT0CTBhsNaY6FecvU5RieWYGlfLxQy0Dnew==; _uetsid=962131f0aebf11f197d9ab0b84c69c63; _uetvid=1667c8208ccc11f1adbb577b422f31f8; BNC_FV_KEY_T=101-GPR%2B749u8njAdSkjB0o6EbT%2FGD1b0FqG0GrwEEBIFZBqdwt0iw9si5BHo3oFswpPuHip1AfTqoPSlhQ4ruxPbQ%3D%3D-7HKF5O5WhvJfQ0bFFFjlMQ%3D%3D-e4; BNC_FV_KEY_EXPIRE=1789326647726; theme=dark; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Sep+13+2026+21%3A53%3A13+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=9bff5e0c-0326-46cd-bb7c-b42b0b736326&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1785493828&intType=1&crTime=1785493830721&geolocation=KR%3B11&AwaitingReconsent=false; _gat_UA-162512367-1=1; _ga_3WP50LGEEC=GS2.1.s1789305048$o9$g1$t1789307596$j34$l0$h0; _ga=GA1.1.1768809681.1785493830"""
+    # csrf_token = 'c4f79d48f01c536ad1107bf83620309d'
+    cookies = ""
+    csrf_token = ""
+    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
+                                           limit=10)
 
 
+    # 删除指定的回复内容 需要cookie
+    cookies = """bnc-uuid=884e61f5-a044-4af1-b820-55dccc789ffb; se_gd=gAIVBTRsBEPVxVbZTVFQgZZUQXFsLBVW1RURfVURlRQWgVlNWWJc1; se_gsd=aDY1FSRVITI3MxEhNCY3BSIsCxMYBAUHVl1HWldVW1RWI1NT1; BNC_FV_KEY=33559d62a73ba3d08cfd60775684fbc93d6d0973; OptanonAlertBoxClosed=2026-07-31T10:30:28.727Z; r30t=1; BNC-Location=CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.1056723489.1785494357; g_state={"i_l":0,"i_ll":1785513332133,"i_b":"G+EsG6LEcCn6TzW7nUlhRgHKa2qzIa755oH36z8FYBk","i_e":{"enable_itp_optimization":24},"i_et":1785513332133}; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; _gid=GA1.2.1585322047.1788931810; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221236030903%22%2C%22first_id%22%3A%2219fb7b8e7f5136e-06c97fc11230be-26071951-921600-19fb7b8e7f62036%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%2C%22%24latest_utm_source%22%3A%22chat%22%2C%22%24latest_utm_campaign%22%3A%22app_square_share_link%22%2C%22%24latest_utm_content%22%3A%22OHu1R-tdGmvA5_c_Kk8h5w%22%2C%22%24latest_utm_medium%22%3A%22app_share%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmYjdiOGU3ZjUxMzZlLTA2Yzk3ZmMxMTIzMGJlLTI2MDcxOTUxLTkyMTYwMC0xOWZiN2I4ZTdmNjIwMzYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjM2MDMwOTAzIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221236030903%22%7D%7D; r20t=web.1236030903.E3BD0C3A0075DD599B036433E63F3B2D; cr00=99E4412C55E98143B3432191DC4DCBC3; d1og=web.1236030903.F521EC18290810ED91BAB9C31E4B9573; r2o1=web.1236030903.735A9645F4025481FD473A2AE3142F30; f30l=web.1236030903.6F2B701AAF0C7D93500855925639AB69; p20t=web.1236030903.FD7A639B63D02545DCB2FDA6A8D065C3; aws-waf-token=0ade320a-976b-4f2b-925e-48cd6052155a:AQoAsjBtSZgKAAAA:+VC85pCoSDMJoAl6ctI4F1eAZRJZW1ITmYuo/wY8EuAAgHftL0Mhr6eKZFh0OS8+8/UlVcCgPbzy0tf0tfXJf+aRql8SPLKHiIt0moipuyzrhsfa8ibAfAo4njVx74wRUGQ+X0LnnZaW2ZPJHs7dwiN4Y2dsVDlroeabmxxPpP4UozayvlEnoOU7I16bqx3njLwM6yR+TBcpjYxRXnzUf+3cBrIAm+czDj92z1s3o9XMb3jM+fIU8UljCKovea5AnoUB0737q280bf7UuC/oBXF8IEn74NSDCbCWT0CTBhsNaY6FecvU5RieWYGlfLxQy0Dnew==; _uetsid=962131f0aebf11f197d9ab0b84c69c63; _uetvid=1667c8208ccc11f1adbb577b422f31f8; BNC_FV_KEY_T=101-GPR%2B749u8njAdSkjB0o6EbT%2FGD1b0FqG0GrwEEBIFZBqdwt0iw9si5BHo3oFswpPuHip1AfTqoPSlhQ4ruxPbQ%3D%3D-7HKF5O5WhvJfQ0bFFFjlMQ%3D%3D-e4; BNC_FV_KEY_EXPIRE=1789326647726; theme=dark; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Sep+13+2026+21%3A53%3A13+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=9bff5e0c-0326-46cd-bb7c-b42b0b736326&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1785493828&intType=1&crTime=1785493830721&geolocation=KR%3B11&AwaitingReconsent=false; _gat_UA-162512367-1=1; _ga_3WP50LGEEC=GS2.1.s1789305048$o9$g1$t1789307596$j34$l0$h0; _ga=GA1.1.1768809681.1785493830"""
+    csrf_token = 'c4f79d48f01c536ad1107bf83620309d'
+    for item in replies:
+        reply_id = item.get("reply_id")
+        if reply_id:
+            success = delete_binance_square_content(
+                content_id=reply_id, cookies=cookies, csrf_token=csrf_token
+            )
+            print(f"删除 reply_id={reply_id} 的结果: {'成功' if success else '失败'}")
 
     master_feed_list = []
 
     logger.info("========== 🚀 开始全量数据抓取测试 ==========")
-
 
     # 0. 获取该帖子的评论数据 (例如拉取前 50 条热门评论，sort_by=1 表示热门)
     target_post_id = "309692475255842"  # 替换为实际的帖子 ID
