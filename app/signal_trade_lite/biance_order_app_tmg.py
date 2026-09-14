@@ -2393,7 +2393,7 @@ class MartinEngine:
         self.recover_attempts = 0
         self.cycles_done = 0
         self.pnl_total = 0.0
-        self._next_sync_ts = time.time() + TIME_SYNC_SEC
+        self._next_sync_ts = 0
 
     # ---------------- 第一步 Sense: 世界快照 + 熔断 ----------------
     def _sense(self, position_side=None):
