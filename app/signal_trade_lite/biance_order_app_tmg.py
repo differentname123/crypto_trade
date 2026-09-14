@@ -3243,8 +3243,8 @@ def main_app():
     main_secret_key = get_config("myself_biance_api_copy_secret")
 
     # 这里是你提供的复制账号(新账户)的密钥读取方式
-    copy_api_key = get_config("ruru_biance_api_copy_key")
-    copy_secret_key = get_config("ruru_biance_api_copy_secret")
+    ruru_api_key = get_config("ruru_biance_api_copy_key")
+    ruru_secret_key = get_config("ruru_biance_api_copy_secret")
 
     configs = [
         # =========================================================
@@ -3299,8 +3299,8 @@ def main_app():
             strategy_id="AAVEL12C",  # <--- 增加了 C 后缀 (长度刚好 8 位)
             symbol="AAVE/USDT:USDT",
             signal_name="factor_044_1",
-            api_key=copy_api_key,  # <--- 注入复制账户密钥
-            secret_key=copy_secret_key,
+            api_key=ruru_api_key,  # <--- 注入复制账户密钥
+            secret_key=ruru_secret_key,
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
             max_loss_usdt=12 * 6, layer_loss_budget_ratio=1,
         ),
@@ -3309,8 +3309,8 @@ def main_app():
             strategy_id="AAVES12C",
             symbol="AAVE/USDT:USDT",
             signal_name="factor_043_10",
-            api_key=copy_api_key,
-            secret_key=copy_secret_key,
+            api_key=ruru_api_key,
+            secret_key=ruru_secret_key,
             first_qty=0.1, step_pct=1.5, qty_mult=2, tp_pct=0.7,
             max_loss_usdt=12 * 7, layer_loss_budget_ratio=1,
         ),
@@ -3319,8 +3319,8 @@ def main_app():
             strategy_id="SOL0912C",
             symbol="SOL/USDT:USDT",
             signal_name="factor_043_9",
-            api_key=copy_api_key,
-            secret_key=copy_secret_key,
+            api_key=ruru_api_key,
+            secret_key=ruru_secret_key,
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
             max_loss_usdt=10 * 9, layer_loss_budget_ratio=1,
         ),
@@ -3329,8 +3329,8 @@ def main_app():
             strategy_id="BNB0912C",
             symbol="BNB/USDT:USDT",
             signal_name="factor_044_10",
-            api_key=copy_api_key,
-            secret_key=copy_secret_key,
+            api_key=ruru_api_key,
+            secret_key=ruru_secret_key,
             first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
             max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
         )
