@@ -831,7 +831,7 @@ def _run_task(task):
 
 if __name__ == "__main__":
     # 如果需要单独统计存活率，可以取消注释执行下行代码
-    # calculate_comment_survival_rate(days=1)
+    calculate_comment_survival_rate(days=1)
 
     tasks = [send_promo_comments, gen_all_promo_comments, delete_old_replay, verify_promo_comments_task]
     threads = []
