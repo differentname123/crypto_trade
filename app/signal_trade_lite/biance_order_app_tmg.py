@@ -3261,7 +3261,7 @@ def run_single_strategy(cfg):
     if not engine.boot():
         logger.critical("[进程] 冷启动检查未通过, 进程退出")
         return
-    DashboardThread(engine, interval_sec=120).start()
+    DashboardThread(engine, interval_sec=240).start()
     engine.run_forever()
 
 
