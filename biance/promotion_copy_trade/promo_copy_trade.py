@@ -46,7 +46,7 @@ VERIFY_MIN_AGE_MS = 10 * 60 * 1000
 
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt"
-USER_DATA_DIR_LIST = [r"W:\temp\biance_qiqi",r"W:\temp\biance_yanglin"]
+USER_DATA_DIR_LIST = [r"W:\temp\biance_qiqi", r"W:\temp\biance_yanglin"]
 DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_nana",
     r"W:\temp\biance_yang",
@@ -431,7 +431,7 @@ def clear_all_promo_comments_batch():
 def send_single_promo_comment(post):
     """按既有发送状态发布单帖，在内存中更新结果，数据库由调用方回写。
     入参：post_id、promo_comment.follower_perspective.{comment_text, link_text}，
-    可含 promo_comment_info.{send_count, status, verify_status}。
+    可含 promo_comment_info.{send_count, status, verify_status, history}。
     返回：(post, SUCCESS/FAILED) 或 (None, CAPTCHA/SKIPPED)。
     """
     comment_info = post.get("promo_comment")
@@ -495,15 +495,33 @@ def send_single_promo_comment(post):
         promo_info = {}
     if success:
         promo_info["send_count"] = promo_info.get("send_count", 0) + 1
+
+    current_time_ms = int(time.time() * 1000)
     promo_info.update({
         "comment_id": comment_id,
-        "comment_time": int(time.time() * 1000),
+        "comment_time": current_time_ms,
         "status": "success" if success else "failed",
         "error_info": None if success else error,
         "account_name": account_name,
         "verify_status": "pending",
         "verify_time": None,
     })
+
+    # 追加发送历史记录以支持存活率验证不漏掉失败重试的数据
+    history = promo_info.get("history")
+    if not isinstance(history, list):
+        history = []
+    history.append({
+        "account_name": account_name,
+        "comment_id": comment_id,
+        "comment_time": current_time_ms,
+        "status": promo_info["status"],
+        "error_info": promo_info["error_info"],
+        "verify_status": promo_info["verify_status"],
+        "verify_time": promo_info["verify_time"]
+    })
+    promo_info["history"] = history
+
     post["promo_comment_info"] = promo_info
     log = logger.info if success else logger.error
     outcome = "接口报告成功" if success else "接口报告失败，可能是帖子不可用或账号受限"
@@ -641,7 +659,7 @@ def delete_old_replay():
 def verify_promo_comments_task():
     """每五分钟核查发送至少十分钟、仍符合条件的评论，并回写最新评论和验证状态。
     帖子字段：post_id、promo_comment_info.{status, verify_status, comment_time,
-    comment_id, send_count}；评论列表每项用 reply_id 匹配；无返回。
+    comment_id, send_count, history}；评论列表每项用 reply_id 匹配；无返回。
     """
     while True:
         started = time.monotonic()
@@ -687,8 +705,19 @@ def verify_promo_comments_task():
                 comment_id = str(promo_info.get("comment_id", ""))
                 # : 沿用字符串比较，缺失 ID 或 None 仍可能互相匹配。
                 survived = any(str(item.get("reply_id", "")) == comment_id for item in comments)
-                promo_info["verify_time"] = int(time.time() * 1000)
+                verify_time_ms = int(time.time() * 1000)
+                promo_info["verify_time"] = verify_time_ms
                 promo_info["verify_status"] = "success" if survived else "failed"
+
+                # 同步更新历史列表中的记录存活状态
+                history = promo_info.get("history")
+                if isinstance(history, list) and history:
+                    for record in reversed(history):
+                        if record.get("comment_id") == comment_id:
+                            record["verify_status"] = promo_info["verify_status"]
+                            record["verify_time"] = verify_time_ms
+                            break
+
                 if survived:
                     survived_count += 1
                     action = "本次找到评论，后续不再验证"
@@ -718,6 +747,76 @@ def verify_promo_comments_task():
         time.sleep(VERIFY_INTERVAL_SEC)
 
 
+def calculate_comment_survival_rate(days=1):
+    """
+    单独调用的统计函数：输出指定时间内（默认1天）的评论统计数据。
+    支持总维度及 account_name 维度的统计输出，供运维人员分析当前风控、转化现状。
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+    posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    cutoff_ms = int((time.time() - days * 24 * 3600) * 1000)
+
+    total_attempts = 0
+    total_success = 0
+    total_survived = 0
+    account_stats = {}
+
+    for post in posts:
+        promo_info = post.get("promo_comment_info")
+        if not isinstance(promo_info, dict):
+            continue
+        history = promo_info.get("history")
+
+        # 兼容旧数据：如果没有history但包含了近期的发送记录，则伪造一条记录计入统计
+        if not isinstance(history, list):
+            if promo_info.get("comment_time", 0) > cutoff_ms:
+                history = [{
+                    "account_name": promo_info.get("account_name", "unknown"),
+                    "comment_time": promo_info.get("comment_time", 0),
+                    "status": promo_info.get("status"),
+                    "verify_status": promo_info.get("verify_status")
+                }]
+            else:
+                continue
+
+        for record in history:
+            if record.get("comment_time", 0) < cutoff_ms:
+                continue
+
+            acc = record.get("account_name", "unknown")
+            if acc not in account_stats:
+                account_stats[acc] = {"attempts": 0, "success": 0, "survived": 0}
+
+            total_attempts += 1
+            account_stats[acc]["attempts"] += 1
+
+            if record.get("status") == "success":
+                total_success += 1
+                account_stats[acc]["success"] += 1
+                if record.get("verify_status") == "success":
+                    total_survived += 1
+                    account_stats[acc]["survived"] += 1
+
+    def format_rate(num, den):
+        return f"{(num / den * 100):.2f}%" if den > 0 else "0.00%"
+
+    logger.info(f"========== 评论存活率统计 (过去 {days} 天) ==========")
+    logger.info(f"【总维度】")
+    logger.info(f" - 评论的总尝试(帖子)数量: {total_attempts}")
+    logger.info(f" - 收到comment_id的数量: {total_success} (发送成功率: {format_rate(total_success, total_attempts)})")
+    logger.info(f" - 最终验证存在的数量: {total_survived} (存活成功率: {format_rate(total_survived, total_success)})")
+
+    logger.info(f"【账号维度】")
+    for acc, stats in account_stats.items():
+        logger.info(f" - 账号 [{acc}]:")
+        logger.info(f"    评论的总尝试数量: {stats['attempts']}")
+        logger.info(
+            f"    收到comment_id: {stats['success']} (发送成功率: {format_rate(stats['success'], stats['attempts'])})")
+        logger.info(
+            f"    最终验证存在: {stats['survived']} (存活成功率: {format_rate(stats['survived'], stats['success'])})")
+    logger.info("=====================================================")
+
+
 def _run_task(task):
     """为线程未处理异常补充业务入口信息，记录后继续抛出，不增加自动重启行为。"""
     try:
@@ -731,6 +830,9 @@ def _run_task(task):
 
 
 if __name__ == "__main__":
+    # 如果需要单独统计存活率，可以取消注释执行下行代码
+    # calculate_comment_survival_rate(days=1)
+
     tasks = [send_promo_comments, gen_all_promo_comments, delete_old_replay, verify_promo_comments_task]
     threads = []
     for task in tasks:
