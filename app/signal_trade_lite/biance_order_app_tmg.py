@@ -2883,9 +2883,34 @@ class DashboardThread(threading.Thread):
                 logger.info(f"[看板] 聚合异常(绝不影响交易主流程) | 错误:[{e}]")
 
     def _get_account_snapshot(self):
-        """只读采样 U 本位账户；任一挂单通道失败，总挂单数保持未知。"""
+        """只读采样 U 本位账户；加入基于 API Key 的多进程文件缓存(方案三)，防抖共享数据。"""
+        import time
+        import json
+        import os
+        import hashlib
         from math import isfinite
 
+        # ================= 方案3: 读取缓存逻辑 =================
+        # 1. 构造基于 API Key 的缓存文件名 (脱敏处理)
+        api_key = self.eng.cfg.api_key or ""
+        key_hash = hashlib.md5(api_key.encode('utf-8')).hexdigest() if api_key else "default"
+        # 复用顶部的 data_path 函数，缓存统一存放在 martin_data 目录
+        cache_file = data_path(f"dash_cache_{key_hash}.json")
+        now = time.time()
+        cache_ttl = 30.0  # 30秒内同一个 API Key 的进程共享此结果，拦截多余请求
+
+        # 2. 尝试读取合法缓存
+        try:
+            if os.path.exists(cache_file) and now - os.path.getmtime(cache_file) < cache_ttl:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    if isinstance(cached_data, dict) and "equity" in cached_data:
+                        cached_data["latency_ms"] = 0  # 标识为缓存命中，耗时设为 0
+                        return cached_data
+        except Exception:
+            pass  # 发生任何读取异常（如文件刚被清理），则静默降级为真实请求
+
+        # ================= 原有真实拉取逻辑 =================
         started = time.perf_counter()
         ex = self.eng.gw.ex
         errors = []
@@ -2928,19 +2953,12 @@ class DashboardThread(threading.Thread):
 
         total_equity = read("总权益", equity)
         pos_count = read("持仓数量", positions_count)
-
-        # 分别使用两个原生接口，不依赖 ccxt 统一接口的条件单路由配置，
-        # 也不在看板线程修改交易线程共用的 ex.options。
-        normal = read("普通挂单", lambda: index_orders(
-            ex.fapiPrivateGetOpenOrders, "orderId"))
-        algo = read("条件挂单", lambda: index_orders(
-            ex.fapiPrivateGetOpenAlgoOrders, "algoId"))
+        normal = read("普通挂单", lambda: index_orders(ex.fapiPrivateGetOpenOrders, "orderId"))
+        algo = read("条件挂单", lambda: index_orders(ex.fapiPrivateGetOpenAlgoOrders, "algoId"))
 
         normal_count = len(normal) if normal is not None else None
         algo_count = None
         if algo is not None:
-            # 只用明确的子订单关联去重；orderId 和 algoId 是不同编号空间。
-            # 条件单已生成普通单且该普通单仍在挂时，只在普通单中计一次。
             algo_count = sum(
                 not (normal is not None and
                      str(o.get("actualOrderId") or "") not in ("", "0") and
@@ -2948,7 +2966,7 @@ class DashboardThread(threading.Thread):
                 for o in algo.values()
             )
 
-        return {
+        result = {
             "equity": total_equity,
             "positions": pos_count,
             "normal_orders": normal_count,
@@ -2959,6 +2977,17 @@ class DashboardThread(threading.Thread):
             "errors": errors,
         }
 
+        # ================= 方案3: 写入缓存逻辑 =================
+        try:
+            # 使用 temp 临时文件 + os.replace 原子替换，彻底杜绝多个子进程同时写一个文件的错乱问题
+            tmp_file = f"{cache_file}.tmp.{os.getpid()}"
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(result, f)
+            os.replace(tmp_file, cache_file)
+        except Exception:
+            pass  # 写入失败不阻断核心业务展示
+
+        return result
     def _report(self):
         """聚合一条业务看板日志；只读引擎状态，不修改交易或记账逻辑。"""
         from datetime import timedelta, timezone
