@@ -46,7 +46,7 @@ VERIFY_MIN_AGE_MS = 10 * 60 * 1000
 
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt"
-USER_DATA_DIR_LIST = [r"W:\temp\biance_qiqi"]
+USER_DATA_DIR_LIST = [r"W:\temp\biance_qiqi",r"W:\temp\biance_yanglin"]
 DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_nana",
     r"W:\temp\biance_yang",
@@ -55,6 +55,7 @@ DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_jie",
     r"W:\temp\biance_qiqi",
     r"W:\temp\biance_zhouling",
+    r"W:\temp\biance_yanglin",
     r"W:\temp\biance_ruru",
 ]
 USER_ACCOUNT_USAGE_FILE = r"W:\project\python_project\crypto_trade\biance\promotion_copy_trade\biance_account_usage.json"
