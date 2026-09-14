@@ -46,7 +46,7 @@ VERIFY_MIN_AGE_MS = 10 * 60 * 1000
 
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt"
-USER_DATA_DIR_LIST = [r"W:\temp\biance_qiqi", r"W:\temp\biance_zhouling", r"W:\temp\biance_yanglin"]
+USER_DATA_DIR_LIST = [r"W:\temp\biance_zhouling", r"W:\temp\biance_yanglin"]
 DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_nana",
     r"W:\temp\biance_yang",
@@ -759,6 +759,7 @@ def calculate_comment_survival_rate(days=1):
     total_attempts = 0
     total_success = 0
     total_survived = 0
+    total_failed = 0  # 新增：记录最终验证不存在的数量
     account_stats = {}
 
     for post in posts:
@@ -785,7 +786,7 @@ def calculate_comment_survival_rate(days=1):
 
             acc = record.get("account_name", "unknown")
             if acc not in account_stats:
-                account_stats[acc] = {"attempts": 0, "success": 0, "survived": 0}
+                account_stats[acc] = {"attempts": 0, "success": 0, "survived": 0, "failed": 0}
 
             total_attempts += 1
             account_stats[acc]["attempts"] += 1
@@ -793,9 +794,15 @@ def calculate_comment_survival_rate(days=1):
             if record.get("status") == "success":
                 total_success += 1
                 account_stats[acc]["success"] += 1
-                if record.get("verify_status") == "success":
+                verify_status = record.get("verify_status")
+
+                # 明确区分验证成功和验证失败，剩余的为待验证
+                if verify_status == "success":
                     total_survived += 1
                     account_stats[acc]["survived"] += 1
+                elif verify_status == "failed":
+                    total_failed += 1
+                    account_stats[acc]["failed"] += 1
 
     def format_rate(num, den):
         return f"{(num / den * 100):.2f}%" if den > 0 else "0.00%"
@@ -804,18 +811,28 @@ def calculate_comment_survival_rate(days=1):
     logger.info(f"【总维度】")
     logger.info(f" - 评论的总尝试(帖子)数量: {total_attempts}")
     logger.info(f" - 收到comment_id的数量: {total_success} (发送成功率: {format_rate(total_success, total_attempts)})")
-    logger.info(f" - 最终验证存在的数量: {total_survived} (存活成功率: {format_rate(total_survived, total_success)})")
+
+    total_pending = total_success - total_survived - total_failed
+    logger.info(
+        f" - 最终验证存在的数量: {total_survived} (占发送成功几率: {format_rate(total_survived, total_success)})")
+    logger.info(f" - 最终验证不存在的数量: {total_failed} (占发送成功几率: {format_rate(total_failed, total_success)})")
+    logger.info(f" - 尚未完成验证的数量: {total_pending} (占发送成功几率: {format_rate(total_pending, total_success)})")
 
     logger.info(f"【账号维度】")
     for acc, stats in account_stats.items():
-        logger.info(f" - 账号 [{acc}]:")
-        logger.info(f"    评论的总尝试数量: {stats['attempts']}")
-        logger.info(
-            f"    收到comment_id: {stats['success']} (发送成功率: {format_rate(stats['success'], stats['attempts'])})")
-        logger.info(
-            f"    最终验证存在: {stats['survived']} (存活成功率: {format_rate(stats['survived'], stats['success'])})")
-    logger.info("=====================================================")
+        acc_attempts = stats['attempts']
+        acc_success = stats['success']
+        acc_survived = stats['survived']
+        acc_failed = stats['failed']
+        acc_pending = acc_success - acc_survived - acc_failed
 
+        logger.info(f" - 账号 [{acc}]:")
+        logger.info(f"    评论的总尝试数量: {acc_attempts}")
+        logger.info(f"    收到comment_id: {acc_success} (发送成功率: {format_rate(acc_success, acc_attempts)})")
+        logger.info(f"    最终验证存在: {acc_survived} (占发送成功几率: {format_rate(acc_survived, acc_success)})")
+        logger.info(f"    最终验证不存在: {acc_failed} (占发送成功几率: {format_rate(acc_failed, acc_success)})")
+        logger.info(f"    尚未完成验证: {acc_pending} (占发送成功几率: {format_rate(acc_pending, acc_success)})")
+    logger.info("=====================================================")
 
 def _run_task(task):
     """为线程未处理异常补充业务入口信息，记录后继续抛出，不增加自动重启行为。"""
