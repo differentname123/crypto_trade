@@ -1097,7 +1097,7 @@ def run_single_strategy(config):
     ReconcilerThread(strategy.engine, strategy.nodes, interval_sec=WATCHDOG_INTERVAL_SEC).start()
 
     # 启动日志统计看板
-    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=120).start()
+    StatisticsThread(strategy.ctx, strategy.nodes, config, interval_sec=60 * 2).start()
     TimeSyncThread(exchange, interval_sec=3600).start()
 
     strategy.run_main_loop()
