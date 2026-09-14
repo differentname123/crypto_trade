@@ -1040,22 +1040,21 @@ class MartinConfig:
     """
 
     def __init__(self, strategy_id, symbol, signal_name,
+                 api_key="", secret_key="",  # <===== 新增：账号密钥参数
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_usdt=50.0,
                  layer_loss_budget_ratio=0.80,
-                 # ↑ 最深层满仓浮亏预算比例, 必须 < 1, 它决定"最深层成交价 -> 止损价"的生存空间:
-                 #   P_sl - P_last = sign * (max_loss - loss_last) / Q_full
-                 #   若设为 1.0, 最深层成交瞬间浮亏就 ≈ max_loss, 止损价会贴死在最深层成交价上,
-                 #   最后一仓刚成交就被扫止损(甚至条件单被交易所拒为 -2021 立即触发)。
                  max_signal_age_sec=31,
-                 entry_timeout_sec=900,                # 入场超时: 一手未成则作废周期
-                 max_cycle_sec=0,                      # 0=不限, 周期总超时强平
+                 entry_timeout_sec=900,
+                 max_cycle_sec=0,
                  poll_interval_sec=2.0,
                  idle_poll_interval_sec=5.0,
-                 sl_working_type="MARK_PRICE"):        # MARK_PRICE 防插针 / CONTRACT_PRICE 更灵敏
+                 sl_working_type="MARK_PRICE"):
         self.strategy_id = str(strategy_id)
         self.symbol = symbol
         self.signal_name = signal_name
+        self.api_key = api_key  # <===== 新增：保存密钥
+        self.secret_key = secret_key  # <===== 新增：保存密钥
         self.first_qty = float(first_qty)
         self.first_notional = float(first_notional)
         self.step_pct = float(step_pct)
@@ -3199,16 +3198,21 @@ def run_single_strategy(cfg):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key = get_config("myself_biance_api_copy_key")
-    secret_key = get_config("myself_biance_api_copy_secret")
+    # ================= 修改开始：从 cfg 获取密钥 =================
+    api_key = cfg.api_key
+    secret_key = cfg.secret_key
 
-    # ================= 修改开始 =================
-    # 使用你要求的代理规则配置给 ccxt 交易所实例
+    if not api_key or not secret_key:
+        logger.critical(f"[进程] 策略未配置 API 密钥，拒绝启动 | 策略:[{cfg.strategy_id}]")
+        return
+    # ================= 修改结束 =================
+
+    # ================= 代理规则配置 =================
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890",
         "https": "http://127.0.0.1:7890",
     }
-    # ================= 修改结束 =================
+    # =================================================
 
     exchange = safe_init_exchange(api_key, secret_key, proxies)
 
@@ -3231,50 +3235,102 @@ def run_single_strategy(cfg):
     DashboardThread(engine, interval_sec=120).start()
     engine.run_forever()
 
-def main_app():
-    configs = [
-        # strategy_id 最长不能超过 8 个字符，并且只能由纯字母和数字组成
-        # 层数不再配置, 由 max_loss_usdt × layer_loss_budget_ratio 自动推导
 
-        # AAVE factor_044_1,多 (Long),a: 3.0% / tp: 0.6%,M6,"13,302",17.00 M,16 次,100.0%,39.4 天
+def main_app():
+    # ================= 1. 加载账户信息 =================
+    # 假设这里是你的主账号密钥读取方式 (如果键名不对请自行修改)
+    main_api_key = get_config("myself_biance_api_copy_key")
+    main_secret_key = get_config("myself_biance_api_copy_secret")
+
+    # 这里是你提供的复制账号(新账户)的密钥读取方式
+    copy_api_key = get_config("ruru_biance_api_copy_key")
+    copy_secret_key = get_config("ruru_biance_api_copy_secret")
+
+    configs = [
+        # =========================================================
+        # 第一组：主账户运行的 4 个策略 (保持原有的 strategy_id)
+        # =========================================================
+        # AAVE factor_044_1,多
         MartinConfig(
             strategy_id="AAVEL12",
             symbol="AAVE/USDT:USDT",
-            # ===== 修改此处 =====
             signal_name="factor_044_1",
-            # ===================
+            api_key=main_api_key,  # <--- 注入主账户密钥
+            secret_key=main_secret_key,
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
             max_loss_usdt=12 * 6, layer_loss_budget_ratio=1,
         ),
-
-        # AAVE factor_043_10,空 (Short),a: 1.5% / tp: 0.7%,M7,"4,234",12.90 M,17 次,69.8%,35.2 天
+        # AAVE factor_043_10,空
         MartinConfig(
             strategy_id="AAVES12",
             symbol="AAVE/USDT:USDT",
-            # ===== 修改此处 =====
             signal_name="factor_043_10",
-            # ===================
+            api_key=main_api_key,
+            secret_key=main_secret_key,
             first_qty=0.1, step_pct=1.5, qty_mult=2, tp_pct=0.7,
             max_loss_usdt=12 * 7, layer_loss_budget_ratio=1,
         ),
-        # SOL factor_043_9,空 (Short),a: 3.0% / tp: 0.8%,M9,"3,636",5.23 M,7 次,85.6%,75.0 天
+        # SOL factor_043_9,空
         MartinConfig(
             strategy_id="SOL0912",
             symbol="SOL/USDT:USDT",
-            # ===== 修改此处 =====
             signal_name="factor_043_9",
-            # ===================
+            api_key=main_api_key,
+            secret_key=main_secret_key,
             first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
             max_loss_usdt=10 * 9, layer_loss_budget_ratio=1,
         ),
-
-        # BNB factor_044_10,多 (Long),a: 2.0% / tp: 1.0%,M8,"1,778",13.56 M,8 次,71.7%,45.9 天
+        # BNB factor_044_10,多
         MartinConfig(
             strategy_id="BNB0912",
             symbol="BNB/USDT:USDT",
-            # ===== 修改此处 =====
             signal_name="factor_044_10",
-            # ===================
+            api_key=main_api_key,
+            secret_key=main_secret_key,
+            first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
+            max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
+        ),
+
+        # =========================================================
+        # 第二组：复制账户运行的 4 个策略 (加上 C 后缀做物理隔离)
+        # =========================================================
+        # AAVE 多 - 复制账户
+        MartinConfig(
+            strategy_id="AAVEL12C",  # <--- 增加了 C 后缀 (长度刚好 8 位)
+            symbol="AAVE/USDT:USDT",
+            signal_name="factor_044_1",
+            api_key=copy_api_key,  # <--- 注入复制账户密钥
+            secret_key=copy_secret_key,
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
+            max_loss_usdt=12 * 6, layer_loss_budget_ratio=1,
+        ),
+        # AAVE 空 - 复制账户
+        MartinConfig(
+            strategy_id="AAVES12C",
+            symbol="AAVE/USDT:USDT",
+            signal_name="factor_043_10",
+            api_key=copy_api_key,
+            secret_key=copy_secret_key,
+            first_qty=0.1, step_pct=1.5, qty_mult=2, tp_pct=0.7,
+            max_loss_usdt=12 * 7, layer_loss_budget_ratio=1,
+        ),
+        # SOL 空 - 复制账户
+        MartinConfig(
+            strategy_id="SOL0912C",
+            symbol="SOL/USDT:USDT",
+            signal_name="factor_043_9",
+            api_key=copy_api_key,
+            secret_key=copy_secret_key,
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
+            max_loss_usdt=10 * 9, layer_loss_budget_ratio=1,
+        ),
+        # BNB 多 - 复制账户
+        MartinConfig(
+            strategy_id="BNB0912C",
+            symbol="BNB/USDT:USDT",
+            signal_name="factor_044_10",
+            api_key=copy_api_key,
+            secret_key=copy_secret_key,
             first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
             max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
         )
@@ -3301,7 +3357,6 @@ def main_app():
             p.join()
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统] 主进程收到中断, 子进程为 daemon 将随之退出")
-
 # ==============================================================================
 # 16. 运维工具 (人工排障用, 与主流程解耦)
 # ==============================================================================
