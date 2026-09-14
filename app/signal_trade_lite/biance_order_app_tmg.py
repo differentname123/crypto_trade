@@ -3236,6 +3236,7 @@ def run_single_strategy(cfg):
     engine.run_forever()
 
 
+
 def main_app():
     # ================= 1. 加载账户信息 =================
     # 假设这里是你的主账号密钥读取方式 (如果键名不对请自行修改)
@@ -3245,6 +3246,10 @@ def main_app():
     # 这里是你提供的复制账号(新账户)的密钥读取方式
     ruru_api_key = get_config("ruru_biance_api_copy_key")
     ruru_secret_key = get_config("ruru_biance_api_copy_secret")
+
+    # 这里是你提供的复制账号(新账户)的密钥读取方式
+    qiqi_api_key = get_config("qiqi_biance_api_copy_key")
+    qiqi_secret_key = get_config("qiqi_biance_api_copy_secret")
 
     configs = [
         # =========================================================
@@ -3333,6 +3338,50 @@ def main_app():
             secret_key=ruru_secret_key,
             first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
             max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
+        ),
+
+        # =========================================================
+        # 第三组：复制账户 qiqi 运行的 4 个策略 (加上 Q 后缀做物理隔离)
+        # =========================================================
+        # AAVE 多 - qiqi 复制账户
+        MartinConfig(
+            strategy_id="AAVEL12Q",  # <--- 增加了 Q 后缀做隔离
+            symbol="AAVE/USDT:USDT",
+            signal_name="factor_044_1",
+            api_key=qiqi_api_key,  # <--- 注入 qiqi 账户密钥
+            secret_key=qiqi_secret_key,
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.6,
+            max_loss_usdt=12 * 6, layer_loss_budget_ratio=1,
+        ),
+        # AAVE 空 - qiqi 复制账户
+        MartinConfig(
+            strategy_id="AAVES12Q",
+            symbol="AAVE/USDT:USDT",
+            signal_name="factor_043_10",
+            api_key=qiqi_api_key,
+            secret_key=qiqi_secret_key,
+            first_qty=0.1, step_pct=1.5, qty_mult=2, tp_pct=0.7,
+            max_loss_usdt=12 * 7, layer_loss_budget_ratio=1,
+        ),
+        # SOL 空 - qiqi 复制账户
+        MartinConfig(
+            strategy_id="SOL0912Q",
+            symbol="SOL/USDT:USDT",
+            signal_name="factor_043_9",
+            api_key=qiqi_api_key,
+            secret_key=qiqi_secret_key,
+            first_qty=0.1, step_pct=3, qty_mult=2, tp_pct=0.8,
+            max_loss_usdt=10 * 9, layer_loss_budget_ratio=1,
+        ),
+        # BNB 多 - qiqi 复制账户
+        MartinConfig(
+            strategy_id="BNB0912Q",
+            symbol="BNB/USDT:USDT",
+            signal_name="factor_044_10",
+            api_key=qiqi_api_key,
+            secret_key=qiqi_secret_key,
+            first_qty=0.02, step_pct=2, qty_mult=2, tp_pct=1,
+            max_loss_usdt=14 * 8, layer_loss_budget_ratio=1,
         )
     ]
 
@@ -3357,6 +3406,7 @@ def main_app():
             p.join()
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统] 主进程收到中断, 子进程为 daemon 将随之退出")
+
 # ==============================================================================
 # 16. 运维工具 (人工排障用, 与主流程解耦)
 # ==============================================================================
