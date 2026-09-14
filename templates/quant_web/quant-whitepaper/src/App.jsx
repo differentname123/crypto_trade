@@ -342,7 +342,7 @@ const Principle=({idx,zh,maxim,takeaway,children})=>(
 
 const WeChatIcon = ({ size = 24, className = "" }) => (
   <svg viewBox="0 0 1024 1024" width={size} height={size} className={className} fill="currentColor">
-    <path d="M682.667 768c-23.467 0-46.934-4.267-66.134-10.667L541.867 800c-12.8 6.4-27.734 0-32-10.667-2.134-8.533-2.134-14.933 0-21.333l19.2-57.6c-49.067-34.133-78.934-83.2-78.934-138.667 0-100.266 98.134-181.333 219.734-181.333 119.466 0 219.733 81.067 219.733 181.333s-98.133 181.333-219.733 181.334z m130.133-270.933c10.667 0 19.2-8.534 19.2-19.2s-8.533-19.2-19.2-19.2-19.2 8.533-19.2 19.2 8.533 19.2 19.2 19.2z m-162.133-38.4c-10.667 0-19.2 8.533-19.2 19.2s8.533 19.2 19.2 19.2 19.2-8.533 19.2-19.2-8.533-19.2-19.2-19.2zM401.067 661.333c-36.267 0-70.4-10.667-100.267-25.6l-98.133 53.334c-17.067 8.533-36.267 0-42.667-14.934-2.133-10.666-2.133-19.2 0-29.866l23.467-78.934c-61.867-51.2-100.267-117.333-100.267-194.133 0-145.067 140.8-262.4 313.6-262.4 174.933 0 315.733 117.333 315.733 262.4 0 27.733-4.267 55.467-12.8 81.067-10.667-2.133-21.333-2.133-32-2.133-142.933 0-258.133 100.267-258.133 226.133 0 59.733 27.733 115.2 76.8 153.6-27.733 21.333-57.6 32-85.333 32z m-123.734-352c-14.933 0-27.733 12.8-27.733 27.734s12.8 27.733 27.733 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z m219.734 0c-14.934 0-27.734 12.8-27.734 27.734s12.8 27.733 27.734 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z"/>
+    <path d="M682.667 768c-23.467 0-46.934-4.267-66.134-10.667L541.867 800c-12.8 6.4-27.734 0-32-10.667-2.134-8.533-2.134-14.933 0-21.333l19.2-57.6c-49.067-34.133-78.934-83.2-78.934-138.667 0-100.266 98.134-181.333 219.734-181.333 119.466 0 219.733 81.067 219.733 181.333s-98.133 181.333-219.733 181.334z m130.133-270.933c10.667 0 19.2-8.534 19.2-19.2s-8.533-19.2-19.2-19.2-19.2 8.533-19.2 19.2 8.533 19.2 19.2 19.2z m-162.133-38.4c-10.667 0-19.2 8.533-19.2 19.2s8.533 19.2 19.2 19.2 19.2-8.533 19.2-19.2-8.533-19.2-19.2-19.2zM401.067 661.333c-36.267 0-70.4-10.667-100.267-25.6l-98.133 53.334c-17.067 8.533-36.267 0-42.667-14.934-2.133-10.666-2.133-19.2 0-29.866l23.467-78.934c-61.867-51.2-100.267-117.333-100.267-194.133 0-145.067 140.8-262.4 313.6-262.4 174.933 0 315.733 117.333 315.733 262.4 0 27.733-4.267 55.467-12.8 81.067-10.667-2.133-21.333-32-2.133-142.933 0-258.133 100.267-258.133 226.133 0 59.733 27.733 115.2 76.8 153.6-27.733 21.333-57.6 32-85.333 32z m-123.734-352c-14.933 0-27.733 12.8-27.733 27.734s12.8 27.733 27.733 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z m219.734 0c-14.934 0-27.734 12.8-27.734 27.734s12.8 27.733 27.734 27.733 27.733-12.8 27.733-27.733-12.8-27.734-27.733-27.734z"/>
   </svg>
 );
 
@@ -504,8 +504,6 @@ const Finale=({ onViewRadar })=>{
 };
 
 const SignalRadar = ({ onBack }) => {
-  const WECHAT_ID = 'easyeverything98';
-
   const [showWarningModal, setShowWarningModal] = useState(false);
   const [modalStep, setModalStep] = useState(1);
   const [agreed, setAgreed] = useState(false);
@@ -552,7 +550,6 @@ const fetchSignals = async () => {
 
   const handleApply = () => {
     if (!agreed) return;
-    try { navigator.clipboard.writeText(WECHAT_ID); } catch (err) {}
     setModalStep(2);
   };
 
@@ -710,24 +707,22 @@ const fetchSignals = async () => {
               ) : (
                 <>
                   <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-transparent via-[#34E0A1] to-transparent opacity-50"></div>
-                  <div className="flex flex-col items-center p-8 text-center pb-6">
-                    <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full border border-[#34E0A1]/20 bg-[#34E0A1]/10"><Check className="text-[#34E0A1]" size={28} strokeWidth={3} /></div>
-                    <h3 className="text-lg font-bold text-white tracking-wider">已复制微信号</h3>
-                    <p style={{color: DIM}} className="mt-1.5 mb-6 text-xs">请前往微信添加助手完成对接</p>
+                  <div className="flex flex-col items-center p-6 text-center pb-6">
+                    <h3 className="text-lg font-bold text-white tracking-wider mt-2">权限申请已就绪</h3>
+                    <p style={{color: DIM}} className="mt-1.5 mb-4 text-xs">请使用 Binance (币安) App 扫描下方二维码 添加好友</p>
 
-                    <div className="mb-6 w-full rounded-xl border border-white/5 bg-[#000000] p-4 flex flex-col gap-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[13px] text-[#8A93A3]">微信号</span>
-                        <span style={{fontFamily: MONO, color: TXT}} className="text-[17px] font-bold tracking-wider">{WECHAT_ID}</span>
-                      </div>
-                      <div className="h-px w-full bg-white/5"></div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-[13px] text-[#8A93A3]">验证口令</span>
-                        <span style={{color: GOLD}} className="text-[17px] font-bold tracking-widest">实时跟单</span>
-                      </div>
+                    <div className="mb-4 w-full flex flex-col items-center justify-center">
+                      {/* 放大二维码图片，移除多余边框背景 */}
+                      <img src="/binance-qr1.jpg" alt="Binance Group QR Code" className="w-56 h-56 object-cover rounded-xl shadow-lg" />
                     </div>
 
-                    <button onClick={() => window.location.href = 'weixin://'} style={{background: GREEN, color: INK}} className="mb-4 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">打开微信 <ExternalLink size={16} /></button>
+                    {/* 新增：Binance UID 保底联系方式 */}
+                    <div className="mb-6 flex w-full flex-col items-center justify-center rounded-xl bg-white/[0.03] border border-white/5 p-3">
+                      <span style={{color: DIM}} className="text-[11px] mb-1">图片无法识别？可直接添加币安 UID 好友</span>
+                      <span style={{fontFamily: MONO, color: GREEN}} className="text-lg font-bold select-all tracking-widest">1236030903</span>
+                    </div>
+
+                    <button onClick={() => setShowWarningModal(false)} style={{background: GREEN, color: INK}} className="mb-3 flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-[15px] font-bold transition-transform active:scale-95">我已扫码或添加</button>
                     <button onClick={() => setShowWarningModal(false)} className="text-xs tracking-wider text-[#8A93A3] transition-colors hover:text-white p-2">关闭</button>
                   </div>
                 </>
