@@ -63,45 +63,93 @@ SCORE_CFG = {
 # 目标参数清单 (可加 "multiplier" 字段来精确锁定加仓倍数, 强烈建议加)
 # =====================================================================
 TARGET_CONFIGS = [
-    {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
-     "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润"},
 
-    {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-     "margin": 6, "备注": "推荐的次数为 3；第二阶段赚分润"},
-    {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
-     "margin": 8, "备注": "推荐的次数为 3；第一阶段稳定做数据"},
+    # 10000筛选
 
-    {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
-     "margin": 7, "备注": "推荐的次数为 2；第一阶段稳定做数据 1 次，第二阶段赚分润 1 次"},
-    {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-     "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
-    {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
-     "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
-     "margin": 9, "备注": "推荐的次数为 2；第一阶段稳定做数据"},
-
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
-     "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "LINKUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
-     "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # 第一阶段：做数据养号期（核心目标：绝对存活、极高安全垫、曲线平滑）
     {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "BNBUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.010,
-     "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "SOLUSDT", "strategy": "factor_023_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
-     "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "LINKUSDT", "strategy": "factor_024_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
-     "margin": 9, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+     "margin": 10, "备注": "推荐次数：7；第一阶段做数据（绝对防御底座首选，存活与安全垫全场最强）"},
+    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+     "margin": 10, "备注": "推荐次数：3；第一阶段做数据（SOL生态备选长跑王，超200天存活无回撤）"},
+
+    # 第二阶段：带单收割期（核心目标：高频平仓、流水最大化、平原均值高防滑点）
+    {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+     "margin": 6, "备注": "推荐次数：6；第二阶段赚分润（极限高频收割机，总收益流水霸榜，适合冲刺表现费）"},
+    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+     "margin": 7, "备注": "推荐次数：4；第二阶段赚分润（同族因子无缝平滑切换，平原均值全场顶格，容错率最高）"},
+    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.025, "tp_step": 0.006,
+     "margin": 8, "备注": "推荐次数：3；第二阶段赚分润（收紧加仓间距高频吃单，Margin8提供更高的极端安全容错）"},
+
+    # 第二阶段：备选方案（不换币平替与高净利增强）
     {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 6, "备注": "推荐的次数为 1；第二阶段赚分润"},
-    {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-     "margin": 8, "备注": "推荐的次数为 1；第二阶段赚分润"},
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
-     "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
-     "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
-     "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+     "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（AAVE不换币平替，保持极高安全垫与净利润，适合大资金稳健收租）"},
+    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+     "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（极高净利润增强备选，适合小比例资金搭配对冲）"},
+
+
+    # 5000筛选
+    {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+     "margin": 9, "备注": "推荐的次数为 7；第一阶段做数据（绝对防御底座首选）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+     "margin": 7, "备注": "推荐的次数为 6；第二阶段赚分润（流水与容错综合收益首选）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+     "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润（高爆发收割进攻备选）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_024_2", "direction": "Long", "add_step": 0.040, "tp_step": 0.007,
+     "margin": 6, "备注": "推荐的次数为 2；第二阶段赚分润（0.040宽距异源因子对冲）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_023_7", "direction": "Long", "add_step": 0.030, "tp_step": 0.005,
+     "margin": 9, "备注": "推荐的次数为 2；第一阶段做数据（近8个月长寿视觉备选）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+     "margin": 10, "备注": "推荐的次数为 2；第一阶段做数据（SOL本币极限防守备选）"},
+
+    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+     "margin": 8, "备注": "推荐的次数为 1；第一阶段做数据（SOL同因子防守备选）"},
+
+
+    # # 全局筛选
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
+    #  "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
+    #  "margin": 6, "备注": "推荐的次数为 3；第二阶段赚分润"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
+    #  "margin": 8, "备注": "推荐的次数为 3；第一阶段稳定做数据"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
+    #  "margin": 7, "备注": "推荐的次数为 2；第一阶段稳定做数据 1 次，第二阶段赚分润 1 次"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
+    #  "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
+    #  "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
+    #  "margin": 9, "备注": "推荐的次数为 2；第一阶段稳定做数据"},
+    #
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
+    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "LINKUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
+    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "BNBUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.010,
+    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
+    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "LINKUSDT", "strategy": "factor_024_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
+    #  "margin": 9, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 6, "备注": "推荐的次数为 1；第二阶段赚分润"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
+    #  "margin": 8, "备注": "推荐的次数为 1；第二阶段赚分润"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
+    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
+    #  "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
+    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
 
     # === 做空 Short ===
     {"symbol": "AAVEUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.007,
