@@ -85,7 +85,7 @@ from biance_order_lite import (
 # ------------------------------------------------------------------------------
 from app.signal_trade_lite.run_cross_signal_lite import get_signal_factor_044_1, get_signal_factor_043_10, get_signal_factor_043_9, get_signal_factor_044_10
 
-# 注册新的信号源
+# 注册新的信号源  这些信号源是会阻塞得到信号的，1min内只会得到一次信号
 SIGNAL_REGISTRY = {
     "factor_044_1": get_signal_factor_044_1,
     "factor_043_10": get_signal_factor_043_10,
