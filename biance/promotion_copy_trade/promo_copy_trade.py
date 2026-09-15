@@ -472,6 +472,7 @@ def send_single_promo_comment(post):
 
     follower = comment_info.get("follower_perspective", {})
     comment_text, link_text = follower.get("comment_text"), follower.get("link_text")
+    score = follower.get("score") if isinstance(follower, dict) else None
     user_data_dir, account_name = acquire_user_account_for_send()
     started = time.monotonic()
 
@@ -874,7 +875,8 @@ if __name__ == "__main__":
              send_promo_comments,
              gen_all_promo_comments,
              delete_old_replay,
-             verify_promo_comments_task]
+             verify_promo_comments_task
+    ]
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
