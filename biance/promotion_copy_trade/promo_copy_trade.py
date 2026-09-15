@@ -456,30 +456,25 @@ def clear_all_promo_comments_batch():
 
 
 def send_single_promo_comment(post):
-    """按既有发送状态发布单帖，在内存中更新结果，数据库由调用方回写。
-    入参：post_id、promo_comment.follower_perspective.{comment_text, link_text}，
-    可含 promo_comment_info.{send_count, status, verify_status, history}。
-    返回：(post, SUCCESS/FAILED) 或 (None, CAPTCHA/SKIPPED)。
-    """
+    """按既有发送状态发布单帖，在内存中更新结果，数据库由调用方回写。"""
     comment_info = post.get("promo_comment")
     if not comment_info:
         return None, "SKIPPED"
     promo_info = post.get("promo_comment_info")
     if isinstance(promo_info, dict):
-        # : 上限统计成功次数而非尝试次数；已有空字典、业务失败或待验证状态均不再发送。
         if promo_info.get("send_count", 0) >= MAX_SUCCESSFUL_SENDS:
             return None, "SKIPPED"
         if not (promo_info.get("status") == "success" and promo_info.get("verify_status") == "failed"):
             return None, "SKIPPED"
-    post_id = post.get("post_id")
+    post_id = str(post.get("post_id", ""))  # 【修改点】确保 post_id 也是字符串
     if not post_id:
         return None, "SKIPPED"
 
-    # : 双视角都校验，但只发布 follower；历史文案缺少正文或链接仍交由外部接口处理。
     follower = comment_info.get("follower_perspective", {})
     comment_text, link_text = follower.get("comment_text"), follower.get("link_text")
     user_data_dir, account_name = acquire_user_account_for_send()
     started = time.monotonic()
+
     try:
         error, success, comment_id = comment_on_binance_post(
             post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
@@ -487,6 +482,10 @@ def send_single_promo_comment(post):
             url_info_list=[{"text": link_text, "url": LEAD_DETAIL_URL}],
             user_data_dir=user_data_dir,
         )
+
+        # 【修改点】强制将接口返回的长 ID 转换为字符串
+        comment_id = str(comment_id) if comment_id else ""
+
     except Exception as send_error:
         record_error = None
         try:
@@ -534,7 +533,6 @@ def send_single_promo_comment(post):
         "verify_time": None,
     })
 
-    # 追加发送历史记录以支持存活率验证不漏掉失败重试的数据
     history = promo_info.get("history")
     if not isinstance(history, list):
         history = []
@@ -616,7 +614,6 @@ def delete_old_replay():
         started = time.monotonic()
         deleted = failed = account_errors = 0
         logger.info(f"[历史清理/开始] 准备查询历史回复 | 账号数: 【{len(DELETE_USER_DATA_DIR_LIST)}】")
-        # 原有容错边界：清理异常只结束当前条目、账号或本轮，随后继续定时执行。
         try:
             cutoff_ms = int((time.time() - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
             for browser_session_dir in DELETE_USER_DATA_DIR_LIST:
@@ -630,7 +627,6 @@ def delete_old_replay():
                             f" | 账号: 【{account_name}】 | 结果: 【跳过该账号】"
                         )
                         continue
-                    # : 沿用接口 time_offset 语义，最多拉 1000 条；不另验时间，也不限定推广回复。
                     replies = fetch_binance_square_replies(
                         target_square_uid=user_info.get("squareUid"),
                         cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,
@@ -638,9 +634,13 @@ def delete_old_replay():
                     if not replies:
                         continue
                     for item in replies:
-                        reply_id = item.get("reply_id")
-                        if not reply_id:
+                        raw_reply_id = item.get("reply_id")
+                        if not raw_reply_id:
                             continue
+
+                        # 【修改点】强制转为字符串传入删除接口，防止驱动/API解析异常
+                        reply_id = str(raw_reply_id)
+
                         try:
                             success = delete_binance_square_content(
                                 content_id=reply_id, cookies=cookies, csrf_token=token
@@ -682,16 +682,11 @@ def delete_old_replay():
         )
         time.sleep(DELETE_INTERVAL_SEC)
 
-
 def verify_promo_comments_task():
-    """每五分钟核查发送至少十分钟、仍符合条件的评论，并回写最新评论和验证状态。
-    帖子字段：post_id、promo_comment_info.{status, verify_status, comment_time,
-    comment_id, send_count, history}；评论列表每项用 reply_id 匹配；无返回。
-    """
+    """每五分钟核查发送至少十分钟、仍符合条件的评论，并回写最新评论和验证状态。"""
     while True:
         started = time.monotonic()
         survived_count = missing_count = query_errors = 0
-        # 原有容错边界：查询失败跳过单帖，其余异常结束本轮，下一轮继续。
         try:
             post_manager = UniversalPostManager(gen_db_object())
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
@@ -699,7 +694,6 @@ def verify_promo_comments_task():
                 promo_info = post.get("promo_comment_info")
                 if not isinstance(promo_info, dict) or promo_info.get("status") != "success":
                     continue
-                # : 验证成功后不再复查；验证失败的帖子在后续轮次仍可能被再次清空文案。
                 if promo_info.get("verify_status") == "success":
                     continue
                 comment_time = promo_info.get("comment_time", 0)
@@ -707,7 +701,7 @@ def verify_promo_comments_task():
                     continue
                 if not is_valid_post_for_promo(post):
                     continue
-                post_id = post.get("post_id")
+                post_id = str(post.get("post_id", ""))  # 【修改点】
                 if not post_id:
                     continue
                 try:
@@ -727,20 +721,20 @@ def verify_promo_comments_task():
                     )
                     continue
 
-                # : 未在返回的 100 条热评中找到就判失败，空列表亦如此，并不等于确认被删。
                 post["comments"] = comments
                 comment_id = str(promo_info.get("comment_id", ""))
-                # : 沿用字符串比较，缺失 ID 或 None 仍可能互相匹配。
+
+                # 【防线1】目标源统一转字符串
                 survived = any(str(item.get("reply_id", "")) == comment_id for item in comments)
                 verify_time_ms = int(time.time() * 1000)
                 promo_info["verify_time"] = verify_time_ms
                 promo_info["verify_status"] = "success" if survived else "failed"
 
-                # 同步更新历史列表中的记录存活状态
+                # 【防线2】同步更新历史列表时统一转字符串
                 history = promo_info.get("history")
                 if isinstance(history, list) and history:
                     for record in reversed(history):
-                        if record.get("comment_id") == comment_id:
+                        if str(record.get("comment_id", "")) == comment_id:
                             record["verify_status"] = promo_info["verify_status"]
                             record["verify_time"] = verify_time_ms
                             break
@@ -772,7 +766,6 @@ def verify_promo_comments_task():
             f" | 休眠: 【{VERIFY_INTERVAL_SEC} 秒】"
         )
         time.sleep(VERIFY_INTERVAL_SEC)
-
 
 def calculate_comment_survival_rate(days=1):
     """
@@ -878,9 +871,9 @@ if __name__ == "__main__":
     calculate_comment_survival_rate(days=1)
 
     tasks = [
-             # send_promo_comments,
-             # gen_all_promo_comments,
-             # delete_old_replay,
+             send_promo_comments,
+             gen_all_promo_comments,
+             delete_old_replay,
              verify_promo_comments_task]
     threads = []
     for task in tasks:
