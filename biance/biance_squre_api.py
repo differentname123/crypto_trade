@@ -1881,9 +1881,7 @@ def fetch_binance_square_replies(
                 "filterType": "REPLY",
             }
 
-            logger.info(
-                f"正在拉取第 {page} 页数据, timeOffset={current_offset}..."
-            )
+            logger.info(f"正在拉取第 {page} 页数据, timeOffset={current_offset}...")
 
             try:
                 response = requests.get(
@@ -1904,9 +1902,7 @@ def fetch_binance_square_replies(
             try:
                 res_json = response.json()
             except Exception:
-                logger.error(
-                    f"响应解析 JSON 失败，返回内容: {response.text[:200]}"
-                )
+                logger.error(f"响应解析 JSON 失败，返回内容: {response.text[:200]}")
                 break
 
             # 3. 业务状态码校验
@@ -1921,32 +1917,59 @@ def fetch_binance_square_replies(
             contents = data.get("contents") or []
 
             if not contents:
-                logger.info(
-                    f"第 {page} 页没有查询到回复内容 (contents 为空)，停止翻页。"
-                )
+                logger.info(f"第 {page} 页没有查询到回复内容 (contents 为空)，停止翻页。")
                 break
 
             logger.info(f"第 {page} 页成功获取到 {len(contents)} 组回复互动。")
 
-            # 4. 数据解析与精简（强化空指针防护）
+            # 4. 数据解析与精简（强化多层级逻辑与空指针防护）
             for item in contents:
-                # 使用 or [] 防止 NoneType 出现
                 reply_post_list = item.get("replyPostList") or []
 
-                origin_post = (
-                    reply_post_list[0] if len(reply_post_list) > 0 else {}
-                )
-                my_reply = (
-                    reply_post_list[1]
-                    if len(reply_post_list) > 1
-                    else (reply_post_list[0] if reply_post_list else {})
-                )
+                if not reply_post_list:
+                    continue
+
+                outer_id = item.get("id")  # 当前互动事件的精确ID
+
+                my_reply = {}
+                origin_post = {}
+                target_idx = -1
+
+                # 策略 A: 先通过外层精确 ID 匹配目标回复节点 (最准确)
+                for i, post in enumerate(reply_post_list):
+                    if post.get("id") == outer_id:
+                        my_reply = post
+                        target_idx = i
+                        break
+
+                # 策略 B: 如果 ID 匹配失败（防范 API 变更），降级通过 target_square_uid 匹配
+                if target_idx == -1:
+                    for i, post in enumerate(reply_post_list):
+                        if post.get("squareUid") == target_square_uid:
+                            my_reply = post
+                            target_idx = i
+                            break
+
+                # 策略 C: 实在匹配不到，采用保守后备方案：最后一条当自己，倒数第二条当父级
+                if target_idx == -1:
+                    my_reply = reply_post_list[-1]
+                    target_idx = len(reply_post_list) - 1
+
+                # 定位父节点 (origin_post)
+                # 逻辑：目标节点的上一层即为直系被回复节点。如果目标节点已经是第0个，则其自身作为origin_post避免越界。
+                if target_idx > 0:
+                    origin_post = reply_post_list[target_idx - 1]
+                else:
+                    origin_post = reply_post_list[0]
+
+                # 【可选】：如果你无论嵌套多少层，都只想提取最上面的“原帖(Yi He)”，
+                # 可以把上面这句 if...else 替换为： origin_post = reply_post_list[0]
 
                 # 确保取出的对象是字典类型
                 origin_post = origin_post or {}
                 my_reply = my_reply or {}
 
-                # 关键修复点：使用 (my_reply.get("hyperlinkList") or [])
+                # 提取链接信息
                 raw_hyperlinks = my_reply.get("hyperlinkList") or []
                 clean_links = [
                     link.get("url")
@@ -1959,20 +1982,15 @@ def fetch_binance_square_replies(
                     "reply_text": my_reply.get("bodyTextOnly") or "",
                     "reply_time": my_reply.get("firstReleaseTime"),
                     "reply_links": clean_links,
-                    "parent_post_id": my_reply.get("parentContentId")
-                                      or origin_post.get("id"),
-                    "parent_post_author": origin_post.get("displayName")
-                                          or origin_post.get("username")
-                                          or "",
+                    "parent_post_id": my_reply.get("parentContentId") or origin_post.get("id"),
+                    "parent_post_author": origin_post.get("displayName") or origin_post.get("username") or "",
                     "parent_post_text": origin_post.get("bodyTextOnly") or "",
                 }
 
                 results.append(simplified_item)
 
                 if 0 < limit <= len(results):
-                    logger.info(
-                        f"已达到设定的拉取限制 limit={limit}，停止抓取。"
-                    )
+                    logger.info(f"已达到设定的拉取限制 limit={limit}，停止抓取。")
                     return results
 
             # 5. 分页游标校验
@@ -1994,12 +2012,13 @@ def fetch_binance_square_replies(
 
 
 if __name__ == "__main__":
-    # # 查询目标用户的回复列表 不需要cookie
-    # target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
-    # cookies = ""
-    # csrf_token = ""
-    # replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
-    #                                        limit=10)
+    # 查询目标用户的回复列表 不需要cookie
+    target_square_uid = "3-VuV48ZMljCq9G1FM_auA"
+    cookies = ""
+    csrf_token = ""
+    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
+                                           limit=1000)
+    print()
     #
     #
     # # 删除指定的回复内容 需要cookie
