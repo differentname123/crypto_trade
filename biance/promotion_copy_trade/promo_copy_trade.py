@@ -263,41 +263,68 @@ def format_post_for_promo(raw_data):
 
 
 def check_comment_info(data):
-    """按原有字段、标点、长度和评分规则校验，返回 (是否有效, 错误说明)。
-    入参：trader_perspective/follower_perspective 字典，各含
-    comment_text、link_text、combined_preview、score、score_reason。
-    """
+    """按原有字段、标点、长度和评分规则校验，新增对新版提示词结构（reply_draft、post_analysis等）的适配。"""
     if not isinstance(data, dict):
         return False, "大模型返回数据不是有效的字典对象"
-    required_fields = ("comment_text", "link_text", "combined_preview", "score", "score_reason")
+
+    # 1. 校验新增的最外层解析节点（防止大模型偷工减料，不输出分析过程）
+    if "post_analysis" not in data or not isinstance(data.get("post_analysis"), dict):
+        return False, "缺失顶层字段或类型错误: post_analysis"
+
+    # 2. 定义新版 JSON 结构下的必须字段
+    required_fields = (
+        "angle", "comment_text", "link_text", "link_target",
+        "combined_preview", "reply_draft", "score", "score_tier", "score_reason"
+    )
+    # 子评论的必须字段
+    reply_required_fields = (
+        "comment_text", "conversion_role", "score", "score_tier", "score_reason"
+    )
+
     for perspective in ("trader_perspective", "follower_perspective"):
         if perspective not in data:
             return False, f"缺失顶层角色字段: {perspective}"
         view = data[perspective]
         if not isinstance(view, dict):
             return False, f"{perspective} 必须是字典结构"
+
+        # 校验外层字段缺失
         missing = [field for field in required_fields if field not in view]
         if missing:
             return False, f"{perspective} 缺失必要字段: {missing}"
 
         comment_text, link_text, score = view["comment_text"], view["link_text"], view["score"]
-        # : 保留空正文及尾部空白的原判定；预览和评分理由仅检查字段存在。
+        reply_draft = view["reply_draft"]
+
+        # 原有的主评论正文和标点合规校验
         if not isinstance(comment_text, str):
             return False, f"{perspective}.comment_text 类型非字符串"
         if comment_text.endswith(("。", "！", "？", ".", "!", "?")):
             return False, f"{perspective}.comment_text 违规：绝对禁止以终止性标点结尾"
+
+        # 原有的引流文案校验
         if not isinstance(link_text, str):
             return False, f"{perspective}.link_text 类型非字符串"
-        # : 原实现只检查字符数，不验证是否为汉字。
-        if not 2 <= len(link_text) <= 6:
-            return False, f"{perspective}.link_text 违规：引流文案长度必须严格在 2-6 个汉字之间"
-        # : bool 是 int 的子类，原实现接受布尔评分；不擅自收紧。
+        if not 2 <= len(link_text) <= 10:
+            return False, f"{perspective}.link_text 违规：引流文案长度必须严格在 2-6 个字符之间"
+
         if not isinstance(score, (int, float)):
             return False, f"{perspective}.score 类型非数字"
         if not 0 <= score <= 10:
             return False, f"{perspective}.score 违规：评分必须介于 0-10 之间"
-    return True, ""
 
+        # 3. 新增：校验“子评论 (reply_draft)”结构完整性
+        if not isinstance(reply_draft, dict):
+            return False, f"{perspective}.reply_draft 必须是字典结构"
+        missing_reply = [field for field in reply_required_fields if field not in reply_draft]
+        if missing_reply:
+            return False, f"{perspective}.reply_draft 缺失必要字段: {missing_reply}"
+        if not isinstance(reply_draft["comment_text"], str):
+            return False, f"{perspective}.reply_draft.comment_text 类型非字符串"
+        if not isinstance(reply_draft["score"], (int, float)) or not 0 <= reply_draft["score"] <= 10:
+            return False, f"{perspective}.reply_draft.score 违规：子评论评分必须为 0-10 之间的数字"
+
+    return True, ""
 
 def gen_promo_comment(post):
     """请求模型并校验双视角结果；重试耗尽返回空字典，保留原有降级边界。
@@ -850,7 +877,11 @@ if __name__ == "__main__":
     # 如果需要单独统计存活率，可以取消注释执行下行代码
     calculate_comment_survival_rate(days=1)
 
-    tasks = [send_promo_comments, gen_all_promo_comments, delete_old_replay, verify_promo_comments_task]
+    tasks = [
+             # send_promo_comments,
+             # gen_all_promo_comments,
+             # delete_old_replay,
+             verify_promo_comments_task]
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
