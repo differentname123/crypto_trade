@@ -68,9 +68,16 @@ from enum import Enum
 import pandas as pd
 
 from common_utils_lite import setup_logger, get_config
-
-logger = setup_logger(app_name="martin_trader")
-
+import time
+import json
+import os
+import hashlib
+from math import isfinite
+if multiprocessing.current_process().name == "MainProcess":
+    logger = setup_logger(app_name="martin_trader")
+else:
+    # 子进程仅拿一个空的句柄占位，实际写盘会在 run_single_strategy 内被 force_reset 重新接管
+    logger = logging.getLogger("martin_trader")
 # 保持原有初始化顺序: 先建好日志再导入下单库
 from biance_order_lite import (
     safe_init_exchange, execute_order, ExecStatus, fetch_single_order,
@@ -601,9 +608,11 @@ class BinanceGateway:
         "OPEN": "OPEN", "CLOSED": "FILLED",
     }
 
-    def __init__(self, exchange, symbol):
+    # 【修改点】: 引入 shared_prices 字典用于跨进程公共数据(价格)共享
+    def __init__(self, exchange, symbol, shared_prices=None):
         self.ex = exchange
         self.symbol = symbol
+        self.shared_prices = shared_prices
         self._last_call_ts = 0.0
         # 【禁用 ccxt 内置重试】所有重试必须归状态机统一管理, 杜绝"以为发一次实际发两次"
         try:
@@ -685,11 +694,25 @@ class BinanceGateway:
                          f"交易对:[{self.symbol}] 错误:[{e}]")
             return None
 
+    # 【修改点】: 复用目标一，拦截 12 个进程对相同公有币种最新价的高频拉取请求
     def fetch_last_price(self):
+        now = time.time()
+        # 1. 如果共享字典存在，且价格够新鲜 (< 1.5秒, 完美契合 2 秒 Tick)，直接返回内存值，不走网络
+        if self.shared_prices is not None:
+            cached = self.shared_prices.get(self.symbol)
+            if cached and now - cached['ts'] < 1.5:
+                return cached['price']
+
+        # 2. 如果过期或不存在，发起真实网络请求
         try:
             self._throttle()
             p = float(self.ex.fetch_ticker(self.symbol).get("last") or 0)
-            return p if p > 0 else None
+            if p > 0:
+                # 3. 拿到最新价后写入多进程共享内存字典，后续 1.5 秒内其他同币种进程直接读缓存
+                if self.shared_prices is not None:
+                    self.shared_prices[self.symbol] = {'price': p, 'ts': now}
+                return p
+            return None
         except Exception as e:
             logger.error(f"[网关] 拉取最新价失败, 本轮不做任何决策(疑网络/交易所抖动) | 错误:[{e}]")
             return None
@@ -1885,7 +1908,7 @@ class MartinCycle:
         slp = self.bp.sl_price
         if self.sl_breach_since == 0.0:
             self.sl_breach_since = w.ts
-            logger.critical(f"[熔断] 现价已击穿全局止损价, 等待条件单自行触发 | 现价:[{w.price}] "
+            logger.critical(f"[熔断] 现价已击穿全局止损价, 等等待条件单自行触发 | 现价:[{w.price}] "
                             f"止损价:[{slp}] 宽限:[{SL_BREACH_CONFIRM_SEC}s]")
         # 存活即算有效保护(含 PENDING / CANCEL_PENDING): 绝不抢在它前面发市价单,
         # 否则两笔先后成交会把仓位平成反向。真正无单时才立即强平。
@@ -2863,9 +2886,6 @@ class MartinEngine:
 # ==============================================================================
 # 14. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
 # ==============================================================================
-# ==============================================================================
-# 14. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
-# ==============================================================================
 class DashboardThread(threading.Thread):
     def __init__(self, engine, interval_sec=120):
         super().__init__(daemon=True)
@@ -2884,11 +2904,7 @@ class DashboardThread(threading.Thread):
 
     def _get_account_snapshot(self):
         """只读采样 U 本位账户；加入基于 API Key 的多进程文件缓存(方案三)，防抖共享数据。"""
-        import time
-        import json
-        import os
-        import hashlib
-        from math import isfinite
+
 
         # ================= 方案3: 读取缓存逻辑 =================
         # 1. 构造基于 API Key 的缓存文件名 (脱敏处理)
@@ -2899,14 +2915,21 @@ class DashboardThread(threading.Thread):
         now = time.time()
         cache_ttl = 30.0  # 30秒内同一个 API Key 的进程共享此结果，拦截多余请求
 
-        # 2. 尝试读取合法缓存
+        # 2. 尝试读取合法缓存 (修改点：加入防惊群效应的排他机制)
         try:
-            if os.path.exists(cache_file) and now - os.path.getmtime(cache_file) < cache_ttl:
-                with open(cache_file, 'r', encoding='utf-8') as f:
-                    cached_data = json.load(f)
-                    if isinstance(cached_data, dict) and "equity" in cached_data:
-                        cached_data["latency_ms"] = 0  # 标识为缓存命中，耗时设为 0
-                        return cached_data
+            if os.path.exists(cache_file):
+                mtime = os.path.getmtime(cache_file)
+                if now - mtime < cache_ttl:
+                    with open(cache_file, 'r', encoding='utf-8') as f:
+                        cached_data = json.load(f)
+                        if isinstance(cached_data, dict) and "equity" in cached_data:
+                            cached_data["latency_ms"] = 0  # 标识为缓存命中，耗时设为 0
+                            return cached_data
+                else:
+                    # 【新增】防惊群效应：缓存已过期，当前进程准备承担拉取任务。
+                    # 立即刷新文件修改时间，这样其他并发被唤醒的进程会去读取旧缓存，
+                    # 完美避免瞬间 4 个进程集体去拉 API。
+                    os.utime(cache_file, (now, now))
         except Exception:
             pass  # 发生任何读取异常（如文件刚被清理），则静默降级为真实请求
 
@@ -3199,7 +3222,8 @@ class DashboardThread(threading.Thread):
 # ==============================================================================
 # 15. 进程编排
 # ==============================================================================
-def run_single_strategy(cfg):
+# 【修改点】: 引入 shared_prices 字典用于跨进程传递
+def run_single_strategy(cfg, shared_prices=None):
     """子进程入口: 独立日志 -> 单实例锁 -> 父进程自杀看门狗 -> 组装 -> 冷启动 -> 主循环。"""
     safe_symbol = cfg.symbol.replace("/", "_").replace(":", "_")
     setup_logger(app_name=f"MT_{cfg.strategy_id}_{safe_symbol}", force_reset=True)
@@ -3245,7 +3269,8 @@ def run_single_strategy(cfg):
 
     exchange = safe_init_exchange(api_key, secret_key, proxies)
 
-    gw = BinanceGateway(exchange, cfg.symbol)  # ← 换 OKX 只需替换这一行
+    # 【修改点】: 网关接收 shared_prices，底层缓存生效
+    gw = BinanceGateway(exchange, cfg.symbol, shared_prices)  # ← 换 OKX 只需替换这一行
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
     def _on_term(signum, frame):
@@ -3262,6 +3287,8 @@ def run_single_strategy(cfg):
         logger.critical("[进程] 冷启动检查未通过, 进程退出")
         return
     DashboardThread(engine, interval_sec=60 * 2).start()
+    # 【修复点】：随机打散子进程的主循环步伐，完美避开同时查询价格的惊群效应
+    time.sleep(random.uniform(0.1, 2.0))
     engine.run_forever()
 
 
@@ -3420,9 +3447,14 @@ def main_app():
                         f"当前配置:{ids}")
         return
 
+    # 【修改点】: 创建跨进程安全共享字典，专门给最新价当缓存池
+    manager = multiprocessing.Manager()
+    shared_prices = manager.dict()
+
     procs = []
     for c in configs:
-        p = multiprocessing.Process(target=run_single_strategy, args=(c,))
+        # 【修改点】: 将共享价格字典通过子进程参数往下透传
+        p = multiprocessing.Process(target=run_single_strategy, args=(c, shared_prices))
         p.daemon = True
         p.start()
         procs.append(p)
