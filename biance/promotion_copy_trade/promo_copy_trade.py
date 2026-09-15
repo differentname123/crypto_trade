@@ -53,7 +53,7 @@ USER_DATA_DIR_LIST = [
     r"W:\temp\biance_yang",
     r"W:\temp\biance_daniang",
     r"W:\temp\biance_mama",
-    r"W:\temp\biance_jie",
+    # r"W:\temp\biance_jie",
     r"W:\temp\biance_qiqi",
     r"W:\temp\biance_zhouling",
     r"W:\temp\biance_yanglin",
@@ -866,7 +866,7 @@ def delete_old_replay():
             f" | 账号异常: 【{account_errors}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
             f" | 休眠: 【{DELETE_INTERVAL_SEC} 秒】"
         )
-        time.sleep(DELETE_INTERVAL_SEC)
+        time.sleep(DELETE_INTERVAL_SEC * 24)
 
 
 def verify_promo_comments_task():
