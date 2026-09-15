@@ -39,6 +39,7 @@ LLM_MAX_RETRIES = 3
 GEMINI_MODEL = "gemini-3.7-flash"
 MAX_SUCCESSFUL_SENDS = 3
 MAX_REPLAY_DAYS = 7
+MAX_DAILY_SUCCESS_PER_ACCOUNT = 100  # 新增：每天每个账号最高成功发评限制
 # : 原注释写“每天”，实际每 3600 秒执行；保留实际的一小时间隔。
 DELETE_INTERVAL_SEC = 3600
 VERIFY_INTERVAL_SEC = 300
@@ -68,7 +69,7 @@ FILTER_CONFIG = {
     ],
     "blacklist_multi_words": ["follow", "share", "comment"],
     "min_text_length": 20,
-    "max_age_hours": 720,
+    "max_age_hours": 24,  # 修改点：时效要求调整为 24 小时
     "max_comment_count": 100,
     "cold_post_hours": 20,
     "cold_post_min_views": 20,
@@ -80,6 +81,8 @@ ACCOUNT_USAGE_DEFAULTS = {
     "last_failure_reason": None,
     "last_send_time": 0,
     "update_time": None,
+    "daily_stats": {"attempts": 0, "success": 0, "survived": 0, "failed": 0},  # 新增：记录日发送情况
+    "daily_stats_sync_time": 0,  # 新增：判断是否需要请求接口更新数据（1h）
 }
 # : 沿用大小写敏感的子串匹配；任何包含“405”的错误都触发暂停，可能误判。
 CAPTCHA_SIGNALS = (
@@ -150,28 +153,68 @@ def _load_user_account_usage_unlocked():
 
 
 def acquire_user_account_for_send():
-    """在冷却已结束的账号中按占用次数、配置顺序选择，持锁预占后返回。
-    返回：(user_data_dir, account_name)；全部冷却时在锁外等待。
+    """低耦合高内聚：自动请求账号监控更新、筛查日发送限额以及检查发送冷却，持锁预占后返回。
+    返回：(user_data_dir, account_name)；全部冷却时在锁外等待。如果全部触达每日限额，返回(None, None)。
     """
     while True:
         with _user_account_usage_lock:
             usage_data = _load_user_account_usage_unlocked()
             now = time.time()
+
+            # 1. 检查是否需要更新最新发送统计数据（距上次超过 1 小时）
+            need_sync = False
+            for user_data_dir in USER_DATA_DIR_LIST:
+                account_name = _get_account_name(user_data_dir)
+                acc_data = usage_data.get(account_name, {})
+                sync_time = acc_data.get("daily_stats_sync_time", 0)
+                if now - sync_time > 3600:
+                    need_sync = True
+                    break
+
+            if need_sync:
+                try:
+                    stats_dict = calculate_comment_survival_rate(days=1)
+                    for user_data_dir in USER_DATA_DIR_LIST:
+                        account_name = _get_account_name(user_data_dir)
+                        acc_data = usage_data.setdefault(account_name, ACCOUNT_USAGE_DEFAULTS.copy())
+                        # 如果没有查到，默认为未使用，数量为 0
+                        acc_stats = stats_dict.get(account_name,
+                                                   {"attempts": 0, "success": 0, "survived": 0, "failed": 0})
+                        acc_data["daily_stats"] = acc_stats
+                        acc_data["daily_stats_sync_time"] = now
+                    _save_user_account_usage_unlocked(usage_data)
+                except Exception as e:
+                    logger.error(f"[发布/账号监控] 获取统计数据失败，无法更新账号发送限额，跳过同步 | 异常: {e!r}")
+
+            # 2. 对通过筛选的账号进行每日额度拦截和冷却时间判断
             available, cooldowns = [], []
+            all_exhausted = True
+
             for index, user_data_dir in enumerate(USER_DATA_DIR_LIST):
                 account_name = _get_account_name(user_data_dir)
                 account_usage = usage_data[account_name]
+                daily_success = account_usage.get("daily_stats", {}).get("success", 0)
+
+                if daily_success >= MAX_DAILY_SUCCESS_PER_ACCOUNT:
+                    continue  # 拦截该账号（本轮发送不参与）
+
+                all_exhausted = False
                 total_count = int(account_usage.get("total_count", 0) or 0)
                 last_send_time = float(account_usage.get("last_send_time", 0) or 0)
                 elapsed = now - last_send_time
+
                 if last_send_time <= 0 or elapsed > COMMENT_SEND_INTERVAL_SEC:
                     available.append((total_count, index, user_data_dir, account_name))
                     continue
                 cooldowns.append(COMMENT_SEND_INTERVAL_SEC - elapsed)
 
+            # 所有账号都达到上限熔断
+            if all_exhausted:
+                return None, None
+
+            # 3. 按使用量均衡提取
             if available:
                 total_count, _, user_data_dir, account_name = min(available)
-                # : total_count 与冷却时间在请求前预占；请求失败或进程退出也不回滚。
                 usage_data[account_name].update({
                     "total_count": total_count + 1,
                     "last_send_time": time.time(),
@@ -326,6 +369,7 @@ def check_comment_info(data):
 
     return True, ""
 
+
 def gen_promo_comment(post):
     """请求模型并校验双视角结果；重试耗尽返回空字典，保留原有降级边界。
     入参：format_post_for_promo 所述帖子；返回 check_comment_info 所述字典或 {}。
@@ -472,10 +516,12 @@ def send_single_promo_comment(post):
 
     follower = comment_info.get("follower_perspective", {})
     comment_text, link_text = follower.get("comment_text"), follower.get("link_text")
-    score = follower.get("score") if isinstance(follower, dict) else None
-    user_data_dir, account_name = acquire_user_account_for_send()
-    started = time.monotonic()
 
+    user_data_dir, account_name = acquire_user_account_for_send()
+    if not user_data_dir:
+        return None, "ALL_ACCOUNTS_EXHAUSTED"
+
+    started = time.monotonic()
     try:
         error, success, comment_id = comment_on_binance_post(
             post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
@@ -561,25 +607,77 @@ def send_single_promo_comment(post):
 
 
 def send_promo_comments():
-    """常驻发布任务：合并成败回写路径，安全验证触发后停止本轮并按分钟报告冷却进度。"""
+    """常驻发布任务：先扫描候选帖子，按分数Top 10发布，合并成败回写，安全验证或限额触发后处理。"""
     while True:
         started = time.monotonic()
         post_manager = UniversalPostManager(gen_db_object())
         posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-        logger.info(f"[发布/开始] 准备筛选并发布 | 帖子数: 【{len(posts)}】")
-        counts = {"SUCCESS": 0, "FAILED": 0, "SKIPPED": 0}
-        hit_captcha = False
+
+        # 建立带评分的候选列表
+        candidate_posts = []
         for post in posts:
             if not is_valid_post_for_promo(post):
-                counts["SKIPPED"] += 1
                 continue
+
+            comment_info = post.get("promo_comment")
+            if not comment_info:
+                continue
+
+            promo_info = post.get("promo_comment_info")
+            if isinstance(promo_info, dict):
+                if promo_info.get("send_count", 0) >= MAX_SUCCESSFUL_SENDS:
+                    continue
+                if not (promo_info.get("status") == "success" and promo_info.get("verify_status") == "failed"):
+                    continue
+
+            post_id = str(post.get("post_id", ""))
+            if not post_id:
+                continue
+
+            # 提取评分
+            try:
+                score = float(comment_info.get("follower_perspective", {}).get("score", 0))
+            except (ValueError, TypeError):
+                score = 0.0
+
+            candidate_posts.append((score, post))
+
+        # 降序排序，截取前 10 条
+        candidate_posts.sort(key=lambda x: x[0], reverse=True)
+        top_candidates = candidate_posts[:10]
+        top_posts = [p[1] for p in top_candidates]
+
+        if not top_candidates:
+            logger.info(
+                f"[发布/名单扫描] 扫描 {len(posts)} 贴 | 无待发送候选 | 耗时: 【{time.monotonic() - started:.2f} 秒】")
+        else:
+            top_scores = [p[0] for p in top_candidates]
+            avg_score = sum(top_scores) / len(top_scores)
+            logger.info(
+                f"[发布/名单扫描] 扫描 {len(posts)} 贴 | 候选: 【{len(candidate_posts)}】 贴 | "
+                f"计划发布前 【{len(top_posts)}】 贴 | 最高分: 【{max(top_scores)}】 | "
+                f"最低分: 【{min(top_scores)}】 | 平均分: 【{avg_score:.2f}】"
+            )
+
+        counts = {"SUCCESS": 0, "FAILED": 0, "SKIPPED": 0}
+        hit_captcha = False
+        all_exhausted = False
+
+        for post in top_posts:
             post_result, status = send_single_promo_comment(post)
+
+            if status == "ALL_ACCOUNTS_EXHAUSTED":
+                all_exhausted = True
+                break
+
             if status == "CAPTCHA":
                 hit_captcha = True
                 break
+
             if status not in ("SUCCESS", "FAILED"):
                 counts["SKIPPED"] += 1
                 continue
+
             try:
                 post_manager.upsert_posts([post_result])
             except Exception as exc:
@@ -590,23 +688,32 @@ def send_promo_comments():
                 raise
             counts[status] += 1
 
-        log = logger.warning if hit_captcha else logger.info
-        outcome = "安全验证触发，本轮提前停止" if hit_captcha else "本轮处理完成"
+        if all_exhausted:
+            outcome = "账号发送额度已满，本轮提前停止"
+            log = logger.warning
+        elif hit_captcha:
+            outcome = "安全验证触发，本轮提前停止"
+            log = logger.warning
+        else:
+            outcome = "本轮处理完成"
+            log = logger.info
+
         log(
             f"[发布/本轮小结] {outcome} | 成功: 【{counts['SUCCESS']}】"
             f" | 失败: 【{counts['FAILED']}】 | 跳过: 【{counts['SKIPPED']}】"
             f" | 耗时: 【{time.monotonic() - started:.2f} 秒】 | 休眠: 【{SCHEDULE_INTERVAL_SEC} 秒】"
         )
-        if not hit_captcha:
+
+        if hit_captcha:
+            remaining = SCHEDULE_INTERVAL_SEC
+            while remaining > 0:
+                sleep_step = min(60, remaining)
+                time.sleep(sleep_step)
+                remaining -= sleep_step
+                if remaining > 0:
+                    logger.info(f"[发布/验证冷却] 安全验证触发后暂停中 | 距下轮检查: 【{remaining} 秒】")
+        else:
             time.sleep(SCHEDULE_INTERVAL_SEC)
-            continue
-        remaining = SCHEDULE_INTERVAL_SEC
-        while remaining > 0:
-            sleep_step = min(60, remaining)
-            time.sleep(sleep_step)
-            remaining -= sleep_step
-            if remaining > 0:
-                logger.info(f"[发布/验证冷却] 安全验证触发后暂停中 | 距下轮检查: 【{remaining} 秒】")
 
 
 def delete_old_replay():
@@ -682,6 +789,7 @@ def delete_old_replay():
             f" | 休眠: 【{DELETE_INTERVAL_SEC} 秒】"
         )
         time.sleep(DELETE_INTERVAL_SEC)
+
 
 def verify_promo_comments_task():
     """每五分钟核查发送至少十分钟、仍符合条件的评论，并回写最新评论和验证状态。"""
@@ -768,10 +876,12 @@ def verify_promo_comments_task():
         )
         time.sleep(VERIFY_INTERVAL_SEC)
 
+
 def calculate_comment_survival_rate(days=1):
     """
     单独调用的统计函数：输出指定时间内（默认1天）的评论统计数据。
     支持总维度及 account_name 维度的统计输出，供运维人员分析当前风控、转化现状。
+    返回: account_stats 字典，包含各个账号的日发送统计信息
     """
     post_manager = UniversalPostManager(gen_db_object())
     posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
@@ -854,6 +964,8 @@ def calculate_comment_survival_rate(days=1):
         logger.info(f"    最终验证不存在: {acc_failed} (占发送成功几率: {format_rate(acc_failed, acc_success)})")
         logger.info(f"    尚未完成验证: {acc_pending} (占发送成功几率: {format_rate(acc_pending, acc_success)})")
     logger.info("=====================================================")
+    return account_stats
+
 
 def _run_task(task):
     """为线程未处理异常补充业务入口信息，记录后继续抛出，不增加自动重启行为。"""
@@ -869,13 +981,13 @@ def _run_task(task):
 
 if __name__ == "__main__":
     # 如果需要单独统计存活率，可以取消注释执行下行代码
-    calculate_comment_survival_rate(days=1)
+    # calculate_comment_survival_rate(days=1)
 
     tasks = [
-             send_promo_comments,
-             gen_all_promo_comments,
-             delete_old_replay,
-             verify_promo_comments_task
+        send_promo_comments,
+        gen_all_promo_comments,
+        delete_old_replay,
+        verify_promo_comments_task
     ]
     threads = []
     for task in tasks:
