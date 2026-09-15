@@ -47,7 +47,15 @@ VERIFY_MIN_AGE_MS = 10 * 60 * 1000
 
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\带单推广评论生成.txt"
-USER_DATA_DIR_LIST = [r"W:\temp\biance_zhouling", r"W:\temp\biance_yanglin"]
+USER_DATA_DIR_LIST = [    r"W:\temp\biance_nana",
+    r"W:\temp\biance_yang",
+    r"W:\temp\biance_daniang",
+    r"W:\temp\biance_mama",
+    r"W:\temp\biance_jie",
+    r"W:\temp\biance_qiqi",
+    r"W:\temp\biance_zhouling",
+    r"W:\temp\biance_yanglin",
+    r"W:\temp\biance_ruru",]
 DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_nana",
     r"W:\temp\biance_yang",
@@ -722,6 +730,7 @@ def delete_old_replay():
         started = time.monotonic()
         deleted = failed = account_errors = 0
         logger.info(f"[历史清理/开始] 准备查询历史回复 | 账号数: 【{len(DELETE_USER_DATA_DIR_LIST)}】")
+        DELETE_USER_DATA_DIR_LIST.reverse()
         try:
             cutoff_ms = int((time.time() - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
             for browser_session_dir in DELETE_USER_DATA_DIR_LIST:
