@@ -27,7 +27,10 @@ import threading
 from datetime import datetime, timedelta
 
 from common_utils_lite import setup_logger
-
+import hashlib
+import pickle
+import re
+import glob
 # 解除 Pandas 控制台打印限制
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
@@ -40,7 +43,534 @@ def _format_bj_time(ts_ms):
     """辅助函数：将时间戳统一格式化为北京时间字符串，消除时区歧义"""
     return pd.to_datetime(ts_ms, unit='ms').tz_localize('UTC').tz_convert('Asia/Shanghai').strftime('%Y-%m-%d %H:%M:%S')
 
+# =====================================================================
+# 🔐 模块零：跨进程去重基建 (Inter-Process Dedupe Infrastructure)
+# ---------------------------------------------------------------------
+# 目标：同一台机器上、多进程发起「完全同参」的 K 线请求时，
+#      只允许一个进程真实打网络（Leader），其余进程等待并直接复用其结果（Follower）。
+# 结构：L1 无锁快照直出 → L2 文件锁 + 双重检查锁定 → L3 等锁超时降级自取（永不失败）
+# =====================================================================
 
+_SNAPSHOT_VERSION = 2
+_SNAPSHOT_DIRNAME = "_snapshots"
+_LOCK_DIRNAME = "_locks"
+_GC_MIN_INTERVAL_SEC = 600  # GC 节流：同一目录最多 10 分钟扫一次
+
+# ------------------------ 底层文件锁后端 ------------------------
+try:
+    from filelock import FileLock as _FileLockImpl  # 优先使用久经考验的 filelock
+
+    _HAS_FILELOCK = True
+except Exception:
+    _FileLockImpl = None
+    _HAS_FILELOCK = False
+
+
+class _RawFileLock:
+    """
+    标准库 fallback 文件锁（无 filelock 依赖时启用）。
+    POSIX 走 fcntl.flock，Windows 走 msvcrt.locking，均为内核级锁：
+    → 进程崩溃/被强杀时由操作系统自动回收，不存在"死锁文件"残留问题。
+    """
+
+    def __init__(self, lock_file):
+        self.lock_file = lock_file
+        self._fd = None
+
+    def try_acquire(self):
+        if self._fd is not None:
+            return True
+        fd = None
+        try:
+            fd = os.open(self.lock_file, os.O_RDWR | os.O_CREAT, 0o644)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._fd = fd
+            return True
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+            return False
+
+    def release(self):
+        if self._fd is None:
+            return
+        try:
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(self._fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(self._fd)
+        except Exception:
+            pass
+        self._fd = None
+
+
+class _FileLockAdapter:
+    """把 filelock.FileLock 适配成统一的 try_acquire / release 接口"""
+
+    def __init__(self, lock_file):
+        self._lock = _FileLockImpl(lock_file, timeout=0)
+
+    def try_acquire(self):
+        try:
+            self._lock.acquire(timeout=0)
+            return True
+        except Exception:
+            return False
+
+    def release(self):
+        try:
+            self._lock.release()
+        except Exception:
+            pass
+
+
+import weakref
+
+
+class _LockWrapper:
+    """包装原生的 threading.Lock，使其支持弱引用 (WeakValueDictionary)"""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def acquire(self, *args, **kwargs):
+        return self.lock.acquire(*args, **kwargs)
+
+    def release(self):
+        return self.lock.release()
+
+
+# 将普通的 dict 替换为弱引用字典，彻底解决长生命周期进程的内存泄漏
+_THREAD_LOCKS = weakref.WeakValueDictionary()
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _get_thread_lock(abs_path):
+    """同一进程内、同一把文件锁路径共享一个线程锁，规避 flock 同进程双 FD 语义坑"""
+    with _THREAD_LOCKS_GUARD:
+        lk = _THREAD_LOCKS.get(abs_path)
+        if lk is None:
+            lk = _LockWrapper()  # 使用包装类，使其能被 GC 自动回收
+            _THREAD_LOCKS[abs_path] = lk
+        return lk
+
+
+class InterProcessMutex:
+    """
+    跨进程 + 跨线程双层互斥锁。
+    - acquire() 永不抛超时异常，只返回 True/False，交由调用方决定降级策略
+    - 支持排队心跳回调 on_wait，避免长时间等待时日志"假死"
+    """
+
+    def __init__(self, lock_path):
+        self.lock_path = os.path.abspath(lock_path)
+        self._tlock = _get_thread_lock(self.lock_path)
+        self._tlock_held = False
+        self._flock = None
+        self._flock_held = False
+
+    def acquire(self, timeout=-1, poll_interval=0.2, on_wait=None, wait_log_interval=15.0):
+        t_start = time.monotonic()
+        deadline = None if (timeout is None or timeout < 0) else t_start + timeout
+
+        # 1) 线程级互斥
+        if deadline is None:
+            ok = self._tlock.acquire(True)
+        else:
+            ok = self._tlock.acquire(True, max(0.0, deadline - time.monotonic()))
+        if not ok:
+            return False
+        self._tlock_held = True
+
+        # 2) 进程级互斥（轮询式非阻塞抢占，便于打心跳 & 精准控制超时）
+        try:
+            parent = os.path.dirname(self.lock_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._flock = _FileLockAdapter(self.lock_path) if _HAS_FILELOCK else _RawFileLock(self.lock_path)
+
+            last_log = t_start
+            while True:
+                if self._flock.try_acquire():
+                    self._flock_held = True
+                    return True
+                now = time.monotonic()
+                if deadline is not None and now >= deadline:
+                    self._release_thread_lock()
+                    return False
+                if on_wait is not None and (now - last_log) >= wait_log_interval:
+                    last_log = now
+                    try:
+                        on_wait(now - t_start)
+                    except Exception:
+                        pass
+                time.sleep(poll_interval)
+        except Exception as e:
+            logger.warning(f"[MUTEX] ⚠️ 进程锁获取异常({e})，视为未取得锁")
+            self._release_thread_lock()
+            return False
+
+    def _release_thread_lock(self):
+        if self._tlock_held:
+            try:
+                self._tlock.release()
+            except Exception:
+                pass
+            self._tlock_held = False
+
+    def release(self):
+        if self._flock_held and self._flock is not None:
+            self._flock.release()
+            self._flock_held = False
+        self._release_thread_lock()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+# ------------------------ 原子落盘 / 受保护读盘 ------------------------
+def _atomic_replace(src, dst, retries=12, delay=0.15, log_prefix=""):
+    """
+    带退避重试的原子覆盖。
+    Windows 下若目标文件正被其它进程 open 读取，os.replace 会抛 PermissionError，
+    此处重试兜底，彻底失败则清理临时文件并返回 False（不影响主流程返回数据）。
+    """
+    last_err = None
+    for _ in range(max(1, retries)):
+        try:
+            os.replace(src, dst)
+            return True
+        except Exception as e:
+            last_err = e
+            time.sleep(delay)
+    logger.error(f"{log_prefix} [IO] ❌ 原子覆盖失败 -> {dst} | err={last_err}")
+    try:
+        if os.path.exists(src):
+            os.remove(src)
+    except Exception:
+        pass
+    return False
+
+
+def _csv_rw_lock_path(path):
+    return f"{path}.rw.lock"
+
+
+def _read_csv_guarded(path, timeout=5.0, log_prefix=""):
+    """
+    加同一把读写锁读取 CSV，与后台落盘线程严格串行，规避 Windows replace 冲突与半截文件。
+    抢不到锁时依然尽力读取（best-effort），绝不阻塞主链路。
+    ⚠️ 注意：本函数内部会抢锁，禁止在已持有同一把锁的代码块中调用（线程锁不可重入）。
+    """
+    mutex = InterProcessMutex(_csv_rw_lock_path(path))
+    got = mutex.acquire(timeout=timeout)
+    try:
+        last_err = None
+        for attempt in range(3):
+            try:
+                return pd.read_csv(path)
+            except Exception as e:
+                last_err = e
+                time.sleep(0.1)
+        raise last_err
+    finally:
+        if got:
+            mutex.release()
+
+
+# ------------------------ 请求指纹 ------------------------
+_TF_UNIT_MS = {'s': 1000, 'm': 60_000, 'h': 3_600_000, 'd': 86_400_000, 'w': 604_800_000}
+
+
+def _parse_timeframe_ms(timeframe):
+    """本地解析周期毫秒（不依赖 ccxt 实例，避免为了算指纹去建连交易所）"""
+    m = re.fullmatch(r'\s*(\d+)\s*([smhdwM])\s*', str(timeframe))
+    if not m:
+        raise ValueError(f"无法解析的 timeframe: {timeframe}")
+    num, unit = int(m.group(1)), m.group(2)
+    if unit == 'M':
+        raise ValueError("月线(M)无固定毫秒长度，不支持指纹级对齐")
+    return num * _TF_UNIT_MS[unit]
+
+
+def _build_kline_request_signature(symbol_list, timeframe, days, target_time_str):
+    """
+    构建请求指纹。必须与 parse_time_params 的「数学级向下对齐」保持完全一致，
+    否则 10:03 / 10:07 (15m) 会散列成两个 key，导致去重失效。
+    指纹刻意 **不含 days / use_ws / use_rest / proxy_url**：
+      - days 存入 meta，实现「大范围快照被小范围请求切片复用」
+      - 传输方式不影响数据内容，纳入 key 只会降低命中率
+    """
+    tf_ms = _parse_timeframe_ms(timeframe)
+
+    ts = pd.to_datetime(target_time_str)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize('Asia/Shanghai')
+    else:
+        ts = ts.tz_convert('Asia/Shanghai')
+    raw_ms = int(ts.value // 1_000_000)
+
+    target_time_ms = raw_ms - (raw_ms % tf_ms)
+    start_time_ms = target_time_ms - int(float(days) * 24 * 60 * 60 * 1000)
+    target_close_time_ms = target_time_ms + tf_ms
+
+    symbols = sorted({str(s).strip() for s in symbol_list})
+    sym_hash = hashlib.md5("|".join(symbols).encode('utf-8')).hexdigest()[:12]
+    tf_tag = re.sub(r'[^0-9A-Za-z]', '', str(timeframe))
+    key = f"kline_{tf_tag}_{target_time_ms}_{sym_hash}"
+
+    return {
+        'key': key,
+        'timeframe': str(timeframe),
+        'timeframe_ms': tf_ms,
+        'days': days,
+        'target_time_ms': target_time_ms,
+        'start_time_ms': start_time_ms,
+        'target_close_time_ms': target_close_time_ms,
+        'symbols': symbols,
+    }
+
+
+# ------------------------ 结果快照读写 ------------------------
+def _snapshot_paths(snapshot_dir, key):
+    return (os.path.join(snapshot_dir, f"{key}.meta.json"),
+            os.path.join(snapshot_dir, f"{key}.pkl"))
+
+
+def _read_kline_snapshot(sig, snapshot_dir, ttl_sec=None, incomplete_ttl_sec=600, log_prefix=""):
+    """
+    读取并严格校验结果快照。任何一项不满足即返回 None（视为 miss，绝不返回可疑数据）。
+    校验链：meta 存在 → 版本/周期/目标时间/币种全量比对 → 覆盖范围足够 → TTL →
+            pkl 可反序列化 → 逐币硬复核（必须含 target 那根 K 线 & 覆盖 start）
+    """
+    meta_path, data_path = _snapshot_paths(snapshot_dir, sig['key'])
+    if not (os.path.exists(meta_path) and os.path.exists(data_path)):
+        return None
+
+    try:
+        with open(meta_path, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+    except Exception:
+        return None
+
+    try:
+        if int(meta.get('version', -1)) != _SNAPSHOT_VERSION:
+            return None
+        if str(meta.get('timeframe')) != str(sig['timeframe']):
+            return None
+        if int(meta.get('target_time_ms', -1)) != int(sig['target_time_ms']):
+            return None
+        if list(meta.get('symbols') or []) != sig['symbols']:
+            return None
+        snap_start_ms = int(meta.get('start_time_ms'))
+        if snap_start_ms > sig['start_time_ms']:
+            return None  # 快照历史深度不够，无法满足本次 days
+        created_at = float(meta.get('created_at', 0))
+    except Exception:
+        return None
+
+    age = max(0.0, time.time() - created_at)
+    if ttl_sec is not None and age > float(ttl_sec):
+        return None
+    if not bool(meta.get('complete', False)) and age > float(incomplete_ttl_sec):
+        logger.info(f"{log_prefix} 🧹 快照存在但数据不完整且超出保护期(age={age:.0f}s)，放弃复用，本进程将重新拉取补洞")
+        return None
+
+    try:
+        with open(data_path, 'rb') as f:
+            payload = pickle.load(f)
+        data = payload.get('data') if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return None
+    except Exception as e:
+        logger.warning(f"{log_prefix} ⚠️ 快照数据文件损坏或不可读({e})，视为未命中")
+        return None
+
+    tf_ms = sig['timeframe_ms']
+    need_slice = snap_start_ms < sig['start_time_ms']
+    out, payload_complete = {}, True
+
+    for sym in sig['symbols']:
+        df = data.get(sym)
+        if df is None or not isinstance(df, pd.DataFrame) or 'timestamp' not in df.columns:
+            return None  # 币种缺失 = 结构性失配，直接 miss
+        if need_slice and not df.empty:
+            df = df[df['timestamp'] >= sig['start_time_ms']].reset_index(drop=True)
+        # 硬复核：目标那根 K 线必须在场，且起点必须无脱节
+        if df.empty or int(df['timestamp'].max()) != sig['target_time_ms'] \
+                or (int(df['timestamp'].min()) - sig['start_time_ms']) > tf_ms:
+            payload_complete = False
+        out[sym] = df
+
+    if not payload_complete and age > float(incomplete_ttl_sec):
+        logger.info(f"{log_prefix} 🧹 快照实测不完整(age={age:.0f}s)，放弃复用")
+        return None
+
+    return out
+
+
+def _write_kline_snapshot(sig, final_dfs, snapshot_dir, log_prefix=""):
+    """
+    Leader 交付前同步写快照（必须同步：Follower 是在 Leader 释放锁后才做双重检查的）。
+    写序：先原子写 pkl（数据体），再原子写 meta.json（提交标记）。
+    """
+    t0 = time.time()
+    os.makedirs(snapshot_dir, exist_ok=True)
+    meta_path, data_path = _snapshot_paths(snapshot_dir, sig['key'])
+
+    expected_rows = int((sig['target_time_ms'] - sig['start_time_ms']) / sig['timeframe_ms']) + 1
+    data, rows, complete = {}, {}, True
+
+    normalized = {str(k).strip(): v for k, v in (final_dfs or {}).items()}
+    for sym in sig['symbols']:
+        df = normalized.get(sym)
+        if df is None or not isinstance(df, pd.DataFrame):
+            complete = False
+            continue
+        data[sym] = df
+        rows[sym] = int(len(df))
+        if df.empty or len(df) < expected_rows or int(df['timestamp'].max()) != sig['target_time_ms']:
+            complete = False
+
+    if len(data) != len(sig['symbols']):
+        logger.warning(f"{log_prefix} ⚠️ 结果币种不齐({len(data)}/{len(sig['symbols'])})，跳过快照写入以免污染缓存")
+        return False
+
+    meta = {
+        'version': _SNAPSHOT_VERSION,
+        'key': sig['key'],
+        'timeframe': sig['timeframe'],
+        'timeframe_ms': sig['timeframe_ms'],
+        'days': sig['days'],
+        'target_time_ms': sig['target_time_ms'],
+        'start_time_ms': sig['start_time_ms'],
+        'symbols': sig['symbols'],
+        'rows': rows,
+        'expected_rows': expected_rows,
+        'complete': bool(complete),
+        'created_at': time.time(),
+        'created_at_bj': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'writer_pid': os.getpid(),
+    }
+
+    tmp_data = f"{data_path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_data, 'wb') as f:
+            pickle.dump({'version': _SNAPSHOT_VERSION, 'meta': meta, 'data': data}, f, protocol=4)
+        size_mb = os.path.getsize(tmp_data) / (1024 * 1024)
+        if not _atomic_replace(tmp_data, data_path, log_prefix=log_prefix):
+            return False
+    except Exception as e:
+        logger.error(f"{log_prefix} ❌ 快照数据写入失败: {e}")
+        try:
+            if os.path.exists(tmp_data):
+                os.remove(tmp_data)
+        except Exception:
+            pass
+        return False
+
+    tmp_meta = f"{meta_path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp_meta, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False)
+        if not _atomic_replace(tmp_meta, meta_path, log_prefix=log_prefix):
+            return False
+    except Exception as e:
+        logger.error(f"{log_prefix} ❌ 快照 meta 写入失败: {e}")
+        return False
+
+    logger.info(f"{log_prefix} 📸 结果快照已提交 | complete={complete} size={size_mb:.2f}MB cost={time.time() - t0:.3f}s")
+    return True
+
+
+# ------------------------ 垃圾回收 ------------------------
+def _gc_dedupe_dirs(snapshot_dir, lock_dir, keep_sec=86400, log_prefix=""):
+    now = time.time()
+    removed = 0
+
+    # 1) 过期快照（数据是幂等的，过期只是为了控制磁盘占用）
+    for p in glob.glob(os.path.join(snapshot_dir, "kline_*")):
+        try:
+            if p.endswith('.tmp'):
+                continue
+            if now - os.path.getmtime(p) > keep_sec:
+                os.remove(p)
+                removed += 1
+        except Exception:
+            pass
+
+    # 2) 残留 .tmp 碎片（1 小时以上必属僵尸）
+    for pattern in (os.path.join(snapshot_dir, "*.tmp"), os.path.join(lock_dir, "*.tmp")):
+        for p in glob.glob(pattern):
+            try:
+                if now - os.path.getmtime(p) > 3600:
+                    os.remove(p)
+                    removed += 1
+            except Exception:
+                pass
+
+    # 3) 陈旧锁文件：仅清理 3 天以上、且能"非阻塞抢到"的锁，
+    #    绝不删除可能正被持有的锁文件（POSIX 下删除被持有的锁文件会直接破坏互斥语义）
+    for p in glob.glob(os.path.join(lock_dir, "kline_*.lock")):
+        try:
+            if now - os.path.getmtime(p) <= 3 * 86400:
+                continue
+            probe = InterProcessMutex(p)
+            if probe.acquire(timeout=0):
+                try:
+                    os.remove(p)
+                    removed += 1
+                finally:
+                    probe.release()
+        except Exception:
+            pass
+
+    if removed:
+        logger.info(f"{log_prefix} 🧹 去重目录 GC 完成 | removed={removed}")
+
+
+def _maybe_dispatch_dedupe_gc(snapshot_dir, lock_dir, keep_sec, log_prefix=""):
+    """节流 + 单进程抢占的后台 GC，绝不影响主链路耗时"""
+    try:
+        stamp = os.path.join(snapshot_dir, ".gc_stamp")
+        if os.path.exists(stamp) and (time.time() - os.path.getmtime(stamp)) < _GC_MIN_INTERVAL_SEC:
+            return
+        gc_mutex = InterProcessMutex(os.path.join(lock_dir, "gc.lock"))
+        if not gc_mutex.acquire(timeout=0):
+            return
+        try:
+            with open(stamp, 'w') as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+
+        def _task():
+            try:
+                _gc_dedupe_dirs(snapshot_dir, lock_dir, keep_sec, log_prefix)
+            finally:
+                gc_mutex.release()
+
+        threading.Thread(target=_task, daemon=True).start()
+    except Exception:
+        pass
 # =====================================================================
 # 🗄️ 模块一：缓存与存储引擎 (Cache & Storage Manager) [已修复]
 # =====================================================================
@@ -49,6 +579,8 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
     智能加载本地缓存数据。
     如果本地缓存涵盖了所需历史的起点，且目标区间无断层，则只需拉取缺失的增量数据；
     否则，从起点强制回拉，弥补空洞。
+    【多进程加固】读盘走 _read_csv_guarded：与后台落盘线程共享同一把文件读写锁，
+                  彻底规避「读到半截文件」以及 Windows 下 os.replace 被读句柄阻塞的问题。
     """
     t0 = time.time()
     memory_pool = {sym: {} for sym in symbol_list}
@@ -62,8 +594,9 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
 
         if os.path.exists(path):
             try:
-                df = pd.read_csv(path)
+                df = _read_csv_guarded(path, timeout=5.0, log_prefix=log_prefix)
                 if df.empty or 'timestamp' not in df.columns:
+                    misses += 1
                     continue
 
                 min_ts = int(df['timestamp'].min())
@@ -75,7 +608,7 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
                     ts = int(row[0])
                     memory_pool[sym][ts] = [ts] + row[1:]
 
-                # [终极修复2] 局部连续性校验：只检查请求的 start_time_ms 到 max_ts 这一段是否存在空洞
+                # 局部连续性校验：只检查请求的 start_time_ms 到 max_ts 这一段是否存在空洞
                 if min_ts <= start_time_ms:
                     sub_df = df[df['timestamp'] >= start_time_ms]
                     if not sub_df.empty:
@@ -84,26 +617,22 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
                         expected_rows = (sub_max_ts - sub_min_ts) // timeframe_ms + 1
                         actual_rows = len(sub_df)
 
-                        # 核心判定：
-                        # 1. actual_rows >= expected_rows 说明这段区间内部无空洞
-                        # 2. sub_min_ts - start_time_ms <= timeframe_ms 说明这段数据刚好能无缝衔接请求起点，没发生脱节
                         if actual_rows >= expected_rows and (sub_min_ts - start_time_ms) <= timeframe_ms:
                             fetch_since_map[sym] = max_ts
                             hits += 1
                             latest_times[sym.split('/')[0]] = _format_bj_time(max_ts)
                         else:
-                            # 存在空洞，从请求起点老老实实回拉弥补
                             fetch_since_map[sym] = start_time_ms
                             misses += 1
                     else:
                         fetch_since_map[sym] = start_time_ms
                         misses += 1
                 else:
-                    # 连起点都没覆盖，必须全量重拉
                     fetch_since_map[sym] = start_time_ms
                     misses += 1
             except Exception as e:
                 logger.warning(f"{log_prefix} [CACHE] ⚠️ 读取 {sym} 缓存失败: {e}")
+                misses += 1
         else:
             misses += 1
 
@@ -112,35 +641,73 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
 
     return memory_pool, fetch_since_map
 
-
 def _save_csv_sync_fast(full_dfs_for_cache, cache_dir, timeframe, log_prefix=""):
     """
-    （后台线程专用）直接将内存池中的全量最新数据覆写落盘，避免二次读取
+    （后台线程专用）将内存池全量最新数据落盘。
+    【多进程加固】
+      1. 每个文件独占一把跨进程读写锁，与 load_local_cache 的读取严格串行；
+      2. merge-on-write：写前把磁盘上可能由**其它进程**新增的行读出来合并，
+         timestamp 去重时保留本次内存池的值（keep='last'），彻底消除"后写者覆盖前写者"的丢帧；
+      3. 原子覆盖走 _atomic_replace，Windows 下 PermissionError 自动退避重试。
     """
     t0 = time.time()
     total_io_size = 0
+    merged_extra_rows = 0
+    MAX_CACHE_ROWS = 525600
+    COLS = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
     os.makedirs(cache_dir, exist_ok=True)
+
     for symbol, df in full_dfs_for_cache.items():
         safe_symbol = symbol.replace("/", "_").replace(":", "_")
         path = os.path.join(cache_dir, f"{safe_symbol}_{timeframe}_latest.csv")
-        temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+
+        mutex = InterProcessMutex(_csv_rw_lock_path(path))
+        got_lock = mutex.acquire(timeout=60.0)  # 抢不到锁也不放弃落盘，退化为原有覆写行为
+        if not got_lock:
+            logger.warning(f"{log_prefix} [DISK] ⚠️ {symbol} 未取得文件锁(60s)，降级为无锁覆写")
+
         try:
-            # 原子性写入保护：先写临时文件，完成后系统级瞬间覆盖，防止程序被强杀导致数月缓存归零损坏
-            df.to_csv(temp_path, index=False)
-            total_io_size += os.path.getsize(temp_path)
-            os.replace(temp_path, path)
-        except Exception as e:
-            logger.error(f"{log_prefix} [DISK] ❌ 异步保存 {symbol} 失败: {e}")
-            if os.path.exists(temp_path):
+            out_df = df
+            if got_lock and os.path.exists(path):
                 try:
-                    os.remove(temp_path)
-                except:
-                    pass
+                    # 注意：此处已持有锁，必须直连 pd.read_csv，禁止调用 _read_csv_guarded（线程锁不可重入）
+                    old_df = pd.read_csv(path)
+                    if not old_df.empty and 'timestamp' in old_df.columns:
+                        old_df = old_df.reindex(columns=COLS)
+                        new_df = df.reindex(columns=COLS)
+                        before = len(new_df)
+                        out_df = (pd.concat([old_df, new_df], ignore_index=True)
+                                  .dropna(subset=['timestamp'])
+                                  .drop_duplicates(subset=['timestamp'], keep='last')
+                                  .sort_values('timestamp')
+                                  .reset_index(drop=True))
+                        if len(out_df) > MAX_CACHE_ROWS:
+                            out_df = out_df.iloc[-MAX_CACHE_ROWS:].reset_index(drop=True)
+                        merged_extra_rows += max(0, len(out_df) - before)
+                except Exception as e:
+                    logger.warning(f"{log_prefix} [DISK] ⚠️ {symbol} 旧缓存合并失败({e})，退化为直接覆写")
+                    out_df = df
+
+            temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
+            try:
+                out_df.to_csv(temp_path, index=False)
+                total_io_size += os.path.getsize(temp_path)
+                _atomic_replace(temp_path, path, log_prefix=log_prefix)
+            except Exception as e:
+                logger.error(f"{log_prefix} [DISK] ❌ 异步保存 {symbol} 失败: {e}")
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+        finally:
+            if got_lock:
+                mutex.release()
 
     cost = time.time() - t0
     logger.info(
-        f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
-
+        f"{log_prefix} [DISK] 💾 独立守护落盘完毕 | files={len(full_dfs_for_cache)} "
+        f"merged_rows={merged_extra_rows} io_size={total_io_size / (1024 * 1024):.2f}MB write_cost={cost:.3f}s")
 
 def _background_pipeline_task(memory_pool_copy, cache_dir, timeframe, log_prefix):
     """
@@ -1138,7 +1705,28 @@ async def _async_core_oi_orchestrator(symbol_list, timeframe, days, target_time_
 # 🌟 对外暴露的公共 API [严格未修改 & 新增资金费率 API & 新增 OI API]
 # =====================================================================
 def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
-                     use_ws=True, use_rest=True, proxy_url=None):
+                     use_ws=True, use_rest=True, proxy_url=None,
+                     dedupe=True,
+                     cache_dir="data",
+                     lock_timeout=None,
+                     snapshot_ttl_sec=None,
+                     incomplete_snapshot_ttl_sec=600,
+                     snapshot_gc_keep_sec=86400):
+    """
+    🚀 同步入口：极速狙击指定时间的 K 线数据。
+
+    【跨进程单飞去重 (Single-Flight)】
+      同机多进程发起「完全同参」请求时，只有一个进程真实打网络（Leader），
+      其余进程复用其结果（Follower），把网络权重与 IO 压力从 N 降到 1。
+
+    :param dedupe: 是否启用跨进程去重（False = 100% 退回旧版行为，可用于灰度/紧急回滚）
+    :param cache_dir: 缓存根目录，快照落在 {cache_dir}/_snapshots，锁落在 {cache_dir}/_locks
+    :param lock_timeout: 排队等锁上限秒数。None = 自动按「目标收盘 + 60s 硬熔断 + 180s 余量」推算
+    :param snapshot_ttl_sec: 完整快照的有效期（None = 永久，因为历史 K 线是幂等的）
+    :param incomplete_snapshot_ttl_sec: 「有断缺」快照的宽限复用期，用于吸收瞬时并发风暴
+    :param snapshot_gc_keep_sec: 快照磁盘保留时长，超期由后台 GC 清理
+    """
+    # ---------- 0. 事件循环护栏（与旧版一致） ----------
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -1147,12 +1735,99 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
     if loop and loop.is_running():
         raise RuntimeError("检测到已存在运行中的异步事件循环。\n请在顶部执行：import nest_asyncio; nest_asyncio.apply()")
 
-    return asyncio.run(
-        _async_core_sniping_orchestrator(
-            symbol_list, timeframe, days, target_time_str, use_ws, use_rest, proxy_url
+    def _run_core():
+        return asyncio.run(
+            _async_core_sniping_orchestrator(
+                symbol_list, timeframe, days, target_time_str, use_ws, use_rest, proxy_url
+            )
         )
-    )
 
+    if not symbol_list:
+        return {}
+    if not dedupe:
+        return _run_core()
+
+    # ---------- 1. 构建请求指纹（失败则静默降级，绝不因去重逻辑导致业务失败） ----------
+    try:
+        sig = _build_kline_request_signature(symbol_list, timeframe, days, target_time_str)
+    except Exception as e:
+        logger.warning(f"[DEDUPE] ⚠️ 请求指纹构建失败({e})，本次退化为独立拉取")
+        return _run_core()
+
+    snapshot_dir = os.path.join(cache_dir, _SNAPSHOT_DIRNAME)
+    lock_dir = os.path.join(cache_dir, _LOCK_DIRNAME)
+    try:
+        os.makedirs(snapshot_dir, exist_ok=True)
+        os.makedirs(lock_dir, exist_ok=True)
+    except Exception as e:
+        logger.warning(f"[DEDUPE] ⚠️ 去重目录创建失败({e})，本次退化为独立拉取")
+        return _run_core()
+
+    log_prefix = f"[DEDUPE|{sig['key'][-17:]}|PID{os.getpid()}]"
+
+    def _remap(payload):
+        """快照按归一化后的 symbol 存储，返回时映射回调用方传入的原始 key，保证外部无感"""
+        try:
+            return {sym: payload[str(sym).strip()] for sym in symbol_list}
+        except KeyError:
+            return None
+
+    # ---------- 2. L1 无锁快路径：快照直出，零网络请求 ----------
+    hit = _read_kline_snapshot(sig, snapshot_dir, snapshot_ttl_sec, incomplete_snapshot_ttl_sec, log_prefix)
+    hit = _remap(hit) if hit is not None else None
+    if hit is not None:
+        logger.info(f"{log_prefix} ⚡ L1 快照直出 | symbols={len(hit)} rows={sum(len(v) for v in hit.values())} 网络请求=0")
+        return hit
+
+    # ---------- 3. L2 抢跨进程锁 + 双重检查锁定 ----------
+    if lock_timeout is None:
+        now_ms = time.time() * 1000
+        # 基础等待：目标收盘时间 + 60s
+        base_wait = (sig['target_close_time_ms'] + 60_000 - now_ms) / 1000.0
+        # 历史拉取补偿：假设每拉取1天的数据，允许额外多等 2 秒钟的网络I/O时间
+        history_buffer = float(sig['days']) * 2.0
+        # 综合计算：保底 180 秒，如果是过去的历史数据，以 (180 + 补偿) 为准
+        lock_timeout = max(180.0, base_wait + history_buffer + 180.0)
+
+    mutex = InterProcessMutex(os.path.join(lock_dir, f"{sig['key']}.lock"))
+    wait_t0 = time.time()
+
+    def _on_wait(waited):
+        logger.info(f"{log_prefix} ⏳ 同参进程正在拉取，本进程排队等待 | waited={waited:.0f}s / limit={lock_timeout:.0f}s")
+
+    if not mutex.acquire(timeout=lock_timeout, poll_interval=0.2, on_wait=_on_wait, wait_log_interval=45.0):
+        logger.warning(f"{log_prefix} ⚠️ 等锁超时({lock_timeout:.0f}s)，为保障可用性降级为独立拉取（可能出现重复请求）")
+        return _run_core()
+
+    try:
+        # 双重检查：等锁期间 Leader 极可能已交付
+        hit = _read_kline_snapshot(sig, snapshot_dir, snapshot_ttl_sec, incomplete_snapshot_ttl_sec, log_prefix)
+        hit = _remap(hit) if hit is not None else None
+        if hit is not None:
+            logger.info(
+                f"{log_prefix} ✅ L2 双重检查命中（复用 Leader 成果） | wait={time.time() - wait_t0:.2f}s "
+                f"rows={sum(len(v) for v in hit.values())} 网络请求=0")
+            return hit
+
+        # ---------- 4. 当选 Leader：真实拉取 ----------
+        logger.info(f"{log_prefix} 👑 当选 Leader，开始真实拉取 | wait={time.time() - wait_t0:.2f}s "
+                    f"target={_format_bj_time(sig['target_time_ms'])} symbols={len(sig['symbols'])}")
+        result = _run_core()
+
+        # 交付前同步写快照（Follower 是在锁释放后才做双重检查的，故不能异步写）
+        try:
+            _write_kline_snapshot(sig, result, snapshot_dir, log_prefix)
+        except Exception as e:
+            logger.error(f"{log_prefix} ❌ 快照写入异常（不影响本次返回）: {e}")
+
+        return result
+
+    finally:
+        try:
+            mutex.release()
+        except Exception as e:
+            logger.warning(f"{log_prefix} ⚠️ 锁释放异常(OS 将在进程退出时自动回收): {e}")
+        _maybe_dispatch_dedupe_gc(snapshot_dir, lock_dir, snapshot_gc_keep_sec, log_prefix)
 
 def snipe_funding_rate_data(symbol_list, days, proxy_url=None):
     """
