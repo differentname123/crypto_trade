@@ -152,8 +152,9 @@ def _load_user_account_usage_unlocked():
     return usage_data
 
 
-def acquire_user_account_for_send():
+def acquire_user_account_for_send(exclude_account_name=None):
     """同步统计后按累计使用量预占账号；额度不足返回 (None, None)，冷却时在锁外等待。
+    支持传入 exclude_account_name 排除指定的账号（用于子评论不自问自答）。
     返回：(user_data_dir, account_name)；统计形状为 {账号: {attempts, success, survived, failed}}。
     """
     while True:
@@ -164,8 +165,8 @@ def acquire_user_account_for_send():
             # : “每日”实际为滚动 24 小时，小时缓存不随本次发送递增；缺失账号按零计。
             # 同步仍在锁内执行，失败继续使用当前内存统计，可能超限或长时间占锁。
             if any(
-                now - usage_data[name].get("daily_stats_sync_time", 0) > ACCOUNT_STATS_SYNC_INTERVAL_SEC
-                for name, _ in accounts
+                    now - usage_data[name].get("daily_stats_sync_time", 0) > ACCOUNT_STATS_SYNC_INTERVAL_SEC
+                    for name, _ in accounts
             ):
                 try:
                     account_stats = calculate_comment_survival_rate(days=1)
@@ -183,6 +184,8 @@ def acquire_user_account_for_send():
 
             available, cooldowns = [], []
             for index, (account_name, user_data_dir) in enumerate(accounts):
+                if exclude_account_name and account_name == exclude_account_name:
+                    continue
                 account_usage = usage_data[account_name]
                 if account_usage.get("daily_stats", {}).get("success", 0) >= MAX_DAILY_SUCCESS_PER_ACCOUNT:
                     continue
@@ -253,8 +256,8 @@ def is_valid_post_for_promo(post):
     if engagement.get("comment_count", 0) > FILTER_CONFIG["max_comment_count"]:
         return False
     return not (
-        age_hours > FILTER_CONFIG["cold_post_hours"]
-        and engagement.get("view_count", 0) < FILTER_CONFIG["cold_post_min_views"]
+            age_hours > FILTER_CONFIG["cold_post_hours"]
+            and engagement.get("view_count", 0) < FILTER_CONFIG["cold_post_min_views"]
     )
 
 
@@ -467,9 +470,9 @@ def _can_send_promo_comment(post):
     promo_info = post.get("promo_comment_info")
     # : 字典状态只允许“发送成功但验证失败”重发；空字典或发送失败均不重试。
     if isinstance(promo_info, dict) and (
-        promo_info.get("send_count", 0) >= MAX_SUCCESSFUL_SENDS
-        or promo_info.get("status") != "success"
-        or promo_info.get("verify_status") != "failed"
+            promo_info.get("send_count", 0) >= MAX_SUCCESSFUL_SENDS
+            or promo_info.get("status") != "success"
+            or promo_info.get("verify_status") != "failed"
     ):
         return False
     # : 保留 str() 规则；None 会变成非空的 "None"，ID 有效性需另行确认。
@@ -575,11 +578,13 @@ def send_single_promo_comment(post):
 
 
 def send_promo_comments():
-    """每轮按 follower_perspective.score 稳定降序选前十；逐帖回写，验证阻断或限额触发则停止本轮。"""
+    """每轮按 follower_perspective.score 稳定降序选前十发主评论；随后独立触发子评论流程为2h内验证成功的评论回帖。"""
     while True:
         started = time.monotonic()
         post_manager = UniversalPostManager(gen_db_object())
         posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+
+        # --- 阶段 1：发布主评论 ---
         candidates = []
         for post in posts:
             if not is_valid_post_for_promo(post) or not _can_send_promo_comment(post):
@@ -597,11 +602,12 @@ def send_promo_comments():
             if scores else "无待发送候选"
         )
         logger.info(
-            f"[发布/名单扫描] 候选筛选完成 | 扫描: 【{len(posts)}】 | 候选: 【{len(candidates)}】"
+            f"[发布/名单扫描] 主评论候选筛选完成 | 扫描: 【{len(posts)}】 | 候选: 【{len(candidates)}】"
             f" | 计划发布: 【{len(top_candidates)}】 | 评分: 【{score_summary}】"
         )
         counts = {"SUCCESS": 0, "FAILED": 0, "SKIPPED": 0}
         stop_reason = None
+
         for _, post in top_candidates:
             post_result, status = send_single_promo_comment(post)
             if status in ("ALL_ACCOUNTS_EXHAUSTED", "CAPTCHA"):
@@ -619,14 +625,158 @@ def send_promo_comments():
                 )
                 raise
             counts[status] += 1
+
+        # --- 阶段 2：发布子评论（不受10条名额限制） ---
+        sub_counts = {"SUCCESS": 0, "FAILED": 0, "SKIPPED": 0}
+        if not stop_reason:
+            sub_comment_candidates = []
+            now_ms = time.time() * 1000
+            for post in posts:
+                promo_info = post.get("promo_comment_info")
+                if not isinstance(promo_info, dict):
+                    continue
+
+                # 条件 1：评论必须存在
+                if promo_info.get("verify_status") != "success":
+                    continue
+
+                # 条件 2：发布时间在 2小时 以内
+                comment_time_ms = promo_info.get("comment_time", 0)
+                if now_ms - comment_time_ms > 2 * 3600 * 1000:
+                    continue
+
+                # 条件 5：发一次就行，无论成功失败（避免重复发送）
+                if promo_info.get("sub_comment_status") is not None:
+                    continue
+
+                sub_comment_candidates.append(post)
+
+            if sub_comment_candidates:
+                logger.info(f"[发布/子评论扫描] 候选筛选完成 | 计划发送子评论: 【{len(sub_comment_candidates)}】")
+
+            for post in sub_comment_candidates:
+                promo_info = post.get("promo_comment_info", {})
+                parent_comment_id = str(promo_info.get("comment_id", ""))
+                parent_account = promo_info.get("account_name", "")
+
+                if not parent_comment_id:
+                    sub_counts["SKIPPED"] += 1
+                    continue
+
+                # 提取 score 较高的 reply_draft 作为子评论内容
+                promo_comment = post.get("promo_comment", {})
+                trader_draft = promo_comment.get("trader_perspective", {}).get("reply_draft", {})
+                follower_draft = promo_comment.get("follower_perspective", {}).get("reply_draft", {})
+
+                try:
+                    score_t = float(trader_draft.get("score", 0))
+                except (ValueError, TypeError):
+                    score_t = 0.0
+                try:
+                    score_f = float(follower_draft.get("score", 0))
+                except (ValueError, TypeError):
+                    score_f = 0.0
+
+                best_draft = trader_draft if score_t >= score_f else follower_draft
+                reply_text = best_draft.get("comment_text", "")
+
+                if not reply_text:
+                    promo_info["sub_comment_status"] = "failed_no_text"
+                    post_manager.upsert_posts([post])
+                    sub_counts["SKIPPED"] += 1
+                    continue
+
+                # 条件 3：调用预占账号，使用 exclude 规避父评论账号（防止自问自答），遵循全局冷却
+                user_data_dir, account_name = acquire_user_account_for_send(exclude_account_name=parent_account)
+                if not user_data_dir:
+                    stop_reason = "ALL_ACCOUNTS_EXHAUSTED"
+                    break
+
+                started_sub = time.monotonic()
+                try:
+                    # post_url 中的 post_id 变为相应存在的 comment_id
+                    error, success, sub_comment_id = comment_on_binance_post(
+                        post_url=f"https://www.binance.com/zh-CN/square/post/{parent_comment_id}",
+                        comment=reply_text,
+                        url_info_list=[],
+                        user_data_dir=user_data_dir,
+                    )
+                    sub_comment_id = str(sub_comment_id) if sub_comment_id else ""
+                except Exception as send_error:
+                    record_error = None
+                    try:
+                        record_user_account_send_result(account_name, success=False, error_info=send_error)
+                    except Exception as exc:
+                        record_error = exc
+                    logger.error(
+                        f"[发布/子评论调用异常] 请求异常 | 父评论: 【{parent_comment_id}】"
+                        f" | 账号: 【{account_name}】 | 异常: 【{send_error!r}】"
+                    )
+                    promo_info["sub_comment_status"] = "error"
+                    promo_info["sub_comment_time"] = int(time.time() * 1000)
+                    promo_info["sub_comment_account"] = account_name
+                    promo_info["sub_comment_text"] = reply_text
+                    post["promo_comment_info"] = promo_info
+                    post_manager.upsert_posts([post])
+                    sub_counts["FAILED"] += 1
+                    continue
+
+                error_text = str(error or "")
+                is_captcha = any(signal in error_text for signal in CAPTCHA_SIGNALS)
+                try:
+                    record_user_account_send_result(
+                        account_name, success=False if is_captcha else success,
+                        error_info=error_text if is_captcha else error,
+                    )
+                except Exception as exc:
+                    logger.error(f"[发布/子评论计数失败] | 异常: 【{exc!r}】")
+
+                if is_captcha:
+                    logger.error(f"[发布/安全验证] 子评论触发验证阻断 | 账号: 【{account_name}】")
+                    stop_reason = "CAPTCHA"
+                    promo_info["sub_comment_status"] = "captcha"
+                    promo_info["sub_comment_time"] = int(time.time() * 1000)
+                    promo_info["sub_comment_account"] = account_name
+                    promo_info["sub_comment_text"] = reply_text
+                    post["promo_comment_info"] = promo_info
+                    post_manager.upsert_posts([post])
+                    break
+
+                # 记录更新 (至少包含：账号，时间，内容，状态)
+                promo_info["sub_comment_status"] = "success" if success else "failed"
+                promo_info["sub_comment_time"] = int(time.time() * 1000)
+                promo_info["sub_comment_account"] = account_name
+                promo_info["sub_comment_text"] = reply_text
+                if success:
+                    promo_info["sub_comment_id"] = sub_comment_id
+
+                post["promo_comment_info"] = promo_info
+                try:
+                    post_manager.upsert_posts([post])
+                except Exception as exc:
+                    logger.error(f"[发布/子评论回写失败] | 异常: 【{exc!r}】")
+
+                if success:
+                    sub_counts["SUCCESS"] += 1
+                else:
+                    sub_counts["FAILED"] += 1
+
+                log = logger.info if success else logger.error
+                outcome_sub = "接口报告成功" if success else "接口报告失败"
+                log(
+                    f"[发布/子评论结果] {outcome_sub} | 父评论: 【{parent_comment_id}】 | 账号: 【{account_name}】"
+                    f" | 耗时: 【{time.monotonic() - started_sub:.2f} 秒】 | 接口提示: 【{error_text or '无'}】"
+                )
+
         outcome = {
             "ALL_ACCOUNTS_EXHAUSTED": "缓存统计显示账号额度已满，本轮提前停止",
             "CAPTCHA": "接口提示安全验证，本轮提前停止，请检查账号验证状态",
         }.get(stop_reason, "本轮处理完成")
         log = logger.warning if stop_reason else logger.info
         log(
-            f"[发布/本轮小结] {outcome} | 已回写成功: 【{counts['SUCCESS']}】"
-            f" | 已回写失败: 【{counts['FAILED']}】 | 跳过: 【{counts['SKIPPED']}】"
+            f"[发布/本轮小结] {outcome}"
+            f" | 主评论 -> 成功: 【{counts['SUCCESS']}】 失败: 【{counts['FAILED']}】 跳过: 【{counts['SKIPPED']}】"
+            f" | 子评论 -> 成功: 【{sub_counts['SUCCESS']}】 失败: 【{sub_counts['FAILED']}】 跳过: 【{sub_counts['SKIPPED']}】"
             f" | 耗时: 【{time.monotonic() - started:.2f} 秒】 | 休眠: 【{SCHEDULE_INTERVAL_SEC} 秒】"
         )
         if stop_reason == "CAPTCHA":
@@ -639,6 +789,7 @@ def send_promo_comments():
                     logger.info(f"[发布/验证冷却] 安全验证触发后暂停中 | 距下轮检查: 【{remaining} 秒】")
         else:
             time.sleep(SCHEDULE_INTERVAL_SEC)
+
 
 def delete_old_replay():
     """每小时按账号清理历史回复；沿用逐条、逐账号及整轮异常隔离，不中断后续轮次。
