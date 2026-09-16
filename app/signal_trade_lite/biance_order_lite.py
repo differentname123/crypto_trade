@@ -31,6 +31,7 @@ Binance U 本位合约 —— 平台适配层 (面向过程 / 全系统唯一与
   3. 一切"能不能换号重发"的生死判断, 统一由 ErrKind 表达, 绝不让上层去猜错误文本。
 ================================================================================
 """
+import hashlib
 import math
 import re
 import time
@@ -399,6 +400,17 @@ def safe_init_exchange(api_key, secret_key, proxies):
             time.sleep(interval)
             interval = min(interval * 2, 60)
 
+def open_session(proxies=None, account="mama"):
+    """
+    按账户别名建立交易所会话: 把"平台凭据的键名规则"收口在本层, 上层只传别名。
+    换平台时在对应适配层实现同名函数即可(如 OKX 还需读 passphrase), 上层代码零改动。
+    :param proxies: 代理配置(None 表示直连)
+    :param account: 账户别名, 如 "mama" -> mama_biance_api_key / mama_biance_api_secret
+    :return: 已就绪的交易所会话(内部指数退避重试直至成功)
+    """
+    api_key = get_config(f"{account}_biance_api_key")
+    secret_key = get_config(f"{account}_biance_api_secret")
+    return safe_init_exchange(api_key, secret_key, proxies)
 
 def sync_exchange_time(exchange):
     """
@@ -436,7 +448,36 @@ def to_market_id(symbol):
     """统一交易对名 -> 交易所原生 market id: BTC/USDT:USDT -> BTCUSDT。"""
     return str(symbol).replace("/", "").split(":")[0]
 
+# 币安 clientOrderId 约束: 仅允许 字母 / 数字 / . - _ , 总长度上限 36
+COID_MAX_LEN = 36
+_COID_ILLEGAL_RE = re.compile(r'[^a-zA-Z0-9_.-]')
 
+
+def sanitize_coid_part(text, max_len):
+    """
+    优雅清洗 client_oid 的单个组件: 只保留平台允许的字符(字母,数字,.-_)并截断。
+    如果全是非法字符(如纯中文), 则使用 MD5 哈希短码代替, 保证确定性与唯一性。
+    """
+    text_str = str(text).strip()
+    safe_str = _COID_ILLEGAL_RE.sub('', text_str)
+    if not safe_str:
+        safe_str = hashlib.md5(text_str.encode('utf-8')).hexdigest()
+    return safe_str[:max_len]
+
+
+def build_client_oid(parts, rand_len=5):
+    """
+    按平台字符集与长度约束, 拼装可溯源的本地唯一单号。
+    上层只描述"用哪些语义组件 + 各组件长度预算", 合法化与长度兜底全部由本层负责。
+    :param parts: [(组件文本, 该组件最大长度), ...]
+    :param rand_len: 随机后缀长度(防同一时刻重复)
+    :return: (prefix, client_oid); prefix 供上层做"同一条信号"的幂等前缀匹配
+    """
+    prefix = "_".join(sanitize_coid_part(t, n) for t, n in parts)
+    client_oid = f"{prefix}_{uuid.uuid4().hex[:rand_len]}"
+    if len(client_oid) > COID_MAX_LEN:      # 兜底: 极端超长时截断, 确保平台可受理
+        client_oid = client_oid[:COID_MAX_LEN]
+    return prefix, client_oid
 def supports_cancel_all(exchange):
     """交易所是否支持原生一键批量撤单(不支持时上层需降级为逐个撤销)。"""
     return bool(exchange.has.get('cancelAllOrders'))
@@ -540,6 +581,15 @@ def fetch_usdt_swap_changes(exchange):
     return {k: v['percentage'] for k, v in tickers.items()
             if k.endswith(':USDT') and v.get('percentage') is not None}
 
+def make_position_key(symbol, position_side):
+    """持仓映射的统一 Key(与 fetch_positions_map 出参口径严格一致): 交易对 + 持仓方向。"""
+    return f"{symbol}_{str(position_side).upper()}"
+
+
+def position_key_symbol(pos_key):
+    """从持仓映射 Key 反解交易对名: 'BTC/USDT:USDT_LONG' -> 'BTC/USDT:USDT'。"""
+    return str(pos_key).rsplit("_", 1)[0]
+
 # ==========================================
 # E. 账户与持仓
 # ==========================================
@@ -593,6 +643,13 @@ def get_total_equity(exchange):
         logger.error(f"[EQUITY_REJECT] 获取账户总权益失败 耗时:{latency}ms | {e}")
         return ExecStatus.REJECT, 0.0
 
+def fetch_total_equity(exchange):
+    """
+    账户总权益(含未实现盈亏)的软兜底读取: 拉取失败一律返回 0.0, 绝不抛异常。
+    日志口径完全复用 get_total_equity; 上层据 ">0" 判定本次采样是否可信(可沿用上轮值不丢轮)。
+    """
+    status, equity = get_total_equity(exchange)
+    return equity if status == ExecStatus.OK else 0.0
 
 def fetch_account_equity(exchange):
     """
@@ -636,9 +693,8 @@ def fetch_positions_map(exchange):
         side = str(pos["info"].get("positionSide", "")).upper()
         if not side or side == "BOTH":
             side = "LONG" if amt > 0 else "SHORT"
-        cache[f"{pos['symbol']}_{side}"] = amt
+        cache[make_position_key(pos['symbol'], side)] = amt
     return cache
-
 
 def fetch_position_qty(exchange, symbol, position_side):
     """
@@ -657,7 +713,12 @@ def is_hedge_mode(exchange):
     """账户是否为【双向持仓 Hedge Mode】; 异常向上抛。"""
     r = exchange.fapiPrivateGetPositionSideDual()
     return str(r.get("dualSidePosition")).lower() == "true"
-
+# 平台无关的标准订单态字面量 (全系统唯一一份定义; 上层只认这几个常量, 严禁解析平台原始状态文本)
+OS_OPEN = "OPEN"
+OS_FILLED = "FILLED"
+OS_CANCELED = "CANCELED"
+OS_REJECTED = "REJECTED"
+OS_UNKNOWN = "UNKNOWN"
 
 # ==========================================
 # F. 订单查询 (状态归一 / 挂单快照 / 点查)
@@ -731,7 +792,10 @@ def order_client_oid(o):
     o = o or {}
     return str(o.get("clientOrderId") or (o.get("info") or {}).get("clientOrderId") or "")
 
-
+def order_exchange_oid(o):
+    """从交易所原始订单结构中提取交易所原生订单号; 缺失一律返回空串。"""
+    o = o or {}
+    return str(o.get("id") or (o.get("info") or {}).get("orderId") or "")
 def make_open_order_stub(exchange_oid, client_oid):
     """
     构造一条"在线挂单"占位记录(与交易所原始订单结构同形)。

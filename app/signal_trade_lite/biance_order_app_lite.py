@@ -15,6 +15,10 @@
   是否开/平由 "当前信号 + 幂等 + 交易所实况" 决定, 不被历史账本一票否决。
 
 实事求是: 平仓量 = min(本单元开仓实际成交量, 交易所该方向实际持仓); 只认实际成交与实际持仓, 不足则告警封顶。
+
+平台无关: 一切交易所交互(会话/校时/权益/持仓/挂单/点查/撤单/下单/精度/行情/单号规则)全部收口在
+  平台适配层(biance_order_lite, 未来的 okx_order_lite); 本文件不出现任何 exchange.xxx 直连、
+  平台字段名、平台错误码与单号命名规则。换交易所只需替换下方唯一一处平台适配层 import。
 """
 import os
 import time
@@ -26,14 +30,10 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from common_utils_lite import get_config, setup_logger
-import re
-import hashlib
-import uuid
-import pandas as pd
-
+from common_utils_lite import setup_logger
 
 CURRENT_SYMBOL = "cross"  # "cross" "top_long" "ma_bottom_long" “XSR_long” "fr_short" "vol_fr_long" "bottom_power_short" "oi_decay_short" "high_fr_bear_div_short" "vwap_reclaim_long"
+ACCOUNT_ALIAS = "mama"  # 交易账户别名; 具体凭据键名的拼装规则由平台适配层负责
 
 logger = setup_logger(app_name=f"{CURRENT_SYMBOL}_trader")
 
@@ -41,9 +41,26 @@ from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_tr
     execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_XSR_long, \
     execute_trading_bot_workflow_short_fr, execute_trading_bot_workflow_vol_fr_long, \
     execute_trading_bot_workflow_bottom_powder_short,execute_trading_bot_oi_decay_short,execute_trading_bot_high_fr_bear_div_short,execute_trading_bot_vwap_reclaim_long
-from biance_order_lite import (execute_order, get_total_equity,
-                               ExecStatus, safe_init_exchange
-                               )
+
+# ==========================================
+# 平台适配层: 全系统唯一与交易所耦合的导入
+# 换交易所只需把下面这一行换成 okx_order_lite (函数签名与出参语义完全一致)
+# ==========================================
+from biance_order_lite import (
+    # 会话与本地单号规则
+    open_session, sync_exchange_time, build_client_oid,
+    # 账户与持仓
+    fetch_total_equity, fetch_positions_map, make_position_key, position_key_symbol,
+    # 挂单快照与订单结构解析(平台无关视图)
+    fetch_open_orders_grouped, order_client_oid, order_exchange_oid, make_open_order_stub,
+    fetch_recent_orders_map, fetch_order_by_id, extract_order_view,
+    # 标准订单态字面量
+    OS_OPEN, OS_FILLED, OS_CANCELED, OS_REJECTED,
+    # 撤单与下单
+    cancel_order_by_id, is_cancel_target_gone, execute_order,
+    # 精度与行情
+    amount_to_precision, fetch_usdt_swap_changes,
+)
 
 # ==========================================
 # L0. 配置与常量
@@ -63,6 +80,7 @@ OPEN_ORDER_TIMEOUT_HOURS = 2  # 开仓单超时清理阈值
 CLOSE_ORDER_TIMEOUT_HOURS = 4  # 平仓单超时清理阈值
 POSITION_DIFF_TOLERANCE = 0.01  # 持仓一致性告警容差 (1%)
 API_MAX_RETRY = 3  # 核心接口重试次数
+RECENT_ORDER_LIMIT = 50  # 对账穿透: 按币种批量拉取近期订单的条数
 
 # 账本内部订单状态枚举
 ST_PENDING = "PENDING"  # 已发出, 未完全确认
@@ -160,32 +178,17 @@ def _safe_to_datetime(val):
         return None
 
 
-def map_exchange_status(ccxt_status):
-    """ccxt 订单状态 → 账本内部状态 (open/其它 → PENDING 继续观察)"""
-    s = str(ccxt_status).lower()
-    if s == "closed":
-        return ST_FILLED
-    if s in ("canceled", "expired"):
-        return ST_CANCELED
-    if s == "rejected":
-        return ST_FAILED
-    return ST_PENDING
+# 平台无关标准订单态 → 账本内部状态 (未收口的状态一律 PENDING 继续观察)
+_EX_TO_LEDGER_STATUS = {
+    OS_FILLED: ST_FILLED,
+    OS_CANCELED: ST_CANCELED,
+    OS_REJECTED: ST_FAILED,
+}
 
 
-
-def _safe_oid_component(text, max_len):
-    """
-    优雅清洗：只保留币安允许的字符(字母,数字,.-_)
-    如果全是非法字符(如纯中文)，则使用MD5哈希短码代替，保证确定性与唯一性。
-    """
-    text_str = str(text).strip()
-    # 移除非法字符
-    safe_str = re.sub(r'[^a-zA-Z0-9_.-]', '', text_str)
-    if not safe_str:
-        # 如果清洗后为空(例如纯中文"币安人生")，采用哈希前缀
-        safe_str = hashlib.md5(text_str.encode('utf-8')).hexdigest()
-
-    return safe_str[:max_len]
+def map_exchange_status(ex_status):
+    """平台标准订单态 → 账本内部状态 (OPEN/UNKNOWN → PENDING 继续观察)"""
+    return _EX_TO_LEDGER_STATUS.get(str(ex_status).upper(), ST_PENDING)
 
 
 def parse_signal(row):
@@ -201,17 +204,13 @@ def parse_signal(row):
     raw_direction = str(row["direction"]).strip().upper()
     raw_event = str(row["event"]).strip().upper()
 
-    # 2. 交易所安全的 OID 组件转化
-    safe_strategy = _safe_oid_component(raw_strategy, 6)
-    safe_coin = _safe_oid_component(raw_coin, 4)
-    safe_dir = _safe_oid_component(raw_direction, 1)
-    safe_evt = _safe_oid_component(raw_event, 1)
-
-    # Client OID 前缀拼接，最大长度: 6+1+4+1+1+1+1+1+6 = 22个字符
-    prefix = f"{safe_strategy}_{safe_coin}_{safe_dir}_{safe_evt}_{st.strftime('%d%H%M')}"
-
-    # 最终 OID: 22 + 1 + 5 = 28个字符 (完美符合币安 <= 36 字符的要求)
-    client_oid = f"{prefix}_{uuid.uuid4().hex[:5]}"
+    # 2. 交易所安全的 OID: 本文件只声明"语义组件 + 长度预算",
+    #    字符集清洗/哈希退化/总长上限一律由平台适配层负责 (换平台无需改动这里)
+    #    组件: 策略名6 / 币种4 / 方向1 / 事件1 / 信号时刻6(日时分) -> prefix 22 字符, 全长 28 字符
+    prefix, client_oid = build_client_oid([
+        (raw_strategy, 6), (raw_coin, 4), (raw_direction, 1),
+        (raw_event, 1), (st.strftime('%d%H%M'), 6),
+    ])
 
     return {
         "signal_time": st,
@@ -224,10 +223,11 @@ def parse_signal(row):
         "price": float(row["price"]),
         "max_weight": float(row.get("max_weight", 0.1)),
         "ssd_key": f"{raw_strategy}_{raw_symbol}_{raw_direction}",
-        "pos_key": f"{raw_symbol}_{raw_direction}",
+        "pos_key": make_position_key(raw_symbol, raw_direction),
         "prefix": prefix,
         "client_oid": client_oid,  # 发给交易所的安全 ID
     }
+
 
 def make_record(sig, target_amount, target_value, status, client_oid,
                 exchange_oid, error_msg="", filled_amount="", actual_fill_price="",
@@ -308,19 +308,15 @@ def _has_unclosed_open(ssd_df):
 def _has_pending_order(open_order_cache, sig):
     """幂等校验: 内存挂单中已有同前缀订单(=同一条信号)则视为重复, 防重复发单"""
     for o in open_order_cache.get(sig["symbol"], []):
-        oid = o.get("clientOrderId") or o.get("info", {}).get("clientOrderId", "")
-        if str(oid).startswith(sig["prefix"]):
+        if order_client_oid(o).startswith(sig["prefix"]):
             return True
     return False
 
 
 def _cache_order(open_order_cache, symbol, exchange_oid, client_oid):
     """内存挂单打标, 封锁同批次重复开平 (下单成功后立即登记)"""
-    open_order_cache.setdefault(symbol, []).append({
-        "id": exchange_oid,
-        "clientOrderId": client_oid,
-        "info": {"clientOrderId": client_oid},
-    })
+    open_order_cache.setdefault(symbol, []).append(
+        make_open_order_stub(exchange_oid, client_oid))
 
 
 # ==========================================
@@ -336,29 +332,6 @@ def _retry_fetch(label, fn):
             time.sleep(1)
     logger.error(f"[PRELOAD] {label}连续拉取失败, 本轮将放弃")
     return None
-
-
-def _fetch_positions(exchange):
-    """拉取非零持仓, 归一化为 {symbol_SIDE: 带符号数量}; 单向持仓按数量正负推断多空"""
-    cache = {}
-    for pos in exchange.fetch_positions():
-        amt = float(pos["info"]["positionAmt"])
-        if amt == 0:
-            continue
-        side = str(pos["info"].get("positionSide", "")).upper()
-        if not side or side == "BOTH":
-            side = "LONG" if amt > 0 else "SHORT"
-        cache[f"{pos['symbol']}_{side}"] = amt
-    return cache
-
-
-def _fetch_open_orders(exchange):
-    """拉取全部活跃挂单, 按 symbol 分组缓存"""
-    exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
-    cache = {}
-    for order in exchange.fetch_open_orders():
-        cache.setdefault(order["symbol"], []).append(order)
-    return cache
 
 
 def _is_order_timeout(row, now):
@@ -397,7 +370,7 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
     open_dict = {}
     for orders in (open_order_cache or {}).values():
         for o in orders:
-            oid = str(o.get("id", ""))
+            oid = order_exchange_oid(o)
             if oid:
                 open_dict[oid] = o
 
@@ -412,8 +385,7 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
     recent_dict = {}
     for sym in missing_by_symbol:
         try:
-            for o in exchange.fetch_orders(sym, limit=50):
-                recent_dict[str(o.get("id"))] = o
+            recent_dict.update(fetch_recent_orders_map(exchange, sym, limit=RECENT_ORDER_LIMIT))
         except Exception as e:
             logger.warning(f"[RECON] 批量拉单失败 | {sym} | {e}")
             time.sleep(0.5)
@@ -431,28 +403,30 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
         if order_info is None:
             try:
                 time.sleep(0.1)  # 防御性限流
-                order_info = exchange.fetch_order(oid, symbol)
+                order_info = fetch_order_by_id(exchange, symbol, oid)
             except Exception as e:
                 logger.warning(f"[RECON] 单笔兜底查询失败 | RID:{rid} OID:{oid} | {e}")
                 continue
         if not order_info:
             continue
 
-        ccxt_status = str(order_info.get("status", "")).lower()
-        filled = to_num(order_info.get("filled"))
-        avg = order_info.get("average") or order_info.get("price") or ""
+        # 平台无关快照: status(标准态) / filled / avg_price, 不解析任何平台原始字段
+        view = extract_order_view(order_info)
+        ex_status = view["status"]
+        filled = to_num(view["filled"])
+        avg = view["avg_price"]
         is_timeout, timeout_hours = _is_order_timeout(row, now)
 
         # 交易所仍挂单(open)且已超时 → 撤单
-        if ccxt_status == "open" and is_timeout:
+        if ex_status == OS_OPEN and is_timeout:
             event = str(row.get("event", "")).strip().upper()
             try:
-                exchange.cancel_order(oid, symbol)
+                cancel_order_by_id(exchange, symbol, oid)
                 try:
                     # 撤单后重拉终态, 防"撤单瞬间恰好成交"漏记成交量
-                    fin = exchange.fetch_order(oid, symbol)
-                    filled = to_num(fin.get("filled"), filled)
-                    avg = fin.get("average") or fin.get("price") or avg
+                    fin = extract_order_view(fetch_order_by_id(exchange, symbol, oid))
+                    filled = to_num(fin["filled"], filled)
+                    avg = fin["avg_price"] or avg
                 except Exception:
                     pass
                 upd = {"exec_status": ST_CANCELED, "update_time": now_str,
@@ -464,9 +438,8 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
                 canceled += 1
                 logger.info(f"[RECON] 超时撤单 | {event} | OID:{oid} | 已成交残量:{filled}")
             except Exception as e:
-                err = (type(e).__name__ + str(e)).lower()
-                # "查无此单": 订单已被交易所清理, 直接核销, 打破 PENDING 死循环
-                if any(k in err for k in ("ordernotfound", "-2011", "does not exist", "unknown order")):
+                # "查无此单": 订单已被交易所清理, 直接核销, 打破 PENDING 死循环 (判定收口在平台层)
+                if is_cancel_target_gone(e):
                     updates[rid] = {"exec_status": ST_CANCELED, "update_time": now_str,
                                     "error_msg": f"撤单查无此单, 强制核销: {e}"}
                     canceled += 1
@@ -477,7 +450,7 @@ def reconcile_ledger(exchange, ledger, open_order_cache):
             continue
 
         # 常规回填: 仍是无成交挂单则跳过; 否则回填状态与成交
-        new_status = map_exchange_status(ccxt_status)
+        new_status = map_exchange_status(ex_status)
         if new_status == ST_PENDING and filled <= 0:
             continue
         upd = {"update_time": now_str}
@@ -514,7 +487,7 @@ def check_position_consistency(ledger, position_cache):
         amt = to_num(r["filled_amount"])
         if amt <= 0:
             continue
-        key = f"{str(r['symbol']).strip()}_{str(r['direction']).strip().upper()}"
+        key = make_position_key(str(r['symbol']).strip(), str(r['direction']).strip())
         expected[key] = expected.get(key, 0.0) + amt
 
     for key, exp in expected.items():
@@ -531,16 +504,16 @@ def preload_account_state(exchange, ledger):
     global _last_equity
     t0 = time.perf_counter()
     try:
-        exchange.load_time_difference()
+        sync_exchange_time(exchange)
     except Exception:
         pass
 
     # 权益: 软兜底, 短时抖动不该错过整轮
     equity = 0.0
     for _ in range(API_MAX_RETRY):
-        st, val = get_total_equity(exchange)
-        if st == ExecStatus.OK and val > 0:
-            equity = _last_equity = val
+        equity = fetch_total_equity(exchange)
+        if equity > 0:
+            _last_equity = equity
             break
         time.sleep(1)
     if equity <= 0:
@@ -548,8 +521,8 @@ def preload_account_state(exchange, ledger):
         logger.warning(f"[PRELOAD] ⚠️ 权益拉取失败, 沿用上轮值:{equity:.2f}")
 
     # 持仓 / 挂单: 硬校验, 任一为 None 上层将放弃本轮
-    position_cache = _retry_fetch("持仓", lambda: _fetch_positions(exchange))
-    open_order_cache = _retry_fetch("挂单", lambda: _fetch_open_orders(exchange))
+    position_cache = _retry_fetch("持仓", lambda: fetch_positions_map(exchange))
+    open_order_cache = _retry_fetch("挂单", lambda: fetch_open_orders_grouped(exchange))
 
     # 对账与一致性校验 (依赖上述缓存, 缺失则跳过)
     if open_order_cache is not None:
@@ -586,7 +559,7 @@ def handle_open(exchange, ledger, ledger_df, sig, total_equity, open_order_cache
 
     # 算量: 权益 x 杠杆 x 权重, 夹在下单金额上下限内
     target_value = min(max(total_equity * LEVERAGE * sig["max_weight"], MIN_ORDER_VALUE), MAX_ORDER_VALUE)
-    amount = float(exchange.amount_to_precision(sig["symbol"], target_value / sig["price"]))
+    amount = amount_to_precision(exchange, sig["symbol"], target_value / sig["price"])
     if amount <= 0:
         logger.warning(f"[OPEN] 算量为 0, 跳过 | {ssd}")
         return
@@ -596,13 +569,13 @@ def handle_open(exchange, ledger, ledger_df, sig, total_equity, open_order_cache
         client_oid=sig["client_oid"], order_type="market",
         reduce_only=False, position_side=sig["direction"]
     )
-    status = ST_PENDING if result.status == ExecStatus.OK else ST_FAILED
+    status = ST_PENDING if result.ok else ST_FAILED
 
     ledger.append(make_record(
         sig, target_amount=amount, target_value=target_value, status=status,
         client_oid=sig["client_oid"], exchange_oid=result.exchange_oid, error_msg=result.error_msg
     ))
-    if result.status == ExecStatus.OK:
+    if result.ok:
         _cache_order(open_order_cache, sig["symbol"], result.exchange_oid, sig["client_oid"])
     logger.info(f"[OPEN] {ssd} | 数量:{amount} | 金额:{target_value:.2f} | {status} | CID:{sig['client_oid']}")
 
@@ -640,7 +613,7 @@ def handle_close(exchange, ledger, ledger_df, sig, position_cache, open_order_ca
         logger.warning(
             f"[CLOSE] ⚠️ 实际持仓不足 | {ssd} | 账本开仓量:{ledger_open_amt:.6f} > 交易所持仓:{actual_pos:.6f} | 以实际持仓封顶")
 
-    amount = float(exchange.amount_to_precision(sig["symbol"], min(ledger_open_amt, actual_pos)))
+    amount = amount_to_precision(exchange, sig["symbol"], min(ledger_open_amt, actual_pos))
     if amount <= 0:
         logger.warning(f"[CLOSE] 算量为 0, 跳过 | {ssd}")
         return
@@ -650,14 +623,14 @@ def handle_close(exchange, ledger, ledger_df, sig, position_cache, open_order_ca
         client_oid=sig["client_oid"], order_type="market",
         reduce_only=False, position_side=sig["direction"]  # reduce_only + 持仓方向, 严格只减仓
     )
-    status = ST_PENDING if result.status == ExecStatus.OK else ST_FAILED
+    status = ST_PENDING if result.ok else ST_FAILED
 
     ledger.append(make_record(
         sig, target_amount=amount, target_value=amount * sig["price"], status=status,
         client_oid=sig["client_oid"], exchange_oid=result.exchange_oid,
         error_msg=result.error_msg, linked_open_id=linked_id  # 关联开仓 ID, 开平一一对应
     ))
-    if result.status == ExecStatus.OK:
+    if result.ok:
         _cache_order(open_order_cache, sig["symbol"], result.exchange_oid, sig["client_oid"])
     logger.info(f"[CLOSE] {ssd} | 数量:{amount} | {status} | 开仓ID:{linked_id} | CID:{sig['client_oid']}")
 
@@ -715,7 +688,7 @@ def print_position_summary(exchange, ledger, open_order_cache=None):
     reconcile_ledger(exchange, ledger, open_order_cache)
 
     # 尝试重新拉取最新持仓以反映本轮可能的发单变更
-    position_cache = _retry_fetch("汇总持仓", lambda: _fetch_positions(exchange))
+    position_cache = _retry_fetch("汇总持仓", lambda: fetch_positions_map(exchange))
     if position_cache is None:
         logger.warning("[SUMMARY] 最新持仓拉取失败, 跳过本轮汇总输出")
         return
@@ -738,7 +711,7 @@ def print_position_summary(exchange, ledger, open_order_cache=None):
 
         symbol = str(r.get("symbol", "")).strip()
         direction = str(r.get("direction", "")).strip().upper()
-        pos_key = f"{symbol}_{direction}"
+        pos_key = make_position_key(symbol, direction)
 
         # 提取实际成交价格并格式化处理空值
         fill_price = str(r.get("actual_fill_price", ""))
@@ -771,49 +744,50 @@ def print_position_summary(exchange, ledger, open_order_cache=None):
 def get_top_movers(exchange, top_n=10, mode='top'):
     """
     获取合约市场的涨跌幅排名
-    :param exchange: ccxt 交易所实例
+    :param exchange: 交易所会话 (由平台适配层创建)
     :param top_n: 获取的数量
     :param mode: 'top' 获取涨幅榜, 'bottom' 获取跌幅榜, 'both' 获取包含两者的字典
     """
-    tickers = exchange.fetch_tickers(params={'type': 'swap'})
-
-    # 过滤出USDT本位合约，并排除没有涨跌幅数据的异常币种
-    usdt_swaps = {k: v for k, v in tickers.items() if k.endswith(':USDT') and v.get('percentage') is not None}
-    df = pd.DataFrame(usdt_swaps).T
+    # 平台适配层直接给出 {symbol: 24h涨跌幅}, 已过滤非 USDT 本位合约与无涨跌幅数据的异常币种
+    changes = pd.Series(fetch_usdt_swap_changes(exchange), dtype="float64")
 
     # 按涨跌幅降序排列（涨得最多的在前面，跌得最多的在最后）
-    df = df.sort_values('percentage', ascending=False)
+    changes = changes.sort_values(ascending=False)
 
     if mode == 'top':
         # 只取涨幅榜前 N 名
-        return df.head(top_n).index.tolist()
+        return changes.head(top_n).index.tolist()
 
     elif mode == 'bottom':
         # 取跌幅榜前 N 名（末尾 N 名）。
         # [::-1] 的作用是反转列表，让跌幅最大的排在第一位
-        return df.tail(top_n)[::-1].index.tolist()
+        return changes.tail(top_n)[::-1].index.tolist()
 
     elif mode == 'both':
         # 同时返回涨幅榜和跌幅榜
         return {
-            'top': df.head(top_n).index.tolist(),
-            'bottom': df.tail(top_n)[::-1].index.tolist()
+            'top': changes.head(top_n).index.tolist(),
+            'bottom': changes.tail(top_n)[::-1].index.tolist()
         }
 
     else:
         raise ValueError("mode 参数必须是 'top', 'bottom' 或 'both'")
 
 
-def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
+def build_monitor_symbols(exchange, position_cache, ledger, top_n, mode):
+    """
+    构造本轮监控币种 = 榜单币种 ∪ (交易所实际持仓 ∩ 账本理论持仓)。
+    取交集可彻底排除其它策略(如 cross)开仓的币种, 避免无意义的信号计算;
+    同时确保本策略自己的持仓一定进入监控, 不漏平仓/加仓。
+    """
     # 获取当前实际持仓与账本理论持仓
     actual_symbols_set = set()
     theoretical_symbols_set = set()
 
-    # 1. 从交易所缓存(实际持仓)中提取
+    # 1. 从交易所缓存(实际持仓)中提取 (Key 的反解规则收口在平台适配层)
     if position_cache:
         for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
+            actual_symbols_set.add(position_key_symbol(k))
 
     # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
     df = ledger.read()
@@ -824,345 +798,89 @@ def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache,
             if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
                 theoretical_symbols_set.add(str(r["symbol"]).strip())
 
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
+    # 取“实际持仓”和“账本理论持仓”的交集
     holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
     holding_symbols = list(holding_symbols_set)
 
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=BEST_TOP_N)
+    # 获取榜单
+    top_symbol_list = get_top_movers(exchange, top_n=top_n, mode=mode)
 
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
+    # 合并榜单币种与当前属于本策略的持仓币种，并去重
     final_symbol_list = list(set(top_symbol_list + holding_symbols))
 
     # 一行输出详细的过滤与统计信息
     logger.info(
         f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
+    return final_symbol_list
 
+
+def get_top_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=BEST_TOP_N, mode='top')  # 获取涨幅榜
     signal_df = execute_trading_bot_workflow_top_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
 
 
 def get_ma_bottom_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=BEST_TOP_N, mode='bottom')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=BEST_TOP_N, mode='bottom')  # 获取跌幅榜
     signal_df = execute_trading_bot_workflow_ma_bottom_long(target_time_str, symbol_list=final_symbol_list,
                                                             proxy_url=proxy_url)
     return signal_df
 
 
 def get_XSR_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=10, mode='bottom')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=10, mode='bottom')  # 获取跌幅榜
     signal_df = execute_trading_bot_workflow_XSR_long(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
 
 
 def get_vol_fr_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=10, mode='bottom')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=10, mode='bottom')  # 获取跌幅榜
     signal_df = execute_trading_bot_workflow_vol_fr_long(target_time_str, symbol_list=final_symbol_list,
                                                          proxy_url=proxy_url)
     return signal_df
 
+
 def get_vwap_reclaim_long_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=10, mode='bottom')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=10, mode='bottom')  # 获取跌幅榜
     signal_df = execute_trading_bot_vwap_reclaim_long(target_time_str, symbol_list=final_symbol_list,
                                                          proxy_url=proxy_url)
     return signal_df
 
+
 def get_high_fr_bear_div_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=1, mode='top')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=1, mode='top')  # 获取涨幅榜
     signal_df = execute_trading_bot_high_fr_bear_div_short(target_time_str, symbol_list=final_symbol_list,
                                                          proxy_url=proxy_url)
     return signal_df
 
+
 def get_oi_decay_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=3, mode='top')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=3, mode='top')  # 获取涨幅榜
     signal_df = execute_trading_bot_oi_decay_short(target_time_str, symbol_list=final_symbol_list,
                                                          proxy_url=proxy_url)
     return signal_df
 
+
 def get_bottom_power_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=10, mode='bottom')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=10, mode='bottom')  # 获取跌幅榜
     signal_df = execute_trading_bot_workflow_bottom_powder_short(target_time_str, symbol_list=final_symbol_list,
                                                                  proxy_url=proxy_url)
     return signal_df
 
 
 def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache, ledger):
-    # 获取当前持仓与账本理论持仓，以确保其加入信号监控不漏平仓/加仓
-    # 获取当前实际持仓与账本理论持仓
-    actual_symbols_set = set()
-    theoretical_symbols_set = set()
-
-    # 1. 从交易所缓存(实际持仓)中提取
-    if position_cache:
-        for k in position_cache.keys():
-            # k 格式形如 "BTC/USDT:USDT_LONG"，用 "_" 分割取前面部分
-            actual_symbols_set.add(k.rsplit('_', 1)[0])
-
-    # 2. 从账本(理论持仓)中提取（有实际成交且尚未关联平仓的单子）
-    df = ledger.read()
-    if not df.empty:
-        closed_ids = _closed_open_ids(df)
-        opens_df = df[df["event"].astype(str).str.strip().str.upper() == "OPEN"]
-        for _, r in opens_df.iterrows():
-            if str(r["record_id"]) not in closed_ids and to_num(r["filled_amount"]) > 0:
-                theoretical_symbols_set.add(str(r["symbol"]).strip())
-
-    # 核心修改：取“实际持仓”和“账本理论持仓”的交集
-    # 这样就彻底排除了其他策略（如 cross）开仓的币种，避免无意义的信号计算
-    holding_symbols_set = actual_symbols_set.intersection(theoretical_symbols_set)
-    holding_symbols = list(holding_symbols_set)
-
-    # 获取涨幅榜
-    top_symbol_list = get_top_movers(exchange, top_n=1, mode='top')  # 获取跌幅榜
-
-    # 合并涨幅榜币种与当前属于本策略的持仓币种，并去重
-    final_symbol_list = list(set(top_symbol_list + holding_symbols))
-
-    # 一行输出详细的过滤与统计信息
-    logger.info(
-        f"[SIGNAL] 监控汇总 | 交易所总持仓:{len(actual_symbols_set)} | 账本理论:{len(theoretical_symbols_set)} | 交集(本策略有效):{len(holding_symbols_set)} | 最终监控({len(final_symbol_list)}个): {final_symbol_list}")
-
+    final_symbol_list = build_monitor_symbols(exchange, position_cache, ledger,
+                                              top_n=1, mode='top')  # 获取涨幅榜
     signal_df = execute_trading_bot_workflow_short_fr(target_time_str, symbol_list=final_symbol_list,
                                                       proxy_url=proxy_url)
     return signal_df
@@ -1170,16 +888,14 @@ def get_fr_short_signal_df(exchange, target_time_str, proxy_url, position_cache,
 
 def run_scheduler():
     """顶层编排: 周期驱动一轮 —— 预加载对账 → 拉信号 → 窗口内执行; 任何环节异常都不致整体停摆"""
-    api_key = get_config("mama_biance_api_key")
-    secret_key = get_config("mama_biance_api_secret")
-
     if platform.system().lower() == "linux":
         proxies, proxy_url = None, None
     else:
         proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
         proxy_url = "http://127.0.0.1:7890"
 
-    exchange = safe_init_exchange(api_key, secret_key, proxies)
+    # 会话建立与凭据读取全部交由平台适配层 (本文件不感知任何平台的密钥命名规则)
+    exchange = open_session(proxies, account=ACCOUNT_ALIAS)
     ledger = LedgerManager(LEDGER_FILE)
     logger.info("[SCHED] 调度系统就绪, 进入调度循环")
     print_position_summary(exchange, ledger)
