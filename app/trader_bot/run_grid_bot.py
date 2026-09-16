@@ -23,7 +23,7 @@ from collections import Counter, defaultdict, namedtuple
 from datetime import datetime
 from enum import Enum
 
-from common_utils_lite import get_config, setup_logger
+from common_utils import get_config, setup_logger
 from binance_u_gateway import (
     ErrKind, ExecStatus, cancel_all_orders_of_symbol, cancel_order_by_id, execute_order,
     fetch_last_price, fetch_market_precision, fetch_open_orders, format_price_amount,
@@ -31,7 +31,7 @@ from binance_u_gateway import (
 )
 
 logger = setup_logger(app_name="grid_trader")
-
+DATA_DIR = "bot_data"
 LOG_DIR = "logs"
 POINT_CHECK_DELAY_COLD = 0.05
 POINT_CHECK_DELAY_RUNTIME = 0.1
@@ -230,8 +230,8 @@ class GridLedger:
     COLUMNS = ["ts", "node_id", "cycle", "action", "client_oid", "price", "amount", "status", "msg"]
 
     def __init__(self, strategy_id):
-        os.makedirs(LOG_DIR, exist_ok=True)
-        self.filename = os.path.join(LOG_DIR, f"grid_ledger_{strategy_id}.csv")
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self.filename = os.path.join(DATA_DIR, f"grid_ledger_{strategy_id}.csv")
         if not os.path.exists(self.filename):
             with open(self.filename, 'w', newline='', encoding='utf-8') as handle:
                 csv.writer(handle).writerow(self.COLUMNS)
@@ -265,8 +265,9 @@ class GridLedger:
 
 def guard_direction_consistency(config):
     """用 sidecar 文件阻止同一 strategy_id 在 LONG/SHORT 间复用。"""
-    os.makedirs(LOG_DIR, exist_ok=True)
-    path, expected = os.path.join(LOG_DIR, f"grid_direction_{config.strategy_id}.lock"), config.direction.value
+    # 修改点 2：将 LOG_DIR 替换为 DATA_DIR
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path, expected = os.path.join(DATA_DIR, f"grid_direction_{config.strategy_id}.lock"), config.direction.value
     try:
         if not os.path.exists(path):
             with open(path, 'w', encoding='utf-8') as handle:
@@ -285,9 +286,7 @@ def guard_direction_consistency(config):
     except SystemExit:
         raise
     except Exception as exc:
-        # : 原实现选择方向锁 I/O 失败后继续交易（fail-open）；属于业务安全边界，暂不擅自改为 fail-closed。
         logger.warning(f"[方向锁/校验失败] 按原逻辑继续启动 | 策略:[{config.strategy_id}] | 风险:[无法确认历史方向] | 错误:[{exc}]")
-
 
 class ExchangeBroker:
     """收拢交易所调用；上层仅依赖稳定 broker 语义。"""

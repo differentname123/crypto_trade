@@ -19,8 +19,8 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from common_utils_lite import setup_logger
-from run_cross_signal_lite import (
+from common_utils import setup_logger
+from signal_generator import (
     execute_trading_bot_high_fr_bear_div_short, execute_trading_bot_oi_decay_short,
     execute_trading_bot_vwap_reclaim_long, execute_trading_bot_workflow_XSR_long,
     execute_trading_bot_workflow_bottom_powder_short, execute_trading_bot_workflow_cross,
@@ -42,7 +42,11 @@ from binance_u_gateway import (
 CURRENT_SYMBOL = "cross"
 ACCOUNT_ALIAS = "mama"
 BEST_TOP_N = 10
-LEDGER_FILE = f"trade_records_{CURRENT_SYMBOL}.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "bot_data")
+LEDGER_FILE = os.path.join(DATA_DIR, f"trade_records_{CURRENT_SYMBOL}.csv")
+
+
 LEVERAGE = 1
 MIN_ORDER_VALUE = 51 if CURRENT_SYMBOL == "cross" else 6
 MAX_ORDER_VALUE = 2000.0 if CURRENT_SYMBOL == "cross" else 500
@@ -98,8 +102,13 @@ class LedgerManager:
     ]
 
     def __init__(self, file_path):
+        # 新增：提取文件所在目录，如果不存在则自动创建 bot_data 文件夹
+        dir_name = os.path.dirname(file_path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+
         self.file_path = file_path
-        self.tmp_path = file_path + ".tmp"
+        self.tmp_path = file_path + ".tmp"  # 临时文件会自动跟随在 bot_data 目录下
         self._lock = threading.Lock()
 
     def _read_unlocked(self):

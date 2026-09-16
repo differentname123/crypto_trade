@@ -65,7 +65,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from math import isfinite
 
-from common_utils_lite import get_config, setup_logger
+from common_utils import get_config, setup_logger
 if multiprocessing.current_process().name == "MainProcess":
     logger = setup_logger(app_name="martin_trader")
 else:
@@ -125,7 +125,7 @@ DASHBOARD_CACHE_SEC = 30.0      # 同账户看板快照跨进程缓存时效
 STARTUP_PREVIEW_SEC = 60        # 启动前蓝图预览确认窗口
 
 # 账本与单实例锁的【固定绝对目录】: 无论从哪个工作目录启动, 同一 strategy_id 只可能有一个实例
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "martin_data")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data")
 
 
 def data_path(name):

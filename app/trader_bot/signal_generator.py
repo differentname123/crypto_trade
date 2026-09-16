@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from common_utils_lite import setup_logger
+from common_utils import setup_logger
 from fetch_data_quick import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
 
 
@@ -194,8 +194,8 @@ def _sync_persistent_signal_ledger(history_file, symbol, new_record, cols):
     入参形貌: new_record 为 None 或包含 cols 全部键，至少含 event/price/direction/signal_timestamp_ms。
     出参形貌: DataFrame(cols=cols)，仅包含当前 symbol 的真实历史事件。
 
-    : 该 CSV 是跨进程状态源但没有文件锁；并发进程同时读改写时仍可能互相覆盖。
-    : 历史 CSV 读取失败按原设计视为空账本继续运行，这会优先保证信号链路可用性，
+    common_utils: 该 CSV 是跨进程状态源但没有文件锁；并发进程同时读改写时仍可能互相覆盖。
+    common_utils: 历史 CSV 读取失败按原设计视为空账本继续运行，这会优先保证信号链路可用性，
            但损坏文件可能造成持仓状态丢失；业务上若更看重一致性，应改为失败即停止。
     """
     history = pd.DataFrame(columns=cols)
@@ -660,7 +660,7 @@ def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
 
     入参形貌: kline_df=原始K线，oi_df=持仓量。
 
-    : 原逻辑给该空头策略 TARGET_WEIGHT=-1.0，而其他空头策略使用正权重；
+    common_utils: 原逻辑给该空头策略 TARGET_WEIGHT=-1.0，而其他空头策略使用正权重；
            下游若把 target_weight 视为绝对仓位比例，这一符号约定不一致。为保持业务行为，此处不改。
     """
     params = {
@@ -727,7 +727,7 @@ def generate_high_fr_bear_div_short_signals(kline_df, fr_df, bar_minutes=15):
 
     入参形貌: kline_df=原始K线，fr_df=资金费率。
 
-    : 业务描述写“资金费率绝对值极高”，原实现实际是 curr_fr > 0.001，
+    common_utils: 业务描述写“资金费率绝对值极高”，原实现实际是 curr_fr > 0.001，
            即只接受高正费率而不是 abs(curr_fr)>阈值。为避免改变策略边界，保留原判断。
     """
     params = {
@@ -845,7 +845,7 @@ def print_top_long_latest_signals(final_signals_df, logger, timeframe='1h'):
 
     入参形貌: final_signals_df 至少含 [time, event, action, coin, direction, price, reason, pnl, target_weight]。
 
-    : 该函数按“机器当前时间”找最新截面，而不是按工作流传入的 target_time；
+    common_utils: 该函数按“机器当前时间”找最新截面，而不是按工作流传入的 target_time；
            回放历史 target_time 时日志可能显示“无当前信号”。保持原行为以免改变实盘调用语义。
     """
     if final_signals_df is None or final_signals_df.empty:
@@ -1160,7 +1160,7 @@ def run_strategy_simulation(df_cross_section, strategy_params, trade_mode, initi
                 target_weight, pnl, top_k, max_weight]
     副作用: 在 df_cross_section 写入 signal_status。
 
-    : 默认 start_trade_date 固定为 2026-04-27，这是业务门槛而不是技术必需；保留原值。
+    common_utils: 默认 start_trade_date 固定为 2026-04-27，这是业务门槛而不是技术必需；保留原值。
     """
     mom_window = strategy_params['MOM_WINDOW']
     vol_window = strategy_params['VOL_WINDOW']
@@ -1455,7 +1455,7 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
             )
             ledger['STRATEGY_NAME'] = name
 
-            # : 缺少 symbol 映射时按原逻辑假定 USDT 永续后缀；
+            # common_utils: 缺少 symbol 映射时按原逻辑假定 USDT 永续后缀；
             # 若交易所支持多结算币需重新定义。
             ledger['symbol'] = ledger['coin'].map(coin_to_symbol).fillna(
                 ledger['coin'] + '/USDT:USDT'
@@ -1511,8 +1511,8 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
     """
     4H横截面入口：按最大指标窗口反推预热天数，拉取1m数据，再执行多参数流水线。
 
-    : 原接口在“完全无行情”时返回空字符串，而其他入口返回 DataFrame；为保持调用兼容继续保留。
-    : Grid_No.43629 的 MAX_WEIGHT=2.6 允许空头/理论目标权重超过100%；
+    common_utils: 原接口在“完全无行情”时返回空字符串，而其他入口返回 DataFrame；为保持调用兼容继续保留。
+    common_utils: Grid_No.43629 的 MAX_WEIGHT=2.6 允许空头/理论目标权重超过100%；
            这是业务参数，不在技术重构中改动。
     """
     strategy_params_list = [
