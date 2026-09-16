@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from common_utils import setup_logger
+from common_utils import setup_logger, get_config
 from signal_generator import (
     execute_trading_bot_high_fr_bear_div_short, execute_trading_bot_oi_decay_short,
     execute_trading_bot_vwap_reclaim_long, execute_trading_bot_workflow_XSR_long,
@@ -28,7 +28,7 @@ from binance_u_gateway import (
     cancel_order_by_id, execute_order, extract_order_view, fetch_open_orders_grouped,
     fetch_order_by_id, fetch_positions_map, fetch_recent_orders_map, fetch_total_equity,
     fetch_usdt_swap_changes, is_cancel_target_gone, make_open_order_stub, make_position_key,
-    open_session, order_client_oid, order_exchange_oid, position_key_symbol, sync_exchange_time,
+    safe_init_exchange, order_client_oid, order_exchange_oid, position_key_symbol, sync_exchange_time,
 )
 
 # =============================================================================
@@ -264,7 +264,7 @@ def _cache_order(open_order_cache, symbol, exchange_oid, client_oid):
 class TradingWorker:
     """原子化交易单元，挂载其独立的 账户/网关/账本/状态。"""
 
-    def __init__(self, account_alias, strategy_name):
+    def __init__(self, account_alias, strategy_name, api_key, api_secret):
         self.account_alias = account_alias
         self.strategy_name = strategy_name
         self.logger = setup_logger(app_name=f"{account_alias}_{strategy_name}_trader")
@@ -285,8 +285,8 @@ class TradingWorker:
             self.proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
             self.proxy_url = "http://127.0.0.1:7890"
 
-        # 打开独立的交易所会话
-        self.exchange = open_session(self.proxies, account=self.account_alias)
+        # 修改 2：打开独立的交易所会话，直接使用传入的 api凭证
+        self.exchange = safe_init_exchange(api_key, api_secret, self.proxies)
 
     def log(self, level, scope, message, **fields):
         """实例级日志门面，强制注入账户和策略上下文。"""
@@ -759,11 +759,21 @@ class TradingWorker:
 
 # 请在此处配置你所需的账户与策略绑定关系，系统会自动并行调度
 WORKER_CONFIGS = [
-    {"account": "mama", "strategy": "cross"},
-    {"account": "dahao", "strategy": "cross"},
+    {
+        "account": "mama",
+        "strategy": "cross",
+        "api_key": get_config("mama_biance_api_copy_key"),
+        "api_secret": get_config("mama_biance_api_copy_secret")
+    },
+    {
+        "account": "myself",
+        "strategy": "cross",
+        "api_key": get_config("myself_biance_api_copy_key"),
+        "api_secret": get_config("myself_biance_api_copy_secret")
+    },
 ]
 
-
+# 修改 4：main 函数遍历配置时，向 TradingWorker 注入对应凭证
 def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动多账号、多策略并行调度中心...")
 
@@ -772,7 +782,9 @@ def main():
     for cfg in WORKER_CONFIGS:
         worker = TradingWorker(
             account_alias=cfg["account"],
-            strategy_name=cfg["strategy"]
+            strategy_name=cfg["strategy"],
+            api_key=cfg["api_key"],         # <--- 传入提取的 api_key
+            api_secret=cfg["api_secret"]    # <--- 传入提取的 api_secret
         )
         t = threading.Thread(
             target=worker.run,
