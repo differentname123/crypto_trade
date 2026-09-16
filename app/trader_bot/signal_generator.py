@@ -1006,7 +1006,7 @@ def _run_signal_workflow(label, target_time, symbol_list, timeframe, bar_minutes
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录数: [{len(final_df)}]")
+    # logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录数: [{len(final_df)}]")
     return final_df
 
 
@@ -1745,7 +1745,7 @@ def _run_factor_workflow(label, target_time, symbol_list, proxy_url, signal_fn, 
     logger = setup_logger()
     logger.info(
         f"🚀 [{label}/启动] 动作: [{launch_text}] | 周期: [{timeframe}] | "
-        f"标的数: [{len(symbol_list)}] | 预热天数: [{lookback_days}] | "
+        f"标的: [{symbol_list}] | 预热天数: [{lookback_days}] | "
         f"单标的预期K线: [{expected_rows}] | 目标时刻: [{target_time}]"
     )
 
@@ -1805,10 +1805,10 @@ def _run_factor_workflow(label, target_time, symbol_list, proxy_url, signal_fn, 
     output_path = os.path.join('signal_data', f'{label}_signals.csv')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
-    logger.info(
-        f"✅ [{label}/账本落盘] 文件: [{output_path}] | "
-        f"记录总数: [{len(final_df)}]"
-    )
+    # logger.info(
+    #     f"✅ [{label}/账本落盘] 文件: [{output_path}] | "
+    #     f"记录总数: [{len(final_df)}]"
+    # )
     return final_df
 
 

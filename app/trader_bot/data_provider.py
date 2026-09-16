@@ -608,7 +608,7 @@ def _write_kline_snapshot(sig, final_dfs, snapshot_dir, log_prefix=""):
         logger.error(f"{log_prefix} ❌ 快照 meta 提交失败，快照将被视为未生成 | 错误=[{e}]")
         return False
 
-    logger.info(f"{log_prefix} 📸 结果快照已提交 | 完整=[{complete}] 体积=[{size_mb:.2f}MB] 耗时=[{time.time() - t0:.3f}s]")
+    # logger.info(f"{log_prefix} 📸 结果快照已提交 | 完整=[{complete}] 体积=[{size_mb:.2f}MB] 耗时=[{time.time() - t0:.3f}s]")
     return True
 
 
@@ -729,8 +729,8 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
             broken.append(f"{sym}({e})")
 
     earliest = _format_bj_time(min(fetch_since_map.values())) if fetch_since_map else 'N/A'
-    logger.info(f"{log_prefix} [CACHE] ♻️ 本地缓存装载完毕 | 命中=[{hits}] 未命中=[{len(symbol_list) - hits}] "
-                f"载入行数=[{loaded_rows}] 最早增量起点=[{earliest}] 耗时=[{time.time() - t0:.2f}s]")
+    # logger.info(f"{log_prefix} [CACHE] ♻️ 本地缓存装载完毕 | 命中=[{hits}] 未命中=[{len(symbol_list) - hits}] "
+    #             f"载入行数=[{loaded_rows}] 最早增量起点=[{earliest}] 耗时=[{time.time() - t0:.2f}s]")
     if broken:
         logger.warning(f"{log_prefix} [CACHE] ⚠️ 部分缓存读取失败，这些币将整段回拉（可能原因：文件被写坏 / 磁盘异常） "
                        f"| 数量=[{len(broken)}] 明细={broken[:3]}")
@@ -920,9 +920,9 @@ async def fetch_historical_rest(exchange, symbol, timeframe, since_ms, queue, tr
         return
 
     latest_str = _format_bj_time(tracker['latest_ts']) if tracker['latest_ts'] > 0 else 'N/A'
-    logger.info(f"{prefix} [{tracker.get('phase', 'HIST')}] 📦 历史补齐全员交卷 "
-                f"| 币种=[{tracker['done']}/{tracker['total']}] 新增行数=[{tracker['fetched_rows']}] "
-                f"最慢单币=[{tracker['max_cost']:.2f}s] 数据最新=[{latest_str}]")
+    # logger.info(f"{prefix} [{tracker.get('phase', 'HIST')}] 📦 历史补齐全员交卷 "
+    #             f"| 币种=[{tracker['done']}/{tracker['total']}] 新增行数=[{tracker['fetched_rows']}] "
+    #             f"最慢单币=[{tracker['max_cost']:.2f}s] 数据最新=[{latest_str}]")
 
 
 async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix=""):
@@ -940,7 +940,7 @@ async def fetch_realtime_ws(symbol_list, timeframe, queue, proxy_url, log_prefix
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(stream_url, proxy=proxy_url, heartbeat=10) as ws:
-                    logger.info(f"{log_prefix} [WSS] ✅ 实时数据总线已建连 | 订阅流=[{len(ws_mapping)}] 周期=[{timeframe}]")
+                    # logger.info(f"{log_prefix} [WSS] ✅ 实时数据总线已建连 | 订阅流=[{len(ws_mapping)}] 周期=[{timeframe}]")
                     attempt = 0
                     async for msg in ws:
                         if msg.type != aiohttp.WSMsgType.TEXT:
@@ -1014,8 +1014,8 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     try:
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
             exchange, timeframe, days, target_time_str)
-        logger.info(f"{log_prefix} [INIT] 🚀 K线极速引擎发车 | 目标=[{_format_bj_time(target_time_ms)}(+0800)] "
-                    f"周期=[{timeframe}] 天数=[{days}] 币种=[{len(symbol_list)}] 双擎=[WS:{use_ws} REST:{use_rest}]")
+        # logger.info(f"{log_prefix} [INIT] 🚀 K线极速引擎发车 | 目标=[{_format_bj_time(target_time_ms)}(+0800)] "
+        #             f"周期=[{timeframe}] 天数=[{days}] 币种=[{len(symbol_list)}] 双擎=[WS:{use_ws} REST:{use_rest}]")
 
         memory_pool, fetch_since_map = load_local_cache(
             symbol_list, start_time_ms, timeframe_ms, timeframe, log_prefix=log_prefix)
@@ -1057,8 +1057,8 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         # 战术休眠二：死等到收盘前 5s，再瞬间点爆无延迟脉冲 REST
         sleep_to_rest = target_close_time_ms - 5000 - exchange.milliseconds()
         if sleep_to_rest > 0:
-            logger.info(f"{log_prefix} [SYNC] 💤 二阶段挂起（等收线冲刺窗口） | 睡眠=[{sleep_to_rest / 1000:.1f}s] "
-                        f"下一动作=[点燃REST脉冲轮询]")
+            # logger.info(f"{log_prefix} [SYNC] 💤 二阶段挂起（等收线冲刺窗口） | 睡眠=[{sleep_to_rest / 1000:.1f}s] "
+            #             f"下一动作=[点燃REST脉冲轮询]")
             await asyncio.sleep(sleep_to_rest / 1000)
 
         if use_rest:
@@ -1526,8 +1526,9 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
     wait_t0 = time.time()
 
     def _on_wait(waited):
-        logger.info(f"{log_prefix} ⏳ 同参进程正在拉取，本进程排队等待中 "
-                    f"| 已等=[{waited:.0f}s] 上限=[{lock_timeout:.0f}s]")
+        # logger.info(f"{log_prefix} ⏳ 同参进程正在拉取，本进程排队等待中 "
+        #             f"| 已等=[{waited:.0f}s] 上限=[{lock_timeout:.0f}s]")
+        pass
 
     if not mutex.acquire(timeout=lock_timeout, poll_interval=0.2, on_wait=_on_wait, wait_log_interval=45.0):
         logger.warning(f"{log_prefix} ⚠️ 等锁超时，为保障可用性降级为独立拉取（会产生重复网络请求） "
@@ -1537,12 +1538,12 @@ def snipe_kline_data(symbol_list, timeframe, days, target_time_str,
     try:
         hit = _remap(_read_kline_snapshot(sig, snapshot_dir, snapshot_ttl_sec, incomplete_snapshot_ttl_sec, log_prefix))
         if hit is not None:
-            logger.info(f"{log_prefix} ✅ L2 双重检查命中，直接复用 Leader 成果 "
-                        f"| 等锁=[{time.time() - wait_t0:.2f}s] 行数=[{sum(len(v) for v in hit.values())}] 网络请求=[0]")
+            # logger.info(f"{log_prefix} ✅ L2 双重检查命中，直接复用 Leader 成果 "
+            #             f"| 等锁=[{time.time() - wait_t0:.2f}s] 行数=[{sum(len(v) for v in hit.values())}] 网络请求=[0]")
             return hit
 
-        logger.info(f"{log_prefix} 👑 当选 Leader，开始真实拉取 | 等锁=[{time.time() - wait_t0:.2f}s] "
-                    f"目标=[{_format_bj_time(sig['target_time_ms'])}] 币种=[{len(sig['symbols'])}]")
+        # logger.info(f"{log_prefix} 👑 当选 Leader，开始真实拉取 | 等锁=[{time.time() - wait_t0:.2f}s] "
+        #             f"目标=[{_format_bj_time(sig['target_time_ms'])}] 币种=[{len(sig['symbols'])}]")
         result = _run_core()
 
         # 交付前必须同步写快照：Follower 是在本进程释放锁之后才做双重检查的

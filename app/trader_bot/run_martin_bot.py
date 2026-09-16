@@ -122,7 +122,7 @@ POS_PROBE_MAX_UNKNOWN = 20       # 收尾阶段实际持仓连续查询失败的
 TIME_SYNC_SEC = 3600.0           # 主循环定时维护: 与交易所重新校时的间隔(对抗本地时钟漂移)
 SHARED_PRICE_CACHE_SEC = 1.5    # 同币种跨进程最新价共享缓存时效
 DASHBOARD_CACHE_SEC = 30.0      # 同账户看板快照跨进程缓存时效
-STARTUP_PREVIEW_SEC = 60        # 启动前蓝图预览确认窗口
+STARTUP_PREVIEW_SEC = 10        # 启动前蓝图预览确认窗口
 
 # 账本与单实例锁的【固定绝对目录】: 无论从哪个工作目录启动, 同一 strategy_id 只可能有一个实例
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data")
