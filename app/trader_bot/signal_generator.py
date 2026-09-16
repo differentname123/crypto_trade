@@ -1947,7 +1947,7 @@ def get_signal_factor_044_10(symbol):
 # =============================================================================
 if __name__ == '__main__':
     target_time = (
-            datetime.now() - timedelta(minutes=1)
+            datetime.now() - timedelta(minutes=0)
     ).strftime('%Y-%m-%d %H:%M')
 
     symbol_list = ['BNB/USDT:USDT']
