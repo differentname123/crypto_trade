@@ -77,7 +77,7 @@ from binance_u_gateway import (
     ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
 )
 
-from app.signal_trade_lite.run_cross_signal_lite import (
+from signal_generator import (
     get_signal_factor_043_9,
     get_signal_factor_043_10,
     get_signal_factor_044_1,

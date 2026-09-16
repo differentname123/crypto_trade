@@ -33,8 +33,7 @@ import numpy as np
 import pandas as pd
 
 from common_utils import setup_logger
-from fetch_data_quick import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
-
+from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
 
 SIGNAL_COLS = [
     'time', 'action', 'coin', 'direction', 'event', 'price', 'reason',
@@ -198,6 +197,9 @@ def _sync_persistent_signal_ledger(history_file, symbol, new_record, cols):
     common_utils: 历史 CSV 读取失败按原设计视为空账本继续运行，这会优先保证信号链路可用性，
            但损坏文件可能造成持仓状态丢失；业务上若更看重一致性，应改为失败即停止。
     """
+    history_file = os.path.join('signal_data', history_file)
+    os.makedirs(os.path.dirname(history_file), exist_ok=True)
+
     history = pd.DataFrame(columns=cols)
     if os.path.exists(history_file):
         try:
@@ -303,7 +305,7 @@ def generate_top_long_signals(df):
     volume_spike = volume > volume_threshold
 
     entry = (close / (max_high + 1e-12) > params['HIGH_CLOSE_THRESH']) & (
-        upper_wick > params['UPPER_WICK_THRESH']
+            upper_wick > params['UPPER_WICK_THRESH']
     ) & volume_spike
     exit_ = inside_bar.shift(1, fill_value=False) & (close > high.shift(1)) & volume_spike
 
@@ -479,8 +481,8 @@ def generate_short_fr_signals(kline_df, fr_df, bar_minutes=15):
     price = float(close.iloc[-1])
     is_entry = current_funding_rank > params['EXTREME_FR_RANK_THRESHOLD']
     is_exit = (
-        current_return_rank > params['STRONG_RET_RANK_THRESHOLD']
-        and current_funding_rank < params['MILD_FR_RANK_THRESHOLD']
+            current_return_rank > params['STRONG_RET_RANK_THRESHOLD']
+            and current_funding_rank < params['MILD_FR_RANK_THRESHOLD']
     )
 
     record = None
@@ -546,12 +548,12 @@ def generate_vol_fr_signals(kline_df, fr_df, bar_minutes=5):
     price = float(close.iloc[-1])
 
     is_entry = (
-        previous_m_atr_rank < params['ATR_RANK_LOW_TH']
-        and current_atr_rank > params['ATR_RANK_HIGH_TH']
+            previous_m_atr_rank < params['ATR_RANK_LOW_TH']
+            and current_atr_rank > params['ATR_RANK_HIGH_TH']
     )
     is_exit = (
-        previous_m_funding_rank < params['FR_RANK_LOW_TH']
-        and current_funding_rank > previous_funding_rank
+            previous_m_funding_rank < params['FR_RANK_LOW_TH']
+            and current_funding_rank > previous_funding_rank
     )
 
     record = None
@@ -590,9 +592,9 @@ def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15)
         'STRATEGY_NAME': 'bottom_stabilize_powder_keg_short',
     }
     if (
-        kline_df is None or kline_df.empty
-        or fr_df is None or fr_df.empty
-        or oi_df is None or oi_df.empty
+            kline_df is None or kline_df.empty
+            or fr_df is None or fr_df.empty
+            or oi_df is None or oi_df.empty
     ):
         return _empty_signal_result()
 
@@ -621,15 +623,15 @@ def generate_bottom_powder_short_signals(kline_df, fr_df, oi_df, bar_minutes=15)
     current_oi_rank, current_volume_rank = _tail_float(oi_rank), _tail_float(volume_rank)
 
     oi_bottom_divergence = (
-        price / (current_min_low + 1e-12) < 1.03
-        and current_oi > current_oi_min * 1.05
+            price / (current_min_low + 1e-12) < 1.03
+            and current_oi > current_oi_min * 1.05
     )
     funding_low_or_negative = current_funding_rank < 0.20 or current_funding < 0
     higher_lows = current_min_low > previous_n_min_low
     is_entry = oi_bottom_divergence and funding_low_or_negative and higher_lows
     is_exit = (
-        current_oi_rank > params['POWDER_OI_RK']
-        and current_volume_rank < params['POWDER_VOL_RK']
+            current_oi_rank > params['POWDER_OI_RK']
+            and current_volume_rank < params['POWDER_VOL_RK']
     )
 
     record = None
@@ -695,8 +697,8 @@ def generate_oi_decay_short_signals(kline_df, oi_df, bar_minutes=30):
     previous_fast, previous_slow = _tail_float(ema_fast, 1), _tail_float(ema_slow, 1)
     is_entry = current_fast < current_slow and previous_fast >= previous_slow
     is_exit = (
-        current_oi_rank > params['OI_RANK_EXTREME_TH']
-        and price / (current_price_ma + 1e-12) - 1.0 < params['OI_HOT_TH']
+            current_oi_rank > params['OI_RANK_EXTREME_TH']
+            and price / (current_price_ma + 1e-12) - 1.0 < params['OI_HOT_TH']
     )
 
     record = None
@@ -784,9 +786,9 @@ def generate_vwap_reclaim_long_signals(kline_df, fr_df, oi_df, bar_minutes=30):
         'STRATEGY_NAME': 'vwap_reclaim_oi_long',
     }
     if (
-        kline_df is None or kline_df.empty
-        or fr_df is None or fr_df.empty
-        or oi_df is None or oi_df.empty
+            kline_df is None or kline_df.empty
+            or fr_df is None or fr_df.empty
+            or oi_df is None or oi_df.empty
     ):
         return _empty_signal_result()
 
@@ -999,6 +1001,10 @@ def _run_signal_workflow(label, target_time, symbol_list, timeframe, bar_minutes
             subset=['symbol', 'signal_timestamp_ms', 'event'], inplace=True
         )
     print_top_long_latest_signals(final_df, logger, timeframe=timeframe)
+
+    output_path = os.path.join('signal_data', output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     logger.info(f"✅ [{label}/账本落盘] 文件: [{output_path}] | 记录数: [{len(final_df)}]")
     return final_df
@@ -1497,7 +1503,9 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
         logger.info('[流水线/收官] 结果: [所有策略均未产生交易账本]')
         return pd.DataFrame()
 
-    output_path = 'live_simulation_logs.csv'
+    output_path = os.path.join('signal_data', 'live_simulation_logs.csv')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
     final_ledger = pd.concat(all_ledgers, ignore_index=True)
     final_ledger.to_csv(output_path, index=False, encoding='utf-8-sig')
     logger.info(
@@ -1594,7 +1602,7 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
     if not fetched:
         logger.error(
             '❌ [Cross/致命] 可用标的数: [0] | 当前动作: [组装横截面矩阵] | '
-            '结果: [终止] | 排查线索: [检查网络/代理/fetch_data_quick]'
+            '结果: [终止] | 排查线索: [检查网络/代理/data_provider]'
         )
         return ''
 
@@ -1794,7 +1802,8 @@ def _run_factor_workflow(label, target_time, symbol_list, proxy_url, signal_fn, 
         ['timestamp', 'symbol']
     ).reset_index(drop=True)
 
-    output_path = f'{label}_signals.csv'
+    output_path = os.path.join('signal_data', f'{label}_signals.csv')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
     logger.info(
         f"✅ [{label}/账本落盘] 文件: [{output_path}] | "
@@ -1938,7 +1947,7 @@ def get_signal_factor_044_10(symbol):
 # =============================================================================
 if __name__ == '__main__':
     target_time = (
-        datetime.now() - timedelta(minutes=1)
+            datetime.now() - timedelta(minutes=1)
     ).strftime('%Y-%m-%d %H:%M')
 
     symbol_list = ['BNB/USDT:USDT']

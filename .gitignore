@@ -5155,3 +5155,8 @@
 /app/factor_dig/factor_out_60m_debugtest/trades_我踏马来了.csv.gz
 /app/factor_dig/factor_out_60m_debugtest/trades_龙虾.csv.gz
 /app/signal_trade_lite/backest/
+/app/trader_bot/bot_data/
+/app/trader_bot/config/
+/app/trader_bot/data/
+/app/trader_bot/logs/
+/app/trader_bot/signal_data/
