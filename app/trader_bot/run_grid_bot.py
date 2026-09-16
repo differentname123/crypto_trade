@@ -876,6 +876,11 @@ def main_app():
         GridConfig(f"AVAX{suffix}", "AVAX/USDT:USDT", 2.5, 8.56, 1.3, 12, account_name="mama"),
         GridConfig(f"BTC{suffix}", "BTC/USDT:USDT", 50000, 82363, 0.74, 0.001, account_name="mama"),
         GridConfig(f"SHORT-UNI{suffix}", "UNI/USDT:USDT", 5, 15, 1.54, 3, GridDirection.SHORT, "mama"),
+        GridConfig(f"AVAX{suffix}", "AVAX/USDT:USDT", 2.5, 8.56, 1.3, 12, account_name="ruru"),
+        GridConfig(f"BTC{suffix}", "BTC/USDT:USDT", 50000, 82363, 0.74, 0.001, account_name="ruru"),
+        GridConfig(f"SHORT-UNI{suffix}", "UNI/USDT:USDT", 5, 15, 1.54, 3, GridDirection.SHORT, "ruru"),
+
+
     ]
     ids = [config.strategy_id for config in configs]
     duplicates = sorted({strategy_id for strategy_id in ids if ids.count(strategy_id) > 1})

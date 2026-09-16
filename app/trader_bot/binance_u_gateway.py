@@ -706,16 +706,18 @@ def execute_order(exchange, symbol, side, amount, client_oid, order_type='market
         return ExecResult(ExecStatus.OK, client_oid, exchange_oid=order.get('id'), latency_ms=latency, raw_data=order)
     except NetworkError as e:
         latency = int((time.perf_counter() - t0) * 1000)
-        err_msg = f"物理断联，订单可能已进撮合引擎: {e}"
+        error_str = str(e)
+        err_msg = f"物理断联，订单可能已进撮合引擎: {error_str}"
         logger.critical(
-            f"[执行/网络丢失] | 关键参数: <CID: {client_oid}> | 结果: [UNKNOWN], 耗时 【{latency}ms】 | 可能原因: 极其凶险的网络波动，绝对禁止原单号重试！")
+            f"[执行/网络丢失] | 关键参数: <CID: {client_oid}> | 结果: [UNKNOWN], 耗时 【{latency}ms】 | 错误:[{error_str}] | 可能原因: 极其凶险的网络波动，绝对禁止原单号重试！")
         return ExecResult(ExecStatus.UNKNOWN, client_oid, latency_ms=latency, error_msg=err_msg,
                           kind=ErrKind.UNKNOWN_RESULT)
     except Exception as e:
         latency = int((time.perf_counter() - t0) * 1000)
+        error_str = str(e)
         logger.error(
-            f"[执行/业务拒单] | 关键参数: <CID: {client_oid}> | 结果: [REJECT], 耗时 【{latency}ms】 | 可能原因: 触碰风控、参数不合规或可用资金不足，异常: {e}")
-        return ExecResult(ExecStatus.REJECT, client_oid, latency_ms=latency, error_msg=str(e), kind=classify_error(e))
+            f"[执行/业务拒单] | 关键参数: <CID: {client_oid}> | 结果: [REJECT], 耗时 【{latency}ms】 | 错误:[{error_str}] | 可能原因: 触碰风控、参数不合规或可用资金不足，异常: {e}")
+        return ExecResult(ExecStatus.REJECT, client_oid, latency_ms=latency, error_msg=error_str, kind=classify_error(e))
 
 
 def place_stop_market_order(exchange, symbol, side, amount, stop_price, client_oid, position_side,
@@ -733,7 +735,10 @@ def place_stop_market_order(exchange, symbol, side, amount, stop_price, client_o
         return ExecResult(ExecStatus.OK, client_oid, exchange_oid=str((o or {}).get("id") or ""),
                           latency_ms=int((time.perf_counter() - t0) * 1000), raw_data=o)
     except Exception as e:
-        return make_fail_result(client_oid, e, latency_ms=int((time.perf_counter() - t0) * 1000))
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        error_str = str(e)
+        logger.error(f"[执行/条件单异常] | 关键参数: <CID: {client_oid}> | 结果: [REJECT/UNKNOWN], 耗时 【{latency_ms}ms】 | 错误:[{error_str}]")
+        return make_fail_result(client_oid, e, latency_ms=latency_ms)
 
 
 def cancel_order_by_id(exchange, symbol, order_id):
@@ -776,11 +781,15 @@ def cancel_single_order(exchange, symbol, order_id, is_client_id=False):
                           latency_ms=latency)
     except NetworkError as e:
         latency = int((time.perf_counter() - t0) * 1000)
-        return ExecResult(ExecStatus.UNKNOWN, client_oid="", latency_ms=latency, error_msg=str(e),
+        error_str = str(e)
+        logger.critical(f"[执行/精准撤单网络丢失] | 关键参数: <ID: {order_id}> | 结果: [UNKNOWN], 耗时 【{latency}ms】 | 错误:[{error_str}]")
+        return ExecResult(ExecStatus.UNKNOWN, client_oid="", latency_ms=latency, error_msg=error_str,
                           kind=ErrKind.UNKNOWN_RESULT)
     except Exception as e:
         latency = int((time.perf_counter() - t0) * 1000)
-        return ExecResult(ExecStatus.REJECT, client_oid="", latency_ms=latency, error_msg=str(e),
+        error_str = str(e)
+        logger.error(f"[执行/精准撤单业务异常] | 关键参数: <ID: {order_id}> | 结果: [REJECT], 耗时 【{latency}ms】 | 错误:[{error_str}]")
+        return ExecResult(ExecStatus.REJECT, client_oid="", latency_ms=latency, error_msg=error_str,
                           kind=classify_error(e))
 
 
