@@ -61,7 +61,7 @@ from common_utils_lite import setup_logger, get_config
 logger = setup_logger(app_name="grid_trader")
 
 # 平台相关的一切调用统一走适配层 (换 OKX 只需把这一行换成 okx_order_lite)
-from biance_order_lite import (
+from binance_u_gateway import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
     fetch_last_price, fetch_open_orders, sync_exchange_time,
@@ -479,12 +479,12 @@ class ExchangeBroker:
 
     def fetch_open_orders_map(self, coid_prefix):
         """【新增】面向对象的统一快照，返回 {cid: UniOrder}"""
-        from biance_order_lite import fetch_open_orders_map
+        from binance_u_gateway import fetch_open_orders_map
         return fetch_open_orders_map(self.exchange, self.symbol, coid_prefix)
 
     def fetch_order(self, client_oid):
         """【修改】统一订单点查，返回 (UniOrder, err) 元组"""
-        from biance_order_lite import fetch_order_uni
+        from binance_u_gateway import fetch_order_uni
         return fetch_order_uni(self.exchange, self.symbol, client_oid)
 
     def place_limit(self, action, amount, price, client_oid, position_side):

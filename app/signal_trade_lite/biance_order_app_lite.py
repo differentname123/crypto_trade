@@ -46,7 +46,7 @@ from run_cross_signal_lite import execute_trading_bot_workflow_cross, execute_tr
 # 平台适配层: 全系统唯一与交易所耦合的导入
 # 换交易所只需把下面这一行换成 okx_order_lite (函数签名与出参语义完全一致)
 # ==========================================
-from biance_order_lite import (
+from binance_u_gateway import (
     # 会话与本地单号规则
     open_session, sync_exchange_time, build_client_oid,
     # 账户与持仓

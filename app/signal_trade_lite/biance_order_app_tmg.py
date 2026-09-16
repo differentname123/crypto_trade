@@ -82,8 +82,8 @@ else:
 # 都收口在其中, 本文件只允许通过 ex_api.xxx() 触达交易所, 严禁任何 exchange.xxx 直连。
 # 【换平台的唯一动作】把下面这一行换成 import okx_order_lite as ex_api 即可。
 # ------------------------------------------------------------------------------
-import biance_order_lite as ex_api
-from biance_order_lite import (
+import binance_u_gateway as ex_api
+from binance_u_gateway import (
     ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
 )
 
