@@ -60,9 +60,12 @@ from common_utils_lite import setup_logger, get_config
 
 logger = setup_logger(app_name="grid_trader")
 
+# 平台相关的一切调用统一走适配层 (换 OKX 只需把这一行换成 okx_order_lite)
 from biance_order_lite import (
     safe_init_exchange, fetch_market_precision, format_price_amount,
     execute_order, ExecStatus, fetch_single_order,
+    fetch_last_price, fetch_open_orders, sync_exchange_time,
+    supports_cancel_all, cancel_all_orders_of_symbol, cancel_order_by_id,ErrKind
 )
 
 
@@ -454,6 +457,7 @@ def guard_direction_consistency(config):
     except Exception as e:
         logger.info(f"[方向锁] 方向一致性校验文件读写异常, 已跳过本次校验(不影响交易) | 错误:[{e}]")
 
+
 class ExchangeBroker:
     """
     交易所网关: 收拢所有 CCXT / 网络调用。
@@ -468,13 +472,20 @@ class ExchangeBroker:
         return fetch_market_precision(self.exchange, self.symbol)
 
     def fetch_last_price(self):
-        return self.exchange.fetch_ticker(self.symbol)['last']
+        return fetch_last_price(self.exchange, self.symbol)
 
     def fetch_open_orders(self):
-        return self.exchange.fetch_open_orders(self.symbol)
+        return fetch_open_orders(self.exchange, self.symbol)
+
+    def fetch_open_orders_map(self, coid_prefix):
+        """【新增】面向对象的统一快照，返回 {cid: UniOrder}"""
+        from biance_order_lite import fetch_open_orders_map
+        return fetch_open_orders_map(self.exchange, self.symbol, coid_prefix)
 
     def fetch_order(self, client_oid):
-        return fetch_single_order(self.exchange, self.symbol, client_oid)
+        """【修改】统一订单点查，返回 (UniOrder, err) 元组"""
+        from biance_order_lite import fetch_order_uni
+        return fetch_order_uni(self.exchange, self.symbol, client_oid)
 
     def place_limit(self, action, amount, price, client_oid, position_side):
         """
@@ -489,7 +500,6 @@ class ExchangeBroker:
             client_oid=client_oid, order_type='limit', price=price,
             reduce_only=False, position_side=position_side,
         )
-
 
 # ==========================================
 # 3. 领域层 (GridNode 状态机)
@@ -663,27 +673,23 @@ class GridNode:
             logger.critical(f"[挂单] {tag} | 结果:[UNKNOWN] 请求发出后未收到交易所回执(疑似网络中断), "
                             f"无法确认是否已受理; 节点转入防御, 等待看门狗点查对账修复")
         else:
-            # 提取报错信息，判断是否为交易所的临时系统风控/限频
-            error_msg_lower = str(res.error_msg).lower()
-            is_transient = "-1008" in error_msg_lower or "throttled" in error_msg_lower or "-1001" in error_msg_lower
+            # 【核心修改点】完全信任底层的 ErrKind 语义分类，不再去匹配特定的报错字符串
+            is_transient = (res.kind == ErrKind.TRANSIENT or res.kind == ErrKind.UNKNOWN_RESULT)
 
             if is_transient:
                 # 瞬态错误：不将节点置为 ERROR，维持当前的 WAIT_OPEN 或 WAIT_CLOSE 状态
-                # 依靠 5 秒 (ORDER_GRACE_PERIOD) 后看门狗发现盘口无单，投递 CANCELED 事件交由主循环自动重试
                 self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                        self.active_client_oid, price, self.quantity, "WARN", msg="触发限频")
-                logger.info(f"[自愈准备] {tag} | 结果:[限频拒单] 触发交易所系统级风控 | "
-                               f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
-                               f"交易所回执:[{res.error_msg}]")
+                logger.info(f"[自愈准备] {tag} | 结果:[限频/延迟] 触发交易所风控或网络抖动 | "
+                            f"节点维持原状态, 等待看门狗在 {ORDER_GRACE_PERIOD} 秒后发起天然退避重试 | "
+                            f"交易所回执:[{res.error_msg}]")
             else:
-                # 真正的致命错误（余额不足、精度错误、持仓模式不匹配等）：必须挂起(ERROR)，防止死循环疯狂发单
+                # 真正的致命错误（余额不足、精度错误、持仓模式不匹配等）：必须挂起(ERROR)
                 self.state = NodeState.ERROR
                 self.ctx.ledger.append(self.node_id, self.cycle_count, "PLACE_ORDER",
                                        self.active_client_oid, price, self.quantity, "ERROR", msg=res.error_msg)
                 logger.error(f"[挂单] {tag} | 结果:[明确拒单] 节点已挂起(ERROR)停止自动交易 | "
-                             f"可能原因: 保证金不足/价格触发限制/数量精度不合法/持仓模式非双向(-4061) | "
-                             f"交易所回执:[{res.error_msg}]")
-
+                             f"原因归类:[{res.kind.value}] | 交易所回执:[{res.error_msg}]")
 
 def build_geometric_grid(config, broker, ctx):
     """
@@ -738,8 +744,7 @@ class TimeSyncThread(threading.Thread):
         while True:
             time.sleep(self.interval_sec)
             try:
-                self.exchange.load_time_difference()
-                offset = self.exchange.options.get('timeDifference', 0)
+                offset = sync_exchange_time(self.exchange)
                 # 使用 debug 级别，避免打扰主业务的日志流
                 logger.info(f"[时间同步] 已重新校准交易所时间差 | 当前动态偏差: {offset} ms")
             except Exception as e:
@@ -752,12 +757,6 @@ class ReconciliationEngine:
     """
     对账引擎: 比对"交易所真相"与"本地状态", 产出标准事件推入总线。
     本层完全方向无关: 只认 client_oid 里的买卖动作, 开平语义由节点自行判定。
-
-    单一写者原则(并发安全核心):
-      冷启动 recover_on_startup —— 主循环/看门狗未启动, 单线程直接拨正节点并补发事件;
-      运行时 repair_runtime    —— 看门狗线程只读节点(GIL 保证原子读)、仅投递事件,
-                                 真正的状态迁移交回主线程串行执行;
-                                 即便读到过时 OID, 产出的事件也会在主线程被幂等拦截丢弃。
     """
 
     def __init__(self, broker, ledger, strategy_id, event_queue):
@@ -776,7 +775,7 @@ class ReconciliationEngine:
         history = self.ledger.load_node_oid_history()
         aligned = 0
 
-        # ── 第1层: 交易所在线单反向认领 (不依赖本地账本, 账本丢失也能兜住活单) ──
+        # ── 第1层: 交易所在线单反向认领
         node_live_orders = defaultdict(list)
         for cid in order_map:
             parsed = OidCodec.parse(cid)
@@ -793,7 +792,7 @@ class ReconciliationEngine:
             self._align_and_emit(node, truth_cid, order_map[truth_cid], via="在线单反向认领")
             aligned += 1
 
-        # ── 第2层: 本地账本多级回溯 (覆盖已成交/已撤销等不在盘口的订单) ──
+        # ── 第2层: 本地账本多级回溯
         for node_id, node in nodes.items():
             if node.state != NodeState.INIT:
                 continue
@@ -806,20 +805,21 @@ class ReconciliationEngine:
                 aligned += 1
             else:
                 logger.info(f"[对账] 【{node_id}】最近[{len(candidates)}]笔历史单号在交易所均查无实据(幽灵单), "
-                               f"该节点将按全新节点重新铺单")
+                            f"该节点将按全新节点重新铺单")
 
-        # ── 第3层: 孤儿单巡检 (不归属任何节点; 仅高密度报警, 不执行物理撤单) ──
+        # ── 第3层: 孤儿单巡检
         managed_cids = {n.active_client_oid for n in nodes.values() if n.active_client_oid}
         orphan_count = 0
-        for cid, order in order_map.items():
+        for cid, order_uni in order_map.items():
             if cid in managed_cids:
                 continue
             orphan_count += 1
             logger.info(f"[对账] 发现脱管孤儿单(保留未撤销, 请人工核查是否为历史遗留) | "
-                           f"CID:[{cid}] 交易所ID:[{order.get('id', 'N/A')}] "
-                           f"[{str(order.get('side', 'N/A')).upper()}] @[{order.get('price', 0)}] x[{order.get('amount', 0)}]")
+                        f"CID:[{cid}] 交易所ID:[{order_uni.ex_id}] "
+                        f"[{order_uni.side.upper()}] @[{order_uni.price}] x[{order_uni.amount}]")
 
-        logger.info(f"[对账] 冷启动对账完成 | 节点恢复:[{aligned}/{len(nodes)}] | 脱管孤儿单:[{orphan_count}]张(未干预)")
+        logger.info(
+            f"[对账] 冷启动对账完成 | 节点恢复:[{aligned}/{len(nodes)}] | 脱管孤儿单:[{orphan_count}]张(未干预)")
 
     # ---------- 运行时: 只读 + 投递事件, 绝不改节点 (线程安全) ----------
     def repair_runtime(self, nodes):
@@ -828,7 +828,7 @@ class ReconciliationEngine:
         if order_map is None:
             return
 
-        suspects = []  # 检测点固定 (node, cid) 二元组, 规避与主线程写入的数据竞态
+        suspects = []
         for node in nodes.values():
             if time.time() - node.last_update_ts < ORDER_GRACE_PERIOD:
                 continue
@@ -841,84 +841,82 @@ class ReconciliationEngine:
         if not suspects:
             return
         logger.info(f"[看门狗] 发现[{len(suspects)}]个节点的在管订单从盘口消失(疑似已成交或被撤), "
-                       f"逐一点查确认真实状态...")
+                    f"逐一点查确认真实状态...")
         for _node, cid in suspects:
-            try:
-                info = self.broker.fetch_order(cid)
-                if info:
-                    self._emit_from_order(cid, info)
-                else:
-                    logger.info(f"[看门狗] 点查无果: 该单从未抵达交易所(多为下单瞬间网络中断的幽灵单), "
-                                   f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
-                    self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
-                time.sleep(POINT_CHECK_DELAY_RUNTIME)
-            except Exception as e:
-                logger.error(f"[看门狗] 点查订单状态时接口异常, 该单留待下一轮巡检复查 | CID:[{cid}] 错误:[{e}]")
+            # 【核心安全修复】严格区分 "交易所明确无此单" 与 "网络异常断联"
+            order_uni, err = self.broker.fetch_order(cid)
+            if order_uni:
+                # 明确拿到订单
+                self._emit_from_order(cid, order_uni)
+            elif err is None:
+                # 没报错且没订单 (即拿到 ORDER_NOT_FOUND 哨兵) -> 交易所明确回执查无实据，合成撤单让节点重铺
+                logger.info(f"[看门狗] 点查明确无果: 交易所回执该单不存在(多为网络中断幽灵单), "
+                            f"已合成撤销事件交由主线程原价重挂 | CID:[{cid}]")
+                self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED))
+            else:
+                # 遭遇网络断联/API 500 等异常 -> 绝对不合成撤销，挂起等下一轮！(防止把掉线当成掉单)
+                logger.warning(f"[看门狗] 点查异常: 遭遇网络或系统故障，留待下轮巡检复查 | CID:[{cid}] 错误:[{err}]")
+
+            time.sleep(POINT_CHECK_DELAY_RUNTIME)
 
     # ---------- 内部工具 ----------
     def _snapshot(self):
-        """拉取本策略前缀的在线挂单快照 -> {client_oid: 订单原文}; 失败返回 None 供上层短路。"""
+        """拉取本策略前缀的在线挂单快照 -> {client_oid: UniOrder}; 失败返回 None 供上层短路。"""
         prefix = OidCodec.prefix_for(self.strategy_id)
         try:
-            open_orders = self.broker.fetch_open_orders()
+            # 【修改点】直接调用新的 map 接口，拿到完美去耦合的 UniOrder 字典
+            return self.broker.fetch_open_orders_map(prefix)
         except Exception as e:
             logger.error(f"[对账] 拉取交易所挂单快照失败, 本轮对账中止(已有状态不受影响, 稍后自动重试) | "
                          f"可能原因: 网络抖动/交易所限频 | 错误:[{e}]")
             return None
-        order_map = {}
-        for o in open_orders:
-            cid = o.get('clientOrderId') or ''  # 兜底 None 值, 防止 startswith 崩溃
-            if cid.startswith(prefix):
-                order_map[cid] = o
-        return order_map
 
     def _resolve_truth(self, candidates, order_map, point_delay):
-        """按新->旧尝试候选单号: 快照命中免 API 直取, 否则点查兜底; 返回首个命中的 (cid, order)。"""
+        """按新->旧尝试候选单号: 快照命中免 API 直取, 否则点查兜底; 返回首个命中的 (cid, order_uni)。"""
         for cid in candidates:
             if cid in order_map:
                 return cid, order_map[cid]
-            try:
-                info = self.broker.fetch_order(cid)
-                time.sleep(point_delay)
-                if info:
-                    return cid, info
-            except Exception as e:
-                logger.info(f"[对账] 回溯点查失败, 继续尝试更早单号 | CID:[{cid}] 错误:[{e}]")
+
+            # 【修改点】适配新的点查返回值
+            order_uni, err = self.broker.fetch_order(cid)
+            time.sleep(point_delay)
+            if order_uni:
+                return cid, order_uni
         return None, None
 
-    def _align_and_emit(self, node, truth_cid, truth_order, via):
+    def _align_and_emit(self, node, truth_cid, truth_order_uni, via):
         """冷启动专用: 依真相拨正节点指针, 输出单条锚定日志, 并按订单状态补发事件。"""
         parsed = OidCodec.parse(truth_cid)
         if parsed is None:
             logger.info(f"[对账] 真相单号解析失败, 放弃拨正节点【{node.node_id}】"
-                           f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
+                        f"(该节点将按全新节点铺单) | CID:[{truth_cid}]")
             return
-        node.align(parsed.cycle, truth_cid, truth_order.get('id', ''), parsed.action)
-        raw = str(truth_order.get('status', '')).upper()
+
+        # 【修改点】取 UniOrder 的 ex_id，告别 dict.get('id')
+        node.align(parsed.cycle, truth_cid, truth_order_uni.ex_id, parsed.action)
+
+        raw = truth_order_uni.status
         direction = "买" if parsed.action == OrderAction.BUY else "卖"
         semantic = "开仓" if parsed.action == node.open_action else "平仓"
         logger.info(f"[对账] 锚定真相({via}) | 【{node.node_id}】第[{parsed.cycle}]轮 [{direction}]单({semantic}) "
                     f"交易所状态:[{raw}] -> 节点状态:[{node.state.value}] | CID:[{truth_cid}]")
-        self._emit_from_order(truth_cid, truth_order)
+        self._emit_from_order(truth_cid, truth_order_uni)
 
-    def _emit_from_order(self, cid, order):
-        """交易所原始订单状态 -> 标准事件 (仅终结态产出; 在盘 / 部分成交不产出)。"""
-        raw = str(order.get('status', '')).upper()
-
-        # 提取交易所时间(毫秒): 优先拿最后成交时间，次选订单更新时间，兜底使用本地当前时间
-        ts = order.get('lastTradeTimestamp') or order.get('lastUpdateTimestamp') or order.get('timestamp') or int(
-            time.time() * 1000)
+    def _emit_from_order(self, cid, uni_order):
+        """标准订单对象 -> 标准事件 (仅终结态产出; 在盘 / 部分成交不产出)。"""
+        # 【核心修改点】完全面向对象调用，彻底脱离 ccxt 的 dict 格式噩梦
+        raw = uni_order.status
+        ts = uni_order.ts
 
         if raw in ("CLOSED", "FILLED"):
             self.event_queue.put(OrderEvent(
                 cid, OrderStatus.FILLED,
-                fill_price=float(order.get('average') or order.get('price') or 0),
-                fill_qty=float(order.get('filled') or 0),
-                update_ts=ts  # 注入时间戳
+                fill_price=uni_order.avg_price or uni_order.price,
+                fill_qty=uni_order.filled,
+                update_ts=ts
             ))
         elif raw in ("CANCELED", "EXPIRED", "REJECTED"):
             self.event_queue.put(OrderEvent(cid, OrderStatus.CANCELED, update_ts=ts))
-
 
 # ==========================================
 # 5. 主控与调度 (GridStrategy / Watchdog)
@@ -1117,14 +1115,14 @@ def cancel_all_orders_for_symbol(exchange, symbol):
     logger.info(f"[紧急清理] 开始撤销 【{symbol}】 的所有活动挂单...")
     try:
         # 1. 优先尝试 ccxt 的批量撤单接口 (币安等主流交易所均支持，单次网络请求即可完成)
-        if exchange.has.get('cancelAllOrders'):
-            exchange.cancel_all_orders(symbol)
+        if supports_cancel_all(exchange):
+            cancel_all_orders_of_symbol(exchange, symbol)
             logger.info(f"[紧急清理] 【{symbol}】 批量撤单指令下发成功 (调用了 cancelAllOrders 接口)")
             return True
 
         # 2. 兜底方案：如果 API 不支持批量撤单，则拉取当前挂单并逐个撤销
         logger.info(f"[紧急清理] 当前交易所不支持一键撤单，自动降级为逐个撤销模式...")
-        open_orders = exchange.fetch_open_orders(symbol)
+        open_orders = fetch_open_orders(exchange, symbol)
 
         if not open_orders:
             logger.info(f"[紧急清理] 【{symbol}】 当前盘口没有活动挂单，无需撤销")
@@ -1134,7 +1132,7 @@ def cancel_all_orders_for_symbol(exchange, symbol):
         for order in open_orders:
             order_id = order.get('id')
             if order_id:
-                exchange.cancel_order(order_id, symbol)
+                cancel_order_by_id(exchange, symbol, order_id)
                 cancel_count += 1
                 logger.info(f"[紧急清理] 已撤销订单 ID:[{order_id}]")
 
@@ -1165,14 +1163,14 @@ def query_all_open_orders_stats(exchange, symbols=None):
         if symbols:
             for sym in symbols:
                 try:
-                    orders = exchange.fetch_open_orders(sym)
+                    orders = fetch_open_orders(exchange, sym)
                     open_orders.extend(orders)
                     time.sleep(0.1)  # 防止触发限频
                 except Exception as e:
                     logger.error(f"[挂单统计] 拉取 {sym} 挂单失败: {e}")
         else:
             # 兜底：尝试全局拉取（Binance 合约通常支持不带 symbol 拉取全部挂单）
-            open_orders = exchange.fetch_open_orders()
+            open_orders = fetch_open_orders(exchange)
 
         total_orders = len(open_orders)
         if total_orders == 0:
@@ -1227,7 +1225,7 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
     精准排查多余挂单：找出哪些挂单属于脱管孤儿单、哪些节点出现了重复挂单。
     """
     prefix = f"GD_{strategy_id}_"
-    orders = exchange.fetch_open_orders(symbol)
+    orders = fetch_open_orders(exchange, symbol)
 
     node_orders = defaultdict(list)
     orphans = []
