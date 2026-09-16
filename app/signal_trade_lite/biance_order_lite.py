@@ -13,11 +13,13 @@ Binance U 本位合约 —— 平台适配层 (面向过程 / 全系统唯一与
 
 [分区导航]
   A. 数据契约   ExecStatus / ErrKind / ExecResult / UniOrder / ORDER_NOT_FOUND / InstrumentSpec
-  B. 错误语义   err_code_of / is_order_not_found / classify_error / make_fail_result
+  B. 错误语义   err_code_of / is_order_not_found / is_cancel_target_gone / classify_error / make_fail_result
   C. 连接会话   init_exchange / safe_init_exchange / sync_exchange_time / throttle / to_market_id
-  D. 市场精度   fetch_market_precision / format_price_amount / fetch_instrument_spec / fetch_last_price
+  D. 市场精度   fetch_market_precision / format_price_amount / fetch_instrument_spec / fetch_last_price /
+                fetch_swap_tickers / fetch_usdt_swap_changes / amount_to_precision
   E. 账户持仓   get_total_equity / fetch_positions_map / fetch_position_qty / is_hedge_mode
-  F. 订单查询   fetch_open_orders / fetch_open_orders_map / fetch_order_uni / normalize_order_status
+  F. 订单查询   fetch_open_orders(_map/_grouped) / fetch_recent_orders(_map) / fetch_order_uni /
+                extract_order_view / order_client_oid / make_open_order_stub / dedup_algo_orders
   G. 下单执行   execute_order / place_stop_market_order
   H. 撤单       cancel_order_by_client_oid / cancel_order_by_id / cancel_all_orders / cancel_order_universal
 
@@ -294,6 +296,17 @@ def is_order_not_found(msg):
     return "order does not exist" in low or "order not found" in low
 
 
+def is_cancel_target_gone(err):
+    """
+    撤单回执是否表示"撤单目标已不存在"(订单已成交 / 已撤销 / 已被交易所清理)。
+    覆盖 ccxt 异常类名(OrderNotFound)与平台语义 -2011 / unknown order / does not exist。
+    上层据此把撤单视为【幂等达成】直接核销, 打破账本 PENDING 死循环。
+    :param err: 异常对象或错误文本
+    :return: bool
+    """
+    text = (type(err).__name__ + str(err)).lower()
+    return any(k in text for k in ("ordernotfound", "-2011", "does not exist", "unknown order"))
+
 def classify_error(msg):
     """
     错误分类(决定后续行为, 极其关键)。铁律:
@@ -518,6 +531,14 @@ def fetch_swap_tickers(exchange):
     """全市场永续合约行情快照 {symbol: ticker}; 异常向上抛。"""
     return exchange.fetch_tickers(params={'type': 'swap'})
 
+def fetch_usdt_swap_changes(exchange):
+    """
+    全市场 USDT 本位永续合约 24h 涨跌幅快照 -> {symbol: percentage}。
+    已过滤掉缺失涨跌幅字段的异常币种; 异常向上抛(调用方决定是否放弃本轮选币)。
+    """
+    tickers = fetch_swap_tickers(exchange)
+    return {k: v['percentage'] for k, v in tickers.items()
+            if k.endswith(':USDT') and v.get('percentage') is not None}
 
 # ==========================================
 # E. 账户与持仓
@@ -685,6 +706,40 @@ def to_uni_order(o):
     )
 
 
+def extract_order_view(o):
+    """
+    交易所原始订单 -> 对账所需的关键字段快照(平台无关视图, 不做任何状态改判)。
+    与 to_uni_order 的区别: 本函数【忠实反映平台回执】, 不会把"已收口但未全成"改判为撤单,
+    专供账本对账使用(账本自己按 filled 判断残量, 状态语义必须原样保留)。
+    :return: dict, 核心 Key:
+        status    标准态 OPEN / FILLED / CANCELED / REJECTED / UNKNOWN
+        filled    已成交数量(保持原样不数值化, 由调用方按自身容错口径转换)
+        avg_price 成交均价, 缺失时退化为委托价, 再缺失为空串
+        order_id  交易所原生订单号(字符串)
+    """
+    o = o or {}
+    return {
+        "status": normalize_order_status(o.get("status", "")),
+        "filled": o.get("filled"),
+        "avg_price": o.get("average") or o.get("price") or "",
+        "order_id": str(o.get("id", "")),
+    }
+
+
+def order_client_oid(o):
+    """从交易所原始订单结构中提取本地单号(client_oid); 缺失一律返回空串。"""
+    o = o or {}
+    return str(o.get("clientOrderId") or (o.get("info") or {}).get("clientOrderId") or "")
+
+
+def make_open_order_stub(exchange_oid, client_oid):
+    """
+    构造一条"在线挂单"占位记录(与交易所原始订单结构同形)。
+    用途: 下单成功后立即登记进本地挂单缓存, 封锁同一批次内的重复开平(幂等打标)。
+    """
+    return {"id": exchange_oid, "clientOrderId": client_oid,
+            "info": {"clientOrderId": client_oid}}
+
 def fetch_open_orders(exchange, symbol=None):
     """
     在线挂单原始列表(ccxt 结构)。symbol=None 时拉取全账户挂单(需交易所支持)。
@@ -695,6 +750,13 @@ def fetch_open_orders(exchange, symbol=None):
         return exchange.fetch_open_orders()
     return exchange.fetch_open_orders(symbol)
 
+
+def fetch_open_orders_grouped(exchange):
+    """全账户在线挂单按交易对分组 -> {symbol: [原始订单, ...]}; 异常向上抛。"""
+    cache = {}
+    for order in fetch_open_orders(exchange):
+        cache.setdefault(order["symbol"], []).append(order)
+    return cache
 
 def fetch_open_orders_map(exchange, symbol, coid_prefix):
     """
@@ -747,11 +809,29 @@ def index_open_orders(exchange, kind="normal"):
         raise ValueError("挂单接口未返回列表，不能视为零挂单")
     return {(str(o["symbol"]), str(o[id_key])): o for o in rows}
 
+def dedup_algo_orders(algo_map, normal_map):
+    """
+    条件单去重: 已触发的条件单会同时出现在普通挂单通道, 直接相加会重复计数。
+    :param algo_map: index_open_orders(exchange, "algo") 的出参; None 表示该通道本轮拉取失败
+    :param normal_map: index_open_orders(exchange, "normal") 的出参; None 表示该通道本轮拉取失败
+    :return: 去重后的未触发条件单笔数; algo_map 为 None 时返回 None(表示未知, 绝不当成 0)
+    """
+    if algo_map is None:
+        return None
+    return sum(
+        not (normal_map is not None and
+             str(o.get("actualOrderId") or "") not in ("", "0") and
+             (str(o["symbol"]), str(o["actualOrderId"])) in normal_map)
+        for o in algo_map.values()
+    )
 
 def fetch_recent_orders(exchange, symbol, limit=50):
     """近期订单(含已成交/已撤销), 用于对账穿透; 异常向上抛。"""
     return exchange.fetch_orders(symbol, limit=limit)
 
+def fetch_recent_orders_map(exchange, symbol, limit=50):
+    """近期订单(含已成交/已撤销)按交易所原生订单号索引 -> {order_id: 原始订单}; 异常向上抛。"""
+    return {str(o.get("id")): o for o in fetch_recent_orders(exchange, symbol, limit=limit)}
 
 def fetch_order_by_id(exchange, symbol, order_id):
     """按交易所原生订单号点查单笔订单(ccxt 原始结构); 异常向上抛。"""

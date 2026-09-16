@@ -57,12 +57,10 @@ import multiprocessing
 import os
 import platform
 import random
-import re
 import signal as sysignal
 import threading
 import time
 from datetime import datetime
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from enum import Enum
 
 import pandas as pd
@@ -79,8 +77,14 @@ else:
     # 子进程仅拿一个空的句柄占位，实际写盘会在 run_single_strategy 内被 force_reset 重新接管
     logger = logging.getLogger("martin_trader")
 # 保持原有初始化顺序: 先建好日志再导入下单库
+# ------------------------------------------------------------------------------
+# 平台适配层: 全系统唯一与交易所耦合的模块。所有 ccxt 调用 / 平台错误码语义 / 精度规则
+# 都收口在其中, 本文件只允许通过 ex_api.xxx() 触达交易所, 严禁任何 exchange.xxx 直连。
+# 【换平台的唯一动作】把下面这一行换成 import okx_order_lite as ex_api 即可。
+# ------------------------------------------------------------------------------
+import biance_order_lite as ex_api
 from biance_order_lite import (
-    safe_init_exchange, execute_order, ExecStatus, fetch_single_order,
+    ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
 )
 
 # ------------------------------------------------------------------------------
@@ -141,23 +145,11 @@ def data_path(name):
 
 # ==============================================================================
 # 2. 枚举与值对象
+#    (UniOrder / ErrKind / InstrumentSpec / ORDER_NOT_FOUND 等平台无关契约统一由
+#     ex_api 提供, 本节只保留业务侧的状态建模与动作意图)
 # ==============================================================================
 class LedgerError(Exception):
     """账本(WAL)写盘失败。这是系统的生命线, 一旦失败必须硬停机, 绝不带病继续交易。"""
-
-
-class _OrderNotFound:
-    """点查语义哨兵: 交易所【明确回执】订单不存在(可安全换号重挂)。"""
-    __slots__ = ()
-
-    def __repr__(self):
-        return "ORDER_NOT_FOUND"
-
-    def __bool__(self):
-        return False
-
-
-ORDER_NOT_FOUND = _OrderNotFound()
 
 
 class Direction(Enum):
@@ -228,59 +220,6 @@ class EndReason(Enum):
     NO_FILL = "END_NO_FILL"           # 入场超时/首轮越界, 一手未成
     TIMEOUT = "END_TIMEOUT"           # 周期超时强平
     MANUAL_FLAT = "END_MANUAL_FLAT"   # 仓位被外部平掉, 周期被动结束
-
-
-class ErrKind(Enum):
-    NONE = "NONE"
-    UNKNOWN_RESULT = "UNKNOWN_RESULT"  # 结果未知(网络中断/超时/回执缺失) -> 保留原OID点查
-    TRANSIENT = "TRANSIENT"          # 明确拒单(限频/时间戳) -> 退避重试
-    PRICE_BAND = "PRICE_BAND"        # 价格离盘口太远 -> 退避后重挂
-    IMMEDIATE_TRIGGER = "IMM_TRIG"   # 条件单会立即触发 -> 需本地现价双重核验
-    INSUFFICIENT = "INSUFFICIENT"    # 保证金/余额不足 -> 退避 + 告警
-    REDUCE_REJECT = "REDUCE_REJECT"  # 平仓数量超过持仓 -> 仓位被外部动过
-    DUPLICATE = "DUPLICATE"          # OID 重复 -> 单子已存在, 保持 PENDING 点查
-    INVALID = "INVALID"              # 精度/最小量/单号格式等参数非法 -> 不可重试
-    FATAL = "FATAL"                  # 明确拒单但未归类 -> 保守停挂
-
-
-class UniOrder:
-    """交易所订单的统一视图。上层只认它, 换交易所只需改网关的转换函数。"""
-    __slots__ = ("coid", "ex_id", "status", "price", "stop_price", "amount",
-                 "filled", "avg_price", "side", "ts", "raw")
-
-    def __init__(self, coid="", ex_id="", status="UNKNOWN", price=0.0, stop_price=0.0,
-                 amount=0.0, filled=0.0, avg_price=0.0, side="", ts=0, raw=None):
-        self.coid = coid
-        self.ex_id = ex_id
-        self.status = status          # OPEN / FILLED / CANCELED / REJECTED / UNKNOWN
-        self.price = price
-        self.stop_price = stop_price
-        self.amount = amount
-        self.filled = filled
-        self.avg_price = avg_price
-        self.side = side
-        self.ts = ts
-        self.raw = raw or {}
-
-    @property
-    def remaining(self):
-        return max(0.0, self.amount - self.filled)
-
-    @property
-    def is_terminal(self):
-        return self.status in ("FILLED", "CANCELED", "REJECTED")
-
-
-class PlaceResult:
-    """挂单结果三态: OK(已受理) / UNKNOWN(结果未知, 必须点查) / 拒单(带错误分类)。"""
-    __slots__ = ("ok", "unknown", "ex_id", "err", "kind")
-
-    def __init__(self, ok=False, unknown=False, ex_id="", err="", kind=ErrKind.NONE):
-        self.ok = ok
-        self.unknown = unknown
-        self.ex_id = ex_id
-        self.err = err
-        self.kind = kind
 
 
 class Signal:
@@ -412,287 +351,39 @@ class OidCodec:
 
 
 # ==============================================================================
-# 4. 交易规格与精度 (最小下单量 / 最小名义价值 / 价格刻度)
+# 4. 交易所网关 —— 业务侧适配器 (平台细节全在 ex_api, 此处只管降级策略与告警口径)
 # ==============================================================================
-def _dec(x):
-    return Decimal(str(x))
-
-
-def quantize(value, step, mode="down"):
+class ExchangeGateway:
     """
-    按 step 定向修约(用 Decimal(str()) 规避二进制浮点误差)。mode: down/up/其它(四舍五入)。
-    【浮点塌陷保护】值与最近 step 整数倍差距 < 1e-8 个 step 时先吸附到该整数倍,
-    避免 0.3-0.2=0.0999.. 被 FLOOR 截断成 0.0 而导致加仓量逐层偏小。
+    交易所访问的唯一出口。平台细节(ccxt 调用 / 错误码语义 / 精度规则 / 双轨撤单)全部在
+    ex_api 内部, 本类只负责三件与业务强相关的事:
+      1) 限流节流 + 跨进程最新价共享缓存;
+      2) 把"读取失败"统一降级为 None / 通道降级标记, 并输出本策略口径的告警文案;
+      3) 把"写入回执"原样交回状态机裁决(ExecResult 自带 ok / unknown / kind)。
+    铁律: 本层永不向上抛异常 —— 查询失败返回 None, 挂单失败返回带分类的 ExecResult。
+    换交易所(OKX/模拟盘/回测)只需替换顶部 ex_api 的 import, 本类与状态机一行都不用改。
     """
-    if step is None or step <= 0:
-        return float(value)
-    v, s = _dec(value), _dec(step)
-    n = v / s
-    nearest = n.to_integral_value(rounding=ROUND_HALF_UP)
-    if abs(n - nearest) <= Decimal("1e-8"):
-        n = nearest
-    elif mode == "down":
-        n = n.to_integral_value(rounding=ROUND_FLOOR)
-    elif mode == "up":
-        n = n.to_integral_value(rounding=ROUND_CEILING)
-    else:
-        n = nearest
-    return float(n * s)
-
-
-class InstrumentSpec:
-    """单个交易对的下单规格。由网关从交易所原始 filters 解析, 上层只用这里的能力。"""
-
-    def __init__(self, symbol, tick_size, step_size, min_qty, max_qty, min_notional,
-                 contract_size=1.0):
-        self.symbol = symbol
-        self.tick_size = float(tick_size or 0.0)
-        self.step_size = float(step_size or 0.0)
-        self.min_qty = float(min_qty or 0.0)
-        self.max_qty = float(max_qty or 0.0) or float("inf")
-        self.min_notional = float(min_notional or 0.0)
-        self.contract_size = float(contract_size or 1.0)
-
-    def round_price(self, price, mode="half"):
-        return quantize(price, self.tick_size, mode)
-
-    def round_qty(self, qty, mode="down"):
-        return quantize(qty, self.step_size, mode)
-
-    def normalize_open_qty(self, qty, price):
-        """
-        开仓量修约: 先向下截断(保守), 再兜底抬到 minQty 与 minNotional 之上。
-        返回 0 表示无法构造合法数量(调用方应丢弃该层/该信号)。
-        """
-        if price <= 0:
-            return 0.0
-        q = self.round_qty(qty, "down")
-        need_by_min_qty = self.round_qty(self.min_qty, "up") if self.min_qty > 0 else 0.0
-        need_by_notional = 0.0
-        if self.min_notional > 0:
-            need_by_notional = self.round_qty(
-                self.min_notional / (price * self.contract_size), "up")
-            while need_by_notional * price * self.contract_size < self.min_notional:
-                need_by_notional = round(need_by_notional + self.step_size, 12)
-        q = max(q, need_by_min_qty, need_by_notional)
-        return 0.0 if q > self.max_qty else q
-
-    def notional(self, price, qty):
-        return price * qty * self.contract_size
-
-    def qty_is_dust(self, qty):
-        """低于最小交易单位的碎屑: 无法下单, 只能账面归零。"""
-        if qty is None:
-            return False
-        return qty < max(self.min_qty, self.step_size) * (1 - 1e-9)
-
-    def __repr__(self):
-        return (f"Spec({self.symbol} tick={self.tick_size} step={self.step_size} "
-                f"minQty={self.min_qty} minNotional={self.min_notional})")
-
-
-# ==============================================================================
-# 5. 错误分类 (决定"能不能换号重发"这一生死问题)
-# ==============================================================================
-_ERR_CODE_RE = re.compile(r'["\']code["\']\s*:\s*(-\d+)')
-
-# 【明确拒单】拿到交易所确定错误码才可判定"单子没进去", 才允许退避重试
-_CODE_KIND = {
-    -1000: ErrKind.UNKNOWN_RESULT,  # 未知内部错误, 请求可能已执行
-    -1001: ErrKind.UNKNOWN_RESULT,  # 内部断连, 结果未知
-    -1006: ErrKind.UNKNOWN_RESULT,  # 收到非预期响应, 结果未知
-    -1007: ErrKind.UNKNOWN_RESULT,  # 等待响应超时, 结果未知
-    -1003: ErrKind.TRANSIENT,       # 请求过频, 明确被拒
-    -1008: ErrKind.TRANSIENT,       # 服务器繁忙, 明确被拒
-    -1015: ErrKind.TRANSIENT,       # 下单过频, 明确被拒
-    -1021: ErrKind.TRANSIENT,       # 时间戳偏差, 明确被拒
-    -1013: ErrKind.INVALID,
-    -1102: ErrKind.INVALID,
-    -1104: ErrKind.INVALID,
-    -1111: ErrKind.INVALID,
-    -1116: ErrKind.INVALID,
-    -1117: ErrKind.INVALID,
-    -1121: ErrKind.INVALID,
-    -2010: ErrKind.INVALID,
-    -2011: ErrKind.INVALID,
-    -2013: ErrKind.INVALID,
-    -2018: ErrKind.INSUFFICIENT,
-    -2019: ErrKind.INSUFFICIENT,
-    -2021: ErrKind.IMMEDIATE_TRIGGER,
-    -2022: ErrKind.REDUCE_REJECT,
-    -2027: ErrKind.INVALID,
-    -4003: ErrKind.INVALID,
-    -4005: ErrKind.INVALID,
-    -4013: ErrKind.INVALID,
-    -4014: ErrKind.INVALID,
-    -4015: ErrKind.INVALID,         # 客户端单号格式/长度非法: 参数错误, 绝不是"重复单号"
-    -4016: ErrKind.INVALID,
-    -4131: ErrKind.PRICE_BAND,
-    -4164: ErrKind.INVALID,
-    -4165: ErrKind.INVALID,
-}
-
-_UNKNOWN_TEXT = ("timeout", "timed out", "read timed out", "connection", "reset by peer",
-                 "network", "temporarily", "service unavailable", "bad gateway",
-                 "gateway timeout", "502", "503", "504", "520", "521", "ssl", "eof",
-                 "no response", "unknown result", "结果未知")
-
-
-def err_code_of(msg):
-    """从报错文本中【正则精确提取】交易所 JSON code 字段, 绝不做子串误匹配。"""
-    m = _ERR_CODE_RE.search(str(msg or ""))
-    return int(m.group(1)) if m else None
-
-
-def is_order_not_found(msg):
-    """是否为交易所明确回执的"订单不存在"。"""
-    if err_code_of(msg) == -2013:
-        return True
-    low = str(msg or "").lower()
-    return "order does not exist" in low or "order not found" in low
-
-
-def classify_error(msg):
-    """
-    错误分类(决定后续行为, 极其关键)。铁律:
-      * 只有拿到交易所【明确错误码/明确语义】才判定"拒单", 才允许换号/退避重发;
-      * 网络中断、超时、回执缺失一律 UNKNOWN_RESULT, 保留原 OID 点查, 绝不换号重发。
-    """
-    raw = str(msg or "")
-    if not raw.strip():
-        return ErrKind.UNKNOWN_RESULT
-    low = raw.lower()
-    if any(k in low for k in ("duplicate", "already exist")):
-        return ErrKind.DUPLICATE
-    code = err_code_of(raw)
-    if code is not None:
-        # 有明确错误码但未归类: 保守停挂, 绝不重发
-        return _CODE_KIND.get(code, ErrKind.FATAL)
-    if any(k in low for k in _UNKNOWN_TEXT):
-        return ErrKind.UNKNOWN_RESULT
-    if any(k in low for k in ("too many", "throttl", "429")):
-        return ErrKind.TRANSIENT
-    if "immediately trigger" in low:
-        return ErrKind.IMMEDIATE_TRIGGER
-    if any(k in low for k in ("reduceonly", "reduce only")):
-        return ErrKind.REDUCE_REJECT
-    if any(k in low for k in ("insufficient", "margin is insufficient")):
-        return ErrKind.INSUFFICIENT
-    if any(k in low for k in ("percent_price", "price_filter", "would immediately match")):
-        return ErrKind.PRICE_BAND
-    if any(k in low for k in ("min_notional", "notional", "lot_size", "precision")):
-        return ErrKind.INVALID
-    return ErrKind.UNKNOWN_RESULT     # 兜底: 宁可点查, 绝不盲目重发
-
-
-def make_fail_result(err):
-    kind = classify_error(err)
-    return PlaceResult(unknown=(kind is ErrKind.UNKNOWN_RESULT), err=str(err), kind=kind)
-
-
-# ==============================================================================
-# 6. 交易所网关 —— 全系统唯一与平台耦合的一层
-# ==============================================================================
-class BinanceGateway:
-    """
-    Binance U 本位合约网关(复用项目内已验证的 execute_order / fetch_single_order)。
-    铁律: 本层永不向上抛异常 —— 查询失败返回 None, 挂单失败返回带分类的 PlaceResult。
-    换交易所(OKX/模拟盘/回测)只需照此实现同名方法: load_instrument / fetch_last_price /
-    fetch_open_orders / fetch_order / fetch_position_qty / place_* / cancel / is_hedge_mode / sync_time。
-    """
-
-    _STATUS_MAP = {
-        "NEW": "OPEN", "PARTIALLY_FILLED": "OPEN", "PENDING_CANCEL": "OPEN",
-        "FILLED": "FILLED", "CANCELED": "CANCELED", "CANCELLED": "CANCELED",
-        "EXPIRED": "CANCELED", "EXPIRED_IN_MATCH": "CANCELED", "REJECTED": "REJECTED",
-        "OPEN": "OPEN", "CLOSED": "FILLED",
-    }
 
     # 【修改点】: 引入 shared_prices 字典用于跨进程公共数据(价格)共享
     def __init__(self, exchange, symbol, shared_prices=None):
         self.ex = exchange
         self.symbol = symbol
         self.shared_prices = shared_prices
-        self._last_call_ts = 0.0
         # 【禁用 ccxt 内置重试】所有重试必须归状态机统一管理, 杜绝"以为发一次实际发两次"
         try:
-            self.ex.options["maxRetriesOnFailure"] = 0
-            self.ex.options["maxRetriesOnFailureDelay"] = 0
+            ex_api.disable_builtin_retry(self.ex)
         except Exception as e:
             logger.info(f"[网关] 关闭 ccxt 内置重试失败(继续启动, 但请留意库层可能自行重发) | "
                         f"错误:[{e}]")
 
     def _throttle(self):
-        gap = time.time() - self._last_call_ts
-        if gap < API_THROTTLE_SEC:
-            time.sleep(API_THROTTLE_SEC - gap)
-        self._last_call_ts = time.time()
-
-    # ---------- 转换: ccxt 原始订单 dict -> UniOrder ----------
-    def _to_uni(self, o):
-        """入参核心 Key: id / clientOrderId / status / price / stopPrice / amount / filled /
-        average / side / info{status,executedQty,origQty,stopPrice,avgPrice,...}。"""
-        info = o.get("info") or {}
-        raw_status = str(info.get("status") or o.get("status") or "").upper()
-        status = self._STATUS_MAP.get(raw_status, "UNKNOWN")
-        filled = float(o.get("filled") or info.get("executedQty") or 0.0)
-        amount = float(o.get("amount") or info.get("origQty") or 0.0)
-        # closed 但未全成 => 实为撤单残留, 按撤单处理, 避免误判"完全成交"
-        if status == "FILLED" and amount > 0 and filled < amount * (1 - 1e-9):
-            status = "CANCELED"
-        return UniOrder(
-            coid=o.get("clientOrderId") or info.get("clientOrderId") or "",
-            ex_id=str(o.get("id") or info.get("orderId") or ""),
-            status=status,
-            price=float(o.get("price") or info.get("price") or 0.0),
-            stop_price=float(o.get("stopPrice") or info.get("stopPrice") or 0.0),
-            amount=amount,
-            filled=filled,
-            avg_price=float(o.get("average") or info.get("avgPrice") or 0.0),
-            side=str(o.get("side") or info.get("side") or "").lower(),
-            ts=int(o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp")
-                   or o.get("timestamp") or 0),
-            raw=o,
-        )
+        ex_api.throttle(self.ex, API_THROTTLE_SEC)
 
     # ---------- 查询 ----------
     def load_instrument(self):
         """解析交易规格; 返回 None 表示拿不到 tick/step 等生命线字段, 上层必须拒绝启动。"""
-        try:
-            self._throttle()
-            try:
-                self.ex.load_markets()
-            except Exception as e:
-                logger.info(f"[网关] load_markets 刷新失败, 改用本地已缓存的市场信息 | 错误:[{e}]")
-            m = self.ex.market(self.symbol)
-            tick = step = min_qty = max_qty = min_notional = 0.0
-            for f in (m.get("info", {}) or {}).get("filters", []) or []:
-                ft = f.get("filterType")
-                if ft == "PRICE_FILTER":
-                    tick = float(f.get("tickSize") or 0)
-                elif ft == "LOT_SIZE":
-                    step = float(f.get("stepSize") or 0)
-                    min_qty = float(f.get("minQty") or 0)
-                    max_qty = float(f.get("maxQty") or 0)
-                elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
-                    min_notional = float(f.get("notional") or f.get("minNotional") or 0)
-            # 兜底: 用 ccxt 统一字段补齐
-            prec, limits = m.get("precision") or {}, m.get("limits") or {}
-            tick = tick or float(prec.get("price") or 0) or 0.0
-            step = step or float(prec.get("amount") or 0) or 0.0
-            min_qty = min_qty or float(((limits.get("amount") or {}).get("min")) or 0)
-            min_notional = min_notional or float(((limits.get("cost") or {}).get("min")) or 0) or 5.0
-            spec = InstrumentSpec(self.symbol, tick, step, min_qty, max_qty, min_notional,
-                                  float(m.get("contractSize") or 1.0))
-            if spec.tick_size <= 0 or spec.step_size <= 0:
-                logger.critical(f"[网关] 交易规格缺少 tickSize/stepSize, 无法安全修约价量, 拒绝启动 | "
-                                f"{spec}")
-                return None
-            return spec
-        except Exception as e:
-            logger.error(f"[网关] 拉取交易规格失败(可能是交易对名写错或网络不通) | "
-                         f"交易对:[{self.symbol}] 错误:[{e}]")
-            return None
+        self._throttle()
+        return ex_api.fetch_instrument_spec(self.ex, self.symbol)
 
     # 【修改点】: 复用目标一，拦截 12 个进程对相同公有币种最新价的高频拉取请求
     def fetch_last_price(self):
@@ -706,7 +397,7 @@ class BinanceGateway:
         # 2. 如果过期或不存在，发起真实网络请求
         try:
             self._throttle()
-            p = float(self.ex.fetch_ticker(self.symbol).get("last") or 0)
+            p = float(ex_api.fetch_last_price(self.ex, self.symbol) or 0)
             if p > 0:
                 # 3. 拿到最新价后写入多进程共享内存字典，后续 1.5 秒内其他同币种进程直接读缓存
                 if self.shared_prices is not None:
@@ -721,12 +412,7 @@ class BinanceGateway:
         """普通挂单(限价开仓/限价止盈/已触发的 STOP_MARKET)。绝对生命线: 失败返回 None。"""
         try:
             self._throttle()
-            out = {}
-            for o in self.ex.fetch_open_orders(self.symbol) or []:
-                u = self._to_uni(o)
-                if u.coid and u.coid.startswith(coid_prefix):
-                    out[u.coid] = u
-            return out
+            return ex_api.fetch_open_orders_map(self.ex, self.symbol, coid_prefix)
         except Exception as e:
             logger.error(f"[网关] 拉取普通在线挂单失败, 本轮跳过决策(世界观残缺绝不下单) | 错误:[{e}]")
             return None
@@ -735,24 +421,7 @@ class BinanceGateway:
         """未触发的算法条件单(普通挂单接口查不到)。失败返回 None 表示"本轮降级", 不阻断主循环。"""
         try:
             self._throttle()
-            market_id = self.symbol.replace("/", "").split(":")[0]  # BTC/USDT:USDT -> BTCUSDT
-            out = {}
-            for a in self.ex.fapiPrivateGetOpenAlgoOrders({"symbol": market_id}) or []:
-                coid = a.get("clientAlgoId") or a.get("clientOrderId") or ""
-                if not coid or not coid.startswith(coid_prefix):
-                    continue
-                out[coid] = UniOrder(
-                    coid=coid,
-                    ex_id=str(a.get("algoId") or a.get("orderId") or ""),
-                    status="OPEN",
-                    stop_price=float(a.get("triggerPrice") or a.get("stopPrice") or 0.0),
-                    amount=float(a.get("quantity") or a.get("origQty") or 0.0),
-                    filled=float(a.get("executedQty") or 0.0),
-                    side=str(a.get("side") or "").lower(),
-                    ts=int(a.get("bookTime") or a.get("time") or 0),
-                    raw=a,
-                )
-            return out
+            return ex_api.fetch_open_algo_orders_map(self.ex, self.symbol, coid_prefix)
         except Exception as e:
             logger.info(f"[网关] 算法条件单接口异常, 本轮降级(不采信'条件单不存在'回执, "
                         f"也不宣告盘口清场) | 错误:[{e}]")
@@ -775,36 +444,20 @@ class BinanceGateway:
           UniOrder        -> 拿到确定的订单快照
           ORDER_NOT_FOUND -> 交易所【明确回执】订单不存在, 上层可安全换新号重挂
           None            -> 结果未知(超时/网络/5xx), 上层必须保留原 OID, 绝不换号重发
-        两级取数: 先走项目封装, 空结果再用原生接口确认, 严格区分"确实不存在"与"查询失败"。
+        两级取数与"确实不存在 vs 查询失败"的区分全部由 ex_api 完成, 本层只翻译成告警文案。
         """
-        fetchers = (lambda: fetch_single_order(self.ex, self.symbol, coid),
-                    lambda: self.ex.fetch_order(coid, self.symbol, {"origClientOrderId": coid}))
-        for idx, fetcher in enumerate(fetchers):
-            try:
-                self._throttle()
-                o = fetcher()
-                if o:
-                    return self._to_uni(o)
-                if idx == len(fetchers) - 1:
-                    return ORDER_NOT_FOUND
-            except Exception as e:
-                if is_order_not_found(e):
-                    return ORDER_NOT_FOUND
-                logger.info(f"[网关] 点查订单结果未知, 保留原 OID 下轮继续点查(严禁换号重发) | "
-                            f"CID:[{coid}] 错误:[{e}]")
-                return None
-        return None
+        o, err = ex_api.fetch_order_uni(self.ex, self.symbol, coid, API_THROTTLE_SEC)
+        if err is not None:
+            logger.info(f"[网关] 点查订单结果未知, 保留原 OID 下轮继续点查(严禁换号重发) | "
+                        f"CID:[{coid}] 错误:[{err}]")
+            return None
+        return o
 
     def fetch_position_qty(self, position_side):
         """用于夹逼平仓量与外部干预识别, 绝不参与均价计算(双向持仓下该数字为全账户共享)。"""
         try:
             self._throttle()
-            for p in self.ex.fetch_positions([self.symbol]) or []:
-                info = p.get("info") or {}
-                ps = str(info.get("positionSide") or p.get("side") or "").upper()
-                if ps == position_side.upper():
-                    return abs(float(p.get("contracts") or info.get("positionAmt") or 0))
-            return 0.0
+            return ex_api.fetch_position_qty(self.ex, self.symbol, position_side)
         except Exception as e:
             logger.info(f"[网关] 拉取真实持仓失败(结果未知, 上层将走保守夹逼) | "
                         f"方向:[{position_side}] 错误:[{e}]")
@@ -813,8 +466,7 @@ class BinanceGateway:
     def is_hedge_mode(self):
         try:
             self._throttle()
-            r = self.ex.fapiPrivateGetPositionSideDual()
-            return str(r.get("dualSidePosition")).lower() == "true"
+            return ex_api.is_hedge_mode(self.ex)
         except Exception as e:
             logger.info(f"[网关] 无法确认持仓模式, 跳过该项校验(启动继续) | 错误:[{e}]")
             return None
@@ -822,32 +474,22 @@ class BinanceGateway:
     def sync_time(self):
         try:
             self._throttle()
-            self.ex.load_time_difference()
-            logger.info(f"[校时] 已重新校准本地与交易所时钟 | 偏差:"
-                        f"[{self.ex.options.get('timeDifference', 0)}ms]")
+            diff = ex_api.sync_exchange_time(self.ex)
+            logger.info(f"[校时] 已重新校准本地与交易所时钟 | 偏差:[{diff}ms]")
         except Exception as e:
             logger.info(f"[校时] 本次校时失败, 保持旧偏差(下个周期再试) | 错误:[{e}]")
 
     # ---------- 下单 ----------
-    def _wrap_exec(self, res):
-        st = getattr(res, "status", None)
-        if st == ExecStatus.OK:
-            return PlaceResult(ok=True, ex_id=getattr(res, "exchange_oid", "") or "")
-        if st == ExecStatus.UNKNOWN:
-            return PlaceResult(unknown=True, err="结果未知(网络中断)", kind=ErrKind.UNKNOWN_RESULT)
-        return make_fail_result(str(getattr(res, "error_msg", "") or ""))
-
     def _exec_order(self, order_type, side, qty, price, coid, position_side):
         """限价/市价单统一入口。Hedge Mode 下 reduce_only 必须为 False, 否则直接拒单。"""
         try:
-            res = execute_order(
+            return ex_api.execute_order(
                 exchange=self.ex, symbol=self.symbol, side=side, amount=qty,
                 client_oid=coid, order_type=order_type, price=price,
                 reduce_only=False, position_side=position_side,
             )
-            return self._wrap_exec(res)
         except Exception as e:
-            return make_fail_result(e)
+            return make_fail_result(coid, e)
 
     def place_limit(self, side, qty, price, coid, position_side):
         return self._exec_order("limit", side, qty, price, coid, position_side)
@@ -860,55 +502,32 @@ class BinanceGateway:
         """条件止损单: 类型必须为 STOP_MARKET, stopPrice 与 amount 必须严格按精度格式化。"""
         try:
             self._throttle()
-            o = self.ex.create_order(
-                symbol=self.symbol, type="STOP_MARKET", side=side,
-                amount=float(self.ex.amount_to_precision(self.symbol, qty)), price=None,
-                params={
-                    "stopPrice": self.ex.price_to_precision(self.symbol, stop_price),
-                    "workingType": working_type,
-                    "positionSide": position_side,
-                    "newClientOrderId": coid,
-                    "priceProtect": "FALSE",     # 必须大写
-                },
-            )
-            return PlaceResult(ok=True, ex_id=str((o or {}).get("id") or ""))
+            return ex_api.place_stop_market_order(self.ex, self.symbol, side, qty, stop_price,
+                                                 coid, position_side, working_type)
         except Exception as e:
-            return make_fail_result(e)
+            return make_fail_result(coid, e)
 
     def cancel(self, coid):
         """
         双轨自适应撤单: 先标准撤单; 若提示查无此单(-2011/unknown order), 自动改走算法单撤销通道。
         返回 True 仅代表"撤单请求已被受理", 不代表终态(可能刚好成交), 终态必须由上层点查裁决。
         """
-        try:
-            self._throttle()
-            self.ex.cancel_order(coid, self.symbol, {"origClientOrderId": coid})
-            return True
-        except Exception as e:
-            msg = str(e).lower()
-            # 单子本来就不存在/已终结 -> 撤单目标已达成(幂等)
-            if any(k in msg for k in ("-2013", "order not found", "does not exist")):
-                return True
-            if "-2011" not in msg and "unknown order" not in msg:
-                logger.info(f"[网关] 撤单失败, 下一轮对账会自动复查并重试 | CID:[{coid}] 错误:[{e}]")
-                return False
-            try:
-                self._throttle()
-                self.ex.fapiPrivateDeleteAlgoOrder({
-                    "symbol": self.symbol.replace("/", "").split(":")[0], "clientAlgoId": coid})
+        ok, via, err = ex_api.cancel_order_by_client_oid(self.ex, self.symbol, coid,
+                                                        API_THROTTLE_SEC)
+        if ok:
+            if via == "ALGO":
                 logger.info(f"[网关] 普通撤单查无此单, 已改走算法条件单通道撤销成功 | CID:[{coid}]")
-                return True
-            except Exception as algo_err:
-                a_msg = str(algo_err).lower()
-                if any(k in a_msg for k in ("-2011", "unknown", "not exist", "does not exist")):
-                    return True      # 确实已经没有了, 目标达成
-                logger.info(f"[网关] 普通与算法两条撤单通道均失败, 留待下一轮对账重试 | "
-                            f"CID:[{coid}] 错误:[{algo_err}]")
-                return False
+            return True
+        if via == "NORMAL":
+            logger.info(f"[网关] 撤单失败, 下一轮对账会自动复查并重试 | CID:[{coid}] 错误:[{err}]")
+        else:
+            logger.info(f"[网关] 普通与算法两条撤单通道均失败, 留待下一轮对账重试 | "
+                        f"CID:[{coid}] 错误:[{err}]")
+        return False
 
 
 # ==============================================================================
-# 7. WAL 账本
+# 5. WAL 账本
 # ==============================================================================
 class MartinLedger:
     """
@@ -1053,7 +672,7 @@ class MartinLedger:
 
 
 # ==============================================================================
-# 8. 配置与信号闸门
+# 6. 配置与信号闸门
 # ==============================================================================
 class MartinConfig:
     """
@@ -1180,7 +799,7 @@ class SignalGate:
             return None
 
 # ==============================================================================
-# 9. 马丁蓝图 (价格全静态固化: 开仓价 / 每层止盈价 / 全局止损价)
+# 7. 马丁蓝图 (价格全静态固化: 开仓价 / 每层止盈价 / 全局止损价)
 # ==============================================================================
 class LayerPlan:
     """
@@ -1342,7 +961,7 @@ class BlueprintBuilder:
 
 
 # ==============================================================================
-# 10. 虚拟仓位账 (I1 记账唯一来源 / I5 价格刚性 / I9 数量守恒)
+# 8. 虚拟仓位账 (I1 记账唯一来源 / I5 价格刚性 / I9 数量守恒)
 # ==============================================================================
 class PositionBook:
     """
@@ -1424,7 +1043,7 @@ class PositionBook:
 
 
 # ==============================================================================
-# 11. 订单全生命周期登记表
+# 9. 订单全生命周期登记表
 # ==============================================================================
 class TrackedOrder:
     """本周期生成过的【每一个】OID 都在此留档直到终态; 幂等入账所需字段也挂在这里(单一真相)。"""
@@ -1497,7 +1116,7 @@ class OrderRegistry:
 
 
 # ==============================================================================
-# 12. 周期状态机 (五步流水线的第 2~5 步)
+# 10. 周期状态机 (五步流水线的第 2~5 步)
 # ==============================================================================
 class CycleCtx:
     """
@@ -2397,7 +2016,7 @@ class MartinCycle:
 
 
 # ==============================================================================
-# 13. 引擎主循环 (全系统唯一写者)
+# 11. 引擎主循环 (全系统唯一写者)
 # ==============================================================================
 class MartinEngine:
     def __init__(self, cfg, gw, ledger):
@@ -2884,7 +2503,7 @@ class MartinEngine:
 
 
 # ==============================================================================
-# 14. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
+# 12. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
 # ==============================================================================
 class DashboardThread(threading.Thread):
     def __init__(self, engine, interval_sec=120):
@@ -2946,48 +2565,15 @@ class DashboardThread(threading.Thread):
                 errors.append(f"{label}失败({type(exc).__name__}: {detail})")
                 return None
 
-        def equity():
-            balance = ex.fetch_balance(params={"type": "future"})
-            value = float(balance["info"]["totalMarginBalance"])
-            if not isfinite(value):
-                raise ValueError("总权益不是有效数值")
-            return value
-
-        def positions_count():
-            positions = ex.fetch_positions(params={"type": "future"})
-            if not isinstance(positions, list):
-                raise ValueError("持仓接口未返回列表")
-            count = 0
-            for p in positions:
-                qty = p.get("contracts")
-                if qty is None:
-                    qty = (p.get("info") or {})["positionAmt"]
-                qty = float(qty)
-                if not isfinite(qty):
-                    raise ValueError("持仓数量不是有效数值")
-                count += abs(qty) > 0
-            return count
-
-        def index_orders(fetch, id_key):
-            rows = fetch({})  # 不传 symbol：覆盖该 U 本位账户的所有交易对。
-            if not isinstance(rows, list):
-                raise ValueError("挂单接口未返回列表，不能视为零挂单")
-            return {(str(o["symbol"]), str(o[id_key])): o for o in rows}
-
-        total_equity = read("总权益", equity)
-        pos_count = read("持仓数量", positions_count)
-        normal = read("普通挂单", lambda: index_orders(ex.fapiPrivateGetOpenOrders, "orderId"))
-        algo = read("条件挂单", lambda: index_orders(ex.fapiPrivateGetOpenAlgoOrders, "algoId"))
+        # 权益/持仓/两条挂单通道的平台细节全部收口在 ex_api, 本层只负责失败归集与降级
+        total_equity = read("总权益", lambda: ex_api.fetch_account_equity(ex))
+        pos_count = read("持仓数量", lambda: ex_api.count_nonzero_positions(ex))
+        normal = read("普通挂单", lambda: ex_api.index_open_orders(ex, "normal"))
+        algo = read("条件挂单", lambda: ex_api.index_open_orders(ex, "algo"))
 
         normal_count = len(normal) if normal is not None else None
-        algo_count = None
-        if algo is not None:
-            algo_count = sum(
-                not (normal is not None and
-                     str(o.get("actualOrderId") or "") not in ("", "0") and
-                     (str(o["symbol"]), str(o["actualOrderId"])) in normal)
-                for o in algo.values()
-            )
+        # 已触发的条件单会同时出现在普通挂单通道, 去重口径统一由 ex_api 负责
+        algo_count = ex_api.dedup_algo_orders(algo, normal)
 
         result = {
             "equity": total_equity,
@@ -3220,7 +2806,7 @@ class DashboardThread(threading.Thread):
         logger.info("\n".join(lines))
 
 # ==============================================================================
-# 15. 进程编排
+# 13. 进程编排
 # ==============================================================================
 # 【修改点】: 引入 shared_prices 字典用于跨进程传递
 def run_single_strategy(cfg, shared_prices=None):
@@ -3270,7 +2856,7 @@ def run_single_strategy(cfg, shared_prices=None):
     exchange = safe_init_exchange(api_key, secret_key, proxies)
 
     # 【修改点】: 网关接收 shared_prices，底层缓存生效
-    gw = BinanceGateway(exchange, cfg.symbol, shared_prices)  # ← 换 OKX 只需替换这一行
+    gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)  # ← 换 OKX 只需替换顶部 ex_api 的 import
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
     def _on_term(signum, frame):
@@ -3513,14 +3099,15 @@ def main_app():
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统] 主进程收到中断, 子进程为 daemon 将随之退出")
 # ==============================================================================
-# 16. 运维工具 (人工排障用, 与主流程解耦)
+# 14. 运维工具 (人工排障用, 与主流程解耦)
 # ==============================================================================
 def admin_inspect(exchange, symbol, strategy_id=None):
     """排查盘口: 按 (策略,周期,角色,层) 归类, 检出重复层单与非本系统孤儿单。"""
-    orders = exchange.fetch_open_orders(symbol) or []
+    orders = [ex_api.to_uni_order(o)
+              for o in (ex_api.fetch_open_orders(exchange, symbol) or [])]
     by_key, others = {}, []
     for o in orders:
-        p = OidCodec.parse(o.get("clientOrderId") or "")
+        p = OidCodec.parse(o.coid)
         if p and (strategy_id is None or p.strategy_id == strategy_id):
             by_key.setdefault((p.strategy_id, p.cycle_id, p.role.value, p.layer), []).append(o)
         else:
@@ -3530,7 +3117,7 @@ def admin_inspect(exchange, symbol, strategy_id=None):
     for k, v in sorted(by_key.items()):
         dup = dup or len(v) > 1
         lines.append(f" {'⚠️重复' if len(v) > 1 else '  '} 策略[{k[0]}] 周期[{k[1]}] 角色[{k[2]}] "
-                     f"层[{k[3]}] x{len(v)}张 价:{[o.get('price') for o in v]}")
+                     f"层[{k[3]}] x{len(v)}张 价:{[o.price for o in v]}")
     if not dup:
         lines.append(" ✅ 未发现同一(周期,角色,层)重复挂单")
     if others:
@@ -3545,16 +3132,16 @@ def admin_cancel_strategy(exchange, symbol, strategy_id):
     #        保留原行为, 人工清场后请务必用 admin_inspect 复核条件单是否残留。
     prefix = OidCodec.strategy_prefix(strategy_id)
     done = fail = 0
-    for o in exchange.fetch_open_orders(symbol) or []:
-        cid = o.get("clientOrderId") or ""
-        if not cid.startswith(prefix):
+    for o in ex_api.fetch_open_orders(exchange, symbol) or []:
+        u = ex_api.to_uni_order(o)
+        if not u.coid.startswith(prefix):
             continue
         try:
-            exchange.cancel_order(o.get("id"), symbol)
+            ex_api.cancel_order_by_id(exchange, symbol, u.ex_id)
             done += 1
         except Exception as e:
+            logger.error(f"[运维] 紧急清场撤单失败(可能是算法条件单或已终态) | CID:[{u.coid}] 错误:[{e}]")
             fail += 1
-            logger.error(f"[运维] 紧急清场撤单失败(可能是算法条件单或已终态) | CID:[{cid}] 错误:[{e}]")
     logger.info(f"[运维] 紧急清场完成 | 策略:[{strategy_id}] 交易对:[{symbol}] "
                 f"成功:[{done}]张 失败:[{fail}]张")
 
