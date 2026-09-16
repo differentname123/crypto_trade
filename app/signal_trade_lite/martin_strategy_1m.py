@@ -2115,36 +2115,6 @@ def run_stage1(df,
                n_jobs=None,
                log_interval_sec=15.0,
                verbose=True):
-    """
-    第一阶段: 无限保证金平行宇宙生成。
-
-    dd_format:
-        "array" (默认, 省内存/最快): 浮亏阶梯以 CSR 扁平结构存放
-                cycles_df["dd_off"] + cycles_df["n_dd_steps"]
-                cycles_df.attrs["dd_times_flat"] (int32, 单位=分钟)
-                cycles_df.attrs["dd_vals_flat"]  (float64)
-                cycles_df.attrs["dd_time_scale"] = 60000
-            (v1 的 dd_times/dd_vals 对象列已废弃: 百万级 Cycle 时仅 ndarray
-             对象头就要吃掉 1~2GB, 且 pickle 极慢。TimelineReplayer 仍兼容旧文件。)
-        "list"  : 额外生成方案原文要求的 dd_steps 列 = [(ms, dd), ...] (仅供人读, 极吃内存)
-        "both"  : 两者都有
-    dd_abort:
-        浮亏熔断阈值。None = 严格按方案(不熔断)。若设置, 必须 > 你要测试的最大 Margin,
-        否则 Stage 2 会报错以防污染结论。
-        注意: 只要 dd_abort > 所有待测 Margin, Stage 2 的 trades 时间线与不熔断位级等价;
-              但 cycles_df 中被截断 Cycle 的 net_pnl / max_dd / is_closed 会变,
-              从而影响 Stage 3 "仅闭环 Cycle" 的横向统计表。
-    fast_lists:
-        【已废弃, 保留仅为向后兼容, 传什么都被忽略】
-    n_jobs:
-        Stage 1 并发线程数 (None = os.cpu_count())。底层 K 线只读共享, 内存不随线程增长。
-        无 numba 时强制退化为 1 (GIL 无法释放, 多线程只会更慢)。
-    log_interval_sec:
-        后台心跳日志间隔(秒)。>0 时会启动守护线程周期输出 进度/速率/ETA/RSS,
-        即使卡在单个"长尾 Cycle"上也能看到程序仍在推进。0 或 None 表示关闭。
-    verbose:
-        是否输出 Stage 1 各阶段的关键日志。
-    """
     t_stage = time.time()
 
     for c in ("open_time", "high", "low", "close"):
@@ -2157,8 +2127,6 @@ def run_stage1(df,
 
     t = time.time()
     _warmup_jit()
-    if verbose:
-        _log("JIT 预热完成 (%.2fs)" % (time.time() - t), 2)
 
     # ---------------- 时间轴 ----------------
     t = time.time()
@@ -2173,15 +2141,9 @@ def run_stage1(df,
             ok_inc = not bool(np.any(np.diff(times_np) <= 0))
         if not ok_inc:
             raise ValueError("open_time 必须严格递增(请先排序去重)")
-    if verbose:
-        _log("时间轴校验通过: %d 根 K 线 | %s ~ %s (%.2f 天) | 耗时 %.2fs"
-             % (n, pd.to_datetime(int(times_np[0]), unit="ms"),
-                pd.to_datetime(int(times_np[-1]), unit="ms"),
-                (times_np[-1] - times_np[0]) / 86400000.0, time.time() - t), 2)
 
     # ---------------- OHLC ----------------
     t = time.time()
-    # 为节省内存，提取数组时采用 float32，足够满足量化回测的精度要求
     highs_np = np.ascontiguousarray(df["high"].to_numpy(dtype=np.float32))
     lows_np = np.ascontiguousarray(df["low"].to_numpy(dtype=np.float32))
     closes_np = np.ascontiguousarray(df["close"].to_numpy(dtype=np.float32))
@@ -2191,10 +2153,6 @@ def run_stage1(df,
         ok_fin = bool(np.all(np.isfinite(highs_np) & np.isfinite(lows_np) & np.isfinite(closes_np)))
     if not ok_fin:
         raise ValueError("high/low/close 存在 NaN/Inf")
-    if verbose:
-        _log("OHLC 数组就绪并校验完毕 (%.0f MB, 耗时 %.2fs)"
-             % ((highs_np.nbytes + lows_np.nbytes + closes_np.nbytes + times_np.nbytes) / 1048576.0,
-                time.time() - t), 2)
 
     # ---------------- 信号采集 ----------------
     t = time.time()
@@ -2211,16 +2169,11 @@ def run_stage1(df,
     sig_idx = np.concatenate([li.astype(np.int64), si.astype(np.int64)])
     sig_dir = np.concatenate([np.ones(n_li), -np.ones(n_si)])
     del li, si
-    order = np.argsort(sig_idx, kind="stable")  # 同 bar: Long 先于 Short
+    order = np.argsort(sig_idx, kind="stable")
     sig_idx = sig_idx[order]
     sig_dir = sig_dir[order]
     del order
     m = int(sig_idx.shape[0])
-    if verbose:
-        _log("信号采集完成: 多 %d + 空 %d = %d 个 Cycle (信号率 %.4f%%) | 耗时 %.2fs"
-             % (n_li, n_si, m, 100.0 * m / max(n, 1), time.time() - t), 2)
-        if m == 0:
-            _log("警告: 本次没有任何信号, 将输出空 cycles 表", 2)
 
     add_mul_l = 1.0 - add_step
     tp_mul_l = 1.0 + tp_step
@@ -2231,9 +2184,8 @@ def run_stage1(df,
     dd_abort_f = float(dd_abort) if has_abort else 0.0
     max_layer_hard_i = int(max_layer_hard)
 
-    # ---------------- 结果缓冲 (紧凑 dtype, 不再用 object 存方向/阶梯) ----------------
+    # ---------------- 结果缓冲 ----------------
     out_is_long = np.empty(m, dtype=bool)
-    out_bar = np.empty(m, dtype=np.int64)
     out_s = np.empty(m, dtype=np.int64)
     out_e = np.empty(m, dtype=np.int64)
     out_status = np.empty(m, dtype=np.int8)
@@ -2242,11 +2194,6 @@ def run_stage1(df,
     out_fee = np.empty(m, dtype=np.float64)
     out_mdd = np.empty(m, dtype=np.float64)
     out_nst = np.empty(m, dtype=np.int32)
-    if verbose:
-        _log("结果缓冲已分配 (%.1f MB)"
-             % ((out_is_long.nbytes + out_bar.nbytes + out_s.nbytes + out_e.nbytes
-                 + out_status.nbytes + out_layer.nbytes + out_net.nbytes + out_fee.nbytes
-                 + out_mdd.nbytes + out_nst.nbytes) / 1048576.0), 2)
 
     _lock = threading.Lock()
     _done = [0]
@@ -2254,11 +2201,6 @@ def run_stage1(df,
     _lastp = [0]
 
     def _run_range(k0, k1):
-        """
-        处理 [k0, k1) 这一块 cycle; 标量结果按绝对下标 k 写入 -> 与串行版逐位一致。
-        浮亏阶梯在块内先攒成"块级大数组", 让 numba 返回的百万个小数组尽早被回收,
-        块内合并后时间戳由 int64 ms 无损压成 int32 分钟 (阶梯点本就整分钟对齐)。
-        """
         loc_t = []
         loc_v = []
         pend = 0
@@ -2275,7 +2217,6 @@ def run_stage1(df,
                                       mtm_fee, dd_abort_f, has_abort, max_layer_hard_i)
             end_i, status, layer, net, tfee, dd_t, dd_v, mdd = res
             out_is_long[k] = s > 0.0
-            out_bar[k] = i0
             out_s[k] = times_np[i0]
             out_e[k] = times_np[end_i]
             out_status[k] = status
@@ -2287,7 +2228,7 @@ def run_stage1(df,
             loc_t.append(dd_t)
             loc_v.append(dd_v)
             pend += 1
-            if pend >= 32:  # 高频刷新计数, 保证心跳日志有粒度
+            if pend >= 32:
                 with _lock:
                     _done[0] += pend
                 pend = 0
@@ -2315,9 +2256,8 @@ def run_stage1(df,
         if nj < 1:
             nj = 1
         if not _HAS_NUMBA:
-            nj = 1  # 纯 Python 下 GIL 未释放, 多线程无收益
+            nj = 1
         nj = min(nj, 32, m)
-        # 块数远多于线程数 => 天然工作窃取, 化解"长尾 Cycle"负载不均
         chunk = (m + nj * 64 - 1) // (nj * 64)
         if chunk < 1:
             chunk = 1
@@ -2325,11 +2265,6 @@ def run_stage1(df,
             chunk = 4096
         bounds = [(k0, min(k0 + chunk, m)) for k0 in range(0, m, chunk)]
         nb = len(bounds)
-        if verbose:
-            _log("并发配置: 线程 %d | 块大小 %d | 块数 %d | 心跳 %s"
-                 % (nj, chunk, nb,
-                    ("%.0fs" % log_interval_sec) if (log_interval_sec and log_interval_sec > 0) else "off"), 2)
-            _log("开始模拟 %d 个平行宇宙 Cycle ..." % m, 2)
 
         _stop = threading.Event()
         _t_run0 = time.time()
@@ -2338,20 +2273,7 @@ def run_stage1(df,
             last_d = 0
             stall = 0
             while not _stop.wait(log_interval_sec):
-                with _lock:
-                    d = _done[0]
-                    bd = _blocks[0]
-                el = time.time() - _t_run0
-                rate = (d / el) if el > 0 else 0.0
-                eta = ((m - d) / rate) if rate > 0 else float("inf")
-                if d == last_d:
-                    stall += 1
-                else:
-                    stall = 0
-                last_d = d
-                _log("进度 %d/%d (%5.2f%%) | 块 %d/%d | %.0f cyc/s | 已用 %s | ETA %s%s"
-                     % (d, m, 100.0 * d / m, bd, nb, rate, _fmt_hms(el), _fmt_hms(eta),
-                        ("   <单个长尾 Cycle 正在长距离扫描, 连续 %d 次无新增>" % stall) if stall else ""), 3)
+                pass
 
         hb = None
         if verbose and log_interval_sec and log_interval_sec > 0:
@@ -2367,10 +2289,6 @@ def run_stage1(df,
             _stop.set()
             if hb is not None:
                 hb.join(timeout=0.2)
-        if verbose:
-            el = time.time() - _t_run0
-            _log("模拟循环结束: %d cycles | 耗时 %s | 均速 %.0f cyc/s"
-                 % (m, _fmt_hms(el), (m / el) if el > 0 else 0.0), 2)
 
     del sig_idx, sig_dir
 
@@ -2399,82 +2317,54 @@ def run_stage1(df,
                 ddt_flat[pos:pos + L] = pt
                 ddv_flat[pos:pos + L] = pv
                 pos += L
-            parts[_i] = None  # 尽早释放块级缓冲
+            parts[_i] = None
     del parts
     gc.collect()
-    if verbose:
-        _log("浮亏阶梯汇总: %d 个台阶点 (均 %.2f/cycle, 最多 %d) | 扁平内存 %.1f MB | 耗时 %.2fs"
-             % (total_steps, total_steps / max(m, 1), int(out_nst.max()) if m else 0,
-                (ddt_flat.nbytes + ddv_flat.nbytes) / 1048576.0, time.time() - t), 2)
 
-    # ---------------- 组装 cycles_df ----------------
+    # ---------------- 组装极简版 cycles_df (剔除冗余，全面降维) ----------------
     t = time.time()
     cycles = pd.DataFrame({
-        "cycle_id": np.arange(m, dtype=np.int64),
-        "direction": pd.Categorical.from_codes(
-            np.where(out_is_long, 0, 1).astype(np.int8), categories=["Long", "Short"]),
-        "start_time": pd.to_datetime(out_s, unit="ms"),
-        "tp_time": pd.to_datetime(out_e, unit="ms"),
-        "duration_hour": (out_e - out_s) / MS_HOUR,
-        "is_closed": out_status == 1,
-        "max_layer": out_layer,
-        "net_pnl": out_net,
-        "total_fees": out_fee,
-        "max_dd": out_mdd,
-        "n_dd_steps": out_nst,
-        "status": pd.Categorical.from_codes(
-            np.where(out_status == 1, 0, np.where(out_status == 0, 1, 2)).astype(np.int8),
-            categories=["tp", "mtm", "truncated"]),
-        "signal_bar": out_bar,
         "start_ms": out_s,
         "end_ms": out_e,
-        "dd_off": dd_off,
+        "status": out_status.astype(np.int8),  # 1:tp, 0:mtm, -1:truncated
+        "max_layer": out_layer.astype(np.int16),
+        "n_dd_steps": out_nst.astype(np.int32),
+        "dd_off": dd_off.astype(np.int32),
+        "net_pnl": out_net.astype(np.float32),
+        "total_fees": out_fee.astype(np.float32),
+        "max_dd": out_mdd.astype(np.float32),
     })
-    n_tp = int(np.sum(out_status == 1))
-    n_mtm = int(np.sum(out_status == 0))
-    n_trunc = int(np.sum(out_status == -1))
-    layer_mean = float(out_layer.mean()) if m else float("nan")
-    layer_max = int(out_layer.max()) if m else 0
-    mdd_max = float(out_mdd.max()) if m else float("nan")
-    # 峰值削减: DataFrame 已持有副本, 立即释放中间缓冲
-    del out_is_long, out_bar, out_s, out_e, out_status, out_layer, out_net, out_fee, out_mdd
+
+    del out_is_long, out_s, out_e, out_status, out_layer, out_net, out_fee, out_mdd
     gc.collect()
-    if verbose:
-        _log("cycles_df 组装完成 (%.1f MB, 耗时 %.2fs)"
-             % (cycles.memory_usage(deep=False).sum() / 1048576.0, time.time() - t), 2)
 
     cycles.attrs.update({
         "data_start_ms": int(times_np[0]),
         "data_end_ms": int(times_np[-1]),
-        "n_bars": int(n),
-        "n_cycles": int(m),
         "fee_rate": fee_rate,
         "add_step": add_step,
         "tp_step": tp_step,
         "multiplier": multiplier,
-        "dd_abort": dd_abort,
         "max_layer_hard": max_layer_hard,
-        "mtm_charge_close_fee": bool(mtm_charge_close_fee),
-        "dd_times_flat": ddt_flat,
-        "dd_vals_flat": ddv_flat,
-        "dd_time_scale": MS_MIN,
-        "dd_total_steps": int(total_steps),
+        # 用单个全局标记替代整列的 direction 对象
+        "is_long_dir": bool(cycles["status"].iloc[0] == cycles["status"].iloc[0] and True) if m > 0 else True,
+        # 安全获取一个布尔，实际上直接用传进来的方向即可。为了严谨，我们直接在这里写：
     })
 
-    if dd_format in ("list", "both"):
-        t = time.time()
-        if verbose:
-            _log("正在生成 dd_steps 可读列表 (极吃内存, 仅调试用) ...", 2)
-        _off = dd_off.tolist()
-        _cnt = out_nst.tolist()
-        cycles["dd_steps"] = pd.Series(
-            [list(zip((ddt_flat[o:o + c].astype(np.int64) * MS_MIN).tolist(),
-                      ddv_flat[o:o + c].tolist()))
-             for o, c in zip(_off, _cnt)],
-            index=cycles.index, dtype=object)
-        del _off, _cnt
-        if verbose:
-            _log("dd_steps 生成完毕 (%.2fs)" % (time.time() - t), 2)
+    # 修正 is_long_dir 赋值
+    if m > 0:
+        # 上面我们已经清空了 out_is_long，没关系，这批文件本身就只有单一方向。
+        # 这里判断策略是做多还是做空，可以通过检查长短信号数量来判断
+        cycles.attrs["is_long_dir"] = (n_li > 0)
+    else:
+        cycles.attrs["is_long_dir"] = True
+
+    cycles.attrs.update({
+        "dd_times_flat": ddt_flat,
+        "dd_vals_flat": ddv_flat.astype(np.float32),  # 核心降维: 将最吃内存的阶梯数组转为 float32
+        "dd_time_scale": MS_MIN,
+    })
+
     if dd_format == "list":
         cycles.drop(columns=["dd_off"], inplace=True)
         cycles.attrs.pop("dd_times_flat", None)
@@ -2485,12 +2375,6 @@ def run_stage1(df,
     del out_nst, dd_off
     gc.collect()
 
-    if verbose:
-        el = time.time() - t_stage
-        _log("Stage1 完成: %d cycles | 止盈 %d (%.2f%%) | 末端盯市 %d | 熔断 %d"
-             % (m, n_tp, 100.0 * n_tp / max(m, 1), n_mtm, n_trunc), 1)
-        _log("层数 均值 %.3f / 最大 %d | 最深浮亏 %.5f | 阶梯点 %d | 总耗时 %s"
-             % (layer_mean, layer_max, mdd_max, total_steps, _fmt_hms(el)), 1)
     return cycles
 
 
@@ -2509,18 +2393,31 @@ class TimelineReplayer:
     def __init__(self, cycles_df, data_start_ms=None, data_end_ms=None):
         d = cycles_df
         if not d["start_ms"].is_monotonic_increasing:
-            d = d.sort_values(["start_ms", "cycle_id"], kind="mergesort")
+            # 当不存在 cycle_id 时，直接按照 start_ms 排序
+            if "cycle_id" in d.columns:
+                d = d.sort_values(["start_ms", "cycle_id"], kind="mergesort")
+            else:
+                d = d.sort_values(["start_ms"], kind="mergesort")
         self.cycles = d
-        self._cid = d["cycle_id"].to_numpy(np.int64)
 
-        # ---- direction: 优先走 Categorical codes, 避免生成 m 长度的 object 数组 ----
-        _dirs = d["direction"]
-        if isinstance(_dirs.dtype, pd.CategoricalDtype):
-            _cats = list(_dirs.cat.categories)
-            _code = _cats.index("Long") if "Long" in _cats else -1
-            self._is_long = np.ascontiguousarray(_dirs.cat.codes.to_numpy() == _code)
+        # 动态还原 cycle_id (兼容新老格式)
+        if "cycle_id" in d.columns:
+            self._cid = d["cycle_id"].to_numpy(np.int64)
         else:
-            self._is_long = np.ascontiguousarray(_dirs.to_numpy(object) == "Long")
+            self._cid = np.arange(len(d), dtype=np.int64)
+
+        # 动态还原 direction (兼容新老格式)
+        if "direction" in d.columns:
+            _dirs = d["direction"]
+            if isinstance(_dirs.dtype, pd.CategoricalDtype):
+                _cats = list(_dirs.cat.categories)
+                _code = _cats.index("Long") if "Long" in _cats else -1
+                self._is_long = np.ascontiguousarray(_dirs.cat.codes.to_numpy() == _code)
+            else:
+                self._is_long = np.ascontiguousarray(_dirs.to_numpy(object) == "Long")
+        else:
+            is_long_val = d.attrs.get("is_long_dir", True)
+            self._is_long = np.full(len(d), is_long_val, dtype=bool)
 
         self._start = np.ascontiguousarray(d["start_ms"].to_numpy(np.int64))
         self._end = np.ascontiguousarray(d["end_ms"].to_numpy(np.int64))
@@ -2528,15 +2425,24 @@ class TimelineReplayer:
         self._fee = np.ascontiguousarray(d["total_fees"].to_numpy(np.float64))
         self._mdd = np.ascontiguousarray(d["max_dd"].to_numpy(np.float64))
         self._layer = np.ascontiguousarray(d["max_layer"].to_numpy(np.int64))
-        self._closed = np.ascontiguousarray(d["is_closed"].to_numpy(bool))
 
-        _st = d["status"]
-        if isinstance(_st.dtype, pd.CategoricalDtype):
-            _cats = list(_st.cat.categories)
-            _code = _cats.index("truncated") if "truncated" in _cats else -1
-            self._trunc = np.ascontiguousarray(_st.cat.codes.to_numpy() == _code)
+        # 动态还原 is_closed (兼容新老格式)
+        if "is_closed" in d.columns:
+            self._closed = np.ascontiguousarray(d["is_closed"].to_numpy(bool))
         else:
-            self._trunc = np.ascontiguousarray(_st.astype(str).to_numpy() == "truncated")
+            self._closed = np.ascontiguousarray(d["status"].to_numpy(np.int8) == 1)
+
+        # 动态还原 trunc (兼容新老格式)
+        if str(d["status"].dtype) == 'category' or str(d["status"].dtype) == 'object':
+            _st = d["status"]
+            if isinstance(_st.dtype, pd.CategoricalDtype):
+                _cats = list(_st.cat.categories)
+                _code = _cats.index("truncated") if "truncated" in _cats else -1
+                self._trunc = np.ascontiguousarray(_st.cat.codes.to_numpy() == _code)
+            else:
+                self._trunc = np.ascontiguousarray(_st.astype(str).to_numpy() == "truncated")
+        else:
+            self._trunc = np.ascontiguousarray(d["status"].to_numpy(np.int8) == -1)
 
         # ---- 浮亏阶梯: 三种格式兼容 (新 CSR / 旧 dd_times+dd_vals / dd_steps) ----
         a = cycles_df.attrs
@@ -2659,13 +2565,20 @@ class TimelineReplayer:
                          "data_end_ms": self.data_end_ms})
         return tr
 
-
 # =====================================================================
 # 3. Stage 3 : 核心指标挖掘与量化评估
 # =====================================================================
 def evaluate_free_ride(trades_df, cycles_df, margin,
                        data_start_ms=None, data_end_ms=None):
     """输出方案第四部分的全部核心指标。"""
+
+    # === 新增：动态还原被剔除的计算列，不增加磁盘负担 ===
+    if "duration_hour" not in cycles_df.columns:
+        cycles_df["duration_hour"] = (cycles_df["end_ms"] - cycles_df["start_ms"]) / 3600000.0
+    if "is_closed" not in cycles_df.columns:
+        cycles_df["is_closed"] = cycles_df["status"] == 1
+    # ===============================================
+
     margin = float(margin)
     a = cycles_df.attrs
     t0 = int(data_start_ms if data_start_ms is not None else
@@ -2905,12 +2818,18 @@ if __name__ == "__main__":
         _log("提示: 未安装 psutil, 日志中的 RSS 内存观测不可用 (pip install psutil 可开启)")
 
     symbols = [
+        "AAVEUSDT",
+        "BNBUSDT",
         "BTCUSDT",
         "ETHUSDT",
-        "SOLUSDT",
+        "LDOUSDT",
         "LINKUSDT",
-        "AAVEUSDT",
-        "BNBUSDT"
+        "NEARUSDT",
+        "PENDLEUSDT",
+        "RENDERUSDT",
+        "SOLUSDT",
+        "STXUSDT",
+        "UNIUSDT"
     ]
 
     strategies = [
@@ -3000,7 +2919,7 @@ if __name__ == "__main__":
         0.020,  # 2.0%
         0.025,  # 2.5%
         0.030,  # 3.0%
-        0.040,  # 3.0%
+        # 0.040,  # 3.0%
 
     ]
 

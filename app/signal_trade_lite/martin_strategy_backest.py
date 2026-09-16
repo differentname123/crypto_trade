@@ -1274,18 +1274,31 @@ class TimelineReplayer:
     def __init__(self, cycles_df, data_start_ms=None, data_end_ms=None):
         d = cycles_df
         if not d["start_ms"].is_monotonic_increasing:
-            d = d.sort_values(["start_ms", "cycle_id"], kind="mergesort")
+            # 当不存在 cycle_id 时，直接按照 start_ms 排序
+            if "cycle_id" in d.columns:
+                d = d.sort_values(["start_ms", "cycle_id"], kind="mergesort")
+            else:
+                d = d.sort_values(["start_ms"], kind="mergesort")
         self.cycles = d
-        self._cid = d["cycle_id"].to_numpy(np.int64)
 
-        # ---- direction: 优先走 Categorical codes, 避免生成 m 长度的 object 数组 ----
-        _dirs = d["direction"]
-        if isinstance(_dirs.dtype, pd.CategoricalDtype):
-            _cats = list(_dirs.cat.categories)
-            _code = _cats.index("Long") if "Long" in _cats else -1
-            self._is_long = np.ascontiguousarray(_dirs.cat.codes.to_numpy() == _code)
+        # 动态还原 cycle_id (兼容新老格式)
+        if "cycle_id" in d.columns:
+            self._cid = d["cycle_id"].to_numpy(np.int64)
         else:
-            self._is_long = np.ascontiguousarray(_dirs.to_numpy(object) == "Long")
+            self._cid = np.arange(len(d), dtype=np.int64)
+
+        # 动态还原 direction (兼容新老格式)
+        if "direction" in d.columns:
+            _dirs = d["direction"]
+            if isinstance(_dirs.dtype, pd.CategoricalDtype):
+                _cats = list(_dirs.cat.categories)
+                _code = _cats.index("Long") if "Long" in _cats else -1
+                self._is_long = np.ascontiguousarray(_dirs.cat.codes.to_numpy() == _code)
+            else:
+                self._is_long = np.ascontiguousarray(_dirs.to_numpy(object) == "Long")
+        else:
+            is_long_val = d.attrs.get("is_long_dir", True)
+            self._is_long = np.full(len(d), is_long_val, dtype=bool)
 
         self._start = np.ascontiguousarray(d["start_ms"].to_numpy(np.int64))
         self._end = np.ascontiguousarray(d["end_ms"].to_numpy(np.int64))
@@ -1293,15 +1306,24 @@ class TimelineReplayer:
         self._fee = np.ascontiguousarray(d["total_fees"].to_numpy(np.float64))
         self._mdd = np.ascontiguousarray(d["max_dd"].to_numpy(np.float64))
         self._layer = np.ascontiguousarray(d["max_layer"].to_numpy(np.int64))
-        self._closed = np.ascontiguousarray(d["is_closed"].to_numpy(bool))
 
-        _st = d["status"]
-        if isinstance(_st.dtype, pd.CategoricalDtype):
-            _cats = list(_st.cat.categories)
-            _code = _cats.index("truncated") if "truncated" in _cats else -1
-            self._trunc = np.ascontiguousarray(_st.cat.codes.to_numpy() == _code)
+        # 动态还原 is_closed (兼容新老格式)
+        if "is_closed" in d.columns:
+            self._closed = np.ascontiguousarray(d["is_closed"].to_numpy(bool))
         else:
-            self._trunc = np.ascontiguousarray(_st.astype(str).to_numpy() == "truncated")
+            self._closed = np.ascontiguousarray(d["status"].to_numpy(np.int8) == 1)
+
+        # 动态还原 trunc (兼容新老格式)
+        if str(d["status"].dtype) == 'category' or str(d["status"].dtype) == 'object':
+            _st = d["status"]
+            if isinstance(_st.dtype, pd.CategoricalDtype):
+                _cats = list(_st.cat.categories)
+                _code = _cats.index("truncated") if "truncated" in _cats else -1
+                self._trunc = np.ascontiguousarray(_st.cat.codes.to_numpy() == _code)
+            else:
+                self._trunc = np.ascontiguousarray(_st.astype(str).to_numpy() == "truncated")
+        else:
+            self._trunc = np.ascontiguousarray(d["status"].to_numpy(np.int8) == -1)
 
         # ---- 浮亏阶梯: 三种格式兼容 (新 CSR / 旧 dd_times+dd_vals / dd_steps) ----
         a = cycles_df.attrs
@@ -1424,13 +1446,20 @@ class TimelineReplayer:
                          "data_end_ms": self.data_end_ms})
         return tr
 
-
 # =====================================================================
 # 3. Stage 3 : 核心指标挖掘与量化评估
 # =====================================================================
 def evaluate_free_ride(trades_df, cycles_df, margin,
                        data_start_ms=None, data_end_ms=None):
     """输出方案第四部分的全部核心指标。"""
+
+    # === 新增：动态还原被剔除的计算列，不增加磁盘负担 ===
+    if "duration_hour" not in cycles_df.columns:
+        cycles_df["duration_hour"] = (cycles_df["end_ms"] - cycles_df["start_ms"]) / 3600000.0
+    if "is_closed" not in cycles_df.columns:
+        cycles_df["is_closed"] = cycles_df["status"] == 1
+    # ===============================================
+
     margin = float(margin)
     a = cycles_df.attrs
     t0 = int(data_start_ms if data_start_ms is not None else
