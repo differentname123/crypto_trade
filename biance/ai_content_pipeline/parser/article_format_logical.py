@@ -27,7 +27,7 @@ POST_QUERY_LIMIT = 50000
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt'
 LLM_MAX_RETRIES = 3
 
-max_age_hours = 24 * 7
+max_age_hours = 24 * 2
 # 全局初始化向量引擎（单例调用，避免重复加载）
 # VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
 
