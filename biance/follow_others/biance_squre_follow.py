@@ -45,7 +45,11 @@ MIN_PROBABILITY = 90
 MIN_FISSION_PROBABILITY = 85
 PROFILE_CACHE_PATH = "user_profile.json"
 PRODUCER_SWEEP_INTERVAL = 10000
-
+# =====================================================================
+# [新增] 矩阵账号状态监控看板配置
+# =====================================================================
+MATRIX_STATUS_PATH = "matrix_account_status.json"
+status_cache_lock = threading.Lock()
 # =====================================================================
 # [新增] 黑名单持久化存取逻辑
 # =====================================================================
@@ -67,6 +71,25 @@ def load_blacklist():
     except FileNotFoundError:
         return set()
 
+
+def update_account_status(user_key, status_data):
+    """
+    [新增] 更新并持久化矩阵账号的实时状态
+    作用：生成一个看板 JSON 文件，让你一眼看清所有矩阵号的存活和增粉状况。
+    """
+    with status_cache_lock:
+        # 读取已有的状态文件，若不存在则初始化为空字典
+        status_map = read_json(MATRIX_STATUS_PATH) or {}
+        if user_key not in status_map:
+            status_map[user_key] = {}
+
+        # 更新传入的最新状态
+        status_map[user_key].update(status_data)
+        # 强制更新时间戳
+        status_map[user_key]['last_update_time'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 落盘保存
+        save_json(MATRIX_STATUS_PATH, status_map)
 
 MUTUAL_FOLLOW_KEYWORDS = [
     "互关", "必回", "互粉", '回关', "互赞", "互评", "互fo", "互助互关", "互关互粉", "互赞互评", "互粉互赞", "互关互赞",
@@ -386,129 +409,204 @@ def get_worth_following_list(initial_user_name_list, target_count):
 def _sync_single_account_logic(user_key, global_fans_uids, allocated_wild_uids):
     """
     单账号闭环：提取全局粉丝与专属探路流量，先保证VIP粉丝全覆盖，再执行剩余份额的新客探索。
-    【改动点】：强制水位控制机制，触达1050时强制分级清理，绝对降至1000。
+    【新增能力】：全链路异常捕获与风控嗅探机制（Auth失效、API阻断、连续动作失败将被精准识别记录）
     """
     my_name = get_config(f"{user_key}_name")
     browser_session_dir = get_config(f"{user_key}_browser_session_dir")
     current_time = time.time()
     update_interval_seconds = COOKIE_UPDATE_INTERVAL_DAYS * 24 * 3600
 
-    with auth_cache_lock:
-        cache_data = ACCOUNT_AUTH_CACHE.get(user_key, {})
-        needs_update = not cache_data or (current_time - cache_data.get('last_update', 0) > update_interval_seconds)
+    # [新增] 看板数据初始化：加入异常监控双字段
+    current_status = {
+        "status": "Initializing",
+        "auth_valid": False,
+        "is_abnormal": False,  # 账号是否异常 (核心红绿灯)
+        "abnormal_reason": "",  # 异常的具体原因 (诊断线索)
+        "following_count": 0,
+        "follower_count": 0,
+        "today_actions": "N/A"
+    }
 
-    if needs_update:
-        logger.info(
-            f"[身份认证/凭证刷新] 账号凭证为空或过期 | 关键参数: 账号【{user_key}】 | 结果: 调用无头浏览器重置鉴权状态")
-        my_cookies, csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
+    # [新增] 全局异常捕获网：防止任何未知错误导致状态不更新
+    try:
+        # --------- 1. 鉴权与配置检测 ---------
         with auth_cache_lock:
-            ACCOUNT_AUTH_CACHE[user_key] = {
-                'cookies': my_cookies,
-                'csrf_token': csrf_token,
-                'last_update': current_time
-            }
-    else:
-        with auth_cache_lock:
-            my_cookies = ACCOUNT_AUTH_CACHE[user_key]['cookies']
-            csrf_token = ACCOUNT_AUTH_CACHE[user_key]['csrf_token']
+            cache_data = ACCOUNT_AUTH_CACHE.get(user_key, {})
+            needs_update = not cache_data or (current_time - cache_data.get('last_update', 0) > update_interval_seconds)
 
-    if not all([my_cookies, csrf_token, my_name]):
-        with auth_cache_lock:
-            if user_key in ACCOUNT_AUTH_CACHE:
-                del ACCOUNT_AUTH_CACHE[user_key]
-        logger.error(
-            f"[业务中断/配置断档] 执行参数不完整 | 关键参数: 账号【{user_key}】 | 结果: 强制退出该账号逻辑 | 可能原因: 环境变量未配置或无头浏览器抓取Cookie失败")
-        return
+        if needs_update:
+            logger.info(
+                f"[身份认证/凭证刷新] 账号凭证为空或过期 | 关键参数: 账号【{user_key}】 | 结果: 调用无头浏览器重置鉴权状态")
+            my_cookies, csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
+            with auth_cache_lock:
+                ACCOUNT_AUTH_CACHE[user_key] = {
+                    'cookies': my_cookies,
+                    'csrf_token': csrf_token,
+                    'last_update': current_time
+                }
+        else:
+            with auth_cache_lock:
+                my_cookies = ACCOUNT_AUTH_CACHE[user_key]['cookies']
+                csrf_token = ACCOUNT_AUTH_CACHE[user_key]['csrf_token']
 
-    # 拉取当前账号自身最新的关注状态
-    following_map, _ = _get_current_relations(my_name, max_count=10000)
-    my_following_uids = set(following_map.values())
+        # 异常嗅探 1：鉴权失败或配置断档
+        if not all([my_cookies, csrf_token, my_name]):
+            with auth_cache_lock:
+                if user_key in ACCOUNT_AUTH_CACHE:
+                    del ACCOUNT_AUTH_CACHE[user_key]
+            logger.error(f"[业务中断/配置断档] 执行参数不完整 | 关键参数: 账号【{user_key}】 | 结果: 强制退出该账号逻辑")
 
-    # ================= 蓄水池水位控制与取关清洗逻辑 =================
-    current_following_count = len(my_following_uids)
+            current_status["status"] = "Error: Auth Failed"
+            current_status["auth_valid"] = False
+            current_status["is_abnormal"] = True
+            current_status["abnormal_reason"] = "鉴权失败: 无头浏览器抓取Cookie/Token失败，或未配置账号名称"
+            update_account_status(user_key, current_status)
+            return
 
-    # [新增核心机制] 强制水位控制参数
-    TARGET_COUNT = 1000  # 清理后的目标绝对底线
-    WATER_MARK = 1050  # 触发清洗的水位线（留50个缓冲空间，避免频繁小额取关）
+        current_status["auth_valid"] = True
 
-    if current_following_count >= WATER_MARK:
-        need_unfollow_count = current_following_count - TARGET_COUNT
-        logger.info(
-            f"[蓄水池/水位告警] 账号【{user_key}】当前关注数【{current_following_count}】触达高水位{WATER_MARK} | 关键参数: 目标强制降至{TARGET_COUNT} | 结果: 阻断加粉, 触发强力清洗模式")
+        # --------- 2. 拉取网络层数据 ---------
+        # 异常嗅探 2：关系链 API 被风控拦截
+        try:
+            following_map, follower_map = _get_current_relations(my_name, max_count=10000)
+        except Exception as api_err:
+            current_status["status"] = "Error: API Blocked"
+            current_status["is_abnormal"] = True
+            current_status["abnormal_reason"] = f"拉取关系链失败: 疑遭币安API网关风控拦截 [{str(api_err)}]"
+            update_account_status(user_key, current_status)
+            return
 
-        # 保持API返回的原始顺序（前端为最新关注，尾端为最老关注）
-        ordered_following_uids = list(following_map.values())
+        my_following_uids = set(following_map.values())
+        my_follower_uids = set(follower_map.values())
+        current_following_count = len(my_following_uids)
 
-        # 1. 提取非互关用户（白嫖党）
-        blacklist_candidates = [uid for uid in ordered_following_uids if uid not in global_fans_uids]
-        # 2. 提取互关铁粉 (用于兜底，当白嫖党杀光了水位还是高于1000时触发)
-        mutual_fans = [uid for uid in ordered_following_uids if uid in global_fans_uids]
+        current_status["following_count"] = current_following_count
+        current_status["follower_count"] = len(my_follower_uids)
+        update_account_status(user_key, current_status)
 
-        # 3. 拼接取关序列：切片反转[::-1]表示从历史最悠久的一端开始提取。
-        # 优先抽取最古老的白嫖党，如果数量不够，继续抽取最古老的互关铁粉，直到填满指标。
-        all_unfollow_candidates = blacklist_candidates[::-1] + mutual_fans[::-1]
+        # 定义连续失败阈值 (用于嗅探账号是否被禁言/封禁关注动作)
+        MAX_CONSECUTIVE_FAILURES = 5
 
-        # 4. 精准截取所需清理的数量
-        uids_to_unfollow = all_unfollow_candidates[:need_unfollow_count]
-        total_unfollow = len(uids_to_unfollow)
+        # --------- 3. 蓄水池水位控制与取关清洗逻辑 ---------
+        TARGET_COUNT = 1000
+        WATER_MARK = 1050
 
-        logger.info(
-            f"[蓄水池/锁定目标] 锁定【{total_unfollow}】名用户准备清理 (策略: 优先剥离最古老白嫖党，不足则清理最早期老粉兜底)")
+        if current_following_count >= WATER_MARK:
+            need_unfollow_count = current_following_count - TARGET_COUNT
+            logger.info(f"[蓄水池/水位告警] 账号【{user_key}】触达高水位{WATER_MARK} | 结果: 触发强力清洗模式")
 
-        unfollow_success_count = 0
-        for index, uid in enumerate(uids_to_unfollow, 1):
-            is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
+            current_status["status"] = "Cleaning Mode"
+            update_account_status(user_key, current_status)
+
+            ordered_following_uids = list(following_map.values())
+            blacklist_candidates = [uid for uid in ordered_following_uids if uid not in global_fans_uids]
+            mutual_fans = [uid for uid in ordered_following_uids if uid in global_fans_uids]
+            all_unfollow_candidates = blacklist_candidates[::-1] + mutual_fans[::-1]
+
+            uids_to_unfollow = all_unfollow_candidates[:need_unfollow_count]
+            total_unfollow = len(uids_to_unfollow)
+
+            unfollow_success_count = 0
+            consecutive_failures = 0  # 连续失败计数器
+
+            for index, uid in enumerate(uids_to_unfollow, 1):
+                is_success = toggle_binance_follow(uid, "unfollow", my_cookies, csrf_token)
+
+                if is_success:
+                    unfollow_success_count += 1
+                    consecutive_failures = 0  # 成功则重置计数器
+                    append_to_blacklist(uid)
+                else:
+                    consecutive_failures += 1
+                    # 异常嗅探 3：连续取关失败判定为被限制
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logger.error(
+                            f"[风控预警/强制阻断] 账号【{user_key}】连续取关失败达{MAX_CONSECUTIVE_FAILURES}次，判定已被软限制！")
+                        current_status["status"] = "Error: Risk Control"
+                        current_status["is_abnormal"] = True
+                        current_status[
+                            "abnormal_reason"] = f"动作受限: 连续 {MAX_CONSECUTIVE_FAILURES} 次取关失败，触发风控阈值"
+                        update_account_status(user_key, current_status)
+                        return  # 直接阻断退出
+
+                logger.info(
+                    f"[网络交互/行为执行] 取关动作 | 账号【{user_key}】, 进度【{index}/{total_unfollow}】 | 结果: 【{'成功' if is_success else '失败'}】")
+
+                if index < total_unfollow:
+                    time.sleep(random.uniform(6, 9))
+
+            # 清洗成功闭环
+            current_status["status"] = "Cleaned"
+            current_status["is_abnormal"] = False
+            current_status["abnormal_reason"] = ""
+            current_status["today_actions"] = f"Unfollowed {unfollow_success_count}/{total_unfollow}"
+            current_status["following_count"] -= unfollow_success_count
+            update_account_status(user_key, current_status)
+            return
+
+        # --------- 4. 核心装填逻辑：绝对优先级排序 ---------
+        vip_queue = global_fans_uids - my_following_uids
+        explore_queue = set(allocated_wild_uids) - my_following_uids
+        final_uids_to_follow = (list(vip_queue) + list(explore_queue))[:100]
+
+        if not final_uids_to_follow:
+            current_status["status"] = "Idle: No targets"
+            current_status["is_abnormal"] = False
+            current_status["abnormal_reason"] = ""
+            current_status["today_actions"] = "Followed 0"
+            update_account_status(user_key, current_status)
+            return
+
+        current_status["status"] = "Following Mode"
+        update_account_status(user_key, current_status)
+
+        # --------- 5. 串行关注执行 ---------
+        success_count = 0
+        total = len(final_uids_to_follow)
+        consecutive_failures = 0  # 连续失败计数器
+
+        for index, uid in enumerate(final_uids_to_follow, 1):
+            is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)
+
             if is_success:
-                unfollow_success_count += 1
-                # 取关成功后，立刻写入本地黑名单文件，确保引擎永不再抓取此人
-                append_to_blacklist(uid)
+                success_count += 1
+                consecutive_failures = 0  # 成功则重置
+            else:
+                consecutive_failures += 1
+                # 异常嗅探 4：连续关注失败判定为被限制
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        f"[风控预警/强制阻断] 账号【{user_key}】连续关注失败达{MAX_CONSECUTIVE_FAILURES}次，判定已被软限制！")
+                    current_status["status"] = "Error: Risk Control"
+                    current_status["is_abnormal"] = True
+                    current_status[
+                        "abnormal_reason"] = f"动作受限: 连续 {MAX_CONSECUTIVE_FAILURES} 次关注失败，触发关注上限或被风控"
+                    # 这里把已成功的数量更新上去
+                    current_status["following_count"] += success_count
+                    update_account_status(user_key, current_status)
+                    return  # 直接阻断退出
 
             logger.info(
-                f"[网络交互/行为执行] 触发账号【取关】动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total_unfollow}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
+                f"[网络交互/行为执行] 关注动作 | 账号【{user_key}】, 进度【{index}/{total}】 | 结果: 【{'成功' if is_success else '失败'}】")
 
-            if index < total_unfollow:
-                sleep_time = random.uniform(6, 9)
-                time.sleep(sleep_time)
+            if index < total:
+                time.sleep(random.uniform(60, 90))
 
-        logger.info(
-            f"[调度流转/账号完结] 单账号强制清洗流闭环完毕 | 关键参数: 账号【{user_key}】, 计划清理【{total_unfollow}】, 成功【{unfollow_success_count}】 | 结果: 释放线程资源")
-        return  # 泄洪轮次直接结束，不执行下方的关注逻辑，等待主线下一轮心跳
-    # ===============================================================
+        # 完美执行闭环
+        current_status["status"] = "Active/Finished"
+        current_status["is_abnormal"] = False
+        current_status["abnormal_reason"] = ""
+        current_status["today_actions"] = f"Followed {success_count}/{total}"
+        current_status["following_count"] += success_count
+        update_account_status(user_key, current_status)
 
-    # ---------------- 核心装填逻辑：绝对优先级排序 ----------------
-    # 1. 提取全矩阵粉丝中的未关注对象作为【优先队列】（保证所有粉丝必须先被关注）
-    vip_queue = global_fans_uids - my_following_uids
-
-    # 2. 提取分发给该账号的独有野生线索作为【探索队列】（防撞车双重保险）
-    explore_queue = set(allocated_wild_uids) - my_following_uids
-
-    # 3. 严格按照先后顺序合并列表，截取前 100 个名额，完美实现粉丝绝对优先策略
-    final_uids_to_follow = (list(vip_queue) + list(explore_queue))[:100]
-    # -----------------------------------------------------------
-
-    logger.info(
-        f"[聚合调度/队列装填] 单账号待关注分配盘点 | 关键参数: 账号【{user_key}】 VIP必回关粉丝【{len(vip_queue)}】, 专属探索线索【{len(explore_queue)}】 | 结果: 截取并锁定 【{len(final_uids_to_follow)}】 个指标")
-
-    if not final_uids_to_follow:
-        return
-
-    success_count = 0
-    total = len(final_uids_to_follow)
-    for index, uid in enumerate(final_uids_to_follow, 1):
-        is_success = toggle_binance_follow(uid, "follow", my_cookies, csrf_token)
-        if is_success:
-            success_count += 1
-
-        logger.info(
-            f"[网络交互/行为执行] 触发账号关注动作 | 关键参数: 账号【{user_key}】, 进度【{index}/{total}】, UID【{uid}】 | 结果: 【{'成功' if is_success else '失败'}】")
-
-        if index < total:
-            sleep_time = random.uniform(60, 90)
-            time.sleep(sleep_time)
-
-    logger.info(
-        f"[调度流转/账号完结] 单账号执行流闭环完毕 | 关键参数: 账号【{user_key}】, 触达总量【{total}】, 成功【{success_count}】 | 结果: 释放线程资源")
-
+    except Exception as e:
+        # 异常嗅探 5：程序级别的意外崩溃
+        logger.error(f"[系统崩溃/账号隔离] 账号【{user_key}】执行流发生未捕获异常: {e}", exc_info=True)
+        current_status["status"] = "Error: System Crash"
+        current_status["is_abnormal"] = True
+        current_status["abnormal_reason"] = f"系统崩溃: {str(e)}"
+        update_account_status(user_key, current_status)
 
 def consumer_auto_sync_main(accounts=None):
     """
