@@ -278,7 +278,7 @@ def check_format_info(json_data, placeholders):
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
     evidence_expected_keys = {
-        'support',
+        'core_fact',
         'dimension', 'coins', 'stance', 'shelf_life', 'images'
     }
 
@@ -287,10 +287,8 @@ def check_format_info(json_data, placeholders):
     valid_shelf_lives = {'hours', 'days', 'weeks', 'long', 'unknown'}
 
     # 【新增】: 加入了 usable 和 unusable_reason
-    image_expected_keys = {'image_id', 'image_type', 'context', 'risk', 'usable', 'unusable_reason'}
+    image_expected_keys = {'image_id', 'image_type', 'context', 'usable', 'unusable_reason'}
     valid_image_types = {'盘面截图', '数据图表', '新闻截图', '社交截图', '收益截图', '梗图表情', '实拍照片', '其他'}
-    valid_risks = {'平台或工具水印', 'KOL或他人言论截图', '推广二维码', '个人私密盈亏截图', '人脸', '敏感内容',
-                   '图片模糊或关键内容不可读'}
 
     for i, ev in enumerate(evidences):
         if not isinstance(ev, dict):
@@ -346,15 +344,6 @@ def check_format_info(json_data, placeholders):
 
             if img.get('image_type') not in valid_image_types:
                 return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 image_type【{img.get('image_type')}】不在枚举值内"
-
-            # 校验风险标签数组
-            risks = img.get('risk')
-            if not isinstance(risks, list):
-                return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 risk 必须是列表(List)"
-
-            for risk in risks:
-                if risk not in valid_risks:
-                    return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 risk 包含了非法枚举值【{risk}】"
 
             # ================= 【新增】校验图片可用性 (usable / unusable_reason) =================
             usable = img.get('usable')
