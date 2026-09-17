@@ -277,7 +277,6 @@ def check_format_info(json_data, placeholders):
         return False, "'evidences' 节点必须是列表(List)"
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
-    # 严格对齐 Prompt 要求的核心字段（已移除 'claim'）
     evidence_expected_keys = {
         'support',
         'dimension', 'coins', 'stance', 'shelf_life', 'images'
@@ -287,7 +286,8 @@ def check_format_info(json_data, placeholders):
     valid_evidence_stances = {'看多', '看空', '震荡'}
     valid_shelf_lives = {'hours', 'days', 'weeks', 'long', 'unknown'}
 
-    image_expected_keys = {'image_id', 'image_type', 'context', 'risk'}
+    # 【新增】: 加入了 usable 和 unusable_reason
+    image_expected_keys = {'image_id', 'image_type', 'context', 'risk', 'usable', 'unusable_reason'}
     valid_image_types = {'盘面截图', '数据图表', '新闻截图', '社交截图', '收益截图', '梗图表情', '实拍照片', '其他'}
     valid_risks = {'平台或工具水印', 'KOL或他人言论截图', '推广二维码', '个人私密盈亏截图', '人脸', '敏感内容',
                    '图片模糊或关键内容不可读'}
@@ -304,7 +304,6 @@ def check_format_info(json_data, placeholders):
         extra_ev_keys = ev.keys() - evidence_expected_keys
         if extra_ev_keys:
             return False, f"evidences 序列第【{i + 1}】项存在未定义的冗余字段: 【{', '.join(extra_ev_keys)}】"
-
 
         # 枚举值检查
         if ev.get('dimension') not in valid_dimensions:
@@ -330,12 +329,17 @@ def check_format_info(json_data, placeholders):
             if not isinstance(img, dict):
                 return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项不是字典"
 
+            # 校验图片节点字段完整性
             missing_img_keys = image_expected_keys - img.keys()
             if missing_img_keys:
                 return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项缺失字段: 【{', '.join(missing_img_keys)}】"
 
+            # 【新增】: 补上图片节点的冗余字段拦截
+            extra_img_keys = img.keys() - image_expected_keys
+            if extra_img_keys:
+                return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项存在未定义的冗余字段: 【{', '.join(extra_img_keys)}】"
+
             # 严格映射：校验引用的图片占位符是否真的存在于原文中
-            # 修复：直接判断 img_id 是否在 placeholders 集合中，防止原文无图时大模型捏造图片
             img_id = img.get('image_id')
             if img_id not in placeholders:
                 return False, f"evidences 第【{i + 1}】项引用的 image_id【{img_id}】非法，只能使用原文真实存在的占位符"
@@ -352,9 +356,25 @@ def check_format_info(json_data, placeholders):
                 if risk not in valid_risks:
                     return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 risk 包含了非法枚举值【{risk}】"
 
+            # ================= 【新增】校验图片可用性 (usable / unusable_reason) =================
+            usable = img.get('usable')
+            unusable_reason = img.get('unusable_reason')
+
+            if not isinstance(usable, bool):
+                return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 usable 必须是布尔值(bool)"
+
+            if not isinstance(unusable_reason, str):
+                return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 unusable_reason 必须是字符串(str)"
+
+            # 逻辑互斥检验：能用则原因必须为空，不能用则必须说明原因
+            if usable is True and unusable_reason.strip() != "":
+                return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 usable 为 true 时，unusable_reason 必须为空字符串"
+
+            if usable is False and unusable_reason.strip() == "":
+                return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 usable 为 false 时，unusable_reason 不能为空"
+
     # 全部校验通过
     return True, ""
-
 def gen_media_format_info(post):
     """
     调度外部大模型根据图文内容提取格式化元数据，支持有限重试与降级返回。
@@ -634,6 +654,7 @@ def build_analysis_content():
 def get_all_non_empty_logic_mul_with_clean_text():
     """
     数据查询：获取数据库中所有不为空的 logic_mul 字段，并打包带有清洗后（无图片、视频占位符）的原始文本。
+    返回时进行排序：将包含有效图片的记录优先排在列表前面。
     [出参 Shape]: List[Dict]，数据结构形如：
                   [
                       {
@@ -657,26 +678,57 @@ def get_all_non_empty_logic_mul_with_clean_text():
         if logic_mul:
             # 1. 按照既有数据结构，安全地获取原始正文文本
             raw_text = post.get("content", {}).get("text_content", "")
-            post_id = post.get("post_id", "UNKNOWN_ID")
 
             # 2. 文本清洗：利用项目原生正则，去除 [插图: http...] / [视频: http...] 等占位符
             cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
 
             # 3. 将清洗后的文本和 logic_mul 组合存入列表
             valid_data_list.append({
-                # "post_id":post_id,
                 "text_content": cleaned_text,
                 "logic_mul": logic_mul
             })
 
     logger.info(
-        f"[数据提取/logic_mul及纯文本] 提取完毕 | "
+        f"[数据提取/logic_mul及纯文本] 初步提取完毕 | "
         f"关键参数: 【扫描帖子总量: {len(existing_posts)}】 | "
         f"结果: 【提取到有效数据组数: {len(valid_data_list)}】"
     )
 
-    return valid_data_list
+    # ==================== 新增：排序逻辑 ====================
+    # 考虑到整个项目中 logic_mul 数据结构可能存在多种版本（字典嵌套 evidences / 直接含 images / 列表）
+    # 编写一个兼容的向下探测函数，只要任意结构中包含有效图片，即判定为 True
+    def has_images(logic_data):
+        if not logic_data:
+            return False
 
+        if isinstance(logic_data, dict):
+            # 场景 A: 兼容 process_posts 中的逻辑 (logic_mul["images"])
+            images_list = logic_data.get("images")
+            if isinstance(images_list, list) and len(images_list) > 0:
+                return True
+
+            # 场景 B: 兼容 check_format_info 中的逻辑 (logic_mul["evidences"][i]["images"])
+            evidences = logic_data.get("evidences")
+            if isinstance(evidences, list):
+                for ev in evidences:
+                    if isinstance(ev, dict):
+                        ev_images = ev.get("images")
+                        if isinstance(ev_images, list) and len(ev_images) > 0:
+                            return True
+
+        # 场景 C: 兼容 build_search_text 中的逻辑 (logic_mul 本身就是一个列表)
+        elif isinstance(logic_data, list):
+            return len(logic_data) > 0
+
+        return False
+
+    # 根据是否包含 images 进行排序。
+    # has_images 为 True 映射为 0 (排在前面)，为 False 映射为 1 (排在后面)
+    valid_data_list.sort(key=lambda x: 0 if has_images(x["logic_mul"]) else 1)
+
+    logger.info("[数据提取/logic_mul及纯文本] 已完成按照 '含图片数据优先' 规则的重新排序。")
+
+    return valid_data_list
 
 
 if __name__ == "__main__":
