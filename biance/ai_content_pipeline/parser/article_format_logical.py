@@ -277,16 +277,16 @@ def check_format_info(json_data, placeholders):
         return False, "'evidences' 节点必须是列表(List)"
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
+    # 【修改点】：补充了新增的 logic_link 和 impact_weight 字段
     evidence_expected_keys = {
-        'core_fact',
-        'dimension', 'coins', 'stance', 'shelf_life', 'images'
+        'core_fact', 'logic_link', 'dimension', 'coins',
+        'stance', 'impact_weight', 'shelf_life', 'images'
     }
 
     valid_dimensions = {'K线形态', '技术指标', '链上数据', '资金流', '消息面', '基本面', '情绪判断'}
     valid_evidence_stances = {'看多', '看空', '震荡'}
     valid_shelf_lives = {'hours', 'days', 'weeks', 'long', 'unknown'}
 
-    # 【新增】: 加入了 usable 和 unusable_reason
     image_expected_keys = {'image_id', 'image_type', 'context', 'usable', 'unusable_reason'}
     valid_image_types = {'盘面截图', '数据图表', '新闻截图', '社交截图', '收益截图', '梗图表情', '实拍照片', '其他'}
 
@@ -302,6 +302,18 @@ def check_format_info(json_data, placeholders):
         extra_ev_keys = ev.keys() - evidence_expected_keys
         if extra_ev_keys:
             return False, f"evidences 序列第【{i + 1}】项存在未定义的冗余字段: 【{', '.join(extra_ev_keys)}】"
+
+        # 【新增】：校验 logic_link 类型
+        if not isinstance(ev.get('logic_link'), str):
+            return False, f"evidences 第【{i + 1}】项 logic_link 必须是字符串(str)"
+
+        # 【新增】：严格校验 impact_weight 的类型与 1-5 范围
+        impact_weight = ev.get('impact_weight')
+        # 注意：在 Python 中 bool 是 int 的子类，所以需要同时拦截 bool 类型
+        if not isinstance(impact_weight, int) or isinstance(impact_weight, bool):
+            return False, f"evidences 第【{i + 1}】项 impact_weight 必须是整数(int)"
+        if impact_weight < 1 or impact_weight > 5:
+            return False, f"evidences 第【{i + 1}】项 impact_weight 取值范围必须在 1 到 5 之间"
 
         # 枚举值检查
         if ev.get('dimension') not in valid_dimensions:
@@ -332,7 +344,7 @@ def check_format_info(json_data, placeholders):
             if missing_img_keys:
                 return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项缺失字段: 【{', '.join(missing_img_keys)}】"
 
-            # 【新增】: 补上图片节点的冗余字段拦截
+            # 补上图片节点的冗余字段拦截
             extra_img_keys = img.keys() - image_expected_keys
             if extra_img_keys:
                 return False, f"evidences 第【{i + 1}】项的 images 序列第【{j + 1}】项存在未定义的冗余字段: 【{', '.join(extra_img_keys)}】"
@@ -345,7 +357,7 @@ def check_format_info(json_data, placeholders):
             if img.get('image_type') not in valid_image_types:
                 return False, f"evidences 第【{i + 1}】项的 images 第【{j + 1}】项 image_type【{img.get('image_type')}】不在枚举值内"
 
-            # ================= 【新增】校验图片可用性 (usable / unusable_reason) =================
+            # 校验图片可用性 (usable / unusable_reason)
             usable = img.get('usable')
             unusable_reason = img.get('unusable_reason')
 
@@ -364,6 +376,7 @@ def check_format_info(json_data, placeholders):
 
     # 全部校验通过
     return True, ""
+
 def gen_media_format_info(post):
     """
     调度外部大模型根据图文内容提取格式化元数据，支持有限重试与降级返回。
@@ -667,12 +680,14 @@ def get_all_non_empty_logic_mul_with_clean_text():
         if logic_mul:
             # 1. 按照既有数据结构，安全地获取原始正文文本
             raw_text = post.get("content", {}).get("text_content", "")
+            # post_id = post.get("post_id", "UNKNOWN_ID")
 
             # 2. 文本清洗：利用项目原生正则，去除 [插图: http...] / [视频: http...] 等占位符
             cleaned_text = re.sub(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]", "", raw_text).strip()
 
             # 3. 将清洗后的文本和 logic_mul 组合存入列表
             valid_data_list.append({
+                # "post_id":post_id,
                 "text_content": cleaned_text,
                 "logic_mul": logic_mul
             })

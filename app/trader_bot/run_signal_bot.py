@@ -778,6 +778,12 @@ WORKER_CONFIGS = [
         "api_key": get_config("myself_biance_api_copy_key"),
         "api_secret": get_config("myself_biance_api_copy_secret")
     },
+    {
+        "account": "nana",
+        "strategy": "cross",
+        "api_key": get_config("nana_biance_api_copy_key"),
+        "api_secret": get_config("nana_biance_api_copy_secret")
+    },
 ]
 
 # 【新增核心函数】：模块顶层的独立运行空间，作为多进程的 target 入口
