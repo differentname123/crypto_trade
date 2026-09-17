@@ -27,7 +27,7 @@ POST_QUERY_LIMIT = 50000
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt'
 LLM_MAX_RETRIES = 3
 
-
+max_age_hours = 24 * 7
 # 全局初始化向量引擎（单例调用，避免重复加载）
 # VECTOR_ENGINE = VectorSearchEngine(collection_name="binance_posts_index")
 
@@ -213,6 +213,14 @@ def is_need_formatting(post):
 
     local_mapping = post.get("media", {}).get("local_mapping", {})
     if not local_mapping:
+        return False
+
+    publish_time = post.get("publish_time", 0)
+    if publish_time > 1e11:
+        publish_time /= 1000
+    # : 未来时间戳仍参与筛选，不单独拒绝。
+    age_hours = (time.time() - publish_time) / 3600
+    if age_hours > max_age_hours:
         return False
 
     video_duration = post.get("media", {}).get("video_duration")
