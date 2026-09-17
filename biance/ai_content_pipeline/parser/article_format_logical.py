@@ -203,37 +203,62 @@ def build_search_text(post):
 
 def is_need_formatting(post):
     """
-    判断帖子是否满足格式化前置条件：未被格式化且本地媒体文件已全部就绪。
-    [入参 Shape]: post 字典
-    [出参 Shape]: bool (是否需要处理)
+    判断帖子是否满足格式化前置条件。
+    采用单项守卫拦截设计（Guard Clause），方便独立注释/开关任一过滤规则。
     """
-    # 此处遵循保真红线，不擅自修改业务边界。
+    # =========================================================================
+    # 1. [核心基石 / 永不修改] 幂等性检查：已成功格式化过的帖子直接跳过，防止重复扣费
+    # =========================================================================
     if post.get("logic_mul"):
         return False
 
-    local_mapping = post.get("media", {}).get("local_mapping", {})
-    if not local_mapping:
+    # =========================================================================
+    # 2. [技术边界 / 极少修改] 格式排他：当前大模型提取链路不支持视频解析
+    # =========================================================================
+    video_duration = post.get("media", {}).get("video_duration")
+    if video_duration and video_duration > 0:
         return False
 
+    # 提取多媒体路径信息（供第 3、4、5 条规则按需消费）
+    local_mapping = post.get("media", {}).get("local_mapping", {})
+    local_paths = list(local_mapping.values())
+
+    # =========================================================================
+    # 3. [IO 安全 / 极少修改] 媒体完整性：若包含媒体，占位符对应的本地文件必须全部存在（防IO崩溃）
+    # =========================================================================
+    if local_paths and any(not path for path in local_paths):
+        return False
+
+    # =========================================================================
+    # 4. [资源保护 / 偶尔调整] 媒体数量上限：单帖图片过多会超出上下文或导致浏览器 OOM
+    # =========================================================================
+    MAX_MEDIA_COUNT = 10
+    if len(local_paths) >= MAX_MEDIA_COUNT:
+        return False
+
+    # =========================================================================
+    # 5. [业务形态 / 灵活调整] 过滤纯文本：
+    #    - 默认保持注释：同时支持【纯文本】和【图文】通过。
+    #    - 解除注释：切换回旧模式，【仅允许图文】通过。
+    # =========================================================================
+    # if not local_mapping:
+    #     return False
+
+    # =========================================================================
+    # 6. [业务策略 / 频繁变动] 时效性过滤：仅处理近 N 天内的数据
+    #    - 跑历史存量数据 / 调试全量数据时，直接整块注释掉此规则即可
+    # =========================================================================
     publish_time = post.get("publish_time", 0)
     if publish_time > 1e11:
-        publish_time /= 1000
-    # : 未来时间戳仍参与筛选，不单独拒绝。
+        publish_time /= 1000  # 毫秒兼容转换为秒
     age_hours = (time.time() - publish_time) / 3600
     if age_hours > max_age_hours:
         return False
 
-    video_duration = post.get("media", {}).get("video_duration")
-    if video_duration and video_duration > 0:
-        return False
-    local_paths = list(local_mapping.values())
-    valid_paths_count = sum(bool(path) for path in local_paths)
-    # if valid_paths_count == 0:
-    #     return False
-
-
-    # 必须保证帖子包含媒体，且所有媒体映射到的本地物理路径都不为空
-    return valid_paths_count == len(local_paths) and valid_paths_count < 10
+    # =========================================================================
+    # 所有前置守卫校验通过
+    # =========================================================================
+    return True
 
 
 def normalize_post_media(post_data):
