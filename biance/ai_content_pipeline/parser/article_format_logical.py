@@ -228,9 +228,12 @@ def is_need_formatting(post):
         return False
     local_paths = list(local_mapping.values())
     valid_paths_count = sum(bool(path) for path in local_paths)
+    # if valid_paths_count == 0:
+    #     return False
+
 
     # 必须保证帖子包含媒体，且所有媒体映射到的本地物理路径都不为空
-    return valid_paths_count > 0 and valid_paths_count == len(local_paths) and valid_paths_count < 10
+    return valid_paths_count == len(local_paths) and valid_paths_count < 10
 
 
 def normalize_post_media(post_data):
