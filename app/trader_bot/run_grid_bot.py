@@ -24,13 +24,14 @@ from datetime import datetime
 from enum import Enum
 
 from common_utils import get_config, setup_logger
+logger = setup_logger(app_name="grid_trader")
+
 from binance_u_gateway import (
     ErrKind, ExecStatus, cancel_all_orders_of_symbol, cancel_order_by_id, execute_order,
     fetch_last_price, fetch_market_precision, fetch_open_orders, format_price_amount,
     safe_init_exchange, supports_cancel_all, sync_exchange_time,
 )
 
-logger = setup_logger(app_name="grid_trader")
 DATA_DIR = "bot_data"
 LOG_DIR = "logs"
 POINT_CHECK_DELAY_COLD = 0.05
