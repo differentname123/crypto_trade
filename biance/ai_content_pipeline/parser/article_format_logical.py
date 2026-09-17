@@ -277,9 +277,9 @@ def check_format_info(json_data, placeholders):
         return False, "'evidences' 节点必须是列表(List)"
 
     # ================= 2. 校验 evidences (逻辑论据单元) =================
-    # 严格对齐 Prompt 要求的 8 个核心字段
+    # 严格对齐 Prompt 要求的核心字段（已移除 'claim'）
     evidence_expected_keys = {
-        'claim', 'support',
+        'support',
         'dimension', 'coins', 'stance', 'shelf_life', 'images'
     }
 

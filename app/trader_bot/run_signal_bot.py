@@ -3,7 +3,7 @@
 [功能摘要] 跨周期信号交易执行系统：按策略原子单元隔离，通过 REST 快照、CSV 账本对账与时间窗信号执行完成开平仓闭环。
 [多点并发支持版本] 面向对象重构：支持多账号、多策略以 Thread Worker 形式并行运行，通过独立账本与上下文隔离。
 """
-
+import multiprocessing
 import os
 import platform
 import threading
@@ -267,7 +267,13 @@ class TradingWorker:
     def __init__(self, account_alias, strategy_name, api_key, api_secret):
         self.account_alias = account_alias
         self.strategy_name = strategy_name
-        self.logger = setup_logger(app_name=f"{account_alias}_{strategy_name}_trader")
+
+        # 【核心修改】：加上 force_reset=True，在子进程启动时强制切断与父进程共用的文件句柄
+        self.logger = setup_logger(
+            app_name=f"{account_alias}_{strategy_name}_trader",
+            force_reset=True
+        )
+
         self._last_equity = 0.0
 
         # 分离账本文件
@@ -285,7 +291,7 @@ class TradingWorker:
             self.proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
             self.proxy_url = "http://127.0.0.1:7890"
 
-        # 修改 2：打开独立的交易所会话，直接使用传入的 api凭证
+        # 打开独立的交易所会话，直接使用传入的 api凭证
         self.exchange = safe_init_exchange(api_key, api_secret, self.proxies)
 
     def log(self, level, scope, message, **fields):
@@ -753,8 +759,9 @@ class TradingWorker:
                 time.sleep(30)
 
 
+
 # =============================================================================
-# L7. 并行任务配置与启动入口 (灵活的多账户/多策略配置)
+# L7. 并行任务配置与启动入口 (多进程模式重构)
 # =============================================================================
 
 # 请在此处配置你所需的账户与策略绑定关系，系统会自动并行调度
@@ -773,35 +780,43 @@ WORKER_CONFIGS = [
     },
 ]
 
-# 修改 4：main 函数遍历配置时，向 TradingWorker 注入对应凭证
+# 【新增核心函数】：模块顶层的独立运行空间，作为多进程的 target 入口
+def _run_worker_process(cfg):
+    """
+    运行在独立的子进程内存中。此时实例化的 Worker 会独占网络会话、日志句柄和资源。
+    """
+    worker = TradingWorker(
+        account_alias=cfg["account"],
+        strategy_name=cfg["strategy"],
+        api_key=cfg["api_key"],
+        api_secret=cfg["api_secret"]
+    )
+    worker.run()
+
+
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动多账号、多策略并行调度中心...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动多账号、多策略并行调度中心(多进程模式)...")
 
-    threads = []
-    # 动态拉起隔离的工作线程
+    processes = []
+    # 动态拉起物理隔离的工作进程
     for cfg in WORKER_CONFIGS:
-        worker = TradingWorker(
-            account_alias=cfg["account"],
-            strategy_name=cfg["strategy"],
-            api_key=cfg["api_key"],         # <--- 传入提取的 api_key
-            api_secret=cfg["api_secret"]    # <--- 传入提取的 api_secret
+        p = multiprocessing.Process(
+            target=_run_worker_process,
+            args=(cfg,),
+            name=f"WorkerProcess-{cfg['account']}-{cfg['strategy']}"
         )
-        t = threading.Thread(
-            target=worker.run,
-            name=f"Worker-{cfg['account']}-{cfg['strategy']}"
-        )
-        t.daemon = True  # 跟随主进程安全退出
-        t.start()
-        threads.append(t)
+        p.daemon = True  # 设为 daemon，使子进程随主进程退出而安全终止
+        p.start()
+        processes.append(p)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 成功拉起工作进程: {p.name} (PID: {p.pid})")
 
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 成功拉起 {len(threads)} 个并行工作单元。")
-
-    # 驻留主线程
+    # 驻留主进程并守护子进程
     try:
-        while True:
-            time.sleep(1)
+        # 使用 join 阻塞主进程，保持守护状态
+        for p in processes:
+            p.join()
     except KeyboardInterrupt:
-        print("\n收到退出信号，系统安全终止。")
+        print("\n收到退出信号，系统安全终止，正在停止所有子进程...")
 
 
 if __name__ == "__main__":
