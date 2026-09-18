@@ -1494,7 +1494,7 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
                 )
             else:
                 lines.append(
-                    f"  ► 🟢 开仓 | {base} | 目标权重: [{row['target_weight'] * 100:.1f}%] | "
+                    f"  ► 🔴 开仓 | {base} | 目标权重: [{row['target_weight'] * 100:.1f}%] | "
                     f"原因: [{row['reason']}]"
                 )
         logger.info("\n".join(lines))
