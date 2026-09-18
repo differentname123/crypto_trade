@@ -26,6 +26,9 @@ from tqdm import tqdm
 # ==========================================
 # 1. 全局绝对性配置参数 (支持动态网格搜索)
 # ==========================================
+# ==========================================
+# 1. 全局绝对性配置参数 (支持动态网格搜索)
+# ==========================================
 class Config:
     DATA_DIR = r"W:\project\python_project\oke_auto_trade\kline_data"
     BASE_OUTPUT_DIR = r"trade_results"
@@ -42,14 +45,15 @@ class Config:
     MIN_BTC_VARIANCE = 1e-16
     MIN_RESIDUAL_STD = 1e-10
 
-    # 可指定开仓评估区间，UTC，左闭右开。结束前不足完整持有期不再开仓。
-    # 不填时使用文件覆盖范围；不会提前查看未来价格来决定是否开仓。
-    # 网格搜索只在研究/决策区间运行；留出期应另设区间并仅运行已冻结参数。
-    ENTRY_START = None  # 例如 "2024-01-01"
-    EVALUATION_END = None  # 例如 "2025-01-01"；允许恰在此边界平仓
+    ENTRY_START = None
+    EVALUATION_END = None
 
-    Z_THRESHOLDS_TO_TEST = [2.0, 3.0, 3.5]
-    HOLDING_PERIODS_TO_TEST = [6, 12, 24]
+    # 【修改点】扩充后的网格搜索空间
+    Z_THRESHOLDS_TO_TEST = [2.0, 2.5, 3.0, 3.5]       # 增加 2.5 观察平滑度
+    HOLDING_PERIODS_TO_TEST = [6, 12, 24, 48]         # 增加 48h (长周期回归)
+    SIGNAL_WINDOWS_TO_TEST = [12, 24, 48]             # 新增: 信号计算窗口
+    BETA_WINDOWS_TO_TEST = [15, 30, 60]               # 新增: Beta历史窗口
+
     CACHE_VERSION = "fixed_beta_independent_v1"
 
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
@@ -75,7 +79,6 @@ class Config:
         cls.PARAM_FOLDER = f"Z{cls.Z_SCORE_THRESHOLD}_H{cls.HOLDING_PERIOD_HOURS}_B{cls.BETA_WINDOW_DAYS}_S{cls.SIGNAL_WINDOW_HOURS}"
         cls.OUTPUT_DIR = os.path.join(cls.BASE_OUTPUT_DIR, cls.PARAM_FOLDER)
         cls.RUN_ID = cls.MARKET_ID = ""
-
 
 TRADE_COLUMNS = [
     "run_id", "trade_id", "symbol", "status", "entry_time", "scheduled_exit_time",
@@ -459,17 +462,15 @@ def analyze_results():
 # ==========================================
 # 启动入口 (支持自动化网格搜索)
 # ==========================================
-# ==========================================
-# 启动入口 (支持自动化网格搜索)
-# ==========================================
 if __name__ == "__main__":
     from common.common_utils import read_json
+    import itertools  # 【新增】用于多维度参数组合
 
     SYMBOLS = read_json(Config.SYMBOLS_FILE)
     if not isinstance(SYMBOLS, list) or not all(isinstance(s, str) for s in SYMBOLS):
         raise ValueError("symbols.json应为币种字符串列表")
 
-    # 【新增修改】：在开始计算指纹之前，提前检查并自动过滤掉缺失的文件
+    # 【新增】在开始计算指纹之前，提前检查并自动过滤掉缺失的文件
     valid_symbols = []
     for s in set(SYMBOLS):
         if os.path.isfile(kline_path(s)):
@@ -478,7 +479,7 @@ if __name__ == "__main__":
             print(f"⚠️ 自动跳过: 未找到 {s} 的K线文件。")
     SYMBOLS = sorted(valid_symbols)
 
-    # 检查基础币种文件是否存在（因为如果没有BTC数据，所有币都无法算对冲收益）
+    # 检查基础币种文件是否存在（没有BTC数据，所有币都无法算对冲收益）
     if not os.path.isfile(kline_path(Config.BTC_SYMBOL)):
         raise FileNotFoundError(f"❌ 核心错误: 无法找到基准币种 {Config.BTC_SYMBOL} 的文件，停止运行。")
 
@@ -488,13 +489,24 @@ if __name__ == "__main__":
         s: file_sha256(kline_path(s)) for s in SYMBOLS + [Config.BTC_SYMBOL]
     }
 
-    for z in Config.Z_THRESHOLDS_TO_TEST:
-        for h in Config.HOLDING_PERIODS_TO_TEST:
-            Config.update_params(z_score=z, holding_period=h,
-                                 beta_window=Config.BETA_WINDOW_DAYS,
-                                 signal_window=Config.SIGNAL_WINDOW_HOURS)
-            print("\n" + "*" * 60)
-            print(f"🚀 正在执行网格搜索组合: Z_Score = {z}, Holding_Hours = {h}")
-            print("*" * 60)
-            run_all_backtests(SYMBOLS, DATA_FINGERPRINTS)
-            analyze_results()
+    # 【修改点】生成 4 个维度的参数笛卡尔积
+    param_grid = list(itertools.product(
+        Config.Z_THRESHOLDS_TO_TEST,
+        Config.HOLDING_PERIODS_TO_TEST,
+        Config.BETA_WINDOWS_TO_TEST,
+        Config.SIGNAL_WINDOWS_TO_TEST
+    ))
+
+    total_runs = len(param_grid)
+    print(f"\n规划了 {total_runs} 组参数网格搜索任务...")
+
+    for idx, (z, h, b, s) in enumerate(param_grid, 1):
+        Config.update_params(z_score=z, holding_period=h, beta_window=b, signal_window=s)
+
+        print("\n" + "=" * 60)
+        print(f"🚀 [任务 {idx}/{total_runs}] 正在执行网格搜索组合:")
+        print(f"   Z-Score触发 = {z} | 持仓限时 = {h}h | Beta预热 = {b}天 | 信号回看 = {s}h")
+        print("=" * 60)
+
+        run_all_backtests(SYMBOLS, DATA_FINGERPRINTS)
+        analyze_results()
