@@ -765,22 +765,16 @@ def run_parameter_combination(params, symbols, data_fingerprints, config_snapsho
         # spawn不会继承父进程对Config类属性的运行时修改，必须显式传入配置。
         for key, value in config_snapshot.items():
             setattr(Config, key, value)
-
         z, h, b, s, right, mode = params
         Config.update_params(z, h, b, s, right, mode)
-
-        # ==========================================
-        # 🔥 新增：在最顶层实现“真跳过” 🔥
-        # 如果汇总文件已存在，说明整个流程已完成，直接返回成功，什么都不算！
-        summary_path = os.path.join(Config.OUTPUT_DIR, f"{Config.PARAM_FOLDER}_quadrant_summary.csv")
-        if os.path.exists(summary_path):
-            return dict(status="OK", params=Config.PARAM_FOLDER,
-                        output_dir=Config.OUTPUT_DIR, log="SKIPPED (Already done)", pid=os.getpid())
-        # ==========================================
-
         prepare_run(symbols, data_fingerprints)
 
-        # 下面的代码保持不变...
+        # 【修改点 1】：检查当前参数组合是否已经成功运行过
+        done_marker = os.path.join(Config.OUTPUT_DIR, ".done")
+        if os.path.exists(done_marker):
+            return dict(status="SKIPPED", params=Config.PARAM_FOLDER,
+                        output_dir=Config.OUTPUT_DIR, log=None, pid=os.getpid())
+
         with parameter_run_lock():
             log_path = result_path("run.log")
             with open(log_path, "w", encoding="utf-8") as log:
@@ -792,11 +786,17 @@ def run_parameter_combination(params, symbols, data_fingerprints, config_snapsho
                     except Exception:
                         traceback.print_exc()
                         raise
+
+            # 【修改点 2】：本组参数全部回测与统计完成后，写入成功标记
+            with open(done_marker, "w", encoding="utf-8") as f:
+                f.write("success")
+
         return dict(status="OK", params=Config.PARAM_FOLDER,
                     output_dir=Config.OUTPUT_DIR, log=log_path, pid=os.getpid())
     except Exception as exc:
         return dict(status="FAILED", params=str(params), error=str(exc),
                     log=log_path, pid=os.getpid())
+
 
 def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
     """参数组合之间多进程并行；父进程只输出进度，各组详细输出写自己的日志。"""
@@ -835,8 +835,12 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
                     result = dict(status="FAILED", params=str(futures[future]),
                                   error=str(exc), log=None)
                 results.append(result)
+
+                # 【修改点 3】：在控制台输出中适配 SKIPPED 状态
                 if result["status"] == "OK":
                     print(f"✅ [{done}/{len(param_grid)}] {result['params']}")
+                elif result["status"] == "SKIPPED":
+                    print(f"⏭️ [{done}/{len(param_grid)}] {result['params']} (已处理，跳过)")
                 else:
                     errors.append(result)
                     print(f"❌ [{done}/{len(param_grid)}] {result['params']}: {result['error']}")
@@ -851,7 +855,6 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
     if errors:
         raise RuntimeError(f"{len(errors)}/{len(param_grid)} 组任务失败；成功组合结果已保留，详见日志。")
     return results
-
 
 # ==========================================
 # 启动入口 (支持自动化网格搜索)
