@@ -652,15 +652,34 @@ class TradingWorker:
             price = str(row.get("actual_fill_price", "")).strip()
             price = "N/A" if not price or price.lower() == "nan" else price
 
+            ledger_amt = to_num(row.get('filled_amount'))
+            exchange_amt = abs(position_cache.get(make_position_key(symbol, direction), 0.0))
+
+            # 使用方向图标和对齐排版增强视觉辨识度
+            icon = "📈 [多]" if direction == "LONG" else "📉 [空]" if direction == "SHORT" else "⚪ [无]"
+
             lines.append(
-                f"  - Symbol:[{symbol}] Direction:[{direction}] "
-                f"OpenRecordID:[{str(row.get('record_id', ''))[:12]}] "
-                f"FillPrice:[{price}] LedgerAmount:[{to_num(row.get('filled_amount'))}] "
-                f"ExchangeAmount:[{abs(position_cache.get(make_position_key(symbol, direction), 0.0))}]"
+                f" │ {icon} 标的: {symbol:<12} 均价: {price:<9} 账本: {ledger_amt:<7} 实际: {exchange_amt:<7} ID: {str(row.get('record_id', ''))[:8]:<8} │"
             )
 
         self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=f"{len(lines)}笔")
-        self.logger.info(" | Details:\n" + "\n".join(lines))
+
+        # 增加高对比度边框，让关键数据在瀑布流日志中一眼可见
+        border_top = " ┍" + "━" * 86 + "┑"
+        border_mid = " ┝" + "━" * 86 + "┥"
+        border_bot = " ┕" + "━" * 86 + "┙"
+        title = f" 💰 账户: [ {self.account_alias} ] | 策略: [ {self.strategy_name} ] | 当前持仓明细 "
+
+        display_block = (
+                f"\n{border_top}\n"
+                f" │ {title.center(84, ' ')} │\n"
+                f"{border_mid}\n" +
+                "\n".join(lines) +
+                f"\n{border_bot}"
+        )
+
+        self.logger.info(display_block)
+
 
     def get_top_movers(self, top_n=10, mode="top"):
         changes = pd.Series(fetch_usdt_swap_changes(self.exchange), dtype="float64").sort_values(ascending=False)
@@ -746,7 +765,7 @@ class TradingWorker:
 
                 if signal_df is not None and not signal_df.empty:
                     self.execute_signals(next_run, equity, position_cache, open_order_cache, signal_df)
-                    self.log("info", "SCHED/POST", "信号执行阶段结束", Next="盘后对账并刷新持仓汇总")
+                    # self.log("info", "SCHED/POST", "信号执行阶段结束", Next="盘后对账并刷新持仓汇总")
                 else:
                     self.log("info", "SIGNAL/SUMMARY", "本轮没有可执行信号", Target=target_time_str)
 
