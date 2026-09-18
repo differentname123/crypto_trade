@@ -17,10 +17,13 @@ from tqdm import tqdm
 # ==========================================
 # 1. 全局绝对性配置参数 (方便后续修改与网格搜索)
 # ==========================================
+# ==========================================
+# 1. 全局绝对性配置参数 (方便后续修改与网格搜索)
+# ==========================================
 class Config:
-    # 路径配置
+    # 基础路径配置
     DATA_DIR = r"W:\project\python_project\oke_auto_trade\kline_data"
-    OUTPUT_DIR = r"trade_results"
+    BASE_OUTPUT_DIR = r"trade_results"  # 改为基础输出目录
     BTC_SYMBOL = "BTCUSDT"
 
     # 策略参数
@@ -35,8 +38,13 @@ class Config:
     # 派生参数
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
 
+    # 【核心修改】：动态生成带有参数标识的专属输出子文件夹
+    # 例如： trade_results/Z2.0_H6_B30_S24
+    PARAM_FOLDER = f"Z{Z_SCORE_THRESHOLD}_H{HOLDING_PERIOD_HOURS}_B{BETA_WINDOW_DAYS}_S{SIGNAL_WINDOW_HOURS}"
+    OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, PARAM_FOLDER)
 
-# 确保输出目录存在
+
+# 确保当前参数组合的专属输出目录存在
 if not os.path.exists(Config.OUTPUT_DIR):
     os.makedirs(Config.OUTPUT_DIR)
 
@@ -97,8 +105,24 @@ def calculate_indicators(df_alt, df_btc):
 # 3. 预计算动态截面中位数 & 单标的回测模块
 # ==========================================
 def generate_market_median(symbols):
-    """预计算全市场的动态截面中位数水位线"""
-    print("正在预计算全市场动态截面中位数水位线...")
+    """预计算全市场的动态截面中位数水位线，带有本地缓存复用功能"""
+
+    # 将缓存文件存放在最外层的 BASE_OUTPUT_DIR 中，作为公共资源被各个参数组合复用
+    # 文件名绑定 BETA_WINDOW_DAYS，如果以后修改了 Beta 窗口天数，它会自动重新计算一份新的
+    cache_path = os.path.join(Config.BASE_OUTPUT_DIR, f"market_median_B{Config.BETA_WINDOW_DAYS}.csv")
+
+    # ============ 1. 尝试命中缓存 ============
+    if os.path.exists(cache_path):
+        print(f"检测到已存在的全市场截面中位数缓存: {cache_path}")
+        print("直接加载缓存，跳过重复计算...\n")
+        df_cache = pd.read_csv(cache_path)
+        df_cache['open_time'] = pd.to_datetime(df_cache['open_time'])
+        df_cache.set_index('open_time', inplace=True)
+        # 返回 pandas Series 格式保持前后兼容
+        return df_cache['median_turnover']
+
+    # ============ 2. 缓存未命中，执行全量计算 ============
+    print("未检测到缓存，正在预计算全市场动态截面中位数水位线 (计算量较大请耐心等待)...")
     turnover_dfs = []
 
     for symbol in tqdm(symbols):
@@ -109,9 +133,11 @@ def generate_market_median(symbols):
         if not os.path.exists(kline_path):
             continue
 
-        df = pd.read_csv(kline_path, usecols=['timestamp', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df.set_index('timestamp', inplace=True)
+        # 读取 open_time
+        df = pd.read_csv(kline_path, usecols=['open_time', 'close', 'volume'])
+        # 指定 unit='ms' 将毫秒级时间戳转为 datetime 格式
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        df.set_index('open_time', inplace=True)
 
         # 计算该币种的30天日均成交额
         turnover = df['volume'] * df['close']
@@ -124,8 +150,13 @@ def generate_market_median(symbols):
     # 拼接全市场成交额大表，并求横截面中位数
     all_turnovers = pd.concat(turnover_dfs, axis=1)
     market_median_series = all_turnovers.median(axis=1)
+    market_median_series.name = 'median_turnover'  # 为存入 CSV 设置列名
 
-    print("动态中位数基准线计算完成！\n")
+    # ============ 3. 落盘保存缓存 ============
+    print(f"计算完成！正在将全市场中位线保存至缓存: {cache_path}")
+    market_median_series.to_csv(cache_path, header=True, index_label='open_time')
+
+    print("动态中位数基准线准备就绪！\n")
     return market_median_series
 
 
@@ -270,8 +301,9 @@ def process_symbol(symbol, btc_df, market_median_series):
             return
 
         df_alt = pd.read_csv(kline_path)
-        df_alt['timestamp'] = pd.to_datetime(df_alt['timestamp'])
-        df_alt.set_index('timestamp', inplace=True)
+        # 指定 unit='ms' 将毫秒级时间戳转为 datetime 格式
+        df_alt['open_time'] = pd.to_datetime(df_alt['open_time'], unit='ms')
+        df_alt.set_index('open_time', inplace=True)
 
         # 数据对齐，只保留同时存在的时间段
         aligned_alt, aligned_btc = df_alt.align(btc_df, join='inner', axis=0)
@@ -302,15 +334,16 @@ def run_all_backtests(symbols):
     print("加载 BTC 基准数据...")
     btc_path = os.path.join(Config.DATA_DIR, f"{Config.BTC_SYMBOL}_1h_2021-01-01_merged.csv")
     btc_df = pd.read_csv(btc_path)
-    btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'])
-    btc_df.set_index('timestamp', inplace=True)
 
-    print(f"开始回测配令人套利，共 {len(symbols)} 个币种...")
+    # 指定 unit='ms' 将毫秒级时间戳转为 datetime 格式
+    btc_df['open_time'] = pd.to_datetime(btc_df['open_time'], unit='ms')
+    btc_df.set_index('open_time', inplace=True)
+
+    print(f"开始回测配对交易，共 {len(symbols)} 个币种...")
     for symbol in tqdm(symbols):
         if symbol == Config.BTC_SYMBOL:
             continue
         process_symbol(symbol, btc_df, market_median_series)
-
 
 # ==========================================
 # 5. 统计与分析模块 (第四、五步：分组与留出期检验基础)
