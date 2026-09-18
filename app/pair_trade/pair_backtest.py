@@ -248,7 +248,7 @@ def prepare_run(symbols, data_fingerprints=None):
     if data_fingerprints is None:
         data_fingerprints = {s: file_sha256(kline_path(s)) for s in universe}
 
-    market = dict(version=Config.CACHE_VERSION, code=file_sha256(__file__),
+    market = dict(version=Config.CACHE_VERSION, code="v1.0_fixed",
                   data={s: data_fingerprints[s] for s in universe}, universe=universe,
                   btc=Config.BTC_SYMBOL, beta=Config.BETA_WINDOW_HOURS,
                   signal=Config.SIGNAL_WINDOW_HOURS, end=Config.EVALUATION_END)
@@ -856,12 +856,28 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
         raise RuntimeError(f"{len(errors)}/{len(param_grid)} 组任务失败；成功组合结果已保留，详见日志。")
     return results
 
+
 # ==========================================
 # 启动入口 (支持自动化网格搜索)
 # ==========================================
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     from common.common_utils import read_json
+    import glob
+    import os
+
+    # 【新增】启动前强行清理所有残留的锁文件（仅限确认单机单例运行的情况使用！）
+    print("正在扫描并清理残留的 .run.lock 文件...")
+    lock_files = glob.glob(os.path.join(Config.BASE_OUTPUT_DIR, "*", ".run.lock"))
+    deleted_count = 0
+    for lock_file in lock_files:
+        try:
+            os.remove(lock_file)
+            deleted_count += 1
+        except Exception as e:
+            print(f"清理死锁失败 {lock_file}: {e}")
+    if deleted_count > 0:
+        print(f"✅ 成功清理了 {deleted_count} 个残留的锁文件！")
 
     SYMBOLS = read_json(Config.SYMBOLS_FILE)
     if not isinstance(SYMBOLS, list) or not all(isinstance(s, str) for s in SYMBOLS):
