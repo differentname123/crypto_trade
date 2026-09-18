@@ -5160,3 +5160,4 @@
 /app/trader_bot/data/
 /app/trader_bot/logs/
 /app/trader_bot/signal_data/
+/app/pair_trade/trade_results/
