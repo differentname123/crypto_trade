@@ -1475,13 +1475,13 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
 
         if latest_signals.empty:
             logger.info(
-                f"🎯 [发单指令/{name}] 截面: [{latest_exec_bjt:%Y-%m-%d %H:%M:%S}] (北京时间) | "
+                f"🎯 [发单指令/{name}] ⏰⏰⏰【信号截面: {latest_exec_bjt:%Y-%m-%d %H:%M:%S}】⏰⏰⏰ (北京时间) | "
                 f"结果: [无开平仓信号，保持现有仓位]"
             )
             continue
 
         lines = [
-            f"🎯 [发单指令/{name}] 截面: [{latest_exec_bjt:%Y-%m-%d %H:%M:%S}] (北京时间) | "
+            f"🎯 [发单指令/{name}] ⏰⏰⏰【信号截面: {latest_exec_bjt:%Y-%m-%d %H:%M:%S}】⏰⏰⏰ (北京时间) | "
             f"待执行: [{len(latest_signals)}] 条"
         ]
         for _, row in latest_signals.iterrows():
@@ -1513,7 +1513,6 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
         f"覆盖策略数: [{len(all_ledgers)}]"
     )
     return final_ledger
-
 
 def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
     """
