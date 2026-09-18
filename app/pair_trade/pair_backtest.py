@@ -65,7 +65,7 @@ class Config:
     POSITION_MODES_TO_TEST = ["FIXED_HOLD", "MAX_DEVIATION"]
 
     # 每个进程独立运行一组参数；多币种长历史会占内存，可按机器调整。
-    MAX_WORKERS = max(1, min(4, (os.cpu_count() or 1) - 1))
+    MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
     NUMERIC_THREADS_PER_WORKER = 1  # 避免每个进程再启动一整组BLAS线程。
 
     CACHE_VERSION = "fixed_beta_right_side_rotation_v2"
@@ -765,9 +765,22 @@ def run_parameter_combination(params, symbols, data_fingerprints, config_snapsho
         # spawn不会继承父进程对Config类属性的运行时修改，必须显式传入配置。
         for key, value in config_snapshot.items():
             setattr(Config, key, value)
+
         z, h, b, s, right, mode = params
         Config.update_params(z, h, b, s, right, mode)
+
+        # ==========================================
+        # 🔥 新增：在最顶层实现“真跳过” 🔥
+        # 如果汇总文件已存在，说明整个流程已完成，直接返回成功，什么都不算！
+        summary_path = os.path.join(Config.OUTPUT_DIR, f"{Config.PARAM_FOLDER}_quadrant_summary.csv")
+        if os.path.exists(summary_path):
+            return dict(status="OK", params=Config.PARAM_FOLDER,
+                        output_dir=Config.OUTPUT_DIR, log="SKIPPED (Already done)", pid=os.getpid())
+        # ==========================================
+
         prepare_run(symbols, data_fingerprints)
+
+        # 下面的代码保持不变...
         with parameter_run_lock():
             log_path = result_path("run.log")
             with open(log_path, "w", encoding="utf-8") as log:
@@ -784,7 +797,6 @@ def run_parameter_combination(params, symbols, data_fingerprints, config_snapsho
     except Exception as exc:
         return dict(status="FAILED", params=str(params), error=str(exc),
                     log=log_path, pid=os.getpid())
-
 
 def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
     """参数组合之间多进程并行；父进程只输出进度，各组详细输出写自己的日志。"""
