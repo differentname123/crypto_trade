@@ -762,6 +762,21 @@ def extract_and_group_valid_evidences():
     # 注意：旧版本这里的 clean_data = process_posts(...) 已不适用，
     # 因为现在分组的最底层数据是【论据(evidence)列表】而不是【帖子(post)列表】了。
     # 具体的组合和清理逻辑应该交由下游负责接收此 Dict 的函数去执行。
+    for coin, stances_dict in grouped_results.items():
+        for stance, ev_list in stances_dict.items():
+            # key 指定根据 impact_weight 排序，防御性使用 get(,0) 防止部分脏数据缺失该字段
+            # reverse=True 表示从大到小（降序）
+            ev_list.sort(key=lambda x: x.get('impact_weight', 0), reverse=True)
+
+        # 转化为普通字典，剥离 defaultdict 属性
+    final_dict = json.loads(json.dumps(grouped_results))
+
+    logger.info(
+        f"[论据提取/完成] 数据清洗、分组与【权重排序】完毕 | "
+        f"获得有效论据总数: {valid_evidence_count} | "
+        f"涉及币种数量: {len(final_dict.keys())}"
+    )
+
     extract_data = final_dict['BTC']['看多']
 
     return final_dict
