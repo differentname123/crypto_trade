@@ -8,7 +8,7 @@
 4. 校验拦截：严格校验大模型返回的 JSON 元数据结构，确保返回的 image_id 与解析的占位符数量及名称做到 1:1 绝对映射。
 [输出数据] 将解析并严格校验通过的格式化元数据赋值给 post['logic_mul']，随后持久化更新至 MongoDB 数据库。
 """
-
+import json
 import re
 import time
 from collections import defaultdict
@@ -637,57 +637,134 @@ def process_posts(post_list):
     return result
 
 
+def extract_and_group_valid_evidences():
+    """
+    [功能摘要]
+    拉取全量帖子数据，提取出其中通过 LLM 格式化的最小逻辑单元 (evidences)，
+    根据时效性 (shelf_life & publish_time) 过滤掉过期的论据（且最长不超过1个月）。
+    最后，将论据按「关联币种(coin)」拆分，并按「立场(stance)」进行二维分组。
 
-def build_analysis_content():
+    [出参结构]
+    Dict[coin(str), Dict[stance(str), List[Evidence(dict)]]]
+    例如:
+    {
+        "BTC": {
+            "看多": [{evidence_1}, {evidence_2}],
+            "看空": [{evidence_3}]
+        },
+        "SOL": {
+            ...
+        }
+    }
+    """
     post_manager = UniversalPostManager(gen_db_object())
+    # 拉取数据库中所有相关源的帖子
     existing_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-    logger.info(
-        f"[数据清理/启动] 拉取待清理帖子完毕 | 关键参数: 【总量: {len(existing_posts)}】 | 结果: 【开始扫描待清理项】")
+
+    logger.info(f"[论据提取/启动] 拉取帖子总量: {len(existing_posts)} | 准备进行有效性判定与币种分组...")
 
     current_time = time.time()
-    one_day_seconds = 24 * 60 * 60
-    filtered_posts = []
 
-    # 1 & 2. 找到 logic_mul 存在的 posts，并过滤 publish_time 在 1 天内的数据
-    for post in existing_posts:
-        # 检查 logic_mul 是否存在
-        if not post.get('logic_mul'):
-            continue
+    # 1. 定义时效映射字典 (将 shelf_life 转换为有效的秒数)
+    shelf_life_map = {
+        'hours': 24 * 3600,  # 24小时
+        'days': 7 * 24 * 3600,  # 7天 (7 * 24小时)
+        'weeks': 30 * 24 * 3600,  # 30天 (近似1个月)
+        'long': 30 * 24 * 3600,  # 长期也受限于1个月硬限制
+        'unknown': 24 * 3600  # 未知默认按最短的24小时处理以防干扰
+    }
 
-        publish_time = post.get('publish_time')
-        if publish_time is not None:
-            try:
-                # 转换为 float 防御性编程，处理 publish_time 可能是字符串的情况
-                # 判断条件：当前时间减去 1天前的时间 <= 发布时间
-                if (current_time - one_day_seconds) <= float(publish_time) <= (current_time + 3600):
-                    # 注: 加 3600 秒是为了兼容服务器间可能存在的轻微时间误差（如未来时间戳）
-                    filtered_posts.append(post)
-            except (ValueError, TypeError):
-                # 如果 publish_time 格式异常无法转换，则跳过
-                continue
+    # 定义绝对时间上限：1个月（30天）
+    MAX_AGE_SECONDS = 30 * 24 * 3600
 
-    # 3. 按照 main 和 stance 进行双重分组
-    # 使用 defaultdict(lambda: defaultdict(list)) 可以自动初始化缺失的嵌套字典
+    # 使用 defaultdict 初始化嵌套字典：grouped_results[coin][stance] = list
     grouped_results = defaultdict(lambda: defaultdict(list))
 
-    for post in filtered_posts:
-        # 安全获取嵌套字典的值，防止因为数据结构不完整抛出 KeyError
-        logic_mul = post.get('logic_mul', {})
-        doc = logic_mul.get('doc', {})
+    valid_evidence_count = 0  # 统计最终有效论据总数
 
-        main_topic = doc.get('main')
-        stance = doc.get('stance')
+    # 2. 开始遍历帖子，提取并过滤论据
+    for post in existing_posts:
+        logic_mul = post.get('logic_mul')
+        # 如果没有格式化数据，或格式化数据没有 evidences 节点，直接跳过
+        if not logic_mul or not isinstance(logic_mul, dict) or not logic_mul.get('evidences'):
+            continue
 
-        # 确保这两个分组键存在才将其加入结果字典
-        if main_topic is not None and stance is not None:
-            grouped_results[main_topic][stance].append(post)
+        evidences = logic_mul.get('evidences', [])
 
-    # 如果后续需要标准的 dict 格式，可以直接将 grouped_results 当作普通字典返回或转换
-    # 打印一下处理结果（可选）
-    logger.info(f"[数据清理/分组] 分组处理完成 | 关键参数: 【符合条件的帖子量: {len(filtered_posts)}】")
-    clean_data = process_posts(grouped_results['BTC']['看多'])
-    return grouped_results
+        # 处理帖子发布时间
+        publish_time = post.get('publish_time')
+        if not publish_time:
+            continue
 
+        try:
+            publish_time = float(publish_time)
+            # 防御性编程：如果是毫秒级时间戳，转换为秒
+            if publish_time > 1e11:
+                publish_time /= 1000
+        except (ValueError, TypeError):
+            continue
+
+        # 计算帖子年龄（秒）
+        age_seconds = current_time - publish_time
+
+        # 规则 1：过滤绝对过期数据。如果帖子发布时间超过1个月，或者出现异常的未来时间(防误差容忍3600秒)，直接整帖丢弃
+        if age_seconds > MAX_AGE_SECONDS or age_seconds < -3600:
+            continue
+
+        # 提前提取原帖文本，注入到论据中，方便下游处理配图和组装文章
+        raw_text_content = post.get('content', {}).get('text_content', '')
+        post_id = post.get('post_id', 'UNKNOWN')
+
+        # 3. 遍历提取出来的所有论据单元 (MLU)
+        for ev in evidences:
+            shelf_life = ev.get('shelf_life', 'unknown')
+            valid_duration = shelf_life_map.get(shelf_life, 24 * 3600)
+
+            # 规则 2：动态有效性判断。帖子年龄超过了该论据的保质期，则判定过期
+            if age_seconds > valid_duration:
+                continue
+
+            # 提取维度信息
+            coins = ev.get('coins', [])
+            stance = ev.get('stance')
+
+            # 防御性判断：如果没有币种或立场，无法分组
+            if not isinstance(coins, list) or not coins or not stance:
+                continue
+
+            # 丰富论据上下文：由于你后续需要脱离原帖对论据进行处理，
+            # 必须把原帖 ID、发布时间、甚至原文纯文本绑在论据上，否则论据就成孤岛了
+            enriched_ev = ev.copy()
+            enriched_ev['source_post_id'] = post_id
+            enriched_ev['publish_time'] = publish_time
+            enriched_ev['source_text_content'] = raw_text_content
+
+            # 规则 3：按币种进行多重分发（展平）
+            # 假如 coins 是 ["BTC", "ETH"]，这个论据会同时被放进 BTC 和 ETH 的列表中
+            for coin in coins:
+                coin = str(coin).strip().upper()  # 标准化处理
+                if not coin:
+                    continue
+
+                # 执行双重分组：按 coin -> 按 stance
+                grouped_results[coin][stance].append(enriched_ev)
+                valid_evidence_count += 1
+
+    # 为了去除 defaultdict 属性（方便后续序列化或打印），将其转化为普通字典
+    final_dict = json.loads(json.dumps(grouped_results))
+
+    logger.info(
+        f"[论据提取/完成] 数据清洗分组完毕 | "
+        f"获得有效论据总数: {valid_evidence_count} | "
+        f"涉及币种数量: {len(final_dict.keys())}"
+    )
+
+    # 注意：旧版本这里的 clean_data = process_posts(...) 已不适用，
+    # 因为现在分组的最底层数据是【论据(evidence)列表】而不是【帖子(post)列表】了。
+    # 具体的组合和清理逻辑应该交由下游负责接收此 Dict 的函数去执行。
+    extract_data = final_dict['BTC']['看多']
+
+    return final_dict
 
 def get_all_non_empty_logic_mul_with_clean_text():
     """
@@ -773,17 +850,10 @@ def get_all_non_empty_logic_mul_with_clean_text():
 
 if __name__ == "__main__":
     # clear_all_media_format_batch()
-
+    extract_and_group_valid_evidences()
 
 
     valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
-
-    # post_manager = UniversalPostManager(gen_db_object())
-
-    # sync_posts_to_vector_db(post_manager)
-
-    # data = search_recent_posts_by_semantics("200倍杠杆", post_manager, top_n=5)
-    # build_analysis_content()
 
     format_image_article()
