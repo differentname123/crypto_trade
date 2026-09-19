@@ -57,8 +57,8 @@ class Config:
     EVALUATION_END = None
 
     # 【修改点】扩充后的网格搜索空间
-    Z_THRESHOLDS_TO_TEST = [3.0, 3.5, 4, 5]       # 增加 2.5 观察平滑度
-    HOLDING_PERIODS_TO_TEST = [24, 48, 60, 72]         # 增加 48h (长周期回归)
+    Z_THRESHOLDS_TO_TEST = [3.0, 3.5, 4, 5, 6, 7]       # 增加 2.5 观察平滑度
+    HOLDING_PERIODS_TO_TEST = [48, 72, 96, 120]         # 增加 48h (长周期回归)
     SIGNAL_WINDOWS_TO_TEST = [24, 48, 60]             # 新增: 信号计算窗口
     BETA_WINDOWS_TO_TEST = [30, 60, 90]               # 新增: Beta历史窗口
     RIGHT_SIDE_ENTRIES_TO_TEST = [False, True]

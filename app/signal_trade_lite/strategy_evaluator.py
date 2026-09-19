@@ -832,16 +832,51 @@ def compute_parameter_plateau(
 def show_leaderboard_csv(
         csv_file="strategy_leaderboard_15600_files.csv",
         direction="both",
-        min_trades=1000,  # 实际开仓数下限
-        min_net_profit=-1000,  # 净利润下限(Margin倍数)
-        min_total_profit=20,  # 总收益下限(Margin倍数)
-        min_plateau_survival_cushion=30,  # 【平原】存活安全垫下限（天），反映极端行情的兜底能力
-        max_plateau_p90_no_profit=20,  # 【平原】90%分位最长无盈利期上限（天）
-        min_plateau_mean_net_profit=0,  # 【平原】平均净利润下限（Margin倍数）
-        max_holding_days=20,  # 最大持仓时间上限（天）
-        min_neighbors=81,  # 全币邻居数下限（如：测试3个币，满邻居为 3×27 = 81）
-        min_median_survival_days=60,  # 中位数存活下限（天）
-        target_strategy_keywords=("factor",)  # 目标策略名称需包含的关键字元组，按此过滤展示
+
+        # ------------------- 基础过滤与容量 -------------------
+        min_trades=1000,
+        # 【自身属性】实际开仓次数下限。
+        # 解释：开仓次数太少（比如只交易了十几次也赚了钱）说明统计样本不足，极大可能是运气好。过滤掉次数太少的数据，确保策略经历了足够的市场考验。
+
+        max_holding_days=20,
+        # 【自身属性】单次开仓的最大持仓时间上限（天）。
+        # 解释：防止出现“死扛策略”。有些策略看似胜率100%、没有回撤，其实是因为被套牢了几个月死不平仓。限制最大持仓天数能剔除这种虚假繁荣。
+
+        # ------------------- 自身收益指标（针对当前币种+当前精确参数） -------------------
+        min_median_survival_days=60,
+        # 【自身属性】当前配置下的中位数存活天数下限（天）。
+        # 解释：只看这特定的一行数据（比如 BTC，加仓0.02，止盈0.03），它自身每次跑策略直到爆仓（或回测结束）的寿命中位数必须达标。要求它自己本身是个“长寿”的策略。
+
+        min_net_profit=-1000,
+        # 【自身属性】单行数据的净利润底线（单位：Margin倍数）。
+        # 解释：1.0代表赚了1倍的本金（保证金）。-1000代表最多允许亏损1000倍本金。这里设为负数通常是作为宽容的底线，把兜底任务交给下面的总收益和平原指标。
+
+        min_total_profit=20,
+        # 【自身属性】单行数据的总收益下限（单位：Margin倍数）。
+        # 解释：过滤掉那些“虽然很安全没亏钱，但也根本赚不到什么钱”的“磨洋工”策略，要求必须有一定打钱能力。
+
+        # ------------------- 平原指标（抗过拟合与全局稳健性） -------------------
+        min_neighbors=81,
+        # 【平原属性】参与平原计算的有效“全币邻居数”下限。
+        # 解释：参数空间是3维的(Margin,加仓间距,止盈间距)，上下浮动一格会形成 3x3x3=27 个网格。如果你测试了3个币种，满数据应该是 3×27=81。这个值用于过滤掉处于参数边界、数据缺失严重、没有足够邻居支撑的孤岛参数。
+
+        min_plateau_survival_cushion=30,
+        # 【平原属性】整个参数平原的存活安全垫下限（天）。
+        # 解释：【极度严格的连坐机制】把当前参数稍微调大调小一点（27个网格），并把所有测试币种全算上，把它们所有的“中位存活时间”排个序，取最差的 10%（P10分位数）。
+        # 哪怕遇到最烂的参数偏移、最难做的垃圾币，它的寿命也必须大于 30 天。如果小于这个值，说明该参数只是在一个币上运气好，换个币或者参数稍微偏一点立马爆仓。
+
+        max_plateau_p90_no_profit=20,
+        # 【平原属性】整个参数平原最长无盈利期的 90% 分位数上限（天）。
+        # 解释：【抗煎熬底线】在这个参数附近以及所有币种中，90% 的情况都不会出现连续超过 20 天没有利润的干等期。用于过滤掉那些“虽然死不了，但经常被套死一两个月一动不动”的策略群。
+
+        min_plateau_mean_net_profit=0,
+        # 【平原属性】整个参数平原的平均净利润下限（Margin倍数）。
+        # 解释：要求这个参数所在的整个“地带”总体上必须是赚钱的（>0）。防止某个特定的参数点刚好卡在了一个偶然赚钱的峰值上，而周围的参数其实全在亏钱（孤岛效应）。
+
+        # ------------------- 展示控制 -------------------
+        target_strategy_keywords=("factor",)
+        # 策略白名单控制。
+        # 解释：只打印展示名称中包含这些关键字（如"factor"）的策略，方便在大乱炖的回测文件中，精准查看自己当前关心的策略，防止日志刷屏。
 ):
     """
     专门用于读取并展示 CSV 文件的函数。
@@ -860,6 +895,39 @@ def show_leaderboard_csv(
     if df_all.empty:
         print("[提示] CSV 文件为空，无数据可展示。")
         return
+
+    # ===== 新增：通过率统计相关组件 =====
+    total_initial_rows = len(df_all)
+    filter_stats = []
+
+    def log_stat(cond_name, before_count, after_count):
+        filter_stats.append((cond_name, before_count, after_count))
+
+    def print_pass_rates():
+        if not filter_stats:
+            return
+        print("\n" + "=" * 100)
+        print(" 📊 各条件过滤通过率统计")
+        print("-" * 100)
+
+        def get_w(s):
+            return sum(2 if unicodedata.east_asian_width(c) in ('F', 'W', 'A') else 1 for c in str(s))
+
+        def pad_w(s, width):
+            s = str(s)
+            return s + " " * max(0, width - get_w(s))
+
+        header = f" {pad_w('过滤条件', 38)} | {pad_w('过滤前(行)', 10)} | {pad_w('过滤后(行)', 10)} | {pad_w('单步通过率', 12)} | {pad_w('总通过率', 12)}"
+        print(header)
+        print("-" * 100)
+        for cond, b, a in filter_stats:
+            step_rate = f"{(a / b * 100):.2f}%" if b > 0 else "0.00%"
+            tot_rate = f"{(a / total_initial_rows * 100):.2f}%" if total_initial_rows > 0 else "0.00%"
+            print(
+                f" {pad_w(cond, 38)} | {pad_w(b, 10)} | {pad_w(a, 10)} | {pad_w(step_rate, 12)} | {pad_w(tot_rate, 12)}")
+        print("=" * 100 + "\n")
+
+    # ====================================
 
     # ===== 输出说明（动态读取过滤参数）=====
     print("=" * 90)
@@ -884,10 +952,13 @@ def show_leaderboard_csv(
 
     # 1. 过滤方向
     d_filter = direction.strip().lower()
+    rows_before = len(df_all)
     if d_filter == 'long':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Long']
+        log_stat("方向过滤: Long", rows_before, len(df_all))
     elif d_filter == 'short':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Short']
+        log_stat("方向过滤: Short", rows_before, len(df_all))
 
     # ================== 新增 Spike 和 Smooth 的计算与过滤 ==================
     def parse_survival(v):
@@ -926,45 +997,76 @@ def show_leaderboard_csv(
     )
 
     # 3. 过滤 Smooth 不为 Y 的行
+    rows_before = len(df_all)
     df_all = df_all[df_all["Smooth"] == "Y"]
+    log_stat("平滑度检测: Smooth == Y", rows_before, len(df_all))
 
     if df_all.empty:
+        print_pass_rates()
         print(f"[提示] 根据 Smooth 过滤后，无匹配数据。")
         return
     # =======================================================================
 
     # 2. 过滤交易次数
     if "实际开仓数" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["实际开仓数"] >= min_trades]
+        log_stat(f"实际开仓数 >= {min_trades}", rows_before, len(df_all))
 
     # 利用内部的 parse_survival 处理 "中位存活(天)"，脱离对外部全局 check_lifespan 函数的依赖
     if "中位存活(天)" in df_all.columns:
+        rows_before = len(df_all)
         df_all["_median_surv_days"] = df_all["中位存活(天)"].apply(parse_survival)
         df_all = df_all[df_all["_median_surv_days"] >= min_median_survival_days]
+        log_stat(f"中位存活(天) >= {min_median_survival_days}", rows_before, len(df_all))
 
     # 3. 过滤净利润
     if "净利润(Margin倍数)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
+        log_stat(f"净利润(Margin倍数) >= {min_net_profit}", rows_before, len(df_all))
 
     # === 参数化提取后的平原指标及风控指标过滤 ===
     if "平原存活安全垫(天)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["平原存活安全垫(天)"] >= min_plateau_survival_cushion]
+        log_stat(f"平原存活安全垫(天) >= {min_plateau_survival_cushion}", rows_before, len(df_all))
 
     if "平原90%分位无盈利(天)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["平原90%分位无盈利(天)"] <= max_plateau_p90_no_profit]
+        log_stat(f"平原90%分位无盈利(天) <= {max_plateau_p90_no_profit}", rows_before, len(df_all))
 
     if "平原均净利(M倍)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["平原均净利(M倍)"] > min_plateau_mean_net_profit]
+        log_stat(f"平原均净利(M倍) > {min_plateau_mean_net_profit}", rows_before, len(df_all))
 
     if "最大持仓(h)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["最大持仓(h)"] <= max_holding_days * 24]
+        log_stat(f"最大持仓(h) <= {max_holding_days * 24}", rows_before, len(df_all))
 
     if "全币邻居数" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["全币邻居数"] >= min_neighbors]
+        log_stat(f"全币邻居数 >= {min_neighbors}", rows_before, len(df_all))
 
     if "总收益(Margin倍数)" in df_all.columns:
+        rows_before = len(df_all)
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
+        log_stat(f"总收益(Margin倍数) >= {min_total_profit}", rows_before, len(df_all))
+
+    # 策略关键字白名单前置过滤计算通过率
+    if target_strategy_keywords:
+        rows_before = len(df_all)
+        mask = df_all["策略"].apply(lambda x: any(kw in x for kw in target_strategy_keywords))
+        df_all = df_all[mask]
+        log_stat(f"策略关键字: {list(target_strategy_keywords)}", rows_before, len(df_all))
     # =========================================================
+
+    # 打印最终统计表
+    print_pass_rates()
 
     if df_all.empty:
         print(f"[提示] 根据条件过滤后，无匹配数据。")
@@ -1002,7 +1104,7 @@ def show_leaderboard_csv(
                     "最长无盈利(天)", "无盈利占比(%)"
                     ]
 
-    display_cols = ["Margin",  "币种", "加仓间距", "止盈间距",
+    display_cols = ["Margin", "币种", "加仓间距", "止盈间距",
                     "实际开仓数",
                     # "0-1层解决战斗比例(%)",
                     "爆仓次数",
