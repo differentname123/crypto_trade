@@ -652,7 +652,7 @@ def transform_mlus(mlu_list):
     cleaned_data = []
     image_mapping = {}
     asset_counter = 1  # 全局图片占位符计数器
-
+    id_count = 1
     for mlu in mlu_list:
         # 1. 过滤出该 MLU 中所有可用 (usable == True) 的图片
         usable_images = [img for img in mlu.get('images', []) if img.get('usable') is True]
@@ -686,11 +686,12 @@ def transform_mlus(mlu_list):
         # 3. 构建极简的纯净数据，丢弃所有工程判断字段 (shelf_life, impact_weight, publish_time 等)
         cleaned_mlu = {
             # "dimension": mlu.get('dimension', ''),
+            "id": f"M{id_count}",
             "fact": mlu.get('core_fact', ''),
             "underlying_logic": mlu.get('logic_link', ''),
             "visual_evidence": visual_evidence
         }
-
+        id_count += 1
         cleaned_data.append(cleaned_mlu)
 
     return cleaned_data, image_mapping
@@ -835,8 +836,8 @@ def extract_and_group_valid_evidences():
         f"涉及币种数量: {len(final_dict.keys())}"
     )
 
-    extract_data = final_dict['BTC']['看空']
-    format_data, image_mapping = transform_mlus(extract_data[:10])
+    extract_data = final_dict['BTC']['看多']
+    format_data, image_mapping = transform_mlus(extract_data[:20])
 
     return final_dict
 
