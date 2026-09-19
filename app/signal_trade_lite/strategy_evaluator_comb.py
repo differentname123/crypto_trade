@@ -1274,7 +1274,7 @@ def evaluate_multi_strategy_portfolios(
                 f"最大相关 {r['最大日相关']} / 平均 {r['平均日相关']} | 币种 {r['独立币种数']}个 | 多空 {r['多空(L/S)']}")
             print(f"   🧘 体验 -> 盈利天 {r['盈利天占比(%)']}% | 最长无盈利 {r['最长无盈利(天)']}天 | "
                   f"最差单日 {r['最差单日(M)']}M | 最差单月 {r['最差单月(M)']}M | 盈利月 {r['盈利月占比(%)']}%")
-
+            print(f"   ⚖️ 均匀度 -> 后半段净利占比 {r['后半段净利占比(%)']}% | 最大单币权重 {r['最大单币权重(%)']}%")
             # 成员在同一窗口内的可比明细
             lo, hi = int(r["_lo"]), int(r["_hi"])
             ii = [int(x) for x in str(r["_idx"]).split(",")]
@@ -1317,7 +1317,7 @@ if __name__ == "__main__":
         output_csv="portfolio_multi_ranking.csv",
         min_k=2,
         max_k=5,
-        top_n_per_k=10,
+        top_n_per_k=100,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
