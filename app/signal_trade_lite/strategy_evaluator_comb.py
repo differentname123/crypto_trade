@@ -30,7 +30,7 @@ from app.signal_trade_lite.martin_strategy_backest import TimelineReplayer, eval
 # =====================================================================
 # 路径与全局常量
 # =====================================================================
-CACHE_DIR = r"W:\backtest_data_1m_detail"        # 做多策略默认缓存目录
+CACHE_DIR = r"W:\backtest_data_1m_detail"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"W:\backtest_data_1m_detail"  # 做空策略缓存目录
 
 _TIME_LIKE_KEYS = ("time", "stamp", "epoch", "date", "millis", "nanos", "_ms", "_ns")
@@ -39,23 +39,23 @@ PNL_COL_CANDIDATES = ["net_pnl_in_margin", "pnl_in_margin", "net_pnl", "pnl", "p
 MDD_COL_CANDIDATES = ["max_drawdown", "max_drawdown_in_margin", "max_dd", "max_loss",
                       "max_loss_in_margin", "mdd", "max_floating_loss"]
 
-BLOWUP_LOSS_THRESHOLD_M = 0.8   # 归一化后(M倍)单笔亏损超过该阈值视为爆仓(与原代码 -0.8*margin 等价)
+BLOWUP_LOSS_THRESHOLD_M = 0.8  # 归一化后(M倍)单笔亏损超过该阈值视为爆仓(与原代码 -0.8*margin 等价)
 DAYS_PER_YEAR = 365.0
-INDEX_FILE = "_single_strategy_index.csv"   # Stage A 产出的元数据索引(Stage B 会读取, 且不会当成交易明细)
+INDEX_FILE = "_single_strategy_index.csv"  # Stage A 产出的元数据索引(Stage B 会读取, 且不会当成交易明细)
 
 # ---------- 组合打分权重(可自由调参, 全部显式暴露) ----------
 SCORE_CFG = {
-    "w_annual": 8.0, "cap_annual": 35.0,          # 年化净利(M/年)
-    "w_calmar": 4.0, "cap_calmar": 20.0,          # 年化 Calmar
-    "w_gain": 4.0, "cap_gain_lo": -8.0, "cap_gain_hi": 12.0,   # 相对最优单策略的 Calmar 增益
+    "w_annual": 8.0, "cap_annual": 35.0,  # 年化净利(M/年)
+    "w_calmar": 4.0, "cap_calmar": 20.0,  # 年化 Calmar
+    "w_gain": 4.0, "cap_gain_lo": -8.0, "cap_gain_hi": 12.0,  # 相对最优单策略的 Calmar 增益
     "corr_base": 0.25, "w_corr": 30.0, "cap_corr_lo": -12.0, "cap_corr_hi": 12.0,  # 最大两两相关
-    "w_div_dd": 20.0, "cap_div_dd": 10.0,         # 回撤分散化收益
-    "w_symbols": 2.0, "cap_symbols": 6.0,         # 币种分散
-    "w_cushion": 0.15, "cap_cushion": 10.0,       # 平原短板安全垫
-    "p_resonance": 15.0, "cap_resonance": 40.0,   # 共振同爆(重罚)
-    "p_rel_dd": 0.4, "cap_rel_dd": 18.0,          # 相对回撤(%)
-    "p_noprofit": 0.25, "cap_noprofit": 12.0,     # 最长无盈利天数
-    "p_underwater": 0.04, "cap_underwater": 10.0, # 水下最长天数
+    "w_div_dd": 20.0, "cap_div_dd": 10.0,  # 回撤分散化收益
+    "w_symbols": 2.0, "cap_symbols": 6.0,  # 币种分散
+    "w_cushion": 0.15, "cap_cushion": 10.0,  # 平原短板安全垫
+    "p_resonance": 15.0, "cap_resonance": 40.0,  # 共振同爆(重罚)
+    "p_rel_dd": 0.4, "cap_rel_dd": 18.0,  # 相对回撤(%)
+    "p_noprofit": 0.25, "cap_noprofit": 12.0,  # 最长无盈利天数
+    "p_underwater": 0.04, "cap_underwater": 10.0,  # 水下最长天数
     "float_base": 0.35, "p_peakfloat": 25.0, "cap_peakfloat": 15.0,  # 峰值合计浮亏
 }
 
@@ -63,52 +63,123 @@ SCORE_CFG = {
 # 目标参数清单 (可加 "multiplier" 字段来精确锁定加仓倍数, 强烈建议加)
 # =====================================================================
 TARGET_CONFIGS = [
+    # 高净收益
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_044_6",
+        "direction": "Long",
+        "add_step": 0.010,
+        "tp_step": 0.010,
+        "margin": 6,
+        "备注": "推荐次数为 6；最高共识。适合第一阶段核心运行，重点验证稳定性、连续盈利能力和实盘分润表现"
+    },
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_024_1",
+        "direction": "Long",
+        "add_step": 0.020,
+        "tp_step": 0.012,
+        "margin": 6,
+        "备注": "推荐次数为 5；核心稳健型。适合第一阶段稳定做数据，跨多个 Margin 连续成立"
+    },
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_044_4",
+        "direction": "Long",
+        "add_step": 0.010,
+        "tp_step": 0.007,
+        "margin": 10,
+        "备注": "推荐次数为 5；高频分润型。适合第一阶段或第一阶段后半段测试，高开仓频率、短持仓"
+    },
+    {
+        "symbol": "LINKUSDT",
+        "strategy": "factor_044_3",
+        "direction": "Long",
+        "add_step": 0.015,
+        "tp_step": 0.012,
+        "margin": 6,
+        "备注": "推荐次数为 3；第三币种核心候选。适合第二阶段加入，用于验证非 UNI/SOL 币种上的持续有效性"
+    },
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_044_5",
+        "direction": "Long",
+        "add_step": 0.010,
+        "tp_step": 0.009,
+        "margin": 9,
+        "备注": "推荐次数为 3；高收益型 UNI 备选。适合第二阶段，与 factor_044_6 二选一或做对照，不建议简单当作独立分散"
+    },
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_044_3",
+        "direction": "Long",
+        "add_step": 0.015,
+        "tp_step": 0.012,
+        "margin": 5,
+        "备注": "推荐次数为 2；SOL 扩展候选。适合第二阶段观察，与 factor_024_1 SOL 做不同开仓逻辑对照"
+    },
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_044_3",
+        "direction": "Long",
+        "add_step": 0.010,
+        "tp_step": 0.005,
+        "margin": 5,
+        "备注": "推荐次数为 2；极高频 UNI 候选。适合第二或第三阶段小规模观察，不应因为高频直接替代有效性更强的 UNI 主策略"
+    },
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_044_1",
+        "direction": "Long",
+        "add_step": 0.025,
+        "tp_step": 0.012,
+        "margin": 7,
+        "备注": "推荐次数为 1；高平原 SOL 候选。适合第三阶段验证，目前共识度低于 factor_024_1 SOL"
+    },
 
-    # 10000筛选
-
-    # 第一阶段：做数据养号期（核心目标：绝对存活、极高安全垫、曲线平滑）
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 10, "备注": "推荐次数：7；第一阶段做数据（绝对防御底座首选，存活与安全垫全场最强）"},
-    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 10, "备注": "推荐次数：3；第一阶段做数据（SOL生态备选长跑王，超200天存活无回撤）"},
-
-    # 第二阶段：带单收割期（核心目标：高频平仓、流水最大化、平原均值高防滑点）
-    {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-     "margin": 6, "备注": "推荐次数：6；第二阶段赚分润（极限高频收割机，总收益流水霸榜，适合冲刺表现费）"},
-    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-     "margin": 7, "备注": "推荐次数：4；第二阶段赚分润（同族因子无缝平滑切换，平原均值全场顶格，容错率最高）"},
-    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.025, "tp_step": 0.006,
-     "margin": 8, "备注": "推荐次数：3；第二阶段赚分润（收紧加仓间距高频吃单，Margin8提供更高的极端安全容错）"},
-
-    # 第二阶段：备选方案（不换币平替与高净利增强）
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（AAVE不换币平替，保持极高安全垫与净利润，适合大资金稳健收租）"},
-    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（极高净利润增强备选，适合小比例资金搭配对冲）"},
-
-
-    # 5000筛选
-    {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 9, "备注": "推荐的次数为 7；第一阶段做数据（绝对防御底座首选）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-     "margin": 7, "备注": "推荐的次数为 6；第二阶段赚分润（流水与容错综合收益首选）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-     "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润（高爆发收割进攻备选）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_024_2", "direction": "Long", "add_step": 0.040, "tp_step": 0.007,
-     "margin": 6, "备注": "推荐的次数为 2；第二阶段赚分润（0.040宽距异源因子对冲）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_023_7", "direction": "Long", "add_step": 0.030, "tp_step": 0.005,
-     "margin": 9, "备注": "推荐的次数为 2；第一阶段做数据（近8个月长寿视觉备选）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 10, "备注": "推荐的次数为 2；第一阶段做数据（SOL本币极限防守备选）"},
-
-    {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-     "margin": 8, "备注": "推荐的次数为 1；第一阶段做数据（SOL同因子防守备选）"},
-
+    # # 10000筛选
+    #
+    # # 第一阶段：做数据养号期（核心目标：绝对存活、极高安全垫、曲线平滑）
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 10, "备注": "推荐次数：7；第一阶段做数据（绝对防御底座首选，存活与安全垫全场最强）"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 10, "备注": "推荐次数：3；第一阶段做数据（SOL生态备选长跑王，超200天存活无回撤）"},
+    #
+    # # 第二阶段：带单收割期（核心目标：高频平仓、流水最大化、平原均值高防滑点）
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+    #  "margin": 6, "备注": "推荐次数：6；第二阶段赚分润（极限高频收割机，总收益流水霸榜，适合冲刺表现费）"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+    #  "margin": 7, "备注": "推荐次数：4；第二阶段赚分润（同族因子无缝平滑切换，平原均值全场顶格，容错率最高）"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.025, "tp_step": 0.006,
+    #  "margin": 8, "备注": "推荐次数：3；第二阶段赚分润（收紧加仓间距高频吃单，Margin8提供更高的极端安全容错）"},
+    #
+    # # 第二阶段：备选方案（不换币平替与高净利增强）
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（AAVE不换币平替，保持极高安全垫与净利润，适合大资金稳健收租）"},
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（极高净利润增强备选，适合小比例资金搭配对冲）"},
+    #
+    # # 5000筛选
+    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 9, "备注": "推荐的次数为 7；第一阶段做数据（绝对防御底座首选）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+    #  "margin": 7, "备注": "推荐的次数为 6；第二阶段赚分润（流水与容错综合收益首选）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
+    #  "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润（高爆发收割进攻备选）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_024_2", "direction": "Long", "add_step": 0.040, "tp_step": 0.007,
+    #  "margin": 6, "备注": "推荐的次数为 2；第二阶段赚分润（0.040宽距异源因子对冲）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_7", "direction": "Long", "add_step": 0.030, "tp_step": 0.005,
+    #  "margin": 9, "备注": "推荐的次数为 2；第一阶段做数据（近8个月长寿视觉备选）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 10, "备注": "推荐的次数为 2；第一阶段做数据（SOL本币极限防守备选）"},
+    #
+    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
+    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段做数据（SOL同因子防守备选）"},
 
     # # 全局筛选
     # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
@@ -152,14 +223,214 @@ TARGET_CONFIGS = [
     #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
 
     # === 做空 Short ===
-    {"symbol": "AAVEUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.007,
-     "margin": 9},
-    {"symbol": "AAVEUSDT", "strategy": "factor_043_10", "direction": "Short", "add_step": 0.015, "tp_step": 0.007,
-     "margin": 7},
-    {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.008,
-     "margin": 9},
-    {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.025, "tp_step": 0.008,
-     "margin": 7}
+    # {"symbol": "AAVEUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.007,
+    #  "margin": 9},
+    # {"symbol": "AAVEUSDT", "strategy": "factor_043_10", "direction": "Short", "add_step": 0.015, "tp_step": 0.007,
+    #  "margin": 7},
+    # {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.008,
+    #  "margin": 9},
+    # {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.025, "tp_step": 0.008,
+    #  "margin": 7},
+
+    # 做空 高净收益
+    {
+        "symbol": "NEARUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.015,
+        "tp_step": 0.011,
+        "margin": 5,
+        "备注": "推荐次数 7，最高共识核心策略；适合第一阶段稳定做数据"
+    },
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.015,
+        "tp_step": 0.011,
+        "margin": 5,
+        "备注": "推荐次数 7，最高共识核心策略；跨币验证较强"
+    },
+
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.015,
+        "tp_step": 0.011,
+        "margin": 5,
+        "备注": "推荐次数 7，收益增强版本；波动更高"
+    },
+
+    {
+        "symbol": "NEARUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.015,
+        "tp_step": 0.009,
+        "margin": 5,
+        "备注": "推荐次数 3，平原均净利更优秀，偏稳定版本"
+    },
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.015,
+        "tp_step": 0.009,
+        "margin": 5,
+        "备注": "推荐次数 3，稳定底仓版本"
+    },
+
+    # ============================
+    # 第二梯队：高稳定参数区域
+    # factor_043_10 0.018~0.020
+    # ============================
+
+    {
+        "symbol": "NEARUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.018,
+        "tp_step": 0.009,
+        "margin": 3,
+        "备注": "推荐次数 3，参数高原区域，偏长期稳定"
+    },
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.020,
+        "tp_step": 0.009,
+        "margin": 3,
+        "备注": "推荐次数 3，低回撤压舱石版本"
+    },
+
+    # ============================
+    # 第三梯队：高收益激进区域
+    # factor_043_9 0.010
+    # ============================
+
+    {
+        "symbol": "NEARUSDT",
+        "strategy": "factor_043_9",
+        "direction": "Short",
+        "add_step": 0.010,
+        "tp_step": 0.012,
+        "margin": 5,
+        "备注": "推荐次数 3，高收益尖峰；收益高但参数敏感"
+    },
+
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_043_9",
+        "direction": "Short",
+        "add_step": 0.010,
+        "tp_step": 0.012,
+        "margin": 5,
+        "备注": "推荐次数 3，高频分润版本"
+    },
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_043_9",
+        "direction": "Short",
+        "add_step": 0.010,
+        "tp_step": 0.012,
+        "margin": 5,
+        "备注": "推荐次数 3，高收益区域验证"
+    },
+
+    # ============================
+    # factor_043_10 0.010~0.012
+    # ============================
+
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.010,
+        "tp_step": 0.012,
+        "margin": 10,
+        "备注": "推荐次数 2，高利润增强仓"
+    },
+
+    {
+        "symbol": "NEARUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.010,
+        "tp_step": 0.012,
+        "margin": 10,
+        "备注": "推荐次数 2，高收益版本"
+    },
+
+    {
+        "symbol": "SOLUSDT",
+        "strategy": "factor_043_10",
+        "direction": "Short",
+        "add_step": 0.012,
+        "tp_step": 0.011,
+        "margin": 5,
+        "备注": "推荐次数 2，进攻型收益版本"
+    },
+
+    # ============================
+    # 其他补充策略
+    # ============================
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_024_8",
+        "direction": "Short",
+        "add_step": 0.025,
+        "tp_step": 0.011,
+        "margin": 9,
+        "备注": "推荐次数 2，非043补充策略，用于分散因子风险"
+    },
+
+    {
+        "symbol": "LINKUSDT",
+        "strategy": "factor_008_8",
+        "direction": "Short",
+        "add_step": 0.025,
+        "tp_step": 0.011,
+        "margin": 7,
+        "备注": "推荐次数 1，补充观察策略"
+    },
+
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_043_9",
+        "direction": "Short",
+        "add_step": 0.025,
+        "tp_step": 0.009,
+        "margin": 8,
+        "备注": "推荐次数 1，平原均净利较好，收益较低，作为防守观察"
+    },
+
+    {
+        "symbol": "UNIUSDT",
+        "strategy": "factor_043_7",
+        "direction": "Short",
+        "add_step": 0.030,
+        "tp_step": 0.011,
+        "margin": 8,
+        "备注": "推荐次数 1，低频稳定观察策略"
+    },
+
+    {
+        "symbol": "AAVEUSDT",
+        "strategy": "factor_043_2",
+        "direction": "Short",
+        "add_step": 0.030,
+        "tp_step": 0.010,
+        "margin": 8,
+        "备注": "推荐次数 1，低风险补充策略"
+    }
+
 ]
 
 
@@ -273,7 +544,9 @@ def print_table(df_display):
         widths.append(w)
     header = " | ".join(right_align(c, widths[i]) for i, c in enumerate(cols))
     sep = "-" * len(header)
-    print(sep); print(header); print(sep)
+    print(sep);
+    print(header);
+    print(sep)
     for _, row in df_display.iterrows():
         print(" | ".join(right_align(format_val(row[c]), widths[i]) for i, c in enumerate(cols)))
     print(sep)
@@ -360,7 +633,7 @@ def _normalize_trades_df(trades_df, cycles_df, margin):
 
     ratio = 1.0
     if abs(net_pnl_sum) > 1e-6 and abs(report_net) > 1e-6 and abs(net_pnl_sum - report_net) > 1e-6:
-        ratio = report_net / net_pnl_sum   # <<< 关键: 单位换算靠 report 校准, 绝不靠"总和大小"猜
+        ratio = report_net / net_pnl_sum  # <<< 关键: 单位换算靠 report 校准, 绝不靠"总和大小"猜
 
     out["pnl_M"] = raw * ratio
     if abs(report_net) > 1e-9 and abs(out["pnl_M"].sum() - report_net) > 1e-3:
@@ -534,7 +807,8 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
 
         cycles_df = data.pop("df")
         cycles_df.attrs = attrs
-        data.clear(); del data
+        data.clear();
+        del data
         gc.collect()
 
         if cycles_df is None or len(cycles_df) == 0:
@@ -1096,7 +1370,7 @@ def evaluate_multi_strategy_portfolios(
 
 
 if __name__ == "__main__":
-    PLATEAU_CSV = "strategy_leaderboard_57600_files_plateau.csv"   # 若无平原表填 None
+    PLATEAU_CSV = "strategy_leaderboard_57600_files_plateau.csv"  # 若无平原表填 None
 
     # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
     extract_target_trades_csv(
@@ -1115,7 +1389,7 @@ if __name__ == "__main__":
         min_k=2,
         max_k=5,
         top_n_per_k=5,
-        allow_same_signal=False,   # 想看"同信号不同 Margin"的叠加效果时改 True
+        allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
-        weight_mode="equal",       # 或 "recommend" 按你备注里的推荐次数加权
+        weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
     )
