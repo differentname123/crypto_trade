@@ -1370,7 +1370,7 @@ def evaluate_multi_strategy_portfolios(
 
 
 if __name__ == "__main__":
-    PLATEAU_CSV = "strategy_leaderboard_57600_files_plateau.csv"  # 若无平原表填 None
+    PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
 
     # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
     extract_target_trades_csv(
