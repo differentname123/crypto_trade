@@ -956,13 +956,12 @@ def evaluate_multi_strategy_portfolios(
         allow_same_signal=False,
         min_overlap_days=180,
         weight_mode="equal",
-        max_combos=400000
+        max_combos=400000,
+        filter_q_balance=10.0,  # 新增：四段切片中，每段利润必须至少占总利润的 10%
+        filter_roll_win_rate=70.0  # 新增：任意连续 30 天的滚动胜率，不得低于 70%
 ):
     """
-    :param allow_same_signal: 是否允许同一"信号源"(同币同策略同间距, 仅 Margin 不同)进入同一组合。
-                              默认 False —— 否则相关性≈1 的伪分散会霸榜。
-    :param min_overlap_days : 组合成员共同重叠交易窗口的最小天数, 不足则丢弃(样本不足无统计意义)
-    :param weight_mode      : "equal"(默认, 资金均分) 或 "recommend"(按 备注/推荐次数 加权)
+    组合回测逻辑：加入了【四段均衡】与【滚动胜率连贯性】的硬核过滤
     """
     records, _ = _load_strategy_records(csv_dir, plateau_csv)
     if not records:
@@ -972,22 +971,19 @@ def evaluate_multi_strategy_portfolios(
 
     # ================= 说明 =================
     print("=" * 108)
-    print(" 📖 组合回测口径与核心字段统一解释 (关注盈利与效率版本)")
+    print(" 📖 组合回测口径与核心字段统一解释 (加入高品质过滤)")
     print("-" * 108)
     print(" [核心单位与资金]")
     print("   • M倍 (Margin): 归一化收益单位，1M代表1份单次开仓所需的绝对保证金。")
-    print("   • 组合资金模型: 每个策略独立预留1个Margin。组合总资金=K单位，所有指标均为『每单位组合总资金』。")
+    print(f" [硬核体验过滤条件] (不满足直接剔除)")
+    print(f"   • 四段利润均衡: 将生命周期四等分，任何一段的利润贡献不得低于 {filter_q_balance}%")
+    print(f"   • 30日滚动胜率: 任何连续 30 天的窗口内，胜率不得低于 {filter_roll_win_rate}%")
     print(" [综合评估指标]")
-    print(
-        "   • 组合持仓重合度: 两两成员同时持仓天数的总和 ÷ 组合运行总天数(最早开始至最晚结束)。越小代表仓位越分散，效率越高。")
-    print("   • 组合Calmar (卡玛比率): 年化净利润 ÷ 组合最大回撤。反映承担每单位风险所获得的年化收益率。")
-    print("   • 1+1>2: 判定组合的Calmar是否超越了内部表现最好的单个策略。如果“是”，说明组合实现了正向的化学反应。")
-    print("   • 分散化系数: 组合最大回撤 ÷ 成员平均最大回撤(同窗口)。<1才是真对冲，越小说明分散互补效果越好。")
-    print(" [极限风险指标]")
-    print("   • 峰值合计浮亏(M): 各成员在同一天的持仓浮亏加总后的历史最大值。反映组合遭遇极端单边行情时的并发深水程度。")
-    print("   • 相关性度量: 基于持仓交并比(IoU)，同向重合越高越接近1，反向(一多一空)重合则视作对冲负相关。")
+    print("   • 组合持仓重合度: 两两成员同时持仓天数的总和 ÷ 组合运行总天数(越小效率越高)。")
+    print("   • 1+1>2: 判定组合的Calmar是否超越了内部表现最好的单个策略。")
+    print("   • 分散化系数: 组合最大回撤 ÷ 成员平均最大回撤(同窗口)。<1才是真对冲。")
     print("-" * 108)
-    print(f" 成员数={N} | K∈[{min_k},{max_k}] | 同信号源同组={'允许' if allow_same_signal else '禁止'} "
+    print(f" 成员数={N} | K∈[{min_k},{max_k}] | 同信号同组={'允许' if allow_same_signal else '禁止'} "
           f"| 最小重叠={min_overlap_days}天 | 权重={weight_mode}")
     print("=" * 108 + "\n")
 
@@ -1023,7 +1019,7 @@ def evaluate_multi_strategy_portfolios(
         np.add.at(NEG[i], ei, np.where(p < 0, p, 0.0))
         np.add.at(CNT[i], ei, 1.0)
 
-        # 持仓覆盖 & 浮亏覆盖(差分+前缀和, O(n) 向量化)
+        # 持仓覆盖 & 浮亏覆盖
         d_hold = np.zeros(T + 1);
         np.add.at(d_hold, si, 1.0);
         np.add.at(d_hold, ei + 1, -1.0)
@@ -1040,8 +1036,6 @@ def evaluate_multi_strategy_portfolios(
 
     # ================= 两两预计算(相关性) =================
     CORR = np.full((N, N), np.nan)
-
-    # 提取多空方向用于相关性方向惩罚判定
     dirs = [str(r.get("direction", "")).upper() for r in records]
 
     for i in range(N):
@@ -1049,17 +1043,11 @@ def evaluate_multi_strategy_portfolios(
             lo = max(first_i[i], first_i[j]);
             hi = min(last_i[i], last_i[j])
             if hi - lo + 1 >= 30:
-                # ------ 马丁专版相关性：改用持仓交并比(IoU) ------
                 hold_i = HOLD[i, lo:hi + 1]
                 hold_j = HOLD[j, lo:hi + 1]
-
                 intersect = np.sum(hold_i & hold_j)
                 union = np.sum(hold_i | hold_j)
-
                 overlap_ratio = float(intersect) / float(union) if union > 0 else 0.0
-
-                # 同方向: 重合度越高越差，计为正相关
-                # 反方向: 重合度越高越好，互为对冲计为负相关
                 if dirs[i] == dirs[j]:
                     CORR[i, j] = CORR[j, i] = overlap_ratio
                 else:
@@ -1071,19 +1059,21 @@ def evaluate_multi_strategy_portfolios(
     total_combos = sum(math.comb(N, k) for k in range(min_k, max_k + 1))
     print(f"数据矩阵完成: {T} 天 | 待穷举组合上限 {total_combos:,} 个\n")
     if total_combos > max_combos:
-        print(f"[警告] 组合数超过 max_combos={max_combos:,}，请缩小 max_k 或成员数。已中止。")
+        print(f"[警告] 组合数超过 max_combos={max_combos:,}，已中止。")
         return
 
     results = []
     skipped_same_signal = 0
     skipped_overlap = 0
+    skipped_win_rate = 0
+    skipped_q_balance = 0
     processed = 0
 
     for k in range(min_k, max_k + 1):
         for idxs in itertools.combinations(range(N), k):
             processed += 1
             if not allow_same_signal:
-                if len({sig_keys[i][:5] for i in idxs}) < k:  # 忽略 Margin, 只看信号源
+                if len({sig_keys[i][:5] for i in idxs}) < k:
                     skipped_same_signal += 1
                     continue
             ii = list(idxs)
@@ -1096,17 +1086,16 @@ def evaluate_multi_strategy_portfolios(
 
             sl = slice(lo, hi + 1)
 
-            # --- 计算两两持仓重合度（按最早的开始到最晚的结束的总天数计算） ---
+            # --- 持仓重合度 ---
             overall_lo = int(min(first_i[ii]))
             overall_hi = int(max(last_i[ii]))
             overall_days = overall_hi - overall_lo + 1
             overall_sl = slice(overall_lo, overall_hi + 1)
-            # 计算全时间段内任意两个策略同时持仓的天数总和（不区分多空，利用HOLD数组自带的纯持仓状态）
             total_overlap_days = sum(
                 np.sum(HOLD[a, overall_sl] & HOLD[b, overall_sl]) for a, b in itertools.combinations(ii, 2))
             pair_overlap_ratio = float(total_overlap_days / overall_days) if overall_days > 0 else 0.0
-            # -------------------------------------------------------------
 
+            # 权重计算
             if weight_mode == "recommend":
                 w = base_w[ii] / base_w[ii].sum()
             else:
@@ -1114,12 +1103,41 @@ def evaluate_multi_strategy_portfolios(
             w = w.reshape(-1, 1)
 
             daily = (PNL[ii, sl] * w).sum(axis=0)
+            cum = np.cumsum(daily)
+            net = float(cum[-1])
+
+            # ================= 核心过滤 1：连续 30 日滚动胜率要求 =================
+            if n_days >= 30:
+                win_mask = (daily > 0).astype(float)
+                # 卷积方式滑动窗口统计每30天内的盈利天数
+                roll_wins = np.convolve(win_mask, np.ones(30), mode='valid')
+                min_roll_win_rate = float((roll_wins.min() / 30.0) * 100.0)
+            else:
+                min_roll_win_rate = 0.0
+
+            if filter_roll_win_rate is not None and min_roll_win_rate < filter_roll_win_rate:
+                skipped_win_rate += 1
+                continue
+
+            # ================= 核心过滤 2：分段净利润贡献均衡度 =================
+            if net > 1e-9:
+                chunks = np.array_split(daily, 4)
+                q_ratios = [float(c.sum() / net) for c in chunks]
+                q_min_ratio = min(q_ratios) * 100.0
+                q_str = f"Q1: {q_ratios[0] * 100:.1f}% | Q2: {q_ratios[1] * 100:.1f}% | Q3: {q_ratios[2] * 100:.1f}% | Q4: {q_ratios[3] * 100:.1f}%"
+            else:
+                q_min_ratio = -999.0
+                q_str = "无盈利/亏损"
+
+            if filter_q_balance is not None and q_min_ratio < filter_q_balance:
+                skipped_q_balance += 1
+                continue
+
+            # 如果能走到这里，说明是真正的优质抗跌策略！
+            # 继续计算常规指标...
             pos_d = (POS[ii, sl] * w).sum(axis=0)
             neg_d = (NEG[ii, sl] * w).sum(axis=0)
-            cum = np.cumsum(daily)
             years = n_days / DAYS_PER_YEAR
-
-            net = float(cum[-1])
             gp = float(pos_d.sum());
             gl = float(neg_d.sum())
             annual = net / years if years > 0 else 0.0
@@ -1151,8 +1169,7 @@ def evaluate_multi_strategy_portfolios(
 
             half = n_days // 2
             first_half = float(cum[half - 1]) if half >= 1 else 0.0
-            second_half = net - first_half
-            second_ratio = (second_half / net * 100.0) if abs(net) > 1e-9 else 0.0
+            second_ratio = ((net - first_half) / net * 100.0) if abs(net) > 1e-9 else 0.0
 
             conc = HOLD[ii, sl].sum(axis=0)
             mean_conc = float(conc.mean());
@@ -1169,7 +1186,6 @@ def evaluate_multi_strategy_portfolios(
             mean_corr = float(np.mean(cvals)) if cvals else 0.0
             max_corr = float(np.max(cvals)) if cvals else 0.0
 
-            # 成员在同一窗口内的独立表现(可比!)
             m_net, m_dd, m_cal = [], [], []
             for i in ii:
                 c_i = np.cumsum(PNL[i, sl])
@@ -1194,7 +1210,7 @@ def evaluate_multi_strategy_portfolios(
             results.append({
                 "组合数量(K)": k,
                 "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
-                "组合持仓重合度": round(pair_overlap_ratio, 3),  # 强制要求的最核心排序字段
+                "组合持仓重合度": round(pair_overlap_ratio, 3),
                 "组合净利(M)": round(net, 2),
                 "组合总收益(M)": round(gp, 2),
                 "年化净利(M/年)": round(annual, 3),
@@ -1218,6 +1234,9 @@ def evaluate_multi_strategy_portfolios(
                 "最差单日(M)": round(worst_day, 3),
                 "最差单月(M)": round(worst_month, 2),
                 "盈利月占比(%)": round(win_month_ratio, 2),
+                "四段净利分布": q_str,
+                "最差单段贡献(%)": round(q_min_ratio, 1),
+                "最低30日胜率(%)": round(min_roll_win_rate, 1),
                 "后半段净利占比(%)": round(second_ratio, 1),
                 "峰值合计浮亏(M)": round(peak_float, 3),
                 "平均合计浮亏(M)": round(mean_float, 3),
@@ -1238,18 +1257,26 @@ def evaluate_multi_strategy_portfolios(
                 print(f"   ...已扫描 {processed:,}/{total_combos:,} 个组合")
 
     if not results:
-        print("[提示] 没有任何组合通过 同信号源/重叠窗口 过滤，请放宽 min_overlap_days 或 allow_same_signal。")
+        print(f"\n[提示] 没有任何组合通过严苛过滤！")
+        print(f"   - 同源剔除: {skipped_same_signal:,}")
+        print(f"   - 重叠不足: {skipped_overlap:,}")
+        print(f"   - 因【最低30日胜率 < {filter_roll_win_rate}%】剔除: {skipped_win_rate:,}")
+        print(f"   - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,}")
+        print("💡 建议放宽 filter_roll_win_rate (如 50.0) 或 filter_q_balance (如 5.0)。")
         return
 
     df_all = pd.DataFrame(results)
 
-    # ======== 核心排序逻辑：按持仓重合度升序(越小越好)，然后按净利降序，总收益降序 ========
-    df_all.sort_values(by=[ "组合净利(M)","组合持仓重合度", "组合总收益(M)"],
+    # 排序逻辑：净利润越大越好，重合度越小越好
+    df_all.sort_values(by=["组合净利(M)", "组合持仓重合度", "组合总收益(M)"],
                        ascending=[False, True, False], inplace=True)
 
     df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print(f"\n🎉 组合评估完成: 有效 {len(df_all):,} 个 "
-          f"(同信号源剔除 {skipped_same_signal:,} / 重叠不足剔除 {skipped_overlap:,})")
+    print(f"\n🎉 组合评估完成: 【幸存有效组合】 {len(df_all):,} 个")
+    print(f"   🔪 过滤击杀统计:")
+    print(f"      - 同源剔除: {skipped_same_signal:,} 个")
+    print(f"      - 因【最低30日胜率 < {filter_roll_win_rate}%】剔除: {skipped_win_rate:,} 个")
+    print(f"      - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,} 个")
     print(f"📄 全量排名已保存: {output_csv}\n")
 
     # ================= 分 K 打印 =================
@@ -1258,24 +1285,23 @@ def evaluate_multi_strategy_portfolios(
         if df_k.empty:
             continue
         print("=" * 128)
-        print(f" 🏆 【{k} 个策略组合】最佳资金效率排行榜 TOP {len(df_k)}   (按持仓重合度升序)")
+        print(f" 🏆 【{k} 策略顶级组合】TOP {len(df_k)}   (已通过极高平顺度过滤要求)")
         print("=" * 128)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
             print(
                 f"🥇 No.{rank} | 🎯持仓重合度 {r['组合持仓重合度']} | 1+1>2: {r['1+1>2']} | 窗口 {r['重叠起']} ~ {r['重叠止']} ({r['重叠天数']}天)")
             print(f"   🧩 {r['组合策略清单']}")
-            print(f"   💰 收益 -> 净利 {r['组合净利(M)']}M | 年化 {r['年化净利(M/年)']}M/年 | "
-                  f"总收益 {r['组合总收益(M)']}M | 总亏损 {r['组合总亏损(M)']}M | 盈亏比 {r['盈亏比']}")
-            print(f"   📉 风险 -> 最大回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | "
-                  f"Calmar {r['组合Calmar']}(单最优 {r['单策略最优Calmar']}) | 分散化系数 {r['分散化系数']} | "
-                  f"夏普 {r['夏普(年化)']}")
             print(
-                f"   🔗 结构 -> 资金利用率 {r['资金利用率(%)']}% | 同时持仓 均{r['平均同时持仓数']}/最大{r['最大同时持仓数']} | "
-                f"最大相关 {r['最大日相关']} / 平均 {r['平均日相关']} | 币种 {r['独立币种数']}个 | 多空 {r['多空(L/S)']}")
-            print(f"   🧘 体验 -> 盈利天 {r['盈利天占比(%)']}% | 最长无盈利 {r['最长无盈利(天)']}天 | "
-                  f"最差单日 {r['最差单日(M)']}M | 最差单月 {r['最差单月(M)']}M | 盈利月 {r['盈利月占比(%)']}%")
-            print(f"   ⚖️ 均匀度 -> 后半段净利占比 {r['后半段净利占比(%)']}% | 最大单币权重 {r['最大单币权重(%)']}%")
-            # 成员在同一窗口内的可比明细
+                f"   💰 收益 -> 净利 {r['组合净利(M)']}M | 年化 {r['年化净利(M/年)']}M/年 | 总收益 {r['组合总收益(M)']}M | 盈亏比 {r['盈亏比']}")
+            print(
+                f"   📉 风险 -> 回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | Calmar {r['组合Calmar']}")
+            print(f"   🚀 连贯 -> 30日最低胜率: {r['最低30日胜率(%)']}% | 四段分布: {r['四段净利分布']}")
+            print(
+                f"   🔗 结构 -> 资金利用率 {r['资金利用率(%)']}% | 并发深水均值 {r['平均合计浮亏(M)']}M / 峰值 {r['峰值合计浮亏(M)']}M")
+            print(
+                f"   🧘 体验 -> 盈利天 {r['盈利天占比(%)']}% | 盈利月 {r['盈利月占比(%)']}% | 最长停滞 {r['最长无盈利(天)']}天")
+
+            # 打印每个成员的表现
             lo, hi = int(r["_lo"]), int(r["_hi"])
             ii = [int(x) for x in str(r["_idx"]).split(",")]
             rows = []
