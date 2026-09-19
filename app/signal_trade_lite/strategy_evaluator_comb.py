@@ -1317,7 +1317,7 @@ if __name__ == "__main__":
         output_csv="portfolio_multi_ranking.csv",
         min_k=2,
         max_k=5,
-        top_n_per_k=5,
+        top_n_per_k=10,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
