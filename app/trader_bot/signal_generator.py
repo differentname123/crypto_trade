@@ -1974,8 +1974,9 @@ def get_signal_factor_044_5(symbol):
 # =============================================================================
 if __name__ == '__main__':
     target_time = (
-            datetime.now() - timedelta(minutes=0)
+            datetime.now() - timedelta(minutes=1)
     ).strftime('%Y-%m-%d %H:%M')
 
     symbol_list = ['UNI/USDT:USDT']
-    get_signal_factor_044_5(symbol_list[0])
+    signal = get_signal_factor_044_5(symbol_list[0])
+    print()
