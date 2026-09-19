@@ -82,6 +82,7 @@ from signal_generator import (
     get_signal_factor_043_10,
     get_signal_factor_044_1,
     get_signal_factor_044_10,
+    get_signal_factor_044_5,
 )
 
 # 信号源按字符串注册，保证 MartinConfig 可跨进程序列化。
@@ -90,6 +91,7 @@ SIGNAL_REGISTRY = {
     "factor_043_10": get_signal_factor_043_10,
     "factor_043_9": get_signal_factor_043_9,
     "factor_044_10": get_signal_factor_044_10,
+    "factor_044_5": get_signal_factor_044_5,
 }
 
 # ==============================================================================
@@ -2831,13 +2833,15 @@ def run_single_strategy(cfg, shared_prices=None):
 
 
 def main_app():
-    """加载四组账户凭据，以同一策略模板生成 16 个互相隔离的策略进程。"""
+    """加载多组账户凭据，并根据账户灵活分配策略进程。"""
     accounts = [
         ("", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
         ("C", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
         ("Q", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
         ("M", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
     ]
+
+    # 1. 公共策略模板（所有账号都会运行的基础策略）
     strategy_templates = [
         {"base_id": "AAVEL12", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_044_1",
          "first_qty": 0.1, "step_pct": 3, "qty_mult": 2, "tp_pct": 0.6,
@@ -2853,9 +2857,29 @@ def main_app():
          "max_loss_usdt": 14 * 8, "layer_loss_budget_ratio": 1},
     ]
 
+    # 2. Myself 账号（""）专用的额外策略
+    myself_extra_templates = [
+        {"base_id": "LSOL19", "symbol": "SOL/USDT:USDT", "signal_name": "factor_044_1",
+         "first_qty": 0.1, "step_pct": 2.5, "qty_mult": 2, "tp_pct": 1.2,
+         "max_loss_usdt": 10 * 7, "layer_loss_budget_ratio": 1},
+        {"base_id": "SUNI19", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_9",
+         "first_qty": 1, "step_pct": 2.5, "qty_mult": 2, "tp_pct": 0.9,
+         "max_loss_usdt": 9 * 8, "layer_loss_budget_ratio": 1},
+        {"base_id": "LUNI19", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_5",
+         "first_qty": 1, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.9,
+         "max_loss_usdt": 9 * 9, "layer_loss_budget_ratio": 1},
+    ]
+
     configs = []
     for suffix, api_key, secret_key in accounts:
-        for template in strategy_templates:
+        # 复制一份公共策略作为基础
+        current_templates = list(strategy_templates)
+
+        # 拦截机制：如果当前账号后缀为空（代表myself账号），则将额外策略拼接到当前任务列表中
+        if suffix == "":
+            current_templates.extend(myself_extra_templates)
+
+        for template in current_templates:
             params = dict(template)
             base_id = params.pop("base_id")
             configs.append(MartinConfig(
@@ -2887,6 +2911,7 @@ def main_app():
             proc.join()
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统/退出] 主进程收到中断，daemon 子进程将随主进程退出")
+
 
 # ==============================================================================
 # 14. 运维工具 (人工排障用, 与主流程解耦)
