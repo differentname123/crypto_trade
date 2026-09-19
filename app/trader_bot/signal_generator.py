@@ -1940,6 +1940,34 @@ def get_signal_factor_044_10(symbol):
         'factor_044_10',
     )
 
+# =============================================================================
+# 因子 044_5: 中线标准 (LONG)
+# =============================================================================
+def generate_factor_044_5_signals(df):
+    """factor_044_5：10根窗口假跌破 180根历史低点后收回，产生 LONG OPEN。"""
+    return _generate_false_break_signals(
+        df, 'factor_044_5', 'LONG', 10, 180
+    )
+
+def execute_trading_bot_workflow_factor_044_5(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_044_5：1m 中线标准假跌破做多。"""
+    return _run_factor_workflow(
+        'factor_044_5',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_044_5_signals,
+        '中线标准假跌破做多信号生成',
+    )
+
+def get_signal_factor_044_5(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_044_5,
+        'factor_044_5',
+    )
+
 
 # =============================================================================
 # 八、本地联调入口
@@ -1949,5 +1977,5 @@ if __name__ == '__main__':
             datetime.now() - timedelta(minutes=0)
     ).strftime('%Y-%m-%d %H:%M')
 
-    symbol_list = ['BNB/USDT:USDT']
-    get_signal_factor_044_10(symbol_list[0])
+    symbol_list = ['UNI/USDT:USDT']
+    get_signal_factor_044_5(symbol_list[0])
