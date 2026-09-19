@@ -1301,14 +1301,14 @@ def evaluate_multi_strategy_portfolios(
 if __name__ == "__main__":
     PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
 
-    # # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
-    # extract_target_trades_csv(
-    #     cache_dir=CACHE_DIR,
-    #     short_cache_dir=SHORT_CACHE_DIR,
-    #     output_dir="./extracted_trades_csv",
-    #     target_configs=TARGET_CONFIGS,
-    #     plateau_csv=PLATEAU_CSV,
-    # )
+    # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
+    extract_target_trades_csv(
+        cache_dir=CACHE_DIR,
+        short_cache_dir=SHORT_CACHE_DIR,
+        output_dir="./extracted_trades_csv",
+        target_configs=TARGET_CONFIGS,
+        plateau_csv=PLATEAU_CSV,
+    )
 
     # Stage B: 穷举 K=2~5 组合并排名
     evaluate_multi_strategy_portfolios(
