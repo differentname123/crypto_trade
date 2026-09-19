@@ -637,6 +637,64 @@ def process_posts(post_list):
     return result
 
 
+def transform_mlus(mlu_list):
+    """
+    清洗并重组 MLU 列表，为第二阶段大模型生成极简的 prompt 喂料。
+
+    Args:
+        mlu_list (list): 数据库捞取并按照条件过滤后的原始 MLU 字典列表。
+
+    Returns:
+        tuple:
+            - cleaned_data (list): 丢给大模型的纯净论据列表。
+            - image_mapping (dict): 图片映射表，用于大模型生成后，纯代码层替换真实的图片 URL。
+    """
+    cleaned_data = []
+    image_mapping = {}
+    asset_counter = 1  # 全局图片占位符计数器
+
+    for mlu in mlu_list:
+        # 1. 过滤出该 MLU 中所有可用 (usable == True) 的图片
+        usable_images = [img for img in mlu.get('images', []) if img.get('usable') is True]
+
+        visual_evidence = None
+
+        # 2. 如果存在可用图片，将其统合为一个全新的占位符，并拼接 context
+        if usable_images:
+            new_placeholder = f"[ASSET_IMG_{asset_counter}]"
+
+            # 提取原始的 image_id 列表
+            original_image_ids = [img['image_id'] for img in usable_images]
+
+            # 拼接多图的 context，用分号隔开，形成一个完整的视觉证据链
+            combined_context = "；".join([img['context'] for img in usable_images if img.get('context')])
+
+            # 写入映射表 (供代码层最终组装贴子使用)
+            image_mapping[new_placeholder] = {
+                "source_post_id": mlu.get('source_post_id'),
+                "original_image_id_list": original_image_ids
+            }
+
+            # 构建给大模型的视觉证据对象
+            visual_evidence = {
+                "placeholder": new_placeholder,
+                "what_it_shows": combined_context
+            }
+
+            asset_counter += 1
+
+        # 3. 构建极简的纯净数据，丢弃所有工程判断字段 (shelf_life, impact_weight, publish_time 等)
+        cleaned_mlu = {
+            "dimension": mlu.get('dimension', ''),
+            "fact": mlu.get('core_fact', ''),
+            "underlying_logic": mlu.get('logic_link', ''),
+            "visual_evidence": visual_evidence
+        }
+
+        cleaned_data.append(cleaned_mlu)
+
+    return cleaned_data, image_mapping
+
 def extract_and_group_valid_evidences():
     """
     [功能摘要]
@@ -777,7 +835,8 @@ def extract_and_group_valid_evidences():
         f"涉及币种数量: {len(final_dict.keys())}"
     )
 
-    extract_data = final_dict['BTC']['看多']
+    extract_data = final_dict['BTC']['看空']
+    format_data, image_mapping = transform_mlus(extract_data[:10])
 
     return final_dict
 
