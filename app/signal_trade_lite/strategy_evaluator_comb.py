@@ -43,22 +43,6 @@ BLOWUP_LOSS_THRESHOLD_M = 0.8  # 归一化后(M倍)单笔亏损超过该阈值�
 DAYS_PER_YEAR = 365.0
 INDEX_FILE = "_single_strategy_index.csv"  # Stage A 产出的元数据索引(Stage B 会读取, 且不会当成交易明细)
 
-# ---------- 组合打分权重(可自由调参, 全部显式暴露) ----------
-SCORE_CFG = {
-    "w_annual": 8.0, "cap_annual": 35.0,  # 年化净利(M/年)
-    "w_calmar": 4.0, "cap_calmar": 20.0,  # 年化 Calmar
-    "w_gain": 4.0, "cap_gain_lo": -8.0, "cap_gain_hi": 12.0,  # 相对最优单策略的 Calmar 增益
-    "corr_base": 0.25, "w_corr": 30.0, "cap_corr_lo": -12.0, "cap_corr_hi": 12.0,  # 最大两两相关
-    "w_div_dd": 20.0, "cap_div_dd": 10.0,  # 回撤分散化收益
-    "w_symbols": 2.0, "cap_symbols": 6.0,  # 币种分散
-    "w_cushion": 0.15, "cap_cushion": 10.0,  # 平原短板安全垫
-    "p_resonance": 15.0, "cap_resonance": 40.0,  # 共振同爆(重罚)
-    "p_rel_dd": 0.4, "cap_rel_dd": 18.0,  # 相对回撤(%)
-    "p_noprofit": 0.25, "cap_noprofit": 12.0,  # 最长无盈利天数
-    "p_underwater": 0.04, "cap_underwater": 10.0,  # 水下最长天数
-    "float_base": 0.35, "p_peakfloat": 25.0, "cap_peakfloat": 15.0,  # 峰值合计浮亏
-}
-
 # =====================================================================
 # 目标参数清单 (可加 "multiplier" 字段来精确锁定加仓倍数, 强烈建议加)
 # =====================================================================
@@ -929,11 +913,6 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
         if df.empty:
             continue
 
-        # ---- 爆仓 / 浮亏 ----
-        if "is_blowup_flag" in df.columns:
-            is_blow = df["is_blowup_flag"].astype(str).str.lower().isin(["true", "1", "1.0", "yes"]).values
-        else:
-            is_blow = (pnl.values <= -BLOWUP_LOSS_THRESHOLD_M)
         float_loss = pd.to_numeric(df.get("float_loss_M", pd.Series(0.0, index=df.index)),
                                    errors="coerce").fillna(0.0).abs().values
 
@@ -945,21 +924,13 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
         mult = float(df["multiplier"].iloc[0]) if ("multiplier" in df.columns
                                                    and pd.notnull(df["multiplier"].iloc[0])) else None
 
-        # ---- 元数据(平原安全垫等): 优先索引表, 否则精确匹配平原宽表 ----
-        cushion = np.nan;
-        med_surv = np.nan;
+        # ---- 元数据: 优先索引表, 否则精确匹配平原宽表 ----
         weight = 1.0;
         note = ""
         if idx_df is not None and "file" in idx_df.columns and (idx_df["file"] == fname).any():
             r = idx_df[idx_df["file"] == fname].iloc[0]
-            cushion = float(r.get("平原存活安全垫(天)", np.nan)) if pd.notnull(r.get("平原存活安全垫(天)")) else np.nan
-            med_surv = float(r.get("中位存活(天)", np.nan)) if pd.notnull(r.get("中位存活(天)")) else np.nan
             weight = float(r.get("推荐权重", 1.0)) if pd.notnull(r.get("推荐权重")) else 1.0
             note = str(r.get("备注", "") or "")
-        elif plateau_df is not None:
-            pm = _match_plateau_row(plateau_df, sym, strat, direct, margin, add_s, tp_s, mult)
-            cushion = pm["平原存活安全垫(天)"];
-            med_surv = pm["中位存活(天)"]
 
         records.append({
             "file": fname,
@@ -968,8 +939,7 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
             "add_step": add_s, "tp_step": tp_s, "multiplier": mult,
             "signal_key": (sym, strat, direct, round(add_s, 6), round(tp_s, 6), mult),
             "pnl": pnl.values, "open_dt": open_dt.values, "close_dt": close_dt.values,
-            "is_blow": np.asarray(is_blow, dtype=bool), "float_loss": float_loss,
-            "cushion": cushion, "median_survival": med_surv,
+            "float_loss": float_loss,
             "weight": weight, "note": note,
             "has_float": bool(np.nanmax(float_loss) > 0) if len(float_loss) else False,
         })
@@ -1002,28 +972,21 @@ def evaluate_multi_strategy_portfolios(
 
     # ================= 说明 =================
     print("=" * 108)
-    print(" 📖 组合回测口径与核心字段统一解释 (供第三方参考)")
+    print(" 📖 组合回测口径与核心字段统一解释 (关注盈利与效率版本)")
     print("-" * 108)
     print(" [核心单位与资金]")
     print("   • M倍 (Margin): 归一化收益单位，1M代表1份单次开仓所需的绝对保证金。")
     print("   • 组合资金模型: 每个策略独立预留1个Margin。组合总资金=K单位，所有指标均为『每单位组合总资金』。")
     print(" [综合评估指标]")
+    print(
+        "   • 组合持仓重合度: 两两成员同时持仓天数的总和 ÷ 组合运行总天数(最早开始至最晚结束)。越小代表仓位越分散，效率越高。")
     print("   • 组合Calmar (卡玛比率): 年化净利润 ÷ 组合最大回撤。反映承担每单位风险所获得的年化收益率。")
     print("   • 1+1>2: 判定组合的Calmar是否超越了内部表现最好的单个策略。如果“是”，说明组合实现了正向的化学反应。")
     print("   • 分散化系数: 组合最大回撤 ÷ 成员平均最大回撤(同窗口)。<1才是真对冲，越小说明分散互补效果越好。")
     print(" [极限风险指标]")
     print("   • 峰值合计浮亏(M): 各成员在同一天的持仓浮亏加总后的历史最大值。反映组合遭遇极端单边行情时的并发深水程度。")
-    print("   • 共振同爆(pair): 任意两个策略在±1天内同时爆仓的累计对数。数值越大，说明底层逻辑在同质化踩坑。")
-    print(
-        "   • 组合持仓重合度 (新增): 两两成员同时持仓天数的总和 ÷ 组合运行总天数(最早开始至最晚结束)。不区分多空，该值完全可能>1。反映了组合总体暴露在市场中的拥挤程度。")
-    print(
-        "   • 平原短板安全垫(天): 策略在不创新高的“平原期”最长能存活的天数。取组合内最差成员的值，体现组合的木桶短板效应。")
     print("   • 相关性度量: 基于持仓交并比(IoU)，同向重合越高越接近1，反向(一多一空)重合则视作对冲负相关。")
     print("-" * 108)
-    n_nofloat = sum(1 for r in records if not r["has_float"])
-    # if n_nofloat:
-    #     print(f" [⚠ 数据缺失] {n_nofloat}/{N} 个成员的明细里没有单笔最大浮亏列，"
-    #           f"『峰值合计浮亏』会被低估，不要当成 0 风险！")
     print(f" 成员数={N} | K∈[{min_k},{max_k}] | 同信号源同组={'允许' if allow_same_signal else '禁止'} "
           f"| 最小重叠={min_overlap_days}天 | 权重={weight_mode}")
     print("=" * 108 + "\n")
@@ -1040,7 +1003,6 @@ def evaluate_multi_strategy_portfolios(
     POS = np.zeros((N, T));
     NEG = np.zeros((N, T))
     CNT = np.zeros((N, T));
-    BLOW = np.zeros((N, T));
     FLOAT = np.zeros((N, T))
     HOLD = np.zeros((N, T), dtype=bool)
     first_i = np.zeros(N, dtype=np.int64);
@@ -1060,7 +1022,6 @@ def evaluate_multi_strategy_portfolios(
         np.add.at(POS[i], ei, np.where(p > 0, p, 0.0))
         np.add.at(NEG[i], ei, np.where(p < 0, p, 0.0))
         np.add.at(CNT[i], ei, 1.0)
-        np.add.at(BLOW[i], ei, r["is_blow"].astype(float))
 
         # 持仓覆盖 & 浮亏覆盖(差分+前缀和, O(n) 向量化)
         d_hold = np.zeros(T + 1);
@@ -1077,13 +1038,8 @@ def evaluate_multi_strategy_portfolios(
         first_i[i] = int(si.min());
         last_i[i] = int(ei.max())
 
-    # ================= 两两预计算(相关性 / 共振同爆) =================
+    # ================= 两两预计算(相关性) =================
     CORR = np.full((N, N), np.nan)
-    COBLOW = np.zeros((N, N))
-    blow_day = BLOW > 0
-    blow_win = blow_day.copy()
-    blow_win[:, 1:] |= blow_day[:, :-1]
-    blow_win[:, :-1] |= blow_day[:, 1:]
 
     # 提取多空方向用于相关性方向惩罚判定
     dirs = [str(r.get("direction", "")).upper() for r in records]
@@ -1108,9 +1064,6 @@ def evaluate_multi_strategy_portfolios(
                     CORR[i, j] = CORR[j, i] = overlap_ratio
                 else:
                     CORR[i, j] = CORR[j, i] = -overlap_ratio
-
-            cb = float(np.sum(blow_day[i] & blow_win[j]) + np.sum(blow_day[j] & blow_win[i])) / 2.0
-            COBLOW[i, j] = COBLOW[j, i] = cb
 
     sig_keys = [r["signal_key"] for r in records]
     base_w = np.array([r["weight"] for r in records], dtype=float)
@@ -1143,7 +1096,7 @@ def evaluate_multi_strategy_portfolios(
 
             sl = slice(lo, hi + 1)
 
-            # --- 新增：计算两两持仓重合度（按最早的开始到最晚的结束的总天数计算） ---
+            # --- 计算两两持仓重合度（按最早的开始到最晚的结束的总天数计算） ---
             overall_lo = int(min(first_i[ii]))
             overall_hi = int(max(last_i[ii]))
             overall_days = overall_hi - overall_lo + 1
@@ -1179,7 +1132,6 @@ def evaluate_multi_strategy_portfolios(
             rel_dd = float(np.max((eq_peak - equity) / np.maximum(eq_peak, 1e-9)) * 100.0)
             underwater = _max_true_run(dd > 1e-12)
             calmar = (annual / max_dd) if max_dd > 1e-9 else 99.0
-            busted = bool(equity.min() <= 0)
 
             sd = float(daily.std(ddof=0))
             sharpe = float(daily.mean() / sd * math.sqrt(DAYS_PER_YEAR)) if sd > 1e-12 else 0.0
@@ -1201,12 +1153,6 @@ def evaluate_multi_strategy_portfolios(
             first_half = float(cum[half - 1]) if half >= 1 else 0.0
             second_half = net - first_half
             second_ratio = (second_half / net * 100.0) if abs(net) > 1e-9 else 0.0
-
-            n_blow = float(BLOW[ii, sl].sum())
-            blow_per_year = n_blow / years if years > 0 else 0.0
-            multi_blow_days = int(np.sum(blow_day[ii, sl].sum(axis=0) >= 2))
-            max_same_day_blow = int(blow_day[ii, sl].sum(axis=0).max())
-            resonance = float(sum(COBLOW[a, b] for a, b in itertools.combinations(ii, 2)))
 
             conc = HOLD[ii, sl].sum(axis=0)
             mean_conc = float(conc.mean());
@@ -1237,11 +1183,6 @@ def evaluate_multi_strategy_portfolios(
             mean_member_dd = float(np.mean(m_dd))
             div_dd = (max_dd / mean_member_dd) if mean_member_dd > 1e-9 else 1.0
 
-            cushions = [records[i]["cushion"] for i in ii]
-            min_cushion = float(np.nanmin(cushions)) if np.any(np.isfinite(cushions)) else np.nan
-            msurv = [records[i]["median_survival"] for i in ii]
-            min_msurv = float(np.nanmin(msurv)) if np.any(np.isfinite(msurv)) else np.nan
-
             syms = {records[i]["symbol"] for i in ii}
             n_long = sum(1 for i in ii if records[i]["direction"] == "Long")
             sym_cnt = {}
@@ -1250,38 +1191,17 @@ def evaluate_multi_strategy_portfolios(
             max_sym_w = max(sym_cnt.values()) / k * 100.0
             trades = float(CNT[ii, sl].sum())
 
-            # ---------------- 打分 ----------------
-            c = SCORE_CFG
-            score = 0.0
-            score += float(np.clip(annual * c["w_annual"], 0, c["cap_annual"]))
-            score += float(np.clip(calmar * c["w_calmar"], 0, c["cap_calmar"]))
-            score += float(np.clip((calmar - best_single_calmar) * c["w_gain"], c["cap_gain_lo"], c["cap_gain_hi"]))
-            score += float(np.clip((c["corr_base"] - max_corr) * c["w_corr"], c["cap_corr_lo"], c["cap_corr_hi"]))
-            score += float(np.clip((1.0 - div_dd) * c["w_div_dd"], 0, c["cap_div_dd"]))
-            score += float(np.clip(len(syms) * c["w_symbols"], 0, c["cap_symbols"]))
-            if np.isfinite(min_cushion):
-                score += float(np.clip(min_cushion * c["w_cushion"], 0, c["cap_cushion"]))
-            score -= float(np.clip(resonance * c["p_resonance"], 0, c["cap_resonance"]))
-            score -= float(np.clip(rel_dd * c["p_rel_dd"], 0, c["cap_rel_dd"]))
-            score -= float(np.clip(longest_np * c["p_noprofit"], 0, c["cap_noprofit"]))
-            score -= float(np.clip(underwater * c["p_underwater"], 0, c["cap_underwater"]))
-            score -= float(np.clip(max(0.0, peak_float - c["float_base"]) * c["p_peakfloat"], 0, c["cap_peakfloat"]))
-            if busted:
-                score = 0.0
-            score = round(float(np.clip(score, 0, 100)), 2)
-
             results.append({
                 "组合数量(K)": k,
                 "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
-                "综合得分": score,
+                "组合持仓重合度": round(pair_overlap_ratio, 3),  # 强制要求的最核心排序字段
+                "组合净利(M)": round(net, 2),
+                "组合总收益(M)": round(gp, 2),
+                "年化净利(M/年)": round(annual, 3),
+                "组合总亏损(M)": round(gl, 2),
                 "1+1>2": "🔥 是" if calmar > best_single_calmar else "否",
-                "曾归零": "💀 是" if busted else "否",
                 "重叠起": str(all_days[lo].date()), "重叠止": str(all_days[hi].date()),
                 "重叠天数": n_days,
-                "组合净利(M)": round(net, 2),
-                "年化净利(M/年)": round(annual, 3),
-                "组合总收益(M)": round(gp, 2),
-                "组合总亏损(M)": round(gl, 2),
                 "盈亏比": round(abs(gp / gl), 2) if abs(gl) > 1e-9 else 99.0,
                 "组合回撤(M)": round(max_dd, 2),
                 "相对回撤(%)": round(rel_dd, 2),
@@ -1291,7 +1211,6 @@ def evaluate_multi_strategy_portfolios(
                 "单策略最优净利(M)": round(best_single_net, 2),
                 "成员均回撤(M)": round(mean_member_dd, 2),
                 "分散化系数": round(div_dd, 3),
-                "组合持仓重合度": round(pair_overlap_ratio, 3),  # 强制要求的新增字段
                 "夏普(年化)": round(sharpe, 2),
                 "Sortino": round(sortino, 2),
                 "盈利天占比(%)": round(win_day_ratio, 2),
@@ -1300,11 +1219,6 @@ def evaluate_multi_strategy_portfolios(
                 "最差单月(M)": round(worst_month, 2),
                 "盈利月占比(%)": round(win_month_ratio, 2),
                 "后半段净利占比(%)": round(second_ratio, 1),
-                "爆仓总次数": int(n_blow),
-                "年化爆仓次数": round(blow_per_year, 2),
-                "共振同爆(pair)": round(resonance, 1),
-                "单日≥2同爆(天)": multi_blow_days,
-                "单日最多同爆": max_same_day_blow,
                 "峰值合计浮亏(M)": round(peak_float, 3),
                 "平均合计浮亏(M)": round(mean_float, 3),
                 "深水>0.5天数": deep_days,
@@ -1316,8 +1230,6 @@ def evaluate_multi_strategy_portfolios(
                 "独立币种数": len(syms),
                 "多空(L/S)": f"{n_long}/{k - n_long}",
                 "最大单币权重(%)": round(max_sym_w, 1),
-                "平原短板安全垫(天)": round(min_cushion, 1) if np.isfinite(min_cushion) else np.nan,
-                "短板中位存活(天)": round(min_msurv, 1) if np.isfinite(min_msurv) else np.nan,
                 "总开仓数": int(trades),
                 "_lo": lo, "_hi": hi, "_idx": ",".join(map(str, ii)),
             })
@@ -1330,8 +1242,11 @@ def evaluate_multi_strategy_portfolios(
         return
 
     df_all = pd.DataFrame(results)
-    df_all.sort_values(by=["综合得分", "组合Calmar", "年化净利(M/年)"],
-                       ascending=[False, False, False], inplace=True)
+
+    # ======== 核心排序逻辑：按持仓重合度升序(越小越好)，然后按净利降序，总收益降序 ========
+    df_all.sort_values(by=["组合持仓重合度", "组合净利(M)", "组合总收益(M)"],
+                       ascending=[True, False, False], inplace=True)
+
     df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"\n🎉 组合评估完成: 有效 {len(df_all):,} 个 "
           f"(同信号源剔除 {skipped_same_signal:,} / 重叠不足剔除 {skipped_overlap:,})")
@@ -1343,26 +1258,22 @@ def evaluate_multi_strategy_portfolios(
         if df_k.empty:
             continue
         print("=" * 128)
-        print(f" 🏆 【{k} 个策略组合】最佳互补排行榜 TOP {len(df_k)}   (按综合得分)")
+        print(f" 🏆 【{k} 个策略组合】最佳资金效率排行榜 TOP {len(df_k)}   (按持仓重合度升序)")
         print("=" * 128)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
-            print(f"🥇 No.{rank} [得分 {r['综合得分']}] | 1+1>2: {r['1+1>2']} | 曾归零: {r['曾归零']} "
-                  f"| 窗口 {r['重叠起']} ~ {r['重叠止']} ({r['重叠天数']}天)")
+            print(
+                f"🥇 No.{rank} | 🎯持仓重合度 {r['组合持仓重合度']} | 1+1>2: {r['1+1>2']} | 窗口 {r['重叠起']} ~ {r['重叠止']} ({r['重叠天数']}天)")
             print(f"   🧩 {r['组合策略清单']}")
             print(f"   💰 收益 -> 净利 {r['组合净利(M)']}M | 年化 {r['年化净利(M/年)']}M/年 | "
                   f"总收益 {r['组合总收益(M)']}M | 总亏损 {r['组合总亏损(M)']}M | 盈亏比 {r['盈亏比']}")
             print(f"   📉 风险 -> 最大回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | "
                   f"Calmar {r['组合Calmar']}(单最优 {r['单策略最优Calmar']}) | 分散化系数 {r['分散化系数']} | "
                   f"夏普 {r['夏普(年化)']}")
-            print(f"   💀 爆仓 -> 总 {r['爆仓总次数']}次 / 年化 {r['年化爆仓次数']} | 共振同爆 {r['共振同爆(pair)']} | "
-                  f"单日≥2同爆 {r['单日≥2同爆(天)']}天 | 峰值合计浮亏 {r['峰值合计浮亏(M)']}M | 深水>0.5 {r['深水>0.5天数']}天")
             print(
-                f"   🔗 结构 -> 持仓重合度 {r['组合持仓重合度']} | 最大相关 {r['最大日相关']} / 平均 {r['平均日相关']} | 币种 {r['独立币种数']}个 | "
-                f"多空 {r['多空(L/S)']} | 最大单币权重 {r['最大单币权重(%)']}% | "
-                f"同时持仓 均{r['平均同时持仓数']}/最大{r['最大同时持仓数']} (占用 {r['资金利用率(%)']}%)")
+                f"   🔗 结构 -> 资金利用率 {r['资金利用率(%)']}% | 同时持仓 均{r['平均同时持仓数']}/最大{r['最大同时持仓数']} | "
+                f"最大相关 {r['最大日相关']} / 平均 {r['平均日相关']} | 币种 {r['独立币种数']}个 | 多空 {r['多空(L/S)']}")
             print(f"   🧘 体验 -> 盈利天 {r['盈利天占比(%)']}% | 最长无盈利 {r['最长无盈利(天)']}天 | "
-                  f"最差单日 {r['最差单日(M)']}M | 最差单月 {r['最差单月(M)']}M | 盈利月 {r['盈利月占比(%)']}% | "
-                  f"后半段贡献 {r['后半段净利占比(%)']}% | 短板安全垫 {r['平原短板安全垫(天)']}天")
+                  f"最差单日 {r['最差单日(M)']}M | 最差单月 {r['最差单月(M)']}M | 盈利月 {r['盈利月占比(%)']}%")
 
             # 成员在同一窗口内的可比明细
             lo, hi = int(r["_lo"]), int(r["_hi"])
@@ -1377,11 +1288,8 @@ def evaluate_multi_strategy_portfolios(
                     "窗口净利(M)": round(float(c_i[-1]), 2),
                     "窗口回撤(M)": round(d_i, 2),
                     "窗口Calmar": round((float(c_i[-1]) / yrs / d_i) if d_i > 1e-9 else 99.0, 2),
-                    "爆仓": int(BLOW[i, lo:hi + 1].sum()),
                     "开仓": int(CNT[i, lo:hi + 1].sum()),
                     "持仓占比(%)": round(float(HOLD[i, lo:hi + 1].mean() * 100), 1),
-                    # "峰值浮亏(M)": round(float(FLOAT[i, lo:hi + 1].max()), 3),
-                    "安全垫(天)": records[i]["cushion"],
                 })
             print_table(pd.DataFrame(rows))
             print("-" * 128)
