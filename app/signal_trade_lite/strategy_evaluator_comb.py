@@ -1245,7 +1245,7 @@ def evaluate_multi_strategy_portfolios(
 
     # ======== 核心排序逻辑：按持仓重合度升序(越小越好)，然后按净利降序，总收益降序 ========
     df_all.sort_values(by=[ "组合净利(M)","组合持仓重合度", "组合总收益(M)"],
-                       ascending=[True, False, False], inplace=True)
+                       ascending=[False, True, False], inplace=True)
 
     df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"\n🎉 组合评估完成: 有效 {len(df_all):,} 个 "
