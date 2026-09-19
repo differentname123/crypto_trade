@@ -829,8 +829,20 @@ def compute_parameter_plateau(
     return df_final
 
 
-def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direction="both", min_trades=1000,
-                         min_net_profit=-1000, min_total_profit=20):
+def show_leaderboard_csv(
+        csv_file="strategy_leaderboard_15600_files.csv",
+        direction="both",
+        min_trades=1000,  # 实际开仓数下限
+        min_net_profit=-1000,  # 净利润下限(Margin倍数)
+        min_total_profit=20,  # 总收益下限(Margin倍数)
+        min_plateau_survival_cushion=30,  # 【平原】存活安全垫下限（天），反映极端行情的兜底能力
+        max_plateau_p90_no_profit=20,  # 【平原】90%分位最长无盈利期上限（天）
+        min_plateau_mean_net_profit=0,  # 【平原】平均净利润下限（Margin倍数）
+        max_holding_days=20,  # 最大持仓时间上限（天）
+        min_neighbors=81,  # 全币邻居数下限（如：测试3个币，满邻居为 3×27 = 81）
+        min_median_survival_days=60,  # 中位数存活下限（天）
+        target_strategy_keywords=("factor",)  # 目标策略名称需包含的关键字元组，按此过滤展示
+):
     """
     专门用于读取并展示 CSV 文件的函数。
     【保留策略分组，且策略区块之间按该组的最大“总收益(M倍)”降序排列】
@@ -849,7 +861,7 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         print("[提示] CSV 文件为空，无数据可展示。")
         return
 
-    # ===== 输出说明（仅看日志者必读）=====
+    # ===== 输出说明（动态读取过滤参数）=====
     print("=" * 90)
     print(" 📖 核心术语与过滤说明")
     print("-" * 90)
@@ -862,22 +874,29 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     print(" [全币邻居数]     : 实际聚合成平原的有效样本数，例如测试3个币，满邻居即为 3×27 = 81。")
     print("-" * 90)
     print(" ⚙️ 榜单已施加以下严格过滤:")
-    print(f"  • 基础与容量 : Smooth=Y | 实际开仓≥{min_trades} | 最大持仓≤20天 | 全币邻居数≥81")
-    print(f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥-1000 M倍 | 平原均净利>0 | 平原90%无盈利≤20天")
-    print("  • 存活与风控 : 中位存活≥60天 | 平原安全垫≥30天")
+    print(
+        f"  • 基础与容量 : Smooth=Y | 实际开仓≥{min_trades} | 最大持仓≤{max_holding_days}天 | 全币邻居数≥{min_neighbors}")
+    print(
+        f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥{min_net_profit} M倍 | 平原均净利>{min_plateau_mean_net_profit} | 平原90%无盈利≤{max_plateau_p90_no_profit}天")
+    print(f"  • 存活与风控 : 中位存活≥{min_median_survival_days}天 | 平原安全垫≥{min_plateau_survival_cushion}天")
+    print(f"  • 策略白名单 : 必须包含关键字 {list(target_strategy_keywords)}")
     print("=" * 90)
+
     # 1. 过滤方向
     d_filter = direction.strip().lower()
     if d_filter == 'long':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Long']
     elif d_filter == 'short':
         df_all = df_all[df_all["方向"].str.capitalize() == 'Short']
+
     # ================== 新增 Spike 和 Smooth 的计算与过滤 ==================
     def parse_survival(v):
         if isinstance(v, str):
             if "未爆仓" in v: return 999.0
-            try: return float(v.split()[0])
-            except: return 999.0
+            try:
+                return float(v.split()[0])
+            except:
+                return 999.0
         return float(v) if pd.notnull(v) else 0.0
 
     df_all["_surv_days"] = df_all["预期存活(天)"].apply(parse_survival)
@@ -901,7 +920,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
     # 2. 计算 Spike
     col_total = "总收益(M倍)" if "总收益(M倍)" in df_all.columns else "总收益(Margin倍数)"
     df_all["Spike"] = df_all.apply(
-        lambda row: row[col_total] / row["平原均总收益(M倍)"] if "平原均总收益(M倍)" in df_all.columns and pd.notnull(row.get("平原均总收益(M倍)")) and row["平原均总收益(M倍)"] > 0 else 0.0,
+        lambda row: row[col_total] / row["平原均总收益(M倍)"] if "平原均总收益(M倍)" in df_all.columns and pd.notnull(
+            row.get("平原均总收益(M倍)")) and row["平原均总收益(M倍)"] > 0 else 0.0,
         axis=1
     )
 
@@ -913,41 +933,38 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         return
     # =======================================================================
 
-
-
     # 2. 过滤交易次数
     if "实际开仓数" in df_all.columns:
         df_all = df_all[df_all["实际开仓数"] >= min_trades]
 
-    df_all = df_all[df_all["中位存活(天)"].apply(check_lifespan)]
+    # 利用内部的 parse_survival 处理 "中位存活(天)"，脱离对外部全局 check_lifespan 函数的依赖
+    if "中位存活(天)" in df_all.columns:
+        df_all["_median_surv_days"] = df_all["中位存活(天)"].apply(parse_survival)
+        df_all = df_all[df_all["_median_surv_days"] >= min_median_survival_days]
 
     # 3. 过滤净利润
     if "净利润(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["净利润(Margin倍数)"] >= min_net_profit]
 
+    # === 参数化提取后的平原指标及风控指标过滤 ===
     if "平原存活安全垫(天)" in df_all.columns:
-        df_all = df_all[df_all["平原存活安全垫(天)"] >= 30]
+        df_all = df_all[df_all["平原存活安全垫(天)"] >= min_plateau_survival_cushion]
 
     if "平原90%分位无盈利(天)" in df_all.columns:
-        df_all = df_all[df_all["平原90%分位无盈利(天)"] <= 20]
-
-    # if "Margin" in df_all.columns:
-    #     df_all = df_all[df_all["Margin"] == 10]
-
-    # if "最小存活(天)" in df_all.columns:
-    #     df_all = df_all[df_all["最小存活(天)"] >= 30]
+        df_all = df_all[df_all["平原90%分位无盈利(天)"] <= max_plateau_p90_no_profit]
 
     if "平原均净利(M倍)" in df_all.columns:
-        df_all = df_all[df_all["平原均净利(M倍)"] > 0]
+        df_all = df_all[df_all["平原均净利(M倍)"] > min_plateau_mean_net_profit]
 
     if "最大持仓(h)" in df_all.columns:
-        df_all = df_all[df_all["最大持仓(h)"] <= 20 * 24]
+        df_all = df_all[df_all["最大持仓(h)"] <= max_holding_days * 24]
 
     if "全币邻居数" in df_all.columns:
-        df_all = df_all[df_all["全币邻居数"] >= 3 * 27]
+        df_all = df_all[df_all["全币邻居数"] >= min_neighbors]
 
     if "总收益(Margin倍数)" in df_all.columns:
         df_all = df_all[df_all["总收益(Margin倍数)"] >= min_total_profit]
+    # =========================================================
 
     if df_all.empty:
         print(f"[提示] 根据条件过滤后，无匹配数据。")
@@ -1025,12 +1042,10 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
         return str(val)
 
     # === 核心调整 2：按照排好序的策略列表依次打印 ===
-    target_strategy_name_list = ["factor"]
-
     index_count = 0
     for strategy_name in sorted_strategies:
-        # strategy_name必须要包含目标列表，比如 "factor_007_01" 就应该打印
-        if not any(target in strategy_name for target in target_strategy_name_list):
+        # 使用传入的参数 target_strategy_keywords 动态校验
+        if not any(target in strategy_name for target in target_strategy_keywords):
             continue
 
         index_count += 1
@@ -1049,7 +1064,8 @@ def show_leaderboard_csv(csv_file="strategy_leaderboard_15600_files.csv", direct
 
         # 打印表头，附带展示该策略的最高收益，一目了然
         max_p = strategy_max_profits[strategy_name]
-        print(f"\n🏆 开仓策略编号{index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
+        print(
+            f"\n🏆 开仓策略编号{index_count} | {strategy_name} | 方向: {direction.upper()} | 本组最高收益: {max_p:.2f} M倍")
 
         cols = list(df_display.columns)
         col_widths = []
@@ -1084,7 +1100,7 @@ if __name__ == "__main__":
     # time.sleep(3600 * 4)
     # mp.freeze_support()
     # analyze_all_strategies()
-    csv_file = "strategy_leaderboard_57600_files.csv"
+    csv_file = "strategy_leaderboard_100800_files.csv"
     output_csv = csv_file.replace(".csv", "_plateau.csv")
 
     # df_with_plateau = compute_parameter_plateau(
