@@ -685,7 +685,7 @@ def transform_mlus(mlu_list):
 
         # 3. 构建极简的纯净数据，丢弃所有工程判断字段 (shelf_life, impact_weight, publish_time 等)
         cleaned_mlu = {
-            "dimension": mlu.get('dimension', ''),
+            # "dimension": mlu.get('dimension', ''),
             "fact": mlu.get('core_fact', ''),
             "underlying_logic": mlu.get('logic_link', ''),
             "visual_evidence": visual_evidence
