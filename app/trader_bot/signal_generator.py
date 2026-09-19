@@ -2054,6 +2054,6 @@ if __name__ == '__main__':
             datetime.now() - timedelta(minutes=1)
     ).strftime('%Y-%m-%d %H:%M')
 
-    symbol_list = ['AAVE/USDT:USDT']
-    signal = get_signal_factor_044_10(symbol_list[0])
+    symbol_list = ['UNI/USDT:USDT']
+    signal = get_signal_factor_044_3(symbol_list[0])
     print()
