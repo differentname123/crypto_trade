@@ -57,12 +57,12 @@ class Config:
     EVALUATION_END = None
 
     # 【修改点】扩充后的网格搜索空间
-    Z_THRESHOLDS_TO_TEST = [2.0, 2.5, 3.0, 3.5]       # 增加 2.5 观察平滑度
-    HOLDING_PERIODS_TO_TEST = [6, 12, 24, 48]         # 增加 48h (长周期回归)
-    SIGNAL_WINDOWS_TO_TEST = [12, 24, 48]             # 新增: 信号计算窗口
-    BETA_WINDOWS_TO_TEST = [15, 30, 60]               # 新增: Beta历史窗口
+    Z_THRESHOLDS_TO_TEST = [3.0, 3.5, 4, 5]       # 增加 2.5 观察平滑度
+    HOLDING_PERIODS_TO_TEST = [24, 48, 60, 72]         # 增加 48h (长周期回归)
+    SIGNAL_WINDOWS_TO_TEST = [24, 48, 60]             # 新增: 信号计算窗口
+    BETA_WINDOWS_TO_TEST = [30, 60, 90]               # 新增: Beta历史窗口
     RIGHT_SIDE_ENTRIES_TO_TEST = [False, True]
-    POSITION_MODES_TO_TEST = ["FIXED_HOLD", "MAX_DEVIATION"]
+    POSITION_MODES_TO_TEST = ["FIXED_HOLD"]
 
     # 每个进程独立运行一组参数；多币种长历史会占内存，可按机器调整。
     MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
