@@ -1205,12 +1205,12 @@ if __name__ == "__main__":
     csv_file = "strategy_leaderboard_100800_files.csv"
     output_csv = csv_file.replace(".csv", "_plateau.csv")
 
-    # df_with_plateau = compute_parameter_plateau(
-    #     csv_file=csv_file,
-    #     output_csv=output_csv,
-    #     neighbor_radius=1,  # 切比雪夫半径
-    #     min_survival_days=60.0  # 存活周期阈值
-    # )
+    df_with_plateau = compute_parameter_plateau(
+        csv_file=csv_file,
+        output_csv=output_csv,
+        neighbor_radius=1,  # 切比雪夫半径
+        min_survival_days=60.0  # 存活周期阈值
+    )
 
 
     show_leaderboard_csv(csv_file=output_csv, direction="long")
