@@ -1969,6 +1969,83 @@ def get_signal_factor_044_5(symbol):
     )
 
 
+def generate_factor_043_10_signals(df):
+    """factor_043_10：15根窗口假突破 1200根历史高点后回落，产生 SHORT OPEN。"""
+    return _generate_false_break_signals(
+        df, 'factor_043_10', 'SHORT', 15, 1200
+    )
+
+def generate_factor_044_3_signals(df):
+    """factor_044_3：5根窗口假跌破 60根历史低点后收回，产生 LONG OPEN。"""
+    return _generate_false_break_signals(
+        df, 'factor_044_3', 'LONG', 5, 60
+    )
+
+def generate_factor_044_4_signals(df):
+    """factor_044_4：8根窗口假跌破 120根历史低点后收回，产生 LONG OPEN。"""
+    return _generate_false_break_signals(
+        df, 'factor_044_4', 'LONG', 8, 120
+    )
+
+
+def execute_trading_bot_workflow_factor_043_10(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_043_10：1m 极低频假突破做空。"""
+    return _run_factor_workflow(
+        'factor_043_10',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_043_10_signals,
+        '极低频重要结构反转做空信号生成',
+    )
+
+def execute_trading_bot_workflow_factor_044_3(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_044_3：1m 短线常规假跌破做多。"""
+    return _run_factor_workflow(
+        'factor_044_3',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_044_3_signals,
+        '短线常规假跌破做多信号生成',
+    )
+
+def execute_trading_bot_workflow_factor_044_4(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_044_4：1m 中短线平滑假跌破做多。"""
+    return _run_factor_workflow(
+        'factor_044_4',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_044_4_signals,
+        '中短线平滑假跌破做多信号生成',
+    )
+
+
+def get_signal_factor_043_10(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_043_10,
+        'factor_043_10',
+    )
+
+def get_signal_factor_044_3(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_044_3,
+        'factor_044_3',
+    )
+
+def get_signal_factor_044_4(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_044_4,
+        'factor_044_4',
+    )
+
 # =============================================================================
 # 八、本地联调入口
 # =============================================================================
@@ -1977,6 +2054,6 @@ if __name__ == '__main__':
             datetime.now() - timedelta(minutes=1)
     ).strftime('%Y-%m-%d %H:%M')
 
-    symbol_list = ['UNI/USDT:USDT']
-    signal = get_signal_factor_044_5(symbol_list[0])
+    symbol_list = ['AAVE/USDT:USDT']
+    signal = get_signal_factor_044_10(symbol_list[0])
     print()

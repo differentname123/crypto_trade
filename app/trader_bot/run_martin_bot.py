@@ -83,6 +83,9 @@ from signal_generator import (
     get_signal_factor_044_1,
     get_signal_factor_044_10,
     get_signal_factor_044_5,
+    get_signal_factor_044_3,
+    get_signal_factor_044_4,
+
 )
 
 # 信号源按字符串注册，保证 MartinConfig 可跨进程序列化。
@@ -92,6 +95,9 @@ SIGNAL_REGISTRY = {
     "factor_043_9": get_signal_factor_043_9,
     "factor_044_10": get_signal_factor_044_10,
     "factor_044_5": get_signal_factor_044_5,
+    "factor_044_3": get_signal_factor_044_3,
+    "factor_044_4": get_signal_factor_044_4,
+
 }
 
 # ==============================================================================
@@ -2859,15 +2865,15 @@ def main_app():
 
     # 2. Myself 账号（""）专用的额外策略
     myself_extra_templates = [
-        {"base_id": "LSOL19", "symbol": "SOL/USDT:USDT", "signal_name": "factor_044_1",
-         "first_qty": 0.1, "step_pct": 2.5, "qty_mult": 2, "tp_pct": 1.2,
-         "max_loss_usdt": 10 * 7, "layer_loss_budget_ratio": 1},
-        {"base_id": "SUNI19", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_9",
-         "first_qty": 1, "step_pct": 2.5, "qty_mult": 2, "tp_pct": 0.9,
-         "max_loss_usdt": 9 * 8, "layer_loss_budget_ratio": 1},
-        {"base_id": "LUNI19", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_5",
-         "first_qty": 1, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.9,
-         "max_loss_usdt": 9 * 9, "layer_loss_budget_ratio": 1},
+        {"base_id": "SAAVE", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
+         "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.9,
+         "max_loss_usdt": 42 * 5, "layer_loss_budget_ratio": 1},
+        {"base_id": "LUNI5", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_3",
+         "first_qty": 4, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.5,
+         "max_loss_usdt": 36 * 5, "layer_loss_budget_ratio": 1},
+        {"base_id": "LUNI10", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_4",
+         "first_qty": 2, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.7,
+         "max_loss_usdt": 18 * 10, "layer_loss_budget_ratio": 1},
     ]
 
     configs = []
