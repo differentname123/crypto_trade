@@ -947,7 +947,7 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
 
 
 def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
-    """生成一个币种/立场分组的文章。所有终态落库，只有 ok 消耗原帖使用次数。"""
+    """生成一个币种/立场分组的文章。仅 ok 结果入库一次，skip/error 直接返回。"""
     creation_brief = {
         'task': {
             'topic': coin,
@@ -957,16 +957,26 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         },
         'materials': []
     }
-    # 先保留任务记录。数据库不可用时直接中断，避免生成无法计数入库的文章。
-    record = article_manager.save_article({
+    model_name = "gemini-3.1-pro-preview"
+    prompt_version = "0920v1.0"
+    # 生成和重试期间只在内存中维护记录，成功后再统一入库。
+    record = {
         'source': BINANCE_SOURCE,
         'topic': coin,
         'stance': stance,
         'status': 'processing',
         'creation_brief': creation_brief,
         'material_post_mapping': {},
-        'prompt_file_path': ARTICLE_PROMPT_FILE_PATH
-    })
+        'prompt_file_path': ARTICLE_PROMPT_FILE_PATH,
+        'post_id_list': [],
+        'article_info': None,
+        'error_message': None,
+        'error_history': [],
+        'raw_response': None,
+        "model_name": model_name,
+        "prompt_version": prompt_version,
+        'attempt_count': 0,
+    }
     try:
         candidates = [
             ev for ev in ev_list
@@ -1005,8 +1015,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
                 material['id']: evidence['source_post_id']
                 for material, evidence in zip(materials, selected_evidences)
             }
-            # 保存本次真实输入和 M1/M2 -> post_id 对照，失败时也能追溯。
-            record = article_manager.save_article(record)
             prompt = read_file_to_str(ARTICLE_PROMPT_FILE_PATH)
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError(f"文章生成提示词为空或读取失败: {ARTICLE_PROMPT_FILE_PATH}")
@@ -1019,7 +1027,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
                 try:
                     # 本阶段只传素材文字和图片描述，不再上传原图。
                     error_detail, raw_response = generate_gemini_content_playwright(
-                        full_prompt, file_path=[]
+                        full_prompt, model_name=model_name
                     )
                     record['raw_response'] = raw_response
                     if error_detail:
@@ -1056,13 +1064,15 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         record['status'] = 'error'
         record['article_info'] = None
         record['error_message'] = f'{type(exc).__name__}: {exc}'
-        logger.error("[文章/生成失败] article_id=%s | topic=%s | stance=%s | error=%s",
-                     record['article_id'], coin, stance, exc, exc_info=True)
+        logger.error("[文章/生成失败] topic=%s | stance=%s | error=%s",
+                     coin, stance, exc, exc_info=True)
 
-    # 落库放在模型重试之外，避免数据库写入异常触发模型重复生成。
+    # 仅成功时落库一次；跳过、失败和中间重试均不写数据库。
+    # 落库仍放在模型重试之外，避免数据库写入异常触发模型重复生成。
     # 写入失败向上传播，停止本轮；不能继续按可能过时的使用次数生成其他分组。
-    return article_manager.save_article(record)
-
+    if record['status'] == 'ok':
+        return article_manager.save_article(record)
+    return record
 
 def generate_analysis_articles_once():
     """执行一轮：刷新有效论据池，遍历 final_dict，每个币种/立场最多生成一篇。"""
