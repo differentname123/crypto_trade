@@ -369,7 +369,10 @@ def print_performance_summary(base_dir="trade_results"):
 
     # ---------------- 打印输出层扁平化重构 ----------------
     print_df = summary.copy()
+    quadrants = ["Long_High", "Long_Low", "Short_High", "Short_Low"]
+
     if common_start is not None:
+        # 保留All的季度数据（仅为打印整体使用）
         all_periods = periods_df.loc[periods_df["Group"].eq("All")]
         for p in range(1, 5):
             p_data = all_periods.loc[all_periods["Period"].eq(p)].set_index("Run")
@@ -378,41 +381,46 @@ def print_performance_summary(base_dir="trade_results"):
             print_df[f"Q{p}_Ret(%)"] = print_df["Run"].map(p_data["Avg_Ret(%)"])
             print_df[f"Q{p}_SumRet(%)"] = print_df["Run"].map(p_data["Sum_Ret(%)"])
 
-    # 增加过滤条件
+        # 为4个象限提取季度数据
+        for quad in quadrants:
+            quad_periods = periods_df.loc[periods_df["Group"].eq(quad)]
+            for p in range(1, 5):
+                p_data = quad_periods.loc[quad_periods["Period"].eq(p)].set_index("Run")
+                print_df[f"{quad}_Q{p}_Trades"] = print_df["Run"].map(p_data["Trades"])
+                print_df[f"{quad}_Q{p}_Ret(%)"] = print_df["Run"].map(p_data["Avg_Ret(%)"])
+
     total = len(print_df)
+    cond_all = pd.Series(False, index=print_df.index)
 
-    cond1 = pd.Series(True, index=print_df.index)
-    if common_start is not None:
-        for p in range(1, 5):
-            col = f"Q{p}_Ret(%)"
-            if col in print_df.columns:
-                # fillna(0) 会将该季度无交易的数据认定为不过滤要求 (>0)
-                cond1 = cond1 & (print_df[col].fillna(0) > 0)
-    else:
-        cond1 = pd.Series(False, index=print_df.index)
+    # 按4个象限独立判断过滤条件
+    for quad in quadrants:
+        cond_quad_q = pd.Series(True, index=print_df.index)
+        if common_start is not None:
+            for p in range(1, 5):
+                col = f"{quad}_Q{p}_Ret(%)"
+                if col in print_df.columns:
+                    # fillna(0) 依然限制无交易记为不过滤要求(>0)
+                    cond_quad_q = cond_quad_q & (print_df[col].fillna(0) > 0)
+        else:
+            cond_quad_q = pd.Series(False, index=print_df.index)
 
-    # WorstMAE是负数，所以 > -200 表示回撤幅度小于200%
-    cond2 = print_df["All_WorstMAE(%)"].fillna(0) > -200
+        cond_quad_risk = print_df[f"{quad}_WorstMAE(%)"].fillna(0) > -200
 
-    cond_all = cond1 & cond2
+        # 只要该象限同时满足季度>0和回撤>-200%条件
+        cond_quad_pass = cond_quad_q & cond_quad_risk
+
+        # 将通过结果聚合到整体过滤器中 (OR)
+        cond_all = cond_all | cond_quad_pass
 
     print("\n" + "=" * 50 + " 过滤条件与统计 " + "=" * 50)
-    print("过滤要求：")
-    print("  1. 每个Q的平均单笔收益是正数 (Q1~Q4_Ret > 0)")
-    print("  2. 单笔最大回撤小于 200% (WorstMAE > -200%)")
+    print("过滤要求（按4个象限独立判断，满足任意1个即可入选）：")
+    print("  1. 该象限每个Q的平均单笔收益是正数 (Q1~Q4_Ret > 0)")
+    print("  2. 该象限单笔最大回撤小于 200% (WorstMAE > -200%)")
     print(f"\n总策略数: {total}")
-
-    cnt1 = cond1.sum()
-    pct1 = (cnt1 / total * 100) if total else 0
-    print(f"满足条件1(各Q均收益>0)通过数量: {cnt1} ({pct1:.2f}%)")
-
-    cnt2 = cond2.sum()
-    pct2 = (cnt2 / total * 100) if total else 0
-    print(f"满足条件2(单笔最大回撤<200%)通过数量: {cnt2} ({pct2:.2f}%)")
 
     cnt_all = cond_all.sum()
     pct_all = (cnt_all / total * 100) if total else 0
-    print(f"最终同时满足条件通过数量: {cnt_all} ({pct_all:.2f}%)")
+    print(f"最终满足条件通过数量: {cnt_all} ({pct_all:.2f}%)")
     print("=" * 116)
 
     def get_stat(r_data, prefix):
@@ -425,6 +433,39 @@ def print_performance_summary(base_dir="trade_results"):
             r_data.get(f"{prefix}_SumRet(%)", np.nan)) else "--"
         return t, w, ret, sr
 
+    def print_quadrant_detail(row, quad_name, display_name):
+        """专为打印某一个象限的详细数据属性"""
+        t, w, ret, sr = get_stat(row, quad_name)
+        if t == 0:
+            print(f"  🔹 {display_name} -> 无交易")
+            return
+
+        net_pnl = f"{row.get(f'{quad_name}_NetPnL', np.nan):.2f}" if pd.notna(
+            row.get(f'{quad_name}_NetPnL', np.nan)) else "--"
+        max_loss = row.get(f'{quad_name}_MaxLossStreak', '--')
+        max_concurrent = row.get(f'{quad_name}_MaxConcurrent', '--')
+        worst_mae = f"{row.get(f'{quad_name}_WorstMAE(%)', np.nan):.2f}%" if pd.notna(
+            row.get(f'{quad_name}_WorstMAE(%)', np.nan)) else "--"
+        avg_mae = f"{row.get(f'{quad_name}_AvgMAE(%)', np.nan):.2f}%" if pd.notna(
+            row.get(f'{quad_name}_AvgMAE(%)', np.nan)) else "--"
+
+        print(f"  🔹 {display_name} -> 笔数 {t} | 胜率 {w} | 均收益 {ret} | 总收益 {sr} | 净盈亏(USDT) {net_pnl}")
+        print(
+            f"      ⚠️ 风险指标 -> 最大连亏 {max_loss}次 | 最大并发 {max_concurrent} | 平均MAE {avg_mae} | 最差MAE {worst_mae}")
+
+        q_info = []
+        if common_start is not None:
+            for p in range(1, 5):
+                q_trades = row.get(f"{quad_name}_Q{p}_Trades", np.nan)
+                if pd.notna(q_trades) and q_trades > 0:
+                    q_ret = row.get(f"{quad_name}_Q{p}_Ret(%)", np.nan)
+                    q_ret_str = f"{q_ret:.4f}%" if pd.notna(q_ret) else "--"
+                    q_info.append(f"Q{p}(笔:{int(q_trades)} 收益:{q_ret_str})")
+                else:
+                    q_info.append(f"Q{p}(无交易)")
+        if q_info:
+            print(f"      📅 季度分布 -> {' | '.join(q_info)}")
+
     for complete, title in [(True, "已全部结算组合（已过滤，按单笔平均净收益率排序）"),
                             (False, "含未结算交易子集（已过滤，不进入完整结果排行）")]:
         selected = print_df.loc[print_df["Run_Complete"].eq(complete) & cond_all]
@@ -436,15 +477,6 @@ def print_performance_summary(base_dir="trade_results"):
 
             all_t, all_w, all_r, all_sr = get_stat(row, "All")
             net_pnl = f"{row['All_NetPnL']:.2f}" if pd.notna(row['All_NetPnL']) else "--"
-
-            l_t, l_w, l_r, l_sr = get_stat(row, "Long")
-            lh_t, lh_w, lh_r, _ = get_stat(row, "Long_High")
-            ll_t, ll_w, ll_r, _ = get_stat(row, "Long_Low")
-
-            s_t, s_w, s_r, s_sr = get_stat(row, "Short")
-            sh_t, sh_w, sh_r, _ = get_stat(row, "Short_High")
-            sl_t, sl_w, sl_r, _ = get_stat(row, "Short_Low")
-
             max_loss = row['All_MaxLossStreak']
             max_concurrent = row['All_MaxConcurrent']
             worst_mae = f"{row['All_WorstMAE(%)']:.2f}%" if pd.notna(row['All_WorstMAE(%)']) else "--"
@@ -452,18 +484,9 @@ def print_performance_summary(base_dir="trade_results"):
 
             print(f"⚙️ 参数 -> {params}")
             print(
-                f"💰 汇总 -> 交易次数 {all_t} | 胜率 {all_w} | 均净收益率 {all_r} | 总净收益率 {all_sr} | 总净盈亏(USDT) {net_pnl}")
-
-            print(f"📈 做多(LONG) -> 笔数 {l_t} | 胜率 {l_w} | 均收益 {l_r} | 总收益 {l_sr}")
-            print(f"    ├─ 高成交额(High) -> 笔数 {lh_t} | 胜率 {lh_w} | 均收益 {lh_r}")
-            print(f"    └─ 低成交额(Low)  -> 笔数 {ll_t} | 胜率 {ll_w} | 均收益 {ll_r}")
-
-            print(f"📉 做空(SHORT)-> 笔数 {s_t} | 胜率 {s_w} | 均收益 {s_r} | 总收益 {s_sr}")
-            print(f"    ├─ 高成交额(High) -> 笔数 {sh_t} | 胜率 {sh_w} | 均收益 {sh_r}")
-            print(f"    └─ 低成交额(Low)  -> 笔数 {sl_t} | 胜率 {sl_w} | 均收益 {sl_r}")
-
+                f"💰 整体汇总 -> 交易次数 {all_t} | 胜率 {all_w} | 均净收益率 {all_r} | 总净收益率 {all_sr} | 总净盈亏(USDT) {net_pnl}")
             print(
-                f"⚠️ 风险 -> 最大连亏 {max_loss}次 | 最大并发 {max_concurrent} | 平均单笔MAE {avg_mae} | 单笔最差MAE {worst_mae}")
+                f"⚠️ 整体风险 -> 最大连亏 {max_loss}次 | 最大并发 {max_concurrent} | 平均单笔MAE {avg_mae} | 单笔最差MAE {worst_mae}")
 
             q_info = []
             if common_start is not None:
@@ -472,12 +495,20 @@ def print_performance_summary(base_dir="trade_results"):
                     if pd.notna(q_trades) and q_trades > 0:
                         q_ret = row.get(f"Q{p}_Ret(%)", np.nan)
                         q_ret_str = f"{q_ret:.4f}%" if pd.notna(q_ret) else "--"
-                        q_info.append(f"Q{p}(笔数:{int(q_trades)} 均收益:{q_ret_str})")
+                        q_info.append(f"Q{p}(笔:{int(q_trades)} 收益:{q_ret_str})")
                     else:
                         q_info.append(f"Q{p}(无交易)")
             if q_info:
-                print(f"📅 季度 -> {' | '.join(q_info)}")
-            print("-" * 80)
+                print(f"📅 整体季度 -> {' | '.join(q_info)}")
+
+            print("   " + "-" * 105)
+            # 分别打印4个象限的详细数据 (包含各自独立的笔数/收益/回撤/季度表现)
+            print_quadrant_detail(row, "Long_High", "做多-高成交额(Long_High)")
+            print_quadrant_detail(row, "Long_Low", "做多-低成交额(Long_Low)")
+            print_quadrant_detail(row, "Short_High", "做空-高成交额(Short_High)")
+            print_quadrant_detail(row, "Short_Low", "做空-低成交额(Short_Low)")
+
+            print("-" * 110)
 
     print("\n[指标说明] MaxLossStreak=逐笔平仓顺序最大连亏；MaxConcurrent=最大同时持仓配对数。")
     print("MAEValid/MAEMissing=已平仓交易中完整/缺失价格路径的笔数；缺失不填0。")
