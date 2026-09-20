@@ -531,148 +531,181 @@ def check_lifespan(val):
     except:
         return True
 
+def analyze_all_strategies(*, max_tasks_per_child=10, print_details=True):
+    """全局评估：有限复用进程，减少汇总内存，保留原有统计口径。
 
-def analyze_all_strategies():
+    max_tasks_per_child:
+        每个子进程处理多少个文件后退出，默认 10；设为 1 恢复逐文件隔离。
+        复用要求回放器/评估函数不依赖逐文件重置的模块全局状态。
+    print_details:
+        默认 True，保留控制台榜单；False 仅关闭详细榜单，仍保存完整 CSV。
+    """
+    if (isinstance(max_tasks_per_child, bool)
+            or not isinstance(max_tasks_per_child, int)
+            or max_tasks_per_child < 1):
+        raise ValueError("max_tasks_per_child 必须为正整数")
+
+    started = time.perf_counter()
     print("=" * 80)
     print(f" 🚀 启动全局策略评估引擎 | 设定测试 Margins = {TEST_MARGINS}")
     print("=" * 80)
 
-    # === 兼容新老文件修改点 3：让 glob 同时搜索 .pkl 和 .pkl.gz 文件 ===
-    files_main = glob.glob(os.path.join(CACHE_DIR, "stage1_*.pkl")) + \
-                 glob.glob(os.path.join(CACHE_DIR, "stage1_*.pkl.gz"))
+    # 两个配置指向同一目录时只扫描一次；仍同时保留 .pkl 和 .pkl.gz。
+    seen_dirs = set()
+    files = []
+    for cache_dir in (CACHE_DIR, SHORT_CACHE_DIR):
+        directory_key = os.path.normcase(os.path.abspath(cache_dir))
+        if directory_key in seen_dirs:
+            continue
+        seen_dirs.add(directory_key)
+        if not os.path.exists(cache_dir):
+            continue
+        files.extend(glob.glob(os.path.join(cache_dir, "stage1_*.pkl")))
+        files.extend(glob.glob(os.path.join(cache_dir, "stage1_*.pkl.gz")))
 
-    if os.path.exists(SHORT_CACHE_DIR):
-        files_short = glob.glob(os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl")) + \
-                      glob.glob(os.path.join(SHORT_CACHE_DIR, "stage1_*.pkl.gz"))
-    else:
-        files_short = []
-
-    pkl_files = list(set(files_main + files_short))
-
+    pkl_files = sorted(set(files))
+    del files
     if not pkl_files:
-        print(f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 stage1_*.pkl(或.gz) 文件！")
+        print(
+            f"[错误] 在 {CACHE_DIR} 及 {SHORT_CACHE_DIR} 目录下均未找到任何 "
+            "stage1_*.pkl(或.gz) 文件！"
+        )
         return
 
-    # 文件前置过滤逻辑，仅保留属于白名单策略的文件
-    filtered_pkl_files = []
-    for filepath in pkl_files:
-        filename = os.path.basename(filepath)
-        _, strategy_name, _ = _parse_filename(filename)
-        # 如果需要过滤特定的策略，可以取消下面这行的注释
-        # if strategy_name in TARGET_STRATEGIES:
-        filtered_pkl_files.append(filepath)
-
-    pkl_files = filtered_pkl_files
-
-    if not pkl_files:
-        print(f"[提示] 未找到匹配目标列表 TARGET_STRATEGIES 的任何文件，请检查命名。")
-        return
-
-    mode_desc = f"子进程池隔离(并行度={PARALLEL_WORKERS}) + dtype 瘦身" if USE_SUBPROCESS else "主进程 + dtype 瘦身"
-    print(f"共匹配到 {len(pkl_files)} 个属于目标列表的缓存文件，开启低内存模式({mode_desc})...\n")
-
+    # 原版白名单判断被注释，实际处理全部匹配文件；此处保留这个行为。
+    # 文件名仍由 _process_one_file 解析，无需在主进程重复解析。
+    num_files = len(pkl_files)
     results_by_margin = {m: [] for m in TEST_MARGINS}
-    use_subprocess = USE_SUBPROCESS
     pool = None
 
-    if use_subprocess:
+    if USE_SUBPROCESS:
         try:
             ctx = mp.get_context("spawn")
-            pool = ctx.Pool(processes=PARALLEL_WORKERS, maxtasksperchild=1)
-        except Exception as e:
-            print(f"[警告] 子进程池初始化失败，自动切换为主进程内处理...")
-            use_subprocess = False
-
-    if use_subprocess:
-        results_iter = pool.imap_unordered(_process_one_file_safe, pkl_files)
-    else:
-        results_iter = map(_process_one_file_safe, pkl_files)
-
-    for idx, result in enumerate(results_iter, 1):
-        file_path = result.get("file_path", "Unknown")
-        filename = os.path.basename(file_path)
-
-        if result.get("ok"):
-            rows = result.get("rows") or {}
-            for margin in TEST_MARGINS:
-                row = rows.get(margin)
-                if row is not None:
-                    results_by_margin[margin].append(row)
-        else:
-            print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
-
-        if idx % 500 == 0 or idx == len(pkl_files):
-            print(f"进度: {idx}/{len(pkl_files)} 个策略文件已处理完成...")
+            pool = ctx.Pool(
+                processes=PARALLEL_WORKERS,
+                maxtasksperchild=max_tasks_per_child,
+            )
+        except Exception as exc:
+            print(f"[警告] 子进程池初始化失败，切换主进程处理: {exc}")
 
     if pool is not None:
-        pool.close()
-        pool.join()
+        mode_desc = (
+            f"子进程池(并行度={PARALLEL_WORKERS}, "
+            f"每进程最多处理 {max_tasks_per_child} 个文件)"
+        )
+    else:
+        mode_desc = "主进程"
+    print(f"共匹配到 {num_files} 个缓存文件，处理模式: {mode_desc}\n")
 
-    print("\n" + "=" * 80)
-    print(f" 🎉 分析完成！开始按策略展示表现...")
-    print("=" * 80)
+    failed_files = 0
+    try:
+        if pool is not None:
+            # 保持一个文件一个任务，使回收周期准确，也利于长短任务均衡。
+            results_iter = pool.imap_unordered(
+                _process_one_file_safe, pkl_files, chunksize=1
+            )
+        else:
+            results_iter = map(_process_one_file_safe, pkl_files)
 
-    # 汇总所有结果形成宽表
-    all_results = []
-    for margin in TEST_MARGINS:
-        for row in results_by_margin.get(margin, []):
-            r = dict(row)
-            r['Margin'] = margin
-            all_results.append(r)
+        for idx, result in enumerate(results_iter, 1):
+            if result.get("ok"):
+                rows = result.get("rows") or {}
+                for margin in TEST_MARGINS:
+                    row = rows.get(margin)
+                    if row is not None:
+                        # 每一行由 _build_row 独立创建，可以直接添加 Margin。
+                        # 避免后续对最多 1,008,000 个字典再执行 dict(row)。
+                        row["Margin"] = margin
+                        results_by_margin[margin].append(row)
+            else:
+                failed_files += 1
+                filename = os.path.basename(result.get("file_path", "Unknown"))
+                print(f"[警告] 处理失败，已跳过: {filename} | {result.get('err')}")
 
+            if idx % 500 == 0 or idx == num_files:
+                elapsed = time.perf_counter() - started
+                rate = idx / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"进度: {idx}/{num_files} 个文件 | "
+                    f"已用时 {elapsed:.1f}s | 平均 {rate:.2f} 文件/s"
+                )
+
+        if pool is not None:
+            pool.close()
+    except BaseException:
+        if pool is not None:
+            pool.terminate()
+        raise
+    finally:
+        if pool is not None:
+            pool.join()
+
+    evaluation_finished = time.perf_counter()
+    print(
+        f"\n评估完成，用时 {evaluation_finished - started:.1f}s，"
+        f"失败文件 {failed_files} 个；开始汇总并保存..."
+    )
+
+    # 保持原来按 TEST_MARGINS 排列的分组顺序，只复制引用，不复制行字典。
+    all_results = [
+        row
+        for margin in TEST_MARGINS
+        for row in results_by_margin.get(margin, [])
+    ]
+    del results_by_margin
     if not all_results:
         print("没有有效数据产生，无结果可展示。")
         return
 
     df_all = pd.DataFrame(all_results)
-
-    # === 修改点：1. 最终保存的这个csv文件不要进行过滤，且包含文件数量信息 ===
-    num_files = len(pkl_files)
+    del all_results
     output_csv = f"strategy_leaderboard_{num_files}_files.csv"
-    df_all.to_csv(output_csv, index=False, encoding='utf-8-sig')
-    print(f"已将未过滤的完整结果保存至: {output_csv}\n")
+    df_all.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print(f"已将未过滤的完整结果保存至: {output_csv}，共 {len(df_all)} 行")
+    print(f"汇总及保存用时: {time.perf_counter() - evaluation_finished:.1f}s")
+
+    if not print_details:
+        return
 
     df_filtered = df_all[df_all["预期存活(天)"].apply(check_lifespan)]
-    df_filtered = df_filtered[df_filtered["净利润(Margin倍数)"] >= MIN_NET_PROFIT]
+    df_filtered = df_filtered[
+        df_filtered["净利润(Margin倍数)"] >= MIN_NET_PROFIT
+    ]
+    del df_all
 
-    # === 增加新增的两列至展示列表 ===
-    display_cols = ["Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数", "实际开仓数", "胜率(%)", "爆仓次数",
-                    "爆仓几率(%)", "预期存活(天)", "中位存活(天)", "最大存活(天)", "最小存活(天)",
-                    "平均持仓(h)", "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)", "死前翻倍胜率(%)",
-                    "平均回撤(M倍)", "中位回撤(M倍)",
-                    "总收益(Margin倍数)", "总亏损(Margin倍数)", "净利润(Margin倍数)",
-                    "平均每天收益(M倍)", "每天中位数收益(M倍)", "最长无盈利(天)", "无盈利占比(%)"]
+    display_cols = [
+        "Margin", "币种", "方向", "加仓间距", "止盈间距", "加仓倍数",
+        "实际开仓数", "胜率(%)", "爆仓次数", "爆仓几率(%)", "预期存活(天)",
+        "中位存活(天)", "最大存活(天)", "最小存活(天)", "平均持仓(h)",
+        "中位数持仓(h)", "最大持仓(h)", "持仓时间占比(%)", "死前翻倍胜率(%)",
+        "平均回撤(M倍)", "中位回撤(M倍)", "总收益(Margin倍数)",
+        "总亏损(Margin倍数)", "净利润(Margin倍数)", "平均每天收益(M倍)",
+        "每天中位数收益(M倍)", "最长无盈利(天)", "无盈利占比(%)",
+    ]
 
-    def get_display_width(s):
-        w = 0
-        for c in str(s):
-            if unicodedata.east_asian_width(c) in ('F', 'W', 'A'):
-                w += 2
-            else:
-                w += 1
-        return w
+    def get_display_width(value):
+        return sum(
+            2 if unicodedata.east_asian_width(char) in ("F", "W", "A") else 1
+            for char in str(value)
+        )
 
-    def right_align(s, width):
-        s = str(s)
-        pad_len = width - get_display_width(s)
-        return " " * max(0, pad_len) + s
+    def right_align(value, width):
+        value = str(value)
+        return " " * max(0, width - get_display_width(value)) + value
 
-    def format_val(val):
-        if isinstance(val, (float, np.float32, np.float64)):
-            return f"{val:.3f}" if val < 0.1 and val > 0 else f"{val:.2f}"
-        return str(val)
+    def format_val(value):
+        if isinstance(value, (float, np.float32, np.float64)):
+            return f"{value:.3f}" if 0 < value < 0.1 else f"{value:.2f}"
+        return str(value)
 
-    # 注意这里使用 df_filtered 做打印展示，防止刷屏
+    display_started = time.perf_counter()
     for strategy_name, df_strat in df_filtered.groupby("策略"):
         print(f"\n🏆 策略 = {strategy_name} | 多币种 & 不同 Margin 综合表现:")
-
-        # 排序
-        df_display = df_strat.sort_values(by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]).copy()
-
+        df_display = df_strat.sort_values(
+            by=["币种", "方向", "Margin", "加仓间距", "止盈间距", "加仓倍数"]
+        )[display_cols].copy()
         if df_display.empty:
             continue
-
-        df_display = df_display[display_cols]
 
         df_display.rename(columns={
             "死前翻倍胜率(%)": "翻倍胜率(%)",
@@ -680,31 +713,34 @@ def analyze_all_strategies():
             "总亏损(Margin倍数)": "总亏损(M倍)",
             "净利润(Margin倍数)": "净利润(M倍)",
             "平均每天收益(M倍)": "日均收益(M)",
-            "每天中位数收益(M倍)": "日中位收益(M)"
+            "每天中位数收益(M倍)": "日中位收益(M)",
         }, inplace=True)
 
         cols = list(df_display.columns)
         col_widths = []
-
         for col in cols:
-            max_w = get_display_width(col)
-            for val in df_display[col]:
-                max_w = max(max_w, get_display_width(format_val(val)))
-            col_widths.append(max_w)
+            max_width = get_display_width(col)
+            for value in df_display[col]:
+                max_width = max(max_width, get_display_width(format_val(value)))
+            col_widths.append(max_width)
 
-        header_cells = [right_align(col, col_widths[i]) for i, col in enumerate(cols)]
-        header_str = " | ".join(header_cells)
+        header_str = " | ".join(
+            right_align(col, col_widths[i]) for i, col in enumerate(cols)
+        )
         sep_line = "-" * len(header_str)
-
         print(sep_line)
         print(header_str)
         print(sep_line)
 
-        for _, row in df_display.iterrows():
-            row_cells = [right_align(format_val(row[col]), col_widths[i]) for i, col in enumerate(cols)]
-            print(" | ".join(row_cells))
-
+        # tuple 迭代避免逐行构造 pandas Series；列顺序和格式与原版一致。
+        for values in df_display.itertuples(index=False, name=None):
+            print(" | ".join(
+                right_align(format_val(value), col_widths[i])
+                for i, value in enumerate(values)
+            ))
         print(sep_line)
+
+    print(f"控制台榜单用时: {time.perf_counter() - display_started:.1f}s")
 
 def compute_parameter_plateau(
         csv_file: str,
@@ -1259,15 +1295,17 @@ if __name__ == "__main__":
     # time.sleep(3600 * 4)
     mp.freeze_support()
     analyze_all_strategies()
-    csv_file = "strategy_leaderboard_100800_files.csv"
-    output_csv = csv_file.replace(".csv", "_plateau.csv")
 
-    # df_with_plateau = compute_parameter_plateau(
-    #     csv_file=csv_file,
-    #     output_csv=output_csv,
-    #     neighbor_radius=1,  # 切比雪夫半径
-    #     min_survival_days=60.0  # 存活周期阈值
-    # )
-
-
-    show_leaderboard_csv(csv_file=output_csv, direction="long")
+    #
+    # csv_file = "strategy_leaderboard_100800_files.csv"
+    # output_csv = csv_file.replace(".csv", "_plateau.csv")
+    #
+    # # df_with_plateau = compute_parameter_plateau(
+    # #     csv_file=csv_file,
+    # #     output_csv=output_csv,
+    # #     neighbor_radius=1,  # 切比雪夫半径
+    # #     min_survival_days=60.0  # 存活周期阈值
+    # # )
+    #
+    #
+    # show_leaderboard_csv(csv_file=output_csv, direction="long")

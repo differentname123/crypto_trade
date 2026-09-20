@@ -1,166 +1,107 @@
 # -*- coding: utf-8 -*-
-import os
-import numpy as np
 import pandas as pd
+import os
 
-# =====================================================================
-# 1. 核心复用：直接引入你的底层回测引擎组件
-# =====================================================================
-from app.signal_trade_lite.martin_strategy_backest import (
-    run_stage1,
-    TimelineReplayer,
-    evaluate_free_ride
-)
+from app.signal_trade_lite.martin_strategy_1m import factor_044_3
+# 1. 复用底层回测引擎核心函数 (从你提供的第三段代码中导入)
+from app.signal_trade_lite.martin_strategy_backest import run_stage1, TimelineReplayer, evaluate_free_ride
+from app.signal_trade_lite.strategy_evaluator_comb import _normalize_trades_df
 
 
-# 导入因子函数 (如果你有专门的 factors 文件请改为从那里 import)
-# 这里为了保证代码即插即用，直接复用你提供的因子逻辑
-def factor_043_9(df):
-    win_break, win_base = 15, 720
-    boundary = df['high'].shift(win_break).rolling(win_base).max()
-    df['signal'] = ((df['high'].rolling(win_break).max() > boundary) & (df['close'] < boundary)).fillna(False).astype(
-        bool)
-    return df
+# 2. 复用因子生成函数 (从你提供的第二段代码中导入，假设文件名为 factors.py)
+# 如果你的因子函数在其他文件，请自行修改此路径
 
+# 3. 复用数据归一化函数 (从你提供的第一段代码中导入，假设文件名为 portfolio_backtest.py)
+# 注意：_normalize_trades_df 依赖 evaluate_free_ride，已经在其内部调用
 
-# =====================================================================
-# 2. 格式对齐：复用你的归一化函数 (保证生成的 CSV 字段与原版一模一样)
-# =====================================================================
-_TIME_LIKE_KEYS = ("time", "stamp", "epoch", "date", "millis", "nanos", "_ms", "_ns")
-PNL_COL_CANDIDATES = ["net_pnl_in_margin", "pnl_in_margin", "net_pnl", "pnl", "profit", "net_profit"]
-MDD_COL_CANDIDATES = ["max_drawdown", "max_drawdown_in_margin", "max_dd", "max_loss", "max_loss_in_margin", "mdd",
-                      "max_floating_loss"]
-BLOWUP_LOSS_THRESHOLD_M = 0.8
-
-
-def _pick_col(df, candidates):
-    for c in candidates:
-        if c in df.columns: return c
-    return None
-
-
-def _to_dt(s):
-    if pd.api.types.is_numeric_dtype(s):
-        v = pd.to_numeric(s, errors="coerce")
-        mx = float(v.max()) if len(v) else 0.0
-        unit = "ns" if mx > 1e15 else ("ms" if mx > 1e11 else "s")
-        return pd.to_datetime(v, unit=unit)
-    return pd.to_datetime(s, errors="coerce")
-
-
-def _detect_time_cols(df):
-    time_col = start_col = end_col = None
-    for col in df.columns:
-        c_lower = str(col).lower()
-        if any(k in c_lower for k in _TIME_LIKE_KEYS):
-            if any(k in c_lower for k in ("close", "end", "finish")):
-                end_col = col; time_col = time_col or col
-            elif any(k in c_lower for k in ("open", "start", "begin")):
-                start_col = col
-            else:
-                time_col = time_col or col
-    return start_col or end_col or time_col, end_col or time_col
-
-
-def _normalize_trades_df(trades_df, cycles_df, margin):
-    out = trades_df.copy()
-    report = evaluate_free_ride(trades_df, cycles_df, margin) or {}
-
-    pnl_col = _pick_col(out, PNL_COL_CANDIDATES)
-    raw = pd.to_numeric(out[pnl_col], errors="coerce").fillna(0.0).astype(float)
-    net_pnl_sum = float(raw.sum())
-    report_net = float(report.get("total_net_pnl_in_margin", 0.0) or 0.0)
-
-    ratio = (report_net / net_pnl_sum) if (abs(net_pnl_sum) > 1e-6 and abs(report_net) > 1e-6) else 1.0
-    out["pnl_M"] = raw * ratio
-
-    start_col, end_col = _detect_time_cols(trades_df)
-    close_dt = _to_dt(out[end_col])
-    open_dt = _to_dt(out[start_col]) if start_col else close_dt
-    open_dt = open_dt.mask(open_dt.isna() | (open_dt > close_dt), close_dt)
-
-    out["open_dt"] = open_dt
-    out["close_dt"] = close_dt
-    out["holding_h"] = (close_dt - open_dt).dt.total_seconds() / 3600.0
-
-    blow_col = next(
-        (c for c in out.columns if any(k in str(c).lower() for k in ("blowup", "blow_up", "liquidat", "is_bust"))),
-        None)
-    if blow_col:
-        is_blow = out[blow_col].fillna(False).astype(bool)
-    else:
-        is_blow = out["pnl_M"] <= -BLOWUP_LOSS_THRESHOLD_M
-
-    out["is_blowup_flag"] = is_blow.values
-    mdd_col = _pick_col(out, MDD_COL_CANDIDATES)
-    out["float_loss_M"] = (
-                pd.to_numeric(out[mdd_col], errors="coerce").abs().fillna(0.0) * abs(ratio)) if mdd_col else 0.0
-    out["pnl_scale_ratio"] = ratio
-
-    return out.sort_values("close_dt").reset_index(drop=True)
-
-
-# =====================================================================
-# 3. 最小执行逻辑
-# =====================================================================
 def run_minimal_backtest():
-    # 参数配置
-    csv_path = r"W:\project\python_project\crypto_trade\app\trader_bot\data\SOL_USDT_USDT_1m_latest.csv"
-    output_csv = "trades_SOLUSDT_factor_043_9_Short_M9.csv"
+    # ==========================================
+    # 1. 核心参数配置
+    # ==========================================
+    csv_path = r"W:\project\python_project\oke_auto_trade\kline_data\UNIUSDT_1m_2021-01-01_merged.csv"
 
-    symbol = "SOLUSDT"
-    strategy_name = "factor_043_9"
-    direction = "Short"
-    margin = 9.0
-    add_step = 0.030  # 3%
-    tp_step = 0.008  # 0.8%
-    multiplier = 2.0  # 默认加仓倍数
-    fee_rate = 0.0005  # 默认手续费
+    symbol = "UNIUSDT"
+    strategy_name = "factor_044_3"
+    direction = "Long"
 
-    print(f"1. 加载数据: {csv_path}...")
+    margin = 5
+    add_step = 0.010  # step_pct 1%
+    tp_step = 0.005  # tp_pct 0.5%
+    qty_mult = 2.0  # qty_mult 2
+
+    # ==========================================
+    # 2. 加载 K线数据
+    # ==========================================
+    print(f"📂 正在加载数据: {csv_path}")
     df = pd.read_csv(csv_path)
 
-    # 如果没有 open_time 将timestamp 复制
+    # ==========================================
+    # 3. 生成信号
+    # ==========================================
+    print(f"🔍 正在计算信号: {strategy_name}")
+    df = factor_044_3(df)
+
+    # 044是向下假突破（做多信号），需要将结果映射到 run_stage1 识别的 long_signal 列
+    df['long_signal'] = df['signal']
     if 'open_time' not in df.columns and 'timestamp' in df.columns:
         df['open_time'] = df['timestamp']
-
-    print("2. 生成做空信号...")
-    df = factor_043_9(df)
-    df['short_signal'] = df['signal'].fillna(False).astype(np.int8)
-
-    print("3. 执行 Stage 1 引擎 (构建平行宇宙阶梯)...")
+    # ==========================================
+    # 4. 运行 Stage 1: 生成马丁平行宇宙缓存
+    # ==========================================
+    print(f"⚙️ 正在运行 Stage 1 (计算引擎)...")
     cycles_df = run_stage1(
         df,
-        short_col="short_signal",
-        long_col="long_signal",
-        fee_rate=fee_rate,
+        fee_rate=0.0005,  # 默认手续费
         add_step=add_step,
         tp_step=tp_step,
-        multiplier=multiplier,
+        multiplier=qty_mult,
         max_layer_hard=512,
-        verbose=False  # 保持输出清爽
+        verbose=False  # 关闭冗长打印
     )
 
-    print(f"4. 执行 Stage 2 引擎 (Margin={margin} 提取真实明细)...")
+    # ==========================================
+    # 5. 运行 Stage 2: 指定 Margin 生成逐笔明细
+    # ==========================================
+    print(f"🔄 正在运行 Stage 2 (时间线重放, Margin={margin})...")
     replayer = TimelineReplayer(cycles_df)
-    trades_df = replayer.run(margin)
+    trades_df = replayer.run(margin=margin)
 
-    print("5. 归一化对齐与 Meta 注入...")
-    norm_df = _normalize_trades_df(trades_df, cycles_df, margin)
+    # ==========================================
+    # 6. 运行 Stage 3: 收益归一化 (与榜单严格对齐)
+    # ==========================================
+    print(f"📊 正在进行收益归一化...")
+    norm_df, summ = _normalize_trades_df(trades_df, cycles_df, margin)
 
-    # 追加 Stage A 要求的完全一致的 Meta 字段
+    # 补充元数据列，确保与 extract_target_trades_csv 产出的宽表格式 100% 一致
     norm_df["symbol"] = symbol
     norm_df["strategy"] = strategy_name
     norm_df["direction"] = direction
     norm_df["margin"] = margin
     norm_df["add_step"] = add_step
     norm_df["tp_step"] = tp_step
-    norm_df["multiplier"] = multiplier
+    norm_df["multiplier"] = qty_mult
 
-    # 落盘
-    norm_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print(f"\n🎉 成功！回测文件已生成: {output_csv}")
-    print(f"统计信息: 实际开仓数 = {len(norm_df)} 笔, 爆仓次数 = {norm_df['is_blowup_flag'].sum()} 次")
+    # ==========================================
+    # 7. 落盘保存 CSV
+    # ==========================================
+    out_dir = "./"
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 构造一致的文件名
+    mtag = f"_x{qty_mult:g}"
+    out_filename = f"trades_{symbol}_{strategy_name}_{direction}_M{margin}_add{add_step:.3f}_tp{tp_step:.3f}{mtag}.csv"
+    out_filepath = os.path.join(out_dir, out_filename)
+
+    norm_df.to_csv(out_filepath, index=False, encoding="utf-8-sig")
+
+    # ==========================================
+    # 8. 打印结果
+    # ==========================================
+    print("\n" + "=" * 60)
+    print(f"🎉 回测文件生成成功: {out_filepath}")
+    print(f"📈 [交易概览] 实际开仓: {summ['实际开仓数']} 笔 | 胜率: {summ['胜率(%)']}%")
+    print(f"💰 [收益概览] 净利润: {summ['净利润(M倍)']} M倍 | 爆仓次数: {summ['爆仓次数']}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
