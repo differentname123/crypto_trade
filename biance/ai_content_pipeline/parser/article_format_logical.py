@@ -12,6 +12,7 @@ import json
 import re
 import time
 from collections import defaultdict
+from multiprocessing import get_context
 
 from common.common_utils import setup_logger, read_file_to_str, string_to_object
 # from common.vector_utils import VectorSearchEngine
@@ -20,12 +21,17 @@ logger = setup_logger(app_name="media_format")
 
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from common.mongo_db.mongo_base import gen_db_object
-from common.mongo_db.mongo_manager import UniversalPostManager
+from common.mongo_db.mongo_manager import UniversalPostManager, GeneratedArticleManager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt'
 LLM_MAX_RETRIES = 3
+ARTICLE_PROMPT_FILE_PATH = r'W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt'
+ARTICLE_MATERIAL_LIMIT = 20
+ARTICLE_POST_USAGE_LIMIT = 5  # 严格按“超过 5 次剔除”：已有 5 次仍可入选。
+ARTICLE_MAX_CHARS = 260
+ARTICLE_GENERATION_INTERVAL_SECONDS = 3600
 
 max_age_hours = 24 * 2
 # 全局初始化向量引擎（单例调用，避免重复加载）
@@ -637,6 +643,24 @@ def process_posts(post_list):
     return result
 
 
+def build_source_image_mapping(post):
+    """复用原占位符编号规则，恢复 [IMAGE_n] 对应的原始 URL 和本地路径。"""
+    _, _, normalized_mapping = normalize_post_media(post)
+    matches = re.finditer(
+        r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]",
+        post.get('content', {}).get('text_content') or ''
+    )
+    return {
+        image_id: {
+            'original_placeholder': match.group(0),
+            'original_url': match.group(2),
+            'local_path': local_path or None
+        }
+        for (image_id, local_path), match in zip(normalized_mapping.items(), matches)
+        if image_id.startswith('[IMAGE_')
+    }
+
+
 def transform_mlus(mlu_list):
     """
     清洗并重组 MLU 列表，为第二阶段大模型生成极简的 prompt 喂料。
@@ -652,6 +676,7 @@ def transform_mlus(mlu_list):
     cleaned_data = []
     image_mapping = {}
     asset_counter = 1  # 全局图片占位符计数器
+    asset_by_source = {}
     id_count = 1
     for mlu in mlu_list:
         # 1. 过滤出该 MLU 中所有可用 (usable == True) 的图片
@@ -659,29 +684,49 @@ def transform_mlus(mlu_list):
 
         visual_evidence = None
 
-        # 2. 如果存在可用图片，将其统合为一个全新的占位符，并拼接 context
+        # 2. 一张真实图片对应一个占位符；多图以数组表达不可拆分的证据链。
         if usable_images:
-            new_placeholder = f"[ASSET_IMG_{asset_counter}]"
-
-            # 提取原始的 image_id 列表
-            original_image_ids = [img['image_id'] for img in usable_images]
-
-            # 拼接多图的 context，用分号隔开，形成一个完整的视觉证据链
-            combined_context = "；".join([img['context'] for img in usable_images if img.get('context')])
-
-            # 写入映射表 (供代码层最终组装贴子使用)
-            image_mapping[new_placeholder] = {
-                "source_post_id": mlu.get('source_post_id'),
-                "original_image_id_list": original_image_ids
-            }
-
-            # 构建给大模型的视觉证据对象
-            visual_evidence = {
-                "placeholder": new_placeholder,
-                "what_it_shows": combined_context
-            }
-
-            asset_counter += 1
+            source_mapping = mlu.get('source_image_mapping')
+            if source_mapping is None:
+                source_mapping = build_source_image_mapping({
+                    'content': {'text_content': mlu.get('source_text_content', '')},
+                    'media': {'local_mapping': mlu.get('source_local_mapping') or {}}
+                })
+            chain_is_complete = all(
+                img.get('image_id') in source_mapping
+                and isinstance(img.get('context'), str) and img['context'].strip()
+                for img in usable_images
+            )
+            if chain_is_complete:
+                visual_items = []
+                seen_image_ids = set()
+                for img in usable_images:
+                    image_id = img['image_id']
+                    if image_id in seen_image_ids:
+                        continue
+                    seen_image_ids.add(image_id)
+                    source_key = (mlu.get('source_post_id'), image_id)
+                    new_placeholder = asset_by_source.get(source_key)
+                    if new_placeholder is None:
+                        new_placeholder = f"[ASSET_IMG_{asset_counter}]"
+                        asset_counter += 1
+                        asset_by_source[source_key] = new_placeholder
+                        image_mapping[new_placeholder] = {
+                            'source': BINANCE_SOURCE,
+                            'source_post_id': mlu.get('source_post_id'),
+                            'original_image_id': image_id,
+                            'original_image_id_list': [image_id],
+                            **source_mapping[image_id]
+                        }
+                    visual_items.append({
+                        'placeholder': new_placeholder,
+                        'what_it_shows': img['context']
+                    })
+                visual_evidence = visual_items[0] if len(visual_items) == 1 else visual_items
+            else:
+                # 缺失任一张映射/描述时，整组不提供配图，但保留文字论据。
+                logger.warning("[文章/配图] 证据链无法完整映射，取消该组配图 | post_id=%s",
+                               mlu.get('source_post_id'))
 
         # 3. 构建极简的纯净数据，丢弃所有工程判断字段 (shelf_life, impact_weight, publish_time 等)
         cleaned_mlu = {
@@ -773,6 +818,7 @@ def extract_and_group_valid_evidences():
         # 提前提取原帖文本，注入到论据中，方便下游处理配图和组装文章
         raw_text_content = post.get('content', {}).get('text_content', '')
         post_id = post.get('post_id', 'UNKNOWN')
+        source_image_mapping = build_source_image_mapping(post)
 
         # 3. 遍历提取出来的所有论据单元 (MLU)
         for ev in evidences:
@@ -797,6 +843,7 @@ def extract_and_group_valid_evidences():
             enriched_ev['source_post_id'] = post_id
             enriched_ev['publish_time'] = publish_time
             enriched_ev['source_text_content'] = raw_text_content
+            enriched_ev['source_image_mapping'] = source_image_mapping
 
             # 规则 3：按币种进行多重分发（展平）
             # 假如 coins 是 ["BTC", "ETH"]，这个论据会同时被放进 BTC 和 ETH 的列表中
@@ -836,10 +883,214 @@ def extract_and_group_valid_evidences():
         f"涉及币种数量: {len(final_dict.keys())}"
     )
 
-    extract_data = final_dict['BTC']['看多']
-    format_data, image_mapping = transform_mlus(extract_data[:20])
-
     return final_dict
+
+def check_article_info(article_info, materials, image_mapping, max_chars):
+    """校验模型输出、真实素材引用、字数和图片证据链；通过后才允许计数入库。"""
+    expected_keys = {'status', 'text', 'image_placeholders', 'used_material_ids', 'score', 'reason'}
+    if not isinstance(article_info, dict) or set(article_info) != expected_keys:
+        return False, "文章必须严格包含 status/text/image_placeholders/used_material_ids/score/reason"
+    if article_info['status'] not in ('ok', 'skip'):
+        return False, "文章 status 必须为 ok 或 skip"
+    if not isinstance(article_info['text'], str):
+        return False, "文章 text 必须为字符串"
+    for key in ('image_placeholders', 'used_material_ids'):
+        values = article_info[key]
+        if (not isinstance(values, list)
+                or any(not isinstance(value, str) or not value for value in values)):
+            return False, f"{key} 必须为字符串列表"
+        if len(values) != len(set(values)):
+            return False, f"{key} 不允许重复"
+
+    if article_info['status'] == 'skip':
+        if (article_info['text'] != '' or article_info['image_placeholders']
+                or article_info['used_material_ids'] or article_info['score'] is not None):
+            return False, "skip 结果必须清空正文、图片、采用素材，score 必须为 null"
+        if not isinstance(article_info['reason'], str) or not article_info['reason'].strip():
+            return False, "skip 结果必须说明 reason"
+        return True, ''
+
+    if not article_info['text'].strip():
+        return False, "ok 结果正文不能为空"
+    if len(re.sub(r'\s', '', article_info['text'])) > max_chars:
+        return False, f"正文非空白字符数超过 {max_chars}"
+    if re.search(r'\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]', article_info['text']):
+        return False, "正文不能插入图片或视频占位符"
+    score = article_info['score']
+    if type(score) is not int or not 0 <= score <= 10:
+        return False, "ok 结果 score 必须为 0—10 的整数"
+    if article_info['reason'] is not None:
+        return False, "ok 结果 reason 必须为 null"
+
+    material_by_id = {item['id']: item for item in materials}
+    used_ids = article_info['used_material_ids']
+    if not 1 <= len(used_ids) <= 3 or any(item not in material_by_id for item in used_ids):
+        return False, "used_material_ids 必须引用输入中实际存在的 1—3 条素材"
+    selected_images = article_info['image_placeholders']
+    if len(selected_images) > 3:
+        return False, "最多只能使用 3 张真实图片"
+
+    allowed_images = set()
+    for material_id in used_ids:
+        visual_evidence = material_by_id[material_id]['visual_evidence']
+        if not visual_evidence:
+            continue
+        chain = visual_evidence if isinstance(visual_evidence, list) else [visual_evidence]
+        chain_ids = [item['placeholder'] for item in chain]
+        allowed_images.update(chain_ids)
+        chosen_chain = [item for item in selected_images if item in chain_ids]
+        if chosen_chain and chosen_chain != chain_ids:
+            return False, f"素材 {material_id} 的图片证据链必须整组使用，并保留输入顺序"
+    if any(item not in allowed_images or item not in image_mapping for item in selected_images):
+        return False, "图片必须来自已采用素材，且必须具有真实的图片映射"
+    return True, ''
+
+
+def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
+    """生成一个币种/立场分组的文章。所有终态落库，只有 ok 消耗原帖使用次数。"""
+    creation_brief = {
+        'task': {
+            'topic': coin,
+            'stance': stance,
+            'max_chars': ARTICLE_MAX_CHARS,
+            'recent_openings': []
+        },
+        'materials': []
+    }
+    # 先保留任务记录。数据库不可用时直接中断，避免生成无法计数入库的文章。
+    record = article_manager.save_article({
+        'source': BINANCE_SOURCE,
+        'topic': coin,
+        'stance': stance,
+        'status': 'processing',
+        'creation_brief': creation_brief,
+        'material_post_mapping': {},
+        'prompt_file_path': ARTICLE_PROMPT_FILE_PATH
+    })
+    try:
+        candidates = [
+            ev for ev in ev_list
+            if isinstance(ev, dict)
+            and isinstance(ev.get('source_post_id'), (str, int))
+            and not isinstance(ev.get('source_post_id'), bool)
+            and ev.get('source_post_id') not in (None, '', 'UNKNOWN')
+            and isinstance(ev.get('core_fact'), str) and ev['core_fact'].strip()
+        ]
+        candidate_post_ids = list(dict.fromkeys(ev['source_post_id'] for ev in candidates))
+        # 每个分组都重新读库，后续分组能看到本轮前面已成功入库的引用次数。
+        usage_counts = article_manager.get_post_usage_counts(BINANCE_SOURCE, candidate_post_ids)
+        selected_evidences = [
+            ev for ev in candidates
+            if usage_counts.get(ev['source_post_id'], 0) <= ARTICLE_POST_USAGE_LIMIT
+        ][:ARTICLE_MATERIAL_LIMIT]
+
+        if not selected_evidences:
+            record['status'] = 'skip'
+            record['article_info'] = {
+                'status': 'skip',
+                'text': '',
+                'image_placeholders': [],
+                'used_material_ids': [],
+                'score': None,
+                'reason': '本分组没有有效论据，或原帖使用次数均已超过允许阈值。',
+                'image_mapping': {}
+            }
+        else:
+            materials, image_mapping = transform_mlus(selected_evidences)
+            creation_brief['materials'] = materials
+            creation_brief['task']['recent_openings'] = article_manager.get_recent_openings(
+                BINANCE_SOURCE, coin, stance
+            )
+            record['material_post_mapping'] = {
+                material['id']: evidence['source_post_id']
+                for material, evidence in zip(materials, selected_evidences)
+            }
+            # 保存本次真实输入和 M1/M2 -> post_id 对照，失败时也能追溯。
+            record = article_manager.save_article(record)
+            prompt = read_file_to_str(ARTICLE_PROMPT_FILE_PATH)
+            if not isinstance(prompt, str) or not prompt.strip():
+                raise ValueError(f"文章生成提示词为空或读取失败: {ARTICLE_PROMPT_FILE_PATH}")
+            # 原提示词原样使用；其末尾已经包含“下面是本次创作简报”。
+            full_prompt = f'{prompt}\n{json.dumps(creation_brief, ensure_ascii=False)}'
+
+            for attempt in range(1, LLM_MAX_RETRIES + 1):
+                record['attempt_count'] = attempt
+                record['raw_response'] = None
+                try:
+                    # 本阶段只传素材文字和图片描述，不再上传原图。
+                    error_detail, raw_response = generate_gemini_content_playwright(
+                        full_prompt, file_path=[]
+                    )
+                    record['raw_response'] = raw_response
+                    if error_detail:
+                        raise RuntimeError(f"文章生成接口返回异常: {error_detail}")
+                    article_info = string_to_object(raw_response)
+                    valid, error_message = check_article_info(
+                        article_info, materials, image_mapping, ARTICLE_MAX_CHARS
+                    )
+                    if not valid:
+                        raise ValueError(error_message)
+                    # 模型只输出原来的六个字段；真实图片映射由代码在校验后追加。
+                    article_info['image_mapping'] = {
+                        placeholder: dict(image_mapping[placeholder])
+                        for placeholder in article_info['image_placeholders']
+                    }
+                    record['article_info'] = article_info
+                    record['status'] = article_info['status']
+                    record['error_message'] = None
+                    break
+                except Exception as exc:
+                    record['error_history'].append({
+                        'attempt': attempt,
+                        'error_message': f'{type(exc).__name__}: {exc}',
+                        'raw_response': record['raw_response']
+                    })
+                    if attempt == LLM_MAX_RETRIES:
+                        raise
+                    logger.warning(
+                        "[文章/生成] 准备重试 | topic=%s | stance=%s | attempt=%s/%s | error=%s",
+                        coin, stance, attempt, LLM_MAX_RETRIES, exc
+                    )
+                    time.sleep(2 ** attempt)
+    except Exception as exc:
+        record['status'] = 'error'
+        record['article_info'] = None
+        record['error_message'] = f'{type(exc).__name__}: {exc}'
+        logger.error("[文章/生成失败] article_id=%s | topic=%s | stance=%s | error=%s",
+                     record['article_id'], coin, stance, exc, exc_info=True)
+
+    # 落库放在模型重试之外，避免数据库写入异常触发模型重复生成。
+    # 写入失败向上传播，停止本轮；不能继续按可能过时的使用次数生成其他分组。
+    return article_manager.save_article(record)
+
+
+def generate_analysis_articles_once():
+    """执行一轮：刷新有效论据池，遍历 final_dict，每个币种/立场最多生成一篇。"""
+    final_dict = extract_and_group_valid_evidences()
+    article_manager = GeneratedArticleManager(gen_db_object())
+    results = []
+    # 单个文章进程内串行处理，确保先落库、后统计下一个分组的使用次数。
+    # 多实例部署若要严格限制全局次数，需要另外提供数据库锁/事务能力。
+    for coin, stances_dict in final_dict.items():
+        for stance, ev_list in stances_dict.items():
+            results.append(generate_and_save_analysis_article(coin, stance, ev_list, article_manager))
+    logger.info("[文章/本轮完成] total=%s | ok=%s | skip=%s | error=%s",
+                len(results), sum(item['status'] == 'ok' for item in results),
+                sum(item['status'] == 'skip' for item in results),
+                sum(item['status'] == 'error' for item in results))
+    return results
+
+
+def generate_analysis_articles():
+    """独立文章生成进程：定期刷新池子；暂无任何分组时每 60 秒重试。"""
+    while True:
+        try:
+            results = generate_analysis_articles_once()
+            time.sleep(ARTICLE_GENERATION_INTERVAL_SECONDS if results else 60)
+        except Exception:
+            logger.exception("[文章/守护进程] 本轮失败，60 秒后重新查询数据库")
+            time.sleep(60)
+
 
 def get_all_non_empty_logic_mul_with_clean_text():
     """
@@ -924,11 +1175,13 @@ def get_all_non_empty_logic_mul_with_clean_text():
 
 
 if __name__ == "__main__":
+    generate_analysis_articles()
+
     # clear_all_media_format_batch()
     extract_and_group_valid_evidences()
 
 
     valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
-
     format_image_article()
+
