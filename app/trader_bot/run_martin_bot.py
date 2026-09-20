@@ -5,7 +5,8 @@
 ================================================================================
 [功能摘要]
   每个 MartinConfig 独占一个子进程: 空闲期轮询外部择时信号, 拿到有效开仓信号后, 依据
-  【加仓间距/加仓倍数/最大亏损金额】一次性算死整张马丁蓝图(层数由 max_loss_usdt 唯一决定),
+  【加仓间距/加仓倍数/首单名义价值的亏损倍数】一次性算死整张马丁蓝图(层数由周期亏损预算决定),
+  周期亏损预算 max_loss_usdt = 首单名义价值 × max_loss_mult, 随蓝图固定并写入 WAL;
   把所有层的限价开仓单铺到盘口; 随后每 2 秒一个 Tick 串行维护止盈/止损, 直到周期收尾回到空闲态。
   价格全程静态固化(开仓价/每层止盈价/全局止损价), 数量动态跟随实际持仓。
 
@@ -117,7 +118,7 @@ OVERFILL_TOLERANCE = 1.02        # I4: 累计开仓成交 / 蓝图总量 的容�
 SL_BREACH_CONFIRM_SEC = 5.0      # 现价击穿止损价后等条件单自己触发的宽限, 超时则主动强平
 POSITION_CACHE_SEC = 5.0         # 实际持仓轻量缓存(常规对齐用); 高危路径与新成交后强制击穿
 MAX_CONSECUTIVE_ERRORS = 20      # 主循环连续异常次数上限
-HARD_MAX_LAYERS = 50             # 【物理硬顶】纯防死循环底线; 真实层数由 max_loss_usdt 决定
+HARD_MAX_LAYERS = 50             # 【物理硬顶】纯防死循环底线; 真实层数由周期亏损预算 max_loss_usdt 决定
 FORCE_CLOSE_MAX_ATTEMPTS = 3     # 市价强平最大尝试次数, 超出转 STOPPED 等人工介入
 SL_IMM_TRIG_MAX_DEV_PCT = 50.0   # "会立即触发"回执的本地核验: 止损价与现价偏离超此阈值判定为算错
 IDLE_ERROR_SLEEP_SEC = (15.0, 30.0)  # IDLE 态连续异常的长休眠退避区间(绝不停机)
@@ -615,7 +616,7 @@ class MartinLedger:
         """
         冷启动读账本。出参 = (状态码, meta, rows, max_signal_ts):
           meta : 未收尾周期的 CYCLE_START 元数据 dict, 核心 Key =
-                 cycle_id / dir / base / sl / sig_ts / layers[{l,p,q,a,t}]
+                 cycle_id / dir / base / sl / max_loss / max_loss_mult / sig_ts / layers[{l,p,q,a,t}]
           rows : 该周期的全部账本行 list[dict(COLUMNS)]
           max_signal_ts: 全局最大信号时间戳, 作为重启后的信号去重水位线
         状态码语义决定 boot() 是 fail-open 还是 fail-closed:
@@ -668,6 +669,8 @@ class MartinLedger:
             layers = meta.get("layers") or []
             valid = (meta.get("dir") in (Direction.LONG.value, Direction.SHORT.value)
                      and len(layers) > 0
+                     and all(isfinite(float(meta[k])) and float(meta[k]) > 0
+                             for k in ("sl", "max_loss", "max_loss_mult"))
                      and all(float(x["p"]) > 0 and float(x["q"]) > 0 and int(x["l"]) >= 0
                              for x in layers))
         except Exception as e:
@@ -675,7 +678,7 @@ class MartinLedger:
                             f"周期:[{last_cycle}] 错误:[{e}]")
             return self.LOAD_BLUEPRINT_BAD, {"cycle_id": last_cycle}, cycle_rows, max_sig_ts
         if not valid:
-            logger.critical(f"[账本] 未收尾周期的蓝图无效(方向/层数/价量字段异常), 判定 BP_BAD, "
+            logger.critical(f"[账本] 未收尾周期的蓝图无效(方向/层数/价量/止损价/亏损预算/倍数字段异常), 判定 BP_BAD, "
                             f"绝不使用残缺蓝图继续运行 | 周期:[{last_cycle}]")
             return self.LOAD_BLUEPRINT_BAD, meta, cycle_rows, max_sig_ts
         return self.LOAD_RECOVER, meta, cycle_rows, max_sig_ts
@@ -688,13 +691,14 @@ class MartinConfig:
     """
     一个实例 = 一个独立子进程 = 一本独立账本 = 一个独立 OID 命名空间。
     同一币种可配置多个(不同 signal / 不同马丁参数), 互不干扰。
-    层数不由配置指定: 完全由 max_loss_usdt 推导(唯一上限是防死循环的物理硬顶)。
+    层数不由配置指定: 由首单名义价值 × max_loss_mult 得到周期亏损预算后推导。
+    first_notional > 0 时首单名义价值取 first_notional, 否则取信号原价 × first_qty。
     """
 
     def __init__(self, strategy_id, symbol, signal_name,
                  api_key="", secret_key="",
                  first_qty=0.0, first_notional=0.0,
-                 step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_usdt=50.0,
+                 step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_mult=5.0,
                  layer_loss_budget_ratio=0.80,
                  max_signal_age_sec=31,
                  entry_timeout_sec=900,
@@ -712,7 +716,7 @@ class MartinConfig:
         self.step_pct = float(step_pct)
         self.qty_mult = float(qty_mult)
         self.tp_pct = float(tp_pct)
-        self.max_loss_usdt = float(max_loss_usdt)
+        self.max_loss_mult = float(max_loss_mult)
         self.layer_loss_budget_ratio = float(layer_loss_budget_ratio)
         self.max_signal_age_sec = float(max_signal_age_sec)
         self.entry_timeout_sec = float(entry_timeout_sec)
@@ -739,8 +743,8 @@ class MartinConfig:
             errs.append("qty_mult 必须在 [1.0,5.0] 区间(过大会指数爆仓)")
         if not (0 < self.tp_pct <= 50):
             errs.append("tp_pct 必须在 (0,50] 区间")
-        if self.max_loss_usdt <= 0:
-            errs.append("max_loss_usdt 必须 > 0")
+        if not isfinite(self.max_loss_mult) or self.max_loss_mult <= 0:
+            errs.append("max_loss_mult 必须为有限数且 > 0")
         # 保留原有可接受边界，避免擅自改变业务参数语义
         if not (0.1 <= self.layer_loss_budget_ratio <= 1):
             errs.append("layer_loss_budget_ratio 必须在 [0.1,1] 区间")
@@ -834,13 +838,15 @@ class LayerPlan:
 
 
 class Blueprint:
-    """整周期只读的价格骨架: layers[LayerPlan] + 全周期唯一止损价。"""
+    """整周期只读的价格骨架: layers[LayerPlan] + 全局止损价 + 周期亏损预算/倍数快照。"""
 
-    def __init__(self, direction, layers, base_price, sl_price=0.0):
+    def __init__(self, direction, layers, base_price, sl_price, max_loss_usdt, max_loss_mult):
         self.direction = direction
         self.layers = layers
         self.base_price = base_price
         self.sl_price = float(sl_price)
+        self.max_loss_usdt = float(max_loss_usdt)
+        self.max_loss_mult = float(max_loss_mult)
 
     @property
     def total_qty(self):
@@ -857,10 +863,11 @@ class Blueprint:
 class BlueprintBuilder:
     """
     由 信号 + 配置 + 交易规格 推导完整马丁蓝图, 价格一次性算死后永不修改:
+      * 亏损预算: 信号原价 × first_qty × max_loss_mult; first_notional > 0 时改用其作为名义价值
       * 加仓价: 第 i 层价 = 第 i-1 层【理论均价】的等比偏离 (avg * (1 - sign*step_pct%))
       * 止盈价: 第 i 层止盈 = 第 i 层【理论均价】的等比偏离 (avg * (1 + sign*tp_pct%))
       * 止损价: 按最后一层满仓时恰好亏 max_loss_usdt 反解, 全周期唯一固定
-    层数判定: 仅当"下一层成交后浮亏 <= max_loss * layer_loss_budget_ratio"时才允许铺该层;
+    层数判定: 仅当"下一层成交后浮亏 <= max_loss_usdt * layer_loss_budget_ratio"时才允许铺该层;
     唯一硬顶 HARD_MAX_LAYERS 纯粹是防死循环的物理底线。
     """
 
@@ -869,6 +876,9 @@ class BlueprintBuilder:
         """出参: Blueprint 或 None(None = 本信号作废, 调用方直接丢弃)。"""
         d = sig.direction
         sign = d.sign
+        if not isfinite(sig.limit_price) or sig.limit_price <= 0:
+            logger.info(f"[蓝图] 信号价非法, 无法计算首单名义价值, 丢弃信号 | 信号价:[{sig.limit_price}]")
+            return None
         # 首单价修约方向: 做多向下(买得更便宜), 做空向上(卖得更贵), 对自己有利
         p0 = spec.round_price(sig.limit_price, "down" if d is Direction.LONG else "up")
         if p0 <= 0:
@@ -877,7 +887,18 @@ class BlueprintBuilder:
             return None
 
         base_qty = cfg.first_qty if cfg.first_notional <= 0 else cfg.first_notional / p0
-        budget = cfg.max_loss_usdt * cfg.layer_loss_budget_ratio
+        # 预算按配置的首单名义价值计算, 不随价格/数量修约、实际成交或后续行情变化。
+        first_order_notional = (sig.limit_price * cfg.first_qty
+                                if cfg.first_notional <= 0 else cfg.first_notional)
+        max_loss_usdt = first_order_notional * cfg.max_loss_mult
+        if (not isfinite(cfg.max_loss_mult) or cfg.max_loss_mult <= 0
+                or not isfinite(first_order_notional) or first_order_notional <= 0
+                or not isfinite(max_loss_usdt) or max_loss_usdt <= 0):
+            logger.info(f"[蓝图] 首单名义价值或周期亏损预算非法, 丢弃信号 | "
+                        f"首单名义:[{first_order_notional}] 倍数:[{cfg.max_loss_mult}] "
+                        f"亏损预算:[{max_loss_usdt}]")
+            return None
+        budget = max_loss_usdt * cfg.layer_loss_budget_ratio
         layers, rows = [], []
         acc_qty = acc_cost = prev_price = prev_avg = 0.0
         i = 0
@@ -885,7 +906,7 @@ class BlueprintBuilder:
         while True:
             if i >= HARD_MAX_LAYERS:
                 logger.critical(f"[蓝图] 触及物理硬顶[{HARD_MAX_LAYERS}]层, 强制收口(防死循环底线), "
-                                f"请检查 step_pct/max_loss_usdt 配比")
+                                f"请检查 step_pct/max_loss_mult 配比")
                 break
             price = p0 if i == 0 else prev_avg * (1 - sign * cfg.step_pct / 100.0)
             price = spec.round_price(price, "down" if d is Direction.LONG else "up")
@@ -917,7 +938,7 @@ class BlueprintBuilder:
             elif loss_at_fill > budget:
                 logger.info(f"[蓝图] 第[{i}]层成交后浮亏将超出亏损预算, 层数在此收口(本周期只铺{i}层) | "
                             f"该层浮亏:[{loss_at_fill:.2f}U] 预算:[{budget:.2f}U] "
-                            f"(={cfg.max_loss_usdt}×{cfg.layer_loss_budget_ratio})")
+                            f"(={max_loss_usdt}×{cfg.layer_loss_budget_ratio})")
                 break
 
             tp = spec.round_price(n_avg * (1 + sign * cfg.tp_pct / 100.0),
@@ -932,23 +953,23 @@ class BlueprintBuilder:
             return None
         if len(layers) == 1:
             logger.info(f"[蓝图] ⚠️ 仅能生成[1]层, 马丁结构退化为单笔交易 | "
-                        f"请检查 max_loss_usdt[{cfg.max_loss_usdt}] 与首单规模的配比是否合理")
+                        f"请检查 max_loss_mult[{cfg.max_loss_mult}] 与首单规模的配比是否合理")
 
         # ---------- 全局唯一止损价: 最后一层满仓时恰好亏 max_loss_usdt ----------
         final_avg = acc_cost / acc_qty
         deepest = layers[-1].price
-        sl = spec.round_price(final_avg - sign * cfg.max_loss_usdt / acc_qty,
+        sl = spec.round_price(final_avg - sign * max_loss_usdt / acc_qty,
                               "up" if d is Direction.LONG else "down")
         if d is Direction.LONG and sl <= 0:
             # : 原行为会把非正止损价夹到极低保护位，实际风险可能显著超过 max_loss_usdt。
             # 该处属于业务风险边界，重构不擅自改为“丢弃信号”。
             sl = spec.round_price(max(spec.tick_size, p0 * 0.02), "up")
             logger.critical(f"[蓝图] 满仓止损价算出非正数(最大亏损远超满仓名义价值), 已夹到极低保护位 | "
-                            f"保护位:[{sl}] 注意: 实际亏损可能远超[{cfg.max_loss_usdt}U]")
+                            f"保护位:[{sl}] 注意: 实际亏损可能远超[{max_loss_usdt}U]")
         if (d is Direction.LONG and sl >= deepest) or (d is Direction.SHORT and sl <= deepest):
             logger.critical(f"[蓝图] 全局止损价与最深层价位置颠倒, 参数异常, 丢弃信号 | "
                             f"止损价:[{sl}] 最深层价:[{deepest}] 方向:[{d.value}] "
-                            f"(请调大 max_loss_usdt 或调小 step_pct/qty_mult)")
+                            f"(请调大 max_loss_mult 或调小 step_pct/qty_mult)")
             return None
 
         table = "\n".join(
@@ -962,10 +983,11 @@ class BlueprintBuilder:
             f"最大名义价值:[{acc_cost:.2f}U] 满仓均价:[{final_avg:.8g}] 全局固定止损价:[{sl:.8g}]"
             f"(距满仓均价 {abs(sl / final_avg - 1) * 100:.3f}%, "
             f"距最深层成交价 {abs(sl / deepest - 1) * 100:.3f}%)\n"
-            f"最大亏损设定:[{cfg.max_loss_usdt}U] 止盈:[{cfg.tp_pct}%] "
+            f"周期亏损预算:[{max_loss_usdt}U] "
+            f"(首单名义价值{first_order_notional}U×亏损倍数{cfg.max_loss_mult}) 止盈:[{cfg.tp_pct}%] "
             f"间距:[{cfg.step_pct}% 相对当层理论均价等比] 倍数:[{cfg.qty_mult}]\n"
             f"=======================================================================")
-        return Blueprint(d, layers, p0, sl)
+        return Blueprint(d, layers, p0, sl, max_loss_usdt, cfg.max_loss_mult)
 
 
 # ==============================================================================
@@ -1668,7 +1690,7 @@ class MartinCycle:
         if slot.role is OrderRole.SL and self._crossed(w.price, target):
             return acts    # 现价已在触发价错误一侧, 挂条件单必被拒; 交由击穿逻辑走收尾强平
         kind = "STOP" if slot.role is OrderRole.SL else "LIMIT"
-        why = (f"全局固定止损 均价{self.book.avg:.8g} 最大亏损{self.ctx.cfg.max_loss_usdt}"
+        why = (f"全局固定止损 均价{self.book.avg:.8g} 最大亏损{self.bp.max_loss_usdt}"
                if slot.role is OrderRole.SL else
                f"第{self.tp_layer_idx()}层固定止盈 均价{self.book.avg:.8g} 止盈{self.ctx.cfg.tp_pct}%")
         return acts + [Action.place(kind, slot.role, 0, target, qty, slot, why)]
@@ -2004,12 +2026,13 @@ class MartinCycle:
         return filled, live, gave_up
 
     def start_meta(self):
-        """CYCLE_START 落账的完整蓝图快照。核心 Key: sig_ts/dir/base/sl/layers[{l,p,q,a,t}]。"""
+        """CYCLE_START 落账的完整蓝图快照。含实际亏损预算 max_loss 及倍数 max_loss_mult。"""
         return {
             "sig_ts": self.signal_ts, "dir": self.direction.value,
             "base": self.bp.base_price, "step_pct": self.ctx.cfg.step_pct,
             "mult": self.ctx.cfg.qty_mult, "tp_pct": self.ctx.cfg.tp_pct,
-            "max_loss": self.ctx.cfg.max_loss_usdt, "sl": self.bp.sl_price,
+            "max_loss": self.bp.max_loss_usdt, "max_loss_mult": self.bp.max_loss_mult,
+            "sl": self.bp.sl_price,
             "layers": self.bp.to_json_layers(),
         }
 
@@ -2242,7 +2265,7 @@ class MartinEngine:
     def _recover_cycle(self, meta, rows):
         """
         断点续传: WAL 时间序重放 -> 复用主流水线的 Sense + Reconcile 向交易所求真相。
-        入参 meta 核心 Key: cycle_id/dir/base/sl/sig_ts/layers[{l,p,q,a,t}]; rows 为该周期账本行。
+        入参 meta 核心 Key: cycle_id/dir/base/sl/max_loss/max_loss_mult/sig_ts/layers[{l,p,q,a,t}]; rows 为该周期账本行。
         出参 True=接管完成(状态已置 ACTIVE/STOPPED), False=本次放弃接管(稍后重试, 绝不清场)。
         """
         try:
@@ -2251,18 +2274,10 @@ class MartinEngine:
             layers = [LayerPlan(int(x["l"]), float(x["p"]), float(x["q"]),
                                 float(x.get("a") or 0), float(x.get("t") or 0))
                       for x in meta["layers"]]
-            sl_px = float(meta.get("sl") or 0)
-            if sl_px <= 0 and layers:
-                # : 老账本缺少止损价时沿用历史行为，使用“当前配置”的 max_loss_usdt 重算。
-                # 若配置在重启前后发生变化，恢复出的止损价可能与历史周期不一致；业务确认前不改口径。
-                tq = sum(l.qty for l in layers)
-                tc = sum(l.qty * l.price for l in layers)
-                if tq > 0:
-                    sl_px = self.spec.round_price(
-                        tc / tq - direction.sign * self.cfg.max_loss_usdt / tq,
-                        "up" if direction is Direction.LONG else "down")
-                    logger.critical(f"[恢复] 账本缺少全局止损价, 已按满仓均价重算 | 止损价:[{sl_px}]")
-            bp = Blueprint(direction, layers, float(meta.get("base") or 0), sl_px)
+            # 直接恢复本周期已落盘的预算/倍数/止损价, 不按当前配置或当前行情重算。
+            bp = Blueprint(direction, layers, float(meta.get("base") or 0),
+                           float(meta["sl"]), float(meta["max_loss"]),
+                           float(meta["max_loss_mult"]))
             cyc = MartinCycle(self.ctx, cycle_id, int(meta.get("sig_ts") or 0), direction, bp)
             logger.info(f"[恢复] 检测到未收尾周期, 开始按账本时间序重放并向交易所求证真相 | "
                         f"周期:[{cycle_id}] 方向:[{direction.value}] 层数:[{len(layers)}] "
@@ -2743,7 +2758,7 @@ class DashboardThread(threading.Thread):
                 f" 🎯 固定止盈:[{tp_price:.8g} | {distance(tp_price, True)} | "
                 f"{tp_layer}/配置{e.cfg.tp_pct}% | {order_text(c.tp)}] "
                 f"🛑 全局固定止损:[{sl_price:.8g} | {distance(sl_price, False)} | "
-                f"蓝图亏损预算{e.cfg.max_loss_usdt:g}U | {order_text(c.sl)}]",
+                f"蓝图亏损预算{c.bp.max_loss_usdt:g}U | {order_text(c.sl)}]",
             ])
 
             if c.add_suspended:
@@ -2859,13 +2874,13 @@ def main_app():
     strategy_templates = [
         {"base_id": "S-AAVE-5", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
          "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.9,
-         "max_loss_usdt": 42 * 5, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
         {"base_id": "L-UNI-5", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_3",
          "first_qty": 4, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.5,
-         "max_loss_usdt": 36 * 5, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
         {"base_id": "L-UNI-10", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_4",
          "first_qty": 2, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.7,
-         "max_loss_usdt": 18 * 10, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 10, "layer_loss_budget_ratio": 1},
     ]
 
     configs = []
