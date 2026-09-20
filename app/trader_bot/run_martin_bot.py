@@ -2849,37 +2849,21 @@ def run_single_strategy(cfg, shared_prices=None):
 def main_app():
     """加载多组账户凭据，并根据账户灵活分配策略进程。"""
     accounts = [
-        ("", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
-        ("C", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
-        ("Q", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
-        ("M", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
+        ("myself", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
+        ("ruru", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
+        ("qiqi", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
+        ("mama", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
     ]
 
     # 1. 公共策略模板（所有账号都会运行的基础策略）
     strategy_templates = [
-        {"base_id": "AAVEL12", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_044_1",
-         "first_qty": 0.1, "step_pct": 3, "qty_mult": 2, "tp_pct": 0.6,
-         "max_loss_usdt": 12 * 6, "layer_loss_budget_ratio": 1},
-        {"base_id": "AAVES12", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 0.1, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.7,
-         "max_loss_usdt": 12 * 7, "layer_loss_budget_ratio": 1},
-        {"base_id": "SOL0912", "symbol": "SOL/USDT:USDT", "signal_name": "factor_043_9",
-         "first_qty": 0.1, "step_pct": 3, "qty_mult": 2, "tp_pct": 0.8,
-         "max_loss_usdt": 10 * 9, "layer_loss_budget_ratio": 1},
-        {"base_id": "BNB0912", "symbol": "BNB/USDT:USDT", "signal_name": "factor_044_10",
-         "first_qty": 0.02, "step_pct": 2, "qty_mult": 2, "tp_pct": 1,
-         "max_loss_usdt": 14 * 8, "layer_loss_budget_ratio": 1},
-    ]
-
-    # 2. Myself 账号（""）专用的额外策略
-    myself_extra_templates = [
-        {"base_id": "MSAAVE", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
+        {"base_id": "S-AAVE-5", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
          "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.9,
          "max_loss_usdt": 42 * 5, "layer_loss_budget_ratio": 1},
-        {"base_id": "MLUNI5", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_3",
+        {"base_id": "L-UNI-5", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_3",
          "first_qty": 4, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.5,
          "max_loss_usdt": 36 * 5, "layer_loss_budget_ratio": 1},
-        {"base_id": "MLUNI10", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_4",
+        {"base_id": "L-UNI-10", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_4",
          "first_qty": 2, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.7,
          "max_loss_usdt": 18 * 10, "layer_loss_budget_ratio": 1},
     ]
@@ -2888,11 +2872,6 @@ def main_app():
     for suffix, api_key, secret_key in accounts:
         # 复制一份公共策略作为基础
         current_templates = list(strategy_templates)
-
-        # 拦截机制：如果当前账号后缀为空（代表myself账号），则将额外策略拼接到当前任务列表中
-        if suffix == "":
-            current_templates.extend(myself_extra_templates)
-
         for template in current_templates:
             params = dict(template)
             base_id = params.pop("base_id")

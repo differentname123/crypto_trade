@@ -12,7 +12,6 @@ import tempfile
 import numpy as np
 import pandas as pd
 
-
 # None表示不限制该参数；MAX_DEVIATION不使用持仓期限过滤。
 FILTER_Z = [6.0, 7.0, 8.0, 9.0]
 FILTER_HOLD = [48, 72, 96, 120, 168]
@@ -97,7 +96,7 @@ def load_trades(root, manifest):
     if not df["position_mode"].eq(manifest["position_mode"]).all():
         raise ValueError("交易仓位模式与manifest不一致")
     if not df["status"].isin([
-            "CLOSED", "UNRESOLVED_MISSING_EXIT", "UNRESOLVED_END_OF_DATA"]).all():
+        "CLOSED", "UNRESOLVED_MISSING_EXIT", "UNRESOLVED_END_OF_DATA"]).all():
         raise ValueError("发现未知交易状态")
     if not df["direction"].isin(["LONG_ALT", "SHORT_ALT"]).all():
         raise ValueError("发现未知ALT方向")
@@ -301,8 +300,8 @@ def print_performance_summary(base_dir="trade_results"):
         try:
             trades = load_trades(root, manifest)
             if not trades.empty and (run["start"] is None
-                    or trades["entry_time"].min() < run["start"]
-                    or trades["entry_time"].max() > run["end"]):
+                                     or trades["entry_time"].min() < run["start"]
+                                     or trades["entry_time"].max() > run["end"]):
                 raise ValueError("开仓时间不在本组实际观察区间内")
             done = trades.loc[trades["status"].eq("CLOSED")]
             if not done.empty and done["exit_time"].max() > run["end"]:
@@ -361,48 +360,59 @@ def print_performance_summary(base_dir="trade_results"):
     atomic_csv(summary, os.path.join(base_dir, "performance_summary.csv"))
     atomic_csv(groups_df, os.path.join(base_dir, "performance_groups.csv"))
     atomic_csv(periods_df, os.path.join(base_dir, "performance_time_quarters.csv"))
+
+    # ---------------- 打印输出层扁平化重构 ----------------
     param_columns = ["ID", "Z", "Hold", "Beta", "Sig", "RightSide", "Mode"]
-    performance_columns = param_columns + [f"{g}_{m}" for g in
-        ["All", "Long", "Short", "High", "Low"] for m in ["Trades", "Win(%)", "Ret(%)"]]
-    risk_columns = ["ID", "Risk_Complete", "All_Unresolved", "All_MAEValid", "All_MAEMissing",
+    performance_columns = [f"{g}_{m}" for g in ["All", "Long", "Short", "High", "Low"]
+                           for m in ["Trades", "Win(%)", "Ret(%)"]]
+    risk_columns = ["Risk_Complete", "All_Unresolved", "All_MAEValid", "All_MAEMissing",
                     "All_MaxLossStreak", "All_MaxConcurrent", "All_AvgMAE(%)",
                     "All_P10MAE(%)", "All_WorstMAE(%)"]
-    with pd.option_context("display.max_columns", None, "display.width", 260):
-        for complete, title in [(True, "已全部结算组合：按单笔平均净收益率排序"),
+
+    # 构造用于打印的宽表，把时间表现展开为同行的列
+    print_df = summary.copy()
+    time_columns_flat = []
+    if common_start is not None:
+        all_periods = periods_df.loc[periods_df["Group"].eq("All")]
+        for p in range(1, 5):
+            p_data = all_periods.loc[all_periods["Period"].eq(p)].set_index("Run")
+            print_df[f"Q{p}_Trades"] = print_df["Run"].map(p_data["Trades"])
+            print_df[f"Q{p}_Win(%)"] = print_df["Run"].map(p_data["Win(%)"])
+            print_df[f"Q{p}_Ret(%)"] = print_df["Run"].map(p_data["Avg_Ret(%)"])
+            print_df[f"Q{p}_SumRet(%)"] = print_df["Run"].map(p_data["Sum_Ret(%)"])
+            time_columns_flat.extend([f"Q{p}_Trades", f"Q{p}_Win(%)", f"Q{p}_Ret(%)", f"Q{p}_SumRet(%)"])
+
+    combined_columns = param_columns + performance_columns + risk_columns + time_columns_flat
+
+    # expand_frame_repr=False 强制一行打印，不论多长都不会折行
+    with pd.option_context("display.max_columns", None, "display.width", None, "display.expand_frame_repr", False):
+        for complete, title in [(True, "已全部结算组合：按单笔平均净收益率排序（单行全景指标）"),
                                 (False, "含未结算交易：仅展示已平仓子集，不进入完整结果排行")]:
-            selected = summary.loc[summary["Run_Complete"].eq(complete)]
+            selected = print_df.loc[print_df["Run_Complete"].eq(complete)]
             if selected.empty:
                 continue
             print("\n" + "=" * 110 + "\n" + title)
-            print(selected[performance_columns].to_string(
+            print(selected[combined_columns].to_string(
                 index=False, float_format=lambda x: f"{x:.4f}", na_rep="--"))
-            print("\n风险指标（收益率列单位为%；MAE负值越小越差）")
-            print(selected[risk_columns].to_string(
-                index=False, float_format=lambda x: f"{x:.4f}", na_rep="--"))
-    print("\nMaxLossStreak=逐笔平仓顺序最大连亏；MaxConcurrent=最大同时持仓配对数。")
+
+    print("\n[指标说明] MaxLossStreak=逐笔平仓顺序最大连亏；MaxConcurrent=最大同时持仓配对数。")
     print("MAEValid/MAEMissing=已平仓交易中完整/缺失价格路径的笔数；缺失不填0。")
     print("P10MAE=单笔MAE的10%分位数，并非最差10%样本的均值。")
     print("Run_Complete仅表示全部结算；Risk_Complete还要求全部已平仓交易极值有效。")
     print("空样本的胜率、均收益和MAE显示--；次数与收益率之和为0。")
     print("并行持仓包含未结算仓位；连亏和收益仅使用已平仓样本。")
-    print("\n四等分日历时间表现：按平仓时间归属；所有组合使用相同边界；时间均为UTC。")
+    print("\n四等分日历时间表现(Q1-Q4)：按平仓时间归属；所有组合使用相同边界；时间均为UTC。")
     if common_start is None:
         print("没有有效观察时间区间。")
     else:
-        for record in summary.to_dict("records"):
-            print(f"\n[{record['ID']}] {record['Run']}")
-            if not record["Run_Complete"]:
-                print("  含未结算交易，以下仅为已平仓子集。")
-            parts = periods_df.loc[periods_df["Run"].eq(record["Run"])
-                                   & periods_df["Group"].eq("All")]
-            for part in parts.to_dict("records"):
-                left = pd.Timestamp(part["Start_UTC"]).strftime("%Y-%m-%d %H:%M")
-                right = pd.Timestamp(part["End_UTC"]).strftime("%Y-%m-%d %H:%M")
-                bracket = "]" if part["End_Inclusive"] else ")"
-                print(f"  [{left} 至 {right}{bracket}: 交易 {part['Trades']:4d} 笔"
-                      f" | 胜率: {display_pct(part['Win(%)'])}"
-                      f" | 均收益率: {display_pct(part['Avg_Ret(%)'])}"
-                      f" | 累计收益(单笔净收益率之和): {display_pct(part['Sum_Ret(%)'])}")
+        # 只打印一次时间区间的边界，不每行重复
+        all_periods_unique = periods_df.loc[periods_df["Group"].eq("All")].drop_duplicates("Period")
+        for part in all_periods_unique.to_dict("records"):
+            left = pd.Timestamp(part["Start_UTC"]).strftime("%Y-%m-%d %H:%M")
+            right = pd.Timestamp(part["End_UTC"]).strftime("%Y-%m-%d %H:%M")
+            bracket = "]" if part["End_Inclusive"] else ")"
+            print(f"  Q{part['Period']} 区间边界: [{left} 至 {right}{bracket}")
+
     print("\n各笔净收益率之和不是账户累计/复利收益；不据此计算年化、夏普或账户最大回撤。")
     print("Long/Short表示ALT方向；High/Low按开仓时Beta窗口日均成交额与截面中位数分组。")
     print("完整明细分组、风险指标、四段时间分析已分别写入3份performance_*.csv。")
@@ -413,6 +423,7 @@ def print_performance_summary(base_dir="trade_results"):
 
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("base_dir", nargs="?", default="trade_results")
     args = parser.parse_args()

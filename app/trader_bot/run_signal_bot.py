@@ -636,7 +636,7 @@ class TradingWorker:
         self.reconcile_ledger(open_order_cache)
         position_cache = self._retry_fetch("汇总持仓", lambda: fetch_positions_map(self.exchange))
 
-        # ================== 新增：拉取或使用缓存的账户总权益 ==================
+        # ================== 拉取或使用缓存的账户总权益 ==================
         current_equity = self._retry_fetch("汇总权益", lambda: fetch_total_equity(self.exchange))
         if current_equity is not None and current_equity > 0:
             self._last_equity = current_equity
@@ -655,43 +655,91 @@ class TradingWorker:
                      Equity=f"{current_equity:.2f}")
             return
 
+        # ================== 新增：获取活动仓位标的的最新价格 ==================
+        symbols_to_fetch = list(set([str(row.get("symbol", "")).strip() for _, row in active_opens.iterrows() if
+                                     str(row.get("symbol", "")).strip()]))
+        latest_prices = {}
+        if symbols_to_fetch:
+            try:
+                # 批量获取持仓标的的 ticker 数据，以获取最新价 (CCXT 基础能力)
+                tickers = self.exchange.fetch_tickers(symbols_to_fetch)
+                for sym, ticker in tickers.items():
+                    latest_prices[sym] = ticker.get('last') or ticker.get('close')
+            except Exception as e:
+                self.log("warning", "SUMMARY/PRICE", "获取最新价格失败，部分收益数据将不可用", Reason=e)
+        # ====================================================================
+
         lines = []
         for _, row in active_opens.iterrows():
             symbol = str(row.get("symbol", "")).strip()
             direction = str(row.get("direction", "")).strip().upper()
-            price = str(row.get("actual_fill_price", "")).strip()
-            price = "N/A" if not price or price.lower() == "nan" else price
+            price_str = str(row.get("actual_fill_price", "")).strip()
+
+            # 解析开仓均价
+            try:
+                open_price = float(price_str)
+            except ValueError:
+                open_price = 0.0
 
             ledger_amt = to_num(row.get('filled_amount'))
             exchange_amt = abs(position_cache.get(make_position_key(symbol, direction), 0.0))
 
+            # ================== 新增：最新价格与理论收益计算 ==================
+            latest_price = latest_prices.get(symbol)
+            pnl_ratio_str = "N/A"
+            pnl_value_str = "N/A"
+            latest_price_str = "N/A"
+            price_display = f"{open_price:g}" if open_price else "N/A"
+
+            if latest_price and open_price > 0 and ledger_amt > 0:
+                latest_price_str = f"{latest_price:g}"
+
+                # 计算理论收益和涨跌幅 (按 USDT 本位线性合约计算公式)
+                if direction == "LONG":
+                    pnl_ratio = (latest_price - open_price) / open_price
+                    pnl_value = (latest_price - open_price) * ledger_amt
+                elif direction == "SHORT":
+                    pnl_ratio = (open_price - latest_price) / open_price
+                    pnl_value = (open_price - latest_price) * ledger_amt
+                else:
+                    pnl_ratio = 0.0
+                    pnl_value = 0.0
+
+                # 格式化: 强制带正负号，涨跌幅保留两位小数百分比，收益保留两位小数
+                pnl_ratio_str = f"{pnl_ratio:+.2%}"
+                pnl_value_str = f"{pnl_value:+.2f}"
+            # ====================================================================
+
             # 使用方向图标和对齐排版增强视觉辨识度
             icon = "📈 [多]" if direction == "LONG" else "📉 [空]" if direction == "SHORT" else "⚪ [无]"
 
-            lines.append(
-                f" │ {icon} 标的: {symbol:<12} 均价: {price:<9} 账本: {ledger_amt:<7} 实际: {exchange_amt:<7} ID: {str(row.get('record_id', ''))[:8]:<8} │"
-            )
+            # 扩展 f-string，加入开仓、现价、涨跌幅及收益
+            line = (f" │ {icon} 标的: {symbol:<14} 开仓: {price_display:<9} 现价: {latest_price_str:<9} "
+                    f"涨跌: {pnl_ratio_str:<9} 收益: {pnl_value_str:<8} "
+                    f"账本: {ledger_amt:<7} 实际: {exchange_amt:<7} ID: {str(row.get('record_id', ''))[:8]:<8} │")
+            lines.append(line)
 
         self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=f"{len(lines)}笔",
                  Equity=f"{current_equity:.2f}")
 
-        # 增加高对比度边框，让关键数据在瀑布流日志中一眼可见
-        border_top = " ┍" + "━" * 86 + "┑"
-        border_mid = " ┝" + "━" * 86 + "┥"
-        border_bot = " ┕" + "━" * 86 + "┙"
+        # 增加高对比度边框，因新增内容调整边框长度为 130（精算中英文字符终端全半角占位比）
+        box_width = 130
+        border_top = " ┍" + "━" * box_width + "┑"
+        border_mid = " ┝" + "━" * box_width + "┥"
+        border_bot = " ┕" + "━" * box_width + "┙"
 
-        # ================== 修改：在 title 中增加了权益模块 ==================
         title = f" 💰 账户: [ {self.account_alias} ] | 权益: [ {current_equity:.2f} ] | 策略: [ {self.strategy_name} ] | 当前持仓明细 "
 
         display_block = (
                 f"\n{border_top}\n"
-                f" │ {title.center(84, ' ')} │\n"
+                f" │ {title.center(box_width - 2, ' ')} │\n"
                 f"{border_mid}\n" +
                 "\n".join(lines) +
                 f"\n{border_bot}"
         )
 
         self.logger.info(display_block)
+
 
     def get_top_movers(self, top_n=10, mode="top"):
         changes = pd.Series(fetch_usdt_swap_changes(self.exchange), dtype="float64").sort_values(ascending=False)
