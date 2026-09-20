@@ -1066,7 +1066,35 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
 
 def generate_analysis_articles_once():
     """执行一轮：刷新有效论据池，遍历 final_dict，每个币种/立场最多生成一篇。"""
+    logger.info("[文章/本轮启动] 正在提取有效论据，准备统计本轮生成任务...")
     final_dict = extract_and_group_valid_evidences()
+
+    # 生成前统一打印本轮规模；这里统计的是使用次数过滤前的池子。
+    group_count = 0
+    non_empty_group_count = 0
+    evidence_count = 0
+    for stances_dict in final_dict.values():
+        for ev_list in stances_dict.values():
+            group_count += 1
+            evidence_count += len(ev_list)
+            if ev_list:
+                non_empty_group_count += 1
+
+    # 每个非空分组正常调用一次；达到使用次数限制等情况会跳过模型调用。
+    # LLM_MAX_RETRIES 是每组最多尝试次数，已经包含第一次调用。
+    logger.info(
+        "[文章/本轮计划] 币种数=%s | 分组数=%s | 非空分组数=%s | "
+        "论据条目数=%s（含跨组重复） | 不含重试的模型调用上限=%s次 | "
+        "含重试的模型调用上限=%s次（每组最多%s次）",
+        len(final_dict), group_count, non_empty_group_count, evidence_count,
+        non_empty_group_count, non_empty_group_count * LLM_MAX_RETRIES, LLM_MAX_RETRIES
+    )
+    logger.info(
+        "[文章/调用估算] 每组先剔除原帖使用次数超过%s次的论据，再取前%s条；"
+        "过滤后无可用素材的分组不调用模型，因此实际调用次数可能低于上述上限。",
+        ARTICLE_POST_USAGE_LIMIT, ARTICLE_MATERIAL_LIMIT
+    )
+
     article_manager = GeneratedArticleManager(gen_db_object())
     results = []
     # 单个文章进程内串行处理，确保先落库、后统计下一个分组的使用次数。
