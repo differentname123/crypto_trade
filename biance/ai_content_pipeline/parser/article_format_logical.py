@@ -1213,13 +1213,13 @@ def get_all_non_empty_logic_mul_with_clean_text():
 
 
 if __name__ == "__main__":
-    generate_analysis_articles()
+    # generate_analysis_articles()
 
     # clear_all_media_format_batch()
-    extract_and_group_valid_evidences()
+    # extract_and_group_valid_evidences()
 
 
-    valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
+    # valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
 
     format_image_article()
 

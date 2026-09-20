@@ -11,9 +11,14 @@
 
 假设：USDT线性合约，volume单位为基础币，close为小时K线收盘价。
 时间戳统一为UTC收盘边界：open_time + 1h；不使用下一根open。
-每笔双腿初始毛名义金额相同；两腿冻结带符号数量，独立结算。
+每笔配对的初始毛名义总额固定；两腿按Beta分配，不保证腿间等额。
+两腿冻结带符号数量，独立结算。
 net_pnl等为USDT金额；net_return才是除以双腿初始毛名义金额的收益率。
 未模拟共享资金、杠杆、强平、订单精度，因此输出为独立交易样本统计。
+MAE/MFE使用含开仓费及预计平仓费的净清算收益率，按小时收盘价更新。
+包含开仓和平仓时点；MAE<=0、MFE>=0，无对应方向的偏移时为0且时间为空。
+价格路径不完整或交易未结算时，四个极值字段均为空，避免将局部极值当成完整极值。
+依赖：pandas、numpy；tqdm为可选进度条。
 """
 import pandas as pd
 import numpy as np
@@ -26,12 +31,13 @@ import multiprocessing
 import traceback
 from contextlib import redirect_stdout, redirect_stderr, contextmanager
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
-# ==========================================
-# 1. 全局绝对性配置参数 (支持动态网格搜索)
-# ==========================================
 # ==========================================
 # 1. 全局绝对性配置参数 (支持动态网格搜索)
 # ==========================================
@@ -48,7 +54,7 @@ class Config:
     HOLDING_PERIOD_HOURS = 6
     RIGHT_SIDE_ENTRY = False  # True: 突破后等待同号Z向0回头，再开仓。
     POSITION_MODE = "FIXED_HOLD"  # FIXED_HOLD / MAX_DEVIATION
-    FEE_RATE = 0.001  # 每腿每次实际成交额的0.1%，已包含全部成本
+    FEE_RATE = 0.001  # 每腿每次实际成交额的0.1%；统一成本假设，不另计资金费
     PAIR_GROSS_NOTIONAL = 1000.0  # 每笔双腿初始毛名义总额，USDT
     MIN_BTC_VARIANCE = 1e-16
     MIN_RESIDUAL_STD = 1e-10
@@ -56,9 +62,9 @@ class Config:
     ENTRY_START = None
     EVALUATION_END = None
 
-    # 【修改点】扩充后的网格搜索空间
-    Z_THRESHOLDS_TO_TEST = [6.0, 7.0, 8.0, 9.0]      # 增加 2.5 观察平滑度
-    HOLDING_PERIODS_TO_TEST = [48, 72, 96, 120, 168]         # 增加 48h (长周期回归)
+    # 参数网格；保持原参数空间
+    Z_THRESHOLDS_TO_TEST = [6.0, 7.0, 8.0, 9.0]
+    HOLDING_PERIODS_TO_TEST = [48, 72, 96, 120, 168]
     SIGNAL_WINDOWS_TO_TEST = [24, 48, 60]             # 新增: 信号计算窗口
     BETA_WINDOWS_TO_TEST = [30, 60, 90, 120]               # 新增: Beta历史窗口
     RIGHT_SIDE_ENTRIES_TO_TEST = [False, True]
@@ -68,7 +74,7 @@ class Config:
     MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
     NUMERIC_THREADS_PER_WORKER = 1  # 避免每个进程再启动一整组BLAS线程。
 
-    CACHE_VERSION = "fixed_beta_right_side_rotation_v2"
+    CACHE_VERSION = "fixed_beta_excursion_net_v3"
 
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
     PARAM_FOLDER = (f"Z{Z_SCORE_THRESHOLD}_H{HOLDING_PERIOD_HOURS}"
@@ -117,7 +123,8 @@ TRADE_COLUMNS = [
     "alt_gross_pnl", "btc_gross_pnl", "gross_pnl", "entry_cost", "exit_cost",
     "total_cost", "net_pnl", "gross_return", "net_return", "holding_hours",
     "planned_holding_hours", "fee_rate", "z_threshold", "beta_window_hours",
-    "signal_window_hours", "right_side_entry", "position_mode", "exit_reason"
+    "signal_window_hours", "right_side_entry", "position_mode", "exit_reason",
+    "mae_return", "mfe_return", "mae_time", "mfe_time"
 ]
 
 
@@ -248,7 +255,7 @@ def prepare_run(symbols, data_fingerprints=None):
     if data_fingerprints is None:
         data_fingerprints = {s: file_sha256(kline_path(s)) for s in universe}
 
-    market = dict(version=Config.CACHE_VERSION, code="v1.0_fixed",
+    market = dict(version=Config.CACHE_VERSION, code=file_sha256(os.path.abspath(__file__)),
                   data={s: data_fingerprints[s] for s in universe}, universe=universe,
                   btc=Config.BTC_SYMBOL, beta=Config.BETA_WINDOW_HOURS,
                   signal=Config.SIGNAL_WINDOW_HOURS, end=Config.EVALUATION_END)
@@ -260,7 +267,11 @@ def prepare_run(symbols, data_fingerprints=None):
                     position_mode=Config.POSITION_MODE, fee=Config.FEE_RATE,
                     gross=Config.PAIR_GROSS_NOTIONAL, start=Config.ENTRY_START,
                     min_var=Config.MIN_BTC_VARIANCE, min_std=Config.MIN_RESIDUAL_STD,
-                    pandas=pd.__version__, numpy=np.__version__)
+                    pandas=pd.__version__, numpy=np.__version__,
+                    excursion=dict(basis="net_liquidation_return", sampling="hourly_close",
+                                   include_entry=True, include_exit=True,
+                                   missing_policy="invalidate_all_four_fields",
+                                   zero_time_policy="NaT", tie_policy="first"))
     Config.RUN_ID = fingerprint(manifest)
     Config.OUTPUT_DIR = os.path.join(Config.BASE_OUTPUT_DIR, Config.PARAM_FOLDER + "_" + Config.RUN_ID[:16])
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
@@ -339,6 +350,104 @@ def generate_market_median(symbols, btc_df=None):
     return series
 
 
+def valid_pair_prices(alt_price, btc_price):
+    return (np.isfinite(alt_price) and alt_price > 0
+            and np.isfinite(btc_price) and btc_price > 0)
+
+
+def pair_valuation(position, alt_price, btc_price):
+    """同一套固定数量/冻结费率公式，同时用于逐小时盯市和最终结算。"""
+    q_alt, q_btc = position["alt_qty"], position["btc_qty"]
+    alt_pnl = q_alt * (alt_price - position["entry_price"])
+    btc_pnl = q_btc * (btc_price - position["btc_entry"])
+    alt_exit, btc_exit = abs(q_alt) * alt_price, abs(q_btc) * btc_price
+    exit_cost = (alt_exit + btc_exit) * position["fee_rate"]
+    gross = alt_pnl + btc_pnl
+    total_cost = position["entry_cost"] + exit_cost
+    denominator = position["entry_gross_notional"]
+    return dict(alt_exit_notional=alt_exit, btc_exit_notional=btc_exit,
+                alt_gross_pnl=alt_pnl, btc_gross_pnl=btc_pnl, gross_pnl=gross,
+                exit_cost=exit_cost, total_cost=total_cost, net_pnl=gross - total_cost,
+                gross_return=gross / denominator,
+                net_return=(gross - total_cost) / denominator)
+
+
+def invalidate_excursions(position):
+    """只有四个输出字段，不额外输出质量标记；空值明确表示无法得到完整极值。"""
+    position.update(mae_return=np.nan, mfe_return=np.nan,
+                    mae_time=pd.NaT, mfe_time=pd.NaT, _excursion_valid=False)
+
+
+def update_excursions(position, now, alt_price, btc_price):
+    """先盯市再判断退出；不依赖当前Z/Beta是否有效。并列极值保留首次时间。"""
+    if not position["_excursion_valid"]:
+        return
+    previous = position["_last_mark_time"]
+    if (not valid_pair_prices(alt_price, btc_price)
+            or (previous is not None
+                and now - previous not in (pd.Timedelta(0), pd.Timedelta(hours=1)))):
+        invalidate_excursions(position)
+        return
+    current_return = pair_valuation(position, alt_price, btc_price)["net_return"]
+    if not np.isfinite(current_return):
+        invalidate_excursions(position)
+        return
+    position["_last_mark_time"] = now
+    if current_return < position["mae_return"]:
+        position.update(mae_return=current_return, mae_time=now)
+    if current_return > position["mfe_return"]:
+        position.update(mfe_return=current_return, mfe_time=now)
+
+
+def open_pair_position(symbol, row, median, scheduled_exit_time=pd.NaT,
+                       planned_holding_hours=np.nan):
+    """每笔总名义固定；Beta可为负或0，数量一经开仓就不再随Beta变化。"""
+    now, z, beta = row.Index, row.z_score, row.beta_shifted
+    direction = 1 if z < -Config.Z_SCORE_THRESHOLD else -1
+    alt_notional = Config.PAIR_GROSS_NOTIONAL / (1 + abs(beta))
+    btc_signed_notional = -direction * beta * alt_notional
+    position = dict(
+        run_id=Config.RUN_ID, trade_id=f"{symbol}_{now.isoformat()}", symbol=symbol,
+        status="OPEN", entry_time=now, scheduled_exit_time=scheduled_exit_time,
+        direction="LONG_ALT" if direction == 1 else "SHORT_ALT",
+        btc_direction=("LONG_BTC" if btc_signed_notional > 0 else
+                       "SHORT_BTC" if btc_signed_notional < 0 else "FLAT"),
+        entry_price=row.close, btc_entry=row.btc_close, beta=beta, z_score=z,
+        hist_res_mean=row.hist_res_mean, hist_res_std=row.hist_res_std,
+        avg_turnover_30d=row.avg_turnover_30d, market_median_at_entry=median,
+        vol_group="High_Vol" if row.avg_turnover_30d >= median else "Low_Vol",
+        alt_qty=direction * alt_notional / row.close,
+        btc_qty=btc_signed_notional / row.btc_close,
+        alt_entry_notional=alt_notional, btc_entry_notional=abs(btc_signed_notional),
+        entry_gross_notional=Config.PAIR_GROSS_NOTIONAL,
+        entry_cost=Config.PAIR_GROSS_NOTIONAL * Config.FEE_RATE,
+        planned_holding_hours=planned_holding_hours, fee_rate=Config.FEE_RATE,
+        z_threshold=Config.Z_SCORE_THRESHOLD, beta_window_hours=Config.BETA_WINDOW_HOURS,
+        signal_window_hours=Config.SIGNAL_WINDOW_HOURS,
+        right_side_entry=Config.RIGHT_SIDE_ENTRY,
+        position_mode=Config.POSITION_MODE, exit_reason=None,
+        mae_return=0.0, mfe_return=0.0, mae_time=pd.NaT, mfe_time=pd.NaT,
+        _excursion_valid=True, _last_mark_time=None)
+    # 开仓当刻的假设净清算收益约为-2*fee_rate；没有正收益时MFE保持0/NaT。
+    update_excursions(position, now, row.close, row.btc_close)
+    return position
+
+
+def close_pair_position(position, now, alt_price, btc_price, z, reason):
+    """含平仓时点极值；无双腿有效平仓价时保留未结算样本，不伪造成交。"""
+    if not valid_pair_prices(alt_price, btc_price):
+        invalidate_excursions(position)
+        position.update(status="UNRESOLVED_MISSING_EXIT", exit_reason=reason)
+        return False
+    update_excursions(position, now, alt_price, btc_price)
+    position.update(pair_valuation(position, alt_price, btc_price))
+    position.update(status="CLOSED", exit_time=now, exit_price=alt_price,
+                    btc_exit=btc_price, exit_z_score=z,
+                    holding_hours=(now - position["entry_time"]).total_seconds() / 3600,
+                    exit_reason=reason)
+    return True
+
+
 def backtest_single_symbol(symbol, df, market_median_series):
     """独立配对；到期退出先于指标检查；数量固定；缺失平仓价不伪造成交。"""
     trades = []
@@ -361,33 +470,21 @@ def backtest_single_symbol(symbol, df, market_median_series):
 
         # 绝不能因Z/Beta缺失跳过已经到期的仓位。
         if position is not None:
+            # 关键：到期前也逐小时更新，且不受Z/Beta缺失影响。
+            if now <= position["scheduled_exit_time"]:
+                update_excursions(position, now, row.close, row.btc_close)
             if now < position["scheduled_exit_time"]:
                 continue
-            valid_prices = (np.isfinite(row.close) and row.close > 0
-                            and np.isfinite(row.btc_close) and row.btc_close > 0)
+            valid_prices = valid_pair_prices(row.close, row.btc_close)
             if now != position["scheduled_exit_time"] or not valid_prices:
+                invalidate_excursions(position)
                 position["status"] = "UNRESOLVED_MISSING_EXIT"
                 position["exit_reason"] = "MISSING_SCHEDULED_EXIT"
                 trades.append(position)
                 position = None
                 # 仓位未能结算，停止本币后续交易；不删除样本，也不私自延期。
                 break
-            q_alt, q_btc = position["alt_qty"], position["btc_qty"]
-            alt_pnl = q_alt * (row.close - position["entry_price"])
-            btc_pnl = q_btc * (row.btc_close - position["btc_entry"])
-            alt_exit, btc_exit = abs(q_alt) * row.close, abs(q_btc) * row.btc_close
-            exit_cost = (alt_exit + btc_exit) * Config.FEE_RATE
-            gross = alt_pnl + btc_pnl
-            total_cost = position["entry_cost"] + exit_cost
-            position.update(
-                status="CLOSED", exit_time=now, exit_price=row.close, btc_exit=row.btc_close,
-                exit_z_score=z, alt_exit_notional=alt_exit, btc_exit_notional=btc_exit,
-                alt_gross_pnl=alt_pnl, btc_gross_pnl=btc_pnl, gross_pnl=gross,
-                exit_cost=exit_cost, total_cost=total_cost, net_pnl=gross - total_cost,
-                gross_return=gross / position["entry_gross_notional"],
-                net_return=(gross - total_cost) / position["entry_gross_notional"],
-                holding_hours=(now - position["entry_time"]).total_seconds() / 3600,
-                exit_reason="FIXED_HOLD")
+            close_pair_position(position, now, row.close, row.btc_close, z, "FIXED_HOLD")
             trades.append(position)
             position = None
             armed = normal  # 退出时已正常即可复位；持仓期间的回归不算平仓后复位。
@@ -426,33 +523,11 @@ def backtest_single_symbol(symbol, df, market_median_series):
         if not (np.isfinite(row.close) and row.close > 0
                 and np.isfinite(row.btc_close) and row.btc_close > 0):
             continue
-        direction = 1 if z < -threshold else -1
-        beta = row.beta_shifted
-        # Beta决定有符号BTC名义金额；abs只用于额度和费用。
-        alt_notional = Config.PAIR_GROSS_NOTIONAL / (1 + abs(beta))
-        btc_signed_notional = -direction * beta * alt_notional
-        position = dict(
-            run_id=Config.RUN_ID, trade_id=f"{symbol}_{now.isoformat()}", symbol=symbol,
-            status="OPEN", entry_time=now, scheduled_exit_time=now + hold,
-            direction="LONG_ALT" if direction == 1 else "SHORT_ALT",
-            btc_direction=("LONG_BTC" if btc_signed_notional > 0 else
-                           "SHORT_BTC" if btc_signed_notional < 0 else "FLAT"),
-            entry_price=row.close, btc_entry=row.btc_close, beta=beta, z_score=z,
-            hist_res_mean=row.hist_res_mean, hist_res_std=row.hist_res_std,
-            avg_turnover_30d=row.avg_turnover_30d, market_median_at_entry=median,
-            vol_group="High_Vol" if row.avg_turnover_30d >= median else "Low_Vol",
-            alt_qty=direction * alt_notional / row.close,
-            btc_qty=btc_signed_notional / row.btc_close,
-            alt_entry_notional=alt_notional, btc_entry_notional=abs(btc_signed_notional),
-            entry_gross_notional=Config.PAIR_GROSS_NOTIONAL,
-            entry_cost=Config.PAIR_GROSS_NOTIONAL * Config.FEE_RATE,
-            planned_holding_hours=Config.HOLDING_PERIOD_HOURS, fee_rate=Config.FEE_RATE,
-            z_threshold=threshold, beta_window_hours=Config.BETA_WINDOW_HOURS,
-            signal_window_hours=Config.SIGNAL_WINDOW_HOURS,
-            right_side_entry=Config.RIGHT_SIDE_ENTRY,
-            position_mode=Config.POSITION_MODE, exit_reason=None)
+        position = open_pair_position(symbol, row, median, now + hold,
+                                      Config.HOLDING_PERIOD_HOURS)
 
     if position is not None:
+        invalidate_excursions(position)
         position["status"] = "UNRESOLVED_END_OF_DATA"
         position["exit_reason"] = "END_OF_DATA"
         trades.append(position)
@@ -467,56 +542,11 @@ def right_side_turn(previous_z, z, threshold):
 
 
 def open_rotation_position(symbol, row, median):
-    """沿用原版双腿定额/有符号Beta/冻结数量公式；轮换模式没有计划到期时间。"""
-    now, z, beta = row.Index, row.z_score, row.beta_shifted
-    direction = 1 if z < -Config.Z_SCORE_THRESHOLD else -1
-    alt_notional = Config.PAIR_GROSS_NOTIONAL / (1 + abs(beta))
-    btc_signed_notional = -direction * beta * alt_notional
-    return dict(
-        run_id=Config.RUN_ID, trade_id=f"{symbol}_{now.isoformat()}", symbol=symbol,
-        status="OPEN", entry_time=now, scheduled_exit_time=pd.NaT,
-        direction="LONG_ALT" if direction == 1 else "SHORT_ALT",
-        btc_direction=("LONG_BTC" if btc_signed_notional > 0 else
-                       "SHORT_BTC" if btc_signed_notional < 0 else "FLAT"),
-        entry_price=row.close, btc_entry=row.btc_close, beta=beta, z_score=z,
-        hist_res_mean=row.hist_res_mean, hist_res_std=row.hist_res_std,
-        avg_turnover_30d=row.avg_turnover_30d, market_median_at_entry=median,
-        vol_group="High_Vol" if row.avg_turnover_30d >= median else "Low_Vol",
-        alt_qty=direction * alt_notional / row.close,
-        btc_qty=btc_signed_notional / row.btc_close,
-        alt_entry_notional=alt_notional, btc_entry_notional=abs(btc_signed_notional),
-        entry_gross_notional=Config.PAIR_GROSS_NOTIONAL,
-        entry_cost=Config.PAIR_GROSS_NOTIONAL * Config.FEE_RATE,
-        planned_holding_hours=np.nan, fee_rate=Config.FEE_RATE,
-        z_threshold=Config.Z_SCORE_THRESHOLD, beta_window_hours=Config.BETA_WINDOW_HOURS,
-        signal_window_hours=Config.SIGNAL_WINDOW_HOURS,
-        right_side_entry=Config.RIGHT_SIDE_ENTRY,
-        position_mode=Config.POSITION_MODE, exit_reason=None)
+    return open_pair_position(symbol, row, median)
 
 
 def close_rotation_position(position, now, alt_price, btc_price, z, reason):
-    """沿用原版实际成交额计费；没有双腿有效平仓价时不伪造成交。"""
-    if not (np.isfinite(alt_price) and alt_price > 0
-            and np.isfinite(btc_price) and btc_price > 0):
-        position.update(status="UNRESOLVED_MISSING_EXIT", exit_reason=reason)
-        return False
-    q_alt, q_btc = position["alt_qty"], position["btc_qty"]
-    alt_pnl = q_alt * (alt_price - position["entry_price"])
-    btc_pnl = q_btc * (btc_price - position["btc_entry"])
-    alt_exit, btc_exit = abs(q_alt) * alt_price, abs(q_btc) * btc_price
-    exit_cost = (alt_exit + btc_exit) * Config.FEE_RATE
-    gross = alt_pnl + btc_pnl
-    total_cost = position["entry_cost"] + exit_cost
-    position.update(
-        status="CLOSED", exit_time=now, exit_price=alt_price, btc_exit=btc_price,
-        exit_z_score=z, alt_exit_notional=alt_exit, btc_exit_notional=btc_exit,
-        alt_gross_pnl=alt_pnl, btc_gross_pnl=btc_pnl, gross_pnl=gross,
-        exit_cost=exit_cost, total_cost=total_cost, net_pnl=gross - total_cost,
-        gross_return=gross / position["entry_gross_notional"],
-        net_return=(gross - total_cost) / position["entry_gross_notional"],
-        holding_hours=(now - position["entry_time"]).total_seconds() / 3600,
-        exit_reason=reason)
-    return True
+    return close_pair_position(position, now, alt_price, btc_price, z, reason)
 
 
 def backtest_max_deviation(symbol_indicators, btc_df, market_median_series):
@@ -590,6 +620,8 @@ def backtest_max_deviation(symbol_indicators, btc_df, market_median_series):
         has_candidate = np.isfinite(best_score[i])
         if position is not None:
             prices, z_values, scores = histories[position["symbol"]]
+            # 必须更新当前持仓币种的价格；冠军可能已经换成另一个币种。
+            update_excursions(position, now, prices[i], btc_prices[i])
             same_direction = (
                 (position["direction"] == "LONG_ALT" and z_values[i] < -threshold)
                 or (position["direction"] == "SHORT_ALT" and z_values[i] > threshold))
@@ -650,6 +682,23 @@ def process_symbol(symbol, btc_df, market_median_series):
     atomic_csv(records, output_csv, index=False)
 
 
+def save_evaluation_window(market_median_series):
+    """保存实际观察区间，统计四等分时保留无交易时段，不从首末成交倒推区间。"""
+    valid = market_median_series.dropna()
+    start = valid.index.min() if not valid.empty else None
+    end = market_median_series.index.max() if not market_median_series.empty else None
+    requested_start = utc_timestamp(Config.ENTRY_START)
+    if start is not None and requested_start is not None:
+        start = max(start, requested_start)
+    if start is not None and end is not None and start > end:
+        start = end  # 配置起点晚于所有数据：无可交易时间、零交易。
+    atomic_json(dict(run_id=Config.RUN_ID, timezone="UTC",
+                     start=start.isoformat() if start is not None else None,
+                     end=end.isoformat() if end is not None else None,
+                     basis="first_eligible_market_hour_to_last_observed_hour"),
+                os.path.join(Config.OUTPUT_DIR, "evaluation_window.json"))
+
+
 def run_all_backtests(symbols, data_fingerprints=None, prepared=False):
     """运行所有币种回测。源CSV应为运行期间不变的静态快照。"""
     symbols = sorted(set(symbols))
@@ -658,6 +707,7 @@ def run_all_backtests(symbols, data_fingerprints=None, prepared=False):
     print("加载 BTC 基准数据...")
     btc_df = load_kline(Config.BTC_SYMBOL)
     median = generate_market_median(symbols, btc_df)
+    save_evaluation_window(median)
     if Config.POSITION_MODE == "MAX_DEVIATION":
         print(f"开始全市场单仓轮换，共 {len(symbols)} 个币种；输出: {Config.OUTPUT_DIR}")
         process_max_deviation(symbols, btc_df, median)
@@ -707,6 +757,11 @@ def analyze_results():
     print(f"单笔平均净收益率 (双腿初始毛名义口径): {df['net_return'].mean():.4%}")
     print(f"单笔净收益率中位数: {df['net_return'].median():.4%}")
     print(f"独立交易净盈亏合计: {df['net_pnl'].sum():.4f} USDT")
+    mae = df["mae_return"].dropna()
+    print(f"完整极值样本: {len(mae)}/{len(df)}；持仓价格缺口使整笔MAE/MFE为空。")
+    if not mae.empty:
+        print(f"平均单笔最大浮亏率: {mae.mean():.4%} | P10: {mae.quantile(0.10):.4%}"
+              f" | 历史最差: {mae.min():.4%}")
     quadrants = df.groupby(["vol_group", "direction"]).agg(
         trade_count=("symbol", "count"),
         win_rate=("net_pnl", lambda x: (x > 0).mean()),
@@ -714,7 +769,12 @@ def analyze_results():
         median_net_return=("net_return", "median"),
         avg_net_pnl=("net_pnl", "mean"),
         sum_net_pnl=("net_pnl", "sum"),
-        avg_cost=("total_cost", "mean")
+        avg_cost=("total_cost", "mean"),
+        excursion_valid_count=("mae_return", "count"),
+        avg_mae_return=("mae_return", "mean"),
+        p10_mae_return=("mae_return", lambda x: x.quantile(0.10)),
+        worst_mae_return=("mae_return", "min"),
+        avg_mfe_return=("mfe_return", "mean")
     ).reset_index()
     print("\n【四象限独立核算表现；收益率列为小数】")
     print(quadrants.to_string(index=False))
@@ -862,24 +922,10 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
 # ==========================================
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    from common.common_utils import read_json
-    import glob
-    import os
-
-    # 【新增】启动前强行清理所有残留的锁文件（仅限确认单机单例运行的情况使用！）
-    print("正在扫描并清理残留的 .run.lock 文件...")
-    lock_files = glob.glob(os.path.join(Config.BASE_OUTPUT_DIR, "*", ".run.lock"))
-    deleted_count = 0
-    for lock_file in lock_files:
-        try:
-            os.remove(lock_file)
-            deleted_count += 1
-        except Exception as e:
-            print(f"清理死锁失败 {lock_file}: {e}")
-    if deleted_count > 0:
-        print(f"✅ 成功清理了 {deleted_count} 个残留的锁文件！")
-
-    SYMBOLS = read_json(Config.SYMBOLS_FILE)
+    # 不自动删除锁：避免另一个仍在运行的脚本失去互斥保护。
+    # 若上次异常退出，先确认相应任务已结束，再手工删除对应目录的.run.lock。
+    with open(Config.SYMBOLS_FILE, "r", encoding="utf-8-sig") as f:
+        SYMBOLS = json.load(f)
     if not isinstance(SYMBOLS, list) or not all(isinstance(s, str) for s in SYMBOLS):
         raise ValueError("symbols.json应为币种字符串列表")
 
@@ -899,7 +945,7 @@ if __name__ == "__main__":
     # 静态源文件只在本次网格搜索开始时哈希一次；再次启动会重新验证。
     print(f"计算源数据指纹 (当前有效币种数: {len(SYMBOLS)})...")
     DATA_FINGERPRINTS = {
-        s: file_sha256(kline_path(s)) for s in SYMBOLS + [Config.BTC_SYMBOL]
+        s: file_sha256(kline_path(s)) for s in sorted(set(SYMBOLS) | {Config.BTC_SYMBOL})
     }
 
     run_parameter_grid(SYMBOLS, DATA_FINGERPRINTS)

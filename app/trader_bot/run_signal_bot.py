@@ -636,13 +636,23 @@ class TradingWorker:
         self.reconcile_ledger(open_order_cache)
         position_cache = self._retry_fetch("汇总持仓", lambda: fetch_positions_map(self.exchange))
 
+        # ================== 新增：拉取或使用缓存的账户总权益 ==================
+        current_equity = self._retry_fetch("汇总权益", lambda: fetch_total_equity(self.exchange))
+        if current_equity is not None and current_equity > 0:
+            self._last_equity = current_equity
+        else:
+            current_equity = self._last_equity
+        # ====================================================================
+
         if position_cache is None:
             self.log("warning", "SUMMARY/SKIP", "最新持仓拉取失败，无法输出汇总", Hint="检查账户接口/网络")
             return
 
         active_opens = _active_opens(self.ledger.read())
         if active_opens.empty:
-            self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=0, Result="当前无理论持仓")
+            # 顺手将权益记录到标准日志中，方便机器查阅
+            self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=0, Result="当前无理论持仓",
+                     Equity=f"{current_equity:.2f}")
             return
 
         lines = []
@@ -662,13 +672,16 @@ class TradingWorker:
                 f" │ {icon} 标的: {symbol:<12} 均价: {price:<9} 账本: {ledger_amt:<7} 实际: {exchange_amt:<7} ID: {str(row.get('record_id', ''))[:8]:<8} │"
             )
 
-        self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=f"{len(lines)}笔")
+        self.log("info", "SUMMARY/POSITION", "本轮结束", TheoreticalOpen=f"{len(lines)}笔",
+                 Equity=f"{current_equity:.2f}")
 
         # 增加高对比度边框，让关键数据在瀑布流日志中一眼可见
         border_top = " ┍" + "━" * 86 + "┑"
         border_mid = " ┝" + "━" * 86 + "┥"
         border_bot = " ┕" + "━" * 86 + "┙"
-        title = f" 💰 账户: [ {self.account_alias} ] | 策略: [ {self.strategy_name} ] | 当前持仓明细 "
+
+        # ================== 修改：在 title 中增加了权益模块 ==================
+        title = f" 💰 账户: [ {self.account_alias} ] | 权益: [ {current_equity:.2f} ] | 策略: [ {self.strategy_name} ] | 当前持仓明细 "
 
         display_block = (
                 f"\n{border_top}\n"
@@ -679,7 +692,6 @@ class TradingWorker:
         )
 
         self.logger.info(display_block)
-
 
     def get_top_movers(self, top_n=10, mode="top"):
         changes = pd.Series(fetch_usdt_swap_changes(self.exchange), dtype="float64").sort_values(ascending=False)
@@ -778,7 +790,6 @@ class TradingWorker:
                 time.sleep(30)
 
 
-
 # =============================================================================
 # L7. 并行任务配置与启动入口 (多进程模式重构)
 # =============================================================================
@@ -803,7 +814,19 @@ WORKER_CONFIGS = [
         "api_key": get_config("nana_biance_api_copy_key"),
         "api_secret": get_config("nana_biance_api_copy_secret")
     },
+    {
+        "account": "qiqi",
+        "strategy": "cross",
+        "api_key": get_config("nana_biance_api_copy_key"),
+        "api_secret": get_config("nana_biance_api_copy_secret")
+    }, {
+        "account": "ruru",
+        "strategy": "cross",
+        "api_key": get_config("nana_biance_api_copy_key"),
+        "api_secret": get_config("nana_biance_api_copy_secret")
+    },
 ]
+
 
 # 【新增核心函数】：模块顶层的独立运行空间，作为多进程的 target 入口
 def _run_worker_process(cfg):

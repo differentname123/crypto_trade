@@ -309,16 +309,14 @@ class ParsedOid:
 
 class OidCodec:
     """
-    格式: M_{S_ID}_{C_ID}_{ROLE}{L_ID}_{TS}
-      M     系统前缀(马丁)
-      S_ID  策略短标识, <=8 位纯字母数字(启动时强校验)
+    格式: {S_ID}_{C_ID}_{ROLE}{L_ID}_{TS}
+      S_ID  策略短标识, <=16 位纯字母数字(去掉了原本毫无用处的 M 前缀)
       C_ID  周期流水号 = base36(信号毫秒时间戳) 【完整不截断, 杜绝命名空间循环冲突】
       ROLE  O=开仓/加仓  T=止盈  S=止损
       L_ID  层级 00~99 (T/S 用 00; 兜底市价强平用 99)
-      TS    毫秒后4位 + 2位随机, 防同层补挂撞号
-    示例: M_B1_1PXQ8K3F_O03_4821XK  (总长 <=30 字符, 低于 Binance 36 上限)
+      TS    毫秒后2位 + 2位随机, 防同层补挂撞号 (精简为4位)
+    示例: AAVEL12_1PXQ8K3F_O03_21XK  (总长 <=34 字符, 完美满足 Binance 36 上限)
     """
-    PREFIX = "M"
 
     @staticmethod
     def cycle_id_of(signal_ts):
@@ -326,8 +324,9 @@ class OidCodec:
 
     @classmethod
     def build(cls, strategy_id, cycle_id, role, layer):
-        suffix = f"{int(time.time() * 1000) % 10000:04d}{random.choice(_B36)}{random.choice(_B36)}"
-        return f"{cls.PREFIX}_{strategy_id}_{cycle_id}_{role.value}{layer:02d}_{suffix}"
+        # 缩短后缀：2位毫秒尾数 + 2位随机B36，共4位 (省下2个字符空间)
+        suffix = f"{int(time.time() * 1000) % 100:02d}{random.choice(_B36)}{random.choice(_B36)}"
+        return f"{strategy_id}_{cycle_id}_{role.value}{layer:02d}_{suffix}"
 
     @classmethod
     def parse(cls, oid):
@@ -335,18 +334,26 @@ class OidCodec:
         if not oid:
             return None
         parts = oid.split("_")
-        if len(parts) < 5 or parts[0] != cls.PREFIX:
+        # 至少需要4段: S_ID, C_ID, ROLE+LAYER, SUFFIX
+        if len(parts) < 4:
             return None
         try:
+            # 失去 M 前缀后，采用从右向左的负向索引解析，超级稳定且兼容手工单过滤
             rl = parts[-2]
-            return ParsedOid("_".join(parts[1:-3]), parts[-3], OrderRole(rl[0]), int(rl[1:]))
+            role = OrderRole(rl[0])
+            layer = int(rl[1:])
+            cycle_id = parts[-3]
+            # 剩下的前面所有部分拼接还原为 strategy_id
+            strategy_id = "_".join(parts[:-3])
+            return ParsedOid(strategy_id, cycle_id, role, layer)
         except Exception:
+            # 如果是非本系统单子，OrderRole(rl[0]) 或 int(rl[1:]) 会直接触发异常而被过滤
             return None
 
     @classmethod
     def strategy_prefix(cls, strategy_id):
-        return f"{cls.PREFIX}_{strategy_id}_"
-
+        # 直接以 strategy_id 作为盘口挂单的查询前缀
+        return f"{strategy_id}_"
 
 # ==============================================================================
 # 4. 交易所网关 —— 业务侧适配器 (平台细节全在 ex_api, 此处只管降级策略与告警口径)
@@ -717,8 +724,11 @@ class MartinConfig:
     def validate(self):
         """启动前强校验: 配置错了直接拒绝启动, 绝不带病上线。"""
         errs = []
-        if not self.strategy_id or len(self.strategy_id) > 8 or not self.strategy_id.isalnum():
-            errs.append("strategy_id 必须为 1~8 位纯字母数字(它是 OID 命名空间与账本名)")
+        # ========= 核心修改处：放宽至 16 位 =========
+        if not self.strategy_id or len(self.strategy_id) > 16 or not self.strategy_id.isalnum():
+            errs.append("strategy_id 必须为 1~16 位纯字母数字(它是 OID 命名空间与账本名)")
+        # ============================================
+
         if self.signal_name not in SIGNAL_REGISTRY:
             errs.append(f"signal_name[{self.signal_name}] 未在 SIGNAL_REGISTRY 中注册")
         if self.first_qty <= 0 and self.first_notional <= 0:
@@ -731,8 +741,7 @@ class MartinConfig:
             errs.append("tp_pct 必须在 (0,50] 区间")
         if self.max_loss_usdt <= 0:
             errs.append("max_loss_usdt 必须 > 0")
-        # : 原校验允许 1.0，而历史文案声称“必须 < 1”，且现有生产配置大量使用 1.0。
-        # 保留原有可接受边界，避免擅自改变业务参数语义；如需收紧必须先确认历史策略兼容性。
+        # 保留原有可接受边界，避免擅自改变业务参数语义
         if not (0.1 <= self.layer_loss_budget_ratio <= 1):
             errs.append("layer_loss_budget_ratio 必须在 [0.1,1] 区间")
         if not errs:
@@ -740,7 +749,6 @@ class MartinConfig:
         logger.critical(f"[配置] 校验失败[{len(errs)}]项, 拒绝启动 | 策略:[{self.strategy_id}] "
                         f"问题清单: " + " || ".join(errs))
         raise SystemExit(1)
-
 
 class SignalGate:
     """
