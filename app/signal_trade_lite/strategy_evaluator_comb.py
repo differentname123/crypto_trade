@@ -863,6 +863,9 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
 # =====================================================================
 # Stage B : 组合回测
 # =====================================================================
+# =====================================================================
+# Stage B : 组合回测
+# =====================================================================
 def _load_strategy_records(csv_dir, plateau_csv=None):
     files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
     files = [f for f in files if not os.path.basename(f).startswith("_")]  # 排除索引/汇总表
@@ -904,12 +907,24 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
             open_dt = pd.to_datetime(df["open_dt"], errors="coerce") if "open_dt" in df.columns else close_dt
         else:
             sc, ec = _detect_time_cols(df)
-            close_dt = _to_dt(df[ec]);
+            close_dt = _to_dt(df[ec])
             open_dt = _to_dt(df[sc]) if sc else close_dt
         open_dt = open_dt.fillna(close_dt)
+
+        # ---- 爆仓标志获取 (为了 Stage B 计算爆仓周期) ----
+        if "is_blowup_flag" in df.columns:
+            is_blowup = df["is_blowup_flag"].fillna(False).astype(bool)
+        elif "outcome" in df.columns:
+            is_blowup = (df["outcome"] == "blowup")
+        else:
+            is_blowup = pd.Series(False, index=df.index)
+
         ok = close_dt.notna()
-        df, pnl, open_dt, close_dt = df[ok].reset_index(drop=True), pnl[ok].reset_index(drop=True), \
-            open_dt[ok].reset_index(drop=True), close_dt[ok].reset_index(drop=True)
+        df, pnl, open_dt, close_dt, is_blowup = \
+            df[ok].reset_index(drop=True), pnl[ok].reset_index(drop=True), \
+                open_dt[ok].reset_index(drop=True), close_dt[ok].reset_index(drop=True), \
+                is_blowup[ok].reset_index(drop=True)
+
         if df.empty:
             continue
 
@@ -925,7 +940,7 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
                                                    and pd.notnull(df["multiplier"].iloc[0])) else None
 
         # ---- 元数据: 优先索引表, 否则精确匹配平原宽表 ----
-        weight = 1.0;
+        weight = 1.0
         note = ""
         if idx_df is not None and "file" in idx_df.columns and (idx_df["file"] == fname).any():
             r = idx_df[idx_df["file"] == fname].iloc[0]
@@ -940,6 +955,7 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
             "signal_key": (sym, strat, direct, round(add_s, 6), round(tp_s, 6), mult),
             "pnl": pnl.values, "open_dt": open_dt.values, "close_dt": close_dt.values,
             "float_loss": float_loss,
+            "is_blowup": is_blowup.values,
             "weight": weight, "note": note,
             "has_float": bool(np.nanmax(float_loss) > 0) if len(float_loss) else False,
         })
@@ -957,11 +973,13 @@ def evaluate_multi_strategy_portfolios(
         min_overlap_days=180,
         weight_mode="equal",
         max_combos=400000,
-        filter_q_balance=10.0,  # 新增：四段切片中，每段利润必须至少占总利润的 10%
-        filter_roll_win_rate=70.0  # 新增：任意连续 30 天的滚动胜率，不得低于 70%
+        filter_q_balance=10.0,
+        filter_roll_profit_win_rate_30=None,  # 任意连续30天的区间利润和>=0的占比要求(默认80%)
+        filter_roll_profit_win_rate_7=None,  # 7日区间利润和胜率要求(可选)
+        filter_roll_profit_win_rate_1=None  # 1日区间利润和胜率要求(可选)
 ):
     """
-    组合回测逻辑：加入了【四段均衡】与【滚动胜率连贯性】的硬核过滤
+    组合回测逻辑：修复优化了马丁评估逻辑（引入滚动区间利润胜率与周期指标）
     """
     records, _ = _load_strategy_records(csv_dir, plateau_csv)
     if not records:
@@ -977,11 +995,11 @@ def evaluate_multi_strategy_portfolios(
     print("   • M倍 (Margin): 归一化收益单位，1M代表1份单次开仓所需的绝对保证金。")
     print(f" [硬核体验过滤条件] (不满足直接剔除)")
     print(f"   • 四段利润均衡: 将生命周期四等分，任何一段的利润贡献不得低于 {filter_q_balance}%")
-    print(f"   • 30日滚动胜率: 任何连续 30 天的窗口内，胜率不得低于 {filter_roll_win_rate}%")
+    print(f"   • 滚动利润胜率: 任意30天窗口区间净利润总和≥0的比例不低于 {filter_roll_profit_win_rate_30 or 0}%")
     print(" [综合评估指标]")
     print("   • 组合持仓重合度: 两两成员同时持仓天数的总和 ÷ 组合运行总天数(越小效率越高)。")
-    print("   • 1+1>2: 判定组合的Calmar是否超越了内部表现最好的单个策略。")
     print("   • 分散化系数: 组合最大回撤 ÷ 成员平均最大回撤(同窗口)。<1才是真对冲。")
+    print("   • 爆仓周期胜率: 基于组合内实际发生的爆仓点切割生命周期，以盈利周期数占比衡量造血韧性。")
     print("-" * 108)
     print(f" 成员数={N} | K∈[{min_k},{max_k}] | 同信号同组={'允许' if allow_same_signal else '禁止'} "
           f"| 最小重叠={min_overlap_days}天 | 权重={weight_mode}")
@@ -995,13 +1013,15 @@ def evaluate_multi_strategy_portfolios(
     day_of_year = all_days.dayofyear.values
     month_key = (all_days.year.values * 12 + all_days.month.values - 1)
 
-    PNL = np.zeros((N, T));
-    POS = np.zeros((N, T));
+    PNL = np.zeros((N, T))
+    POS = np.zeros((N, T))
     NEG = np.zeros((N, T))
-    CNT = np.zeros((N, T));
+    CNT = np.zeros((N, T))
     FLOAT = np.zeros((N, T))
     HOLD = np.zeros((N, T), dtype=bool)
-    first_i = np.zeros(N, dtype=np.int64);
+    BLOWUP = np.zeros((N, T), dtype=bool)  # 记录爆仓事件
+
+    first_i = np.zeros(N, dtype=np.int64)
     last_i = np.zeros(N, dtype=np.int64)
 
     for i, r in enumerate(records):
@@ -1009,7 +1029,7 @@ def evaluate_multi_strategy_portfolios(
         c = pd.DatetimeIndex(r["close_dt"]).normalize()
         si = ((o - g_start).days.values).astype(np.int64)
         ei = ((c - g_start).days.values).astype(np.int64)
-        si = np.clip(si, 0, T - 1);
+        si = np.clip(si, 0, T - 1)
         ei = np.clip(ei, 0, T - 1)
         si = np.minimum(si, ei)
         p = r["pnl"]
@@ -1019,19 +1039,24 @@ def evaluate_multi_strategy_portfolios(
         np.add.at(NEG[i], ei, np.where(p < 0, p, 0.0))
         np.add.at(CNT[i], ei, 1.0)
 
+        # 记录爆仓发生天
+        blow = r.get("is_blowup", np.zeros(len(p), dtype=bool))
+        blow_ei = ei[blow]
+        BLOWUP[i, blow_ei] = True
+
         # 持仓覆盖 & 浮亏覆盖
-        d_hold = np.zeros(T + 1);
-        np.add.at(d_hold, si, 1.0);
+        d_hold = np.zeros(T + 1)
+        np.add.at(d_hold, si, 1.0)
         np.add.at(d_hold, ei + 1, -1.0)
         HOLD[i] = np.cumsum(d_hold)[:T] > 0.5
         fl = r["float_loss"]
         if fl is not None and len(fl) == len(p) and np.nanmax(fl) > 0:
-            d_f = np.zeros(T + 1);
-            np.add.at(d_f, si, fl);
+            d_f = np.zeros(T + 1)
+            np.add.at(d_f, si, fl)
             np.add.at(d_f, ei + 1, -fl)
             FLOAT[i] = np.maximum(np.cumsum(d_f)[:T], 0.0)
 
-        first_i[i] = int(si.min());
+        first_i[i] = int(si.min())
         last_i[i] = int(ei.max())
 
     # ================= 两两预计算(相关性) =================
@@ -1040,7 +1065,7 @@ def evaluate_multi_strategy_portfolios(
 
     for i in range(N):
         for j in range(i + 1, N):
-            lo = max(first_i[i], first_i[j]);
+            lo = max(first_i[i], first_i[j])
             hi = min(last_i[i], last_i[j])
             if hi - lo + 1 >= 30:
                 hold_i = HOLD[i, lo:hi + 1]
@@ -1077,7 +1102,7 @@ def evaluate_multi_strategy_portfolios(
                     skipped_same_signal += 1
                     continue
             ii = list(idxs)
-            lo = int(max(first_i[ii]));
+            lo = int(max(first_i[ii]))
             hi = int(min(last_i[ii]))
             n_days = hi - lo + 1
             if n_days < min_overlap_days:
@@ -1106,16 +1131,29 @@ def evaluate_multi_strategy_portfolios(
             cum = np.cumsum(daily)
             net = float(cum[-1])
 
-            # ================= 核心过滤 1：连续 30 日滚动胜率要求 =================
+            # ================= 核心过滤 1：滚动天数利润胜率 (符合扛单马丁特性) =================
             if n_days >= 30:
-                win_mask = (daily > 0).astype(float)
-                # 卷积方式滑动窗口统计每30天内的盈利天数
-                roll_wins = np.convolve(win_mask, np.ones(30), mode='valid')
-                min_roll_win_rate = float((roll_wins.min() / 30.0) * 100.0)
+                roll_pnl_30 = np.convolve(daily, np.ones(30), mode='valid')
+                win_rate_30 = float(np.mean(roll_pnl_30 >= 0) * 100.0)
             else:
-                min_roll_win_rate = 0.0
+                win_rate_30 = 0.0
 
-            if filter_roll_win_rate is not None and min_roll_win_rate < filter_roll_win_rate:
+            if n_days >= 7:
+                roll_pnl_7 = np.convolve(daily, np.ones(7), mode='valid')
+                win_rate_7 = float(np.mean(roll_pnl_7 >= 0) * 100.0)
+            else:
+                win_rate_7 = 0.0
+
+            win_rate_1 = float(np.mean(daily >= 0) * 100.0)
+
+            # 根据传入要求对策略进行硬过滤
+            if filter_roll_profit_win_rate_30 is not None and win_rate_30 < filter_roll_profit_win_rate_30:
+                skipped_win_rate += 1
+                continue
+            if filter_roll_profit_win_rate_7 is not None and win_rate_7 < filter_roll_profit_win_rate_7:
+                skipped_win_rate += 1
+                continue
+            if filter_roll_profit_win_rate_1 is not None and win_rate_1 < filter_roll_profit_win_rate_1:
                 skipped_win_rate += 1
                 continue
 
@@ -1124,7 +1162,7 @@ def evaluate_multi_strategy_portfolios(
                 chunks = np.array_split(daily, 4)
                 q_ratios = [float(c.sum() / net) for c in chunks]
                 q_min_ratio = min(q_ratios) * 100.0
-                q_str = f"Q1: {q_ratios[0] * 100:.1f}% | Q2: {q_ratios[1] * 100:.1f}% | Q3: {q_ratios[2] * 100:.1f}% | Q4: {q_ratios[3] * 100:.1f}%"
+                q_str = f"Q1:{q_ratios[0] * 100:.1f}%|Q2:{q_ratios[1] * 100:.1f}%|Q3:{q_ratios[2] * 100:.1f}%|Q4:{q_ratios[3] * 100:.1f}%"
             else:
                 q_min_ratio = -999.0
                 q_str = "无盈利/亏损"
@@ -1133,12 +1171,30 @@ def evaluate_multi_strategy_portfolios(
                 skipped_q_balance += 1
                 continue
 
-            # 如果能走到这里，说明是真正的优质抗跌策略！
-            # 继续计算常规指标...
+            # ================= 周期造血韧性统计 (利用爆仓点切分) =================
+            port_blowup = BLOWUP[ii, sl].any(axis=0)  # 组合内任一策略爆仓即算一个切割点
+            blowup_idx = np.where(port_blowup)[0]
+
+            period_pnls = []
+            start_idx = 0
+            for b_idx in blowup_idx:
+                period_pnls.append(daily[start_idx:b_idx + 1].sum())
+                start_idx = b_idx + 1
+            if start_idx < n_days:
+                period_pnls.append(daily[start_idx:].sum())
+
+            if len(period_pnls) > 0:
+                period_win_rate = float(sum(1 for p in period_pnls if p > 0) / len(period_pnls) * 100.0)
+                period_avg_pnl = float(np.mean(period_pnls))
+            else:
+                period_win_rate = 0.0
+                period_avg_pnl = 0.0
+
+            # 常规指标计算
             pos_d = (POS[ii, sl] * w).sum(axis=0)
             neg_d = (NEG[ii, sl] * w).sum(axis=0)
             years = n_days / DAYS_PER_YEAR
-            gp = float(pos_d.sum());
+            gp = float(pos_d.sum())
             gl = float(neg_d.sum())
             annual = net / years if years > 0 else 0.0
 
@@ -1151,13 +1207,6 @@ def evaluate_multi_strategy_portfolios(
             underwater = _max_true_run(dd > 1e-12)
             calmar = (annual / max_dd) if max_dd > 1e-9 else 99.0
 
-            sd = float(daily.std(ddof=0))
-            sharpe = float(daily.mean() / sd * math.sqrt(DAYS_PER_YEAR)) if sd > 1e-12 else 0.0
-            downs = daily[daily < 0]
-            dsd = float(downs.std(ddof=0)) if len(downs) > 1 else 0.0
-            sortino = float(daily.mean() / dsd * math.sqrt(DAYS_PER_YEAR)) if dsd > 1e-12 else 0.0
-
-            win_day_ratio = float(np.mean(daily > 0) * 100.0)
             longest_np = _max_true_run(daily <= 0)
             worst_day = float(daily.min())
 
@@ -1172,12 +1221,12 @@ def evaluate_multi_strategy_portfolios(
             second_ratio = ((net - first_half) / net * 100.0) if abs(net) > 1e-9 else 0.0
 
             conc = HOLD[ii, sl].sum(axis=0)
-            mean_conc = float(conc.mean());
+            mean_conc = float(conc.mean())
             max_conc = int(conc.max())
             util = mean_conc / k * 100.0
 
             fsum = (FLOAT[ii, sl] * w).sum(axis=0)
-            peak_float = float(fsum.max());
+            peak_float = float(fsum.max())
             mean_float = float(fsum.mean())
             deep_days = int(np.sum(fsum > 0.5))
 
@@ -1191,10 +1240,10 @@ def evaluate_multi_strategy_portfolios(
                 c_i = np.cumsum(PNL[i, sl])
                 d_i = float((np.maximum.accumulate(c_i) - c_i).max())
                 a_i = float(c_i[-1]) / years if years > 0 else 0.0
-                m_net.append(float(c_i[-1]));
+                m_net.append(float(c_i[-1]))
                 m_dd.append(d_i)
                 m_cal.append(a_i / d_i if d_i > 1e-9 else 99.0)
-            best_single_calmar = float(max(m_cal));
+            best_single_calmar = float(max(m_cal))
             best_single_net = float(max(m_net))
             mean_member_dd = float(np.mean(m_dd))
             div_dd = (max_dd / mean_member_dd) if mean_member_dd > 1e-9 else 1.0
@@ -1207,6 +1256,7 @@ def evaluate_multi_strategy_portfolios(
             max_sym_w = max(sym_cnt.values()) / k * 100.0
             trades = float(CNT[ii, sl].sum())
 
+            # 组装展示字段（移除了不适配马丁体系的夏普与Sortino）
             results.append({
                 "组合数量(K)": k,
                 "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
@@ -1227,16 +1277,20 @@ def evaluate_multi_strategy_portfolios(
                 "单策略最优净利(M)": round(best_single_net, 2),
                 "成员均回撤(M)": round(mean_member_dd, 2),
                 "分散化系数": round(div_dd, 3),
-                "夏普(年化)": round(sharpe, 2),
-                "Sortino": round(sortino, 2),
-                "盈利天占比(%)": round(win_day_ratio, 2),
+
+                # 新增指标
+                "30日滚动胜率(%)": round(win_rate_30, 2),
+                "7日滚动胜率(%)": round(win_rate_7, 2),
+                "1日滚动胜率(%)": round(win_rate_1, 2),
+                "爆仓周期胜率(%)": round(period_win_rate, 2),
+                "周期平均净利润(M)": round(period_avg_pnl, 3),
+
                 "最长无盈利(天)": longest_np,
                 "最差单日(M)": round(worst_day, 3),
                 "最差单月(M)": round(worst_month, 2),
                 "盈利月占比(%)": round(win_month_ratio, 2),
                 "四段净利分布": q_str,
                 "最差单段贡献(%)": round(q_min_ratio, 1),
-                "最低30日胜率(%)": round(min_roll_win_rate, 1),
                 "后半段净利占比(%)": round(second_ratio, 1),
                 "峰值合计浮亏(M)": round(peak_float, 3),
                 "平均合计浮亏(M)": round(mean_float, 3),
@@ -1260,22 +1314,22 @@ def evaluate_multi_strategy_portfolios(
         print(f"\n[提示] 没有任何组合通过严苛过滤！")
         print(f"   - 同源剔除: {skipped_same_signal:,}")
         print(f"   - 重叠不足: {skipped_overlap:,}")
-        print(f"   - 因【最低30日胜率 < {filter_roll_win_rate}%】剔除: {skipped_win_rate:,}")
+        print(f"   - 因【滚动区间净利胜率不足】剔除: {skipped_win_rate:,}")
         print(f"   - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,}")
-        print("💡 建议放宽 filter_roll_win_rate (如 50.0) 或 filter_q_balance (如 5.0)。")
+        print("💡 建议放宽 filter_roll_profit_win_rate 系列要求。")
         return
 
     df_all = pd.DataFrame(results)
 
-    # 排序逻辑：净利润越大越好，重合度越小越好
-    df_all.sort_values(by=["组合净利(M)", "组合持仓重合度", "组合总收益(M)"],
+    # 排序逻辑优化：优先看卡玛比率和分散对冲效果，不再盲目崇拜净利绝对值
+    df_all.sort_values(by=["组合Calmar", "分散化系数", "组合净利(M)"],
                        ascending=[False, True, False], inplace=True)
 
     df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"\n🎉 组合评估完成: 【幸存有效组合】 {len(df_all):,} 个")
     print(f"   🔪 过滤击杀统计:")
     print(f"      - 同源剔除: {skipped_same_signal:,} 个")
-    print(f"      - 因【最低30日胜率 < {filter_roll_win_rate}%】剔除: {skipped_win_rate:,} 个")
+    print(f"      - 因【滚动区间净利胜率不足】剔除: {skipped_win_rate:,} 个")
     print(f"      - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,} 个")
     print(f"📄 全量排名已保存: {output_csv}\n")
 
@@ -1285,21 +1339,23 @@ def evaluate_multi_strategy_portfolios(
         if df_k.empty:
             continue
         print("=" * 128)
-        print(f" 🏆 【{k} 策略顶级组合】TOP {len(df_k)}   (已通过极高平顺度过滤要求)")
+        print(f" 🏆 【{k} 策略顶级组合】TOP {len(df_k)}   (按风险调整后收益与对冲质量严选)")
         print("=" * 128)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
             print(
-                f"🥇 No.{rank} | 🎯持仓重合度 {r['组合持仓重合度']} | 1+1>2: {r['1+1>2']} | 窗口 {r['重叠起']} ~ {r['重叠止']} ({r['重叠天数']}天)")
+                f"🥇 No.{rank} | 🎯分散化系数 {r['分散化系数']} | 持仓重合度 {r['组合持仓重合度']} | 窗口 {r['重叠起']} ~ {r['重叠止']}")
             print(f"   🧩 {r['组合策略清单']}")
             print(
                 f"   💰 收益 -> 净利 {r['组合净利(M)']}M | 年化 {r['年化净利(M/年)']}M/年 | 总收益 {r['组合总收益(M)']}M | 盈亏比 {r['盈亏比']}")
             print(
-                f"   📉 风险 -> 回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | Calmar {r['组合Calmar']}")
-            print(f"   🚀 连贯 -> 30日最低胜率: {r['最低30日胜率(%)']}% | 四段分布: {r['四段净利分布']}")
+                f"   📉 风险 -> 回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | 组合Calmar {r['组合Calmar']}")
+            print(
+                f"   🚀 连贯 -> 30日胜率: {r['30日滚动胜率(%)']}% | 7日胜率: {r['7日滚动胜率(%)']}% | 1日胜率: {r['1日滚动胜率(%)']}%")
+            print(
+                f"   🛡️ 周期 -> 爆仓周期胜率: {r['爆仓周期胜率(%)']}% | 周期平均造血: {r['周期平均净利润(M)']}M")
+            print(f"   📊 四段 -> {r['四段净利分布']}")
             print(
                 f"   🔗 结构 -> 资金利用率 {r['资金利用率(%)']}% | 并发深水均值 {r['平均合计浮亏(M)']}M / 峰值 {r['峰值合计浮亏(M)']}M")
-            print(
-                f"   🧘 体验 -> 盈利天 {r['盈利天占比(%)']}% | 盈利月 {r['盈利月占比(%)']}% | 最长停滞 {r['最长无盈利(天)']}天")
 
             # 打印每个成员的表现
             lo, hi = int(r["_lo"]), int(r["_hi"])
@@ -1323,9 +1379,8 @@ def evaluate_multi_strategy_portfolios(
 
     return df_all
 
-
 if __name__ == "__main__":
-    PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
+    PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau_back.csv"  # 若无平原表填 None
 
     # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
     extract_target_trades_csv(

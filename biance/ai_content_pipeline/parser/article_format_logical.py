@@ -10,11 +10,14 @@
 """
 import json
 import re
+import threading
 import time
 from collections import defaultdict
 from multiprocessing import get_context
 
-from common.common_utils import setup_logger, read_file_to_str, string_to_object
+from biance.biance_squre_api import publish_to_binance_square
+from common.common_utils import setup_logger, read_file_to_str, string_to_object, get_config, read_json, save_json
+
 # from common.vector_utils import VectorSearchEngine
 
 logger = setup_logger(app_name="media_format")
@@ -1212,14 +1215,202 @@ def get_all_non_empty_logic_mul_with_clean_text():
     return valid_data_list
 
 
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+
+def auto_publish_articles():
+    """
+    后台守护主流程：自动发布符合条件的无图帖子到币安广场。
+    每轮检查休眠 10 分钟，无限循环。
+    """
+    STATE_FILE = "account_publish_state.json"
+    ACCOUNTS = ["yang", "ruru"]
+
+    # 账号冷却时间 (1小时) 和 同Topic防重时间 (12小时)
+    ACCOUNT_COOLDOWN_SECONDS = 3600
+    TOPIC_COOLDOWN_SECONDS = 12 * 3600
+
+    db_client = gen_db_object()
+    article_manager = GeneratedArticleManager(db_client)
+
+    logger.info("[自动发布] 启动帖子自动发布守护进程...")
+
+    while True:
+        try:
+            # 用于调度判断的时间戳
+            now_timestamp = time.time()
+
+            # 1. 载入本地账号状态
+            if os.path.exists(STATE_FILE):
+                state = read_json(STATE_FILE) or {}
+            else:
+                state = {}
+
+            # 初始化账号结构
+            for acc in ACCOUNTS:
+                if acc not in state:
+                    state[acc] = {
+                        "total_success": 0,
+                        "last_publish_time": 0,
+                        "last_error_msg": "",
+                        "last_error_time": 0,
+                        "topic_publish_history": {}
+                    }
+
+            # 2. 查询 MongoDB，过滤 6h 内生成的，且未被成功发布的记录
+            # 【修复】：根据 GeneratedArticleManager，使用 UTC datetime 对象进行查询
+            six_hours_ago_dt = datetime.now(timezone.utc) - timedelta(hours=6)
+
+            query = {
+                "created_at": {"$gte": six_hours_ago_dt},
+                "status": "ok",
+                "publish_status": {"$ne": "success"}  # 不等于 success，代表没发过或失败过
+            }
+
+            # 从数据库中拉取潜在的文章候选列表
+            candidates = article_manager.db.find_many(article_manager.collection_name, query=query)
+            if not candidates:
+                candidates = []
+
+            # 3. 内存进行精细化过滤：过滤出无图片的帖子
+            valid_articles = []
+            for art in candidates:
+                article_info = art.get("article_info", {})
+                if not isinstance(article_info, dict):
+                    continue
+
+                # 条件：image_placeholders 没有使用图片（列表为空）
+                images = article_info.get("image_placeholders", [])
+                if len(images) > 0:
+                    continue
+
+                valid_articles.append(art)
+
+            # 4. 总体打印统计信息
+            logger.info(f"[自动发布] =========================================")
+            logger.info(f"[自动发布] 统计信息：近 6h 内待发布(无图)帖子数量 -> {len(valid_articles)}")
+
+            # 5. 按照 score 从大到小排序
+            valid_articles.sort(key=lambda x: x.get("article_info", {}).get("score", 0), reverse=True)
+
+            # 6. 发布分配逻辑
+            for acc in ACCOUNTS:
+                # 检查该账号是否还在 1 小时的发帖冷却期内
+                last_pub_time = state[acc].get("last_publish_time", 0)
+                if now_timestamp - last_pub_time < ACCOUNT_COOLDOWN_SECONDS:
+                    logger.info(f"[自动发布] 账号【{acc}】正在冷却中 (距离下次可用还剩 {int(ACCOUNT_COOLDOWN_SECONDS - (now_timestamp - last_pub_time))} 秒)")
+                    continue
+
+                if not valid_articles:
+                    logger.info(f"[自动发布] 账号【{acc}】暂无可用的帖子候选。")
+                    continue
+
+                # 在候选列表中为该账号寻找符合 "12小时内未发过该 topic" 的最佳帖子
+                selected_art = None
+                selected_idx = -1
+                for idx, art in enumerate(valid_articles):
+                    topic = art.get("topic", "")
+                    last_topic_pub_time = state[acc]["topic_publish_history"].get(topic, 0)
+
+                    if now_timestamp - last_topic_pub_time >= TOPIC_COOLDOWN_SECONDS:
+                        selected_art = art
+                        selected_idx = idx
+                        break
+
+                if not selected_art:
+                    logger.info(f"[自动发布] 账号【{acc}】当前的高分帖子因为【12小时内发过同Topic】防重限制，已被跳过。")
+                    continue
+
+                # 7. 文本重构处理
+                article_info = selected_art.get("article_info", {})
+                original_text = article_info.get("text", "")
+                topic = selected_art.get("topic", "")
+
+                if topic:
+                    # 使用 \b 确保是完整单词，(?<!\$) 防止把已经写了 $DOGE 的变成 $$DOGE
+                    pattern = rf"(?<!\$)\b{re.escape(topic)}\b"
+                    formatted_text = re.sub(pattern, f"${topic}", original_text, flags=re.IGNORECASE)
+
+                    # 统一增加标签，追加到文末
+                    formatted_text = f"{formatted_text}\n\n#{topic}"
+                else:
+                    formatted_text = original_text
+
+                logger.info(f"[自动发布] 账号【{acc}】准备发布帖子 | Topic: {topic} | Score: {article_info.get('score')} | ID: {selected_art.get('_id')}")
+
+                # 8. 执行发布
+                api_key = get_config(f'{acc}_square_api_key')
+                if not api_key:
+                    logger.error(f"[自动发布] 找不到账号【{acc}】的 API KEY 配置！请检查配置文件。")
+                    continue
+
+                is_success = publish_to_binance_square(api_key=api_key, text_content=formatted_text)
+
+                if is_success:
+                    logger.info(f"[自动发布] 🎉 账号【{acc}】发布成功！")
+                    # 更新状态并落盘 (记录时间戳)
+                    state[acc]["total_success"] += 1
+                    state[acc]["last_publish_time"] = now_timestamp
+                    if topic:
+                        state[acc]["topic_publish_history"][topic] = now_timestamp
+                    save_json(STATE_FILE, state)
+
+                    # 回写数据库，标记成功
+                    article_manager.db.update_one(
+                        article_manager.collection_name,
+                        {"_id": selected_art["_id"]},
+                        {"$set": {"publish_status": "success", "published_by": acc, "publish_time": now_timestamp}}
+                    )
+
+                    # 将这篇刚发出去的帖子从待发队列中移除，避免其他账号重复发
+                    valid_articles.pop(selected_idx)
+                else:
+                    error_msg = "发帖失败（可能是网络不通、Key失效或达到每日上限）"
+                    logger.error(f"[自动发布] ❌ 账号【{acc}】发布失败: {error_msg}")
+
+                    # 更新报错记录落盘
+                    state[acc]["last_error_msg"] = error_msg
+                    state[acc]["last_error_time"] = now_timestamp
+                    save_json(STATE_FILE, state)
+
+                    # 回写数据库，记录失败状态供之后重试
+                    article_manager.db.update_one(
+                        article_manager.collection_name,
+                        {"_id": selected_art["_id"]},
+                        {"$set": {"publish_status": "failed", "last_error": error_msg}}
+                    )
+
+        except Exception as e:
+            logger.error(f"[自动发布] 轮询主循环遭遇异常: {e}", exc_info=True)
+
+        finally:
+            logger.info("[自动发布] 本轮处理结束，进入 10 分钟 (600s) 休眠...\n")
+            time.sleep(600)
+
+def _run_task(task):
+    """为未处理异常补充任务入口信息后重抛，保留当前线程退出、不自动重启的行为。"""
+    try:
+        task()
+    except Exception as exc:
+        logger.error(
+            f"[任务/退出] 任务异常退出，请检查对应链路的数据、文件权限和外部服务"
+            f" | 任务: 【{task.__name__}】 | 异常: 【{exc!r}】 | 结果: 【当前线程停止】"
+        )
+        raise
+
+
 if __name__ == "__main__":
-    # generate_analysis_articles()
-
-    # clear_all_media_format_batch()
-    # extract_and_group_valid_evidences()
-
-
-    # valid_logic_mul_list = get_all_non_empty_logic_mul_with_clean_text()
-
-    format_image_article()
-
+    tasks = (
+        generate_analysis_articles,
+        format_image_article,
+        auto_publish_articles
+    )
+    threads = []
+    for task in tasks:
+        thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()

@@ -2063,5 +2063,22 @@ if __name__ == "__main__":
 
     logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
 
+    # 2. 准备你要发布的纯文本内容 (支持换行和带 HashTag)
+    post_content = "BTC带头反弹，SOL却在100美元关口前尽显疲态，根本看不到独立资金愿意进场接盘。\n\n更反常的是衍生品数据：价格这么弱，100美元附近的资金费率依然维持正值（+0.0057%）。散户还在扎堆开仓赌反弹，市场连最起码的恐慌出清都没完成。\n\n没增量资金拉盘，车上却挤满了等别人抬轿的多头。筹码洗不干净，现在买入大概率要替套牢盘当燃料。多头不死，见底还早。\n\n $BTC $SOL\n\n #BTC #行情分析 #加密货币"
+
+
+    # 3. 调用发帖函数
+    SQUARE_API_KEY = get_config('yang_square_api_key')
+    logger.info("准备执行自动发帖任务...")
+    is_success = publish_to_binance_square(
+        api_key=SQUARE_API_KEY,
+        text_content=post_content
+    )
+
+    # 4. 根据返回的布尔值处理后续逻辑
+    if is_success:
+        print("\n🎉 发帖成功！请前往币安广场个人主页查看。")
+    else:
+        print("\n❌ 发帖失败！请检查上方日志中的错误码（可能是网络不通、Key失效或达到每日上限）。")
 
 
