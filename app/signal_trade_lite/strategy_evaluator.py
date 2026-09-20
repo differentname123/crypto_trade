@@ -32,7 +32,7 @@ CACHE_DIR = r"W:\backtest_data_1m_detail"  # 做多策略默认缓存目录
 SHORT_CACHE_DIR = r"W:\backtest_data_1m_detail"  # 新增：做空策略缓存目录
 
 # 回测测试用的保证金深度 (Margin) 列表
-TEST_MARGINS = [2,3,4,5,6,7,8,9,10]
+TEST_MARGINS = [1,2,3,4,5,6,7,8,9,10]
 
 # === 新增：打印过滤与并行处理参数 ===
 # 最终打印时，过滤掉预期存活(天)小于此数值的结果
@@ -164,8 +164,14 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "总信号数": n_cycles_total,
         "实际开仓数": n_trades_actual,
         "胜率(%)": round(report.get("win_rate", 0) * 100, 2) if pd.notnull(report.get("win_rate")) else 0.0,
+
+        # === 新增：滚动胜率 ===
+        "单日胜率(%)": round(report.get("_win_rate_1d", 0), 2),
+        "7日滚动胜率(%)": round(report.get("_win_rate_7d", 0), 2),
+        "30日滚动胜率(%)": round(report.get("_win_rate_30d", 0), 2),
+
         "爆仓次数": n_blowup,
-        "爆仓几率(%)": round(blowup_prob, 2),  # 现在这里计算准确了
+        "爆仓几率(%)": round(blowup_prob, 2),
         "预期存活(天)": round(expected_lifespan_hour / 24.0, 2) if not np.isinf(
             expected_lifespan_hour) else "999 (未爆仓)",
         "中位存活(天)": round(report.get("_median_survival", 0), 2),
@@ -178,6 +184,13 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "死前翻倍胜率(%)": round(free_ride_win_rate * 100, 2) if pd.notnull(free_ride_win_rate) else 0.0,
         "平均回撤(M倍)": round(report.get("_avg_mdd", 0), 4),
         "中位回撤(M倍)": round(report.get("_median_mdd", 0), 4),
+
+        # === 新增：四段生命周期净利润 ===
+        "Q1净利(M倍)": round(report.get("_q1_profit", 0), 2),
+        "Q2净利(M倍)": round(report.get("_q2_profit", 0), 2),
+        "Q3净利(M倍)": round(report.get("_q3_profit", 0), 2),
+        "Q4净利(M倍)": round(report.get("_q4_profit", 0), 2),
+
         "总收益(Margin倍数)": round(report.get("_extracted_gross_profit", 0), 2),
         "总亏损(Margin倍数)": round(report.get("_extracted_gross_loss", 0), 2),
         "净利润(Margin倍数)": round(report.get("total_net_pnl_in_margin", 0), 2),
@@ -190,6 +203,7 @@ def _build_row(symbol, strategy_name, direction, report, add_step, tp_step, mult
         "0-1层解决战斗比例(%)": round(report.get("low_layer_ratio", 0) * 100, 2),
         "手续费占毛利(%)": round(report.get("fee_ratio_traded", 0) * 100, 2)
     }
+
 
 def _process_one_file(file_path):
     filename = os.path.basename(file_path)
@@ -256,6 +270,15 @@ def _process_one_file(file_path):
         median_survival = 0.0
         max_survival = 0.0
         min_survival = 0.0
+
+        # === 新增初始化：滚动胜率与四段净利 ===
+        win_rate_1d = 0.0
+        win_rate_7d = 0.0
+        win_rate_30d = 0.0
+        q1_profit = 0.0
+        q2_profit = 0.0
+        q3_profit = 0.0
+        q4_profit = 0.0
 
         if pnl_col:
             gross_profit = float(trades_df.loc[trades_df[pnl_col] > 0, pnl_col].sum())
@@ -331,6 +354,32 @@ def _process_one_file(file_path):
                             all_pnl = trades_df[pnl_col] * ratio
                             daily_net_pnl = all_pnl.groupby(dates).sum()
                             daily_net_pnl = daily_net_pnl.reindex(full_dates, fill_value=0.0)
+
+                            # ==========================================================
+                            # 🔥 新增功能核心代码区：滚动周期胜率 & 四段生命周期净利润
+                            # ==========================================================
+                            daily_arr = daily_net_pnl.values
+                            n_days = len(daily_arr)
+
+                            if n_days > 0:
+                                # 1天、7天、30天窗口滑动求和，大于0即为胜率
+                                win_rate_1d = float(np.mean(daily_arr > 0) * 100.0)
+
+                                if n_days >= 7:
+                                    roll_7d = np.convolve(daily_arr, np.ones(7), mode='valid')
+                                    win_rate_7d = float(np.mean(roll_7d > 0) * 100.0)
+
+                                if n_days >= 30:
+                                    roll_30d = np.convolve(daily_arr, np.ones(30), mode='valid')
+                                    win_rate_30d = float(np.mean(roll_30d > 0) * 100.0)
+
+                                # 将整个时间序列切割为 4 份，并分别求和
+                                chunks = np.array_split(daily_arr, 4)
+                                q1_profit = float(chunks[0].sum()) if len(chunks) > 0 else 0.0
+                                q2_profit = float(chunks[1].sum()) if len(chunks) > 1 else 0.0
+                                q3_profit = float(chunks[2].sum()) if len(chunks) > 2 else 0.0
+                                q4_profit = float(chunks[3].sum()) if len(chunks) > 3 else 0.0
+                            # ==========================================================
 
                             no_profit_mask = daily_net_pnl <= 0
                             no_profit_days = int(no_profit_mask.sum())
@@ -445,6 +494,15 @@ def _process_one_file(file_path):
         report["_median_survival"] = median_survival
         report["_max_survival"] = max_survival
         report["_min_survival"] = min_survival
+
+        # === 写入新增的统计指标到 report，供 _build_row 使用 ===
+        report["_win_rate_1d"] = win_rate_1d
+        report["_win_rate_7d"] = win_rate_7d
+        report["_win_rate_30d"] = win_rate_30d
+        report["_q1_profit"] = q1_profit
+        report["_q2_profit"] = q2_profit
+        report["_q3_profit"] = q3_profit
+        report["_q4_profit"] = q4_profit
         # =====================================================
 
         del trades_df
@@ -455,7 +513,6 @@ def _process_one_file(file_path):
     del cycles_df, replayer
     gc.collect()
     return rows_by_margin
-
 
 def _process_one_file_safe(file_path):
     try:
@@ -1200,8 +1257,8 @@ def compute_marting():
 
 if __name__ == "__main__":
     # time.sleep(3600 * 4)
-    # mp.freeze_support()
-    # analyze_all_strategies()
+    mp.freeze_support()
+    analyze_all_strategies()
     csv_file = "strategy_leaderboard_100800_files.csv"
     output_csv = csv_file.replace(".csv", "_plateau.csv")
 
