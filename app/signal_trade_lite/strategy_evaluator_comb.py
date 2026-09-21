@@ -1434,7 +1434,7 @@ if __name__ == "__main__":
         plateau_csv=PLATEAU_CSV,
         output_csv="portfolio_multi_ranking.csv",
         min_k=2,
-        max_k=5,
+        max_k=7,
         top_n_per_k=50,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
