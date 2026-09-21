@@ -388,6 +388,7 @@ def print_performance_summary(base_dir="trade_results"):
                 p_data = quad_periods.loc[quad_periods["Period"].eq(p)].set_index("Run")
                 print_df[f"{quad}_Q{p}_Trades"] = print_df["Run"].map(p_data["Trades"])
                 print_df[f"{quad}_Q{p}_Ret(%)"] = print_df["Run"].map(p_data["Avg_Ret(%)"])
+                print_df[f"{quad}_Q{p}_SumRet(%)"] = print_df["Run"].map(p_data["Sum_Ret(%)"])
 
     total = len(print_df)
     cond_all = pd.Series(False, index=print_df.index)
@@ -396,17 +397,21 @@ def print_performance_summary(base_dir="trade_results"):
     for quad in quadrants:
         cond_quad_q = pd.Series(True, index=print_df.index)
         if common_start is not None:
+            quad_total_sum_ret = print_df[f"{quad}_SumRet(%)"].fillna(0)
             for p in range(1, 5):
-                col = f"{quad}_Q{p}_Ret(%)"
-                if col in print_df.columns:
+                col_ret = f"{quad}_Q{p}_Ret(%)"
+                col_sum_ret = f"{quad}_Q{p}_SumRet(%)"
+                if col_ret in print_df.columns and col_sum_ret in print_df.columns:
                     # fillna(0) 依然限制无交易记为不过滤要求(>0)
-                    cond_quad_q = cond_quad_q & (print_df[col].fillna(0) > 0)
+                    cond_quad_q = cond_quad_q & (print_df[col_ret].fillna(0) > 0)
+                    # 新增条件：每个Q的总收益占比都要超过10%
+                    cond_quad_q = cond_quad_q & (print_df[col_sum_ret].fillna(0) > 0.1 * quad_total_sum_ret)
         else:
             cond_quad_q = pd.Series(False, index=print_df.index)
 
         cond_quad_risk = print_df[f"{quad}_WorstMAE(%)"].fillna(0) > -200
 
-        # 只要该象限同时满足季度>0和回撤>-200%条件
+        # 只要该象限同时满足季度均收益>0、季度收益占比>10%和回撤>-200%条件
         cond_quad_pass = cond_quad_q & cond_quad_risk
 
         # 将通过结果聚合到整体过滤器中 (OR)
@@ -415,7 +420,8 @@ def print_performance_summary(base_dir="trade_results"):
     print("\n" + "=" * 50 + " 过滤条件与统计 " + "=" * 50)
     print("过滤要求（按4个象限独立判断，满足任意1个即可入选）：")
     print("  1. 该象限每个Q的平均单笔收益是正数 (Q1~Q4_Ret > 0)")
-    print("  2. 该象限单笔最大回撤小于 200% (WorstMAE > -200%)")
+    print("  2. 该象限每个Q的总收益占比均超过 10% (Q1~Q4_SumRet > 10% * 象限总收益)")
+    print("  3. 该象限单笔最大回撤小于 200% (WorstMAE > -200%)")
     print(f"\n总策略数: {total}")
 
     cnt_all = cond_all.sum()
@@ -460,7 +466,11 @@ def print_performance_summary(base_dir="trade_results"):
                 if pd.notna(q_trades) and q_trades > 0:
                     q_ret = row.get(f"{quad_name}_Q{p}_Ret(%)", np.nan)
                     q_ret_str = f"{q_ret:.4f}%" if pd.notna(q_ret) else "--"
-                    q_info.append(f"Q{p}(笔:{int(q_trades)} 收益:{q_ret_str})")
+
+                    q_sum_ret = row.get(f"{quad_name}_Q{p}_SumRet(%)", np.nan)
+                    q_sum_str = f"{q_sum_ret:.4f}%" if pd.notna(q_sum_ret) else "--"
+
+                    q_info.append(f"Q{p}(笔:{int(q_trades)} 均收益:{q_ret_str} 总收益:{q_sum_str})")
                 else:
                     q_info.append(f"Q{p}(无交易)")
         if q_info:
@@ -495,7 +505,11 @@ def print_performance_summary(base_dir="trade_results"):
                     if pd.notna(q_trades) and q_trades > 0:
                         q_ret = row.get(f"Q{p}_Ret(%)", np.nan)
                         q_ret_str = f"{q_ret:.4f}%" if pd.notna(q_ret) else "--"
-                        q_info.append(f"Q{p}(笔:{int(q_trades)} 收益:{q_ret_str})")
+
+                        q_sum_ret = row.get(f"Q{p}_SumRet(%)", np.nan)
+                        q_sum_str = f"{q_sum_ret:.4f}%" if pd.notna(q_sum_ret) else "--"
+
+                        q_info.append(f"Q{p}(笔:{int(q_trades)} 均收益:{q_ret_str} 总收益:{q_sum_str})")
                     else:
                         q_info.append(f"Q{p}(无交易)")
             if q_info:
@@ -510,7 +524,7 @@ def print_performance_summary(base_dir="trade_results"):
 
             print("-" * 110)
 
-    print("\n[指标说明] MaxLossStreak=逐笔平仓顺序最大连亏；MaxConcurrent=最大同时持仓配对数。")
+    print("\n[指标说明] MaxLossStreak=逐笔平仓顺序最大连亏；MaxConcurrent=最大同时持仓配堆数。")
     print("MAEValid/MAEMissing=已平仓交易中完整/缺失价格路径的笔数；缺失不填0。")
     print("P10MAE=单笔MAE的10%分位数，并非最差10%样本的均值。")
     print("Run_Complete仅表示全部结算；Risk_Complete还要求全部已平仓交易极值有效。")
