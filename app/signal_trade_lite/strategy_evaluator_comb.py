@@ -1017,6 +1017,7 @@ def evaluate_multi_strategy_portfolios(
       * Profit Factor 使用加权逐笔正/负收益，不能先做日内净额抵消。
       * 数值不提前 round；仅显示时格式化，保证排序使用完整精度。
     """
+
     def fmt(value, digits=2, suffix=""):
         if pd.isna(value):
             return "N/A"
@@ -1294,7 +1295,7 @@ def evaluate_multi_strategy_portfolios(
                 "最差单日(M)": float(daily.min()),
                 "最差单月(M)": float(monthly_nonzero.min()) if len(monthly_nonzero) else 0.0,
                 "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0)
-                                  if len(monthly_nonzero) else 0.0,
+                if len(monthly_nonzero) else 0.0,
                 "后半段净利占比(%)": (net - half_net) / net * 100.0 if net != 0 else np.nan,
                 "峰值合计浮亏(M)": float(float_sum.max()),
                 "平均合计浮亏(M)": float(float_sum.mean()),
@@ -1340,6 +1341,11 @@ def evaluate_multi_strategy_portfolios(
         output_csv, index=False, encoding="utf-8-sig", na_rep="N/A")
     print(f"组合评估完成：{len(df_all):,} 个有效组合 | 全量排名：{output_csv}\n")
 
+    # ==========================
+    # 核心修改点：加入成员全局别名映射字典
+    # ==========================
+    member_alias_map = {}
+
     for k in range(min_k, max_k + 1):
         df_k = df_all[df_all["组合数量(K)"] == k].head(top_n_per_k)
         if df_k.empty:
@@ -1376,14 +1382,37 @@ def evaluate_multi_strategy_portfolios(
             for i in ii:
                 m = member_risk(i, lo, hi)
                 _, member_win, _ = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
+
+                # 获取原成员标识
+                member_label = records[i]["label"]
+                # 记录全局唯一的名称映射
+                if member_label not in member_alias_map:
+                    member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
+
                 rows.append({
-                    "成员": records[i]["label"],
+                    "成员": member_label,
+                    "成员编号": member_alias_map[member_label],
                     "窗口净利(M)": fmt(m["net"]),
                     "已实现MDD(M)": fmt(m["mdd"]),
                     "已实现Calmar": fmt(m["calmar"]),
                     "周期盈利率(%)": fmt(member_win),
                 })
-            print_table(pd.DataFrame(rows))
+
+            # 使用 DataFrame 组织数据
+            df_print = pd.DataFrame(rows)
+
+            # 此处控制实际向 print_table 输入的列
+            # 默认去掉了 "成员"（已用 # 注释掉），如果你将来想连同成员一起输出，只需去掉 "成员", 前面的 # 号即可
+            display_cols = [
+                # "成员",          # <--- 默认注释掉，随时可以放开
+                "成员编号",  # <--- 现在默认输出映射后的名称
+                "窗口净利(M)",
+                "已实现MDD(M)",
+                "已实现Calmar",
+                "周期盈利率(%)"
+            ]
+
+            print_table(df_print[display_cols])
         print()
     return df_all
 
