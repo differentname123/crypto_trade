@@ -865,13 +865,13 @@ WORKER_CONFIGS = [
     {
         "account": "qiqi",
         "strategy": "cross",
-        "api_key": get_config("nana_biance_api_copy_key"),
-        "api_secret": get_config("nana_biance_api_copy_secret")
+        "api_key": get_config("qiqi_biance_api_copy_key"),
+        "api_secret": get_config("qiqi_biance_api_copy_secret")
     }, {
         "account": "ruru",
         "strategy": "cross",
-        "api_key": get_config("nana_biance_api_copy_key"),
-        "api_secret": get_config("nana_biance_api_copy_secret")
+        "api_key": get_config("ruru_biance_api_copy_key"),
+        "api_secret": get_config("ruru_biance_api_copy_secret")
     },
 ]
 
