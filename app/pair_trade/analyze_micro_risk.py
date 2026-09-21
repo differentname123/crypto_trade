@@ -405,7 +405,7 @@ def print_performance_summary(base_dir="trade_results"):
                     # fillna(0) 依然限制无交易记为不过滤要求(>0)
                     cond_quad_q = cond_quad_q & (print_df[col_ret].fillna(0) > 0)
                     # 新增条件：每个Q的总收益占比都要超过10%
-                    cond_quad_q = cond_quad_q & (print_df[col_sum_ret].fillna(0) > 0.1 * quad_total_sum_ret)
+                    cond_quad_q = cond_quad_q & (print_df[col_sum_ret].fillna(0) > 0.05 * quad_total_sum_ret)
         else:
             cond_quad_q = pd.Series(False, index=print_df.index)
 

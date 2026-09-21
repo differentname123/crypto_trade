@@ -136,16 +136,7 @@ class UniversalPostManager:
 class GeneratedArticleManager:
     """
     生成文章管理器，独立使用 generated_articles 集合。
-
-    status: processing / ok / skip / error。
-    post_id_list: 仅由成功文章的 used_material_ids 反查得到，同一原帖去重。
-    article_info: 校验通过的模型 JSON，以及程序补齐的 image_mapping。
-    creation_brief / material_post_mapping: 本次输入及素材到原帖的溯源信息。
-    error_message / error_history / raw_response: 最终异常、重试记录与原始返回。
-    created_at / updated_at: UTC 时间。更新时应继续传入 save_article 返回的记录。
-
-    只调用原 MongoBase 已有的 create_index / find_many / bulk_upsert。
-    使用次数查询显式传 limit=0，要求沿用 MongoDB 的“不限制条数”语义。
+    核心原则：本类只做底层纯粹的增改与查询封装，不做任何业务数据校验或拼接。
     """
 
     COLLECTION_NAME = "generated_articles"
@@ -172,93 +163,39 @@ class GeneratedArticleManager:
         )
         self.db.create_index(self.collection_name, [('updated_at', -1)], unique=False)
 
-    def save_article(self, article_data):
-        """按 article_id 幂等写入；从实际采用素材推导 post_id_list，禁止用输入池计数。"""
-        record = dict(article_data)
-        for key in ('source', 'topic', 'stance'):
-            if not isinstance(record.get(key), str) or not record[key].strip():
-                raise ValueError(f"文章缺失有效字段: {key}")
+    def upsert_articles(self, data_list):
+        """
+        通用批量更新/插入文章数据的底层方法。
+        自动补齐 updated_at，若为新数据则自动生成 article_id 和 created_at。
+        """
+        if not data_list:
+            logger.warning("upsert_articles 收到空数据集，已跳过入库")
+            return
 
-        status = record.get('status')
-        if status not in ('processing', 'ok', 'skip', 'error'):
-            raise ValueError(f"不支持的文章状态: {status}")
-
-        post_id_list = []
-        if status == 'ok':
-            article_info = record.get('article_info')
-            material_post_mapping = record.get('material_post_mapping')
-            if not isinstance(article_info, dict) or article_info.get('status') != 'ok':
-                raise ValueError("成功记录必须包含 status=ok 的 article_info")
-            if not isinstance(material_post_mapping, dict):
-                raise ValueError("成功记录必须包含 material_post_mapping")
-            used_material_ids = article_info.get('used_material_ids')
-            if not isinstance(used_material_ids, list) or not used_material_ids:
-                raise ValueError("成功文章的 used_material_ids 不能为空")
-            for material_id in used_material_ids:
-                if not isinstance(material_id, str) or material_id not in material_post_mapping:
-                    raise ValueError(f"实际采用素材无法反查原帖: {material_id!r}")
-                post_id = material_post_mapping[material_id]
-                if (not isinstance(post_id, (str, int)) or isinstance(post_id, bool)
-                        or post_id in (None, '', 'UNKNOWN')):
-                    raise ValueError(f"素材对应的原帖 ID 无效: {material_id}")
-                if post_id not in post_id_list:
-                    post_id_list.append(post_id)
-
-        # skip / error / processing 不消耗素材；不接受调用方直接传入的候选帖子列表。
-        record['post_id_list'] = post_id_list
         now = datetime.now(timezone.utc)
-        record.setdefault('article_id', uuid4().hex)
-        record.setdefault('created_at', now)
-        record['updated_at'] = now
-        record.setdefault('article_info', None)
-        record.setdefault('error_message', None)
-        record.setdefault('error_history', [])
-        record.setdefault('raw_response', None)
-        record.setdefault('attempt_count', 0)
-        self.db.bulk_upsert(self.collection_name, [record], self.UNIQUE_KEYS)
-        logger.info(
-            "文章入库完成 | article_id=%s | status=%s | used_posts=%s",
-            record['article_id'], status, len(post_id_list)
-        )
-        return record
+        for record in data_list:
+            # 若没有 article_id，视为新数据并补齐主键与创建时间
+            if not record.get('article_id'):
+                record['article_id'] = uuid4().hex
+                record.setdefault('created_at', now)
+            # 无论新增还是更新，永远刷新 updated_at
+            record['updated_at'] = now
 
-    def get_post_usage_counts(self, source, post_ids):
-        """统计同平台的成功文章引用次数，不限币种/立场；每篇文章内同帖最多计一次。"""
-        unique_ids = list(dict.fromkeys(post_ids))
-        counts = dict.fromkeys(unique_ids, 0)
-        if not unique_ids:
-            return counts
-        articles = self.db.find_many(
-            self.collection_name,
-            query={'source': source, 'status': 'ok', 'post_id_list': {'$in': unique_ids}},
-            limit=0
-        )
-        # 查询异常必须向上传播，不能把查询失败当成“使用次数为 0”。
-        for article in articles:
-            for post_id in set(article.get('post_id_list', [])):
-                if post_id in counts:
-                    counts[post_id] += 1
-        return counts
+        self.db.bulk_upsert(self.collection_name, data_list, self.UNIQUE_KEYS)
 
-    def get_recent_openings(self, source, topic, stance, limit=5):
-        """取同币种、同立场近期成功文章的开头，供提示词避开重复表达。"""
-        if limit <= 0:
+    def find_articles(self, query=None, sort=None, limit=0):
+        """通用查询入口"""
+        query = query or {}
+        return self.db.find_many(self.collection_name, query=query, sort=sort, limit=limit)
+
+    def find_articles_by_ids(self, article_ids, source=None):
+        """根据 article_id 批量精确查询"""
+        if not article_ids:
             return []
-        articles = self.db.find_many(
-            self.collection_name,
-            query={'source': source, 'topic': topic, 'stance': stance, 'status': 'ok'},
-            sort=[('created_at', -1)],
-            limit=limit
-        )
-        openings = []
-        for article in articles:
-            text = (article.get('article_info') or {}).get('text', '')
-            if isinstance(text, str) and text.strip():
-                opening = text.strip().splitlines()[0][:80]
-                if opening not in openings:
-                    openings.append(opening)
-        return openings
-
+        query = {"article_id": {"$in": article_ids}}
+        if source:
+            query["source"] = source
+        return self.db.find_many(self.collection_name, query=query)
 
 # ==========================================
 # 接入清洗流程的使用示例

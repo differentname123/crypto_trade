@@ -860,22 +860,33 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
     print("=" * 70)
 
 
-# =====================================================================
-# Stage B : 组合回测
-# =====================================================================
-# =====================================================================
-# Stage B : 组合回测
-# =====================================================================
 def _load_strategy_records(csv_dir, plateau_csv=None):
+    """读取交易明细；兼容原调用，严格解析爆仓布尔标志，时间统一为 UTC。
+
+    plateau_csv 保留用于兼容原接口；本次指标不需要读取平原表。
+    已有 is_blowup_flag 优先；只有完全缺少爆仓字段时才按原阈值推断。
+    """
+    def parse_flags(series, filename):
+        # astype(bool) 会把字符串 "False"、"0" 都转换成 True。
+        values = series.astype("string").str.strip().str.lower()
+        mapping = {
+            "true": True, "1": True, "1.0": True,
+            "false": False, "0": False, "0.0": False,
+        }
+        missing = series.isna() | values.eq("").fillna(False)
+        invalid = ~missing & ~values.isin(mapping)
+        if invalid.any():
+            bad = series[invalid].astype(str).unique()[:5].tolist()
+            raise ValueError(f"{filename}: 无法识别 is_blowup_flag={bad}")
+        return values.map(mapping).fillna(False).astype(bool)
+
     files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
-    files = [f for f in files if not os.path.basename(f).startswith("_")]  # 排除索引/汇总表
+    files = [f for f in files if not os.path.basename(f).startswith("_")]
     if not files:
         return [], None
 
     idx_path = os.path.join(csv_dir, INDEX_FILE)
     idx_df = pd.read_csv(idx_path) if os.path.exists(idx_path) else None
-    plateau_df = pd.read_csv(plateau_csv) if (plateau_csv and os.path.exists(plateau_csv)) else None
-
     records = []
     for f in files:
         fname = os.path.basename(f)
@@ -884,80 +895,93 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
             continue
 
         margin = float(df["margin"].iloc[0]) if "margin" in df.columns else 1.0
+        if not np.isfinite(margin) or margin <= 0:
+            raise ValueError(f"{fname}: margin 必须为正数")
 
-        # ---- 收益(必须是 M 倍) ----
         if "pnl_M" in df.columns:
-            pnl = pd.to_numeric(df["pnl_M"], errors="coerce").fillna(0.0).astype(float)
+            pnl = pd.to_numeric(df["pnl_M"], errors="coerce").astype(float)
         else:
             pcol = _pick_col(df, PNL_COL_CANDIDATES)
             if pcol is None:
-                print(f"[警告] 无收益列, 跳过: {fname}")
+                print(f"[提示] 无收益列，跳过: {fname}")
                 continue
-            pnl = pd.to_numeric(df[pcol], errors="coerce").fillna(0.0).astype(float)
+            pnl = pd.to_numeric(df[pcol], errors="coerce").astype(float)
             if "in_margin" not in pcol:
-                pnl = pnl / max(margin, 1e-9)
-            print(f"[⚠] {fname} 缺少 pnl_M 列(旧版明细)，已按列名启发式换算，强烈建议重跑 Stage A！")
+                pnl = pnl / margin
+            print(f"[警告] {fname} 缺少 pnl_M，按列名换算；建议重跑 Stage A。")
 
-        # ---- 时间 (优先使用明确提供的 start_ms 和 end_ms 列) ----
         if "start_ms" in df.columns and "end_ms" in df.columns:
-            open_dt = _to_dt(df["start_ms"])
-            close_dt = _to_dt(df["end_ms"])
+            open_dt = pd.to_datetime(pd.to_numeric(df["start_ms"], errors="coerce"),
+                                     unit="ms", errors="coerce", utc=True)
+            close_dt = pd.to_datetime(pd.to_numeric(df["end_ms"], errors="coerce"),
+                                      unit="ms", errors="coerce", utc=True)
         elif "close_dt" in df.columns:
-            close_dt = pd.to_datetime(df["close_dt"], errors="coerce")
-            open_dt = pd.to_datetime(df["open_dt"], errors="coerce") if "open_dt" in df.columns else close_dt
+            close_dt = pd.to_datetime(df["close_dt"], errors="coerce", utc=True)
+            open_dt = (pd.to_datetime(df["open_dt"], errors="coerce", utc=True)
+                       if "open_dt" in df.columns else close_dt.copy())
         else:
             sc, ec = _detect_time_cols(df)
-            close_dt = _to_dt(df[ec])
-            open_dt = _to_dt(df[sc]) if sc else close_dt
+            if ec is None:
+                print(f"[警告] 无平仓时间列，跳过: {fname}")
+                continue
+            close_dt = pd.to_datetime(_to_dt(df[ec]), errors="coerce", utc=True)
+            open_dt = (pd.to_datetime(_to_dt(df[sc]), errors="coerce", utc=True)
+                       if sc else close_dt.copy())
         open_dt = open_dt.fillna(close_dt)
+        open_dt = open_dt.mask(open_dt > close_dt, close_dt)
 
-        # ---- 爆仓标志获取 (为了 Stage B 计算爆仓周期) ----
         if "is_blowup_flag" in df.columns:
-            is_blowup = df["is_blowup_flag"].fillna(False).astype(bool)
+            is_blowup = parse_flags(df["is_blowup_flag"], fname)
         elif "outcome" in df.columns:
-            is_blowup = (df["outcome"] == "blowup")
+            is_blowup = (df["outcome"].astype("string").str.strip().str.lower()
+                         .isin(["blowup", "blow_up", "liquidation", "liquidated", "bust"]))
         else:
-            is_blowup = pd.Series(False, index=df.index)
+            is_blowup = pnl <= -BLOWUP_LOSS_THRESHOLD_M
+            print(f"[警告] {fname} 无爆仓标志，按 pnl_M <= "
+                  f"-{BLOWUP_LOSS_THRESHOLD_M:g} 推断；建议重跑 Stage A。")
 
-        ok = close_dt.notna()
-        df, pnl, open_dt, close_dt, is_blowup = \
-            df[ok].reset_index(drop=True), pnl[ok].reset_index(drop=True), \
-                open_dt[ok].reset_index(drop=True), close_dt[ok].reset_index(drop=True), \
-                is_blowup[ok].reset_index(drop=True)
+        ok = close_dt.notna() & np.isfinite(pnl)
+        if not ok.all():
+            # 缺失收益不能静默填 0，否则会影响盈利窗口率、周期率及排名。
+            raise ValueError(f"{fname}: 有 {int((~ok).sum())} 行平仓时间或收益无效，请修复明细")
 
-        if df.empty:
-            continue
-
-        float_loss = pd.to_numeric(df.get("float_loss_M", pd.Series(0.0, index=df.index)),
-                                   errors="coerce").fillna(0.0).abs().values
+        order = np.argsort(close_dt.to_numpy(), kind="stable")
+        df = df.iloc[order].reset_index(drop=True)
+        pnl = pnl.iloc[order].reset_index(drop=True)
+        open_dt = open_dt.iloc[order].reset_index(drop=True)
+        close_dt = close_dt.iloc[order].reset_index(drop=True)
+        is_blowup = is_blowup.iloc[order].reset_index(drop=True)
+        float_loss = pd.to_numeric(
+            df.get("float_loss_M", pd.Series(0.0, index=df.index)), errors="coerce"
+        ).replace([np.inf, -np.inf], np.nan).fillna(0.0).abs().to_numpy()
 
         sym = str(df["symbol"].iloc[0]) if "symbol" in df.columns else "UNK"
         strat = str(df["strategy"].iloc[0]) if "strategy" in df.columns else "UNK"
         direct = str(df["direction"].iloc[0]).capitalize() if "direction" in df.columns else "UNK"
         add_s = float(df["add_step"].iloc[0]) if "add_step" in df.columns else 0.0
         tp_s = float(df["tp_step"].iloc[0]) if "tp_step" in df.columns else 0.0
-        mult = float(df["multiplier"].iloc[0]) if ("multiplier" in df.columns
-                                                   and pd.notnull(df["multiplier"].iloc[0])) else None
-
-        # ---- 元数据: 优先索引表, 否则精确匹配平原宽表 ----
-        weight = 1.0
-        note = ""
-        if idx_df is not None and "file" in idx_df.columns and (idx_df["file"] == fname).any():
-            r = idx_df[idx_df["file"] == fname].iloc[0]
-            weight = float(r.get("推荐权重", 1.0)) if pd.notnull(r.get("推荐权重")) else 1.0
-            note = str(r.get("备注", "") or "")
+        mult = (float(df["multiplier"].iloc[0])
+                if "multiplier" in df.columns and pd.notna(df["multiplier"].iloc[0]) else None)
+        weight, note = 1.0, ""
+        if idx_df is not None and "file" in idx_df.columns:
+            matched = idx_df[idx_df["file"] == fname]
+            if not matched.empty:
+                meta = matched.iloc[0]
+                weight = float(meta["推荐权重"]) if pd.notna(meta.get("推荐权重")) else 1.0
+                note = str(meta["备注"]) if pd.notna(meta.get("备注")) else ""
 
         records.append({
             "file": fname,
-            "label": _make_label(sym, strat, direct, margin, add_s, tp_s) + (f"_x{mult:g}" if mult else ""),
+            "label": _make_label(sym, strat, direct, margin, add_s, tp_s)
+                     + (f"_x{mult:g}" if mult is not None else ""),
             "symbol": sym, "strategy": strat, "direction": direct, "margin": margin,
             "add_step": add_s, "tp_step": tp_s, "multiplier": mult,
             "signal_key": (sym, strat, direct, round(add_s, 6), round(tp_s, 6), mult),
-            "pnl": pnl.values, "open_dt": open_dt.values, "close_dt": close_dt.values,
-            "float_loss": float_loss,
-            "is_blowup": is_blowup.values,
-            "weight": weight, "note": note,
-            "has_float": bool(np.nanmax(float_loss) > 0) if len(float_loss) else False,
+            "pnl": pnl.to_numpy(dtype=float),
+            "open_dt": open_dt.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]"),
+            "close_dt": close_dt.dt.tz_convert(None).to_numpy(dtype="datetime64[ns]"),
+            "float_loss": float_loss, "is_blowup": is_blowup.to_numpy(dtype=bool),
+            "weight": weight, "note": note, "has_float": bool(np.any(float_loss > 0)),
         })
     return records, idx_df
 
@@ -974,409 +998,393 @@ def evaluate_multi_strategy_portfolios(
         weight_mode="equal",
         max_combos=400000,
         filter_q_balance=10.0,
-        filter_roll_profit_win_rate_30=None,  # 任意连续30天的区间利润和>=0的占比要求(默认80%)
-        filter_roll_profit_win_rate_7=None,  # 7日区间利润和胜率要求(可选)
-        filter_roll_profit_win_rate_1=None  # 1日区间利润和胜率要求(可选)
+        filter_roll_profit_win_rate_30=None,
+        filter_roll_profit_win_rate_7=None,
+        filter_roll_profit_win_rate_1=None,
 ):
+    """按完整爆仓周期盈利率降序，再按 30 日盈利窗口率降序评估组合。
+
+    口径：
+      * 日收益按平仓日入账，包含无交易的自然日；M 是保证金归一化单位。
+      * 共同窗口沿用各成员“首笔开仓日～末笔平仓日”的交集，含首尾日。
+      * MDD/Calmar 为日末已实现口径；初始累计收益 0、初始权益 1M。
+      * 两两持仓重合 = 同时持仓日 / 至少一方持仓日，在共同窗口计算；
+        忽略多空方向，开平仓当日均计持仓日，双方均空仓时约定为 0。
+      * 完整周期是 (上次爆仓时刻, 下次爆仓时刻]，含末端爆仓损失；
+        组合边界取所有成员爆仓时刻的并集，不代表组合账户本身爆仓。
+        同日不同时刻分别统计，同一时刻同时发生的爆仓合并为一个边界。
+        边界必须都在共同窗口内；无完整周期返回 NaN，排序放最后。
+      * Profit Factor 使用加权逐笔正/负收益，不能先做日内净额抵消。
+      * 数值不提前 round；仅显示时格式化，保证排序使用完整精度。
     """
-    组合回测逻辑：修复优化了马丁评估逻辑（引入滚动区间利润胜率与周期指标）
-    """
+    def fmt(value, digits=2, suffix=""):
+        if pd.isna(value):
+            return "N/A"
+        if np.isposinf(value):
+            return "∞" + suffix
+        if np.isneginf(value):
+            return "-∞" + suffix
+        return f"{value:.{digits}f}" + suffix
+
+    def ratio(numerator, denominator):
+        if denominator > 0:
+            return float(numerator / denominator)
+        return float("inf") if numerator > 0 else float("nan")
+
+    def realized_risk(daily):
+        # 把初始 0 纳入峰值；首日亏损也形成回撤和水下期。
+        cum = np.cumsum(daily, dtype=float)
+        peak = np.maximum.accumulate(np.r_[0.0, cum])[1:]
+        dd = np.maximum(peak - cum, 0.0)
+        net = float(cum[-1])
+        annual = net * DAYS_PER_YEAR / len(daily)
+        mdd = float(dd.max())
+        return {
+            "net": net, "annual": annual, "mdd": mdd,
+            "relative_dd": float(np.max(dd / (1.0 + peak)) * 100.0),
+            "underwater": _max_true_run(dd > 0),
+            "calmar": ratio(annual, mdd),
+        }
+
+    def rolling_stats(prefix, days):
+        if len(prefix) - 1 < days:
+            return float("nan"), float("nan")
+        values = prefix[days:] - prefix[:-days]
+        return float(np.mean(values > 0) * 100.0), float(values.min())
+
+    def window_blowups(i, lo, hi):
+        boundaries = event_data[i][2]
+        a = np.searchsorted(boundaries, day_ns[lo], side="left")
+        b = np.searchsorted(boundaries, day_ns[hi + 1], side="left")
+        return boundaries[a:b]
+
+    def cycle_stats(indices, weights, boundaries):
+        count = len(boundaries) - 1
+        if count <= 0:
+            return 0, float("nan"), float("nan")
+        profits = np.zeros(count, dtype=float)
+        for i, weight in zip(indices, weights):
+            times, prefix, _ = event_data[i]
+            # C(t) 包含时刻 t 的全部平仓；C(b)-C(a) 正好对应 (a,b]。
+            positions = np.searchsorted(times, boundaries, side="right")
+            profits += weight * np.diff(prefix[positions])
+        return count, float(np.mean(profits > 0) * 100.0), float(profits.mean())
+
+    if weight_mode not in ("equal", "recommend"):
+        raise ValueError("weight_mode 只能为 'equal' 或 'recommend'")
+    for name, value, minimum in (
+            ("min_k", min_k, 1), ("max_k", max_k, 1),
+            ("top_n_per_k", top_n_per_k, 0),
+            ("min_overlap_days", min_overlap_days, 1), ("max_combos", max_combos, 1)):
+        if not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f"{name} 必须为不小于 {minimum} 的整数")
+    if min_k > max_k:
+        raise ValueError("min_k 不能大于 max_k")
+    filters = {
+        30: filter_roll_profit_win_rate_30,
+        7: filter_roll_profit_win_rate_7,
+        1: filter_roll_profit_win_rate_1,
+    }
+    for days, threshold in filters.items():
+        if threshold is not None and (not np.isfinite(threshold) or not 0 <= threshold <= 100):
+            raise ValueError(f"{days} 日盈利窗口率阈值必须在 0～100 之间，或为 None")
+    if filter_q_balance is not None and not np.isfinite(filter_q_balance):
+        raise ValueError("filter_q_balance 必须是有限数值或 None")
+
     records, _ = _load_strategy_records(csv_dir, plateau_csv)
-    if not records:
-        print(f"[错误] 目录 {csv_dir} 下未找到任何有效交易明细 CSV！")
-        return
     N = len(records)
+    if N < min_k:
+        print(f"[提示] 有效策略数 {N} 少于 min_k={min_k}，无法构建组合。")
+        return
+    max_k = min(max_k, N)
+    total_combos = sum(math.comb(N, k) for k in range(min_k, max_k + 1))
+    if total_combos > max_combos:
+        print(f"[提示] 组合数 {total_combos:,} 超过 max_combos={max_combos:,}，已中止。")
+        return
 
-    # ================= 说明 =================
-    print("=" * 108)
-    print(" 📖 组合回测口径与核心字段统一解释 (加入高品质过滤)")
-    print("-" * 108)
-    print(" [核心单位与资金]")
-    print("   • M倍 (Margin): 归一化收益单位，1M代表1份单次开仓所需的绝对保证金。")
-    print(f" [硬核体验过滤条件] (不满足直接剔除)")
-    print(f"   • 四段利润均衡: 将生命周期四等分，任何一段的利润贡献不得低于 {filter_q_balance}%")
-    print(f"   • 滚动利润胜率: 任意30天窗口区间净利润总和≥0的比例不低于 {filter_roll_profit_win_rate_30 or 0}%")
-    print(" [综合评估指标]")
-    print("   • 组合持仓重合度: 两两成员同时持仓天数的总和 ÷ 组合运行总天数(越小效率越高)。")
-    print("   • 分散化系数: 组合最大回撤 ÷ 成员平均最大回撤(同窗口)。<1才是真对冲。")
-    print("   • 爆仓周期胜率: 基于组合内实际发生的爆仓点切割生命周期，以盈利周期数占比衡量造血韧性。")
-    print("-" * 108)
-    print(f" 成员数={N} | K∈[{min_k},{max_k}] | 同信号同组={'允许' if allow_same_signal else '禁止'} "
-          f"| 最小重叠={min_overlap_days}天 | 权重={weight_mode}")
-    print("=" * 108 + "\n")
+    base_w = np.array([r["weight"] for r in records], dtype=float)
+    if weight_mode == "recommend" and (not np.isfinite(base_w).all() or np.any(base_w <= 0)):
+        raise ValueError("recommend 模式要求所有推荐权重均为有限正数")
 
-    # ================= 构建日级矩阵 =================
+    print("=" * 112)
+    print("马丁组合评估 | 排序：完整爆仓周期盈利率 ↓ → 30日盈利窗口率 ↓")
+    print(f"成员 {N} | K={min_k}～{max_k} | 最少共同窗口 {min_overlap_days} 天 | 权重 {weight_mode}")
+    print("M=保证金归一化单位；回撤为日末已实现口径，初始权益=1M。")
+    print("窗口按交易明细起止日交集推定；持仓重合按日统计，不区分多空方向。")
+    print("任一成员爆仓即切分；完整周期=(上次爆仓时刻,下次爆仓时刻]；同时刻合并边界。")
+    print("盈利窗口和盈利周期均要求净利润 > 0；无足够数据的指标显示 N/A。")
+    print("四段贡献按共同窗口的时间顺序四等分，并非自然季度；净利≤0时显示 N/A。")
+    q_filter = "关闭" if filter_q_balance is None else f"最低阶段贡献≥{filter_q_balance:g}%"
+    roll_filters = " | ".join(
+        f"{days}日：{'关闭' if threshold is None else f'≥{threshold:g}%'}"
+        for days, threshold in filters.items())
+    print(f"过滤：四段 {q_filter} | 盈利窗口率 {roll_filters}")
+    print("=" * 112)
+
     g_start = min(pd.Timestamp(r["open_dt"].min()) for r in records).normalize()
     g_end = max(pd.Timestamp(r["close_dt"].max()) for r in records).normalize()
     all_days = pd.date_range(g_start, g_end, freq="D")
     T = len(all_days)
-    day_of_year = all_days.dayofyear.values
-    month_key = (all_days.year.values * 12 + all_days.month.values - 1)
-
-    PNL = np.zeros((N, T))
-    POS = np.zeros((N, T))
-    NEG = np.zeros((N, T))
-    CNT = np.zeros((N, T))
-    FLOAT = np.zeros((N, T))
+    day_ns = pd.date_range(g_start, periods=T + 1, freq="D").asi8
+    month_key = all_days.year.to_numpy() * 12 + all_days.month.to_numpy() - 1
+    PNL, POS, NEG, CNT, FLOAT = (np.zeros((N, T)) for _ in range(5))
     HOLD = np.zeros((N, T), dtype=bool)
-    BLOWUP = np.zeros((N, T), dtype=bool)  # 记录爆仓事件
-
     first_i = np.zeros(N, dtype=np.int64)
     last_i = np.zeros(N, dtype=np.int64)
+    event_data = []
 
     for i, r in enumerate(records):
-        o = pd.DatetimeIndex(r["open_dt"]).normalize()
-        c = pd.DatetimeIndex(r["close_dt"]).normalize()
-        si = ((o - g_start).days.values).astype(np.int64)
-        ei = ((c - g_start).days.values).astype(np.int64)
-        si = np.clip(si, 0, T - 1)
-        ei = np.clip(ei, 0, T - 1)
+        opens = pd.DatetimeIndex(r["open_dt"])
+        closes = pd.DatetimeIndex(r["close_dt"])
+        si = np.asarray((opens.normalize() - g_start).days, dtype=np.int64)
+        ei = np.asarray((closes.normalize() - g_start).days, dtype=np.int64)
         si = np.minimum(si, ei)
-        p = r["pnl"]
-
+        p = np.asarray(r["pnl"], dtype=float)
         np.add.at(PNL[i], ei, p)
-        np.add.at(POS[i], ei, np.where(p > 0, p, 0.0))
-        np.add.at(NEG[i], ei, np.where(p < 0, p, 0.0))
+        np.add.at(POS[i], ei, np.maximum(p, 0.0))
+        np.add.at(NEG[i], ei, np.minimum(p, 0.0))
         np.add.at(CNT[i], ei, 1.0)
 
-        # 记录爆仓发生天
-        blow = r.get("is_blowup", np.zeros(len(p), dtype=bool))
-        blow_ei = ei[blow]
-        BLOWUP[i, blow_ei] = True
-
-        # 持仓覆盖 & 浮亏覆盖
         d_hold = np.zeros(T + 1)
         np.add.at(d_hold, si, 1.0)
         np.add.at(d_hold, ei + 1, -1.0)
-        HOLD[i] = np.cumsum(d_hold)[:T] > 0.5
-        fl = r["float_loss"]
-        if fl is not None and len(fl) == len(p) and np.nanmax(fl) > 0:
-            d_f = np.zeros(T + 1)
-            np.add.at(d_f, si, fl)
-            np.add.at(d_f, ei + 1, -fl)
-            FLOAT[i] = np.maximum(np.cumsum(d_f)[:T], 0.0)
+        HOLD[i] = np.cumsum(d_hold)[:T] > 0
+        fl = r.get("float_loss")
+        if fl is not None and len(fl) == len(p) and np.any(fl > 0):
+            # 仅为原辅助字段保留的持仓区间最大浮亏代理，不是 MTM 曲线。
+            d_float = np.zeros(T + 1)
+            np.add.at(d_float, si, fl)
+            np.add.at(d_float, ei + 1, -fl)
+            FLOAT[i] = np.maximum(np.cumsum(d_float)[:T], 0.0)
 
-        first_i[i] = int(si.min())
-        last_i[i] = int(ei.max())
+        first_i[i], last_i[i] = int(si.min()), int(ei.max())
+        # 保留实际平仓时间，避免 BLOWUP 日布尔矩阵丢失同日多个边界。
+        order = np.argsort(closes.asi8, kind="stable")
+        times = closes.asi8[order]
+        prefix = np.r_[0.0, np.cumsum(p[order], dtype=float)]
+        flags = np.asarray(r["is_blowup"], dtype=bool)[order]
+        event_data.append((times, prefix, np.unique(times[flags])))
 
-    # ================= 两两预计算(相关性) =================
+    # 保留原 CSV 的方向签名重合代理；这不是收益相关系数。
     CORR = np.full((N, N), np.nan)
-    dirs = [str(r.get("direction", "")).upper() for r in records]
-
-    for i in range(N):
-        for j in range(i + 1, N):
-            lo = max(first_i[i], first_i[j])
-            hi = min(last_i[i], last_i[j])
-            if hi - lo + 1 >= 30:
-                hold_i = HOLD[i, lo:hi + 1]
-                hold_j = HOLD[j, lo:hi + 1]
-                intersect = np.sum(hold_i & hold_j)
-                union = np.sum(hold_i | hold_j)
-                overlap_ratio = float(intersect) / float(union) if union > 0 else 0.0
-                if dirs[i] == dirs[j]:
-                    CORR[i, j] = CORR[j, i] = overlap_ratio
-                else:
-                    CORR[i, j] = CORR[j, i] = -overlap_ratio
+    for i, j in itertools.combinations(range(N), 2):
+        lo, hi = max(first_i[i], first_i[j]), min(last_i[i], last_i[j])
+        if hi - lo + 1 >= 30:
+            a, b = HOLD[i, lo:hi + 1], HOLD[j, lo:hi + 1]
+            union = int(np.count_nonzero(a | b))
+            overlap = float(np.count_nonzero(a & b) / union) if union else 0.0
+            sign = 1.0 if records[i]["direction"] == records[j]["direction"] else -1.0
+            CORR[i, j] = CORR[j, i] = overlap * sign
 
     sig_keys = [r["signal_key"] for r in records]
-    base_w = np.array([r["weight"] for r in records], dtype=float)
+    member_cache = {}
 
-    total_combos = sum(math.comb(N, k) for k in range(min_k, max_k + 1))
-    print(f"数据矩阵完成: {T} 天 | 待穷举组合上限 {total_combos:,} 个\n")
-    if total_combos > max_combos:
-        print(f"[警告] 组合数超过 max_combos={max_combos:,}，已中止。")
-        return
+    def member_risk(i, lo, hi):
+        key = (i, lo, hi)
+        if key not in member_cache:
+            member_cache[key] = realized_risk(PNL[i, lo:hi + 1])
+        return member_cache[key]
 
     results = []
-    skipped_same_signal = 0
-    skipped_overlap = 0
-    skipped_win_rate = 0
-    skipped_q_balance = 0
+    skipped = {"同源": 0, "重叠不足": 0, "盈利窗口率": 0, "四段贡献": 0}
     processed = 0
-
+    print(f"数据矩阵：{T} 天 | 待扫描 {total_combos:,} 个组合\n")
     for k in range(min_k, max_k + 1):
         for idxs in itertools.combinations(range(N), k):
             processed += 1
-            if not allow_same_signal:
-                if len({sig_keys[i][:5] for i in idxs}) < k:
-                    skipped_same_signal += 1
-                    continue
+            if processed % 20000 == 0:
+                print(f"   ...已扫描 {processed:,}/{total_combos:,}")
+            if not allow_same_signal and len({sig_keys[i][:5] for i in idxs}) < k:
+                skipped["同源"] += 1
+                continue
             ii = list(idxs)
-            lo = int(max(first_i[ii]))
-            hi = int(min(last_i[ii]))
+            lo, hi = int(first_i[ii].max()), int(last_i[ii].min())
             n_days = hi - lo + 1
             if n_days < min_overlap_days:
-                skipped_overlap += 1
+                skipped["重叠不足"] += 1
                 continue
-
             sl = slice(lo, hi + 1)
-
-            # --- 持仓重合度 ---
-            overall_lo = int(min(first_i[ii]))
-            overall_hi = int(max(last_i[ii]))
-            overall_days = overall_hi - overall_lo + 1
-            overall_sl = slice(overall_lo, overall_hi + 1)
-            total_overlap_days = sum(
-                np.sum(HOLD[a, overall_sl] & HOLD[b, overall_sl]) for a, b in itertools.combinations(ii, 2))
-            pair_overlap_ratio = float(total_overlap_days / overall_days) if overall_days > 0 else 0.0
-
-            # 权重计算
-            if weight_mode == "recommend":
-                w = base_w[ii] / base_w[ii].sum()
-            else:
-                w = np.full(k, 1.0 / k)
-            w = w.reshape(-1, 1)
-
-            daily = (PNL[ii, sl] * w).sum(axis=0)
-            cum = np.cumsum(daily)
-            net = float(cum[-1])
-
-            # ================= 核心过滤 1：滚动天数利润胜率 (符合扛单马丁特性) =================
-            if n_days >= 30:
-                roll_pnl_30 = np.convolve(daily, np.ones(30), mode='valid')
-                win_rate_30 = float(np.mean(roll_pnl_30 >= 0) * 100.0)
-            else:
-                win_rate_30 = 0.0
-
-            if n_days >= 7:
-                roll_pnl_7 = np.convolve(daily, np.ones(7), mode='valid')
-                win_rate_7 = float(np.mean(roll_pnl_7 >= 0) * 100.0)
-            else:
-                win_rate_7 = 0.0
-
-            win_rate_1 = float(np.mean(daily >= 0) * 100.0)
-
-            # 根据传入要求对策略进行硬过滤
-            if filter_roll_profit_win_rate_30 is not None and win_rate_30 < filter_roll_profit_win_rate_30:
-                skipped_win_rate += 1
-                continue
-            if filter_roll_profit_win_rate_7 is not None and win_rate_7 < filter_roll_profit_win_rate_7:
-                skipped_win_rate += 1
-                continue
-            if filter_roll_profit_win_rate_1 is not None and win_rate_1 < filter_roll_profit_win_rate_1:
-                skipped_win_rate += 1
+            w = (base_w[ii] / base_w[ii].sum() if weight_mode == "recommend"
+                 else np.full(k, 1.0 / k))
+            daily = (PNL[ii, sl] * w[:, None]).sum(axis=0)
+            prefix = np.r_[0.0, np.cumsum(daily, dtype=float)]
+            net = float(prefix[-1])
+            win_7, worst_7 = rolling_stats(prefix, 7)
+            win_30, worst_30 = rolling_stats(prefix, 30)
+            win_1 = float(np.mean(daily > 0) * 100.0)
+            rates = {1: win_1, 7: win_7, 30: win_30}
+            if any(threshold is not None and
+                   (not np.isfinite(rates[days]) or rates[days] < threshold)
+                   for days, threshold in filters.items()):
+                skipped["盈利窗口率"] += 1
                 continue
 
-            # ================= 核心过滤 2：分段净利润贡献均衡度 =================
-            if net > 1e-9:
-                chunks = np.array_split(daily, 4)
-                q_ratios = [float(c.sum() / net) for c in chunks]
-                q_min_ratio = min(q_ratios) * 100.0
-                q_str = f"Q1:{q_ratios[0] * 100:.1f}%|Q2:{q_ratios[1] * 100:.1f}%|Q3:{q_ratios[2] * 100:.1f}%|Q4:{q_ratios[3] * 100:.1f}%"
+            if net > 0 and n_days >= 4:
+                q_ratios = [float(chunk.sum() / net * 100.0)
+                            for chunk in np.array_split(daily, 4)]
+                q_min = min(q_ratios)
+                q_str = " | ".join(f"Q{i + 1} {value:.1f}%" for i, value in enumerate(q_ratios))
             else:
-                q_min_ratio = -999.0
-                q_str = "无盈利/亏损"
-
-            if filter_q_balance is not None and q_min_ratio < filter_q_balance:
-                skipped_q_balance += 1
+                q_ratios = [float("nan")] * 4
+                q_min = float("nan")
+                q_str = "N/A（总净利≤0或窗口不足4天）"
+            if filter_q_balance is not None and (not np.isfinite(q_min) or q_min < filter_q_balance):
+                skipped["四段贡献"] += 1
                 continue
 
-            # ================= 周期造血韧性统计 (利用爆仓点切分) =================
-            port_blowup = BLOWUP[ii, sl].any(axis=0)  # 组合内任一策略爆仓即算一个切割点
-            blowup_idx = np.where(port_blowup)[0]
+            _, worst_90 = rolling_stats(prefix, 90)
+            boundaries = np.unique(np.concatenate([window_blowups(i, lo, hi) for i in ii]))
+            cycle_count, cycle_win, cycle_mean = cycle_stats(ii, w, boundaries)
+            risk = realized_risk(daily)
+            gp = float((POS[ii, sl] * w[:, None]).sum())
+            gl = float((NEG[ii, sl] * w[:, None]).sum())
+            pf = ratio(gp, abs(gl))
+            member_metrics = [member_risk(i, lo, hi) for i in ii]
+            mean_member_dd = float(np.mean([m["mdd"] for m in member_metrics]))
+            div_dd = ratio(risk["mdd"], mean_member_dd)
+            member_calmars = [m["calmar"] for m in member_metrics if not np.isnan(m["calmar"])]
+            best_calmar = max(member_calmars) if member_calmars else float("nan")
+            best_net = max(m["net"] for m in member_metrics)
 
-            period_pnls = []
-            start_idx = 0
-            for b_idx in blowup_idx:
-                period_pnls.append(daily[start_idx:b_idx + 1].sum())
-                start_idx = b_idx + 1
-            if start_idx < n_days:
-                period_pnls.append(daily[start_idx:].sum())
+            pair_overlaps = []
+            for a, b in itertools.combinations(ii, 2):
+                hold_a, hold_b = HOLD[a, sl], HOLD[b, sl]
+                union = int(np.count_nonzero(hold_a | hold_b))
+                pair_overlaps.append(float(np.count_nonzero(hold_a & hold_b) / union)
+                                     if union else 0.0)
+            mean_overlap = float(np.mean(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
+            max_overlap = float(np.max(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
 
-            if len(period_pnls) > 0:
-                period_win_rate = float(sum(1 for p in period_pnls if p > 0) / len(period_pnls) * 100.0)
-                period_avg_pnl = float(np.mean(period_pnls))
-            else:
-                period_win_rate = 0.0
-                period_avg_pnl = 0.0
-
-            # 常规指标计算
-            pos_d = (POS[ii, sl] * w).sum(axis=0)
-            neg_d = (NEG[ii, sl] * w).sum(axis=0)
-            years = n_days / DAYS_PER_YEAR
-            gp = float(pos_d.sum())
-            gl = float(neg_d.sum())
-            annual = net / years if years > 0 else 0.0
-
-            peak = np.maximum.accumulate(cum)
-            dd = peak - cum
-            max_dd = float(dd.max())
-            equity = 1.0 + cum
-            eq_peak = np.maximum.accumulate(np.maximum(equity, 1.0))
-            rel_dd = float(np.max((eq_peak - equity) / np.maximum(eq_peak, 1e-9)) * 100.0)
-            underwater = _max_true_run(dd > 1e-12)
-            calmar = (annual / max_dd) if max_dd > 1e-9 else 99.0
-
-            longest_np = _max_true_run(daily <= 0)
-            worst_day = float(daily.min())
-
+            # 继续保留原 CSV 的辅助指标，不在控制台占用展示空间。
             mk = month_key[sl]
-            msum = np.bincount(mk - mk[0], weights=daily)
-            msum = msum[msum != 0] if len(msum) else msum
-            worst_month = float(msum.min()) if len(msum) else 0.0
-            win_month_ratio = float(np.mean(msum > 0) * 100.0) if len(msum) else 0.0
-
-            half = n_days // 2
-            first_half = float(cum[half - 1]) if half >= 1 else 0.0
-            second_ratio = ((net - first_half) / net * 100.0) if abs(net) > 1e-9 else 0.0
-
+            monthly = np.bincount(mk - mk[0], weights=daily)
+            monthly_nonzero = monthly[monthly != 0]
             conc = HOLD[ii, sl].sum(axis=0)
-            mean_conc = float(conc.mean())
-            max_conc = int(conc.max())
-            util = mean_conc / k * 100.0
+            float_sum = (FLOAT[ii, sl] * w[:, None]).sum(axis=0)
+            cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2)
+                     if np.isfinite(CORR[a, b])]
+            symbol_weights = {}
+            for i, weight in zip(ii, w):
+                sym = records[i]["symbol"]
+                symbol_weights[sym] = symbol_weights.get(sym, 0.0) + weight
+            n_long = sum(records[i]["direction"] == "Long" for i in ii)
+            half_net = float(prefix[n_days // 2])
 
-            fsum = (FLOAT[ii, sl] * w).sum(axis=0)
-            peak_float = float(fsum.max())
-            mean_float = float(fsum.mean())
-            deep_days = int(np.sum(fsum > 0.5))
-
-            cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2)]
-            cvals = [c for c in cvals if np.isfinite(c)]
-            mean_corr = float(np.mean(cvals)) if cvals else 0.0
-            max_corr = float(np.max(cvals)) if cvals else 0.0
-
-            m_net, m_dd, m_cal = [], [], []
-            for i in ii:
-                c_i = np.cumsum(PNL[i, sl])
-                d_i = float((np.maximum.accumulate(c_i) - c_i).max())
-                a_i = float(c_i[-1]) / years if years > 0 else 0.0
-                m_net.append(float(c_i[-1]))
-                m_dd.append(d_i)
-                m_cal.append(a_i / d_i if d_i > 1e-9 else 99.0)
-            best_single_calmar = float(max(m_cal))
-            best_single_net = float(max(m_net))
-            mean_member_dd = float(np.mean(m_dd))
-            div_dd = (max_dd / mean_member_dd) if mean_member_dd > 1e-9 else 1.0
-
-            syms = {records[i]["symbol"] for i in ii}
-            n_long = sum(1 for i in ii if records[i]["direction"] == "Long")
-            sym_cnt = {}
-            for i in ii:
-                sym_cnt[records[i]["symbol"]] = sym_cnt.get(records[i]["symbol"], 0) + 1
-            max_sym_w = max(sym_cnt.values()) / k * 100.0
-            trades = float(CNT[ii, sl].sum())
-
-            # 组装展示字段（移除了不适配马丁体系的夏普与Sortino）
-            results.append({
+            row = {
                 "组合数量(K)": k,
                 "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
-                "组合持仓重合度": round(pair_overlap_ratio, 3),
-                "组合净利(M)": round(net, 2),
-                "组合总收益(M)": round(gp, 2),
-                "年化净利(M/年)": round(annual, 3),
-                "组合总亏损(M)": round(gl, 2),
-                "1+1>2": "🔥 是" if calmar > best_single_calmar else "否",
                 "重叠起": str(all_days[lo].date()), "重叠止": str(all_days[hi].date()),
                 "重叠天数": n_days,
-                "盈亏比": round(abs(gp / gl), 2) if abs(gl) > 1e-9 else 99.0,
-                "组合回撤(M)": round(max_dd, 2),
-                "相对回撤(%)": round(rel_dd, 2),
-                "水下最长(天)": underwater,
-                "组合Calmar": round(calmar, 2),
-                "单策略最优Calmar": round(best_single_calmar, 2),
-                "单策略最优净利(M)": round(best_single_net, 2),
-                "成员均回撤(M)": round(mean_member_dd, 2),
-                "分散化系数": round(div_dd, 3),
-
-                # 新增指标
-                "30日滚动胜率(%)": round(win_rate_30, 2),
-                "7日滚动胜率(%)": round(win_rate_7, 2),
-                "1日滚动胜率(%)": round(win_rate_1, 2),
-                "爆仓周期胜率(%)": round(period_win_rate, 2),
-                "周期平均净利润(M)": round(period_avg_pnl, 3),
-
-                "最长无盈利(天)": longest_np,
-                "最差单日(M)": round(worst_day, 3),
-                "最差单月(M)": round(worst_month, 2),
-                "盈利月占比(%)": round(win_month_ratio, 2),
-                "四段净利分布": q_str,
-                "最差单段贡献(%)": round(q_min_ratio, 1),
-                "后半段净利占比(%)": round(second_ratio, 1),
-                "峰值合计浮亏(M)": round(peak_float, 3),
-                "平均合计浮亏(M)": round(mean_float, 3),
-                "深水>0.5天数": deep_days,
-                "平均同时持仓数": round(mean_conc, 2),
-                "最大同时持仓数": max_conc,
-                "资金利用率(%)": round(util, 1),
-                "平均日相关": round(mean_corr, 3),
-                "最大日相关": round(max_corr, 3),
-                "独立币种数": len(syms),
-                "多空(L/S)": f"{n_long}/{k - n_long}",
-                "最大单币权重(%)": round(max_sym_w, 1),
-                "总开仓数": int(trades),
+                "组合净利(M)": net, "年化净利(M/年)": risk["annual"],
+                "组合总收益(M)": gp, "组合总亏损(M)": gl, "Profit Factor": pf,
+                "已实现MDD(M)": risk["mdd"], "相对已实现MDD(%)": risk["relative_dd"],
+                "最长水下期(天)": risk["underwater"], "已实现Calmar": risk["calmar"],
+                "最差7日收益(M)": worst_7, "最差30日收益(M)": worst_30,
+                "最差90日收益(M)": worst_90,
+                "完整周期数": cycle_count, "周期盈利率(%)": cycle_win,
+                "周期平均净利润(M)": cycle_mean,
+                "7日盈利窗口率(%)": win_7, "30日盈利窗口率(%)": win_30,
+                "1日盈利窗口率(%)": win_1,
+                "四段净利分布": q_str, "最低阶段贡献(%)": q_min,
+                "平均两两持仓重合(%)": mean_overlap, "最高两两持仓重合(%)": max_overlap,
+                "分散化系数": div_dd, "成员均回撤(M)": mean_member_dd,
+                "单策略最优Calmar": best_calmar, "单策略最优净利(M)": best_net,
+                "1+1>2": "是" if risk["calmar"] > best_calmar else "否",
+                "最长无盈利(天)": _max_true_run(daily <= 0),
+                "最差单日(M)": float(daily.min()),
+                "最差单月(M)": float(monthly_nonzero.min()) if len(monthly_nonzero) else 0.0,
+                "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0)
+                                  if len(monthly_nonzero) else 0.0,
+                "后半段净利占比(%)": (net - half_net) / net * 100.0 if net != 0 else np.nan,
+                "峰值合计浮亏(M)": float(float_sum.max()),
+                "平均合计浮亏(M)": float(float_sum.mean()),
+                "深水>0.5天数": int(np.sum(float_sum > 0.5)),
+                "平均同时持仓数": float(conc.mean()), "最大同时持仓数": int(conc.max()),
+                "资金利用率(%)": float(conc.mean() / k * 100.0),
+                "平均日相关": float(np.mean(cvals)) if cvals else 0.0,
+                "最大日相关": float(np.max(cvals)) if cvals else 0.0,
+                "独立币种数": len(symbol_weights), "多空(L/S)": f"{n_long}/{k - n_long}",
+                "最大单币权重(%)": float(max(symbol_weights.values()) * 100.0),
+                "总开仓数": int(CNT[ii, sl].sum()),
                 "_lo": lo, "_hi": hi, "_idx": ",".join(map(str, ii)),
+            }
+            row.update({f"Q{j + 1}利润贡献(%)": value for j, value in enumerate(q_ratios)})
+            # 旧列名仅作兼容别名，数值全部使用新口径；控制台使用新名称。
+            row.update({
+                "组合持仓重合度": mean_overlap / 100.0,
+                "盈亏比": pf, "组合回撤(M)": risk["mdd"],
+                "相对回撤(%)": risk["relative_dd"], "水下最长(天)": risk["underwater"],
+                "组合Calmar": risk["calmar"], "30日滚动胜率(%)": win_30,
+                "7日滚动胜率(%)": win_7, "1日滚动胜率(%)": win_1,
+                "爆仓周期胜率(%)": cycle_win, "最差单段贡献(%)": q_min,
             })
+            results.append(row)
 
-            if processed % 20000 == 0:
-                print(f"   ...已扫描 {processed:,}/{total_combos:,} 个组合")
-
+    print("\n过滤统计：" + " | ".join(f"{name} {count:,}" for name, count in skipped.items()))
     if not results:
-        print(f"\n[提示] 没有任何组合通过严苛过滤！")
-        print(f"   - 同源剔除: {skipped_same_signal:,}")
-        print(f"   - 重叠不足: {skipped_overlap:,}")
-        print(f"   - 因【滚动区间净利胜率不足】剔除: {skipped_win_rate:,}")
-        print(f"   - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,}")
-        print("💡 建议放宽 filter_roll_profit_win_rate 系列要求。")
+        print("[提示] 没有组合通过当前过滤条件。")
         return
 
     df_all = pd.DataFrame(results)
+    # 用未舍入的值排序；完全同分时保留穷举顺序，不引入隐藏的收益/Calmar排序。
+    df_all["_scan_order"] = np.arange(len(df_all))
+    df_all.sort_values(
+        by=["周期盈利率(%)", "30日盈利窗口率(%)", "_scan_order"],
+        ascending=[False, False, True], na_position="last", inplace=True,
+    )
+    df_all.drop(columns="_scan_order", inplace=True)
+    df_all.reset_index(drop=True, inplace=True)
+    output_parent = os.path.dirname(os.path.abspath(output_csv))
+    os.makedirs(output_parent, exist_ok=True)
+    df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(
+        output_csv, index=False, encoding="utf-8-sig", na_rep="N/A")
+    print(f"组合评估完成：{len(df_all):,} 个有效组合 | 全量排名：{output_csv}\n")
 
-    # 排序逻辑优化：优先看卡玛比率和分散对冲效果，不再盲目崇拜净利绝对值
-    df_all.sort_values(by=["组合Calmar", "分散化系数", "组合净利(M)"],
-                       ascending=[False, True, False], inplace=True)
-
-    df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(output_csv, index=False, encoding="utf-8-sig")
-    print(f"\n🎉 组合评估完成: 【幸存有效组合】 {len(df_all):,} 个")
-    print(f"   🔪 过滤击杀统计:")
-    print(f"      - 同源剔除: {skipped_same_signal:,} 个")
-    print(f"      - 因【滚动区间净利胜率不足】剔除: {skipped_win_rate:,} 个")
-    print(f"      - 因【四段利润失衡 < {filter_q_balance}%】剔除: {skipped_q_balance:,} 个")
-    print(f"📄 全量排名已保存: {output_csv}\n")
-
-    # ================= 分 K 打印 =================
     for k in range(min_k, max_k + 1):
         df_k = df_all[df_all["组合数量(K)"] == k].head(top_n_per_k)
         if df_k.empty:
             continue
-        print("=" * 128)
-        print(f" 🏆 【{k} 策略顶级组合】TOP {len(df_k)}   (按风险调整后收益与对冲质量严选)")
-        print("=" * 128)
+        print("=" * 112)
+        print(f"🏆 【{k} 策略顶级组合】TOP {len(df_k)}")
+        print("   主排序：周期盈利率 ↓ → 30日盈利窗口率 ↓（N/A 排最后）")
+        print("=" * 112)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
-            print(
-                f"🥇 No.{rank} | 🎯分散化系数 {r['分散化系数']} | 持仓重合度 {r['组合持仓重合度']} | 窗口 {r['重叠起']} ~ {r['重叠止']}")
-            print(f"   🧩 {r['组合策略清单']}")
-            print(
-                f"   💰 收益 -> 净利 {r['组合净利(M)']}M | 年化 {r['年化净利(M/年)']}M/年 | 总收益 {r['组合总收益(M)']}M | 盈亏比 {r['盈亏比']}")
-            print(
-                f"   📉 风险 -> 回撤 {r['组合回撤(M)']}M ({r['相对回撤(%)']}%) | 水下最长 {r['水下最长(天)']}天 | 组合Calmar {r['组合Calmar']}")
-            print(
-                f"   🚀 连贯 -> 30日胜率: {r['30日滚动胜率(%)']}% | 7日胜率: {r['7日滚动胜率(%)']}% | 1日胜率: {r['1日滚动胜率(%)']}%")
-            print(
-                f"   🛡️ 周期 -> 爆仓周期胜率: {r['爆仓周期胜率(%)']}% | 周期平均造血: {r['周期平均净利润(M)']}M")
-            print(f"   📊 四段 -> {r['四段净利分布']}")
-            print(
-                f"   🔗 结构 -> 资金利用率 {r['资金利用率(%)']}% | 并发深水均值 {r['平均合计浮亏(M)']}M / 峰值 {r['峰值合计浮亏(M)']}M")
+            print(f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 "
+                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
+            print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
+            print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
+                  f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
+                  f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
+            print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
+                  f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
+                  f"| Profit Factor {fmt(r['Profit Factor'])}")
+            print(f"   已实现风险 | 最大回撤 {fmt(r['已实现MDD(M)'])} M "
+                  f"| 相对最大回撤 {fmt(r['相对已实现MDD(%)'], suffix='%')} "
+                  f"| 最长水下期 {int(r['最长水下期(天)'])} 天 "
+                  f"| 已实现 Calmar {fmt(r['已实现Calmar'])}")
+            print(f"   滚动尾部 | 最差7日收益 {fmt(r['最差7日收益(M)'])} M "
+                  f"| 最差30日收益 {fmt(r['最差30日收益(M)'])} M "
+                  f"| 最差90日收益 {fmt(r['最差90日收益(M)'])} M")
+            print(f"   时间稳定性 | 7日盈利窗口率 {fmt(r['7日盈利窗口率(%)'], suffix='%')} "
+                  f"| 30日盈利窗口率 {fmt(r['30日盈利窗口率(%)'], suffix='%')}")
+            print(f"   四段利润贡献 | {r['四段净利分布']} "
+                  f"| 最低阶段贡献 {fmt(r['最低阶段贡献(%)'], 1, suffix='%')}")
 
-            # 打印每个成员的表现
             lo, hi = int(r["_lo"]), int(r["_hi"])
-            ii = [int(x) for x in str(r["_idx"]).split(",")]
+            ii = [int(value) for value in str(r["_idx"]).split(",")]
             rows = []
-            yrs = (hi - lo + 1) / DAYS_PER_YEAR
             for i in ii:
-                c_i = np.cumsum(PNL[i, lo:hi + 1])
-                d_i = float((np.maximum.accumulate(c_i) - c_i).max())
+                m = member_risk(i, lo, hi)
+                _, member_win, _ = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
                 rows.append({
                     "成员": records[i]["label"],
-                    "窗口净利(M)": round(float(c_i[-1]), 2),
-                    "窗口回撤(M)": round(d_i, 2),
-                    "窗口Calmar": round((float(c_i[-1]) / yrs / d_i) if d_i > 1e-9 else 99.0, 2),
-                    "开仓": int(CNT[i, lo:hi + 1].sum()),
-                    "持仓占比(%)": round(float(HOLD[i, lo:hi + 1].mean() * 100), 1),
+                    "窗口净利(M)": fmt(m["net"]),
+                    "已实现MDD(M)": fmt(m["mdd"]),
+                    "已实现Calmar": fmt(m["calmar"]),
+                    "周期盈利率(%)": fmt(member_win),
                 })
             print_table(pd.DataFrame(rows))
-            print("-" * 128)
-        print("\n")
-
+        print()
     return df_all
 
 if __name__ == "__main__":

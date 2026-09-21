@@ -228,8 +228,7 @@ def process_and_save_single_post(post, post_manager):
     started = time.monotonic()
     post_id = post.get("post_id", "UNKNOWN_ID") if isinstance(post, dict) else "UNKNOWN_ID"
     try:
-        if not is_need_formatting(post):
-            return
+        # 注意：过滤逻辑已前置到 format_image_article 集中处理，此处直接进入提取环节
         format_info = gen_media_format_info(post)
         if not format_info:
             return
@@ -258,19 +257,32 @@ def format_image_article():
             if not posts:
                 time.sleep(60)
                 continue
-            with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
-                futures = [
-                    executor.submit(process_and_save_single_post, post, post_manager)
-                    for post in posts
-                ]
-                for future in as_completed(futures):
-                    future.result()
+
+            # 集中处理前置筛选，以便运维掌握运行全貌
+            valid_posts = [post for post in posts if is_need_formatting(post)]
+
+            logger.info(
+                "[帖子/本轮计划] 已完成格式化前置筛选 | 扫描总帖数: [%s] | 需提取论据: [%s] | 已跳过: [%s] "
+                "| 实际分配线程数: [%s] | 规则: [无 logic_mul、非视频且不超过允许数量的本地图片、%s 小时内]",
+                len(posts), len(valid_posts), len(posts) - len(valid_posts),
+                min(MAX_CONCURRENCY, len(valid_posts)) if valid_posts else 0, POST_MAX_AGE_HOURS
+            )
+
+            if valid_posts:
+                with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+                    futures = [
+                        executor.submit(process_and_save_single_post, post, post_manager)
+                        for post in valid_posts
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
+
             # : 原查询未分页；满额仅缩短等待，不能保证后续记录会被扫描。
             delay = 5 if len(posts) >= POST_QUERY_LIMIT else 3600
             logger.info(
-                "[帖子/本轮完成] 工作线程已结束 | 扫描: [%s] | 耗时: [%.2f 秒] "
+                "[帖子/本轮完成] 工作线程已结束 | 扫描: [%s] | 实际处理: [%s] | 耗时: [%.2f 秒] "
                 "| 下次扫描: [%s 秒后] | 单帖失败: [见对应帖子日志]",
-                len(posts), time.monotonic() - started, delay,
+                len(posts), len(valid_posts), time.monotonic() - started, delay,
             )
             time.sleep(delay)
         except Exception:
@@ -279,7 +291,6 @@ def format_image_article():
                 "| 排查: [数据库访问或工作线程出现异常]"
             )
             time.sleep(60)
-
 
 def clear_all_media_format_batch():
     """手动清理查询范围内的 logic_mul；无入参，非 None 字段置空后批量回写。"""
@@ -490,11 +501,89 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
     return True, ""
 
 
+def get_post_usage_counts(article_manager, source, post_ids):
+    """统计同平台的成功文章引用次数，不限币种/立场；每篇文章内同帖最多计一次。"""
+    unique_ids = list(dict.fromkeys(post_ids))
+    counts = dict.fromkeys(unique_ids, 0)
+    if not unique_ids:
+        return counts
+    articles = article_manager.find_articles(
+        query={'source': source, 'status': 'ok', 'post_id_list': {'$in': unique_ids}},
+        limit=0
+    )
+    for article in articles:
+        for post_id in set(article.get('post_id_list', [])):
+            if post_id in counts:
+                counts[post_id] += 1
+    return counts
+
+
+def get_recent_openings(article_manager, source, topic, stance, limit=5):
+    """取同币种、同立场近期成功文章的开头，供提示词避开重复表达。"""
+    if limit <= 0:
+        return []
+    articles = article_manager.find_articles(
+        query={'source': source, 'topic': topic, 'stance': stance, 'status': 'ok'},
+        sort=[('created_at', -1)],
+        limit=limit
+    )
+    openings = []
+    for article in articles:
+        text = (article.get('article_info') or {}).get('text', '')
+        if isinstance(text, str) and text.strip():
+            opening = text.strip().splitlines()[0][:80]
+            if opening not in openings:
+                openings.append(opening)
+    return openings
+
+
+def prepare_article_record_for_db(article_data):
+    """文章入库前的数据校验与字段推导（从实际采用素材推导 post_id_list）。"""
+    record = dict(article_data)
+    for key in ('source', 'topic', 'stance'):
+        if not isinstance(record.get(key), str) or not record[key].strip():
+            raise ValueError(f"文章缺失有效字段: {key}")
+
+    status = record.get('status')
+    if status not in ('processing', 'ok', 'skip', 'error'):
+        raise ValueError(f"不支持的文章状态: {status}")
+
+    post_id_list = []
+    if status == 'ok':
+        article_info = record.get('article_info')
+        material_post_mapping = record.get('material_post_mapping')
+        if not isinstance(article_info, dict) or article_info.get('status') != 'ok':
+            raise ValueError("成功记录必须包含 status=ok 的 article_info")
+        if not isinstance(material_post_mapping, dict):
+            raise ValueError("成功记录必须包含 material_post_mapping")
+        used_material_ids = article_info.get('used_material_ids')
+        if not isinstance(used_material_ids, list) or not used_material_ids:
+            raise ValueError("成功文章的 used_material_ids 不能为空")
+        for material_id in used_material_ids:
+            if not isinstance(material_id, str) or material_id not in material_post_mapping:
+                raise ValueError(f"实际采用素材无法反查原帖: {material_id!r}")
+            post_id = material_post_mapping[material_id]
+            if (not isinstance(post_id, (str, int)) or isinstance(post_id, bool)
+                    or post_id in (None, '', 'UNKNOWN')):
+                raise ValueError(f"素材对应的原帖 ID 无效: {material_id}")
+            if post_id not in post_id_list:
+                post_id_list.append(post_id)
+
+    record['post_id_list'] = post_id_list
+    record.setdefault('article_info', None)
+    record.setdefault('error_message', None)
+    record.setdefault('error_history', [])
+    record.setdefault('raw_response', None)
+    record.setdefault('attempt_count', 0)
+    return record
+
+
+# =========================================================================
+# 待修改的原有逻辑函数 (更新为调用上面的封装以及 Manager 提供的新接口)
+# =========================================================================
+
 def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
-    """为一个币种/立场生成文章；ev_list 为已按权重排序的增强论据。
-    返回记录含 status、article_info、creation_brief、material_post_mapping、
-    error_history 等；仅 ok 调用 save_article，写库异常必须向上传播。
-    """
+    """为一个币种/立场生成文章；ev_list 为已按权重排序的增强论据。"""
     started = time.monotonic()
     brief = {
         "task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS, "recent_openings": []},
@@ -513,18 +602,21 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         candidates = [
             evidence for evidence in ev_list
             if isinstance(evidence, dict)
-            and isinstance(evidence.get("source_post_id"), (str, int))
-            and not isinstance(evidence.get("source_post_id"), bool)
-            and evidence.get("source_post_id") not in (None, "", "UNKNOWN")
-            and isinstance(evidence.get("core_fact"), str) and evidence["core_fact"].strip()
+               and isinstance(evidence.get("source_post_id"), (str, int))
+               and not isinstance(evidence.get("source_post_id"), bool)
+               and evidence.get("source_post_id") not in (None, "", "UNKNOWN")
+               and isinstance(evidence.get("core_fact"), str) and evidence["core_fact"].strip()
         ]
         post_ids = list(dict.fromkeys(item["source_post_id"] for item in candidates))
-        usage_counts = article_manager.get_post_usage_counts(BINANCE_SOURCE, post_ids)
-        # : 保留“超过 5 次才剔除”：已有 5 次仍可入选，成功后可能达到 6 次。
+
+        # [修改点 1]：调用应用层自行封装的查重逻辑
+        usage_counts = get_post_usage_counts(article_manager, BINANCE_SOURCE, post_ids)
+
         selected = [
-            item for item in candidates
-            if usage_counts.get(item["source_post_id"], 0) <= ARTICLE_POST_USAGE_LIMIT
-        ][:ARTICLE_MATERIAL_LIMIT]
+                       item for item in candidates
+                       if usage_counts.get(item["source_post_id"], 0) <= ARTICLE_POST_USAGE_LIMIT
+                   ][:ARTICLE_MATERIAL_LIMIT]
+
         if not selected:
             record["status"] = "skip"
             record["article_info"] = {
@@ -533,11 +625,13 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
                 "image_mapping": {},
             }
             return record
+
         materials, image_mapping = transform_mlus(selected)
         brief["materials"] = materials
-        brief["task"]["recent_openings"] = article_manager.get_recent_openings(
-            BINANCE_SOURCE, coin, stance
-        )
+
+        # [修改点 2]：调用应用层自行封装的开头记录拉取逻辑
+        brief["task"]["recent_openings"] = get_recent_openings(article_manager, BINANCE_SOURCE, coin, stance)
+
         record["material_post_mapping"] = {
             material["id"]: evidence["source_post_id"]
             for material, evidence in zip(materials, selected)
@@ -582,7 +676,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
                 )
                 time.sleep(2 ** attempt)
     except Exception as exc:
-        # 原设计将生成错误作为记录返回，不入库，允许继续处理下一个分组。
         record["status"], record["article_info"] = "error", None
         record["error_message"] = f"{type(exc).__name__}: {exc}"
         logger.exception(
@@ -592,14 +685,16 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         )
     if record["status"] != "ok":
         return record
-    # 保存放在模型重试和错误降级之外；失败会中断本轮，避免使用可能过时的引用次数。
-    saved_record = article_manager.save_article(record)
+
+    # [修改点 3]：清洗数据结构后再交由 manager 入库
+    saved_record = prepare_article_record_for_db(record)
+    article_manager.upsert_articles([saved_record])
+
     logger.info(
         "[文章/生成] 已完成校验并保存 | 币种: [%s] | 立场: [%s] | 尝试: [%s] | 耗时: [%.2f 秒]",
         coin, stance, record["attempt_count"], time.monotonic() - started,
     )
     return saved_record
-
 
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
@@ -646,9 +741,7 @@ def generate_analysis_articles():
 
 
 def _publish_articles_once(article_manager):
-    """执行一轮账号调度；读取文章 article_info.text/score/image_placeholders、
-    topic/_id 及状态字典 {账号: {累计次数、时间、错误、topic_publish_history}}，发布后回写。
-    """
+    """执行一轮账号调度；发布后回写。"""
     now = time.time()
     state = (read_json(STATE_FILE) or {}) if os.path.exists(STATE_FILE) else {}
     for account in ACCOUNTS:
@@ -656,23 +749,27 @@ def _publish_articles_once(article_manager):
             "total_success": 0, "last_publish_time": 0, "last_error_msg": "",
             "last_error_time": 0, "topic_publish_history": {},
         })
-    # : 保留原查询不限制 source 的范围，也不新增最低评分门槛。
+
     query = {
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
         "status": "ok",
         "publish_status": {"$ne": "success"},
     }
-    candidates = article_manager.db.find_many(article_manager.collection_name, query=query) or []
+
+    # [修改点 4]：调用 Manager 的通用查找接口 find_articles
+    candidates = article_manager.find_articles(query=query) or []
+
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-        and len(article.get("article_info", {}).get("image_placeholders", [])) == 0
+           and len(article.get("article_info", {}).get("image_placeholders", [])) == 0
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
     logger.info(
         "[发布/本轮计划] 已按评分排列近 6 小时无图文章 | 候选: [%s] | 可调度账号: [%s]",
         len(articles), len(ACCOUNTS),
     )
+
     for account in ACCOUNTS:
         account_state = state[account]
         remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("last_publish_time", 0))
@@ -684,19 +781,20 @@ def _publish_articles_once(article_manager):
         selected_index = next((
             index for index, article in enumerate(articles)
             if now - account_state["topic_publish_history"].get(article.get("topic", ""), 0)
-            >= TOPIC_COOLDOWN_SECONDS
+               >= TOPIC_COOLDOWN_SECONDS
         ), None)
         if selected_index is None:
             logger.debug("[发布/账号] 候选主题均在 12 小时冷却期内 | 账号: [%s]", account)
             continue
+
         article = articles[selected_index]
         info, topic = article.get("article_info", {}), article.get("topic", "")
         text = info.get("text", "")
         if topic:
-            # : 保留原单词边界和无条件追加标签规则；与中文紧邻的币种可能不被替换。
             pattern = rf"(?<!\$)\b{re.escape(topic)}\b"
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
             text = f"{text}\n\n#{topic}"
+
         api_key = get_config(f"{account}_square_api_key")
         if not api_key:
             logger.error(
@@ -705,6 +803,7 @@ def _publish_articles_once(article_manager):
                 account,
             )
             continue
+
         started = time.monotonic()
         stage, api_result = "调用发布接口", "未知"
         try:
@@ -720,14 +819,15 @@ def _publish_articles_once(article_manager):
                 error = "发帖失败（可能是网络不通、Key失效或达到每日上限）"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
                 changes = {"publish_status": "failed", "last_error": error}
-            # : 发布、状态文件和 MongoDB 不构成事务；远端成功后回写失败可能导致重复发布。
-            # 保留原回写顺序及整轮时间戳；API 返回失败时，其他账号仍可在本轮尝试同一文章。
+
             stage = "写入账号状态文件"
             save_json(STATE_FILE, state)
             stage = "回写数据库发布状态"
-            article_manager.db.update_one(
-                article_manager.collection_name, {"_id": article["_id"]}, {"$set": changes}
-            )
+
+            # [修改点 5]：回写状态更新为调用纯净的 upsert 接口
+            article.update(changes)
+            article_manager.upsert_articles([article])
+
         except Exception as exc:
             raise RuntimeError(
                 f"发布阶段[{stage}]失败 | 账号: [{account}] | 文章: [{article.get('_id')}] "
@@ -743,7 +843,6 @@ def _publish_articles_once(article_manager):
             "发布成功" if success else "发布失败",
             "已调用本地和数据库状态回写" if success else error,
         )
-
 
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
