@@ -996,27 +996,52 @@ def evaluate_multi_strategy_portfolios(
         allow_same_signal=False,
         min_overlap_days=180,
         weight_mode="equal",
-        max_combos=400000,
+        max_combos=None,
         filter_q_balance=10.0,
         filter_roll_profit_win_rate_30=None,
         filter_roll_profit_win_rate_7=None,
         filter_roll_profit_win_rate_1=None,
+        search_mode="exact",
+        beam_width=1000,
 ):
-    """按完整爆仓周期盈利率降序，再按 30 日盈利窗口率降序评估组合。
+    """组合回测：结构剪枝的精确搜索 / 按上一层指标选种的近似搜索。
 
-    口径：
-      * 日收益按平仓日入账，包含无交易的自然日；M 是保证金归一化单位。
-      * 共同窗口沿用各成员“首笔开仓日～末笔平仓日”的交集，含首尾日。
-      * MDD/Calmar 为日末已实现口径；初始累计收益 0、初始权益 1M。
-      * 两两持仓重合 = 同时持仓日 / 至少一方持仓日，在共同窗口计算；
-        忽略多空方向，开平仓当日均计持仓日，双方均空仓时约定为 0。
-      * 完整周期是 (上次爆仓时刻, 下次爆仓时刻]，含末端爆仓损失；
-        组合边界取所有成员爆仓时刻的并集，不代表组合账户本身爆仓。
-        同日不同时刻分别统计，同一时刻同时发生的爆仓合并为一个边界。
-        边界必须都在共同窗口内；无完整周期返回 NaN，排序放最后。
-      * Profit Factor 使用加权逐笔正/负收益，不能先做日内净额抵消。
-      * 数值不提前 round；仅显示时格式化，保证排序使用完整精度。
+    用法：只替换原文件中的本函数，保留原有 import、常量及其他函数。
+
+    搜索参数：
+      search_mode="exact"：默认；仅剪掉能证明不可能通过的分支，不漏解。
+        同源冲突、共同窗口不足、剩余可兼容成员不足均可向下剪枝。
+        盈利窗口率、四段贡献、周期盈利率、Calmar 不用于淘汰后代。
+      search_mode="beam"：近似；从 K=1 开始，每层保留至多 beam_width
+        个可扩展组合，向下一层加任意兼容成员，再对组合去重。
+        优先保留通过过滤的组合，再按周期盈利率、30日盈利窗口率排序；
+        同分按原成员索引排序。过滤失败的组合仍参与选种，空余名额可保留。
+        当前层全部已评估且通过过滤的组合都进入结果；宽度只限制下一层。
+        不能保证全局最优，CSV 会注明搜索模式及是否穷尽。
+      beam_width：每层可扩展种子的数量上限；仅 beam 模式使用。
+      max_combos=None：默认不设评估预算，不再按理论组合总数提前中止。
+        正整数限制实际进行核心指标评估的候选数，包含 beam 的低阶种子。
+        超限抛出 RuntimeError，本次结果不会写入 CSV，避免误当完整榜单。
+      top_n_per_k：仍然只控制控制台展示数量，不限制搜索或 CSV 行数。
+
+    指标口径与原函数保持一致：
+      * 收益按平仓日计入，包含无交易日；共同窗口含首尾日。
+      * MDD/Calmar 是日末已实现口径，初始收益 0、初始权益 1M。
+      * 完整周期是成员爆仓边界并集上的 (上次爆仓时刻, 下次爆仓时刻]。
+        同日不同时刻分别统计；同一时刻合并；无完整周期返回 NaN。
+      * Profit Factor 使用加权逐笔正负收益；日内不先抵消。
+      * 两两持仓重合忽略方向，在组合共同窗口内按自然日计算。
+      * 四段是共同窗口按时间等分，不是自然季度。
+      * 同源定义仍为 signal_key[:5]，保持原行为（不含 margin/multiplier）。
+      * 每个候选重新按原顺序计算权重和加权收益，不拼接上一层的标量指标，
+        也不改变浮点运算顺序，以免净利 > 0 等边界判定发生变化。
+
+    说明：exact 最坏仍需指数级搜索；默认保留所有通过过滤的结果，
+    因而取消预算并不消除时间和内存成本。beam 明确以覆盖率换取速度。
     """
+    from functools import lru_cache
+    import heapq
+    count_bits = getattr(int, "bit_count", lambda value: bin(value).count("1"))
 
     def fmt(value, digits=2, suffix=""):
         if pd.isna(value):
@@ -1073,12 +1098,19 @@ def evaluate_multi_strategy_portfolios(
 
     if weight_mode not in ("equal", "recommend"):
         raise ValueError("weight_mode 只能为 'equal' 或 'recommend'")
+    if search_mode not in ("exact", "beam"):
+        raise ValueError("search_mode 只能为 'exact' 或 'beam'")
     for name, value, minimum in (
             ("min_k", min_k, 1), ("max_k", max_k, 1),
             ("top_n_per_k", top_n_per_k, 0),
-            ("min_overlap_days", min_overlap_days, 1), ("max_combos", max_combos, 1)):
-        if not isinstance(value, (int, np.integer)) or value < minimum:
+            ("min_overlap_days", min_overlap_days, 1),
+            ("beam_width", beam_width, 1)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
             raise ValueError(f"{name} 必须为不小于 {minimum} 的整数")
+    if max_combos is not None and (
+            isinstance(max_combos, (bool, np.bool_)) or
+            not isinstance(max_combos, (int, np.integer)) or max_combos < 1):
+        raise ValueError("max_combos 必须为正整数或 None")
     if min_k > max_k:
         raise ValueError("min_k 不能大于 max_k")
     filters = {
@@ -1099,14 +1131,16 @@ def evaluate_multi_strategy_portfolios(
         return
     max_k = min(max_k, N)
     total_combos = sum(math.comb(N, k) for k in range(min_k, max_k + 1))
-    if total_combos > max_combos:
-        print(f"[提示] 组合数 {total_combos:,} 超过 max_combos={max_combos:,}，已中止。")
-        return
-
     base_w = np.array([r["weight"] for r in records], dtype=float)
     if weight_mode == "recommend" and (not np.isfinite(base_w).all() or np.any(base_w <= 0)):
         raise ValueError("recommend 模式要求所有推荐权重均为有限正数")
 
+    # 缺少足够天数时，启用的窗口率/四段贡献必为 NaN；后代窗口只会更短。
+    required_days = max(
+        [min_overlap_days] +
+        [days for days, threshold in filters.items() if threshold is not None] +
+        ([4] if filter_q_balance is not None else [])
+    )
     print("=" * 112)
     print("马丁组合评估 | 排序：完整爆仓周期盈利率 ↓ → 30日盈利窗口率 ↓")
     print(f"成员 {N} | K={min_k}～{max_k} | 最少共同窗口 {min_overlap_days} 天 | 权重 {weight_mode}")
@@ -1120,6 +1154,10 @@ def evaluate_multi_strategy_portfolios(
         f"{days}日：{'关闭' if threshold is None else f'≥{threshold:g}%'}"
         for days, threshold in filters.items())
     print(f"过滤：四段 {q_filter} | 盈利窗口率 {roll_filters}")
+    budget_text = "不限" if max_combos is None else f"{max_combos:,}"
+    print(f"搜索模式 {search_mode} | 理论组合 {total_combos:,} | 实际评估预算 {budget_text}")
+    if search_mode == "beam":
+        print(f"近似搜索：每层保留至多 {beam_width:,} 个可扩展种子，可能遗漏优质组合。")
     print("=" * 112)
 
     g_start = min(pd.Timestamp(r["open_dt"].min()) for r in records).normalize()
@@ -1166,168 +1204,317 @@ def evaluate_multi_strategy_portfolios(
         flags = np.asarray(r["is_blowup"], dtype=bool)[order]
         event_data.append((times, prefix, np.unique(times[flags])))
 
-    # 保留原 CSV 的方向签名重合代理；这不是收益相关系数。
-    CORR = np.full((N, N), np.nan)
-    for i, j in itertools.combinations(range(N), 2):
-        lo, hi = max(first_i[i], first_i[j]), min(last_i[i], last_i[j])
-        if hi - lo + 1 >= 30:
-            a, b = HOLD[i, lo:hi + 1], HOLD[j, lo:hi + 1]
-            union = int(np.count_nonzero(a | b))
-            overlap = float(np.count_nonzero(a & b) / union) if union else 0.0
-            sign = 1.0 if records[i]["direction"] == records[j]["direction"] else -1.0
-            CORR[i, j] = CORR[j, i] = overlap * sign
+    # 兼容图：有边表示二者可以同时出现在满足结构约束的组合中。
+    # 对一维日期区间，所有两两交集长度 >= L 等价于整体交集长度 >= L：
+    # 整体左端点和右端点各来自某个成员，它们之间也必须兼容。
+    sig_keys = [r["signal_key"][:5] for r in records]
+    active = [i for i in range(N) if last_i[i] - first_i[i] + 1 >= required_days]
+    active_mask = sum(1 << i for i in active)
+    compatible = [0] * N
+    blocked_same = blocked_window = 0
+    for i, j in itertools.combinations(active, 2):
+        if not allow_same_signal and sig_keys[i] == sig_keys[j]:
+            blocked_same += 1
+            continue
+        lo = max(int(first_i[i]), int(first_i[j]))
+        hi = min(int(last_i[i]), int(last_i[j]))
+        if hi - lo + 1 < required_days:
+            blocked_window += 1
+            continue
+        compatible[i] |= 1 << j
+        compatible[j] |= 1 << i
 
-    sig_keys = [r["signal_key"] for r in records]
-    member_cache = {}
-
-    def member_risk(i, lo, hi):
-        key = (i, lo, hi)
-        if key not in member_cache:
-            member_cache[key] = realized_risk(PNL[i, lo:hi + 1])
-        return member_cache[key]
-
-    results = []
-    skipped = {"同源": 0, "重叠不足": 0, "盈利窗口率": 0, "四段贡献": 0}
-    processed = 0
-    print(f"数据矩阵：{T} 天 | 待扫描 {total_combos:,} 个组合\n")
-    for k in range(min_k, max_k + 1):
-        for idxs in itertools.combinations(range(N), k):
-            processed += 1
-            if processed % 20000 == 0:
-                print(f"   ...已扫描 {processed:,}/{total_combos:,}")
-            if not allow_same_signal and len({sig_keys[i][:5] for i in idxs}) < k:
-                skipped["同源"] += 1
-                continue
-            ii = list(idxs)
-            lo, hi = int(first_i[ii].max()), int(last_i[ii].min())
-            n_days = hi - lo + 1
-            if n_days < min_overlap_days:
-                skipped["重叠不足"] += 1
-                continue
-            sl = slice(lo, hi + 1)
-            w = (base_w[ii] / base_w[ii].sum() if weight_mode == "recommend"
-                 else np.full(k, 1.0 / k))
-            daily = (PNL[ii, sl] * w[:, None]).sum(axis=0)
-            prefix = np.r_[0.0, np.cumsum(daily, dtype=float)]
-            net = float(prefix[-1])
-            win_7, worst_7 = rolling_stats(prefix, 7)
-            win_30, worst_30 = rolling_stats(prefix, 30)
-            win_1 = float(np.mean(daily > 0) * 100.0)
-            rates = {1: win_1, 7: win_7, 30: win_30}
-            if any(threshold is not None and
-                   (not np.isfinite(rates[days]) or rates[days] < threshold)
-                   for days, threshold in filters.items()):
-                skipped["盈利窗口率"] += 1
-                continue
-
-            if net > 0 and n_days >= 4:
-                q_ratios = [float(chunk.sum() / net * 100.0)
-                            for chunk in np.array_split(daily, 4)]
-                q_min = min(q_ratios)
-                q_str = " | ".join(f"Q{i + 1} {value:.1f}%" for i, value in enumerate(q_ratios))
-            else:
-                q_ratios = [float("nan")] * 4
-                q_min = float("nan")
-                q_str = "N/A（总净利≤0或窗口不足4天）"
-            if filter_q_balance is not None and (not np.isfinite(q_min) or q_min < filter_q_balance):
-                skipped["四段贡献"] += 1
-                continue
-
-            _, worst_90 = rolling_stats(prefix, 90)
-            boundaries = np.unique(np.concatenate([window_blowups(i, lo, hi) for i in ii]))
-            cycle_count, cycle_win, cycle_mean = cycle_stats(ii, w, boundaries)
-            risk = realized_risk(daily)
-            gp = float((POS[ii, sl] * w[:, None]).sum())
-            gl = float((NEG[ii, sl] * w[:, None]).sum())
-            pf = ratio(gp, abs(gl))
-            member_metrics = [member_risk(i, lo, hi) for i in ii]
-            mean_member_dd = float(np.mean([m["mdd"] for m in member_metrics]))
-            div_dd = ratio(risk["mdd"], mean_member_dd)
-            member_calmars = [m["calmar"] for m in member_metrics if not np.isnan(m["calmar"])]
-            best_calmar = max(member_calmars) if member_calmars else float("nan")
-            best_net = max(m["net"] for m in member_metrics)
-
-            pair_overlaps = []
-            for a, b in itertools.combinations(ii, 2):
-                hold_a, hold_b = HOLD[a, sl], HOLD[b, sl]
-                union = int(np.count_nonzero(hold_a | hold_b))
-                pair_overlaps.append(float(np.count_nonzero(hold_a & hold_b) / union)
-                                     if union else 0.0)
-            mean_overlap = float(np.mean(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
-            max_overlap = float(np.max(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
-
-            # 继续保留原 CSV 的辅助指标，不在控制台占用展示空间。
-            mk = month_key[sl]
-            monthly = np.bincount(mk - mk[0], weights=daily)
-            monthly_nonzero = monthly[monthly != 0]
-            conc = HOLD[ii, sl].sum(axis=0)
-            float_sum = (FLOAT[ii, sl] * w[:, None]).sum(axis=0)
-            cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2)
-                     if np.isfinite(CORR[a, b])]
-            symbol_weights = {}
-            for i, weight in zip(ii, w):
-                sym = records[i]["symbol"]
-                symbol_weights[sym] = symbol_weights.get(sym, 0.0) + weight
-            n_long = sum(records[i]["direction"] == "Long" for i in ii)
-            half_net = float(prefix[n_days // 2])
-
-            row = {
-                "组合数量(K)": k,
-                "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
-                "重叠起": str(all_days[lo].date()), "重叠止": str(all_days[hi].date()),
-                "重叠天数": n_days,
-                "组合净利(M)": net, "年化净利(M/年)": risk["annual"],
-                "组合总收益(M)": gp, "组合总亏损(M)": gl, "Profit Factor": pf,
-                "已实现MDD(M)": risk["mdd"], "相对已实现MDD(%)": risk["relative_dd"],
-                "最长水下期(天)": risk["underwater"], "已实现Calmar": risk["calmar"],
-                "最差7日收益(M)": worst_7, "最差30日收益(M)": worst_30,
-                "最差90日收益(M)": worst_90,
-                "完整周期数": cycle_count, "周期盈利率(%)": cycle_win,
-                "周期平均净利润(M)": cycle_mean,
-                "7日盈利窗口率(%)": win_7, "30日盈利窗口率(%)": win_30,
-                "1日盈利窗口率(%)": win_1,
-                "四段净利分布": q_str, "最低阶段贡献(%)": q_min,
-                "平均两两持仓重合(%)": mean_overlap, "最高两两持仓重合(%)": max_overlap,
-                "分散化系数": div_dd, "成员均回撤(M)": mean_member_dd,
-                "单策略最优Calmar": best_calmar, "单策略最优净利(M)": best_net,
-                "1+1>2": "是" if risk["calmar"] > best_calmar else "否",
-                "最长无盈利(天)": _max_true_run(daily <= 0),
-                "最差单日(M)": float(daily.min()),
-                "最差单月(M)": float(monthly_nonzero.min()) if len(monthly_nonzero) else 0.0,
-                "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0)
-                if len(monthly_nonzero) else 0.0,
-                "后半段净利占比(%)": (net - half_net) / net * 100.0 if net != 0 else np.nan,
-                "峰值合计浮亏(M)": float(float_sum.max()),
-                "平均合计浮亏(M)": float(float_sum.mean()),
-                "深水>0.5天数": int(np.sum(float_sum > 0.5)),
-                "平均同时持仓数": float(conc.mean()), "最大同时持仓数": int(conc.max()),
-                "资金利用率(%)": float(conc.mean() / k * 100.0),
-                "平均日相关": float(np.mean(cvals)) if cvals else 0.0,
-                "最大日相关": float(np.max(cvals)) if cvals else 0.0,
-                "独立币种数": len(symbol_weights), "多空(L/S)": f"{n_long}/{k - n_long}",
-                "最大单币权重(%)": float(max(symbol_weights.values()) * 100.0),
-                "总开仓数": int(CNT[ii, sl].sum()),
-                "_lo": lo, "_hi": hi, "_idx": ",".join(map(str, ii)),
-            }
-            row.update({f"Q{j + 1}利润贡献(%)": value for j, value in enumerate(q_ratios)})
-            # 旧列名仅作兼容别名，数值全部使用新口径；控制台使用新名称。
-            row.update({
-                "组合持仓重合度": mean_overlap / 100.0,
-                "盈亏比": pf, "组合回撤(M)": risk["mdd"],
-                "相对回撤(%)": risk["relative_dd"], "水下最长(天)": risk["underwater"],
-                "组合Calmar": risk["calmar"], "30日滚动胜率(%)": win_30,
-                "7日滚动胜率(%)": win_7, "1日滚动胜率(%)": win_1,
-                "爆仓周期胜率(%)": cycle_win, "最差单段贡献(%)": q_min,
-            })
-            results.append(row)
-
-    print("\n过滤统计：" + " | ".join(f"{name} {count:,}" for name, count in skipped.items()))
-    if not results:
-        print("[提示] 没有组合通过当前过滤条件。")
+    print(f"数据矩阵：{T} 天 | 有效最短共同窗口 {required_days} 天")
+    print(f"结构预筛：窗口过短成员 {N - len(active):,} | "
+          f"同源禁配对 {blocked_same:,} | 窗口禁配对 {blocked_window:,}")
+    if len(active) < min_k:
+        print("[提示] 满足必要窗口长度的成员不足，无法构建组合。")
+        return
+    if not allow_same_signal and len({sig_keys[i] for i in active}) < min_k:
+        print("[提示] 不同信号源数量不足，无法构建组合。")
         return
 
+    # 窗口也是缓存键的一部分；不同组合的共同窗口可能不同。
+    # 使用有界缓存，避免随着组合数量增长而无限保存成员/对子统计。
+    @lru_cache(maxsize=20000)
+    def member_risk(i, lo, hi):
+        return realized_risk(PNL[i, lo:hi + 1])
+
+    @lru_cache(maxsize=20000)
+    def pair_overlap(a, b, lo, hi):
+        hold_a, hold_b = HOLD[a, lo:hi + 1], HOLD[b, lo:hi + 1]
+        union = int(np.count_nonzero(hold_a | hold_b))
+        return float(np.count_nonzero(hold_a & hold_b) / union) if union else 0.0
+
+    # 保留旧 CSV 的方向签名重合代理；它不是收益相关系数。
+    CORR = np.full((N, N), np.nan)
+    for i, j in itertools.combinations(active, 2):
+        if not (compatible[i] & (1 << j)):
+            continue
+        lo, hi = max(int(first_i[i]), int(first_i[j])), min(int(last_i[i]), int(last_i[j]))
+        if hi - lo + 1 >= 30:
+            sign = 1.0 if records[i]["direction"] == records[j]["direction"] else -1.0
+            CORR[i, j] = CORR[j, i] = pair_overlap(i, j, lo, hi) * sign
+
+    results = []
+    skipped = {"盈利窗口率": 0, "四段贡献": 0}
+    processed = 0
+    evaluated_by_k = {}
+    insufficient_branches = 0
+    beam_discarded = 0
+
+    def exact_candidates(target_k):
+        """按原 itertools.combinations 的顺序，只生成结构可行的候选。"""
+        def visit(chosen, candidates, lo, hi):
+            nonlocal insufficient_branches
+            need = target_k - len(chosen)
+            if count_bits(candidates) < need:
+                insufficient_branches += 1
+                return
+            while candidates:
+                if count_bits(candidates) < need:
+                    insufficient_branches += 1
+                    break
+                bit = candidates & -candidates
+                candidates ^= bit
+                i = bit.bit_length() - 1
+                child = chosen + (i,)
+                child_lo = max(lo, int(first_i[i]))
+                child_hi = min(hi, int(last_i[i]))
+                if need == 1:
+                    yield child, child_lo, child_hi
+                else:
+                    # candidates 只含更大索引，保证不重复；交集继承所有父级约束。
+                    yield from visit(child, candidates & compatible[i], child_lo, child_hi)
+
+        yield from visit((), active_mask, 0, T - 1)
+
+    def evaluate_core(idxs, lo, hi, need_rank):
+        nonlocal processed
+        if max_combos is not None and processed >= max_combos:
+            raise RuntimeError(
+                f"实际评估数达到 max_combos={max_combos:,}，搜索尚未完成；"
+                "本次结果未写入 CSV。可设 max_combos=None 取消预算，"
+                "或显式使用 search_mode='beam' 并调小 beam_width。"
+            )
+        processed += 1
+        k = len(idxs)
+        evaluated_by_k[k] = evaluated_by_k.get(k, 0) + 1
+        if processed % 20000 == 0:
+            print(f"   ...已评估 {processed:,} 个候选 | 当前 K={k}")
+        ii = list(idxs)
+        n_days = hi - lo + 1
+        sl = slice(lo, hi + 1)
+        w = (base_w[ii] / base_w[ii].sum() if weight_mode == "recommend"
+             else np.full(k, 1.0 / k))
+        daily = (PNL[ii, sl] * w[:, None]).sum(axis=0)
+        prefix = np.r_[0.0, np.cumsum(daily, dtype=float)]
+        net = float(prefix[-1])
+        win_7, worst_7 = rolling_stats(prefix, 7)
+        win_30, worst_30 = rolling_stats(prefix, 30)
+        win_1 = float(np.mean(daily > 0) * 100.0)
+        rates = {1: win_1, 7: win_7, 30: win_30}
+        roll_failed = any(
+            threshold is not None and
+            (not np.isfinite(rates[days]) or rates[days] < threshold)
+            for days, threshold in filters.items()
+        )
+
+        if net > 0 and n_days >= 4:
+            q_ratios = [float(chunk.sum() / net * 100.0)
+                        for chunk in np.array_split(daily, 4)]
+            q_min = min(q_ratios)
+            q_str = " | ".join(f"Q{i + 1} {value:.1f}%" for i, value in enumerate(q_ratios))
+        else:
+            q_ratios = [float("nan")] * 4
+            q_min = float("nan")
+            q_str = "N/A（总净利≤0或窗口不足4天）"
+        q_failed = filter_q_balance is not None and (not np.isfinite(q_min) or q_min < filter_q_balance)
+        passed = not roll_failed and not q_failed
+        if k >= min_k:
+            if roll_failed:
+                skipped["盈利窗口率"] += 1
+            elif q_failed:
+                skipped["四段贡献"] += 1
+        if not passed and not need_rank:
+            return None
+
+        # beam 的失败候选也可当种子；不能在过滤失败时直接剪掉全部后代。
+        boundaries = np.unique(np.concatenate([window_blowups(i, lo, hi) for i in ii]))
+        cycle_count, cycle_win, cycle_mean = cycle_stats(ii, w, boundaries)
+        return {
+            "idxs": idxs, "ii": ii, "k": k, "lo": lo, "hi": hi,
+            "n_days": n_days, "sl": sl, "w": w, "daily": daily, "prefix": prefix,
+            "net": net, "win_7": win_7, "worst_7": worst_7,
+            "win_30": win_30, "worst_30": worst_30, "win_1": win_1,
+            "q_ratios": q_ratios, "q_min": q_min, "q_str": q_str,
+            "cycle_count": cycle_count, "cycle_win": cycle_win, "cycle_mean": cycle_mean,
+            "passed": passed,
+        }
+
+    def make_row(core):
+        k, ii, lo, hi = core["k"], core["ii"], core["lo"], core["hi"]
+        n_days, sl, w = core["n_days"], core["sl"], core["w"]
+        daily, prefix, net = core["daily"], core["prefix"], core["net"]
+        win_7, worst_7 = core["win_7"], core["worst_7"]
+        win_30, worst_30, win_1 = core["win_30"], core["worst_30"], core["win_1"]
+        q_ratios, q_min, q_str = core["q_ratios"], core["q_min"], core["q_str"]
+        cycle_count, cycle_win, cycle_mean = core["cycle_count"], core["cycle_win"], core["cycle_mean"]
+        _, worst_90 = rolling_stats(prefix, 90)
+        risk = realized_risk(daily)
+        gp = float((POS[ii, sl] * w[:, None]).sum())
+        gl = float((NEG[ii, sl] * w[:, None]).sum())
+        pf = ratio(gp, abs(gl))
+        member_metrics = [member_risk(i, lo, hi) for i in ii]
+        mean_member_dd = float(np.mean([m["mdd"] for m in member_metrics]))
+        div_dd = ratio(risk["mdd"], mean_member_dd)
+        member_calmars = [m["calmar"] for m in member_metrics if not np.isnan(m["calmar"])]
+        best_calmar = max(member_calmars) if member_calmars else float("nan")
+        best_net = max(m["net"] for m in member_metrics)
+
+        pair_overlaps = [pair_overlap(a, b, lo, hi)
+                         for a, b in itertools.combinations(ii, 2)]
+        mean_overlap = float(np.mean(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
+        max_overlap = float(np.max(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
+
+        # 继续保留原 CSV 的辅助指标，不在控制台占用展示空间。
+        mk = month_key[sl]
+        monthly = np.bincount(mk - mk[0], weights=daily)
+        monthly_nonzero = monthly[monthly != 0]
+        conc = HOLD[ii, sl].sum(axis=0)
+        float_sum = (FLOAT[ii, sl] * w[:, None]).sum(axis=0)
+        cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2)
+                 if np.isfinite(CORR[a, b])]
+        symbol_weights = {}
+        for i, weight in zip(ii, w):
+            sym = records[i]["symbol"]
+            symbol_weights[sym] = symbol_weights.get(sym, 0.0) + weight
+        n_long = sum(records[i]["direction"] == "Long" for i in ii)
+        half_net = float(prefix[n_days // 2])
+
+        row = {
+            "组合数量(K)": k,
+            "组合策略清单": "  ➕  ".join(records[i]["label"] for i in ii),
+            "重叠起": str(all_days[lo].date()), "重叠止": str(all_days[hi].date()),
+            "重叠天数": n_days,
+            "组合净利(M)": net, "年化净利(M/年)": risk["annual"],
+            "组合总收益(M)": gp, "组合总亏损(M)": gl, "Profit Factor": pf,
+            "已实现MDD(M)": risk["mdd"], "相对已实现MDD(%)": risk["relative_dd"],
+            "最长水下期(天)": risk["underwater"], "已实现Calmar": risk["calmar"],
+            "最差7日收益(M)": worst_7, "最差30日收益(M)": worst_30,
+            "最差90日收益(M)": worst_90,
+            "完整周期数": cycle_count, "周期盈利率(%)": cycle_win,
+            "周期平均净利润(M)": cycle_mean,
+            "7日盈利窗口率(%)": win_7, "30日盈利窗口率(%)": win_30,
+            "1日盈利窗口率(%)": win_1,
+            "四段净利分布": q_str, "最低阶段贡献(%)": q_min,
+            "平均两两持仓重合(%)": mean_overlap, "最高两两持仓重合(%)": max_overlap,
+            "分散化系数": div_dd, "成员均回撤(M)": mean_member_dd,
+            "单策略最优Calmar": best_calmar, "单策略最优净利(M)": best_net,
+            "1+1>2": "是" if risk["calmar"] > best_calmar else "否",
+            "最长无盈利(天)": _max_true_run(daily <= 0),
+            "最差单日(M)": float(daily.min()),
+            "最差单月(M)": float(monthly_nonzero.min()) if len(monthly_nonzero) else 0.0,
+            "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0)
+            if len(monthly_nonzero) else 0.0,
+            "后半段净利占比(%)": (net - half_net) / net * 100.0 if net != 0 else np.nan,
+            "峰值合计浮亏(M)": float(float_sum.max()),
+            "平均合计浮亏(M)": float(float_sum.mean()),
+            "深水>0.5天数": int(np.sum(float_sum > 0.5)),
+            "平均同时持仓数": float(conc.mean()), "最大同时持仓数": int(conc.max()),
+            "资金利用率(%)": float(conc.mean() / k * 100.0),
+            "平均日相关": float(np.mean(cvals)) if cvals else 0.0,
+            "最大日相关": float(np.max(cvals)) if cvals else 0.0,
+            "独立币种数": len(symbol_weights), "多空(L/S)": f"{n_long}/{k - n_long}",
+            "最大单币权重(%)": float(max(symbol_weights.values()) * 100.0),
+            "总开仓数": int(CNT[ii, sl].sum()),
+            "_lo": lo, "_hi": hi, "_idx": ",".join(map(str, ii)),
+        }
+        row.update({f"Q{j + 1}利润贡献(%)": value for j, value in enumerate(q_ratios)})
+        # 旧列名仅作兼容别名，数值全部使用新口径；控制台使用新名称。
+        row.update({
+            "组合持仓重合度": mean_overlap / 100.0,
+            "盈亏比": pf, "组合回撤(M)": risk["mdd"],
+            "相对回撤(%)": risk["relative_dd"], "水下最长(天)": risk["underwater"],
+            "组合Calmar": risk["calmar"], "30日滚动胜率(%)": win_30,
+            "7日滚动胜率(%)": win_7, "1日滚动胜率(%)": win_1,
+            "爆仓周期胜率(%)": cycle_win, "最差单段贡献(%)": q_min,
+        })
+        return row
+
+    if search_mode == "exact":
+        for k in range(min_k, max_k + 1):
+            before = processed
+            for idxs, lo, hi in exact_candidates(k):
+                core = evaluate_core(idxs, lo, hi, need_rank=False)
+                if core is not None:
+                    results.append(make_row(core))
+            print(f"K={k}：评估 {processed - before:,} 个结构可行候选")
+    else:
+        # 每个种子仅保存成员、窗口和可加成员掩码，不保存整条日收益数组。
+        frontier = [((), 0, T - 1, active_mask)]
+        for k in range(1, max_k + 1):
+            seen = set()
+            next_heap = []
+            expandable_count = 0
+            before = processed
+            for chosen, parent_lo, parent_hi, parent_mask in frontier:
+                candidates = parent_mask
+                while candidates:
+                    bit = candidates & -candidates
+                    candidates ^= bit
+                    i = bit.bit_length() - 1
+                    idxs = tuple(sorted(chosen + (i,)))
+                    if idxs in seen:
+                        continue
+                    seen.add(idxs)
+                    lo = max(parent_lo, int(first_i[i]))
+                    hi = min(parent_hi, int(last_i[i]))
+                    # 复用父级的完整兼容集，不能用循环中逐渐消耗的 candidates，
+                    # 也不能只加更大索引，否则会产生额外顺序偏差。
+                    child_mask = parent_mask & compatible[i]
+                    if k < min_k and count_bits(child_mask) < min_k - k:
+                        insufficient_branches += 1
+                        continue
+                    can_expand = k < max_k and bool(child_mask)
+                    core = evaluate_core(idxs, lo, hi, need_rank=can_expand)
+                    if core is not None and core["passed"] and k >= min_k:
+                        results.append(make_row(core))
+                    if not can_expand:
+                        continue
+
+                    # 排名只影响选种，不把低分/过滤失败误称为不可能变好的组合。
+                    cycle_score = core["cycle_win"] if np.isfinite(core["cycle_win"]) else -1.0
+                    roll_score = core["win_30"] if np.isfinite(core["win_30"]) else -1.0
+                    priority = (int(core["passed"]), cycle_score, roll_score,
+                                tuple(-j for j in idxs))
+                    item = (priority, (idxs, lo, hi, child_mask))
+                    expandable_count += 1
+                    if len(next_heap) < beam_width:
+                        heapq.heappush(next_heap, item)
+                    elif priority > next_heap[0][0]:
+                        heapq.heapreplace(next_heap, item)
+
+            discarded = expandable_count - len(next_heap)
+            beam_discarded += discarded
+            print(f"K={k}：评估 {processed - before:,} 个候选 | "
+                  f"下层种子 {len(next_heap):,} | 近似淘汰种子 {discarded:,}")
+            frontier = sorted((item[1] for item in next_heap), key=lambda node: node[0])
+            if not frontier:
+                break
+
+    exhaustive = beam_discarded == 0
+    coverage_text = "已穷尽所有结构可行候选" if exhaustive else "近似搜索，未穷尽全部候选"
+    print(f"\n搜索统计：实际评估 {processed:,} | {coverage_text}")
+    print(f"候选不足分支 {insufficient_branches:,} | 近似淘汰种子 {beam_discarded:,}")
+    print("已评估目标组合的过滤统计：" + " | ".join(f"{name} {count:,}" for name, count in skipped.items()))
+    if not results:
+        print("[提示] 本次搜索未发现通过当前过滤条件的组合。")
+        return
+
+    # 两种搜索模式都按原 K、成员索引顺序打破完全同分，保持可复现。
+    results.sort(key=lambda row: (row["组合数量(K)"], tuple(map(int, row["_idx"].split(",")))))
     df_all = pd.DataFrame(results)
-    # 用未舍入的值排序；完全同分时保留穷举顺序，不引入隐藏的收益/Calmar排序。
     df_all["_scan_order"] = np.arange(len(df_all))
     df_all.sort_values(
         by=["周期盈利率(%)", "30日盈利窗口率(%)", "_scan_order"],
@@ -1335,15 +1522,22 @@ def evaluate_multi_strategy_portfolios(
     )
     df_all.drop(columns="_scan_order", inplace=True)
     df_all.reset_index(drop=True, inplace=True)
+    df_all["搜索模式"] = search_mode
+    df_all["搜索是否穷尽"] = exhaustive
+    df_all.attrs["search"] = {
+        "mode": search_mode, "exhaustive": exhaustive,
+        "theoretical_combos": total_combos, "evaluated": processed,
+        "evaluated_by_k": evaluated_by_k,
+        "beam_discarded": beam_discarded,
+        "insufficient_branches": insufficient_branches,
+        "required_overlap_days": required_days,
+    }
     output_parent = os.path.dirname(os.path.abspath(output_csv))
     os.makedirs(output_parent, exist_ok=True)
     df_all.drop(columns=["_lo", "_hi", "_idx"]).to_csv(
         output_csv, index=False, encoding="utf-8-sig", na_rep="N/A")
-    print(f"组合评估完成：{len(df_all):,} 个有效组合 | 全量排名：{output_csv}\n")
+    print(f"组合评估完成：{len(df_all):,} 个已发现的有效组合 | {coverage_text} | {output_csv}\n")
 
-    # ==========================
-    # 核心修改点：加入成员全局别名映射字典
-    # ==========================
     member_alias_map = {}
 
     for k in range(min_k, max_k + 1):
@@ -1351,7 +1545,7 @@ def evaluate_multi_strategy_portfolios(
         if df_k.empty:
             continue
         print("=" * 112)
-        print(f"🏆 【{k} 策略顶级组合】TOP {len(df_k)}")
+        print(f"🏆 【{k} 策略组合】本次结果 TOP {len(df_k)}")
         print("   主排序：周期盈利率 ↓ → 30日盈利窗口率 ↓（N/A 排最后）")
         print("=" * 112)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
@@ -1398,14 +1592,11 @@ def evaluate_multi_strategy_portfolios(
                     "周期盈利率(%)": fmt(member_win),
                 })
 
-            # 使用 DataFrame 组织数据
             df_print = pd.DataFrame(rows)
 
-            # 此处控制实际向 print_table 输入的列
-            # 默认去掉了 "成员"（已用 # 注释掉），如果你将来想连同成员一起输出，只需去掉 "成员", 前面的 # 号即可
             display_cols = [
-                "成员",          # <--- 默认注释掉，随时可以放开
-                "成员编号",  # <--- 现在默认输出映射后的名称
+                "成员",
+                "成员编号",
                 "窗口净利(M)",
                 "已实现MDD(M)",
                 "已实现Calmar",
@@ -1415,6 +1606,7 @@ def evaluate_multi_strategy_portfolios(
             print_table(df_print[display_cols])
         print()
     return df_all
+
 
 if __name__ == "__main__":
     PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau_back.csv"  # 若无平原表填 None

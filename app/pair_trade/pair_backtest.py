@@ -7,7 +7,7 @@
     基于Beta调整与固定期限的横截面统计套利策略 (修正版)
     低耦合架构：先逐个币种回测并保存交易明细 -> 最后汇总分析
     支持多参数组合自动网格搜索，并动态打印参数标识
-    新增：可选右侧入场、全市场最大偏差单仓轮换、参数组合多进程并行
+    入场：长期Z偏离与短期多小时相对强弱同时满足；参数组合多进程并行
 
 假设：USDT线性合约，volume单位为基础币，close为小时K线收盘价。
 时间戳统一为UTC收盘边界：open_time + 1h；不使用下一根open。
@@ -52,8 +52,15 @@ class Config:
     SIGNAL_WINDOW_HOURS = 24
     Z_SCORE_THRESHOLD = 2.0
     HOLDING_PERIOD_HOURS = 6
-    RIGHT_SIDE_ENTRY = False  # True: 突破后等待同号Z向0回头，再开仓。
-    POSITION_MODE = "FIXED_HOLD"  # FIXED_HOLD / MAX_DEVIATION
+
+    # 短期确认单独估计Beta；实际两腿数量仍使用原来的长期Beta。
+    SHORT_BETA_WINDOW_DAYS = 7
+    SHORT_SIGNAL_WINDOW_HOURS = 6
+    SHORT_EXCESS_THRESHOLD = 0.0  # 每小时平均对数残差的绝对门槛；0.0005 = 5bp/h。
+    SHORT_MIN_BAR_RATIO = 0.5  # 对应窗口/涨跌子样本中，同方向残差bar的最低比例。
+    SHORT_MIN_REGIME_BARS = 2  # UP/DOWN子样本至少2根；无该方向样本不得自动通过。
+    SHORT_CONFIRM_MODE = "BOTH"  # NET / UP / DOWN / BOTH / EITHER，见下方网格注释。
+    SHORT_CONFIRM_TIMING = "ROLLING"  # ROLLING / POST_TRIGGER。
     FEE_RATE = 0.001  # 每腿每次实际成交额的0.1%；统一成本假设，不另计资金费
     PAIR_GROSS_NOTIONAL = 1000.0  # 每笔双腿初始毛名义总额，USDT
     MIN_BTC_VARIANCE = 1e-16
@@ -62,31 +69,49 @@ class Config:
     ENTRY_START = None
     EVALUATION_END = None
 
-    # 参数网格；保持原参数空间
-    Z_THRESHOLDS_TO_TEST = [6.0, 7.0, 8.0, 9.0]
-    HOLDING_PERIODS_TO_TEST = [48, 72, 96, 120, 168]
-    SIGNAL_WINDOWS_TO_TEST = [24, 48, 60]             # 新增: 信号计算窗口
-    BETA_WINDOWS_TO_TEST = [30, 60, 90, 120]               # 新增: Beta历史窗口
-    RIGHT_SIDE_ENTRIES_TO_TEST = [False, True]
-    POSITION_MODES_TO_TEST = ["FIXED_HOLD"]
+    # 第一轮定性粗筛：先比较信号结构与时间尺度，再根据结果细调数值。
+    # 第一组含持仓期：2 * 3 * 2 * 1 = 12组；Beta天数先固定，不代表最优。
+    Z_THRESHOLDS_TO_TEST = [6.0, 9.0]
+    HOLDING_PERIODS_TO_TEST = [48, 96, 168]
+    SIGNAL_WINDOWS_TO_TEST = [24, 60]
+    BETA_WINDOWS_TO_TEST = [60]
+
+    # 第二组：Beta天数与幅度门槛先固定；与第一组完整交叉，不按长短关系删组合。
+    SHORT_BETA_WINDOWS_TO_TEST = [7]
+    SHORT_SIGNAL_WINDOWS_TO_TEST = [6, 12, 24, 48]
+    SHORT_EXCESS_THRESHOLDS_TO_TEST = [0.0]
+    # 0.0检验平均表现；0.75检验转弱/转强是否分布在更多bar上。
+    SHORT_MIN_BAR_RATIOS_TO_TEST = [0.0, 0.75]
+    # NET: 全窗口；UP: BTC上涨小时；DOWN: BTC下跌小时；
+    # BOTH: UP且DOWN；EITHER: UP或DOWN。五种均与长期Z条件取AND。
+    SHORT_CONFIRM_MODES_TO_TEST = ["NET", "UP", "DOWN", "BOTH", "EITHER"]
+    # ROLLING允许确认窗口覆盖突破之前；POST_TRIGGER要求整个窗口在突破之后。
+    SHORT_CONFIRM_TIMINGS_TO_TEST = ["ROLLING", "POST_TRIGGER"]
+    # 短期组：1 * 4 * 1 * 2 * 5 * 2 = 80组；完整交叉12 * 80 = 960组。
+    MAX_GRID_COMBINATIONS = 1000  # 本轮粗筛上限；超限报错，不截取或随机丢弃组合。
 
     # 每个进程独立运行一组参数；多币种长历史会占内存，可按机器调整。
     MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
     NUMERIC_THREADS_PER_WORKER = 1  # 避免每个进程再启动一整组BLAS线程。
 
-    CACHE_VERSION = "fixed_beta_excursion_net_v3"
+    CACHE_VERSION = "dual_horizon_fixed_beta_excursion_net_v4"
 
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
+    SHORT_BETA_WINDOW_HOURS = SHORT_BETA_WINDOW_DAYS * 24
     PARAM_FOLDER = (f"Z{Z_SCORE_THRESHOLD}_H{HOLDING_PERIOD_HOURS}"
                     f"_B{BETA_WINDOW_DAYS}_S{SIGNAL_WINDOW_HOURS}"
-                    f"_R{int(RIGHT_SIDE_ENTRY)}_M{POSITION_MODE}")
+                    f"_b{SHORT_BETA_WINDOW_DAYS}_s{SHORT_SIGNAL_WINDOW_HOURS}"
+                    f"_e{SHORT_EXCESS_THRESHOLD}_p{SHORT_MIN_BAR_RATIO}"
+                    f"_n{SHORT_MIN_REGIME_BARS}_{SHORT_CONFIRM_MODE}_{SHORT_CONFIRM_TIMING}")
     OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, PARAM_FOLDER)
     RUN_ID = ""
     MARKET_ID = ""
 
     @classmethod
     def update_params(cls, z_score, holding_period, beta_window=30, signal_window=24,
-                      right_side_entry=False, position_mode="FIXED_HOLD"):
+                      short_beta_window=7, short_signal_window=6,
+                      short_excess_threshold=0.0, short_min_bar_ratio=0.5,
+                      short_confirm_mode="BOTH", short_confirm_timing="ROLLING"):
         """动态更新参数并重建路径配置；实际运行再绑定数据/代码指纹。"""
         if (not np.isfinite(z_score) or z_score <= 0
                 or any(int(x) != x or x <= 0 for x in
@@ -96,20 +121,40 @@ class Config:
         cls.HOLDING_PERIOD_HOURS = int(holding_period)
         cls.BETA_WINDOW_DAYS = int(beta_window)
         cls.SIGNAL_WINDOW_HOURS = int(signal_window)
-        if not isinstance(right_side_entry, (bool, np.bool_)):
-            raise ValueError("right_side_entry必须为布尔值")
-        if position_mode not in ("FIXED_HOLD", "MAX_DEVIATION"):
-            raise ValueError("position_mode必须为FIXED_HOLD或MAX_DEVIATION")
-        cls.RIGHT_SIDE_ENTRY = bool(right_side_entry)
-        cls.POSITION_MODE = position_mode
+        if any(isinstance(x, (bool, np.bool_)) or not np.isfinite(x)
+               or int(x) != x or x <= 0
+               for x in (short_beta_window, short_signal_window)):
+            raise ValueError("短期Beta天数和信号小时数必须为正整数")
+        if short_signal_window < 2:
+            raise ValueError("短期确认窗口必须至少包含2根小时bar")
+        if not np.isfinite(short_excess_threshold) or short_excess_threshold < 0:
+            raise ValueError("short_excess_threshold必须为有限非负数")
+        if not np.isfinite(short_min_bar_ratio) or not 0 <= short_min_bar_ratio <= 1:
+            raise ValueError("short_min_bar_ratio必须在[0, 1]内")
+        n = cls.SHORT_MIN_REGIME_BARS
+        if (isinstance(n, (bool, np.bool_)) or not np.isfinite(n)
+                or int(n) != n or n < 2):
+            raise ValueError("SHORT_MIN_REGIME_BARS必须为不小于2的整数")
+        if short_confirm_mode not in ("NET", "UP", "DOWN", "BOTH", "EITHER"):
+            raise ValueError("short_confirm_mode必须为NET/UP/DOWN/BOTH/EITHER")
+        if short_confirm_timing not in ("ROLLING", "POST_TRIGGER"):
+            raise ValueError("short_confirm_timing必须为ROLLING或POST_TRIGGER")
+        cls.SHORT_BETA_WINDOW_DAYS = int(short_beta_window)
+        cls.SHORT_SIGNAL_WINDOW_HOURS = int(short_signal_window)
+        cls.SHORT_EXCESS_THRESHOLD = float(short_excess_threshold)
+        cls.SHORT_MIN_BAR_RATIO = float(short_min_bar_ratio)
+        cls.SHORT_CONFIRM_MODE = short_confirm_mode
+        cls.SHORT_CONFIRM_TIMING = short_confirm_timing
         cls.BETA_WINDOW_HOURS = cls.BETA_WINDOW_DAYS * 24
+        cls.SHORT_BETA_WINDOW_HOURS = cls.SHORT_BETA_WINDOW_DAYS * 24
         if cls.BETA_WINDOW_HOURS <= cls.SIGNAL_WINDOW_HOURS:
             raise ValueError("Beta历史窗口必须长于信号窗口")
-        # 单仓轮换不使用H；统一写NA，避免无效H造成重复回测和重复文件。
-        hold_tag = str(cls.HOLDING_PERIOD_HOURS) if position_mode == "FIXED_HOLD" else "NA"
-        cls.PARAM_FOLDER = (f"Z{cls.Z_SCORE_THRESHOLD}_H{hold_tag}"
+        cls.PARAM_FOLDER = (f"Z{cls.Z_SCORE_THRESHOLD}_H{cls.HOLDING_PERIOD_HOURS}"
                             f"_B{cls.BETA_WINDOW_DAYS}_S{cls.SIGNAL_WINDOW_HOURS}"
-                            f"_R{int(cls.RIGHT_SIDE_ENTRY)}_M{cls.POSITION_MODE}")
+                            f"_b{cls.SHORT_BETA_WINDOW_DAYS}_s{cls.SHORT_SIGNAL_WINDOW_HOURS}"
+                            f"_e{cls.SHORT_EXCESS_THRESHOLD}_p{cls.SHORT_MIN_BAR_RATIO}"
+                            f"_n{cls.SHORT_MIN_REGIME_BARS}_{cls.SHORT_CONFIRM_MODE}"
+                            f"_{cls.SHORT_CONFIRM_TIMING}")
         cls.OUTPUT_DIR = os.path.join(cls.BASE_OUTPUT_DIR, cls.PARAM_FOLDER)
         cls.RUN_ID = cls.MARKET_ID = ""
 
@@ -123,7 +168,13 @@ TRADE_COLUMNS = [
     "alt_gross_pnl", "btc_gross_pnl", "gross_pnl", "entry_cost", "exit_cost",
     "total_cost", "net_pnl", "gross_return", "net_return", "holding_hours",
     "planned_holding_hours", "fee_rate", "z_threshold", "beta_window_hours",
-    "signal_window_hours", "right_side_entry", "position_mode", "exit_reason",
+    "signal_window_hours", "short_beta_window_hours", "short_signal_window_hours",
+    "short_excess_threshold", "short_min_bar_ratio", "short_min_regime_bars",
+    "short_confirm_mode", "short_confirm_timing", "short_beta",
+    "short_mean_excess", "short_up_mean_excess", "short_down_mean_excess",
+    "short_support_ratio", "short_up_support_ratio", "short_down_support_ratio",
+    "short_up_count", "short_down_count", "long_trigger_time", "long_trigger_z",
+    "exit_reason",
     "mae_return", "mfe_return", "mae_time", "mfe_time"
 ]
 
@@ -261,10 +312,16 @@ def prepare_run(symbols, data_fingerprints=None):
                   signal=Config.SIGNAL_WINDOW_HOURS, end=Config.EVALUATION_END)
     Config.MARKET_ID = fingerprint(market)
     manifest = dict(market=market, z=Config.Z_SCORE_THRESHOLD,
-                    holding=(Config.HOLDING_PERIOD_HOURS
-                             if Config.POSITION_MODE == "FIXED_HOLD" else None),
-                    right_side_entry=Config.RIGHT_SIDE_ENTRY,
-                    position_mode=Config.POSITION_MODE, fee=Config.FEE_RATE,
+                    holding=Config.HOLDING_PERIOD_HOURS,
+                    short_beta=Config.SHORT_BETA_WINDOW_HOURS,
+                    short_signal=Config.SHORT_SIGNAL_WINDOW_HOURS,
+                    short_excess_threshold=Config.SHORT_EXCESS_THRESHOLD,
+                    short_min_bar_ratio=Config.SHORT_MIN_BAR_RATIO,
+                    short_min_regime_bars=Config.SHORT_MIN_REGIME_BARS,
+                    short_confirm_mode=Config.SHORT_CONFIRM_MODE,
+                    short_confirm_timing=Config.SHORT_CONFIRM_TIMING,
+                    short_basis="mean_hourly_log_residual_fixed_pre_window_beta",
+                    fee=Config.FEE_RATE,
                     gross=Config.PAIR_GROSS_NOTIONAL, start=Config.ENTRY_START,
                     min_var=Config.MIN_BTC_VARIANCE, min_std=Config.MIN_RESIDUAL_STD,
                     pandas=pd.__version__, numpy=np.__version__,
@@ -318,6 +375,84 @@ def calculate_indicators(df_alt, df_btc):
     df["z_score"] = df["z_score"].replace([np.inf, -np.inf], np.nan)
     df["turnover"] = df["volume"] * df["close"]
     df["avg_turnover_30d"] = historical_turnover(df)
+    df = calculate_short_confirmation(df)
+    return df
+
+
+def calculate_short_confirmation(df):
+    """短期Beta训练结束于确认窗口之前；窗口内每根bar均使用同一个Beta。
+
+    e_i(t) = alt_ret_i - short_beta_t * btc_ret_i。
+    不减去历史残差均值：这里检验实际相对走势，而不是是否低于历史平均。
+    均值严格超过幅度门槛，支持bar比例达到下限，才算对应方向确认。
+    BTC零收益bar计入NET，不属于UP/DOWN；缺少涨/跌子样本不能视为通过。
+    """
+    B = Config.SHORT_BETA_WINDOW_HOURS
+    C = Config.SHORT_SIGNAL_WINDOW_HOURS
+    a, m = df["ret_1h"], df["btc_ret_1h"]
+    cov = a.rolling(B, min_periods=B).cov(m)
+    var = m.rolling(B, min_periods=B).var()
+    df["short_beta_shifted"] = (cov / var.where(
+        var > Config.MIN_BTC_VARIANCE)).shift(C).replace([np.inf, -np.inf], np.nan)
+    beta = df["short_beta_shifted"].to_numpy()
+    n = len(df)
+    groups = ("net", "up", "down")
+    counts = {g: np.zeros(n, dtype=np.int64) for g in groups}
+    sums = {g: np.zeros(n, dtype=float) for g in groups}
+    negatives = {g: np.zeros(n, dtype=np.int64) for g in groups}
+    positives = {g: np.zeros(n, dtype=np.int64) for g in groups}
+
+    # 沿窗口长度循环，整条时间轴向量化；不创建n*C的大矩阵。
+    # 不能先用每小时各自的Beta算残差再rolling，否则窗口内Beta并不固定。
+    for lag in range(C):
+        ar, mr = a.shift(lag).to_numpy(), m.shift(lag).to_numpy()
+        residual = ar - beta * mr
+        valid = np.isfinite(residual)
+        masks = {"net": valid, "up": valid & (mr > 0), "down": valid & (mr < 0)}
+        for g in groups:
+            mask = masks[g]
+            counts[g] += mask
+            sums[g] += np.where(mask, residual, 0.0)
+            negatives[g] += mask & (residual < 0)
+            positives[g] += mask & (residual > 0)
+
+    complete = counts["net"] == C
+    threshold, ratio = Config.SHORT_EXCESS_THRESHOLD, Config.SHORT_MIN_BAR_RATIO
+    short_ok, long_ok = {}, {}
+    for g in groups:
+        prefix = "short" if g == "net" else f"short_{g}"
+        count = counts[g]
+        mean = np.divide(sums[g], count, out=np.full(n, np.nan), where=count > 0)
+        negative_ratio = np.divide(negatives[g], count,
+                                   out=np.full(n, np.nan), where=count > 0)
+        positive_ratio = np.divide(positives[g], count,
+                                   out=np.full(n, np.nan), where=count > 0)
+        df[f"{prefix}_mean_excess"] = np.where(complete, mean, np.nan)
+        df[f"{prefix}_negative_ratio"] = np.where(complete, negative_ratio, np.nan)
+        df[f"{prefix}_positive_ratio"] = np.where(complete, positive_ratio, np.nan)
+        if g != "net":
+            df[f"{prefix}_count"] = np.where(complete, count, np.nan)
+        required = C if g == "net" else Config.SHORT_MIN_REGIME_BARS
+        enough = complete & (count >= required)
+        short_ok[g] = enough & (mean < -threshold) & (negative_ratio >= ratio)
+        long_ok[g] = enough & (mean > threshold) & (positive_ratio >= ratio)
+
+    def combine(signals):
+        mode = Config.SHORT_CONFIRM_MODE
+        if mode == "NET":
+            return signals["net"]
+        if mode == "UP":
+            return signals["up"]
+        if mode == "DOWN":
+            return signals["down"]
+        if mode == "BOTH":
+            return signals["up"] & signals["down"]
+        if mode == "EITHER":
+            return signals["up"] | signals["down"]
+        raise ValueError(f"未知短期确认方式: {mode}")
+
+    df["short_ready_short"] = combine(short_ok)
+    df["short_ready_long"] = combine(long_ok)
     return df
 
 
@@ -424,8 +559,25 @@ def open_pair_position(symbol, row, median, scheduled_exit_time=pd.NaT,
         planned_holding_hours=planned_holding_hours, fee_rate=Config.FEE_RATE,
         z_threshold=Config.Z_SCORE_THRESHOLD, beta_window_hours=Config.BETA_WINDOW_HOURS,
         signal_window_hours=Config.SIGNAL_WINDOW_HOURS,
-        right_side_entry=Config.RIGHT_SIDE_ENTRY,
-        position_mode=Config.POSITION_MODE, exit_reason=None,
+        short_beta_window_hours=Config.SHORT_BETA_WINDOW_HOURS,
+        short_signal_window_hours=Config.SHORT_SIGNAL_WINDOW_HOURS,
+        short_excess_threshold=Config.SHORT_EXCESS_THRESHOLD,
+        short_min_bar_ratio=Config.SHORT_MIN_BAR_RATIO,
+        short_min_regime_bars=Config.SHORT_MIN_REGIME_BARS,
+        short_confirm_mode=Config.SHORT_CONFIRM_MODE,
+        short_confirm_timing=Config.SHORT_CONFIRM_TIMING,
+        short_beta=row.short_beta_shifted,
+        short_mean_excess=row.short_mean_excess,
+        short_up_mean_excess=row.short_up_mean_excess,
+        short_down_mean_excess=row.short_down_mean_excess,
+        short_support_ratio=(row.short_negative_ratio if direction == -1
+                             else row.short_positive_ratio),
+        short_up_support_ratio=(row.short_up_negative_ratio if direction == -1
+                                else row.short_up_positive_ratio),
+        short_down_support_ratio=(row.short_down_negative_ratio if direction == -1
+                                  else row.short_down_positive_ratio),
+        short_up_count=row.short_up_count, short_down_count=row.short_down_count,
+        exit_reason=None,
         mae_return=0.0, mfe_return=0.0, mae_time=pd.NaT, mfe_time=pd.NaT,
         _excursion_valid=True, _last_mark_time=None)
     # 开仓当刻的假设净清算收益约为-2*fee_rate；没有正收益时MFE保持0/NaT。
@@ -453,8 +605,8 @@ def backtest_single_symbol(symbol, df, market_median_series):
     trades = []
     position = None
     armed = False  # 必须先看到正常区间，才能确认首次突破。
-    pending_side = 0  # +1/-1: 已突破，等待同侧首次向0回头；0: 无等待。
-    previous_z, previous_time = np.nan, None
+    pending_side = 0  # +1/-1: 长期Z已突破，等待对应方向的多小时确认。
+    trigger_time, trigger_z = None, np.nan
     threshold = Config.Z_SCORE_THRESHOLD
     begin, end = utc_timestamp(Config.ENTRY_START), utc_timestamp(Config.EVALUATION_END)
     hold = pd.Timedelta(hours=Config.HOLDING_PERIOD_HOURS)
@@ -463,10 +615,6 @@ def backtest_single_symbol(symbol, df, market_median_series):
         now, z = row.Index, row.z_score
         valid_z = np.isfinite(z) and np.isfinite(row.beta_shifted)
         normal = valid_z and -threshold <= z <= threshold
-        turned = (previous_time is not None
-                  and now - previous_time == pd.Timedelta(hours=1)
-                  and right_side_turn(previous_z, z, threshold))
-        previous_z, previous_time = (z if valid_z else np.nan), now
 
         # 绝不能因Z/Beta缺失跳过已经到期的仓位。
         if position is not None:
@@ -489,30 +637,39 @@ def backtest_single_symbol(symbol, df, market_median_series):
             position = None
             armed = normal  # 退出时已正常即可复位；持仓期间的回归不算平仓后复位。
             pending_side = 0
+            trigger_time, trigger_z = None, np.nan
             continue
 
         if not valid_z:
             armed = False  # 缺口后首次看到极值，无法确认这是首次突破。
             pending_side = 0
+            trigger_time, trigger_z = None, np.nan
             continue
         if normal:
             armed = True
             pending_side = 0
+            trigger_time, trigger_z = None, np.nan
             continue
-        if Config.RIGHT_SIDE_ENTRY and pending_side:
+        if pending_side:
             if (1 if z > 0 else -1) != pending_side:
                 pending_side = 0  # 跨0跳到另一侧极值，不当成原方向的回归。
+                trigger_time, trigger_z = None, np.nan
                 continue
-            if not turned:
-                continue
-            pending_side = 0  # 首次回头消耗信号；分组/区间不满足也不追单。
         else:
             if not armed:
                 continue
-            armed = False  # 消耗这次突破，即使区间/分组要求使本次不成交也不追单。
-            if Config.RIGHT_SIDE_ENTRY:
-                pending_side = 1 if z > 0 else -1
-                continue
+            armed = False
+            pending_side = 1 if z > 0 else -1
+            trigger_time, trigger_z = now, z
+        # 长期条件必须仍在同侧阈值外；回到正常区间已在上面清除等待。
+        # POST_TRIGGER在突破后至少经过C小时，整个短期收益窗口才位于突破之后。
+        if (Config.SHORT_CONFIRM_TIMING == "POST_TRIGGER"
+                and now - trigger_time < pd.Timedelta(hours=Config.SHORT_SIGNAL_WINDOW_HOURS)):
+            continue
+        ready = row.short_ready_short if pending_side == 1 else row.short_ready_long
+        if not ready:
+            continue  # 短期尚未确认，不消耗突破；后续同侧极值小时继续检查。
+        pending_side = 0  # 首次双条件满足消耗信号；沿用原有区间/分组不满足不追单规则。
         if begin is not None and now < begin:
             continue
         if end is not None and (now >= end or now + hold > end):
@@ -525,6 +682,7 @@ def backtest_single_symbol(symbol, df, market_median_series):
             continue
         position = open_pair_position(symbol, row, median, now + hold,
                                       Config.HOLDING_PERIOD_HOURS)
+        position.update(long_trigger_time=trigger_time, long_trigger_z=trigger_z)
 
     if position is not None:
         invalidate_excursions(position)
@@ -532,136 +690,6 @@ def backtest_single_symbol(symbol, df, market_median_series):
         position["exit_reason"] = "END_OF_DATA"
         trades.append(position)
     return pd.DataFrame(trades, columns=TRADE_COLUMNS)
-
-
-def right_side_turn(previous_z, z, threshold):
-    """仅比较已收盘的相邻小时：两端同侧超阈值，当前绝对值严格减小。"""
-    return (np.isfinite(previous_z) and np.isfinite(z)
-            and ((previous_z > threshold and z > threshold and z < previous_z)
-                 or (previous_z < -threshold and z < -threshold and z > previous_z)))
-
-
-def open_rotation_position(symbol, row, median):
-    return open_pair_position(symbol, row, median)
-
-
-def close_rotation_position(position, now, alt_price, btc_price, z, reason):
-    return close_pair_position(position, now, alt_price, btc_price, z, reason)
-
-
-def backtest_max_deviation(symbol_indicators, btc_df, market_median_series):
-    """在统一时间轴上只管理一个ALT/BTC仓位；不能逐币回测后再筛选交易。
-
-    排名用当小时满足Z、Beta、价格、成交额基准要求的最大abs(Z)。
-    右侧条件只管新开仓：新冠军尚未掉头时空仓等待，不持有次优标的。
-    不要求重新穿越阈值；排名变化本身即可触发轮换。并列时优先保留旧仓，
-    空仓则按symbol排序选取。最后一个评估小时结算且不再开仓。
-    symbol_indicators为按symbol排序的(symbol, 指标DataFrame)惰性迭代器。
-    """
-    if market_median_series.empty:
-        return pd.DataFrame(columns=TRADE_COLUMNS)
-    index = pd.date_range(market_median_series.index.min(),
-                          market_median_series.index.max(), freq="h", name="close_time")
-    end = utc_timestamp(Config.EVALUATION_END)
-    if end is not None:
-        index = index[index <= end]
-    if index.empty:
-        return pd.DataFrame(columns=TRADE_COLUMNS)
-    median = market_median_series.reindex(index).to_numpy()
-    btc_prices = btc_df["close"].reindex(index).to_numpy()
-    n, threshold = len(index), Config.Z_SCORE_THRESHOLD
-    best_score = np.full(n, -np.inf)
-    best_symbol = np.full(n, "", dtype=object)
-    best_right = np.zeros(n, dtype=bool)
-    entry_columns = ("close", "z_score", "beta_shifted", "hist_res_mean",
-                     "hist_res_std", "avg_turnover_30d")
-    best_values = {key: np.full(n, np.nan) for key in entry_columns}
-    histories = {}
-
-    # 逐币生成指标，只保留各币平仓/排名所需的3条数组及每小时冠军的开仓字段。
-    # 全样本预计算不使用未来值：排名数组的每一行仅比较同一个收盘时间。
-    for symbol, indicators in symbol_indicators:
-        frame = indicators.loc[:, list(entry_columns)].reindex(index)
-        z = frame["z_score"].to_numpy(copy=True)
-        close = frame["close"].to_numpy(copy=True)
-        beta = frame["beta_shifted"].to_numpy()
-        turnover = frame["avg_turnover_30d"].to_numpy()
-        valid = (np.isfinite(z) & (np.abs(z) > threshold) & np.isfinite(beta)
-                 & np.isfinite(close) & (close > 0)
-                 & np.isfinite(btc_prices) & (btc_prices > 0)
-                 & np.isfinite(turnover) & np.isfinite(median))
-        scores = np.where(valid, np.abs(z), -np.inf)
-        prev_z = np.r_[np.nan, z[:-1]]
-        prev_beta = np.r_[np.nan, beta[:-1]]
-        right = (np.isfinite(prev_z) & np.isfinite(prev_beta)
-                 & (((prev_z > threshold) & (z > threshold) & (z < prev_z))
-                    | ((prev_z < -threshold) & (z < -threshold) & (z > prev_z))))
-        # 相同分数取字典序小者；持仓并列优先在逐小时循环中处理。
-        better = (scores > best_score) | (
-            np.isfinite(scores) & (scores == best_score) & (symbol < best_symbol))
-        best_score[better] = scores[better]
-        best_symbol[better] = symbol
-        best_right[better] = right[better]
-        for key in entry_columns:
-            best_values[key][better] = frame[key].to_numpy()[better]
-        histories[symbol] = (close, z, scores)
-
-    winners = pd.DataFrame(best_values, index=index)
-    winners["btc_close"] = btc_prices
-    winners["symbol"] = best_symbol
-    winners["right_ready"] = best_right
-    trades, position = [], None
-    begin = utc_timestamp(Config.ENTRY_START)
-    for i, row in enumerate(winners.itertuples()):
-        now = row.Index
-        if begin is not None and now < begin:
-            continue
-        final_bar = i == n - 1
-        has_candidate = np.isfinite(best_score[i])
-        if position is not None:
-            prices, z_values, scores = histories[position["symbol"]]
-            # 必须更新当前持仓币种的价格；冠军可能已经换成另一个币种。
-            update_excursions(position, now, prices[i], btc_prices[i])
-            same_direction = (
-                (position["direction"] == "LONG_ALT" and z_values[i] < -threshold)
-                or (position["direction"] == "SHORT_ALT" and z_values[i] > threshold))
-            still_largest = has_candidate and scores[i] == best_score[i]
-            if not final_bar and still_largest and same_direction:
-                continue
-            reason = ("END_OF_BACKTEST" if final_bar else
-                      "NO_ELIGIBLE_PAIR" if not has_candidate else
-                      "DIRECTION_CHANGED" if still_largest and not same_direction else
-                      "RANK_CHANGED")
-            settled = close_rotation_position(
-                position, now, prices[i], btc_prices[i], z_values[i], reason)
-            trades.append(position)
-            position = None
-            if not settled:
-                # 旧仓未平，不能假装空仓后再开新仓；停止整个单仓组合。
-                break
-        if final_bar or not has_candidate:
-            continue
-        if Config.RIGHT_SIDE_ENTRY and not row.right_ready:
-            continue
-        position = open_rotation_position(row.symbol, row, median[i])
-    return pd.DataFrame(trades, columns=TRADE_COLUMNS)
-
-
-def process_max_deviation(symbols, btc_df, market_median_series):
-    output_csv = result_path("portfolio_trades.csv")
-    if os.path.exists(output_csv):
-        columns = pd.read_csv(output_csv, nrows=0).columns.tolist()
-        if columns != TRADE_COLUMNS:
-            raise ValueError(f"缓存字段不匹配，请删除后重跑: {output_csv}")
-        return
-
-    def iter_indicators():
-        for symbol in tqdm(sorted(set(symbols))):
-            if symbol != Config.BTC_SYMBOL:
-                yield symbol, calculate_indicators(load_kline(symbol), btc_df)
-
-    records = backtest_max_deviation(iter_indicators(), btc_df, market_median_series)
-    atomic_csv(records, output_csv, index=False)
 
 
 # ==========================================
@@ -708,10 +736,6 @@ def run_all_backtests(symbols, data_fingerprints=None, prepared=False):
     btc_df = load_kline(Config.BTC_SYMBOL)
     median = generate_market_median(symbols, btc_df)
     save_evaluation_window(median)
-    if Config.POSITION_MODE == "MAX_DEVIATION":
-        print(f"开始全市场单仓轮换，共 {len(symbols)} 个币种；输出: {Config.OUTPUT_DIR}")
-        process_max_deviation(symbols, btc_df, median)
-        return
     print(f"开始回测配对交易，共 {len(symbols)} 个币种；输出: {Config.OUTPUT_DIR}")
     errors = []
     for symbol in tqdm(symbols):
@@ -741,8 +765,12 @@ def analyze_results():
         return
     all_trades = pd.concat(nonempty, ignore_index=True)
     print("\n" + "=" * 60)
-    hold_label = f"{Config.HOLDING_PERIOD_HOURS}h" if Config.POSITION_MODE == "FIXED_HOLD" else "按排名轮换"
-    print(f"【参数组合评估】 Z: {Config.Z_SCORE_THRESHOLD} | 持仓: {hold_label} | Beta: {Config.BETA_WINDOW_DAYS}d | 信号: {Config.SIGNAL_WINDOW_HOURS}h | 右侧: {Config.RIGHT_SIDE_ENTRY} | 模式: {Config.POSITION_MODE}")
+    print(f"【参数组合评估】 Z: {Config.Z_SCORE_THRESHOLD} | 持仓: {Config.HOLDING_PERIOD_HOURS}h"
+          f" | 长期Beta: {Config.BETA_WINDOW_DAYS}d | 长期信号: {Config.SIGNAL_WINDOW_HOURS}h"
+          f" | 短期Beta: {Config.SHORT_BETA_WINDOW_DAYS}d | 短期信号: {Config.SHORT_SIGNAL_WINDOW_HOURS}h"
+          f" | 短期门槛: {Config.SHORT_EXCESS_THRESHOLD} | 支持bar比例: {Config.SHORT_MIN_BAR_RATIO}"
+          f" | 涨跌最少bar: {Config.SHORT_MIN_REGIME_BARS}"
+          f" | 确认: {Config.SHORT_CONFIRM_MODE} | 时序: {Config.SHORT_CONFIRM_TIMING}")
     print("【配对交易样本统计；不是共享资金账户收益】")
     print(all_trades["status"].value_counts().to_string())
     unresolved = all_trades[all_trades["status"] != "CLOSED"]
@@ -802,16 +830,20 @@ def parameter_run_lock():
 
 
 def build_param_grid():
-    """轮换模式去掉无意义的H维度；重复配置只运行一次。"""
+    """长期组×持仓期×短期组的完整笛卡尔积；只去重，不按主观规则删组合。
+
+    不强制短期窗口/短期Beta小于长期；也不提前删除可能零交易的组合。
+    真正非法的数值在update_params中报FAILED，不会被静默忽略。
+    """
     import itertools
     grid = []
     seen = set()
-    for z, h, b, s, right, mode in itertools.product(
+    for params in itertools.product(
             Config.Z_THRESHOLDS_TO_TEST, Config.HOLDING_PERIODS_TO_TEST,
             Config.BETA_WINDOWS_TO_TEST, Config.SIGNAL_WINDOWS_TO_TEST,
-            Config.RIGHT_SIDE_ENTRIES_TO_TEST, Config.POSITION_MODES_TO_TEST):
-        params = (z, h if mode == "FIXED_HOLD" else Config.HOLDING_PERIOD_HOURS,
-                  b, s, right, mode)
+            Config.SHORT_BETA_WINDOWS_TO_TEST, Config.SHORT_SIGNAL_WINDOWS_TO_TEST,
+            Config.SHORT_EXCESS_THRESHOLDS_TO_TEST, Config.SHORT_MIN_BAR_RATIOS_TO_TEST,
+            Config.SHORT_CONFIRM_MODES_TO_TEST, Config.SHORT_CONFIRM_TIMINGS_TO_TEST):
         if params not in seen:
             grid.append(params)
             seen.add(params)
@@ -825,8 +857,7 @@ def run_parameter_combination(params, symbols, data_fingerprints, config_snapsho
         # spawn不会继承父进程对Config类属性的运行时修改，必须显式传入配置。
         for key, value in config_snapshot.items():
             setattr(Config, key, value)
-        z, h, b, s, right, mode = params
-        Config.update_params(z, h, b, s, right, mode)
+        Config.update_params(*params)
         prepare_run(symbols, data_fingerprints)
 
         # 【修改点 1】：检查当前参数组合是否已经成功运行过
@@ -863,10 +894,14 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
     param_grid = build_param_grid() if param_grid is None else list(dict.fromkeys(param_grid))
     if not param_grid:
         raise ValueError("参数网格为空")
-    for name in ("MAX_WORKERS", "NUMERIC_THREADS_PER_WORKER"):
+    for name in ("MAX_WORKERS", "NUMERIC_THREADS_PER_WORKER", "MAX_GRID_COMBINATIONS"):
         value = getattr(Config, name)
         if isinstance(value, bool) or int(value) != value or value <= 0:
             raise ValueError(f"{name}必须为正整数")
+    if len(param_grid) > Config.MAX_GRID_COMBINATIONS:
+        raise ValueError(
+            f"参数网格共{len(param_grid)}组，超过本轮上限{Config.MAX_GRID_COMBINATIONS}组；"
+            "请缩小搜索列表。程序不会截取网格，以免偏向排列靠前的组合。")
     workers = min(int(Config.MAX_WORKERS), len(param_grid))
     if os.name == "nt":
         workers = min(workers, 61)  # ProcessPoolExecutor在Windows上的进程数上限。
