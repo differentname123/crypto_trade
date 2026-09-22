@@ -121,101 +121,6 @@ TARGET_CONFIGS = [
         "备注": "推荐次数为 1；高平原 SOL 候选。适合第三阶段验证，目前共识度低于 factor_024_1 SOL"
     },
 
-    # # 10000筛选
-    #
-    # # 第一阶段：做数据养号期（核心目标：绝对存活、极高安全垫、曲线平滑）
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 10, "备注": "推荐次数：7；第一阶段做数据（绝对防御底座首选，存活与安全垫全场最强）"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 10, "备注": "推荐次数：3；第一阶段做数据（SOL生态备选长跑王，超200天存活无回撤）"},
-    #
-    # # 第二阶段：带单收割期（核心目标：高频平仓、流水最大化、平原均值高防滑点）
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-    #  "margin": 6, "备注": "推荐次数：6；第二阶段赚分润（极限高频收割机，总收益流水霸榜，适合冲刺表现费）"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-    #  "margin": 7, "备注": "推荐次数：4；第二阶段赚分润（同族因子无缝平滑切换，平原均值全场顶格，容错率最高）"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.025, "tp_step": 0.006,
-    #  "margin": 8, "备注": "推荐次数：3；第二阶段赚分润（收紧加仓间距高频吃单，Margin8提供更高的极端安全容错）"},
-    #
-    # # 第二阶段：备选方案（不换币平替与高净利增强）
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（AAVE不换币平替，保持极高安全垫与净利润，适合大资金稳健收租）"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 6, "备注": "推荐次数：2；第二阶段赚分润（极高净利润增强备选，适合小比例资金搭配对冲）"},
-    #
-    # # 5000筛选
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 9, "备注": "推荐的次数为 7；第一阶段做数据（绝对防御底座首选）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-    #  "margin": 7, "备注": "推荐的次数为 6；第二阶段赚分润（流水与容错综合收益首选）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_3", "direction": "Long", "add_step": 0.030, "tp_step": 0.007,
-    #  "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润（高爆发收割进攻备选）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_024_2", "direction": "Long", "add_step": 0.040, "tp_step": 0.007,
-    #  "margin": 6, "备注": "推荐的次数为 2；第二阶段赚分润（0.040宽距异源因子对冲）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_7", "direction": "Long", "add_step": 0.030, "tp_step": 0.005,
-    #  "margin": 9, "备注": "推荐的次数为 2；第一阶段做数据（近8个月长寿视觉备选）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_2", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 10, "备注": "推荐的次数为 2；第一阶段做数据（SOL本币极限防守备选）"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段做数据（SOL同因子防守备选）"},
-
-    # # 全局筛选
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
-    #  "margin": 6, "备注": "推荐的次数为 5；第二阶段赚分润"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-    #  "margin": 6, "备注": "推荐的次数为 3；第二阶段赚分润"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
-    #  "margin": 8, "备注": "推荐的次数为 3；第一阶段稳定做数据"},
-    #
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
-    #  "margin": 7, "备注": "推荐的次数为 2；第一阶段稳定做数据 1 次，第二阶段赚分润 1 次"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-    #  "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.012,
-    #  "margin": 7, "备注": "推荐的次数为 2；第二阶段赚分润"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
-    #  "margin": 9, "备注": "推荐的次数为 2；第一阶段稳定做数据"},
-    #
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.006,
-    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "LINKUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.011,
-    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "BNBUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.010,
-    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_023_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
-    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "LINKUSDT", "strategy": "factor_024_6", "direction": "Long", "add_step": 0.030, "tp_step": 0.008,
-    #  "margin": 9, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_1", "direction": "Long", "add_step": 0.030, "tp_step": 0.006,
-    #  "margin": 6, "备注": "推荐的次数为 1；第二阶段赚分润"},
-    # {"symbol": "SOLUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.009,
-    #  "margin": 8, "备注": "推荐的次数为 1；第二阶段赚分润"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_10", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
-    #  "margin": 7, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_044_9", "direction": "Long", "add_step": 0.020, "tp_step": 0.007,
-    #  "margin": 10, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_007_1", "direction": "Long", "add_step": 0.020, "tp_step": 0.008,
-    #  "margin": 8, "备注": "推荐的次数为 1；第一阶段稳定做数据"},
-
-    # === 做空 Short ===
-    # {"symbol": "AAVEUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.007,
-    #  "margin": 9},
-    # {"symbol": "AAVEUSDT", "strategy": "factor_043_10", "direction": "Short", "add_step": 0.015, "tp_step": 0.007,
-    #  "margin": 7},
-    # {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.030, "tp_step": 0.008,
-    #  "margin": 9},
-    # {"symbol": "SOLUSDT", "strategy": "factor_043_9", "direction": "Short", "add_step": 0.025, "tp_step": 0.008,
-    #  "margin": 7},
-
     # 做空 高净收益
     {
         "symbol": "NEARUSDT",
@@ -226,7 +131,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 7，最高共识核心策略；适合第一阶段稳定做数据"
     },
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_043_10",
@@ -236,7 +140,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 7，最高共识核心策略；跨币验证较强"
     },
-
     {
         "symbol": "SOLUSDT",
         "strategy": "factor_043_10",
@@ -246,7 +149,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 7，收益增强版本；波动更高"
     },
-
     {
         "symbol": "NEARUSDT",
         "strategy": "factor_043_10",
@@ -256,7 +158,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 3，平原均净利更优秀，偏稳定版本"
     },
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_043_10",
@@ -266,12 +167,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 3，稳定底仓版本"
     },
-
-    # ============================
-    # 第二梯队：高稳定参数区域
-    # factor_043_10 0.018~0.020
-    # ============================
-
     {
         "symbol": "NEARUSDT",
         "strategy": "factor_043_10",
@@ -281,7 +176,6 @@ TARGET_CONFIGS = [
         "margin": 3,
         "备注": "推荐次数 3，参数高原区域，偏长期稳定"
     },
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_043_10",
@@ -291,12 +185,6 @@ TARGET_CONFIGS = [
         "margin": 3,
         "备注": "推荐次数 3，低回撤压舱石版本"
     },
-
-    # ============================
-    # 第三梯队：高收益激进区域
-    # factor_043_9 0.010
-    # ============================
-
     {
         "symbol": "NEARUSDT",
         "strategy": "factor_043_9",
@@ -306,7 +194,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 3，高收益尖峰；收益高但参数敏感"
     },
-
     {
         "symbol": "SOLUSDT",
         "strategy": "factor_043_9",
@@ -316,7 +203,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 3，高频分润版本"
     },
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_043_9",
@@ -326,11 +212,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 3，高收益区域验证"
     },
-
-    # ============================
-    # factor_043_10 0.010~0.012
-    # ============================
-
     {
         "symbol": "SOLUSDT",
         "strategy": "factor_043_10",
@@ -340,7 +221,6 @@ TARGET_CONFIGS = [
         "margin": 10,
         "备注": "推荐次数 2，高利润增强仓"
     },
-
     {
         "symbol": "NEARUSDT",
         "strategy": "factor_043_10",
@@ -350,7 +230,6 @@ TARGET_CONFIGS = [
         "margin": 10,
         "备注": "推荐次数 2，高收益版本"
     },
-
     {
         "symbol": "SOLUSDT",
         "strategy": "factor_043_10",
@@ -360,11 +239,6 @@ TARGET_CONFIGS = [
         "margin": 5,
         "备注": "推荐次数 2，进攻型收益版本"
     },
-
-    # ============================
-    # 其他补充策略
-    # ============================
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_024_8",
@@ -374,7 +248,6 @@ TARGET_CONFIGS = [
         "margin": 9,
         "备注": "推荐次数 2，非043补充策略，用于分散因子风险"
     },
-
     {
         "symbol": "LINKUSDT",
         "strategy": "factor_008_8",
@@ -384,7 +257,6 @@ TARGET_CONFIGS = [
         "margin": 7,
         "备注": "推荐次数 1，补充观察策略"
     },
-
     {
         "symbol": "UNIUSDT",
         "strategy": "factor_043_9",
@@ -394,7 +266,6 @@ TARGET_CONFIGS = [
         "margin": 8,
         "备注": "推荐次数 1，平原均净利较好，收益较低，作为防守观察"
     },
-
     {
         "symbol": "UNIUSDT",
         "strategy": "factor_043_7",
@@ -404,7 +275,6 @@ TARGET_CONFIGS = [
         "margin": 8,
         "备注": "推荐次数 1，低频稳定观察策略"
     },
-
     {
         "symbol": "AAVEUSDT",
         "strategy": "factor_043_2",
@@ -414,7 +284,6 @@ TARGET_CONFIGS = [
         "margin": 8,
         "备注": "推荐次数 1，低风险补充策略"
     }
-
 ]
 
 
@@ -423,7 +292,6 @@ TARGET_CONFIGS = [
 # =====================================================================
 def _parse_filename(filename):
     """解析文件名 -> (symbol, strategy_name, direction)，使用正则匹配增强鲁棒性"""
-    # 匹配规范如: stage1_BTCUSDT_strategy_1_vwap_zscore_Long_xxxxx.pkl
     pattern = r"^stage1_([A-Z0-9]+)_(.+?)_(Long|Short)_"
     match = re.search(pattern, filename)
     if match:
@@ -528,8 +396,8 @@ def print_table(df_display):
         widths.append(w)
     header = " | ".join(right_align(c, widths[i]) for i, c in enumerate(cols))
     sep = "-" * len(header)
-    print(sep);
-    print(header);
+    print(sep)
+    print(header)
     print(sep)
     for _, row in df_display.iterrows():
         print(" | ".join(right_align(format_val(row[c]), widths[i]) for i, c in enumerate(cols)))
@@ -691,11 +559,116 @@ def _normalize_trades_df(trades_df, cycles_df, margin):
     return out, summary
 
 
+def _worker_process_cache_file(fpath, groups, plateau_df, output_dir):
+    """
+    多进程 Worker 函数：处理单个缓存文件，独立完成反序列化、回放与归一化导出。
+    提取到顶层以满足 ProcessPoolExecutor 的序列化(Pickle)要求。
+    """
+    import os
+    import gc
+    import math
+    import numpy as np
+
+    local_summaries = []
+    local_done = set()
+    local_mult_seen = {}
+    logs = []
+
+    fname = os.path.basename(fpath)
+    sym, strat, direct = _parse_filename(fname)
+    direct = str(direct).capitalize()
+
+    try:
+        data = _load_pickle(fpath)
+    except Exception as e:
+        logs.append(f"[警告] 读取失败已跳过: {fname} | {e}")
+        return local_summaries, local_done, local_mult_seen, logs
+
+    attrs = data.get("attrs", {}) or {}
+    add_s = round(float(attrs.get("add_step", -1)), 6)
+    tp_s = round(float(attrs.get("tp_step", -1)), 6)
+    mult = attrs.get("multiplier", None)
+    mult = float(mult) if mult is not None else None
+    key = (sym, strat, direct, add_s, tp_s)
+
+    if key not in groups:
+        del data
+        gc.collect()
+        return local_summaries, local_done, local_mult_seen, logs
+
+    g = groups[key]
+    if g["multiplier"] is not None and mult is not None and not math.isclose(g["multiplier"], mult, abs_tol=1e-6):
+        del data
+        gc.collect()
+        return local_summaries, local_done, local_mult_seen, logs
+
+    local_mult_seen[key] = {mult}
+
+    cycles_df = data.pop("df")
+    cycles_df.attrs = attrs
+    data.clear()
+    del data
+    gc.collect()
+
+    if cycles_df is None or len(cycles_df) == 0:
+        logs.append(f"[警告] cycles 为空: {fname}")
+        del cycles_df
+        gc.collect()
+        return local_summaries, local_done, local_mult_seen, logs
+
+    replayer = TimelineReplayer(cycles_df)
+    for margin in sorted(g["margins"].keys()):
+        meta = g["margins"][margin]
+        try:
+            trades_df = replayer.run(margin)
+            norm_df, summ = _normalize_trades_df(trades_df, cycles_df, margin)
+        except Exception as e:
+            logs.append(f"[警告] 回放/归一化失败: {sym}|{strat}|{direct}|M{margin} | {type(e).__name__}: {e}")
+            continue
+
+        norm_df["symbol"] = sym
+        norm_df["strategy"] = strat
+        norm_df["direction"] = direct
+        norm_df["margin"] = margin
+        norm_df["add_step"] = add_s
+        norm_df["tp_step"] = tp_s
+        norm_df["multiplier"] = mult if mult is not None else np.nan
+
+        mtag = f"_x{mult:g}" if mult is not None else ""
+        out_filename = (f"trades_{sym}_{strat}_{direct}_M{margin}"
+                        f"_add{add_s:.3f}_tp{tp_s:.3f}{mtag}.csv")
+        norm_df.to_csv(os.path.join(output_dir, out_filename), index=False, encoding="utf-8-sig")
+
+        row = {
+            "file": out_filename,
+            "label": _make_label(sym, strat, direct, margin, add_s, tp_s) + mtag,
+            "币种": sym, "策略": strat, "方向": direct, "Margin": margin,
+            "加仓间距": add_s, "止盈间距": tp_s, "加仓倍数": mult,
+            "推荐权重": meta["weight"], "备注": meta["note"],
+        }
+        row.update(summ)
+        row.update(_match_plateau_row(plateau_df, sym, strat, direct, margin, add_s, tp_s, mult))
+
+        local_summaries.append(row)
+        local_done.add((key, margin))
+        logs.append(f"✅ {out_filename} | 笔数={summ['实际开仓数']} "
+                    f"净利={summ['净利润(M倍)']}M 爆仓={summ['爆仓次数']} ratio={summ['pnl换算ratio']}")
+
+        del trades_df, norm_df
+        gc.collect()
+
+    del cycles_df, replayer
+    gc.collect()
+
+    return local_summaries, local_done, local_mult_seen, logs
+
+
 def extract_target_trades_csv(cache_dir=CACHE_DIR,
                               short_cache_dir=SHORT_CACHE_DIR,
                               output_dir="./extracted_trades_csv",
                               target_configs=None,
-                              plateau_csv=None):
+                              plateau_csv=None,
+                              target_csv_list=None):
     """
     针对给定的精选参数组合，独立回放并导出对应的 trades_df 逐笔交易记录 CSV。
     修复要点:
@@ -703,8 +676,59 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
       * 收益统一换算为 M 倍并落盘 pnl_M (禁止后续阶段再猜单位)
       * 记录/校验 multiplier(加仓倍数), 写进文件名, 避免张冠李戴与互相覆盖
       * 附带导出 _single_strategy_index.csv (含平原精确匹配指标 + 推荐权重)
+      * [新增] 支持直接从给定的 CSV 列表加载策略组合，替代 TARGET_CONFIGS
+      * [新增] 引入并发度为 10 的多进程处理，极速榨干 CPU
     """
-    target_configs = target_configs or TARGET_CONFIGS
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    # 默认加载的 CSV 列表
+    if target_csv_list is None:
+        target_csv_list = [
+            r"W:\project\python_project\crypto_trade\app\signal_trade_lite\good_longs.csv",
+            r"W:\project\python_project\crypto_trade\app\signal_trade_lite\good_shorts.csv"
+        ]
+
+    # ---- 0. 解析 CSV 参数文件列表 ----
+    if target_csv_list:
+        loaded_configs = []
+        for csv_file in target_csv_list:
+            if os.path.exists(csv_file):
+                try:
+                    df_csv = pd.read_csv(csv_file)
+                    count = 0
+                    for _, row in df_csv.iterrows():
+                        if pd.isna(row.get("币种")):
+                            continue
+                        cfg = {
+                            "symbol": str(row["币种"]),
+                            "strategy": str(row["策略"]),
+                            "direction": str(row["方向"]),
+                            "add_step": float(row["加仓间距"]),
+                            "tp_step": float(row["止盈间距"]),
+                            "margin": float(row["Margin"]),
+                        }
+                        if "加仓倍数" in row and pd.notna(row["加仓倍数"]):
+                            cfg["multiplier"] = float(row["加仓倍数"])
+                        if "备注" in row and pd.notna(row["备注"]):
+                            cfg["备注"] = str(row["备注"])
+
+                        loaded_configs.append(cfg)
+                        count += 1
+                    print(f"📄 从文件 [{os.path.basename(csv_file)}] 成功加载了 {count} 个参数组合。")
+                except Exception as e:
+                    print(f"❌ 读取参数文件 {csv_file} 失败: {e}")
+            else:
+                print(f"⚠️ 找不到参数文件 (已跳过): {csv_file}")
+
+        if loaded_configs:
+            target_configs = loaded_configs
+            print(f"✅ 共从 CSV 列表加载了 {len(target_configs)} 个目标配置 (已覆盖默认 TARGET_CONFIGS)。\n")
+        else:
+            print("⚠️ CSV列表未加载到有效数据，将回退使用默认的 TARGET_CONFIGS。\n")
+            target_configs = target_configs or TARGET_CONFIGS
+    else:
+        target_configs = target_configs or TARGET_CONFIGS
+
     os.makedirs(output_dir, exist_ok=True)
 
     plateau_df = None
@@ -750,99 +774,45 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
         s, st, d = _parse_filename(os.path.basename(fp))
         if (s, st, str(d).capitalize()) in coarse:
             candidates.append(fp)
-    print(f"📂 缓存文件总数 {len(files)}，按币种/策略/方向粗筛后候选 {len(candidates)} 个，开始逐个加载...\n")
+    print(f"📂 缓存文件总数 {len(files)}，按币种/策略/方向粗筛后候选 {len(candidates)} 个，准备并行处理...\n")
 
-    # ---- 3. 逐候选文件加载一次, 内循环多 Margin ----
+    # ---- 3. 并行加载文件, 内循环多 Margin ----
     done = set()
     summaries = []
     mult_seen = {}
-    for fi, fpath in enumerate(candidates, 1):
-        fname = os.path.basename(fpath)
-        sym, strat, direct = _parse_filename(fname)
-        direct = str(direct).capitalize()
-        try:
-            data = _load_pickle(fpath)
-        except Exception as e:
-            print(f"[警告] 读取失败已跳过: {fname} | {e}")
-            continue
 
-        attrs = data.get("attrs", {}) or {}
-        add_s = round(float(attrs.get("add_step", -1)), 6)
-        tp_s = round(float(attrs.get("tp_step", -1)), 6)
-        mult = attrs.get("multiplier", None)
-        mult = float(mult) if mult is not None else None
-        key = (sym, strat, direct, add_s, tp_s)
+    print(f"🚀 启动多进程并发处理 (并发度 10) ...")
 
-        if key not in groups:
-            del data
-            gc.collect()
-            continue
+    with ProcessPoolExecutor(max_workers=10) as executor:
+        futures = {
+            executor.submit(_worker_process_cache_file, fpath, groups, plateau_df, output_dir): fpath
+            for fpath in candidates
+        }
 
-        g = groups[key]
-        if g["multiplier"] is not None and mult is not None and not math.isclose(g["multiplier"], mult, abs_tol=1e-6):
-            del data
-            gc.collect()
-            continue
-
-        mult_seen.setdefault(key, set()).add(mult)
-        if g["multiplier"] is None and len(mult_seen[key]) > 1:
-            print(f"[⚠ 重要] {key} 在缓存中存在多个加仓倍数 {sorted(x for x in mult_seen[key] if x is not None)}；"
-                  f"已按倍数分别导出，请在 TARGET_CONFIGS 中显式补 'multiplier' 以锁定榜单那一行！")
-
-        cycles_df = data.pop("df")
-        cycles_df.attrs = attrs
-        data.clear();
-        del data
-        gc.collect()
-
-        if cycles_df is None or len(cycles_df) == 0:
-            print(f"[警告] cycles 为空: {fname}")
-            del cycles_df
-            gc.collect()
-            continue
-
-        replayer = TimelineReplayer(cycles_df)
-        for margin in sorted(g["margins"].keys()):
-            meta = g["margins"][margin]
+        for future in as_completed(futures):
+            fpath = futures[future]
             try:
-                trades_df = replayer.run(margin)
-                norm_df, summ = _normalize_trades_df(trades_df, cycles_df, margin)
+                local_summaries, local_done, local_mult_seen, logs = future.result()
             except Exception as e:
-                print(f"[警告] 回放/归一化失败: {sym}|{strat}|{direct}|M{margin} | {type(e).__name__}: {e}")
+                print(f"❌ 进程抛出未捕获异常: {os.path.basename(fpath)} | {e}")
                 continue
 
-            norm_df["symbol"] = sym
-            norm_df["strategy"] = strat
-            norm_df["direction"] = direct
-            norm_df["margin"] = margin
-            norm_df["add_step"] = add_s
-            norm_df["tp_step"] = tp_s
-            norm_df["multiplier"] = mult if mult is not None else np.nan
+            # 聚合结果
+            summaries.extend(local_summaries)
 
-            mtag = f"_x{mult:g}" if mult is not None else ""
-            out_filename = (f"trades_{sym}_{strat}_{direct}_M{margin}"
-                            f"_add{add_s:.3f}_tp{tp_s:.3f}{mtag}.csv")
-            norm_df.to_csv(os.path.join(output_dir, out_filename), index=False, encoding="utf-8-sig")
+            for k, v_set in local_mult_seen.items():
+                mult_seen.setdefault(k, set()).update(v_set)
+                if groups[k]["multiplier"] is None and len(mult_seen[k]) > 1:
+                    print(f"[⚠ 重要] {k} 在缓存中存在多个加仓倍数 {sorted(x for x in mult_seen[k] if x is not None)}；"
+                          f"已按倍数分别导出，请在 TARGET_CONFIGS 中显式补 'multiplier' 以锁定榜单那一行！")
 
-            row = {
-                "file": out_filename,
-                "label": _make_label(sym, strat, direct, margin, add_s, tp_s) + mtag,
-                "币种": sym, "策略": strat, "方向": direct, "Margin": margin,
-                "加仓间距": add_s, "止盈间距": tp_s, "加仓倍数": mult,
-                "推荐权重": meta["weight"], "备注": meta["note"],
-            }
-            row.update(summ)
-            row.update(_match_plateau_row(plateau_df, sym, strat, direct, margin, add_s, tp_s, mult))
-            summaries.append(row)
-            done.add((key, margin))
-            print(f"[{len(done)}/{n_targets}] ✅ {out_filename} | 笔数={summ['实际开仓数']} "
-                  f"净利={summ['净利润(M倍)']}M 爆仓={summ['爆仓次数']} ratio={summ['pnl换算ratio']}")
-
-            del trades_df, norm_df
-            gc.collect()
-
-        del cycles_df, replayer
-        gc.collect()
+            # 为了平滑打印日志进度，我们先更新 done 集合，然后再打印 log
+            done.update(local_done)
+            for log in logs:
+                if log.startswith("✅"):
+                    print(f"[{len(done)}/{n_targets}] {log}")
+                else:
+                    print(log)
 
     # ---- 4. 汇总索引 ----
     if summaries:
@@ -851,7 +821,7 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
 
     missing = [(k, m) for k, g in groups.items() for m in g["margins"] if (k, m) not in done]
     print("\n" + "=" * 70)
-    print(f"🎉 导出完成: {len(done)}/{n_targets} 个，目录: {output_dir}")
+    print(f"🎉 并行导出完成: {len(done)}/{n_targets} 个，目录: {output_dir}")
     print(f"📑 元数据索引: {INDEX_FILE}")
     if missing:
         print(f"⚠️ 未命中 {len(missing)} 个组合(请核对 add/tp/multiplier 与缓存 attrs):")
@@ -866,8 +836,8 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
     plateau_csv 保留用于兼容原接口；本次指标不需要读取平原表。
     已有 is_blowup_flag 优先；只有完全缺少爆仓字段时才按原阈值推断。
     """
+
     def parse_flags(series, filename):
-        # astype(bool) 会把字符串 "False"、"0" 都转换成 True。
         values = series.astype("string").str.strip().str.lower()
         mapping = {
             "true": True, "1": True, "1.0": True,
@@ -942,7 +912,6 @@ def _load_strategy_records(csv_dir, plateau_csv=None):
 
         ok = close_dt.notna() & np.isfinite(pnl)
         if not ok.all():
-            # 缺失收益不能静默填 0，否则会影响盈利窗口率、周期率及排名。
             raise ValueError(f"{fname}: 有 {int((~ok).sum())} 行平仓时间或收益无效，请修复明细")
 
         order = np.argsort(close_dt.to_numpy(), kind="stable")
@@ -1001,44 +970,12 @@ def evaluate_multi_strategy_portfolios(
         filter_roll_profit_win_rate_30=None,
         filter_roll_profit_win_rate_7=None,
         filter_roll_profit_win_rate_1=None,
-        search_mode="exact",
+        search_mode="prune",  # [修改点] 默认开启剪枝搜索
         beam_width=1000,
+        prune_tolerance=0.8,  # [新增] 下限容忍系数
+        prune_metric="calmar",  # [新增] 层级剪枝的核心评估指标：'calmar' 或 'pf'(盈亏比)
 ):
-    """组合回测：结构剪枝的精确搜索 / 按上一层指标选种的近似搜索。
-
-    用法：只替换原文件中的本函数，保留原有 import、常量及其他函数。
-
-    搜索参数：
-      search_mode="exact"：默认；仅剪掉能证明不可能通过的分支，不漏解。
-        同源冲突、共同窗口不足、剩余可兼容成员不足均可向下剪枝。
-        盈利窗口率、四段贡献、周期盈利率、Calmar 不用于淘汰后代。
-      search_mode="beam"：近似；从 K=1 开始，每层保留至多 beam_width
-        个可扩展组合，向下一层加任意兼容成员，再对组合去重。
-        优先保留通过过滤的组合，再按周期盈利率、30日盈利窗口率排序；
-        同分按原成员索引排序。过滤失败的组合仍参与选种，空余名额可保留。
-        当前层全部已评估且通过过滤的组合都进入结果；宽度只限制下一层。
-        不能保证全局最优，CSV 会注明搜索模式及是否穷尽。
-      beam_width：每层可扩展种子的数量上限；仅 beam 模式使用。
-      max_combos=None：默认不设评估预算，不再按理论组合总数提前中止。
-        正整数限制实际进行核心指标评估的候选数，包含 beam 的低阶种子。
-        超限抛出 RuntimeError，本次结果不会写入 CSV，避免误当完整榜单。
-      top_n_per_k：仍然只控制控制台展示数量，不限制搜索或 CSV 行数。
-
-    指标口径与原函数保持一致：
-      * 收益按平仓日计入，包含无交易日；共同窗口含首尾日。
-      * MDD/Calmar 是日末已实现口径，初始收益 0、初始权益 1M。
-      * 完整周期是成员爆仓边界并集上的 (上次爆仓时刻, 下次爆仓时刻]。
-        同日不同时刻分别统计；同一时刻合并；无完整周期返回 NaN。
-      * Profit Factor 使用加权逐笔正负收益；日内不先抵消。
-      * 两两持仓重合忽略方向，在组合共同窗口内按自然日计算。
-      * 四段是共同窗口按时间等分，不是自然季度。
-      * 同源定义仍为 signal_key[:5]，保持原行为（不含 margin/multiplier）。
-      * 每个候选重新按原顺序计算权重和加权收益，不拼接上一层的标量指标，
-        也不改变浮点运算顺序，以免净利 > 0 等边界判定发生变化。
-
-    说明：exact 最坏仍需指数级搜索；默认保留所有通过过滤的结果，
-    因而取消预算并不消除时间和内存成本。beam 明确以覆盖率换取速度。
-    """
+    """组合回测：加入了基于下限容忍的层级剪枝策略，以及精确搜索/近视搜索的支持。"""
     from functools import lru_cache
     import heapq
     count_bits = getattr(int, "bit_count", lambda value: bin(value).count("1"))
@@ -1058,7 +995,6 @@ def evaluate_multi_strategy_portfolios(
         return float("inf") if numerator > 0 else float("nan")
 
     def realized_risk(daily):
-        # 把初始 0 纳入峰值；首日亏损也形成回撤和水下期。
         cum = np.cumsum(daily, dtype=float)
         peak = np.maximum.accumulate(np.r_[0.0, cum])[1:]
         dd = np.maximum(peak - cum, 0.0)
@@ -1091,15 +1027,14 @@ def evaluate_multi_strategy_portfolios(
         profits = np.zeros(count, dtype=float)
         for i, weight in zip(indices, weights):
             times, prefix, _ = event_data[i]
-            # C(t) 包含时刻 t 的全部平仓；C(b)-C(a) 正好对应 (a,b]。
             positions = np.searchsorted(times, boundaries, side="right")
             profits += weight * np.diff(prefix[positions])
         return count, float(np.mean(profits > 0) * 100.0), float(profits.mean())
 
     if weight_mode not in ("equal", "recommend"):
         raise ValueError("weight_mode 只能为 'equal' 或 'recommend'")
-    if search_mode not in ("exact", "beam"):
-        raise ValueError("search_mode 只能为 'exact' 或 'beam'")
+    if search_mode not in ("exact", "beam", "prune"):
+        raise ValueError("search_mode 只能为 'exact', 'beam' 或 'prune'")
     for name, value, minimum in (
             ("min_k", min_k, 1), ("max_k", max_k, 1),
             ("top_n_per_k", top_n_per_k, 0),
@@ -1135,7 +1070,6 @@ def evaluate_multi_strategy_portfolios(
     if weight_mode == "recommend" and (not np.isfinite(base_w).all() or np.any(base_w <= 0)):
         raise ValueError("recommend 模式要求所有推荐权重均为有限正数")
 
-    # 缺少足够天数时，启用的窗口率/四段贡献必为 NaN；后代窗口只会更短。
     required_days = max(
         [min_overlap_days] +
         [days for days, threshold in filters.items() if threshold is not None] +
@@ -1158,6 +1092,8 @@ def evaluate_multi_strategy_portfolios(
     print(f"搜索模式 {search_mode} | 理论组合 {total_combos:,} | 实际评估预算 {budget_text}")
     if search_mode == "beam":
         print(f"近似搜索：每层保留至多 {beam_width:,} 个可扩展种子，可能遗漏优质组合。")
+    elif search_mode == "prune":
+        print(f"层级剪枝搜索：每一层的高维组合，基于核心指标({prune_metric})必须 ≥ 0.8×[其最差直系父组合指标]")
     print("=" * 112)
 
     g_start = min(pd.Timestamp(r["open_dt"].min()) for r in records).normalize()
@@ -1190,23 +1126,18 @@ def evaluate_multi_strategy_portfolios(
         HOLD[i] = np.cumsum(d_hold)[:T] > 0
         fl = r.get("float_loss")
         if fl is not None and len(fl) == len(p) and np.any(fl > 0):
-            # 仅为原辅助字段保留的持仓区间最大浮亏代理，不是 MTM 曲线。
             d_float = np.zeros(T + 1)
             np.add.at(d_float, si, fl)
             np.add.at(d_float, ei + 1, -fl)
             FLOAT[i] = np.maximum(np.cumsum(d_float)[:T], 0.0)
 
         first_i[i], last_i[i] = int(si.min()), int(ei.max())
-        # 保留实际平仓时间，避免 BLOWUP 日布尔矩阵丢失同日多个边界。
         order = np.argsort(closes.asi8, kind="stable")
         times = closes.asi8[order]
         prefix = np.r_[0.0, np.cumsum(p[order], dtype=float)]
         flags = np.asarray(r["is_blowup"], dtype=bool)[order]
         event_data.append((times, prefix, np.unique(times[flags])))
 
-    # 兼容图：有边表示二者可以同时出现在满足结构约束的组合中。
-    # 对一维日期区间，所有两两交集长度 >= L 等价于整体交集长度 >= L：
-    # 整体左端点和右端点各来自某个成员，它们之间也必须兼容。
     sig_keys = [r["signal_key"][:5] for r in records]
     active = [i for i in range(N) if last_i[i] - first_i[i] + 1 >= required_days]
     active_mask = sum(1 << i for i in active)
@@ -1234,8 +1165,6 @@ def evaluate_multi_strategy_portfolios(
         print("[提示] 不同信号源数量不足，无法构建组合。")
         return
 
-    # 窗口也是缓存键的一部分；不同组合的共同窗口可能不同。
-    # 使用有界缓存，避免随着组合数量增长而无限保存成员/对子统计。
     @lru_cache(maxsize=20000)
     def member_risk(i, lo, hi):
         return realized_risk(PNL[i, lo:hi + 1])
@@ -1246,7 +1175,6 @@ def evaluate_multi_strategy_portfolios(
         union = int(np.count_nonzero(hold_a | hold_b))
         return float(np.count_nonzero(hold_a & hold_b) / union) if union else 0.0
 
-    # 保留旧 CSV 的方向签名重合代理；它不是收益相关系数。
     CORR = np.full((N, N), np.nan)
     for i, j in itertools.combinations(active, 2):
         if not (compatible[i] & (1 << j)):
@@ -1264,7 +1192,6 @@ def evaluate_multi_strategy_portfolios(
     beam_discarded = 0
 
     def exact_candidates(target_k):
-        """按原 itertools.combinations 的顺序，只生成结构可行的候选。"""
         def visit(chosen, candidates, lo, hi):
             nonlocal insufficient_branches
             need = target_k - len(chosen)
@@ -1284,7 +1211,6 @@ def evaluate_multi_strategy_portfolios(
                 if need == 1:
                     yield child, child_lo, child_hi
                 else:
-                    # candidates 只含更大索引，保证不重复；交集继承所有父级约束。
                     yield from visit(child, candidates & compatible[i], child_lo, child_hi)
 
         yield from visit((), active_mask, 0, T - 1)
@@ -1339,7 +1265,6 @@ def evaluate_multi_strategy_portfolios(
         if not passed and not need_rank:
             return None
 
-        # beam 的失败候选也可当种子；不能在过滤失败时直接剪掉全部后代。
         boundaries = np.unique(np.concatenate([window_blowups(i, lo, hi) for i in ii]))
         cycle_count, cycle_win, cycle_mean = cycle_stats(ii, w, boundaries)
         return {
@@ -1372,19 +1297,16 @@ def evaluate_multi_strategy_portfolios(
         best_calmar = max(member_calmars) if member_calmars else float("nan")
         best_net = max(m["net"] for m in member_metrics)
 
-        pair_overlaps = [pair_overlap(a, b, lo, hi)
-                         for a, b in itertools.combinations(ii, 2)]
+        pair_overlaps = [pair_overlap(a, b, lo, hi) for a, b in itertools.combinations(ii, 2)]
         mean_overlap = float(np.mean(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
         max_overlap = float(np.max(pair_overlaps) * 100.0) if pair_overlaps else float("nan")
 
-        # 继续保留原 CSV 的辅助指标，不在控制台占用展示空间。
         mk = month_key[sl]
         monthly = np.bincount(mk - mk[0], weights=daily)
         monthly_nonzero = monthly[monthly != 0]
         conc = HOLD[ii, sl].sum(axis=0)
         float_sum = (FLOAT[ii, sl] * w[:, None]).sum(axis=0)
-        cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2)
-                 if np.isfinite(CORR[a, b])]
+        cvals = [CORR[a, b] for a, b in itertools.combinations(ii, 2) if np.isfinite(CORR[a, b])]
         symbol_weights = {}
         for i, weight in zip(ii, w):
             sym = records[i]["symbol"]
@@ -1415,8 +1337,7 @@ def evaluate_multi_strategy_portfolios(
             "最长无盈利(天)": _max_true_run(daily <= 0),
             "最差单日(M)": float(daily.min()),
             "最差单月(M)": float(monthly_nonzero.min()) if len(monthly_nonzero) else 0.0,
-            "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0)
-            if len(monthly_nonzero) else 0.0,
+            "盈利月占比(%)": float(np.mean(monthly_nonzero > 0) * 100.0) if len(monthly_nonzero) else 0.0,
             "后半段净利占比(%)": (net - half_net) / net * 100.0 if net != 0 else np.nan,
             "峰值合计浮亏(M)": float(float_sum.max()),
             "平均合计浮亏(M)": float(float_sum.mean()),
@@ -1431,7 +1352,6 @@ def evaluate_multi_strategy_portfolios(
             "_lo": lo, "_hi": hi, "_idx": ",".join(map(str, ii)),
         }
         row.update({f"Q{j + 1}利润贡献(%)": value for j, value in enumerate(q_ratios)})
-        # 旧列名仅作兼容别名，数值全部使用新口径；控制台使用新名称。
         row.update({
             "组合持仓重合度": mean_overlap / 100.0,
             "盈亏比": pf, "组合回撤(M)": risk["mdd"],
@@ -1450,8 +1370,8 @@ def evaluate_multi_strategy_portfolios(
                 if core is not None:
                     results.append(make_row(core))
             print(f"K={k}：评估 {processed - before:,} 个结构可行候选")
-    else:
-        # 每个种子仅保存成员、窗口和可加成员掩码，不保存整条日收益数组。
+
+    elif search_mode == "beam":
         frontier = [((), 0, T - 1, active_mask)]
         for k in range(1, max_k + 1):
             seen = set()
@@ -1470,8 +1390,6 @@ def evaluate_multi_strategy_portfolios(
                     seen.add(idxs)
                     lo = max(parent_lo, int(first_i[i]))
                     hi = min(parent_hi, int(last_i[i]))
-                    # 复用父级的完整兼容集，不能用循环中逐渐消耗的 candidates，
-                    # 也不能只加更大索引，否则会产生额外顺序偏差。
                     child_mask = parent_mask & compatible[i]
                     if k < min_k and count_bits(child_mask) < min_k - k:
                         insufficient_branches += 1
@@ -1483,11 +1401,9 @@ def evaluate_multi_strategy_portfolios(
                     if not can_expand:
                         continue
 
-                    # 排名只影响选种，不把低分/过滤失败误称为不可能变好的组合。
                     cycle_score = core["cycle_win"] if np.isfinite(core["cycle_win"]) else -1.0
                     roll_score = core["win_30"] if np.isfinite(core["win_30"]) else -1.0
-                    priority = (int(core["passed"]), cycle_score, roll_score,
-                                tuple(-j for j in idxs))
+                    priority = (int(core["passed"]), cycle_score, roll_score, tuple(-j for j in idxs))
                     item = (priority, (idxs, lo, hi, child_mask))
                     expandable_count += 1
                     if len(next_heap) < beam_width:
@@ -1497,22 +1413,122 @@ def evaluate_multi_strategy_portfolios(
 
             discarded = expandable_count - len(next_heap)
             beam_discarded += discarded
-            print(f"K={k}：评估 {processed - before:,} 个候选 | "
-                  f"下层种子 {len(next_heap):,} | 近似淘汰种子 {discarded:,}")
+            print(
+                f"K={k}：评估 {processed - before:,} 个候选 | 下层种子 {len(next_heap):,} | 近似淘汰种子 {discarded:,}")
             frontier = sorted((item[1] for item in next_heap), key=lambda node: node[0])
             if not frontier:
                 break
 
-    exhaustive = beam_discarded == 0
-    coverage_text = "已穷尽所有结构可行候选" if exhaustive else "近似搜索，未穷尽全部候选"
+    elif search_mode == "prune":
+        # ======================================================================
+        # 新增的核心逻辑：基于容忍下限的高阶组合前向剪枝搜索
+        # 无需维持巨大的seen集合，利用位运算严格保证组合拓展无重复。
+        # 记录每一层合法组合的核心指标，如果某个父组合已经被剪枝，或者当前
+        # 新产生的K阶组合相对其父节点回落过大（下限容忍度），则废弃不繁衍。
+        # ======================================================================
+        combo_metrics_cache = {}
+        # 初始 BFS 边缘: (已选中的节点元组, 共同窗口左端点, 共同窗口右端点, 剩余候选集Mask)
+        frontier = [((), 0, T - 1, active_mask)]
+
+        for k in range(1, max_k + 1):
+            next_frontier = []
+            before = processed
+
+            for chosen, parent_lo, parent_hi, parent_mask in frontier:
+                candidates = parent_mask
+                while candidates:
+                    bit = candidates & -candidates
+                    candidates ^= bit  # 剔除已取出的位，防止(i, j)与(j, i)的重复
+                    i = bit.bit_length() - 1
+                    idxs = chosen + (i,)
+
+                    # 1. 回溯查询 K-1 阶所有直系父节点的指标
+                    if k > 1:
+                        parent_metrics = []
+                        valid_parents = True
+                        for p_idxs in itertools.combinations(idxs, k - 1):
+                            if p_idxs not in combo_metrics_cache:
+                                valid_parents = False
+                                break
+                            parent_metrics.append(combo_metrics_cache[p_idxs])
+
+                        # 只要有一个父组合之前因为没达标被剪枝了，子组合也无资格繁衍
+                        if not valid_parents:
+                            insufficient_branches += 1
+                            continue
+                        min_parent_metric = min(parent_metrics)
+                    else:
+                        min_parent_metric = None
+
+                    # 获取新的交集约束
+                    child_mask = candidates & compatible[i]
+                    lo = max(parent_lo, int(first_i[i]))
+                    hi = min(parent_hi, int(last_i[i]))
+
+                    if k < min_k and count_bits(child_mask) < min_k - k:
+                        insufficient_branches += 1
+                        continue
+
+                    core = evaluate_core(idxs, lo, hi, need_rank=True)
+                    if core is None:
+                        continue
+
+                    # 2. 提取核心指标
+                    if prune_metric.lower() == "calmar":
+                        risk = realized_risk(core["daily"])
+                        metric_val = risk["calmar"]
+                        if np.isnan(metric_val):
+                            metric_val = -np.inf
+                    else:
+                        # 退化备用为 Profit Factor (盈亏比)
+                        sl = core["sl"]
+                        w = core["w"]
+                        gp = float((POS[list(idxs), sl] * w[:, None]).sum())
+                        gl = float((NEG[list(idxs), sl] * w[:, None]).sum())
+                        metric_val = ratio(gp, abs(gl))
+                        if np.isnan(metric_val):
+                            metric_val = 0.0
+
+                    # 3. 容忍下限验证
+                    if k > 1 and min_parent_metric is not None:
+                        # 兼容处理指标出现负数的防错（若最差父级为负，应当放宽下限）
+                        if min_parent_metric > 0:
+                            threshold = prune_tolerance * min_parent_metric
+                        else:
+                            # e.g., 若容忍系数0.8，父代-10，则下限降至 -12，允许进一步恶化一丢丢
+                            threshold = min_parent_metric * (2.0 - prune_tolerance)
+
+                        # 若指标触发了断崖式恶化，直接不让它繁衍下一层
+                        if metric_val < threshold:
+                            beam_discarded += 1
+                            continue
+
+                    # 4. 保留“半成品”数据至缓存
+                    combo_metrics_cache[idxs] = metric_val
+
+                    # 若组合达标，则推入结果报告中
+                    if k >= min_k and core["passed"]:
+                        results.append(make_row(core))
+
+                    # 把满足基础繁衍条件的推入下层
+                    if k < max_k and bool(child_mask):
+                        next_frontier.append((idxs, lo, hi, child_mask))
+
+            print(
+                f"K={k}：评估 {processed - before:,} 个候选 | 容忍下限剪枝淘汰 {beam_discarded:,} | 下层种子 {len(next_frontier):,}")
+            frontier = next_frontier
+            if not frontier:
+                break
+
+    exhaustive = (search_mode == "exact") or (beam_discarded == 0)
+    coverage_text = "已穷尽所有结构可行候选" if exhaustive else "执行剪枝搜索，未穷尽全部候选"
     print(f"\n搜索统计：实际评估 {processed:,} | {coverage_text}")
-    print(f"候选不足分支 {insufficient_branches:,} | 近似淘汰种子 {beam_discarded:,}")
+    print(f"候选不足分支 {insufficient_branches:,} | 剪枝/近似淘汰种子 {beam_discarded:,}")
     print("已评估目标组合的过滤统计：" + " | ".join(f"{name} {count:,}" for name, count in skipped.items()))
     if not results:
         print("[提示] 本次搜索未发现通过当前过滤条件的组合。")
         return
 
-    # 两种搜索模式都按原 K、成员索引顺序打破完全同分，保持可复现。
     results.sort(key=lambda row: (row["组合数量(K)"], tuple(map(int, row["_idx"].split(",")))))
     df_all = pd.DataFrame(results)
     df_all["_scan_order"] = np.arange(len(df_all))
@@ -1577,9 +1593,7 @@ def evaluate_multi_strategy_portfolios(
                 m = member_risk(i, lo, hi)
                 _, member_win, _ = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
 
-                # 获取原成员标识
                 member_label = records[i]["label"]
-                # 记录全局唯一的名称映射
                 if member_label not in member_alias_map:
                     member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
 
@@ -1608,8 +1622,163 @@ def evaluate_multi_strategy_portfolios(
     return df_all
 
 
+def print_ranking_report_from_csv(
+        ranking_csv="portfolio_multi_ranking.csv",
+        csv_dir="./extracted_trades_csv",
+        top_n_per_k=5
+):
+    """
+    独立打印函数：从已生成的 CSV 中直接读取排名，
+    并提取对应的明细重构窗口内的成员指标，免去重新搜索。
+    """
+    import os
+    import pandas as pd
+    import numpy as np
+
+    if not os.path.exists(ranking_csv):
+        print(f"❌ 找不到排名文件: {ranking_csv}，请确认文件名或路径。")
+        return
+
+    df_all = pd.read_csv(ranking_csv)
+    if df_all.empty:
+        print("❌ 排名文件为空。")
+        return
+
+    print("正在加载明细以重构成员数据 (这只需要几秒钟)...")
+    records, _ = _load_strategy_records(csv_dir)
+    label_to_idx = {r["label"]: i for i, r in enumerate(records)}
+
+    if not records:
+        print("❌ 找不到单策略明细，无法重构成指标。")
+        return
+
+    # 重建时间轴基准，用于对齐窗口
+    g_start = min(pd.Timestamp(r["open_dt"].min()) for r in records).normalize()
+    g_end = max(pd.Timestamp(r["close_dt"].max()) for r in records).normalize()
+    all_days = pd.date_range(g_start, g_end, freq="D")
+    T = len(all_days)
+    day_ns = pd.date_range(g_start, periods=T + 1, freq="D").asi8
+
+    PNL = np.zeros((len(records), T))
+    event_data = []
+
+    for i, r in enumerate(records):
+        opens = pd.DatetimeIndex(r["open_dt"])
+        closes = pd.DatetimeIndex(r["close_dt"])
+        si = np.asarray((opens.normalize() - g_start).days, dtype=np.int64)
+        ei = np.asarray((closes.normalize() - g_start).days, dtype=np.int64)
+        si = np.minimum(si, ei)
+        p = np.asarray(r["pnl"], dtype=float)
+        np.add.at(PNL[i], ei, p)
+
+        order = np.argsort(closes.asi8, kind="stable")
+        times = closes.asi8[order]
+        prefix = np.r_[0.0, np.cumsum(p[order], dtype=float)]
+        flags = np.asarray(r["is_blowup"], dtype=bool)[order]
+        event_data.append((times, prefix, np.unique(times[flags])))
+
+    def member_risk(i, lo, hi):
+        daily = PNL[i, lo:hi + 1]
+        cum = np.cumsum(daily, dtype=float)
+        peak = np.maximum.accumulate(np.r_[0.0, cum])[1:]
+        dd = np.maximum(peak - cum, 0.0)
+        net = float(cum[-1])
+        annual = net * DAYS_PER_YEAR / len(daily)
+        mdd = float(dd.max())
+        calmar = (annual / mdd) if mdd > 0 else (float("inf") if net > 0 else float("nan"))
+        return {"net": net, "mdd": mdd, "calmar": calmar}
+
+    def window_blowups(i, lo, hi):
+        boundaries = event_data[i][2]
+        a = np.searchsorted(boundaries, day_ns[lo], side="left")
+        b = np.searchsorted(boundaries, day_ns[hi + 1], side="left")
+        return boundaries[a:b]
+
+    def cycle_stats(indices, weights, boundaries):
+        count = len(boundaries) - 1
+        if count <= 0:
+            return 0, float("nan")
+        profits = np.zeros(count, dtype=float)
+        for i, weight in zip(indices, weights):
+            times, prefix, _ = event_data[i]
+            positions = np.searchsorted(times, boundaries, side="right")
+            profits += weight * np.diff(prefix[positions])
+        return count, float(np.mean(profits > 0) * 100.0)
+
+    def fmt(value, digits=2, suffix=""):
+        if pd.isna(value): return "N/A"
+        if np.isposinf(value): return "∞" + suffix
+        if np.isneginf(value): return "-∞" + suffix
+        return f"{value:.{digits}f}" + suffix
+
+    member_alias_map = {}
+
+    # 按照 K 的大小进行分组打印
+    for k in sorted(df_all["组合数量(K)"].unique()):
+        df_k = df_all[df_all["组合数量(K)"] == k].head(top_n_per_k)
+        if df_k.empty:
+            continue
+
+        print("\n" + "=" * 112)
+        print(f"🏆 【{k} 策略组合】历史排名记录读取 TOP {len(df_k)}")
+        print("=" * 112)
+
+        for rank, (_, r) in enumerate(df_k.iterrows(), 1):
+            print(
+                f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 | 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
+            print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
+            print(
+                f"   分散化系数 {fmt(r['分散化系数'], 3)} | 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} | 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
+            print(
+                f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M | 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 | Profit Factor {fmt(r['Profit Factor'])}")
+            print(
+                f"   已实现风险 | 最大回撤 {fmt(r['已实现MDD(M)'])} M | 相对最大回撤 {fmt(r['相对已实现MDD(%)'], suffix='%')} | 最长水下期 {int(r['最长水下期(天)'])} 天 | 已实现 Calmar {fmt(r['已实现Calmar'])}")
+            print(
+                f"   滚动尾部 | 最差7日收益 {fmt(r['最差7日收益(M)'])} M | 最差30日收益 {fmt(r['最差30日收益(M)'])} M | 最差90日收益 {fmt(r['最差90日收益(M)'])} M")
+            print(
+                f"   时间稳定性 | 7日盈利窗口率 {fmt(r['7日盈利窗口率(%)'], suffix='%')} | 30日盈利窗口率 {fmt(r['30日盈利窗口率(%)'], suffix='%')}")
+            print(f"   四段利润贡献 | {r['四段净利分布']} | 最低阶段贡献 {fmt(r['最低阶段贡献(%)'], 1, suffix='%')}")
+
+            # 解析组合对应的单策略标签
+            labels = str(r["组合策略清单"]).split("  ➕  ")
+
+            # 定位时间窗口索引
+            lo_dt = pd.Timestamp(r['重叠起']).normalize()
+            hi_dt = pd.Timestamp(r['重叠止']).normalize()
+            lo = (lo_dt - g_start).days
+            hi = (hi_dt - g_start).days
+
+            rows = []
+            for lbl in labels:
+                lbl = lbl.strip()
+                if lbl not in label_to_idx:
+                    print(f"   [警告] 缓存中找不到策略 {lbl}，略过其详情打印。")
+                    continue
+
+                i = label_to_idx[lbl]
+                m = member_risk(i, lo, hi)
+                _, member_win = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
+
+                if lbl not in member_alias_map:
+                    member_alias_map[lbl] = f"成员{len(member_alias_map) + 1}"
+
+                rows.append({
+                    "成员": lbl,
+                    "成员编号": member_alias_map[lbl],
+                    "窗口净利(M)": fmt(m["net"]),
+                    "已实现MDD(M)": fmt(m["mdd"]),
+                    "已实现Calmar": fmt(m["calmar"]),
+                    "周期盈利率(%)": fmt(member_win),
+                })
+
+            if rows:
+                df_print = pd.DataFrame(rows)
+                display_cols = ["成员", "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
+                print_table(df_print[display_cols])
+        print()
+
 if __name__ == "__main__":
-    PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau_back.csv"  # 若无平原表填 None
+    PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
 
     # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
     extract_target_trades_csv(
@@ -1631,4 +1800,9 @@ if __name__ == "__main__":
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
+        search_mode="prune",  # 使用最新集成的层级容忍剪枝算法
+        prune_tolerance=0.8,  # 指标回落容忍度，0.8代表允许最大20%回撤
+        prune_metric="calmar",  # 核心评估指标 (可选 "calmar" 或 "pf")
     )
+
+    # print_ranking_report_from_csv()
