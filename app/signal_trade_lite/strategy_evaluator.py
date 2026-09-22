@@ -779,13 +779,14 @@ def compute_parameter_plateau(
         "单日胜率(%)": "单日胜率_val",
         "7日滚动胜率(%)": "七日胜率_val",
         "30日滚动胜率(%)": "三十日胜率_val",
+        "翻倍所需时间(小时)": "翻倍耗时_val",
     }
     for old_col, new_col in col_map.items():
         if old_col in df.columns and new_col not in df.columns:
             df[new_col] = df[old_col]
 
     # 防御性填充，防止宽表中确实不存在某些列导致后续报错
-    for req_col in ["单日胜率_val", "七日胜率_val", "三十日胜率_val"]:
+    for req_col in ["单日胜率_val", "七日胜率_val", "三十日胜率_val", "翻倍耗时_val"]:
         if req_col not in df.columns:
             df[req_col] = 0.0
 
@@ -811,6 +812,9 @@ def compute_parameter_plateau(
     df["_clean_单日胜率"] = pd.to_numeric(df["单日胜率_val"], errors="coerce").fillna(0.0)
     df["_clean_七日胜率"] = pd.to_numeric(df["七日胜率_val"], errors="coerce").fillna(0.0)
     df["_clean_三十日胜率"] = pd.to_numeric(df["三十日胜率_val"], errors="coerce").fillna(0.0)
+
+    # 【核心调整】将未能翻倍的 nan 耗时直接视为无限大 (np.inf)
+    df["_clean_翻倍耗时"] = pd.to_numeric(df["翻倍耗时_val"], errors="coerce").fillna(np.inf)
 
     # =========================================================================
     # 计算 "最低Q净利占比(%)"
@@ -890,6 +894,7 @@ def compute_parameter_plateau(
         win_1d_arr = g_df["_clean_单日胜率"].values
         win_7d_arr = g_df["_clean_七日胜率"].values
         win_30d_arr = g_df["_clean_三十日胜率"].values
+        ttd_arr = g_df["_clean_翻倍耗时"].values
 
         # 对当前组下的每个唯一参数网格点求其邻域
         for _, row in sub_grids.iterrows():
@@ -918,6 +923,7 @@ def compute_parameter_plateau(
                 nb_win_1d = win_1d_arr[neighbor_mask]
                 nb_win_7d = win_7d_arr[neighbor_mask]
                 nb_win_30d = win_30d_arr[neighbor_mask]
+                nb_ttd = ttd_arr[neighbor_mask]
 
                 mean_pnl = float(np.mean(nb_pnl))
                 mean_gross = float(np.mean(nb_gross))
@@ -944,6 +950,9 @@ def compute_parameter_plateau(
 
                 mean_win_30d = float(np.mean(nb_win_30d))
                 min_win_30d = float(np.min(nb_win_30d))
+
+                # 【核心调整】不剔除有效记录，直接求均值。若 nb_ttd 内含有 np.inf，均值将自动等于 np.inf
+                mean_ttd = float(np.mean(nb_ttd))
             else:
                 mean_pnl = 0.0
                 mean_gross = 0.0
@@ -961,6 +970,7 @@ def compute_parameter_plateau(
                 min_win_7d = 0.0
                 mean_win_30d = 0.0
                 min_win_30d = 0.0
+                mean_ttd = float('inf')
 
             res = {c: row[c] for c in (group_keys + dim_cols)}
             res.update({
@@ -975,6 +985,7 @@ def compute_parameter_plateau(
                 "平原最小30日胜率(%)": round(min_win_30d, 2),
                 "平原均最低Q净利占比(%)": round(mean_min_q, 2),
                 "平原最小最低Q净利占比(%)": round(min_min_q, 2),
+                "平原均翻倍耗时(小时)": round(mean_ttd, 2) if not np.isinf(mean_ttd) else np.inf,
                 "平原均总收益(M倍)": round(mean_gross, 2),
                 "平原存活安全垫(天)": round(surv_cushion, 2),
                 "平原存活率(%)": round(surv_rate, 2),
@@ -992,9 +1003,10 @@ def compute_parameter_plateau(
 
     # 清理过程生成的临时列
     drop_temp_cols = ["净利_val", "总收益_val", "预期存活_val", "中位存活_val", "最长无盈利_val",
-                      "单日胜率_val", "七日胜率_val", "三十日胜率_val",
+                      "单日胜率_val", "七日胜率_val", "三十日胜率_val", "翻倍耗时_val",
                       "_clean_预期存活", "_clean_中位存活", "_clean_净利", "_clean_总收益",
-                      "_clean_最长无盈利", "_clean_单日胜率", "_clean_七日胜率", "_clean_三十日胜率"] + idx_cols
+                      "_clean_最长无盈利", "_clean_单日胜率", "_clean_七日胜率", "_clean_三十日胜率",
+                      "_clean_翻倍耗时"] + idx_cols
     df_final.drop(columns=[c for c in drop_temp_cols if c in df_final.columns], inplace=True)
 
     # 5. 存储为新的 CSV 文件
@@ -1071,6 +1083,7 @@ def show_leaderboard_csv(
 
     try:
         df_all = pd.read_csv(csv_file)
+        df_all["score"] = df_all["净利润(Margin倍数)"] * df_all["净利润(Margin倍数)"] * df_all["净利润(Margin倍数)"] / df_all["总收益(Margin倍数)"]
     except Exception as e:
         print(f"[错误] 读取 CSV 失败: {e}")
         return
