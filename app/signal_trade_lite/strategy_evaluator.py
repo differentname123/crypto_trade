@@ -743,6 +743,9 @@ def analyze_all_strategies(*, max_tasks_per_child=10, print_details=True):
     print(f"控制台榜单用时: {time.perf_counter() - display_started:.1f}s")
 
 
+import pandas as pd
+import numpy as np
+
 def compute_parameter_plateau(
         csv_file: str,
         output_csv: str = None,
@@ -964,6 +967,7 @@ def compute_parameter_plateau(
                 p90_no_profit = float(np.percentile(nb_no_profit, 90))
 
                 min_pnl = float(np.min(nb_pnl))
+                median_pnl = float(np.median(nb_pnl))
                 mean_min_q = float(np.mean(nb_min_q))
                 min_min_q = float(np.min(nb_min_q))
                 mean_win_1d = float(np.mean(nb_win_1d))
@@ -982,6 +986,7 @@ def compute_parameter_plateau(
                 p90_no_profit = 0.0
 
                 min_pnl = 0.0
+                median_pnl = 0.0
                 mean_min_q = 0.0
                 min_min_q = 0.0
                 mean_win_1d = 0.0
@@ -996,6 +1001,7 @@ def compute_parameter_plateau(
             res.update({
                 "全币邻居数": n_neighbors,
                 "平原均净利(M倍)": round(mean_pnl, 2),
+                "平原中位净利(M倍)": round(median_pnl, 2),
                 "平原最小净利(M倍)": round(min_pnl, 2),
                 "平原均单日胜率(%)": round(mean_win_1d, 2),
                 "平原最小单日胜率(%)": round(min_win_1d, 2),
@@ -1041,6 +1047,14 @@ def compute_parameter_plateau(
     print(f"✅ 平原分析完成！新文件已包含平原维度指标与优势得分(最高12分)，总行数: {len(df_final):,}\n")
     return df_final
 
+
+import os
+import pandas as pd
+import numpy as np
+import unicodedata
+import re
+
+
 def show_leaderboard_csv(
         csv_file="strategy_leaderboard_15600_files.csv",
         direction="both",
@@ -1055,11 +1069,11 @@ def show_leaderboard_csv(
         # 解释：防止出现“死扛策略”。有些策略看似胜率100%、没有回撤，其实是因为被套牢了几个月死不平仓。限制最大持仓天数能剔除这种虚假繁荣。
 
         # ------------------- 自身收益指标（针对当前币种+当前精确参数） -------------------
-        min_median_survival_days=60,
+        min_median_survival_days=1,
         # 【自身属性】当前配置下的中位数存活天数下限（天）。
         # 解释：只看这特定的一行数据（比如 BTC，加仓0.02，止盈0.03），它自身每次跑策略直到爆仓（或回测结束）的寿命中位数必须达标。要求它自己本身是个“长寿”的策略。
 
-        min_net_profit=-1000,
+        min_net_profit=20,
         # 【自身属性】单行数据的净利润底线（单位：Margin倍数）。
         # 解释：1.0代表赚了1倍的本金（保证金）。-1000代表最多允许亏损1000倍本金。这里设为负数通常是作为宽容的底线，把兜底任务交给下面的总收益和平原指标。
 
@@ -1067,7 +1081,7 @@ def show_leaderboard_csv(
         # 【自身属性】单行数据的总收益下限（单位：Margin倍数）。
         # 解释：过滤掉那些“虽然很安全没亏钱，但也根本赚不到什么钱”的“磨洋工”策略，要求必须有一定打钱能力。
 
-        min_median_outperform_count=10,
+        min_median_outperform_count=9,
         # 【自身属性】中位指标超越数下限（满分12）。
         # 解释：要求该参数组合在各项中位数指标对比中，至少有一定数量的指标超越同类基准线，体现综合优势。
 
@@ -1076,7 +1090,7 @@ def show_leaderboard_csv(
         # 【平原属性】参与平原计算的有效“全币邻居数”下限。
         # 解释：参数空间是3维的(Margin,加仓间距,止盈间距)，上下浮动一格会形成 3x3x3=27 个网格。如果你测试了3个币种，满数据应该是 3×27=81。这个值用于过滤掉处于参数边界、数据缺失严重、没有足够邻居支撑的孤岛参数。
 
-        min_plateau_survival_cushion=30,
+        min_plateau_survival_cushion=1,
         # 【平原属性】整个参数平原的存活安全垫下限（天）。
         # 解释：【极度严格的连坐机制】把当前参数稍微调大调小一点（27个网格），并把所有测试币种全算上，把它们所有的“中位存活时间”排个序，取最差的 10%（P10分位数）。
         # 哪怕遇到最烂的参数偏移、最难做的垃圾币，它的寿命也必须大于 30 天。如果小于这个值，说明该参数只是在一个币上运气好，换个币或者参数稍微偏一点立马爆仓。
@@ -1088,6 +1102,9 @@ def show_leaderboard_csv(
         min_plateau_mean_net_profit=0,
         # 【平原属性】整个参数平原的平均净利润下限（Margin倍数）。
         # 解释：要求这个参数所在的整个“地带”总体上必须是赚钱的（>0）。防止某个特定的参数点刚好卡在了一个偶然赚钱的峰值上，而周围的参数其实全在亏钱（孤岛效应）。
+
+        min_plateau_median_net_profit=0,
+        # 【平原属性】整个参数平原的中位数净利润下限（Margin倍数）。
 
         min_Q_ratio=10,
         # 【平原属性】最低Q净利占比下限（%）。
@@ -1165,7 +1182,7 @@ def show_leaderboard_csv(
     print(
         f"  • 基础与容量 : Smooth=Y | 实际开仓≥{min_trades} | 最大持仓≤{max_holding_days}天 | 全币邻居数≥{min_neighbors}")
     print(
-        f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥{min_net_profit} M倍 | 最低Q净利占比≥{min_Q_ratio}% | 平原均净利>{min_plateau_mean_net_profit} | 平原90%无盈利≤{max_plateau_p90_no_profit}天")
+        f"  • 收益与回撤 : 总收益≥{min_total_profit} M倍 | 净利润≥{min_net_profit} M倍 | 最低Q净利占比≥{min_Q_ratio}% | 平原均净利>{min_plateau_mean_net_profit}| 平原中位净利>{min_plateau_median_net_profit} | 平原90%无盈利≤{max_plateau_p90_no_profit}天")
     print(
         f"  • 存活与风控 : 中位存活≥{min_median_survival_days}天 | 平原安全垫≥{min_plateau_survival_cushion}天 | 指标超越数≥{min_median_outperform_count}")
     print(f"  • 策略白名单 : 必须包含关键字 {list(target_strategy_keywords)}")
@@ -1182,40 +1199,57 @@ def show_leaderboard_csv(
         log_stat("方向过滤: Short", rows_before, len(df_all))
 
     # ================== 新增 Spike 和 Smooth 的计算与过滤 ==================
-    def parse_survival(v):
-        if isinstance(v, str):
-            if "未爆仓" in v: return 999.0
-            try:
-                return float(v.split()[0])
-            except:
-                return 999.0
-        return float(v) if pd.notnull(v) else 0.0
+    # 替换原本极慢的 parse_survival 与 df.apply 为向量化提取
+    def vectorize_survival(series):
+        res = np.zeros(len(series), dtype=float)
+        is_null = series.isna()
+        not_null_series = series[~is_null]
 
-    df_all["_surv_days"] = df_all["预期存活(天)"].apply(parse_survival)
+        s_str = not_null_series.astype(str)
+        is_safe = s_str.str.contains("未爆仓", na=False)
+        extracted_nums = s_str.str.extract(r'([-+]?[0-9]*\.?[0-9]+)', expand=False).astype(float)
+
+        final_vals = extracted_nums.copy()
+        final_vals[is_safe] = 999.0
+        final_vals[final_vals.isna()] = 999.0
+
+        res[~is_null] = final_vals
+        return res
+
+    df_all["_surv_days"] = vectorize_survival(df_all["预期存活(天)"])
 
     # 1. 计算 Margin 单调平滑度 (Smoothness)
-    smooth_keys = set()
-    for name, grp in df_all.groupby(["策略", "币种", "加仓间距", "止盈间距"]):
-        if len(grp) < 4: continue
-        grp = grp.sort_values("Margin")
-        diffs = grp["_surv_days"].diff().dropna().tolist()
-        signs = [1 if d >= 0 else -1 for d in diffs]
-        flips = sum(1 for i in range(len(signs) - 1) if signs[i] != signs[i + 1])
-        if flips < 1:
-            smooth_keys.add(name)
+    # 替换原本极慢的 for 循环与 groupby，改为 Pandas 底层向量化运算
+    group_cols = ["策略", "币种", "加仓间距", "止盈间距"]
+    df_sorted = df_all.sort_values(group_cols + ["Margin"])
 
-    df_all["Smooth"] = df_all.apply(
-        lambda row: "Y" if (row["策略"], row["币种"], row["加仓间距"], row["止盈间距"]) in smooth_keys else "",
-        axis=1
-    )
+    df_sorted['diff'] = df_sorted.groupby(group_cols, dropna=False)["_surv_days"].diff()
+    df_valid_diff = df_sorted.dropna(subset=['diff']).copy()
+
+    df_valid_diff['sign'] = np.where(df_valid_diff['diff'] >= 0, 1, -1)
+    df_valid_diff['sign_shift'] = df_valid_diff.groupby(group_cols, dropna=False)['sign'].shift(1)
+    df_valid_diff['is_flip'] = (df_valid_diff['sign'] != df_valid_diff['sign_shift']) & df_valid_diff[
+        'sign_shift'].notna()
+
+    flip_counts = df_valid_diff.groupby(group_cols, dropna=False)['is_flip'].sum()
+    group_sizes = df_sorted.groupby(group_cols, dropna=False).size()
+
+    valid_groups = group_sizes[group_sizes >= 4].index.intersection(flip_counts[flip_counts < 1].index)
+    df_all_idx = pd.MultiIndex.from_arrays([df_all[c] for c in group_cols])
+    df_all["Smooth"] = np.where(df_all_idx.isin(valid_groups), "Y", "")
 
     # 2. 计算 Spike
+    # 替换原本的 apply 逐行遍历计算，改为 Numpy 的条件向量化计算
     col_total = "总收益(M倍)" if "总收益(M倍)" in df_all.columns else "总收益(Margin倍数)"
-    df_all["Spike"] = df_all.apply(
-        lambda row: row[col_total] / row["平原均总收益(M倍)"] if "平原均总收益(M倍)" in df_all.columns and pd.notnull(
-            row.get("平原均总收益(M倍)")) and row["平原均总收益(M倍)"] > 0 else 0.0,
-        axis=1
-    )
+    if "平原均总收益(M倍)" in df_all.columns:
+        valid_mask = df_all["平原均总收益(M倍)"].notna() & (df_all["平原均总收益(M倍)"] > 0)
+        df_all["Spike"] = np.where(
+            valid_mask,
+            df_all[col_total] / df_all["平原均总收益(M倍)"].where(valid_mask, 1.0),
+            0.0
+        )
+    else:
+        df_all["Spike"] = 0.0
 
     # 3. 过滤 Smooth 不为 Y 的行
     rows_before = len(df_all)
@@ -1246,10 +1280,10 @@ def show_leaderboard_csv(
         df_all = df_all[df_all["实际开仓数"] >= min_trades]
         log_stat(f"实际开仓数 >= {min_trades}", rows_before, len(df_all))
 
-    # 利用内部的 parse_survival 处理 "中位存活(天)"，脱离对外部全局 check_lifespan 函数的依赖
+    # 利用内部的 vectorize_survival (替代原有的 parse_survival) 处理 "中位存活(天)"，脱离对外部全局 check_lifespan 函数的依赖
     if "中位存活(天)" in df_all.columns:
         rows_before = len(df_all)
-        df_all["_median_surv_days"] = df_all["中位存活(天)"].apply(parse_survival)
+        df_all["_median_surv_days"] = vectorize_survival(df_all["中位存活(天)"])
         df_all = df_all[df_all["_median_surv_days"] >= min_median_survival_days]
         log_stat(f"中位存活(天) >= {min_median_survival_days}", rows_before, len(df_all))
 
@@ -1275,6 +1309,12 @@ def show_leaderboard_csv(
         df_all = df_all[df_all["平原均净利(M倍)"] > min_plateau_mean_net_profit]
         log_stat(f"平原均净利(M倍) > {min_plateau_mean_net_profit}", rows_before, len(df_all))
 
+    if "平原中位净利(M倍)" in df_all.columns:
+        rows_before = len(df_all)
+        df_all = df_all[df_all["平原中位净利(M倍)"] > min_plateau_median_net_profit]
+        log_stat(f"平原中位净利(M倍) > {min_plateau_median_net_profit}", rows_before, len(df_all))
+
+
     if "最大持仓(h)" in df_all.columns:
         rows_before = len(df_all)
         df_all = df_all[df_all["最大持仓(h)"] <= max_holding_days * 24]
@@ -1293,7 +1333,9 @@ def show_leaderboard_csv(
     # 策略关键字白名单前置过滤计算通过率
     if target_strategy_keywords:
         rows_before = len(df_all)
-        mask = df_all["策略"].apply(lambda x: any(kw in x for kw in target_strategy_keywords))
+        # 用正则匹配替代原生 apply() 提升速度，但保留原有的注释说明
+        pattern = '|'.join(map(re.escape, target_strategy_keywords))
+        mask = df_all["策略"].astype(str).str.contains(pattern, na=False)
         df_all = df_all[mask]
         log_stat(f"策略关键字: {list(target_strategy_keywords)}", rows_before, len(df_all))
     # =========================================================
@@ -1338,17 +1380,18 @@ def show_leaderboard_csv(
                     ]
 
     display_cols = ["Margin", "币种", "加仓间距", "止盈间距",
-                    "实际开仓数",
+                    # "实际开仓数",
                     # "0-1层解决战斗比例(%)",
-                    "爆仓次数",
-                    "预期存活(天)",
+                    # "爆仓次数",
+                    # "预期存活(天)",
                     "平均持仓(h)",
                     # "持仓时间占比(%)",
                     "总收益(M倍)", "净利润(M倍)",
-                    # "全币邻居数",
-                    "平原均净利(M倍)",
-                    "平原均总收益(M倍)",
-                    "平原存活安全垫(天)",
+                    "全币邻居数",
+                    # "平原均净利(M倍)",
+                    "平原中位净利(M倍)",
+                    # "平原均总收益(M倍)",
+                    # "平原存活安全垫(天)",
                     # "平原存活率(%)",
                     # "平原盈利%",
                     # "平原90%分位无盈利(天)",
@@ -1373,13 +1416,13 @@ def show_leaderboard_csv(
 
     def format_val(val):
         if isinstance(val, (float, np.float32, np.float64)):
-            return f"{val:.3f}" if 0 < val < 0.1 else f"{val:.2f}"
+            return f"{val:.3f}" if pd.notna(val) and 0 < val < 0.1 else (f"{val:.2f}" if pd.notna(val) else "nan")
         return str(val)
 
     # === 核心调整 2：按照排好序的策略列表依次打印 ===
     index_count = 0
     for strategy_name in sorted_strategies:
-        # 使用传入的参数 target_strategy_keywords 动态校验
+        # 使用传入的参数 target_strategy_keywords 动态校验 (因为前面已经矢量化过滤过了，这里保留原逻辑直接通过即可)
         if not any(target in strategy_name for target in target_strategy_keywords):
             continue
 
@@ -1424,6 +1467,7 @@ def show_leaderboard_csv(
             print(" | ".join(row_cells))
 
         print(sep_line)
+
 
 def compute_marting():
     mp.freeze_support()
