@@ -1,36 +1,47 @@
-# -- coding: utf-8 --
-""":authors:
-    zhuxiaohu, AI Assistant
-:create_date:
-    2026/9/18
-:description:
-    基于Beta调整与固定期限的横截面统计套利策略 (修正版)
-    低耦合架构：先逐个币种回测并保存交易明细 -> 最后汇总分析
-    支持多参数组合自动网格搜索，并动态打印参数标识
-    入场：长期Z偏离与短期多小时相对强弱同时满足；参数组合多进程并行
+# -*- coding: utf-8 -*-
+"""ALT/BTC 固定期限统计套利：LONG_ALT / SHORT_ALT 分方向最终精搜。
 
-假设：USDT线性合约，volume单位为基础币，close为小时K线收盘价。
-时间戳统一为UTC收盘边界：open_time + 1h；不使用下一根open。
-每笔配对的初始毛名义总额固定；两腿按Beta分配，不保证腿间等额。
-两腿冻结带符号数量，独立结算。
-net_pnl等为USDT金额；net_return才是除以双腿初始毛名义金额的收益率。
-未模拟共享资金、杠杆、强平、订单精度，因此输出为独立交易样本统计。
-MAE/MFE使用含开仓费及预计平仓费的净清算收益率，按小时收盘价更新。
-包含开仓和平仓时点；MAE<=0、MFE>=0，无对应方向的偏移时为0且时间为空。
-价格路径不完整或交易未结算时，四个极值字段均为空，避免将局部极值当成完整极值。
-依赖：pandas、numpy；tqdm为可选进度条。
+作者：zhuxiaohu, AI Assistant
+
+运行：python alt_directional_fine_search.py
+依赖：pandas、numpy；tqdm 可选。请先修改 Config 的数据路径。
+
+默认搜索：LONG_ALT 1080 组 + SHORT_ALT 1440 组 = 2520 组。
+只跑多头：Config.SEARCH_DIRECTIONS = ("LONG_ALT",)
+只跑空头：Config.SEARCH_DIRECTIONS = ("SHORT_ALT",)
+SHORT_* 参数均表示“短期确认”，不表示只用于做空。
+
+模型口径沿用原脚本：
+1. USDT 线性合约，volume 为基础币数量；时间戳为 UTC 收盘边界 open_time + 1h。
+2. 在信号小时收盘价开仓；未模拟信号计算延迟、滑点、资金费、订单精度或强平。
+3. 每笔双腿初始毛名义固定，以长期 Beta 分配并冻结带符号数量。
+4. 每个参数组合只交易指定 ALT 方向，每币同时最多一笔，固定期限退出。
+5. 多空任务独立回测，没有共享资金或跨方向仓位约束；统计为独立交易样本。
+6. MAE/MFE 按小时收盘的净清算收益率计算，含开/平仓时点及费用。
+   MAE <= 0、MFE >= 0；无对应方向偏移时为 0 且时间为空。
+   价格路径不完整或交易未结算时，四个极值字段全部为空。
+7. 为兼容原字段，ret_24h 实际使用 SIGNAL_WINDOW_HOURS；avg_turnover_30d
+   实际使用 BETA_WINDOW_DAYS 天的历史日均成交额，不一定是 24h / 30d。
+8. CSV 源文件须在整次搜索期间保持不变；启动时缺失 ALT 文件会跳过，
+   启动后文件消失则报错，避免各组币池不一致。
 """
-import pandas as pd
-import numpy as np
-import os
+
 import glob
-import json
 import hashlib
-import tempfile
+import itertools
+import json
 import multiprocessing
+import os
+import tempfile
 import traceback
-from contextlib import redirect_stdout, redirect_stderr, contextmanager
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -38,8 +49,43 @@ except ImportError:
         return iterable
 
 
+GRID_KEYS = (
+    "Z_THRESHOLDS_TO_TEST", "HOLDING_PERIODS_TO_TEST",
+    "BETA_WINDOWS_TO_TEST", "SIGNAL_WINDOWS_TO_TEST",
+    "SHORT_BETA_WINDOWS_TO_TEST", "SHORT_SIGNAL_WINDOWS_TO_TEST",
+    "SHORT_EXCESS_THRESHOLDS_TO_TEST", "SHORT_MIN_BAR_RATIOS_TO_TEST",
+    "SHORT_CONFIRM_MODES_TO_TEST", "SHORT_CONFIRM_TIMINGS_TO_TEST",
+)
+VALID_DIRECTIONS = ("LONG_ALT", "SHORT_ALT")
+
+
+def require_integer(name, value, minimum=1):
+    try:
+        valid = (not isinstance(value, (bool, np.bool_))
+                 and np.isfinite(value) and int(value) == value and value >= minimum)
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError(f"{name}必须为不小于{minimum}的整数")
+    return int(value)
+
+
+def require_number(name, value, minimum=0.0, strict=False, maximum=None):
+    try:
+        valid = (not isinstance(value, (bool, np.bool_)) and np.isfinite(value)
+                 and (value > minimum if strict else value >= minimum)
+                 and (maximum is None or value <= maximum))
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        relation = ">" if strict else ">="
+        raise ValueError(f"{name}必须为有限数值且{relation}{minimum}"
+                         + (f"，同时<={maximum}" if maximum is not None else ""))
+    return float(value)
+
+
 # ==========================================
-# 1. 全局绝对性配置参数 (支持动态网格搜索)
+# 1. 全局配置与两个独立搜索空间
 # ==========================================
 class Config:
     DATA_DIR = r"W:\project\python_project\oke_auto_trade\kline_data"
@@ -48,120 +94,124 @@ class Config:
     KLINE_FILE_TEMPLATE = "{symbol}_1h_2021-01-01_merged.csv"
     SYMBOLS_FILE = "symbols.json"
 
-    BETA_WINDOW_DAYS = 30
-    SIGNAL_WINDOW_HOURS = 24
-    Z_SCORE_THRESHOLD = 2.0
-    HOLDING_PERIOD_HOURS = 6
+    # 同时运行两个方向，或者改成只有一个方向的元组。
+    SEARCH_DIRECTIONS = ("LONG_ALT", "SHORT_ALT")
 
-    # 短期确认单独估计Beta；实际两腿数量仍使用原来的长期Beta。
-    SHORT_BETA_WINDOW_DAYS = 7
-    SHORT_SIGNAL_WINDOW_HOURS = 6
-    SHORT_EXCESS_THRESHOLD = 0.0  # 每小时平均对数残差的绝对门槛；0.0005 = 5bp/h。
-    SHORT_MIN_BAR_RATIO = 0.5  # 对应窗口/涨跌子样本中，同方向残差bar的最低比例。
-    SHORT_MIN_REGIME_BARS = 2  # UP/DOWN子样本至少2根；无该方向样本不得自动通过。
-    SHORT_CONFIRM_MODE = "BOTH"  # NET / UP / DOWN / BOTH / EITHER，见下方网格注释。
-    SHORT_CONFIRM_TIMING = "ROLLING"  # ROLLING / POST_TRIGGER。
-    FEE_RATE = 0.001  # 每腿每次实际成交额的0.1%；统一成本假设，不另计资金费
-    PAIR_GROSS_NOTIONAL = 1000.0  # 每笔双腿初始毛名义总额，USDT
+    # 每个 worker 由任务覆盖以下单组参数；不会同时开多和开空 ALT。
+    TRADE_DIRECTION = "LONG_ALT"
+    BETA_WINDOW_DAYS = 45
+    SIGNAL_WINDOW_HOURS = 18
+    Z_SCORE_THRESHOLD = 5.0
+    HOLDING_PERIOD_HOURS = 72
+    SHORT_BETA_WINDOW_DAYS = 5
+    SHORT_SIGNAL_WINDOW_HOURS = 18
+    SHORT_EXCESS_THRESHOLD = 0.0
+    SHORT_MIN_BAR_RATIO = 0.0
+    SHORT_MIN_REGIME_BARS = 2
+    SHORT_CONFIRM_MODE = "UP"
+    SHORT_CONFIRM_TIMING = "ROLLING"
+
+    FEE_RATE = 0.001  # 每腿每次实际成交额的 0.1%，不另计资金费。
+    PAIR_GROSS_NOTIONAL = 1000.0
     MIN_BTC_VARIANCE = 1e-16
     MIN_RESIDUAL_STD = 1e-10
-
     ENTRY_START = None
     EVALUATION_END = None
 
-    # 第一轮定性粗筛：先比较信号结构与时间尺度，再根据结果细调数值。
-    # 第一组含持仓期：2 * 3 * 2 * 1 = 12组；Beta天数先固定，不代表最优。
-    Z_THRESHOLDS_TO_TEST = [6.0, 9.0]
-    HOLDING_PERIODS_TO_TEST = [48, 96, 168]
-    SIGNAL_WINDOWS_TO_TEST = [24, 60]
-    BETA_WINDOWS_TO_TEST = [60]
+    # LONG ALT 专用最终精搜：5*4*3*3*2*3*1*1*1*1 = 1080。
+    LONG_PARAM_SPACE = {
+        "Z_THRESHOLDS_TO_TEST": [5.0, 5.5, 6.0, 6.5, 7.0],
+        "HOLDING_PERIODS_TO_TEST": [72, 84, 96, 120],
+        "BETA_WINDOWS_TO_TEST": [45, 60, 90],
+        "SIGNAL_WINDOWS_TO_TEST": [18, 24, 30],
+        "SHORT_BETA_WINDOWS_TO_TEST": [5, 7],
+        "SHORT_SIGNAL_WINDOWS_TO_TEST": [18, 24, 30],
+        "SHORT_EXCESS_THRESHOLDS_TO_TEST": [0.0],
+        "SHORT_MIN_BAR_RATIOS_TO_TEST": [0.0],
+        "SHORT_CONFIRM_MODES_TO_TEST": ["UP"],
+        "SHORT_CONFIRM_TIMINGS_TO_TEST": ["ROLLING"],
+    }
 
-    # 第二组：Beta天数与幅度门槛先固定；与第一组完整交叉，不按长短关系删组合。
-    SHORT_BETA_WINDOWS_TO_TEST = [7]
-    SHORT_SIGNAL_WINDOWS_TO_TEST = [6, 12, 24, 48]
-    SHORT_EXCESS_THRESHOLDS_TO_TEST = [0.0]
-    # 0.0检验平均表现；0.75检验转弱/转强是否分布在更多bar上。
-    SHORT_MIN_BAR_RATIOS_TO_TEST = [0.0, 0.75]
-    # NET: 全窗口；UP: BTC上涨小时；DOWN: BTC下跌小时；
-    # BOTH: UP且DOWN；EITHER: UP或DOWN。五种均与长期Z条件取AND。
-    SHORT_CONFIRM_MODES_TO_TEST = ["NET", "UP", "DOWN", "BOTH", "EITHER"]
-    # ROLLING允许确认窗口覆盖突破之前；POST_TRIGGER要求整个窗口在突破之后。
-    SHORT_CONFIRM_TIMINGS_TO_TEST = ["ROLLING", "POST_TRIGGER"]
-    # 短期组：1 * 4 * 1 * 2 * 5 * 2 = 80组；完整交叉12 * 80 = 960组。
-    MAX_GRID_COMBINATIONS = 1000  # 本轮粗筛上限；超限报错，不截取或随机丢弃组合。
+    # SHORT ALT 专用最终精搜：5*3*3*1*1*4*1*4*2*1 = 1440。
+    SHORT_PARAM_SPACE = {
+        "Z_THRESHOLDS_TO_TEST": [8.0, 8.5, 9.0, 9.5, 10.0],
+        "HOLDING_PERIODS_TO_TEST": [72, 96, 120],
+        "BETA_WINDOWS_TO_TEST": [45, 60, 90],
+        "SIGNAL_WINDOWS_TO_TEST": [24],
+        "SHORT_BETA_WINDOWS_TO_TEST": [7],
+        "SHORT_SIGNAL_WINDOWS_TO_TEST": [8, 12, 16, 20],
+        "SHORT_EXCESS_THRESHOLDS_TO_TEST": [0.0],
+        "SHORT_MIN_BAR_RATIOS_TO_TEST": [0.0, 0.25, 0.50, 0.75],
+        "SHORT_CONFIRM_MODES_TO_TEST": ["UP", "BOTH"],
+        "SHORT_CONFIRM_TIMINGS_TO_TEST": ["POST_TRIGGER"],
+    }
 
-    # 每个进程独立运行一组参数；多币种长历史会占内存，可按机器调整。
+    MAX_GRID_COMBINATIONS = 3000  # 两组相加为 2520，不能沿用原来的 1000。
     MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
-    NUMERIC_THREADS_PER_WORKER = 1  # 避免每个进程再启动一整组BLAS线程。
-
-    CACHE_VERSION = "dual_horizon_fixed_beta_excursion_net_v4"
+    NUMERIC_THREADS_PER_WORKER = 1
+    CACHE_VERSION = "directional_fine_search_fixed_beta_excursion_net_v5"
 
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
     SHORT_BETA_WINDOW_HOURS = SHORT_BETA_WINDOW_DAYS * 24
-    PARAM_FOLDER = (f"Z{Z_SCORE_THRESHOLD}_H{HOLDING_PERIOD_HOURS}"
-                    f"_B{BETA_WINDOW_DAYS}_S{SIGNAL_WINDOW_HOURS}"
-                    f"_b{SHORT_BETA_WINDOW_DAYS}_s{SHORT_SIGNAL_WINDOW_HOURS}"
-                    f"_e{SHORT_EXCESS_THRESHOLD}_p{SHORT_MIN_BAR_RATIO}"
-                    f"_n{SHORT_MIN_REGIME_BARS}_{SHORT_CONFIRM_MODE}_{SHORT_CONFIRM_TIMING}")
-    OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, PARAM_FOLDER)
+    PARAM_FOLDER = ""
+    OUTPUT_DIR = ""
     RUN_ID = ""
     MARKET_ID = ""
 
     @classmethod
-    def update_params(cls, z_score, holding_period, beta_window=30, signal_window=24,
-                      short_beta_window=7, short_signal_window=6,
-                      short_excess_threshold=0.0, short_min_bar_ratio=0.5,
-                      short_confirm_mode="BOTH", short_confirm_timing="ROLLING"):
-        """动态更新参数并重建路径配置；实际运行再绑定数据/代码指纹。"""
-        if (not np.isfinite(z_score) or z_score <= 0
-                or any(int(x) != x or x <= 0 for x in
-                       (holding_period, beta_window, signal_window))):
-            raise ValueError("阈值必须为正数，时间窗口必须为正整数")
-        cls.Z_SCORE_THRESHOLD = float(z_score)
-        cls.HOLDING_PERIOD_HOURS = int(holding_period)
-        cls.BETA_WINDOW_DAYS = int(beta_window)
-        cls.SIGNAL_WINDOW_HOURS = int(signal_window)
-        if any(isinstance(x, (bool, np.bool_)) or not np.isfinite(x)
-               or int(x) != x or x <= 0
-               for x in (short_beta_window, short_signal_window)):
-            raise ValueError("短期Beta天数和信号小时数必须为正整数")
-        if short_signal_window < 2:
-            raise ValueError("短期确认窗口必须至少包含2根小时bar")
-        if not np.isfinite(short_excess_threshold) or short_excess_threshold < 0:
-            raise ValueError("short_excess_threshold必须为有限非负数")
-        if not np.isfinite(short_min_bar_ratio) or not 0 <= short_min_bar_ratio <= 1:
-            raise ValueError("short_min_bar_ratio必须在[0, 1]内")
-        n = cls.SHORT_MIN_REGIME_BARS
-        if (isinstance(n, (bool, np.bool_)) or not np.isfinite(n)
-                or int(n) != n or n < 2):
-            raise ValueError("SHORT_MIN_REGIME_BARS必须为不小于2的整数")
+    def update_params(cls, trade_direction, z_score, holding_period,
+                      beta_window=45, signal_window=18,
+                      short_beta_window=5, short_signal_window=18,
+                      short_excess_threshold=0.0, short_min_bar_ratio=0.0,
+                      short_confirm_mode="UP", short_confirm_timing="ROLLING"):
+        """参数元组第一个元素是方向；校验完成后才更新 Config。"""
+        if trade_direction not in VALID_DIRECTIONS:
+            raise ValueError("trade_direction必须为LONG_ALT或SHORT_ALT")
+        z_score = require_number("z_score", z_score, strict=True)
+        holding_period = require_integer("holding_period", holding_period)
+        beta_window = require_integer("beta_window", beta_window)
+        signal_window = require_integer("signal_window", signal_window)
+        short_beta_window = require_integer("short_beta_window", short_beta_window)
+        short_signal_window = require_integer("short_signal_window", short_signal_window, 2)
+        short_excess_threshold = require_number("short_excess_threshold", short_excess_threshold)
+        short_min_bar_ratio = require_number("short_min_bar_ratio", short_min_bar_ratio, maximum=1)
+        require_integer("SHORT_MIN_REGIME_BARS", cls.SHORT_MIN_REGIME_BARS, 2)
+        if beta_window * 24 <= signal_window:
+            raise ValueError("长期Beta历史小时数必须长于长期信号窗口")
         if short_confirm_mode not in ("NET", "UP", "DOWN", "BOTH", "EITHER"):
             raise ValueError("short_confirm_mode必须为NET/UP/DOWN/BOTH/EITHER")
         if short_confirm_timing not in ("ROLLING", "POST_TRIGGER"):
             raise ValueError("short_confirm_timing必须为ROLLING或POST_TRIGGER")
-        cls.SHORT_BETA_WINDOW_DAYS = int(short_beta_window)
-        cls.SHORT_SIGNAL_WINDOW_HOURS = int(short_signal_window)
-        cls.SHORT_EXCESS_THRESHOLD = float(short_excess_threshold)
-        cls.SHORT_MIN_BAR_RATIO = float(short_min_bar_ratio)
+
+        cls.TRADE_DIRECTION = trade_direction
+        cls.Z_SCORE_THRESHOLD = z_score
+        cls.HOLDING_PERIOD_HOURS = holding_period
+        cls.BETA_WINDOW_DAYS = beta_window
+        cls.SIGNAL_WINDOW_HOURS = signal_window
+        cls.SHORT_BETA_WINDOW_DAYS = short_beta_window
+        cls.SHORT_SIGNAL_WINDOW_HOURS = short_signal_window
+        cls.SHORT_EXCESS_THRESHOLD = short_excess_threshold
+        cls.SHORT_MIN_BAR_RATIO = short_min_bar_ratio
         cls.SHORT_CONFIRM_MODE = short_confirm_mode
         cls.SHORT_CONFIRM_TIMING = short_confirm_timing
-        cls.BETA_WINDOW_HOURS = cls.BETA_WINDOW_DAYS * 24
-        cls.SHORT_BETA_WINDOW_HOURS = cls.SHORT_BETA_WINDOW_DAYS * 24
-        if cls.BETA_WINDOW_HOURS <= cls.SIGNAL_WINDOW_HOURS:
-            raise ValueError("Beta历史窗口必须长于信号窗口")
-        cls.PARAM_FOLDER = (f"Z{cls.Z_SCORE_THRESHOLD}_H{cls.HOLDING_PERIOD_HOURS}"
-                            f"_B{cls.BETA_WINDOW_DAYS}_S{cls.SIGNAL_WINDOW_HOURS}"
-                            f"_b{cls.SHORT_BETA_WINDOW_DAYS}_s{cls.SHORT_SIGNAL_WINDOW_HOURS}"
-                            f"_e{cls.SHORT_EXCESS_THRESHOLD}_p{cls.SHORT_MIN_BAR_RATIO}"
-                            f"_n{cls.SHORT_MIN_REGIME_BARS}_{cls.SHORT_CONFIRM_MODE}"
-                            f"_{cls.SHORT_CONFIRM_TIMING}")
-        cls.OUTPUT_DIR = os.path.join(cls.BASE_OUTPUT_DIR, cls.PARAM_FOLDER)
+        cls.BETA_WINDOW_HOURS = beta_window * 24
+        cls.SHORT_BETA_WINDOW_HOURS = short_beta_window * 24
+        cls.PARAM_FOLDER = (
+            f"{trade_direction}_Z{z_score}_H{holding_period}"
+            f"_B{beta_window}_S{signal_window}"
+            f"_b{short_beta_window}_s{short_signal_window}"
+            f"_e{short_excess_threshold}_p{short_min_bar_ratio}"
+            f"_n{cls.SHORT_MIN_REGIME_BARS}_{short_confirm_mode}_{short_confirm_timing}"
+        )
+        cls.OUTPUT_DIR = os.path.join(os.path.abspath(cls.BASE_OUTPUT_DIR),
+                                      trade_direction, cls.PARAM_FOLDER)
         cls.RUN_ID = cls.MARKET_ID = ""
 
+
 TRADE_COLUMNS = [
-    "run_id", "trade_id", "symbol", "status", "entry_time", "scheduled_exit_time",
-    "exit_time", "direction", "btc_direction", "entry_price", "exit_price",
-    "btc_entry", "btc_exit", "beta", "z_score", "exit_z_score",
+    "run_id", "search_direction", "trade_id", "symbol", "status", "entry_time",
+    "scheduled_exit_time", "exit_time", "direction", "btc_direction", "entry_price",
+    "exit_price", "btc_entry", "btc_exit", "beta", "z_score", "exit_z_score",
     "hist_res_mean", "hist_res_std", "avg_turnover_30d", "market_median_at_entry",
     "vol_group", "alt_qty", "btc_qty", "alt_entry_notional", "btc_entry_notional",
     "entry_gross_notional", "alt_exit_notional", "btc_exit_notional",
@@ -174,13 +224,17 @@ TRADE_COLUMNS = [
     "short_mean_excess", "short_up_mean_excess", "short_down_mean_excess",
     "short_support_ratio", "short_up_support_ratio", "short_down_support_ratio",
     "short_up_count", "short_down_count", "long_trigger_time", "long_trigger_z",
-    "exit_reason",
-    "mae_return", "mfe_return", "mae_time", "mfe_time"
+    "exit_reason", "mae_return", "mfe_return", "mae_time", "mfe_time",
 ]
 
 
 def utc_timestamp(value):
-    return pd.to_datetime(value, utc=True) if value is not None else None
+    if value is None:
+        return None
+    result = pd.to_datetime(value, utc=True)
+    if pd.isna(result):
+        raise ValueError("时间边界不能为NaT")
+    return result
 
 
 def kline_path(symbol):
@@ -188,7 +242,7 @@ def kline_path(symbol):
 
 
 def load_kline(symbol):
-    """排序、拒绝重复时间戳，保留缺口为NaN；禁止填价格。"""
+    """排序、拒绝重复时间戳，保留缺口为 NaN；禁止填价格。"""
     df = pd.read_csv(kline_path(symbol), usecols=["open_time", "close", "volume"])
     if df.empty:
         raise ValueError(f"{symbol}: K线文件为空")
@@ -209,7 +263,7 @@ def load_kline(symbol):
 
 
 def align_hourly(df_alt, df_btc):
-    """公共时间轴延伸到两份数据中较晚的结尾，以显式发现退市/尾部缺口。"""
+    """公共时间轴延伸到较晚结尾，显式保留退市和尾部缺口。"""
     start = max(df_alt.index.min(), df_btc.index.min())
     end = max(df_alt.index.max(), df_btc.index.max())
     limit = utc_timestamp(Config.EVALUATION_END)
@@ -220,7 +274,6 @@ def align_hourly(df_alt, df_btc):
 
 
 def eligible_pool(df_alt, df_btc):
-    # B+S小时收益需要B+S+1个价格点；价格有效性同时覆盖BTC。
     n = Config.BETA_WINDOW_HOURS + Config.SIGNAL_WINDOW_HOURS + 1
     good = (df_alt["close"].notna() & df_alt["volume"].notna()
             & df_btc["close"].notna())
@@ -228,118 +281,124 @@ def eligible_pool(df_alt, df_btc):
 
 
 def historical_turnover(df):
-    # 排除触发信号的当前小时，避免暴涨放量改变自己的分组。
+    # 排除当前小时；虽然保留原字段名，但窗口跟随长期 Beta 天数。
     return (df["volume"] * df["close"]).shift(1).rolling(
         Config.BETA_WINDOW_HOURS, min_periods=Config.BETA_WINDOW_HOURS).mean() * 24
 
 
 def atomic_csv(df, path, reuse_existing=False, **kwargs):
-    # 不同参数可能同时计算同一个市场中位数缓存；临时文件必须各自独立。
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     if reuse_existing and os.path.isfile(path):
         return
-    fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
-                                suffix=".tmp", dir=os.path.dirname(path) or ".")
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                                     suffix=".tmp", dir=os.path.dirname(path) or ".")
     os.close(fd)
     try:
-        df.to_csv(temp, **kwargs)
+        df.to_csv(temporary, **kwargs)
         try:
-            os.replace(temp, path)
+            os.replace(temporary, path)
         except PermissionError:
-            # Windows可能禁止替换正在被其他进程读取的文件。同一指纹的市场
-            # 缓存已经由另一进程完整发布时直接复用；其他写入错误仍然上抛。
+            # Windows 可能无法替换其他进程正在读取的同指纹市场缓存。
             if not (reuse_existing and os.path.isfile(path)):
                 raise
     finally:
-        if os.path.exists(temp):
-            os.remove(temp)
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def atomic_json(value, path):
-    fd, temp = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
-                                suffix=".tmp", dir=os.path.dirname(path) or ".")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".",
+                                     suffix=".tmp", dir=os.path.dirname(path) or ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, indent=2)
-        os.replace(temp, path)
+            json.dump(value, f, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(temporary, path)
     finally:
-        if os.path.exists(temp):
-            os.remove(temp)
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 def result_path(name):
-    """目录和文件名同时标识参数；保持交易文件以_trades.csv结尾。"""
-    return os.path.join(Config.OUTPUT_DIR, f"{Config.PARAM_FOLDER}_{name}")
+    # 目录已经包含方向和全部参数；文件名不再重复参数，以降低 Windows 路径长度。
+    return os.path.join(Config.OUTPUT_DIR, name)
 
 
 def file_sha256(path):
-    h = hashlib.sha256()
+    digest = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def fingerprint(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def prepare_run(symbols, data_fingerprints=None):
-    """文件内容、币池、全部结果相关参数及本脚本变化均使缓存失效。"""
-    if not np.isfinite(Config.FEE_RATE) or Config.FEE_RATE < 0:
-        raise ValueError("FEE_RATE必须为有限非负数")
-    if not np.isfinite(Config.PAIR_GROSS_NOTIONAL) or Config.PAIR_GROSS_NOTIONAL <= 0:
-        raise ValueError("PAIR_GROSS_NOTIONAL必须为有限正数")
+    """计算指纹和路径；manifest 由持有运行锁的调用方发布。"""
+    require_number("FEE_RATE", Config.FEE_RATE)
+    require_number("PAIR_GROSS_NOTIONAL", Config.PAIR_GROSS_NOTIONAL, strict=True)
+    require_number("MIN_BTC_VARIANCE", Config.MIN_BTC_VARIANCE)
+    require_number("MIN_RESIDUAL_STD", Config.MIN_RESIDUAL_STD, strict=True)
+    if Config.TRADE_DIRECTION not in VALID_DIRECTIONS or not Config.PARAM_FOLDER:
+        raise ValueError("须先调用Config.update_params设置本次搜索方向与参数")
     begin, end = utc_timestamp(Config.ENTRY_START), utc_timestamp(Config.EVALUATION_END)
     if begin is not None and end is not None and begin >= end:
         raise ValueError("ENTRY_START必须早于EVALUATION_END")
-
     universe = sorted(set(symbols) | {Config.BTC_SYMBOL})
-
-    # 【修改点】：取消原来的直接崩溃报错，改为在底层再次确认并兼容跳过逻辑
     missing = [s for s in universe if not os.path.isfile(kline_path(s))]
     if missing:
-        if Config.BTC_SYMBOL in missing:
-            raise FileNotFoundError(f"❌ 基础对冲币种 {Config.BTC_SYMBOL} 的数据文件不存在，程序无法运行！")
-        print(f"⚠️ 警告: prepare_run发现缺失K线文件，将从币池中忽略: {missing}")
-        universe = [s for s in universe if s not in missing]
-
+        raise FileNotFoundError(f"静态币池中的源文件缺失: {missing}；请检查后重新启动搜索")
     if data_fingerprints is None:
         data_fingerprints = {s: file_sha256(kline_path(s)) for s in universe}
+    if any(s not in data_fingerprints for s in universe):
+        raise ValueError("数据指纹未覆盖本次完整币池")
 
-    market = dict(version=Config.CACHE_VERSION, code=file_sha256(os.path.abspath(__file__)),
-                  data={s: data_fingerprints[s] for s in universe}, universe=universe,
-                  btc=Config.BTC_SYMBOL, beta=Config.BETA_WINDOW_HOURS,
-                  signal=Config.SIGNAL_WINDOW_HOURS, end=Config.EVALUATION_END)
+    # 市场分组只依赖数据、币池、长期窗口和结束边界，可在多空之间共用。
+    market = dict(
+        version=Config.CACHE_VERSION, code=file_sha256(os.path.abspath(__file__)),
+        data={s: data_fingerprints[s] for s in universe}, universe=universe,
+        btc=Config.BTC_SYMBOL, beta=Config.BETA_WINDOW_HOURS,
+        signal=Config.SIGNAL_WINDOW_HOURS, end=end.isoformat() if end is not None else None,
+        pandas=pd.__version__, numpy=np.__version__,
+    )
     Config.MARKET_ID = fingerprint(market)
-    manifest = dict(market=market, z=Config.Z_SCORE_THRESHOLD,
-                    holding=Config.HOLDING_PERIOD_HOURS,
-                    short_beta=Config.SHORT_BETA_WINDOW_HOURS,
-                    short_signal=Config.SHORT_SIGNAL_WINDOW_HOURS,
-                    short_excess_threshold=Config.SHORT_EXCESS_THRESHOLD,
-                    short_min_bar_ratio=Config.SHORT_MIN_BAR_RATIO,
-                    short_min_regime_bars=Config.SHORT_MIN_REGIME_BARS,
-                    short_confirm_mode=Config.SHORT_CONFIRM_MODE,
-                    short_confirm_timing=Config.SHORT_CONFIRM_TIMING,
-                    short_basis="mean_hourly_log_residual_fixed_pre_window_beta",
-                    fee=Config.FEE_RATE,
-                    gross=Config.PAIR_GROSS_NOTIONAL, start=Config.ENTRY_START,
-                    min_var=Config.MIN_BTC_VARIANCE, min_std=Config.MIN_RESIDUAL_STD,
-                    pandas=pd.__version__, numpy=np.__version__,
-                    excursion=dict(basis="net_liquidation_return", sampling="hourly_close",
-                                   include_entry=True, include_exit=True,
-                                   missing_policy="invalidate_all_four_fields",
-                                   zero_time_policy="NaT", tie_policy="first"))
+    manifest = dict(
+        market=market, trade_direction=Config.TRADE_DIRECTION,
+        z=Config.Z_SCORE_THRESHOLD, holding=Config.HOLDING_PERIOD_HOURS,
+        short_beta=Config.SHORT_BETA_WINDOW_HOURS,
+        short_signal=Config.SHORT_SIGNAL_WINDOW_HOURS,
+        short_excess_threshold=Config.SHORT_EXCESS_THRESHOLD,
+        short_min_bar_ratio=Config.SHORT_MIN_BAR_RATIO,
+        short_min_regime_bars=Config.SHORT_MIN_REGIME_BARS,
+        short_confirm_mode=Config.SHORT_CONFIRM_MODE,
+        short_confirm_timing=Config.SHORT_CONFIRM_TIMING,
+        short_basis="mean_hourly_log_residual_fixed_pre_window_beta",
+        direction_policy="one_alt_side_per_run_normal_band_rearm",
+        fee=Config.FEE_RATE, gross=Config.PAIR_GROSS_NOTIONAL,
+        start=begin.isoformat() if begin is not None else None,
+        min_var=Config.MIN_BTC_VARIANCE, min_std=Config.MIN_RESIDUAL_STD,
+        excursion=dict(basis="net_liquidation_return", sampling="hourly_close",
+                       include_entry=True, include_exit=True,
+                       missing_policy="invalidate_all_four_fields",
+                       zero_time_policy="NaT", tie_policy="first"),
+    )
     Config.RUN_ID = fingerprint(manifest)
-    Config.OUTPUT_DIR = os.path.join(Config.BASE_OUTPUT_DIR, Config.PARAM_FOLDER + "_" + Config.RUN_ID[:16])
+    Config.OUTPUT_DIR = os.path.join(
+        os.path.abspath(Config.BASE_OUTPUT_DIR), Config.TRADE_DIRECTION,
+        Config.PARAM_FOLDER + "_" + Config.RUN_ID[:16])
     os.makedirs(Config.OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(Config.OUTPUT_DIR, "run_manifest.json")
-    atomic_json(manifest, path)
+    return manifest
+
 
 # ==========================================
-# 2. 核心信号计算与指标加工模块
+# 2. 原有长期指标和固定短期 Beta 确认
 # ==========================================
 def calculate_indicators(df_alt, df_btc):
-    """历史残差均采用当前时点事先估计的同一个Beta，且窗口完整位于30天内。"""
+    """用信号窗口之前估计的固定 Beta 重算历史残差分布。"""
     df_alt, df_btc = align_hourly(df_alt, df_btc)
     df = pd.DataFrame(index=df_alt.index)
     df["close"] = df_alt["close"]
@@ -348,20 +407,17 @@ def calculate_indicators(df_alt, df_btc):
     B, S = Config.BETA_WINDOW_HOURS, Config.SIGNAL_WINDOW_HOURS
     df["ret_1h"] = np.log(df["close"]).diff()
     df["btc_ret_1h"] = np.log(df["btc_close"]).diff()
-    # 使用滚动求和而非端点相除，缺失小时不会被跨过。
     df["ret_24h"] = df["ret_1h"].rolling(S, min_periods=S).sum()
     df["btc_ret_24h"] = df["btc_ret_1h"].rolling(S, min_periods=S).sum()
     cov = df["ret_1h"].rolling(B, min_periods=B).cov(df["btc_ret_1h"])
     var = df["btc_ret_1h"].rolling(B, min_periods=B).var()
     df["beta"] = cov / var.where(var > Config.MIN_BTC_VARIANCE)
-    df["beta_shifted"] = df["beta"].shift(S)
+    df["beta_shifted"] = df["beta"].shift(S).replace([np.inf, -np.inf], np.nan)
     beta = df["beta_shifted"]
     df["residual_24h"] = df["ret_24h"] - beta * df["btc_ret_24h"]
 
-    # 对t时点，Beta收益训练区间是[t-S-B+1, t-S]，共B个小时收益。
-    # 完整落在该区间内的S小时收益窗口端点：[t-B, t-S]，共B-S+1个。
-    # Var(A-beta*M) = Var(A)+beta²*Var(M)-2*beta*Cov(A,M)。
-    # 等价于逐时点用当期Beta重算所有历史残差，避免第二层30天预热。
+    # Beta 训练收益区间：[t-S-B+1, t-S]。
+    # 完整包含于训练区间的 S 小时窗口端点：[t-B, t-S]，共 B-S+1 个。
     N = B - S + 1
     a = df["ret_24h"].shift(S)
     m = df["btc_ret_24h"].shift(S)
@@ -375,20 +431,18 @@ def calculate_indicators(df_alt, df_btc):
     df["z_score"] = df["z_score"].replace([np.inf, -np.inf], np.nan)
     df["turnover"] = df["volume"] * df["close"]
     df["avg_turnover_30d"] = historical_turnover(df)
-    df = calculate_short_confirmation(df)
-    return df
+    return calculate_short_confirmation(df)
 
 
 def calculate_short_confirmation(df):
-    """短期Beta训练结束于确认窗口之前；窗口内每根bar均使用同一个Beta。
+    """短期 Beta 训练在确认窗口之前结束，窗口内各 bar 使用同一个 Beta。
 
-    e_i(t) = alt_ret_i - short_beta_t * btc_ret_i。
-    不减去历史残差均值：这里检验实际相对走势，而不是是否低于历史平均。
-    均值严格超过幅度门槛，支持bar比例达到下限，才算对应方向确认。
-    BTC零收益bar计入NET，不属于UP/DOWN；缺少涨/跌子样本不能视为通过。
+    e_i(t) = alt_ret_i - short_beta_t * btc_ret_i，不减历史均值。
+    做多要求正残差均值，做空要求负残差均值，幅度使用严格不等式。
+    UP/DOWN 是 BTC 涨跌小时子样本；BOTH 表示两个子样本均须通过。
+    BTC 零收益 bar 只进入 NET；UP/DOWN 样本不足不得自动通过。
     """
-    B = Config.SHORT_BETA_WINDOW_HOURS
-    C = Config.SHORT_SIGNAL_WINDOW_HOURS
+    B, C = Config.SHORT_BETA_WINDOW_HOURS, Config.SHORT_SIGNAL_WINDOW_HOURS
     a, m = df["ret_1h"], df["btc_ret_1h"]
     cov = a.rolling(B, min_periods=B).cov(m)
     var = m.rolling(B, min_periods=B).var()
@@ -401,41 +455,38 @@ def calculate_short_confirmation(df):
     sums = {g: np.zeros(n, dtype=float) for g in groups}
     negatives = {g: np.zeros(n, dtype=np.int64) for g in groups}
     positives = {g: np.zeros(n, dtype=np.int64) for g in groups}
-
-    # 沿窗口长度循环，整条时间轴向量化；不创建n*C的大矩阵。
-    # 不能先用每小时各自的Beta算残差再rolling，否则窗口内Beta并不固定。
     for lag in range(C):
         ar, mr = a.shift(lag).to_numpy(), m.shift(lag).to_numpy()
         residual = ar - beta * mr
         valid = np.isfinite(residual)
         masks = {"net": valid, "up": valid & (mr > 0), "down": valid & (mr < 0)}
-        for g in groups:
-            mask = masks[g]
-            counts[g] += mask
-            sums[g] += np.where(mask, residual, 0.0)
-            negatives[g] += mask & (residual < 0)
-            positives[g] += mask & (residual > 0)
+        for group in groups:
+            mask = masks[group]
+            counts[group] += mask
+            sums[group] += np.where(mask, residual, 0.0)
+            negatives[group] += mask & (residual < 0)
+            positives[group] += mask & (residual > 0)
 
     complete = counts["net"] == C
     threshold, ratio = Config.SHORT_EXCESS_THRESHOLD, Config.SHORT_MIN_BAR_RATIO
     short_ok, long_ok = {}, {}
-    for g in groups:
-        prefix = "short" if g == "net" else f"short_{g}"
-        count = counts[g]
-        mean = np.divide(sums[g], count, out=np.full(n, np.nan), where=count > 0)
-        negative_ratio = np.divide(negatives[g], count,
+    for group in groups:
+        prefix = "short" if group == "net" else f"short_{group}"
+        count = counts[group]
+        mean = np.divide(sums[group], count, out=np.full(n, np.nan), where=count > 0)
+        negative_ratio = np.divide(negatives[group], count,
                                    out=np.full(n, np.nan), where=count > 0)
-        positive_ratio = np.divide(positives[g], count,
+        positive_ratio = np.divide(positives[group], count,
                                    out=np.full(n, np.nan), where=count > 0)
         df[f"{prefix}_mean_excess"] = np.where(complete, mean, np.nan)
         df[f"{prefix}_negative_ratio"] = np.where(complete, negative_ratio, np.nan)
         df[f"{prefix}_positive_ratio"] = np.where(complete, positive_ratio, np.nan)
-        if g != "net":
+        if group != "net":
             df[f"{prefix}_count"] = np.where(complete, count, np.nan)
-        required = C if g == "net" else Config.SHORT_MIN_REGIME_BARS
+        required = C if group == "net" else Config.SHORT_MIN_REGIME_BARS
         enough = complete & (count >= required)
-        short_ok[g] = enough & (mean < -threshold) & (negative_ratio >= ratio)
-        long_ok[g] = enough & (mean > threshold) & (positive_ratio >= ratio)
+        short_ok[group] = enough & (mean < -threshold) & (negative_ratio >= ratio)
+        long_ok[group] = enough & (mean > threshold) & (positive_ratio >= ratio)
 
     def combine(signals):
         mode = Config.SHORT_CONFIRM_MODE
@@ -457,29 +508,30 @@ def calculate_short_confirmation(df):
 
 
 # ==========================================
-# 3. 预计算动态截面中位数 & 单标的回测模块
+# 3. 市场分组与双腿估值
 # ==========================================
 def generate_market_median(symbols, btc_df=None):
-    """仅用当时满足历史完整性准入要求的币种计算中位数。"""
+    """只在当时历史完整的 ALT 币池中计算成交额中位数。"""
     if not Config.MARKET_ID:
         prepare_run(symbols)
-    cache_path = os.path.join(Config.BASE_OUTPUT_DIR, f"market_median_{Config.MARKET_ID}.csv")
-    if os.path.exists(cache_path):
-        df_cache = pd.read_csv(cache_path)
-        df_cache["close_time"] = pd.to_datetime(df_cache["close_time"], utc=True)
-        return df_cache.set_index("close_time")["median_turnover"]
-    print("预计算全市场动态截面中位数...")
+    cache_path = os.path.join(os.path.abspath(Config.BASE_OUTPUT_DIR),
+                              f"market_median_{Config.MARKET_ID}.csv")
+    if os.path.isfile(cache_path):
+        cached = pd.read_csv(cache_path)
+        cached["close_time"] = pd.to_datetime(cached["close_time"], utc=True)
+        return cached.set_index("close_time")["median_turnover"]
+    print("预计算全市场动态截面成交额中位数...")
     if btc_df is None:
         btc_df = load_kline(Config.BTC_SYMBOL)
-    turnover_dfs = []
+    turnovers = []
     for symbol in tqdm(sorted(set(symbols))):
         if symbol == Config.BTC_SYMBOL:
             continue
         alt, btc = align_hourly(load_kline(symbol), btc_df)
         turnover = historical_turnover(alt).where(eligible_pool(alt, btc))
-        turnover_dfs.append(turnover.rename(symbol))
-    series = (pd.concat(turnover_dfs, axis=1).median(axis=1)
-              if turnover_dfs else pd.Series(dtype=float))
+        turnovers.append(turnover.rename(symbol))
+    series = (pd.concat(turnovers, axis=1).median(axis=1) if turnovers else
+              pd.Series(index=pd.DatetimeIndex([], tz="UTC", name="close_time"), dtype=float))
     series.name = "median_turnover"
     atomic_csv(series, cache_path, reuse_existing=True, header=True, index_label="close_time")
     return series
@@ -491,7 +543,7 @@ def valid_pair_prices(alt_price, btc_price):
 
 
 def pair_valuation(position, alt_price, btc_price):
-    """同一套固定数量/冻结费率公式，同时用于逐小时盯市和最终结算。"""
+    """固定数量和冻结费率公式，同时用于逐小时盯市与最终结算。"""
     q_alt, q_btc = position["alt_qty"], position["btc_qty"]
     alt_pnl = q_alt * (alt_price - position["entry_price"])
     btc_pnl = q_btc * (btc_price - position["btc_entry"])
@@ -508,13 +560,12 @@ def pair_valuation(position, alt_price, btc_price):
 
 
 def invalidate_excursions(position):
-    """只有四个输出字段，不额外输出质量标记；空值明确表示无法得到完整极值。"""
     position.update(mae_return=np.nan, mfe_return=np.nan,
                     mae_time=pd.NaT, mfe_time=pd.NaT, _excursion_valid=False)
 
 
 def update_excursions(position, now, alt_price, btc_price):
-    """先盯市再判断退出；不依赖当前Z/Beta是否有效。并列极值保留首次时间。"""
+    """逐小时更新净清算收益；并列极值保留首次时间。"""
     if not position["_excursion_valid"]:
         return
     previous = position["_last_mark_time"]
@@ -536,15 +587,24 @@ def update_excursions(position, now, alt_price, btc_price):
 
 def open_pair_position(symbol, row, median, scheduled_exit_time=pd.NaT,
                        planned_holding_hours=np.nan):
-    """每笔总名义固定；Beta可为负或0，数量一经开仓就不再随Beta变化。"""
+    """方向由任务指定，长期 Beta 可正、负或零；开仓后数量固定。"""
     now, z, beta = row.Index, row.z_score, row.beta_shifted
-    direction = 1 if z < -Config.Z_SCORE_THRESHOLD else -1
+    if Config.TRADE_DIRECTION not in VALID_DIRECTIONS:
+        raise ValueError("未设置有效交易方向")
+    direction = 1 if Config.TRADE_DIRECTION == "LONG_ALT" else -1
+    signal_matches = (z < -Config.Z_SCORE_THRESHOLD if direction == 1
+                      else z > Config.Z_SCORE_THRESHOLD)
+    if not signal_matches or not np.isfinite(beta):
+        raise ValueError("开仓信号与指定ALT方向不一致，或Beta无效")
+    if not valid_pair_prices(row.close, row.btc_close):
+        raise ValueError("开仓双腿价格必须为有限正数")
     alt_notional = Config.PAIR_GROSS_NOTIONAL / (1 + abs(beta))
     btc_signed_notional = -direction * beta * alt_notional
     position = dict(
-        run_id=Config.RUN_ID, trade_id=f"{symbol}_{now.isoformat()}", symbol=symbol,
-        status="OPEN", entry_time=now, scheduled_exit_time=scheduled_exit_time,
-        direction="LONG_ALT" if direction == 1 else "SHORT_ALT",
+        run_id=Config.RUN_ID, search_direction=Config.TRADE_DIRECTION,
+        trade_id=f"{Config.RUN_ID[:16]}_{symbol}_{Config.TRADE_DIRECTION}_{now.isoformat()}",
+        symbol=symbol, status="OPEN", entry_time=now, scheduled_exit_time=scheduled_exit_time,
+        direction=Config.TRADE_DIRECTION,
         btc_direction=("LONG_BTC" if btc_signed_notional > 0 else
                        "SHORT_BTC" if btc_signed_notional < 0 else "FLAT"),
         entry_price=row.close, btc_entry=row.btc_close, beta=beta, z_score=z,
@@ -577,16 +637,14 @@ def open_pair_position(symbol, row, median, scheduled_exit_time=pd.NaT,
         short_down_support_ratio=(row.short_down_negative_ratio if direction == -1
                                   else row.short_down_positive_ratio),
         short_up_count=row.short_up_count, short_down_count=row.short_down_count,
-        exit_reason=None,
-        mae_return=0.0, mfe_return=0.0, mae_time=pd.NaT, mfe_time=pd.NaT,
-        _excursion_valid=True, _last_mark_time=None)
-    # 开仓当刻的假设净清算收益约为-2*fee_rate；没有正收益时MFE保持0/NaT。
+        exit_reason=None, mae_return=0.0, mfe_return=0.0, mae_time=pd.NaT, mfe_time=pd.NaT,
+        _excursion_valid=True, _last_mark_time=None,
+    )
     update_excursions(position, now, row.close, row.btc_close)
     return position
 
 
 def close_pair_position(position, now, alt_price, btc_price, z, reason):
-    """含平仓时点极值；无双腿有效平仓价时保留未结算样本，不伪造成交。"""
     if not valid_pair_prices(alt_price, btc_price):
         invalidate_excursions(position)
         position.update(status="UNRESOLVED_MISSING_EXIT", exit_reason=reason)
@@ -600,118 +658,124 @@ def close_pair_position(position, now, alt_price, btc_price, z, reason):
     return True
 
 
+# ==========================================
+# 4. 单方向入场状态机
+# ==========================================
 def backtest_single_symbol(symbol, df, market_median_series):
-    """独立配对；到期退出先于指标检查；数量固定；缺失平仓价不伪造成交。"""
+    """每次只交易指定方向；反向极值永不产生仓位。
+
+    沿用原规则：先见到正常区间才允许首次突破；突破后仍须在同侧阈值外。
+    返回正常区间、无效指标或进入反向极值都会清除等待。
+    平仓当根不重新开仓；平仓后的重新武装仍要求正常区间。
+    """
+    if Config.TRADE_DIRECTION not in VALID_DIRECTIONS:
+        raise ValueError("回测方向必须为LONG_ALT或SHORT_ALT")
     trades = []
     position = None
-    armed = False  # 必须先看到正常区间，才能确认首次突破。
-    pending_side = 0  # +1/-1: 长期Z已突破，等待对应方向的多小时确认。
+    armed = False
+    pending = False
     trigger_time, trigger_z = None, np.nan
     threshold = Config.Z_SCORE_THRESHOLD
+    is_long = Config.TRADE_DIRECTION == "LONG_ALT"
     begin, end = utc_timestamp(Config.ENTRY_START), utc_timestamp(Config.EVALUATION_END)
     hold = pd.Timedelta(hours=Config.HOLDING_PERIOD_HOURS)
+    confirmation_wait = pd.Timedelta(hours=Config.SHORT_SIGNAL_WINDOW_HOURS)
 
     for row in df.itertuples():
         now, z = row.Index, row.z_score
         valid_z = np.isfinite(z) and np.isfinite(row.beta_shifted)
         normal = valid_z and -threshold <= z <= threshold
 
-        # 绝不能因Z/Beta缺失跳过已经到期的仓位。
+        # 退出和盯市优先于指标有效性判断。
         if position is not None:
-            # 关键：到期前也逐小时更新，且不受Z/Beta缺失影响。
             if now <= position["scheduled_exit_time"]:
                 update_excursions(position, now, row.close, row.btc_close)
             if now < position["scheduled_exit_time"]:
                 continue
-            valid_prices = valid_pair_prices(row.close, row.btc_close)
-            if now != position["scheduled_exit_time"] or not valid_prices:
+            if (now != position["scheduled_exit_time"]
+                    or not valid_pair_prices(row.close, row.btc_close)):
                 invalidate_excursions(position)
-                position["status"] = "UNRESOLVED_MISSING_EXIT"
-                position["exit_reason"] = "MISSING_SCHEDULED_EXIT"
+                position.update(status="UNRESOLVED_MISSING_EXIT",
+                                exit_reason="MISSING_SCHEDULED_EXIT")
                 trades.append(position)
                 position = None
-                # 仓位未能结算，停止本币后续交易；不删除样本，也不私自延期。
-                break
+                break  # 无法按计划结算，停止本币后续交易，不私自延期。
             close_pair_position(position, now, row.close, row.btc_close, z, "FIXED_HOLD")
             trades.append(position)
             position = None
-            armed = normal  # 退出时已正常即可复位；持仓期间的回归不算平仓后复位。
-            pending_side = 0
+            armed = bool(normal)
+            pending = False
             trigger_time, trigger_z = None, np.nan
             continue
 
         if not valid_z:
-            armed = False  # 缺口后首次看到极值，无法确认这是首次突破。
-            pending_side = 0
+            armed = pending = False
             trigger_time, trigger_z = None, np.nan
             continue
         if normal:
             armed = True
-            pending_side = 0
+            pending = False
             trigger_time, trigger_z = None, np.nan
             continue
-        if pending_side:
-            if (1 if z > 0 else -1) != pending_side:
-                pending_side = 0  # 跨0跳到另一侧极值，不当成原方向的回归。
-                trigger_time, trigger_z = None, np.nan
-                continue
-        else:
+
+        target_extreme = z < -threshold if is_long else z > threshold
+        if not target_extreme:
+            # 反向极值不建仓，且不能将跨零跳变冒充从正常区间产生的新突破。
+            armed = pending = False
+            trigger_time, trigger_z = None, np.nan
+            continue
+        if not pending:
             if not armed:
                 continue
             armed = False
-            pending_side = 1 if z > 0 else -1
+            pending = True
             trigger_time, trigger_z = now, z
-        # 长期条件必须仍在同侧阈值外；回到正常区间已在上面清除等待。
-        # POST_TRIGGER在突破后至少经过C小时，整个短期收益窗口才位于突破之后。
+
+        # t0 突破，C 小时确认：最早 t0+C 入场，收益 bar 端点为 t0+1...t0+C。
+        # 短期 Beta 仍在各确认窗口开始之前估计，并非冻结在首次突破时点。
         if (Config.SHORT_CONFIRM_TIMING == "POST_TRIGGER"
-                and now - trigger_time < pd.Timedelta(hours=Config.SHORT_SIGNAL_WINDOW_HOURS)):
+                and now - trigger_time < confirmation_wait):
             continue
-        ready = row.short_ready_short if pending_side == 1 else row.short_ready_long
-        if not ready:
-            continue  # 短期尚未确认，不消耗突破；后续同侧极值小时继续检查。
-        pending_side = 0  # 首次双条件满足消耗信号；沿用原有区间/分组不满足不追单规则。
+        ready = row.short_ready_long if is_long else row.short_ready_short
+        if pd.isna(ready) or not bool(ready):
+            continue
+
+        pending = False  # 第一次双条件满足即消耗信号，区间/分组失败时不追单。
         if begin is not None and now < begin:
             continue
         if end is not None and (now >= end or now + hold > end):
             continue
         median = market_median_series.get(now, np.nan)
         if not np.isfinite(median) or not np.isfinite(row.avg_turnover_30d):
-            continue  # 缺失基准不能自动归为低成交组。
-        if not (np.isfinite(row.close) and row.close > 0
-                and np.isfinite(row.btc_close) and row.btc_close > 0):
+            continue
+        if not valid_pair_prices(row.close, row.btc_close):
             continue
         position = open_pair_position(symbol, row, median, now + hold,
                                       Config.HOLDING_PERIOD_HOURS)
+        # long_trigger_* 是“长期信号触发”，不表示 LONG_ALT。
         position.update(long_trigger_time=trigger_time, long_trigger_z=trigger_z)
 
     if position is not None:
         invalidate_excursions(position)
-        position["status"] = "UNRESOLVED_END_OF_DATA"
-        position["exit_reason"] = "END_OF_DATA"
+        position.update(status="UNRESOLVED_END_OF_DATA", exit_reason="END_OF_DATA")
         trades.append(position)
     return pd.DataFrame(trades, columns=TRADE_COLUMNS)
 
 
-# ==========================================
-# 4. 主控调度流程
-# ==========================================
 def process_symbol(symbol, btc_df, market_median_series):
-    """成功的零交易也保存表头；异常不落成功缓存；失败时整组不汇总。"""
+    """成功的零交易也保存表头；原子写入，异常不伪造成功缓存。"""
     output_csv = result_path(f"{symbol}_trades.csv")
-    if os.path.exists(output_csv):
-        # 检查结构，避免把旧版/不完整CSV误认为可复用结果。
+    if os.path.isfile(output_csv):
         columns = pd.read_csv(output_csv, nrows=0).columns.tolist()
         if columns != TRADE_COLUMNS:
-            raise ValueError(f"缓存字段不匹配，请删除后重跑: {output_csv}")
+            raise ValueError(f"缓存字段不匹配，请检查后删除对应缓存: {output_csv}")
         return
-    df_alt = load_kline(symbol)
-    indicators = calculate_indicators(df_alt, btc_df)
+    indicators = calculate_indicators(load_kline(symbol), btc_df)
     records = backtest_single_symbol(symbol, indicators, market_median_series)
     atomic_csv(records, output_csv, index=False)
 
 
 def save_evaluation_window(market_median_series):
-    """保存实际观察区间，统计四等分时保留无交易时段，不从首末成交倒推区间。"""
     valid = market_median_series.dropna()
     start = valid.index.min() if not valid.empty else None
     end = market_median_series.index.max() if not market_median_series.empty else None
@@ -719,108 +783,184 @@ def save_evaluation_window(market_median_series):
     if start is not None and requested_start is not None:
         start = max(start, requested_start)
     if start is not None and end is not None and start > end:
-        start = end  # 配置起点晚于所有数据：无可交易时间、零交易。
-    atomic_json(dict(run_id=Config.RUN_ID, timezone="UTC",
-                     start=start.isoformat() if start is not None else None,
+        start = end
+    atomic_json(dict(run_id=Config.RUN_ID, search_direction=Config.TRADE_DIRECTION,
+                     timezone="UTC", start=start.isoformat() if start is not None else None,
                      end=end.isoformat() if end is not None else None,
                      basis="first_eligible_market_hour_to_last_observed_hour"),
-                os.path.join(Config.OUTPUT_DIR, "evaluation_window.json"))
+                result_path("evaluation_window.json"))
 
 
 def run_all_backtests(symbols, data_fingerprints=None, prepared=False):
-    """运行所有币种回测。源CSV应为运行期间不变的静态快照。"""
-    symbols = sorted(set(symbols))
+    symbols = sorted(set(symbols) - {Config.BTC_SYMBOL})
+    if not symbols:
+        raise ValueError("没有可回测的ALT币种")
     if not prepared:
-        prepare_run(symbols, data_fingerprints)
+        manifest = prepare_run(symbols, data_fingerprints)
+        atomic_json(manifest, result_path("run_manifest.json"))
     print("加载 BTC 基准数据...")
     btc_df = load_kline(Config.BTC_SYMBOL)
     median = generate_market_median(symbols, btc_df)
     save_evaluation_window(median)
-    print(f"开始回测配对交易，共 {len(symbols)} 个币种；输出: {Config.OUTPUT_DIR}")
+    print(f"开始 {Config.TRADE_DIRECTION} 回测，共 {len(symbols)} 个ALT；输出: {Config.OUTPUT_DIR}")
     errors = []
     for symbol in tqdm(symbols):
-        if symbol == Config.BTC_SYMBOL:
-            continue
         try:
             process_symbol(symbol, btc_df, median)
-        except Exception as e:
-            errors.append(f"{symbol}: {e}")
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
     if errors:
         raise RuntimeError("部分币种失败，禁止把残缺样本汇总为完整结果:\n" + "\n".join(errors))
 
 
 # ==========================================
-# 5. 统计与分析模块 (分组与留出期检验基础)
+# 5. 单组统计：零交易也保存摘要，不混入反方向交易
 # ==========================================
-def analyze_results():
-    """这里只统计独立交易样本，不把交易收益相加伪称组合收益率。"""
-    all_files = sorted(glob.glob(os.path.join(Config.OUTPUT_DIR, "*_trades.csv")))
+TASK_FIELDS = (
+    "search_direction", "z_threshold", "holding_period_hours",
+    "beta_window_days", "signal_window_hours",
+    "short_beta_window_days", "short_signal_window_hours",
+    "short_excess_threshold", "short_min_bar_ratio",
+    "short_confirm_mode", "short_confirm_timing",
+)
+
+
+def task_metadata(params):
+    return dict(zip(TASK_FIELDS, params))
+
+
+def current_task_params():
+    return (Config.TRADE_DIRECTION, Config.Z_SCORE_THRESHOLD, Config.HOLDING_PERIOD_HOURS,
+            Config.BETA_WINDOW_DAYS, Config.SIGNAL_WINDOW_HOURS,
+            Config.SHORT_BETA_WINDOW_DAYS, Config.SHORT_SIGNAL_WINDOW_HOURS,
+            Config.SHORT_EXCESS_THRESHOLD, Config.SHORT_MIN_BAR_RATIO,
+            Config.SHORT_CONFIRM_MODE, Config.SHORT_CONFIRM_TIMING)
+
+
+def optional_float(value):
+    return float(value) if pd.notna(value) and np.isfinite(value) else None
+
+
+def analyze_results(symbols=None):
+    """返回可供跨参数比较的摘要；收益统计只基于已平仓的独立交易。"""
+    if symbols is None:
+        all_files = sorted(glob.glob(result_path("*_trades.csv")))
+    else:
+        all_files = [result_path(f"{s}_trades.csv")
+                     for s in sorted(set(symbols) - {Config.BTC_SYMBOL})]
     if not all_files:
-        print("没有找到任何交易记录文件。")
-        return
-    frames = [pd.read_csv(f) for f in all_files]
-    nonempty = [x for x in frames if not x.empty]
-    if not nonempty:
-        print("交易记录为空；各币种的零交易结果已缓存。")
-        return
-    all_trades = pd.concat(nonempty, ignore_index=True)
+        raise RuntimeError("未找到任何币种结果文件，不能标记整组完成")
+    frames = []
+    for path in all_files:
+        frame = pd.read_csv(path)
+        if frame.columns.tolist() != TRADE_COLUMNS:
+            raise ValueError(f"交易字段不匹配: {path}")
+        if not frame.empty:
+            frames.append(frame)
+    all_trades = (pd.concat(frames, ignore_index=True) if frames
+                  else pd.DataFrame(columns=TRADE_COLUMNS))
+    if not all_trades.empty:
+        if (not all_trades["run_id"].eq(Config.RUN_ID).all()
+                or not all_trades["search_direction"].eq(Config.TRADE_DIRECTION).all()
+                or not all_trades["direction"].eq(Config.TRADE_DIRECTION).all()):
+            raise ValueError("交易文件混入其他运行指纹或方向，拒绝汇总")
+        if all_trades["trade_id"].duplicated().any():
+            raise ValueError("交易ID重复，拒绝重复计数")
+        if not all_trades["status"].isin(
+                ["CLOSED", "UNRESOLVED_MISSING_EXIT", "UNRESOLVED_END_OF_DATA"]).all():
+            raise ValueError("交易文件包含未知或尚未终结的状态")
+    for col in ("net_pnl", "net_return", "total_cost", "entry_cost", "mae_return", "mfe_return"):
+        all_trades[col] = pd.to_numeric(all_trades[col], errors="raise")
+    closed = all_trades.loc[all_trades["status"] == "CLOSED"].copy()
+    unresolved = all_trades.loc[all_trades["status"] != "CLOSED"].copy()
+    if not closed.empty and not np.isfinite(
+            closed[["net_pnl", "net_return", "total_cost"]].to_numpy(dtype=float)).all():
+        raise ValueError("已平仓交易缺少有限的收益或费用，拒绝汇总")
+
+    summary = dict(
+        **task_metadata(current_task_params()),
+        run_id=Config.RUN_ID, short_min_regime_bars=int(Config.SHORT_MIN_REGIME_BARS),
+        fee_rate=float(Config.FEE_RATE), pair_gross_notional=float(Config.PAIR_GROSS_NOTIONAL),
+        symbol_count=len(all_files), trade_count=len(all_trades), closed_count=len(closed),
+        unresolved_count=len(unresolved), result_complete=unresolved.empty,
+        has_closed_trades=not closed.empty,
+        unresolved_missing_exit_count=int((unresolved["status"] == "UNRESOLVED_MISSING_EXIT").sum()),
+        unresolved_end_of_data_count=int((unresolved["status"] == "UNRESOLVED_END_OF_DATA").sum()),
+        unresolved_entry_cost=float(unresolved["entry_cost"].sum()),
+        win_rate=optional_float((closed["net_pnl"] > 0).mean()),
+        avg_net_return=optional_float(closed["net_return"].mean()),
+        median_net_return=optional_float(closed["net_return"].median()),
+        avg_net_pnl=optional_float(closed["net_pnl"].mean()),
+        sum_net_pnl=optional_float(closed["net_pnl"].sum()) if not closed.empty else None,
+        avg_cost=optional_float(closed["total_cost"].mean()),
+        excursion_valid_count=int(closed["mae_return"].count()),
+        avg_mae_return=optional_float(closed["mae_return"].mean()),
+        p10_mae_return=optional_float(closed["mae_return"].quantile(0.10)),
+        worst_mae_return=optional_float(closed["mae_return"].min()),
+        avg_mfe_return=optional_float(closed["mfe_return"].mean()),
+    )
+
+    group_columns = [
+        "vol_group", "direction", "trade_count", "win_rate", "avg_net_return",
+        "median_net_return", "avg_net_pnl", "sum_net_pnl", "avg_cost",
+        "excursion_valid_count", "avg_mae_return", "p10_mae_return",
+        "worst_mae_return", "avg_mfe_return",
+    ]
+    if closed.empty:
+        groups = pd.DataFrame(columns=group_columns)
+    else:
+        groups = closed.groupby(["vol_group", "direction"]).agg(
+            trade_count=("symbol", "count"),
+            win_rate=("net_pnl", lambda x: (x > 0).mean()),
+            avg_net_return=("net_return", "mean"),
+            median_net_return=("net_return", "median"),
+            avg_net_pnl=("net_pnl", "mean"), sum_net_pnl=("net_pnl", "sum"),
+            avg_cost=("total_cost", "mean"), excursion_valid_count=("mae_return", "count"),
+            avg_mae_return=("mae_return", "mean"),
+            p10_mae_return=("mae_return", lambda x: x.quantile(0.10)),
+            worst_mae_return=("mae_return", "min"), avg_mfe_return=("mfe_return", "mean"),
+        ).reset_index()[group_columns]
+    # 保留原分组汇总文件名；本次只有指定方向的高/低成交额分组。
+    atomic_csv(groups, result_path("quadrant_summary.csv"), index=False)
+    atomic_json(summary, result_path("run_summary.json"))
+
     print("\n" + "=" * 60)
-    print(f"【参数组合评估】 Z: {Config.Z_SCORE_THRESHOLD} | 持仓: {Config.HOLDING_PERIOD_HOURS}h"
-          f" | 长期Beta: {Config.BETA_WINDOW_DAYS}d | 长期信号: {Config.SIGNAL_WINDOW_HOURS}h"
-          f" | 短期Beta: {Config.SHORT_BETA_WINDOW_DAYS}d | 短期信号: {Config.SHORT_SIGNAL_WINDOW_HOURS}h"
-          f" | 短期门槛: {Config.SHORT_EXCESS_THRESHOLD} | 支持bar比例: {Config.SHORT_MIN_BAR_RATIO}"
-          f" | 涨跌最少bar: {Config.SHORT_MIN_REGIME_BARS}"
-          f" | 确认: {Config.SHORT_CONFIRM_MODE} | 时序: {Config.SHORT_CONFIRM_TIMING}")
-    print("【配对交易样本统计；不是共享资金账户收益】")
-    print(all_trades["status"].value_counts().to_string())
-    unresolved = all_trades[all_trades["status"] != "CLOSED"]
-    df = all_trades[all_trades["status"] == "CLOSED"].copy()
+    print(f"【参数组合】{Config.PARAM_FOLDER}")
+    print("【独立配对交易样本；非共享资金账户收益】")
+    print(f"交易总数: {len(all_trades)}；已平仓: {len(closed)}；未结算: {len(unresolved)}")
     if not unresolved.empty:
-        print("结果不完整：存在未结算交易，下列仅为已平仓子集，不可用于判断策略盈利。")
-        print(f"未结算笔数: {len(unresolved)}；这些交易已发生开仓成本: {unresolved['entry_cost'].sum():.4f} USDT")
-    if df.empty:
-        return
-    print(f"已平仓次数: {len(df)}")
-    print(f"胜率: {(df['net_pnl'] > 0).mean():.2%}")
-    print(f"单笔平均净收益率 (双腿初始毛名义口径): {df['net_return'].mean():.4%}")
-    print(f"单笔净收益率中位数: {df['net_return'].median():.4%}")
-    print(f"独立交易净盈亏合计: {df['net_pnl'].sum():.4f} USDT")
-    mae = df["mae_return"].dropna()
-    print(f"完整极值样本: {len(mae)}/{len(df)}；持仓价格缺口使整笔MAE/MFE为空。")
-    if not mae.empty:
-        print(f"平均单笔最大浮亏率: {mae.mean():.4%} | P10: {mae.quantile(0.10):.4%}"
-              f" | 历史最差: {mae.min():.4%}")
-    quadrants = df.groupby(["vol_group", "direction"]).agg(
-        trade_count=("symbol", "count"),
-        win_rate=("net_pnl", lambda x: (x > 0).mean()),
-        avg_net_return=("net_return", "mean"),
-        median_net_return=("net_return", "median"),
-        avg_net_pnl=("net_pnl", "mean"),
-        sum_net_pnl=("net_pnl", "sum"),
-        avg_cost=("total_cost", "mean"),
-        excursion_valid_count=("mae_return", "count"),
-        avg_mae_return=("mae_return", "mean"),
-        p10_mae_return=("mae_return", lambda x: x.quantile(0.10)),
-        worst_mae_return=("mae_return", "min"),
-        avg_mfe_return=("mfe_return", "mean")
-    ).reset_index()
-    print("\n【四象限独立核算表现；收益率列为小数】")
-    print(quadrants.to_string(index=False))
-    # 无样本象限不制造0收益；独立BTC腿按各笔成交全额计费。
-    atomic_csv(quadrants, result_path("quadrant_summary.csv"), index=False)
-    print("未计算组合年化/夏普/最大回撤：需要共享资金分配及逐小时盯市账本。")
+        print("结果不完整：收益统计仅含已平仓子集，不应据此判断该参数组盈利。")
+        print(f"未结算交易已发生开仓成本: {summary['unresolved_entry_cost']:.4f} USDT")
+    if closed.empty:
+        print("没有已平仓交易；摘要已保存，收益指标为空，不填成零收益。")
+        return summary
+    print(f"胜率: {summary['win_rate']:.2%}")
+    print(f"单笔平均净收益率: {summary['avg_net_return']:.4%}")
+    print(f"单笔净收益率中位数: {summary['median_net_return']:.4%}")
+    print(f"独立交易净盈亏合计: {summary['sum_net_pnl']:.4f} USDT")
+    print(f"完整极值样本: {summary['excursion_valid_count']}/{len(closed)}")
+    if summary["avg_mae_return"] is not None:
+        print(f"平均MAE: {summary['avg_mae_return']:.4%}；"
+              f"P10: {summary['p10_mae_return']:.4%}；最差: {summary['worst_mae_return']:.4%}")
+    print("\n【成交额分组 × ALT方向；收益率列为小数】")
+    print(groups.to_string(index=False))
+    print("未计算组合年化、夏普和最大回撤：需要共享资金分配及逐小时盯市账本。")
+    return summary
 
 
+# ==========================================
+# 6. 网格调度、缓存与跨参数汇总
+# ==========================================
 @contextmanager
 def parameter_run_lock():
-    """额外防止两个独立脚本同时写同一组结果；不同组合互不等待。"""
-    lock_path = os.path.join(Config.OUTPUT_DIR, ".run.lock")
+    """不同参数互不等待；禁止两个脚本同时写相同运行结果。"""
+    lock_path = result_path(".run.lock")
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
         raise RuntimeError(
-            f"同一组结果正在运行或上次异常中断留下锁: {lock_path}；"
-            "仅在确认无对应任务运行后才可删除此锁") from exc
+            f"同一组正在运行，或上次异常中断留下锁: {lock_path}；"
+            "仅在确认对应任务已经结束后，才可手动删除此锁") from exc
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump({"pid": os.getpid(), "run_id": Config.RUN_ID}, f)
@@ -829,86 +969,149 @@ def parameter_run_lock():
         os.remove(lock_path)
 
 
-def build_param_grid():
-    """长期组×持仓期×短期组的完整笛卡尔积；只去重，不按主观规则删组合。
+def build_param_grid(directions=None):
+    """分别构造两个空间的笛卡尔积，然后拼接；绝不把两个空间混合交叉。
 
-    不强制短期窗口/短期Beta小于长期；也不提前删除可能零交易的组合。
-    真正非法的数值在update_params中报FAILED，不会被静默忽略。
+    每组元组结构：(direction, z, hold, B_days, S_hours, b_days, s_hours,
+                   excess_threshold, min_bar_ratio, confirm_mode, confirm_timing)。
+    只去重，不主观删掉可能零交易或时间尺度特殊的合法组合。
     """
-    import itertools
-    grid = []
-    seen = set()
-    for params in itertools.product(
-            Config.Z_THRESHOLDS_TO_TEST, Config.HOLDING_PERIODS_TO_TEST,
-            Config.BETA_WINDOWS_TO_TEST, Config.SIGNAL_WINDOWS_TO_TEST,
-            Config.SHORT_BETA_WINDOWS_TO_TEST, Config.SHORT_SIGNAL_WINDOWS_TO_TEST,
-            Config.SHORT_EXCESS_THRESHOLDS_TO_TEST, Config.SHORT_MIN_BAR_RATIOS_TO_TEST,
-            Config.SHORT_CONFIRM_MODES_TO_TEST, Config.SHORT_CONFIRM_TIMINGS_TO_TEST):
-        if params not in seen:
-            grid.append(params)
-            seen.add(params)
+    if directions is None:
+        directions = Config.SEARCH_DIRECTIONS
+    if isinstance(directions, str):
+        directions = (directions,)
+    directions = tuple(dict.fromkeys(directions))
+    if not directions or any(side not in VALID_DIRECTIONS for side in directions):
+        raise ValueError("搜索方向只能包含LONG_ALT和/或SHORT_ALT")
+    spaces = {"LONG_ALT": Config.LONG_PARAM_SPACE, "SHORT_ALT": Config.SHORT_PARAM_SPACE}
+    grid, seen = [], set()
+    for direction in directions:
+        space = spaces[direction]
+        if set(space) != set(GRID_KEYS):
+            raise ValueError(f"{direction}搜索空间字段缺失或多余，必须对应GRID_KEYS")
+        axes = [space[name] for name in GRID_KEYS]
+        if any(not isinstance(axis, (list, tuple)) or not axis for axis in axes):
+            raise ValueError(f"{direction}搜索空间的每一维必须为非空列表或元组")
+        for values in itertools.product(*axes):
+            task = (direction,) + values
+            if task not in seen:
+                grid.append(task)
+                seen.add(task)
     return grid
 
 
+def validate_grid_limits(param_grid):
+    if not param_grid:
+        raise ValueError("参数网格为空")
+    for name in ("MAX_WORKERS", "NUMERIC_THREADS_PER_WORKER", "MAX_GRID_COMBINATIONS"):
+        require_integer(name, getattr(Config, name))
+    if len(param_grid) > Config.MAX_GRID_COMBINATIONS:
+        raise ValueError(
+            f"参数网格共{len(param_grid)}组，超过上限{Config.MAX_GRID_COMBINATIONS}；"
+            "请调整上限或搜索列表。程序不会截取网格。")
+    for params in param_grid:
+        if len(params) != len(TASK_FIELDS) or params[0] not in VALID_DIRECTIONS:
+            raise ValueError(f"无效参数元组（首元素必须是方向）: {params}")
+
+
+def read_completed_summary():
+    """.done 表示计算完成；是否全部结算由 result_complete 另行表示。"""
+    marker = result_path(".done")
+    if not os.path.isfile(marker):
+        return None
+    with open(marker, "r", encoding="utf-8") as f:
+        done = json.load(f)
+    if done.get("run_id") != Config.RUN_ID or done.get("status") != "success":
+        raise ValueError(f"完成标记与本次指纹不符: {marker}")
+    with open(result_path("run_summary.json"), "r", encoding="utf-8") as f:
+        summary = json.load(f)
+    if (summary.get("run_id") != Config.RUN_ID
+            or summary.get("search_direction") != Config.TRADE_DIRECTION):
+        raise ValueError("完成摘要与本次运行指纹/方向不一致")
+    return summary
+
+
 def run_parameter_combination(params, symbols, data_fingerprints, config_snapshot):
-    """必须为模块顶层函数，供Windows spawn序列化；每进程同一时刻只跑一组。"""
+    """顶层函数兼容 Windows spawn；每个进程同一时刻只跑一组参数。"""
     log_path = None
     try:
-        # spawn不会继承父进程对Config类属性的运行时修改，必须显式传入配置。
+        # spawn 不继承父进程运行时修改的类属性，须显式恢复配置。
         for key, value in config_snapshot.items():
             setattr(Config, key, value)
         Config.update_params(*params)
-        prepare_run(symbols, data_fingerprints)
+        manifest = prepare_run(symbols, data_fingerprints)
 
-        # 【修改点 1】：检查当前参数组合是否已经成功运行过
-        done_marker = os.path.join(Config.OUTPUT_DIR, ".done")
-        if os.path.exists(done_marker):
-            return dict(status="SKIPPED", params=Config.PARAM_FOLDER,
-                        output_dir=Config.OUTPUT_DIR, log=None, pid=os.getpid())
+        def completed_result(status, summary):
+            return dict(summary, status=status, params=Config.PARAM_FOLDER,
+                        output_dir=Config.OUTPUT_DIR,
+                        log=result_path("run.log"), pid=os.getpid())
 
+        summary = read_completed_summary()
+        if summary is not None:
+            return completed_result("SKIPPED", summary)
         with parameter_run_lock():
+            # 获取锁前其他进程可能刚好完成，锁内再检查一次。
+            summary = read_completed_summary()
+            if summary is not None:
+                return completed_result("SKIPPED", summary)
+            atomic_json(manifest, result_path("run_manifest.json"))
             log_path = result_path("run.log")
             with open(log_path, "w", encoding="utf-8") as log:
                 with redirect_stdout(log), redirect_stderr(log):
                     try:
                         print(f"参数: {Config.PARAM_FOLDER} | PID: {os.getpid()}")
                         run_all_backtests(symbols, data_fingerprints, prepared=True)
-                        analyze_results()
+                        summary = analyze_results(symbols)
                     except Exception:
                         traceback.print_exc()
                         raise
-
-            # 【修改点 2】：本组参数全部回测与统计完成后，写入成功标记
-            with open(done_marker, "w", encoding="utf-8") as f:
-                f.write("success")
-
-        return dict(status="OK", params=Config.PARAM_FOLDER,
-                    output_dir=Config.OUTPUT_DIR, log=log_path, pid=os.getpid())
+            atomic_json(dict(status="success", run_id=Config.RUN_ID), result_path(".done"))
+        return completed_result("OK", summary)
     except Exception as exc:
-        return dict(status="FAILED", params=str(params), error=str(exc),
-                    log=log_path, pid=os.getpid())
+        return dict(task_metadata(params), status="FAILED", params=str(params),
+                    error=str(exc), log=log_path, pid=os.getpid())
+
+
+def save_grid_summaries(results, param_grid, summary_dir):
+    """按方向和参数排序保存；不把最高样本内均值直接宣布为最优策略。"""
+    frame = pd.DataFrame(results)
+    sort_keys = [key for key in TASK_FIELDS if key in frame.columns]
+    if sort_keys:
+        frame = frame.sort_values(sort_keys, kind="stable").reset_index(drop=True)
+    atomic_csv(frame, os.path.join(summary_dir, "grid_summary.csv"),
+               index=False, encoding="utf-8-sig")
+    for direction in dict.fromkeys(params[0] for params in param_grid):
+        part = frame.loc[frame["search_direction"] == direction]
+        atomic_csv(part, os.path.join(summary_dir, f"{direction}_grid_summary.csv"),
+                   index=False, encoding="utf-8-sig")
+    print(f"\n跨参数汇总已保存: {summary_dir}")
+    print("比较时请检查 status、result_complete、closed_count 和 excursion_valid_count。")
+    print("收益列均为已平仓交易样本统计，收益率为小数，不是组合收益率。")
 
 
 def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
-    """参数组合之间多进程并行；父进程只输出进度，各组详细输出写自己的日志。"""
+    """参数任务共享进程池；每个任务固定一个方向并拥有独立的持仓状态。"""
     param_grid = build_param_grid() if param_grid is None else list(dict.fromkeys(param_grid))
-    if not param_grid:
-        raise ValueError("参数网格为空")
-    for name in ("MAX_WORKERS", "NUMERIC_THREADS_PER_WORKER", "MAX_GRID_COMBINATIONS"):
-        value = getattr(Config, name)
-        if isinstance(value, bool) or int(value) != value or value <= 0:
-            raise ValueError(f"{name}必须为正整数")
-    if len(param_grid) > Config.MAX_GRID_COMBINATIONS:
-        raise ValueError(
-            f"参数网格共{len(param_grid)}组，超过本轮上限{Config.MAX_GRID_COMBINATIONS}组；"
-            "请缩小搜索列表。程序不会截取网格，以免偏向排列靠前的组合。")
+    validate_grid_limits(param_grid)
+    symbols = sorted(set(symbols) - {Config.BTC_SYMBOL})
+    if not symbols:
+        raise ValueError("没有可回测的ALT币种")
     workers = min(int(Config.MAX_WORKERS), len(param_grid))
     if os.name == "nt":
-        workers = min(workers, 61)  # ProcessPoolExecutor在Windows上的进程数上限。
+        workers = min(workers, 61)
     config_snapshot = {key: getattr(Config, key) for key in vars(Config) if key.isupper()}
-    print(f"\n规划了 {len(param_grid)} 组参数网格搜索任务，并行进程数: {workers}")
-    print("每组明细、汇总和日志均写入各自参数目录。")
-    # 父进程已导入numpy，但spawn子进程会在导入numpy之前继承这些环境变量。
+    counts = Counter(params[0] for params in param_grid)
+    print(f"\n规划 {len(param_grid)} 组；分方向: {dict(counts)}；并行进程数: {workers}")
+    print("各组明细、分组摘要和日志分别写入LONG_ALT / SHORT_ALT目录。")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    summary_dir = os.path.join(os.path.abspath(Config.BASE_OUTPUT_DIR),
+                               f"grid_search_{stamp}_{os.getpid()}")
+    os.makedirs(summary_dir, exist_ok=True)
+    atomic_json(dict(created_at_utc=stamp, task_count=len(param_grid),
+                     counts_by_direction=dict(counts), symbols=symbols, tasks=param_grid),
+                os.path.join(summary_dir, "grid_manifest.json"))
+
     thread_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "BLIS_NUM_THREADS")
     previous_env = {key: os.environ.get(key) for key in thread_keys}
@@ -923,64 +1126,70 @@ def run_parameter_grid(symbols, data_fingerprints, param_grid=None):
                             data_fingerprints, config_snapshot): params
                 for params in param_grid
             }
-            for done, future in enumerate(as_completed(futures), 1):
+            for done_count, future in enumerate(as_completed(futures), 1):
                 try:
                     result = future.result()
                 except Exception as exc:
-                    result = dict(status="FAILED", params=str(futures[future]),
+                    params = futures[future]
+                    result = dict(task_metadata(params), status="FAILED", params=str(params),
                                   error=str(exc), log=None)
                 results.append(result)
-
-                # 【修改点 3】：在控制台输出中适配 SKIPPED 状态
                 if result["status"] == "OK":
-                    print(f"✅ [{done}/{len(param_grid)}] {result['params']}")
+                    print(f"[OK {done_count}/{len(param_grid)}] {result['params']}")
                 elif result["status"] == "SKIPPED":
-                    print(f"⏭️ [{done}/{len(param_grid)}] {result['params']} (已处理，跳过)")
+                    print(f"[SKIP {done_count}/{len(param_grid)}] {result['params']}（已完成）")
                 else:
                     errors.append(result)
-                    print(f"❌ [{done}/{len(param_grid)}] {result['params']}: {result['error']}")
+                    print(f"[FAILED {done_count}/{len(param_grid)}] {result['params']}: {result['error']}")
                     if result.get("log"):
-                        print(f"   日志: {result['log']}")
+                        print(f"  日志: {result['log']}")
     finally:
         for key, value in previous_env.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        # 中断前已经返回的任务也形成部分汇总；各组 .done 可在重启后继续使用。
+        if results:
+            save_grid_summaries(results, param_grid, summary_dir)
     if errors:
-        raise RuntimeError(f"{len(errors)}/{len(param_grid)} 组任务失败；成功组合结果已保留，详见日志。")
+        raise RuntimeError(f"{len(errors)}/{len(param_grid)}组失败；成功组合和失败清单已保留。")
     return results
 
 
 # ==========================================
-# 启动入口 (支持自动化网格搜索)
+# 7. 启动入口
 # ==========================================
+def main():
+    # 在读取大文件和计算哈希前先检查网格数量。
+    grid = build_param_grid()
+    validate_grid_limits(grid)
+    print(f"本轮搜索组合数: {dict(Counter(params[0] for params in grid))}；合计 {len(grid)}")
+    with open(Config.SYMBOLS_FILE, "r", encoding="utf-8-sig") as f:
+        requested_symbols = json.load(f)
+    if (not isinstance(requested_symbols, list)
+            or not all(isinstance(s, str) and s.strip() for s in requested_symbols)):
+        raise ValueError("symbols.json应为非空币种名称组成的字符串列表")
+    if not os.path.isfile(kline_path(Config.BTC_SYMBOL)):
+        raise FileNotFoundError(f"找不到核心基准币种 {Config.BTC_SYMBOL} 的数据，停止运行")
+
+    symbols = []
+    for symbol in sorted(set(requested_symbols) - {Config.BTC_SYMBOL}):
+        if os.path.isfile(kline_path(symbol)):
+            symbols.append(symbol)
+        else:
+            print(f"自动跳过: 未找到 {symbol} 的K线文件")
+    if not symbols:
+        raise ValueError("过滤缺失数据后，没有任何可回测的ALT币种")
+    print(f"计算静态源数据指纹，ALT币种数: {len(symbols)}...")
+    data_fingerprints = {
+        symbol: file_sha256(kline_path(symbol))
+        for symbol in sorted(set(symbols) | {Config.BTC_SYMBOL})
+    }
+    run_parameter_grid(symbols, data_fingerprints, grid)
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    # 不自动删除锁：避免另一个仍在运行的脚本失去互斥保护。
-    # 若上次异常退出，先确认相应任务已结束，再手工删除对应目录的.run.lock。
-    with open(Config.SYMBOLS_FILE, "r", encoding="utf-8-sig") as f:
-        SYMBOLS = json.load(f)
-    if not isinstance(SYMBOLS, list) or not all(isinstance(s, str) for s in SYMBOLS):
-        raise ValueError("symbols.json应为币种字符串列表")
-
-    # 【新增】在开始计算指纹之前，提前检查并自动过滤掉缺失的文件
-    valid_symbols = []
-    for s in set(SYMBOLS):
-        if os.path.isfile(kline_path(s)):
-            valid_symbols.append(s)
-        else:
-            print(f"⚠️ 自动跳过: 未找到 {s} 的K线文件。")
-    SYMBOLS = sorted(valid_symbols)
-
-    # 检查基础币种文件是否存在（没有BTC数据，所有币都无法算对冲收益）
-    if not os.path.isfile(kline_path(Config.BTC_SYMBOL)):
-        raise FileNotFoundError(f"❌ 核心错误: 无法找到基准币种 {Config.BTC_SYMBOL} 的文件，停止运行。")
-
-    # 静态源文件只在本次网格搜索开始时哈希一次；再次启动会重新验证。
-    print(f"计算源数据指纹 (当前有效币种数: {len(SYMBOLS)})...")
-    DATA_FINGERPRINTS = {
-        s: file_sha256(kline_path(s)) for s in sorted(set(SYMBOLS) | {Config.BTC_SYMBOL})
-    }
-
-    run_parameter_grid(SYMBOLS, DATA_FINGERPRINTS)
+    # 不自动删除 .run.lock；须确认旧任务已结束后，才可手动清理异常遗留锁。
+    main()
