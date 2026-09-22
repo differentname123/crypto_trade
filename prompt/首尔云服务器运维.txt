@@ -63,7 +63,10 @@ chmod -R 755 /var/www/<对应目录>
 
 ```bash
 systemctl restart alpha-api.service
-journalctl -u alpha-api.service -n 50 -f  # 按 Ctrl+C 退出
+journalctl -u alpha-api.service -n 50 -f
+
+
+# 按 Ctrl+C 退出
 
 ```
 

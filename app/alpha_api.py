@@ -89,10 +89,10 @@ async def chat_endpoint(request: ChatRequest):
 @app.get('/api/signals')
 def get_signals():
     if platform.system().lower() == 'windows':
-        CSV_FILE_PATH = r"W:\project\python_project\crypto_trade\app\signal_trade_lite\live_simulation_logs.csv"
+        CSV_FILE_PATH = r"W:\project\python_project\crypto_trade\app\trader_bot\signal_data\live_simulation_logs.csv"
     else:
         # 宽泛适配：非 Windows 系统（Linux / macOS）均使用 Linux 路径
-        CSV_FILE_PATH = "/root/signal_trade_lite/live_simulation_logs.csv"
+        CSV_FILE_PATH = "/root/trader_bot/signal_data/live_simulation_logs.csv"
     # 兜底返回数据格式
     res_data = {
         "updateTime": "--", "currentPositions": [],

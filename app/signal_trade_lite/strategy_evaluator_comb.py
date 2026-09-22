@@ -921,7 +921,7 @@ def evaluate_multi_strategy_portfolios(
         search_mode="prune",  # [修改点] 默认开启剪枝搜索
         beam_width=1000,
         prune_tolerance=0.8,  # [新增] 下限容忍系数
-        prune_metric="calmar",  # [新增] 层级剪枝的核心评估指标：'calmar' 或 'pf'(盈亏比)
+        prune_metric=("calmar", "周期盈利率(%)", "7日盈利窗口率(%)"),  # [修改点] 默认列表多指标评估
 ):
     """组合回测：加入了基于下限容忍的层级剪枝策略，以及精确搜索/近视搜索的支持。"""
     from functools import lru_cache
@@ -1041,7 +1041,8 @@ def evaluate_multi_strategy_portfolios(
     if search_mode == "beam":
         print(f"近似搜索：每层保留至多 {beam_width:,} 个可扩展种子，可能遗漏优质组合。")
     elif search_mode == "prune":
-        print(f"层级剪枝搜索：每一层的高维组合，基于核心指标({prune_metric})必须 ≥ 0.8×[其最差直系父组合指标]")
+        m_str = ", ".join(prune_metric) if isinstance(prune_metric, (list, tuple)) else str(prune_metric)
+        print(f"层级剪枝搜索：每一层的高维组合，基于核心指标({m_str})必须 ≥ {prune_tolerance}×[其最差直系父组合指标]")
     print("=" * 112)
 
     g_start = min(pd.Timestamp(r["open_dt"].min()) for r in records).normalize()
@@ -1138,6 +1139,76 @@ def evaluate_multi_strategy_portfolios(
     evaluated_by_k = {}
     insufficient_branches = 0
     beam_discarded = 0
+
+    member_alias_map = {}
+
+    def print_top_for_current_layer(current_k):
+        """核心新增：每一层计算完毕即可结算该层并立马先打印结果"""
+        if current_k < min_k:
+            return
+        layer_res = [r for r in results if r.get("组合数量(K)") == current_k]
+        if not layer_res:
+            return
+
+        df_layer = pd.DataFrame(layer_res)
+        df_layer["_scan_order"] = np.arange(len(df_layer))
+        df_layer.sort_values(
+            by=["周期盈利率(%)", "30日盈利窗口率(%)", "_scan_order"],
+            ascending=[False, False, True], na_position="last", inplace=True
+        )
+        df_layer.drop(columns="_scan_order", inplace=True)
+        df_k = df_layer.head(top_n_per_k)
+
+        print("=" * 112)
+        print(f"🏆 【{current_k} 策略组合】本层探索完毕，阶段结果 TOP {len(df_k)}")
+        print("   主排序：周期盈利率 ↓ → 30日盈利窗口率 ↓（N/A 排最后）")
+        print("=" * 112)
+        for rank, (_, r) in enumerate(df_k.iterrows(), 1):
+            print(f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 "
+                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
+            print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
+            print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
+                  f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
+                  f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
+            print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
+                  f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
+                  f"| Profit Factor {fmt(r['Profit Factor'])}")
+            print(f"   已实现风险 | 最大回撤 {fmt(r['已实现MDD(M)'])} M "
+                  f"| 相对最大回撤 {fmt(r['相对已实现MDD(%)'], suffix='%')} "
+                  f"| 最长水下期 {int(r['最长水下期(天)'])} 天 "
+                  f"| 已实现 Calmar {fmt(r['已实现Calmar'])}")
+            print(f"   滚动尾部 | 最差7日收益 {fmt(r['最差7日收益(M)'])} M "
+                  f"| 最差30日收益 {fmt(r['最差30日收益(M)'])} M "
+                  f"| 最差90日收益 {fmt(r['最差90日收益(M)'])} M")
+            print(f"   时间稳定性 | 7日盈利窗口率 {fmt(r['7日盈利窗口率(%)'], suffix='%')} "
+                  f"| 30日盈利窗口率 {fmt(r['30日盈利窗口率(%)'], suffix='%')}")
+            print(f"   四段利润贡献 | {r['四段净利分布']} "
+                  f"| 最低阶段贡献 {fmt(r['最低阶段贡献(%)'], 1, suffix='%')}")
+
+            lo, hi = int(r["_lo"]), int(r["_hi"])
+            ii = [int(value) for value in str(r["_idx"]).split(",")]
+            rows = []
+            for i in ii:
+                m = member_risk(i, lo, hi)
+                _, member_win, _ = cycle_stats((i,), (1.0,), window_blowups(i, lo, hi))
+
+                member_label = records[i]["label"]
+                if member_label not in member_alias_map:
+                    member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
+
+                rows.append({
+                    "成员": member_label,
+                    "成员编号": member_alias_map[member_label],
+                    "窗口净利(M)": fmt(m["net"]),
+                    "已实现MDD(M)": fmt(m["mdd"]),
+                    "已实现Calmar": fmt(m["calmar"]),
+                    "周期盈利率(%)": fmt(member_win),
+                })
+
+            df_print = pd.DataFrame(rows)
+            display_cols = ["成员", "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
+            print_table(df_print[display_cols])
+        print()
 
     def exact_candidates(target_k):
         def visit(chosen, candidates, lo, hi):
@@ -1318,6 +1389,7 @@ def evaluate_multi_strategy_portfolios(
                 if core is not None:
                     results.append(make_row(core))
             print(f"K={k}：评估 {processed - before:,} 个结构可行候选")
+            print_top_for_current_layer(k)
 
     elif search_mode == "beam":
         frontier = [((), 0, T - 1, active_mask)]
@@ -1363,20 +1435,24 @@ def evaluate_multi_strategy_portfolios(
             beam_discarded += discarded
             print(
                 f"K={k}：评估 {processed - before:,} 个候选 | 下层种子 {len(next_heap):,} | 近似淘汰种子 {discarded:,}")
+
+            print_top_for_current_layer(k)
+
             frontier = sorted((item[1] for item in next_heap), key=lambda node: node[0])
             if not frontier:
                 break
 
     elif search_mode == "prune":
         # ======================================================================
-        # 新增的核心逻辑：基于容忍下限的高阶组合前向剪枝搜索
-        # 无需维持巨大的seen集合，利用位运算严格保证组合拓展无重复。
-        # 记录每一层合法组合的核心指标，如果某个父组合已经被剪枝，或者当前
-        # 新产生的K阶组合相对其父节点回落过大（下限容忍度），则废弃不繁衍。
+        # 新增的核心逻辑：基于容忍下限的高阶组合前向剪枝搜索（支持多指标列表）
         # ======================================================================
         combo_metrics_cache = {}
-        # 初始 BFS 边缘: (已选中的节点元组, 共同窗口左端点, 共同窗口右端点, 剩余候选集Mask)
         frontier = [((), 0, T - 1, active_mask)]
+
+        if isinstance(prune_metric, str):
+            p_metrics = [prune_metric]
+        else:
+            p_metrics = list(prune_metric)
 
         for k in range(1, max_k + 1):
             next_frontier = []
@@ -1386,27 +1462,25 @@ def evaluate_multi_strategy_portfolios(
                 candidates = parent_mask
                 while candidates:
                     bit = candidates & -candidates
-                    candidates ^= bit  # 剔除已取出的位，防止(i, j)与(j, i)的重复
+                    candidates ^= bit
                     i = bit.bit_length() - 1
                     idxs = chosen + (i,)
 
                     # 1. 回溯查询 K-1 阶所有直系父节点的指标
                     if k > 1:
-                        parent_metrics = []
+                        parent_metrics_list = []
                         valid_parents = True
                         for p_idxs in itertools.combinations(idxs, k - 1):
                             if p_idxs not in combo_metrics_cache:
                                 valid_parents = False
                                 break
-                            parent_metrics.append(combo_metrics_cache[p_idxs])
+                            parent_metrics_list.append(combo_metrics_cache[p_idxs])
 
-                        # 只要有一个父组合之前因为没达标被剪枝了，子组合也无资格繁衍
                         if not valid_parents:
                             insufficient_branches += 1
                             continue
-                        min_parent_metric = min(parent_metrics)
                     else:
-                        min_parent_metric = None
+                        parent_metrics_list = []
 
                     # 获取新的交集约束
                     child_mask = candidates & compatible[i]
@@ -1421,49 +1495,71 @@ def evaluate_multi_strategy_portfolios(
                     if core is None:
                         continue
 
-                    # 2. 提取核心指标
-                    if prune_metric.lower() == "calmar":
-                        risk = realized_risk(core["daily"])
-                        metric_val = risk["calmar"]
-                        if np.isnan(metric_val):
-                            metric_val = -np.inf
-                    else:
-                        # 退化备用为 Profit Factor (盈亏比)
-                        sl = core["sl"]
-                        w = core["w"]
-                        gp = float((POS[list(idxs), sl] * w[:, None]).sum())
-                        gl = float((NEG[list(idxs), sl] * w[:, None]).sum())
-                        metric_val = ratio(gp, abs(gl))
-                        if np.isnan(metric_val):
-                            metric_val = 0.0
+                    # 2. 提取核心指标(兼容提取多指标至字典)
+                    current_metrics = {}
+                    risk_cache = None
+                    if any(m.lower() == "calmar" for m in p_metrics):
+                        risk_cache = realized_risk(core["daily"])
 
-                    # 3. 容忍下限验证
-                    if k > 1 and min_parent_metric is not None:
-                        # 兼容处理指标出现负数的防错（若最差父级为负，应当放宽下限）
-                        if min_parent_metric > 0:
-                            threshold = prune_tolerance * min_parent_metric
+                    for m_name in p_metrics:
+                        m_lower = m_name.lower()
+                        if m_lower == "calmar":
+                            val = risk_cache["calmar"]
+                            current_metrics[m_name] = val if not np.isnan(val) else -np.inf
+                        elif m_lower in ("pf", "profit factor", "盈亏比"):
+                            sl = core["sl"]
+                            w = core["w"]
+                            gp = float((POS[list(idxs), sl] * w[:, None]).sum())
+                            gl = float((NEG[list(idxs), sl] * w[:, None]).sum())
+                            val = ratio(gp, abs(gl))
+                            current_metrics[m_name] = val if not np.isnan(val) else 0.0
+                        elif m_lower in ("周期盈利率(%)", "cycle_win", "周期盈利率"):
+                            val = core["cycle_win"]
+                            current_metrics[m_name] = val if not np.isnan(val) else -np.inf
+                        elif m_lower in ("7日盈利窗口率(%)", "7日盈利窗口率", "win_7"):
+                            val = core["win_7"]
+                            current_metrics[m_name] = val if not np.isnan(val) else -np.inf
+                        elif m_lower in ("30日盈利窗口率(%)", "30日盈利窗口率", "win_30"):
+                            val = core["win_30"]
+                            current_metrics[m_name] = val if not np.isnan(val) else -np.inf
+                        elif m_lower in ("1日盈利窗口率(%)", "1日盈利窗口率", "win_1"):
+                            val = core["win_1"]
+                            current_metrics[m_name] = val if not np.isnan(val) else -np.inf
                         else:
-                            # e.g., 若容忍系数0.8，父代-10，则下限降至 -12，允许进一步恶化一丢丢
-                            threshold = min_parent_metric * (2.0 - prune_tolerance)
+                            current_metrics[m_name] = -np.inf
 
-                        # 若指标触发了断崖式恶化，直接不让它繁衍下一层
-                        if metric_val < threshold:
-                            beam_discarded += 1
-                            continue
+                    # 3. 容忍下限验证(要求所有的指标都不产生断崖式恶化)
+                    pruned = False
+                    if k > 1 and parent_metrics_list:
+                        for m_name in p_metrics:
+                            min_parent_val = min(p[m_name] for p in parent_metrics_list)
+                            if min_parent_val > 0:
+                                threshold = prune_tolerance * min_parent_val
+                            else:
+                                threshold = min_parent_val * (2.0 - prune_tolerance)
+
+                            if current_metrics[m_name] < threshold:
+                                pruned = True
+                                break
+
+                    if pruned:
+                        beam_discarded += 1
+                        continue
 
                     # 4. 保留“半成品”数据至缓存
-                    combo_metrics_cache[idxs] = metric_val
+                    combo_metrics_cache[idxs] = current_metrics
 
-                    # 若组合达标，则推入结果报告中
                     if k >= min_k and core["passed"]:
                         results.append(make_row(core))
 
-                    # 把满足基础繁衍条件的推入下层
                     if k < max_k and bool(child_mask):
                         next_frontier.append((idxs, lo, hi, child_mask))
 
             print(
                 f"K={k}：评估 {processed - before:,} 个候选 | 容忍下限剪枝淘汰 {beam_discarded:,} | 下层种子 {len(next_frontier):,}")
+
+            print_top_for_current_layer(k)
+
             frontier = next_frontier
             if not frontier:
                 break
@@ -1502,71 +1598,6 @@ def evaluate_multi_strategy_portfolios(
         output_csv, index=False, encoding="utf-8-sig", na_rep="N/A")
     print(f"组合评估完成：{len(df_all):,} 个已发现的有效组合 | {coverage_text} | {output_csv}\n")
 
-    member_alias_map = {}
-
-    for k in range(min_k, max_k + 1):
-        df_k = df_all[df_all["组合数量(K)"] == k].head(top_n_per_k)
-        if df_k.empty:
-            continue
-        print("=" * 112)
-        print(f"🏆 【{k} 策略组合】本次结果 TOP {len(df_k)}")
-        print("   主排序：周期盈利率 ↓ → 30日盈利窗口率 ↓（N/A 排最后）")
-        print("=" * 112)
-        for rank, (_, r) in enumerate(df_k.iterrows(), 1):
-            print(f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 "
-                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
-            print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
-            print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
-                  f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
-                  f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
-            print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
-                  f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
-                  f"| Profit Factor {fmt(r['Profit Factor'])}")
-            print(f"   已实现风险 | 最大回撤 {fmt(r['已实现MDD(M)'])} M "
-                  f"| 相对最大回撤 {fmt(r['相对已实现MDD(%)'], suffix='%')} "
-                  f"| 最长水下期 {int(r['最长水下期(天)'])} 天 "
-                  f"| 已实现 Calmar {fmt(r['已实现Calmar'])}")
-            print(f"   滚动尾部 | 最差7日收益 {fmt(r['最差7日收益(M)'])} M "
-                  f"| 最差30日收益 {fmt(r['最差30日收益(M)'])} M "
-                  f"| 最差90日收益 {fmt(r['最差90日收益(M)'])} M")
-            print(f"   时间稳定性 | 7日盈利窗口率 {fmt(r['7日盈利窗口率(%)'], suffix='%')} "
-                  f"| 30日盈利窗口率 {fmt(r['30日盈利窗口率(%)'], suffix='%')}")
-            print(f"   四段利润贡献 | {r['四段净利分布']} "
-                  f"| 最低阶段贡献 {fmt(r['最低阶段贡献(%)'], 1, suffix='%')}")
-
-            lo, hi = int(r["_lo"]), int(r["_hi"])
-            ii = [int(value) for value in str(r["_idx"]).split(",")]
-            rows = []
-            for i in ii:
-                m = member_risk(i, lo, hi)
-                _, member_win, _ = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
-
-                member_label = records[i]["label"]
-                if member_label not in member_alias_map:
-                    member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
-
-                rows.append({
-                    "成员": member_label,
-                    "成员编号": member_alias_map[member_label],
-                    "窗口净利(M)": fmt(m["net"]),
-                    "已实现MDD(M)": fmt(m["mdd"]),
-                    "已实现Calmar": fmt(m["calmar"]),
-                    "周期盈利率(%)": fmt(member_win),
-                })
-
-            df_print = pd.DataFrame(rows)
-
-            display_cols = [
-                "成员",
-                "成员编号",
-                "窗口净利(M)",
-                "已实现MDD(M)",
-                "已实现Calmar",
-                "周期盈利率(%)"
-            ]
-
-            print_table(df_print[display_cols])
-        print()
     return df_all
 
 
@@ -1725,17 +1756,18 @@ def print_ranking_report_from_csv(
                 print_table(df_print[display_cols])
         print()
 
+
 if __name__ == "__main__":
     PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
 
-    # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
-    extract_target_trades_csv(
-        cache_dir=CACHE_DIR,
-        short_cache_dir=SHORT_CACHE_DIR,
-        output_dir="./extracted_trades_csv",
-        target_configs=TARGET_CONFIGS,
-        plateau_csv=PLATEAU_CSV,
-    )
+    # # Stage A: 抽取并归一化逐笔明细(只需在参数或缓存变化时跑一次)
+    # extract_target_trades_csv(
+    #     cache_dir=CACHE_DIR,
+    #     short_cache_dir=SHORT_CACHE_DIR,
+    #     output_dir="./extracted_trades_csv",
+    #     target_configs=TARGET_CONFIGS,
+    #     plateau_csv=PLATEAU_CSV,
+    # )
 
     # Stage B: 穷举 K=2~5 组合并排名
     evaluate_multi_strategy_portfolios(
@@ -1749,8 +1781,8 @@ if __name__ == "__main__":
         min_overlap_days=180,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
         search_mode="prune",  # 使用最新集成的层级容忍剪枝算法
-        prune_tolerance=0.8,  # 指标回落容忍度，0.8代表允许最大20%回撤
-        prune_metric="calmar",  # 核心评估指标 (可选 "calmar" 或 "pf")
+        prune_tolerance=1,  # 指标回落容忍度，0.8代表允许最大20%回撤
+        prune_metric=["calmar", "周期盈利率(%)", "7日盈利窗口率(%)"],  # [修改点] 默认按列表输入，多指标同时生效
     )
 
     # print_ranking_report_from_csv()
