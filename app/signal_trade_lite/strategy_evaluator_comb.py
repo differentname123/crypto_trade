@@ -559,110 +559,6 @@ def _normalize_trades_df(trades_df, cycles_df, margin):
     return out, summary
 
 
-def _worker_process_cache_file(fpath, groups, plateau_df, output_dir):
-    """
-    多进程 Worker 函数：处理单个缓存文件，独立完成反序列化、回放与归一化导出。
-    提取到顶层以满足 ProcessPoolExecutor 的序列化(Pickle)要求。
-    """
-    import os
-    import gc
-    import math
-    import numpy as np
-
-    local_summaries = []
-    local_done = set()
-    local_mult_seen = {}
-    logs = []
-
-    fname = os.path.basename(fpath)
-    sym, strat, direct = _parse_filename(fname)
-    direct = str(direct).capitalize()
-
-    try:
-        data = _load_pickle(fpath)
-    except Exception as e:
-        logs.append(f"[警告] 读取失败已跳过: {fname} | {e}")
-        return local_summaries, local_done, local_mult_seen, logs
-
-    attrs = data.get("attrs", {}) or {}
-    add_s = round(float(attrs.get("add_step", -1)), 6)
-    tp_s = round(float(attrs.get("tp_step", -1)), 6)
-    mult = attrs.get("multiplier", None)
-    mult = float(mult) if mult is not None else None
-    key = (sym, strat, direct, add_s, tp_s)
-
-    if key not in groups:
-        del data
-        gc.collect()
-        return local_summaries, local_done, local_mult_seen, logs
-
-    g = groups[key]
-    if g["multiplier"] is not None and mult is not None and not math.isclose(g["multiplier"], mult, abs_tol=1e-6):
-        del data
-        gc.collect()
-        return local_summaries, local_done, local_mult_seen, logs
-
-    local_mult_seen[key] = {mult}
-
-    cycles_df = data.pop("df")
-    cycles_df.attrs = attrs
-    data.clear()
-    del data
-    gc.collect()
-
-    if cycles_df is None or len(cycles_df) == 0:
-        logs.append(f"[警告] cycles 为空: {fname}")
-        del cycles_df
-        gc.collect()
-        return local_summaries, local_done, local_mult_seen, logs
-
-    replayer = TimelineReplayer(cycles_df)
-    for margin in sorted(g["margins"].keys()):
-        meta = g["margins"][margin]
-        try:
-            trades_df = replayer.run(margin)
-            norm_df, summ = _normalize_trades_df(trades_df, cycles_df, margin)
-        except Exception as e:
-            logs.append(f"[警告] 回放/归一化失败: {sym}|{strat}|{direct}|M{margin} | {type(e).__name__}: {e}")
-            continue
-
-        norm_df["symbol"] = sym
-        norm_df["strategy"] = strat
-        norm_df["direction"] = direct
-        norm_df["margin"] = margin
-        norm_df["add_step"] = add_s
-        norm_df["tp_step"] = tp_s
-        norm_df["multiplier"] = mult if mult is not None else np.nan
-
-        mtag = f"_x{mult:g}" if mult is not None else ""
-        out_filename = (f"trades_{sym}_{strat}_{direct}_M{margin}"
-                        f"_add{add_s:.3f}_tp{tp_s:.3f}{mtag}.csv")
-        norm_df.to_csv(os.path.join(output_dir, out_filename), index=False, encoding="utf-8-sig")
-
-        row = {
-            "file": out_filename,
-            "label": _make_label(sym, strat, direct, margin, add_s, tp_s) + mtag,
-            "币种": sym, "策略": strat, "方向": direct, "Margin": margin,
-            "加仓间距": add_s, "止盈间距": tp_s, "加仓倍数": mult,
-            "推荐权重": meta["weight"], "备注": meta["note"],
-        }
-        row.update(summ)
-        row.update(_match_plateau_row(plateau_df, sym, strat, direct, margin, add_s, tp_s, mult))
-
-        local_summaries.append(row)
-        local_done.add((key, margin))
-        logs.append(f"✅ {out_filename} | 笔数={summ['实际开仓数']} "
-                    f"净利={summ['净利润(M倍)']}M 爆仓={summ['爆仓次数']} ratio={summ['pnl换算ratio']}")
-
-        del trades_df, norm_df
-        gc.collect()
-
-    del cycles_df, replayer
-    gc.collect()
-
-    return local_summaries, local_done, local_mult_seen, logs
-
-
 def extract_target_trades_csv(cache_dir=CACHE_DIR,
                               short_cache_dir=SHORT_CACHE_DIR,
                               output_dir="./extracted_trades_csv",
@@ -677,10 +573,7 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
       * 记录/校验 multiplier(加仓倍数), 写进文件名, 避免张冠李戴与互相覆盖
       * 附带导出 _single_strategy_index.csv (含平原精确匹配指标 + 推荐权重)
       * [新增] 支持直接从给定的 CSV 列表加载策略组合，替代 TARGET_CONFIGS
-      * [新增] 引入并发度为 10 的多进程处理，极速榨干 CPU
     """
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-
     # 默认加载的 CSV 列表
     if target_csv_list is None:
         target_csv_list = [
@@ -707,6 +600,7 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
                             "tp_step": float(row["止盈间距"]),
                             "margin": float(row["Margin"]),
                         }
+                        # 处理可选字段
                         if "加仓倍数" in row and pd.notna(row["加仓倍数"]):
                             cfg["multiplier"] = float(row["加仓倍数"])
                         if "备注" in row and pd.notna(row["备注"]):
@@ -774,45 +668,99 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
         s, st, d = _parse_filename(os.path.basename(fp))
         if (s, st, str(d).capitalize()) in coarse:
             candidates.append(fp)
-    print(f"📂 缓存文件总数 {len(files)}，按币种/策略/方向粗筛后候选 {len(candidates)} 个，准备并行处理...\n")
+    print(f"📂 缓存文件总数 {len(files)}，按币种/策略/方向粗筛后候选 {len(candidates)} 个，开始逐个加载...\n")
 
-    # ---- 3. 并行加载文件, 内循环多 Margin ----
+    # ---- 3. 逐候选文件加载一次, 内循环多 Margin ----
     done = set()
     summaries = []
     mult_seen = {}
+    for fi, fpath in enumerate(candidates, 1):
+        fname = os.path.basename(fpath)
+        sym, strat, direct = _parse_filename(fname)
+        direct = str(direct).capitalize()
+        try:
+            data = _load_pickle(fpath)
+        except Exception as e:
+            print(f"[警告] 读取失败已跳过: {fname} | {e}")
+            continue
 
-    print(f"🚀 启动多进程并发处理 (并发度 10) ...")
+        attrs = data.get("attrs", {}) or {}
+        add_s = round(float(attrs.get("add_step", -1)), 6)
+        tp_s = round(float(attrs.get("tp_step", -1)), 6)
+        mult = attrs.get("multiplier", None)
+        mult = float(mult) if mult is not None else None
+        key = (sym, strat, direct, add_s, tp_s)
 
-    with ProcessPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(_worker_process_cache_file, fpath, groups, plateau_df, output_dir): fpath
-            for fpath in candidates
-        }
+        if key not in groups:
+            del data
+            gc.collect()
+            continue
 
-        for future in as_completed(futures):
-            fpath = futures[future]
+        g = groups[key]
+        if g["multiplier"] is not None and mult is not None and not math.isclose(g["multiplier"], mult, abs_tol=1e-6):
+            del data
+            gc.collect()
+            continue
+
+        mult_seen.setdefault(key, set()).add(mult)
+        if g["multiplier"] is None and len(mult_seen[key]) > 1:
+            print(f"[⚠ 重要] {key} 在缓存中存在多个加仓倍数 {sorted(x for x in mult_seen[key] if x is not None)}；"
+                  f"已按倍数分别导出，请在 TARGET_CONFIGS 中显式补 'multiplier' 以锁定榜单那一行！")
+
+        cycles_df = data.pop("df")
+        cycles_df.attrs = attrs
+        data.clear()
+        del data
+        gc.collect()
+
+        if cycles_df is None or len(cycles_df) == 0:
+            print(f"[警告] cycles 为空: {fname}")
+            del cycles_df
+            gc.collect()
+            continue
+
+        replayer = TimelineReplayer(cycles_df)
+        for margin in sorted(g["margins"].keys()):
+            meta = g["margins"][margin]
             try:
-                local_summaries, local_done, local_mult_seen, logs = future.result()
+                trades_df = replayer.run(margin)
+                norm_df, summ = _normalize_trades_df(trades_df, cycles_df, margin)
             except Exception as e:
-                print(f"❌ 进程抛出未捕获异常: {os.path.basename(fpath)} | {e}")
+                print(f"[警告] 回放/归一化失败: {sym}|{strat}|{direct}|M{margin} | {type(e).__name__}: {e}")
                 continue
 
-            # 聚合结果
-            summaries.extend(local_summaries)
+            norm_df["symbol"] = sym
+            norm_df["strategy"] = strat
+            norm_df["direction"] = direct
+            norm_df["margin"] = margin
+            norm_df["add_step"] = add_s
+            norm_df["tp_step"] = tp_s
+            norm_df["multiplier"] = mult if mult is not None else np.nan
 
-            for k, v_set in local_mult_seen.items():
-                mult_seen.setdefault(k, set()).update(v_set)
-                if groups[k]["multiplier"] is None and len(mult_seen[k]) > 1:
-                    print(f"[⚠ 重要] {k} 在缓存中存在多个加仓倍数 {sorted(x for x in mult_seen[k] if x is not None)}；"
-                          f"已按倍数分别导出，请在 TARGET_CONFIGS 中显式补 'multiplier' 以锁定榜单那一行！")
+            mtag = f"_x{mult:g}" if mult is not None else ""
+            out_filename = (f"trades_{sym}_{strat}_{direct}_M{margin}"
+                            f"_add{add_s:.3f}_tp{tp_s:.3f}{mtag}.csv")
+            norm_df.to_csv(os.path.join(output_dir, out_filename), index=False, encoding="utf-8-sig")
 
-            # 为了平滑打印日志进度，我们先更新 done 集合，然后再打印 log
-            done.update(local_done)
-            for log in logs:
-                if log.startswith("✅"):
-                    print(f"[{len(done)}/{n_targets}] {log}")
-                else:
-                    print(log)
+            row = {
+                "file": out_filename,
+                "label": _make_label(sym, strat, direct, margin, add_s, tp_s) + mtag,
+                "币种": sym, "策略": strat, "方向": direct, "Margin": margin,
+                "加仓间距": add_s, "止盈间距": tp_s, "加仓倍数": mult,
+                "推荐权重": meta["weight"], "备注": meta["note"],
+            }
+            row.update(summ)
+            row.update(_match_plateau_row(plateau_df, sym, strat, direct, margin, add_s, tp_s, mult))
+            summaries.append(row)
+            done.add((key, margin))
+            print(f"[{len(done)}/{n_targets}] ✅ {out_filename} | 笔数={summ['实际开仓数']} "
+                  f"净利={summ['净利润(M倍)']}M 爆仓={summ['爆仓次数']} ratio={summ['pnl换算ratio']}")
+
+            del trades_df, norm_df
+            gc.collect()
+
+        del cycles_df, replayer
+        gc.collect()
 
     # ---- 4. 汇总索引 ----
     if summaries:
@@ -821,7 +769,7 @@ def extract_target_trades_csv(cache_dir=CACHE_DIR,
 
     missing = [(k, m) for k, g in groups.items() for m in g["margins"] if (k, m) not in done]
     print("\n" + "=" * 70)
-    print(f"🎉 并行导出完成: {len(done)}/{n_targets} 个，目录: {output_dir}")
+    print(f"🎉 导出完成: {len(done)}/{n_targets} 个，目录: {output_dir}")
     print(f"📑 元数据索引: {INDEX_FILE}")
     if missing:
         print(f"⚠️ 未命中 {len(missing)} 个组合(请核对 add/tp/multiplier 与缓存 attrs):")
