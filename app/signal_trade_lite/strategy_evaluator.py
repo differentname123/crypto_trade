@@ -742,6 +742,7 @@ def analyze_all_strategies(*, max_tasks_per_child=10, print_details=True):
 
     print(f"控制台榜单用时: {time.perf_counter() - display_started:.1f}s")
 
+
 def compute_parameter_plateau(
         csv_file: str,
         output_csv: str = None,
@@ -774,10 +775,19 @@ def compute_parameter_plateau(
         "预期存活(天)": "预期存活_val",
         "中位存活(天)": "中位存活_val",
         "最长无盈利(天)": "最长无盈利_val",
+        # 新增要求列映射
+        "单日胜率(%)": "单日胜率_val",
+        "7日滚动胜率(%)": "七日胜率_val",
+        "30日滚动胜率(%)": "三十日胜率_val",
     }
     for old_col, new_col in col_map.items():
         if old_col in df.columns and new_col not in df.columns:
             df[new_col] = df[old_col]
+
+    # 防御性填充，防止宽表中确实不存在某些列导致后续报错
+    for req_col in ["单日胜率_val", "七日胜率_val", "三十日胜率_val"]:
+        if req_col not in df.columns:
+            df[req_col] = 0.0
 
     # 数值类型清洗与转换
     # 预期存活可能包含 "999 (未爆仓)" 字符串
@@ -796,6 +806,37 @@ def compute_parameter_plateau(
     df["_clean_净利"] = pd.to_numeric(df["净利_val"], errors="coerce").fillna(0.0)
     df["_clean_总收益"] = pd.to_numeric(df["总收益_val"], errors="coerce").fillna(0.0)
     df["_clean_最长无盈利"] = pd.to_numeric(df["最长无盈利_val"], errors="coerce").fillna(0.0)
+
+    # 新增清洗列
+    df["_clean_单日胜率"] = pd.to_numeric(df["单日胜率_val"], errors="coerce").fillna(0.0)
+    df["_clean_七日胜率"] = pd.to_numeric(df["七日胜率_val"], errors="coerce").fillna(0.0)
+    df["_clean_三十日胜率"] = pd.to_numeric(df["三十日胜率_val"], errors="coerce").fillna(0.0)
+
+    # =========================================================================
+    # 计算 "最低Q净利占比(%)"
+    # =========================================================================
+    q_col_names = ["Q1净利(M倍)", "Q2净利(M倍)", "Q3净利(M倍)", "Q4净利(M倍)"]
+    for q_col in q_col_names:
+        if q_col not in df.columns:
+            df[q_col] = 0.0
+
+    def calc_min_q_ratio(row):
+        try:
+            q_vals = [float(row[c]) for c in q_col_names]
+            min_q = min(q_vals)
+            sum_q = sum(q_vals)
+
+            if sum_q == 0:
+                return 0.0
+
+            # 使用 abs(sum_q) 做分母，保证当 min_q 为负数时，最终算出来的百分比直接为负数
+            ratio = (min_q / abs(sum_q)) * 100.0
+            return round(ratio, 2)
+        except Exception:
+            return 0.0
+
+    df["最低Q净利占比(%)"] = df.apply(calc_min_q_ratio, axis=1)
+    # =========================================================================
 
     # 2. 自动识别维度参数的不重复离散值并构建网格索引 (Grid Rank)
     # 平原空间坐标轴：Margin, 加仓间距, 止盈间距
@@ -844,6 +885,12 @@ def compute_parameter_plateau(
         exp_surv_arr = g_df["_clean_预期存活"].values
         no_profit_arr = g_df["_clean_最长无盈利"].values
 
+        # 提取新增计算用的数组
+        min_q_arr = g_df["最低Q净利占比(%)"].values
+        win_1d_arr = g_df["_clean_单日胜率"].values
+        win_7d_arr = g_df["_clean_七日胜率"].values
+        win_30d_arr = g_df["_clean_三十日胜率"].values
+
         # 对当前组下的每个唯一参数网格点求其邻域
         for _, row in sub_grids.iterrows():
             target_m = row["Margin_idx"]
@@ -866,6 +913,12 @@ def compute_parameter_plateau(
                 nb_exp_surv = exp_surv_arr[neighbor_mask]
                 nb_no_profit = no_profit_arr[neighbor_mask]
 
+                # 新增邻居切片
+                nb_min_q = min_q_arr[neighbor_mask]
+                nb_win_1d = win_1d_arr[neighbor_mask]
+                nb_win_7d = win_7d_arr[neighbor_mask]
+                nb_win_30d = win_30d_arr[neighbor_mask]
+
                 mean_pnl = float(np.mean(nb_pnl))
                 mean_gross = float(np.mean(nb_gross))
                 # 中位存活的 P10 分位数
@@ -876,6 +929,21 @@ def compute_parameter_plateau(
                 win_pnl_rate = float(np.mean(nb_pnl > 0) * 100.0)
                 # 最长无盈利的 90 分位数
                 p90_no_profit = float(np.percentile(nb_no_profit, 90))
+
+                # 新增平原计算
+                min_pnl = float(np.min(nb_pnl))
+
+                mean_min_q = float(np.mean(nb_min_q))
+                min_min_q = float(np.min(nb_min_q))
+
+                mean_win_1d = float(np.mean(nb_win_1d))
+                min_win_1d = float(np.min(nb_win_1d))
+
+                mean_win_7d = float(np.mean(nb_win_7d))
+                min_win_7d = float(np.min(nb_win_7d))
+
+                mean_win_30d = float(np.mean(nb_win_30d))
+                min_win_30d = float(np.min(nb_win_30d))
             else:
                 mean_pnl = 0.0
                 mean_gross = 0.0
@@ -884,10 +952,29 @@ def compute_parameter_plateau(
                 win_pnl_rate = 0.0
                 p90_no_profit = 0.0
 
+                min_pnl = 0.0
+                mean_min_q = 0.0
+                min_min_q = 0.0
+                mean_win_1d = 0.0
+                min_win_1d = 0.0
+                mean_win_7d = 0.0
+                min_win_7d = 0.0
+                mean_win_30d = 0.0
+                min_win_30d = 0.0
+
             res = {c: row[c] for c in (group_keys + dim_cols)}
             res.update({
                 "全币邻居数": n_neighbors,
                 "平原均净利(M倍)": round(mean_pnl, 2),
+                "平原最小净利(M倍)": round(min_pnl, 2),
+                "平原均单日胜率(%)": round(mean_win_1d, 2),
+                "平原最小单日胜率(%)": round(min_win_1d, 2),
+                "平原均7日胜率(%)": round(mean_win_7d, 2),
+                "平原最小7日胜率(%)": round(min_win_7d, 2),
+                "平原均30日胜率(%)": round(mean_win_30d, 2),
+                "平原最小30日胜率(%)": round(min_win_30d, 2),
+                "平原均最低Q净利占比(%)": round(mean_min_q, 2),
+                "平原最小最低Q净利占比(%)": round(min_min_q, 2),
                 "平原均总收益(M倍)": round(mean_gross, 2),
                 "平原存活安全垫(天)": round(surv_cushion, 2),
                 "平原存活率(%)": round(surv_rate, 2),
@@ -905,8 +992,9 @@ def compute_parameter_plateau(
 
     # 清理过程生成的临时列
     drop_temp_cols = ["净利_val", "总收益_val", "预期存活_val", "中位存活_val", "最长无盈利_val",
+                      "单日胜率_val", "七日胜率_val", "三十日胜率_val",
                       "_clean_预期存活", "_clean_中位存活", "_clean_净利", "_clean_总收益",
-                      "_clean_最长无盈利"] + idx_cols
+                      "_clean_最长无盈利", "_clean_单日胜率", "_clean_七日胜率", "_clean_三十日胜率"] + idx_cols
     df_final.drop(columns=[c for c in drop_temp_cols if c in df_final.columns], inplace=True)
 
     # 5. 存储为新的 CSV 文件
@@ -920,7 +1008,6 @@ def compute_parameter_plateau(
     df_final.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"✅ 平原分析完成！新文件已包含平原维度指标，总行数: {len(df_final):,}\n")
     return df_final
-
 
 def show_leaderboard_csv(
         csv_file="strategy_leaderboard_15600_files.csv",
@@ -965,6 +1052,9 @@ def show_leaderboard_csv(
         min_plateau_mean_net_profit=0,
         # 【平原属性】整个参数平原的平均净利润下限（Margin倍数）。
         # 解释：要求这个参数所在的整个“地带”总体上必须是赚钱的（>0）。防止某个特定的参数点刚好卡在了一个偶然赚钱的峰值上，而周围的参数其实全在亏钱（孤岛效应）。
+
+        min_Q_ratio=10,
+        # 【平原属性】最低Q净利占比下限（%）。
 
         # ------------------- 展示控制 -------------------
         target_strategy_keywords=("factor",)
@@ -1099,6 +1189,13 @@ def show_leaderboard_csv(
         print(f"[提示] 根据 Smooth 过滤后，无匹配数据。")
         return
     # =======================================================================
+
+    # 2. 过滤最低Q净利占比
+    if "最低Q净利占比(%)" in df_all.columns:
+        rows_before = len(df_all)
+        df_all = df_all[df_all["最低Q净利占比(%)"] >= min_Q_ratio]
+        log_stat(f"最低Q净利占比(%) >= {min_Q_ratio}", rows_before, len(df_all))
+
 
     # 2. 过滤交易次数
     if "实际开仓数" in df_all.columns:
@@ -1298,7 +1395,9 @@ Index(['币种', '策略', '方向', '加仓间距', '止盈间距', '加仓倍�
        '持仓时间占比(%)', '死前翻倍胜率(%)', '平均回撤(M倍)', '中位回撤(M倍)', 'Q1净利(M倍)',
        'Q2净利(M倍)', 'Q3净利(M倍)', 'Q4净利(M倍)', '总收益(Margin倍数)', '总亏损(Margin倍数)',
        '净利润(Margin倍数)', '平均每天收益(M倍)', '每天中位数收益(M倍)', '最长无盈利(天)', '无盈利占比(%)',
-       '年化爆仓次数', '翻倍所需时间(小时)', '0-1层解决战斗比例(%)', '手续费占毛利(%)', 'Margin'],
+       '年化爆仓次数', '翻倍所需时间(小时)', '0-1层解决战斗比例(%)', '手续费占毛利(%)', 'Margin',
+       '最低Q净利占比(%)', '全币邻居数', '平原均净利(M倍)', '平原均总收益(M倍)', '平原存活安全垫(天)',
+       '平原存活率(%)', '平原盈利%', '平原90%分位无盈利(天)'],
       dtype='str')
 """
 
