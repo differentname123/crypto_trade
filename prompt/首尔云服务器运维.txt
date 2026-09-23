@@ -11,6 +11,7 @@
 
 * ☁️ **服务器管理 (腾讯云轻量应用服务器):**
 * 公网 IPv4 地址: `43.131.225.155`
+* 硬件配置：**2GB 物理内存 + 2GB Swap 虚拟内存 (总容量 4GB)**
 * 服务器控制台: [点击访问 腾讯云 Lighthouse 实例详情]
 
 
@@ -44,19 +45,18 @@
 ### 3. 标准运维与通用部署流程
 
 🟢 **通用前端网页更新 (Vite 打包部署标准 4 步)**
-所有前端页面的更新，请将下方命令中的 `<对应目录>` 替换为实际路径（如 `alpha-web` 或 `copy-sweep-web`）：
+所有前端页面的更新，请将下方命令中的 `<对应目录>` 替换为实际路径：
 
 1. 本地打包：`npm run build`
 2. 清空旧代码：`rm -rf /var/www/<对应目录>/*`
 3. 上传新代码：将本地 `dist` 文件夹内的**所有内容**上传至 `/var/www/<对应目录>/`
 4. 修复文件权限：
+
 ```bash
 chown -R www-data:www-data /var/www/<对应目录>
 chmod -R 755 /var/www/<对应目录>
 
 ```
-
-
 
 🟢 **后端逻辑更新 (代码修改后必做)**
 修改了 `alpha_api.py` 后，必须重启服务并检查日志：
@@ -64,8 +64,6 @@ chmod -R 755 /var/www/<对应目录>
 ```bash
 systemctl restart alpha-api.service
 journalctl -u alpha-api.service -n 50 -f
-
-
 # 按 Ctrl+C 退出
 
 ```
@@ -80,54 +78,71 @@ systemctl reload nginx
 
 ---
 
+## 三、 自动交易机器人运维手册 (Grid / Martin / Signal)
 
-### 三、 自动交易机器人双策略运维手册 (Lite & Grid)
+当前服务器运行着 **3 套独立的交易策略机器人**，统一存放于 `/root/trader_bot` 目录下，并使用虚拟环境运行以隔离依赖。
 
-#### 1. 核心路径说明
+### 1. 核心路径说明
 
-工作目录均在 `/root/signal_trade_lite`（共用代码与虚拟环境）。
+* **核心工作目录:** `/root/trader_bot`
+* **Python 虚拟环境路径:** `/root/trader_bot/venv/bin/python`
+* **Grid 策略 (网格):**
+* 执行入口: `/root/trader_bot/run_grid_bot.py`
+* 服务配置: `/etc/systemd/system/bot-grid.service`
 
-查看服务被kill的记录：  "  dmesg -T | grep -i -E "killed process|oom" -C 10   "
+
+* **Martin 策略 (马丁):**
+* 执行入口: `/root/trader_bot/run_martin_bot.py`
+* 服务配置: `/etc/systemd/system/bot-martin.service`
 
 
-**Lite 策略 (主干)：**
+* **Signal 策略 (信号):**
+* 执行入口: `/root/trader_bot/run_signal_bot.py`
+* 服务配置: `/etc/systemd/system/bot-signal.service`
 
-* **服务配置:** `/etc/systemd/system/binance-trade.service`
-* **业务日志:** `/root/signal_trade_lite/app/signal_trade_lite/logs/trading_trader.log`
 
-**Grid 策略 (网格)：**
 
-* **服务配置:** `/etc/systemd/system/binance-trade-grid.service`
-* **业务日志:** `/root/signal_trade_lite/app/signal_trade_lite/logs/grid_trader.log`
+### 2. 常用运维命令（免拼接，直接复制）
+
+**🟢 Grid 策略 (网格机器人)**
+
+* **重启/停止/状态:** `systemctl restart bot-grid`
+| `systemctl stop bot-grid` |
+`systemctl status bot-grid`
+* **查看实时日志/报错:** `  journalctl -u bot-grid -n 100 -f    `
+
+**🔵 Martin 策略 (马丁机器人)**
+
+* **重启/停止/状态:** `systemctl restart bot-martin` | `systemctl stop bot-martin` | `systemctl status bot-martin`
+* **查看实时日志/报错:** `        journalctl -u bot-martin -n 100 -f        `
+
+**🟣 Signal 策略 (信号机器人)**
+
+* **重启/停止/状态:** `systemctl restart bot-signal` | `systemctl stop bot-signal` | `systemctl status bot-signal`
+* **查看实时日志/报错:** `       journalctl -u bot-signal -n 100 -f       `
+
+### 3. 核心注意事项
+
+* **配置重载:** 每次修改了 `/etc/systemd/system/` 下的 service 文件后，必须先执行 `systemctl daemon-reload`，再执行 restart。
+* **内存分配策略 (已放宽限制):**
+* 依托于 `2GB 物理内存 + 2GB 虚拟内存` 的配置，为避免机器人运行中被误杀，当前 3 个服务均设置了 **`MemoryMax=1200M`**。
+* 三者合计理论峰值为 3600M，在 4GB 总容量的安全范围内。
+* 配合 `Restart=always` 与 `RestartSec=5` 参数，即使偶发 OOM 也能在 5 秒内迅速自启。
+* **一键排查进程被杀记录 (OOM检查):**
+```bash
+
+
+dmesg -T | grep -i -E "killed process|oom" -C 5
+
+
+
+```
+
+
+
+
 
 ---
-
-#### 2. 常用运维命令（免拼接，直接复制）
-
-**🟢 Lite 策略 (主干) 专用命令**
-
-* **启动/重启:** `systemctl restart binance-trade`
-* **紧急停止:** `systemctl stop binance-trade`
-* **查看状态:** `systemctl status binance-trade`
-* **查看系统报错:** `    journalctl -u binance-trade -n 100 -f      `
-* **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/trading_trader.log`
-
-**🔵 Grid 策略 (网格) 专用命令**
-
-* **启动/重启:** `systemctl restart binance-trade-grid`
-* **紧急停止:** `systemctl stop binance-trade-grid`
-* **查看状态:** `systemctl status binance-trade-grid`
-* **查看系统报错:** `  journalctl -u binance-trade-grid -n 100 -f    `
-* **实时查看业务日志:** `tail -f /root/signal_trade_lite/app/signal_trade_lite/logs/grid_trader.log`
-
----
-
-#### 3. 核心注意事项
-
-* **重载配置:** 每次修改配置后，必须先执行以下重载命令，再执行对应的重启命令：
-`systemctl daemon-reload`
-* **内存保护:** 两套策略均已设定 `MemoryMax=800M`，合计占用不超过 1600M，防止 2GB 服务器内存溢出死机。
-
 
 ## 四、 HTTPS 安全代理节点 (GOST Proxy)
 
@@ -141,14 +156,15 @@ systemctl reload nginx
 ### 2. 常用运维与调用模板
 
 * 🟢 **修改配置后重启:**
+
 ```bash
 systemctl daemon-reload
 systemctl restart gost
 
 ```
 
-
 * 🚀 **Python 代码直连调用模板:**
+
 ```python
 import requests
 PROXY_URL = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
@@ -156,8 +172,6 @@ proxies = {"http": PROXY_URL, "https": PROXY_URL}
 response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
 
 ```
-
-
 
 ---
 
@@ -170,3 +184,12 @@ response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
 1. 登录 Cloudflare 控制台 -> Caching (缓存) -> Configuration -> 点击 **`Purge Everything`**。
 2. 浏览器端按 `Ctrl + F5` 强制刷新，或在 F12 Network 中勾选 `Disable cache`。
 
+
+
+### 🚨 故障 2：机器人突然不交易了 / 服务状态显示 failed 或 killed
+
+* **根本原因：** 极大概率是内存溢出（OOM），导致系统强制杀死了 Python 进程。
+* **解决方案：**
+1. 执行 `dmesg -T | grep -i oom` 确认是否是因为内存不足。
+2. 检查是哪个策略吃内存：`systemd-cgtop`。
+3. 虽然内存限制已放宽至 1200M，但如果持续出现 OOM，建议排查 Python 代码中是否存在内存泄漏。

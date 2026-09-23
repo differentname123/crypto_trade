@@ -1782,7 +1782,7 @@ if __name__ == "__main__":
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
         search_mode="prune",  # 使用最新集成的层级容忍剪枝算法
         prune_tolerance=1,  # 指标回落容忍度，0.8代表允许最大20%回撤
-        prune_metric=["calmar", "周期盈利率(%)", "7日盈利窗口率(%)"],  # [修改点] 默认按列表输入，多指标同时生效
+        prune_metric=["calmar", "周期盈利率(%)"],  # [修改点] 默认按列表输入，多指标同时生效
     )
 
     # print_ranking_report_from_csv()
