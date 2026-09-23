@@ -2046,10 +2046,175 @@ def get_signal_factor_044_4(symbol):
         'factor_044_4',
     )
 
+
+import pandas as pd
+import numpy as np
+
+
+def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
+    """
+    底层核心信号生成器：计算 Z-Score、短期确认，并通过状态机生成最终开仓信号。
+    注意：传入的 df 必须包含 'close' 列，且 Index 为标准 1h 的 DatetimeIndex。
+    """
+    # 1. 对齐时间轴与基础字段
+    df = pd.DataFrame(index=alt_df.index)
+    df['close'] = alt_df['close']
+    df['btc_close'] = btc_df['close']
+
+    # 常量配置
+    S = 24  # 长期信号窗口 (24h)
+    B = beta_days * 24  # 长期 Beta 窗口 (1440h 或 1080h)
+    S_C = 12  # 短期确认窗口 (12h)
+    S_B = 7 * 24  # 短期 Beta 窗口 (168h)
+    MIN_BTC_VAR = 1e-16
+    MIN_RESIDUAL_STD = 1e-10
+
+    # 2. 基础收益率计算
+    df['ret_1h'] = np.log(df['close']).diff()
+    df['btc_ret_1h'] = np.log(df['btc_close']).diff()
+    df['ret_24h'] = df['ret_1h'].rolling(S, min_periods=S).sum()
+    df['btc_ret_24h'] = df['btc_ret_1h'].rolling(S, min_periods=S).sum()
+
+    # 3. 长期 Beta 与 Z-Score 计算
+    cov = df['ret_1h'].rolling(B, min_periods=B).cov(df['btc_ret_1h'])
+    var = df['btc_ret_1h'].rolling(B, min_periods=B).var()
+    # var.where() 防止除以0或极小值导致无穷大
+    df['beta_shifted'] = (cov / var.where(var > MIN_BTC_VAR)).shift(S)
+    beta = df['beta_shifted']
+
+    df['residual_24h'] = df['ret_24h'] - beta * df['btc_ret_24h']
+
+    # 历史残差分布 (使用 S 之前估算的 Beta)
+    N = B - S + 1
+    ar = df['ret_24h'].shift(S).rolling(N, min_periods=N)
+    mr = df['btc_ret_24h'].shift(S).rolling(N, min_periods=N)
+
+    hist_res_mean = ar.mean() - beta * mr.mean()
+    res_var = ar.var() + beta.pow(2) * mr.var() - 2 * beta * ar.cov(df['btc_ret_24h'].shift(S))
+    hist_res_std = np.sqrt(res_var.clip(lower=0))
+
+    std = hist_res_std.where(hist_res_std > MIN_RESIDUAL_STD)
+    df['z_score'] = (df['residual_24h'] - hist_res_mean) / std
+    df['z_score'] = df['z_score'].replace([np.inf, -np.inf], np.nan)
+
+    # 4. 短期弱势确认 (Short Confirmation: UP, 12h)
+    cov_s = df['ret_1h'].rolling(S_B, min_periods=S_B).cov(df['btc_ret_1h'])
+    var_s = df['btc_ret_1h'].rolling(S_B, min_periods=S_B).var()
+    short_beta = (cov_s / var_s.where(var_s > MIN_BTC_VAR)).shift(S_C)
+
+    # 用向量化方式累加过去 12 小时的状态
+    net_counts = np.zeros(len(df), dtype=int)
+    up_counts = np.zeros(len(df), dtype=int)
+    up_sums = np.zeros(len(df), dtype=float)
+    up_negatives = np.zeros(len(df), dtype=int)
+
+    ret_1h_np = df['ret_1h'].to_numpy()
+    btc_ret_1h_np = df['btc_ret_1h'].to_numpy()
+    short_beta_np = short_beta.to_numpy()
+
+    for lag in range(S_C):
+        ar_lag = pd.Series(ret_1h_np).shift(lag).to_numpy()
+        mr_lag = pd.Series(btc_ret_1h_np).shift(lag).to_numpy()
+        residual_lag = ar_lag - short_beta_np * mr_lag
+
+        valid = np.isfinite(residual_lag)
+        up_mask = valid & (mr_lag > 0)
+
+        net_counts += valid.astype(int)
+        up_counts += up_mask.astype(int)
+        up_sums += np.where(up_mask, residual_lag, 0.0)
+        up_negatives += (up_mask & (residual_lag < 0)).astype(int)
+
+    # 严格要求 12 个小时 K 线齐全，且 BTC 至少有 2 小时上涨 (N=2)
+    complete = (net_counts == S_C)
+    enough = complete & (up_counts >= 2)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        mean_excess = np.where(up_counts > 0, up_sums / up_counts, np.nan)
+        negative_ratio = np.where(up_counts > 0, up_negatives / up_counts, np.nan)
+
+    df['short_ready'] = enough & (mean_excess < 0.0) & (negative_ratio >= 0.0)
+
+    # 5. 实盘信号状态机 (State Machine)
+    signals = []
+    armed = False
+    pending = False
+    trigger_time = pd.NaT
+    wait_time = pd.Timedelta(hours=12)
+
+    for row in df.itertuples():
+        z = row.z_score
+        ready = row.short_ready
+        now = row.Index
+
+        signal_triggered = False
+
+        if not np.isfinite(z):
+            armed = pending = False
+            trigger_time = pd.NaT
+        elif -z_threshold <= z <= z_threshold:
+            # 回落至正常区间，重新填装子弹，取消正在等待的警报
+            armed = True
+            pending = False
+            trigger_time = pd.NaT
+        elif z > z_threshold:
+            # 持续处于做空极值区
+            if pending:
+                # 已经突破，正在熬时间
+                if (now - trigger_time) >= wait_time:
+                    if ready:
+                        signal_triggered = True
+                        pending = False  # 消耗信号，避免随后几小时重复开空
+            else:
+                if armed:
+                    # 首次向上突破
+                    armed = False
+                    pending = True
+                    trigger_time = now
+        else:
+            # 处于反向极端区 (z < -z_threshold)，完全解除武装
+            armed = pending = False
+            trigger_time = pd.NaT
+
+        signals.append(signal_triggered)
+
+    # 最终赋值并返回修改后的 alt_df
+    alt_df['z_score'] = df['z_score']
+    alt_df['signal'] = signals
+    return alt_df
+
+
+# =========================================================
+# 面向你的两个专属策略的调用函数
+# =========================================================
+
+def apply_signal_1671(alt_df, btc_df):
+    """
+    应用 ID 1671 策略：Z: 8.5 | Beta: 60d
+    """
+    return _generate_core_signal(alt_df, btc_df, beta_days=60, z_threshold=8.5)
+
+
+def apply_signal_2384(alt_df, btc_df):
+    """
+    应用 ID 2384 策略：Z: 9.5 | Beta: 45d
+    """
+    return _generate_core_signal(alt_df, btc_df, beta_days=45, z_threshold=9.5)
+
+
 # =============================================================================
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
+    btc_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\trader_bot\data\BTC_USDT_USDT_1h_latest.csv')
+    btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
+    btc_df = btc_df.set_index('timestamp').sort_index()
+    alt_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\trader_bot\data\CTSI_USDT_USDT_1h_latest.csv')
+    alt_df['timestamp'] = pd.to_datetime(alt_df['timestamp'], unit='ms')
+    alt_df = alt_df.set_index('timestamp').sort_index()
+    final_df = apply_signal_2384(alt_df, btc_df)
+
+
     target_time = (
             datetime.now() - timedelta(minutes=1)
     ).strftime('%Y-%m-%d %H:%M')
