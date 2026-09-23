@@ -24,6 +24,8 @@ SHORT_* 参数均表示“短期确认”，不表示只用于做空。
    实际使用 BETA_WINDOW_DAYS 天的历史日均成交额，不一定是 24h / 30d。
 8. CSV 源文件须在整次搜索期间保持不变；启动时缺失 ALT 文件会跳过，
    启动后文件消失则报错，避免各组币池不一致。
+9. 每笔原双腿交易同步计算 ALT_ONLY 反事实：使用相同信号、方向、入场时点和固定持有期，
+   初始名义为 PAIR_GROSS_NOTIONAL，仅持有 ALT，BTC 数量恒为 0，费用只按 ALT 实际成交额计。
 """
 
 import glob
@@ -149,7 +151,7 @@ class Config:
     MAX_GRID_COMBINATIONS = 3000  # 两组相加为 2520，不能沿用原来的 1000。
     MAX_WORKERS = max(1, min(10, (os.cpu_count() or 1) - 1))
     NUMERIC_THREADS_PER_WORKER = 1
-    CACHE_VERSION = "directional_fine_search_fixed_beta_excursion_net_v5"
+    CACHE_VERSION = "directional_fine_search_fixed_beta_excursion_net_alt_only_v6"
 
     BETA_WINDOW_HOURS = BETA_WINDOW_DAYS * 24
     SHORT_BETA_WINDOW_HOURS = SHORT_BETA_WINDOW_DAYS * 24
@@ -225,6 +227,13 @@ TRADE_COLUMNS = [
     "short_support_ratio", "short_up_support_ratio", "short_down_support_ratio",
     "short_up_count", "short_down_count", "long_trigger_time", "long_trigger_z",
     "exit_reason", "mae_return", "mfe_return", "mae_time", "mfe_time",
+    "alt_only_status", "alt_only_exit_time", "alt_only_exit_price",
+    "alt_only_holding_hours", "alt_only_exit_reason", "alt_only_qty",
+    "alt_only_btc_qty", "alt_only_entry_notional", "alt_only_exit_notional",
+    "alt_only_gross_pnl", "alt_only_entry_cost", "alt_only_exit_cost",
+    "alt_only_total_cost", "alt_only_net_pnl", "alt_only_gross_return",
+    "alt_only_net_return", "alt_only_mae_return", "alt_only_mfe_return",
+    "alt_only_mae_time", "alt_only_mfe_time",
 ]
 
 
@@ -379,6 +388,9 @@ def prepare_run(symbols, data_fingerprints=None):
         short_basis="mean_hourly_log_residual_fixed_pre_window_beta",
         direction_policy="one_alt_side_per_run_normal_band_rearm",
         fee=Config.FEE_RATE, gross=Config.PAIR_GROSS_NOTIONAL,
+        alt_only=dict(enabled=True, same_signal=True, same_holding=True,
+                      gross=Config.PAIR_GROSS_NOTIONAL, btc_qty=0.0,
+                      fee_basis="alt_actual_turnover"),
         start=begin.isoformat() if begin is not None else None,
         min_var=Config.MIN_BTC_VARIANCE, min_std=Config.MIN_RESIDUAL_STD,
         excursion=dict(basis="net_liquidation_return", sampling="hourly_close",
@@ -559,6 +571,52 @@ def pair_valuation(position, alt_price, btc_price):
                 net_return=(gross - total_cost) / denominator)
 
 
+def valid_alt_price(alt_price):
+    return np.isfinite(alt_price) and alt_price > 0
+
+
+def alt_only_valuation(position, alt_price):
+    """ALT_ONLY 反事实：只持有 ALT，BTC 数量恒为 0。"""
+    q_alt = position["alt_only_qty"]
+    gross = q_alt * (alt_price - position["entry_price"])
+    exit_notional = abs(q_alt) * alt_price
+    exit_cost = exit_notional * position["fee_rate"]
+    total_cost = position["alt_only_entry_cost"] + exit_cost
+    denominator = position["alt_only_entry_notional"]
+    return dict(alt_only_exit_notional=exit_notional, alt_only_gross_pnl=gross,
+                alt_only_exit_cost=exit_cost, alt_only_total_cost=total_cost,
+                alt_only_net_pnl=gross - total_cost,
+                alt_only_gross_return=gross / denominator,
+                alt_only_net_return=(gross - total_cost) / denominator)
+
+
+def invalidate_alt_only_excursions(position):
+    position.update(alt_only_mae_return=np.nan, alt_only_mfe_return=np.nan,
+                    alt_only_mae_time=pd.NaT, alt_only_mfe_time=pd.NaT,
+                    _alt_only_excursion_valid=False)
+
+
+def update_alt_only_excursions(position, now, alt_price):
+    """ALT_ONLY 按小时收盘更新净清算收益；只要求 ALT 价格路径连续。"""
+    if not position["_alt_only_excursion_valid"]:
+        return
+    previous = position["_alt_only_last_mark_time"]
+    if (not valid_alt_price(alt_price)
+            or (previous is not None
+                and now - previous not in (pd.Timedelta(0), pd.Timedelta(hours=1)))):
+        invalidate_alt_only_excursions(position)
+        return
+    current_return = alt_only_valuation(position, alt_price)["alt_only_net_return"]
+    if not np.isfinite(current_return):
+        invalidate_alt_only_excursions(position)
+        return
+    position["_alt_only_last_mark_time"] = now
+    if current_return < position["alt_only_mae_return"]:
+        position.update(alt_only_mae_return=current_return, alt_only_mae_time=now)
+    if current_return > position["alt_only_mfe_return"]:
+        position.update(alt_only_mfe_return=current_return, alt_only_mfe_time=now)
+
+
 def invalidate_excursions(position):
     position.update(mae_return=np.nan, mfe_return=np.nan,
                     mae_time=pd.NaT, mfe_time=pd.NaT, _excursion_valid=False)
@@ -638,9 +696,18 @@ def open_pair_position(symbol, row, median, scheduled_exit_time=pd.NaT,
                                   else row.short_down_positive_ratio),
         short_up_count=row.short_up_count, short_down_count=row.short_down_count,
         exit_reason=None, mae_return=0.0, mfe_return=0.0, mae_time=pd.NaT, mfe_time=pd.NaT,
+        alt_only_status="OPEN", alt_only_exit_time=pd.NaT, alt_only_exit_price=np.nan,
+        alt_only_holding_hours=np.nan, alt_only_exit_reason=None,
+        alt_only_qty=direction * Config.PAIR_GROSS_NOTIONAL / row.close,
+        alt_only_btc_qty=0.0, alt_only_entry_notional=Config.PAIR_GROSS_NOTIONAL,
+        alt_only_entry_cost=Config.PAIR_GROSS_NOTIONAL * Config.FEE_RATE,
+        alt_only_mae_return=0.0, alt_only_mfe_return=0.0,
+        alt_only_mae_time=pd.NaT, alt_only_mfe_time=pd.NaT,
         _excursion_valid=True, _last_mark_time=None,
+        _alt_only_excursion_valid=True, _alt_only_last_mark_time=None,
     )
     update_excursions(position, now, row.close, row.btc_close)
+    update_alt_only_excursions(position, now, row.close)
     return position
 
 
@@ -655,6 +722,21 @@ def close_pair_position(position, now, alt_price, btc_price, z, reason):
                     btc_exit=btc_price, exit_z_score=z,
                     holding_hours=(now - position["entry_time"]).total_seconds() / 3600,
                     exit_reason=reason)
+    return True
+
+
+def close_alt_only_position(position, now, alt_price, reason):
+    if not valid_alt_price(alt_price):
+        invalidate_alt_only_excursions(position)
+        position.update(alt_only_status="UNRESOLVED_MISSING_EXIT",
+                        alt_only_exit_reason="MISSING_SCHEDULED_EXIT")
+        return False
+    update_alt_only_excursions(position, now, alt_price)
+    position.update(alt_only_valuation(position, alt_price))
+    position.update(alt_only_status="CLOSED", alt_only_exit_time=now,
+                    alt_only_exit_price=alt_price,
+                    alt_only_holding_hours=(now - position["entry_time"]).total_seconds() / 3600,
+                    alt_only_exit_reason=reason)
     return True
 
 
@@ -690,10 +772,21 @@ def backtest_single_symbol(symbol, df, market_median_series):
         if position is not None:
             if now <= position["scheduled_exit_time"]:
                 update_excursions(position, now, row.close, row.btc_close)
+                update_alt_only_excursions(position, now, row.close)
             if now < position["scheduled_exit_time"]:
                 continue
-            if (now != position["scheduled_exit_time"]
-                    or not valid_pair_prices(row.close, row.btc_close)):
+            if now != position["scheduled_exit_time"]:
+                invalidate_excursions(position)
+                invalidate_alt_only_excursions(position)
+                position.update(status="UNRESOLVED_MISSING_EXIT",
+                                exit_reason="MISSING_SCHEDULED_EXIT",
+                                alt_only_status="UNRESOLVED_MISSING_EXIT",
+                                alt_only_exit_reason="MISSING_SCHEDULED_EXIT")
+                trades.append(position)
+                position = None
+                break  # 无法按计划结算，停止本币后续交易，不私自延期。
+            close_alt_only_position(position, now, row.close, "FIXED_HOLD")
+            if not valid_pair_prices(row.close, row.btc_close):
                 invalidate_excursions(position)
                 position.update(status="UNRESOLVED_MISSING_EXIT",
                                 exit_reason="MISSING_SCHEDULED_EXIT")
@@ -757,7 +850,10 @@ def backtest_single_symbol(symbol, df, market_median_series):
 
     if position is not None:
         invalidate_excursions(position)
-        position.update(status="UNRESOLVED_END_OF_DATA", exit_reason="END_OF_DATA")
+        invalidate_alt_only_excursions(position)
+        position.update(status="UNRESOLVED_END_OF_DATA", exit_reason="END_OF_DATA",
+                        alt_only_status="UNRESOLVED_END_OF_DATA",
+                        alt_only_exit_reason="END_OF_DATA")
         trades.append(position)
     return pd.DataFrame(trades, columns=TRADE_COLUMNS)
 
@@ -869,13 +965,24 @@ def analyze_results(symbols=None):
         if not all_trades["status"].isin(
                 ["CLOSED", "UNRESOLVED_MISSING_EXIT", "UNRESOLVED_END_OF_DATA"]).all():
             raise ValueError("交易文件包含未知或尚未终结的状态")
-    for col in ("net_pnl", "net_return", "total_cost", "entry_cost", "mae_return", "mfe_return"):
+        if not all_trades["alt_only_status"].isin(
+                ["CLOSED", "UNRESOLVED_MISSING_EXIT", "UNRESOLVED_END_OF_DATA"]).all():
+            raise ValueError("ALT_ONLY交易包含未知或尚未终结的状态")
+    for col in ("net_pnl", "net_return", "total_cost", "entry_cost", "mae_return", "mfe_return",
+                "alt_only_net_pnl", "alt_only_net_return", "alt_only_total_cost",
+                "alt_only_entry_cost", "alt_only_mae_return", "alt_only_mfe_return"):
         all_trades[col] = pd.to_numeric(all_trades[col], errors="raise")
     closed = all_trades.loc[all_trades["status"] == "CLOSED"].copy()
     unresolved = all_trades.loc[all_trades["status"] != "CLOSED"].copy()
+    alt_only_closed = all_trades.loc[all_trades["alt_only_status"] == "CLOSED"].copy()
+    alt_only_unresolved = all_trades.loc[all_trades["alt_only_status"] != "CLOSED"].copy()
     if not closed.empty and not np.isfinite(
             closed[["net_pnl", "net_return", "total_cost"]].to_numpy(dtype=float)).all():
         raise ValueError("已平仓交易缺少有限的收益或费用，拒绝汇总")
+    if not alt_only_closed.empty and not np.isfinite(
+            alt_only_closed[["alt_only_net_pnl", "alt_only_net_return",
+                             "alt_only_total_cost"]].to_numpy(dtype=float)).all():
+        raise ValueError("ALT_ONLY已平仓交易缺少有限的收益或费用，拒绝汇总")
 
     summary = dict(
         **task_metadata(current_task_params()),
@@ -898,6 +1005,29 @@ def analyze_results(symbols=None):
         p10_mae_return=optional_float(closed["mae_return"].quantile(0.10)),
         worst_mae_return=optional_float(closed["mae_return"].min()),
         avg_mfe_return=optional_float(closed["mfe_return"].mean()),
+        alt_only_gross_notional=float(Config.PAIR_GROSS_NOTIONAL),
+        alt_only_btc_qty=0.0,
+        alt_only_closed_count=len(alt_only_closed),
+        alt_only_unresolved_count=len(alt_only_unresolved),
+        alt_only_result_complete=alt_only_unresolved.empty,
+        alt_only_has_closed_trades=not alt_only_closed.empty,
+        alt_only_unresolved_missing_exit_count=int(
+            (alt_only_unresolved["alt_only_status"] == "UNRESOLVED_MISSING_EXIT").sum()),
+        alt_only_unresolved_end_of_data_count=int(
+            (alt_only_unresolved["alt_only_status"] == "UNRESOLVED_END_OF_DATA").sum()),
+        alt_only_unresolved_entry_cost=float(alt_only_unresolved["alt_only_entry_cost"].sum()),
+        alt_only_win_rate=optional_float((alt_only_closed["alt_only_net_pnl"] > 0).mean()),
+        alt_only_avg_net_return=optional_float(alt_only_closed["alt_only_net_return"].mean()),
+        alt_only_median_net_return=optional_float(alt_only_closed["alt_only_net_return"].median()),
+        alt_only_avg_net_pnl=optional_float(alt_only_closed["alt_only_net_pnl"].mean()),
+        alt_only_sum_net_pnl=(optional_float(alt_only_closed["alt_only_net_pnl"].sum())
+                              if not alt_only_closed.empty else None),
+        alt_only_avg_cost=optional_float(alt_only_closed["alt_only_total_cost"].mean()),
+        alt_only_excursion_valid_count=int(alt_only_closed["alt_only_mae_return"].count()),
+        alt_only_avg_mae_return=optional_float(alt_only_closed["alt_only_mae_return"].mean()),
+        alt_only_p10_mae_return=optional_float(alt_only_closed["alt_only_mae_return"].quantile(0.10)),
+        alt_only_worst_mae_return=optional_float(alt_only_closed["alt_only_mae_return"].min()),
+        alt_only_avg_mfe_return=optional_float(alt_only_closed["alt_only_mfe_return"].mean()),
     )
 
     group_columns = [
@@ -920,6 +1050,34 @@ def analyze_results(symbols=None):
             p10_mae_return=("mae_return", lambda x: x.quantile(0.10)),
             worst_mae_return=("mae_return", "min"), avg_mfe_return=("mfe_return", "mean"),
         ).reset_index()[group_columns]
+
+    alt_only_group_columns = [
+        "vol_group", "direction", "alt_only_trade_count", "alt_only_win_rate",
+        "alt_only_avg_net_return", "alt_only_median_net_return",
+        "alt_only_avg_net_pnl", "alt_only_sum_net_pnl", "alt_only_avg_cost",
+        "alt_only_excursion_valid_count", "alt_only_avg_mae_return",
+        "alt_only_p10_mae_return", "alt_only_worst_mae_return",
+        "alt_only_avg_mfe_return",
+    ]
+    if alt_only_closed.empty:
+        alt_only_groups = pd.DataFrame(columns=alt_only_group_columns)
+    else:
+        alt_only_groups = alt_only_closed.groupby(["vol_group", "direction"]).agg(
+            alt_only_trade_count=("symbol", "count"),
+            alt_only_win_rate=("alt_only_net_pnl", lambda x: (x > 0).mean()),
+            alt_only_avg_net_return=("alt_only_net_return", "mean"),
+            alt_only_median_net_return=("alt_only_net_return", "median"),
+            alt_only_avg_net_pnl=("alt_only_net_pnl", "mean"),
+            alt_only_sum_net_pnl=("alt_only_net_pnl", "sum"),
+            alt_only_avg_cost=("alt_only_total_cost", "mean"),
+            alt_only_excursion_valid_count=("alt_only_mae_return", "count"),
+            alt_only_avg_mae_return=("alt_only_mae_return", "mean"),
+            alt_only_p10_mae_return=("alt_only_mae_return", lambda x: x.quantile(0.10)),
+            alt_only_worst_mae_return=("alt_only_mae_return", "min"),
+            alt_only_avg_mfe_return=("alt_only_mfe_return", "mean"),
+        ).reset_index()[alt_only_group_columns]
+    groups = groups.merge(alt_only_groups, on=["vol_group", "direction"], how="outer")
+    groups = groups[group_columns + alt_only_group_columns[2:]]
     # 保留原分组汇总文件名；本次只有指定方向的高/低成交额分组。
     atomic_csv(groups, result_path("quadrant_summary.csv"), index=False)
     atomic_json(summary, result_path("run_summary.json"))
@@ -933,15 +1091,37 @@ def analyze_results(symbols=None):
         print(f"未结算交易已发生开仓成本: {summary['unresolved_entry_cost']:.4f} USDT")
     if closed.empty:
         print("没有已平仓交易；摘要已保存，收益指标为空，不填成零收益。")
-        return summary
-    print(f"胜率: {summary['win_rate']:.2%}")
-    print(f"单笔平均净收益率: {summary['avg_net_return']:.4%}")
-    print(f"单笔净收益率中位数: {summary['median_net_return']:.4%}")
-    print(f"独立交易净盈亏合计: {summary['sum_net_pnl']:.4f} USDT")
-    print(f"完整极值样本: {summary['excursion_valid_count']}/{len(closed)}")
-    if summary["avg_mae_return"] is not None:
-        print(f"平均MAE: {summary['avg_mae_return']:.4%}；"
-              f"P10: {summary['p10_mae_return']:.4%}；最差: {summary['worst_mae_return']:.4%}")
+    else:
+        print(f"胜率: {summary['win_rate']:.2%}")
+        print(f"单笔平均净收益率: {summary['avg_net_return']:.4%}")
+        print(f"单笔净收益率中位数: {summary['median_net_return']:.4%}")
+        print(f"独立交易净盈亏合计: {summary['sum_net_pnl']:.4f} USDT")
+        print(f"完整极值样本: {summary['excursion_valid_count']}/{len(closed)}")
+        if summary["avg_mae_return"] is not None:
+            print(f"平均MAE: {summary['avg_mae_return']:.4%}；"
+                  f"P10: {summary['p10_mae_return']:.4%}；最差: {summary['worst_mae_return']:.4%}")
+
+    print("\n【ALT_ONLY：同信号/同持有期，仅开ALT，不做BTC对冲】")
+    print(f"初始ALT名义: {Config.PAIR_GROSS_NOTIONAL:.4f} USDT；BTC数量: 0")
+    print(f"已平仓: {len(alt_only_closed)}；未结算: {len(alt_only_unresolved)}")
+    if not alt_only_unresolved.empty:
+        print("ALT_ONLY结果不完整：收益统计仅含ALT_ONLY已平仓子集。")
+        print(f"ALT_ONLY未结算交易已发生开仓成本: "
+              f"{summary['alt_only_unresolved_entry_cost']:.4f} USDT")
+    if alt_only_closed.empty:
+        print("ALT_ONLY没有已平仓交易；相关收益指标为空，不填成零收益。")
+    else:
+        print(f"ALT_ONLY胜率: {summary['alt_only_win_rate']:.2%}")
+        print(f"ALT_ONLY单笔平均净收益率: {summary['alt_only_avg_net_return']:.4%}")
+        print(f"ALT_ONLY单笔净收益率中位数: {summary['alt_only_median_net_return']:.4%}")
+        print(f"ALT_ONLY独立交易净盈亏合计: {summary['alt_only_sum_net_pnl']:.4f} USDT")
+        print(f"ALT_ONLY完整极值样本: "
+              f"{summary['alt_only_excursion_valid_count']}/{len(alt_only_closed)}")
+        if summary["alt_only_avg_mae_return"] is not None:
+            print(f"ALT_ONLY平均MAE: {summary['alt_only_avg_mae_return']:.4%}；"
+                  f"P10: {summary['alt_only_p10_mae_return']:.4%}；"
+                  f"最差: {summary['alt_only_worst_mae_return']:.4%}")
+
     print("\n【成交额分组 × ALT方向；收益率列为小数】")
     print(groups.to_string(index=False))
     print("未计算组合年化、夏普和最大回撤：需要共享资金分配及逐小时盯市账本。")

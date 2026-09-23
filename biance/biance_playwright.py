@@ -40,7 +40,6 @@ from playwright.sync_api import sync_playwright, expect, TimeoutError as Playwri
 
 from common.common_utils import setup_logger
 
-logger = setup_logger(app_name="biance_playwright")
 
 # ==============================================================================
 #                                   运行配置
@@ -96,6 +95,7 @@ RE_SUBMIT_API_PRIMARY = re.compile(r"pgc/content/add", re.IGNORECASE)
 RE_SUBMIT_API_SECONDARY = re.compile(
     r"(content/comment|comment/add|comment/create|/reply|square/.*(publish|post/add))", re.IGNORECASE
 )
+logger = setup_logger(app_name="biance_playwright")
 
 
 class PageCrashedException(Exception):
