@@ -1110,9 +1110,13 @@ def show_leaderboard_csv(
         # 【平原属性】最低Q净利占比下限（%）。
 
         # ------------------- 展示控制 -------------------
-        target_strategy_keywords=("factor",)
+        target_strategy_keywords=("factor",),
         # 策略白名单控制。
         # 解释：只打印展示名称中包含这些关键字（如"factor"）的策略，方便在大乱炖的回测文件中，精准查看自己当前关心的策略，防止日志刷屏。
+
+        black_strategy_keywords=()
+        # 策略黑名单控制。
+        # 解释：剔除展示名称中包含这些关键字的策略。同时配置白名单与黑名单时，两者条件需同时满足。
 ):
     """
     专门用于读取并展示 CSV 文件的函数。
@@ -1186,6 +1190,7 @@ def show_leaderboard_csv(
     print(
         f"  • 存活与风控 : 中位存活≥{min_median_survival_days}天 | 平原安全垫≥{min_plateau_survival_cushion}天 | 指标超越数≥{min_median_outperform_count}")
     print(f"  • 策略白名单 : 必须包含关键字 {list(target_strategy_keywords)}")
+    print(f"  • 策略黑名单 : 必须不包含关键字 {list(black_strategy_keywords)}")
     print("=" * 90)
 
     # 1. 过滤方向
@@ -1314,7 +1319,6 @@ def show_leaderboard_csv(
         df_all = df_all[df_all["平原中位净利(M倍)"] > min_plateau_median_net_profit]
         log_stat(f"平原中位净利(M倍) > {min_plateau_median_net_profit}", rows_before, len(df_all))
 
-
     if "最大持仓(h)" in df_all.columns:
         rows_before = len(df_all)
         df_all = df_all[df_all["最大持仓(h)"] <= max_holding_days * 24]
@@ -1338,6 +1342,14 @@ def show_leaderboard_csv(
         mask = df_all["策略"].astype(str).str.contains(pattern, na=False)
         df_all = df_all[mask]
         log_stat(f"策略关键字: {list(target_strategy_keywords)}", rows_before, len(df_all))
+
+    # 策略关键字黑名单前置过滤计算通过率
+    if black_strategy_keywords:
+        rows_before = len(df_all)
+        black_pattern = '|'.join(map(re.escape, black_strategy_keywords))
+        mask = ~df_all["策略"].astype(str).str.contains(black_pattern, na=False)
+        df_all = df_all[mask]
+        log_stat(f"策略黑名单: {list(black_strategy_keywords)}", rows_before, len(df_all))
     # =========================================================
 
     # 打印最终统计表
@@ -1426,6 +1438,9 @@ def show_leaderboard_csv(
         if not any(target in strategy_name for target in target_strategy_keywords):
             continue
 
+        if black_strategy_keywords and any(black in strategy_name for black in black_strategy_keywords):
+            continue
+
         index_count += 1
         # 提取当前策略的数据
         df_strat = df_all[df_all["策略"] == strategy_name].copy()
@@ -1467,7 +1482,6 @@ def show_leaderboard_csv(
             print(" | ".join(row_cells))
 
         print(sep_line)
-
 
 def compute_marting():
     mp.freeze_support()
