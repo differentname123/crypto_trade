@@ -1006,8 +1006,8 @@ def evaluate_multi_strategy_portfolios(
         processed += 1
         k = len(idxs)
         evaluated_by_k[k] = evaluated_by_k.get(k, 0) + 1
-        if processed % 20000 == 0:
-            print(f"   ...已评估 {processed:,} 个候选 | 当前 K={k}")
+        # if processed % 20000 == 0:
+        #     print(f"   ...已评估 {processed:,} 个候选 | 当前 K={k}")
         ii = list(idxs)
         n_days = hi - lo + 1
         sl = slice(lo, hi + 1)
