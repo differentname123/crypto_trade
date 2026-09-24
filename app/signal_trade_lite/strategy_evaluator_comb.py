@@ -45,7 +45,7 @@ INDEX_FILE = "_single_strategy_index.csv"  # Stage A 产出的元数据索引(St
 DISPLAY_COLS = [
     # "成员",
 
-    "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
+    "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)", "平仓次数"]
 # =====================================================================
 # 目标参数清单 (可加 "multiplier" 字段来精确锁定加仓倍数, 强烈建议加)
 # =====================================================================
@@ -826,7 +826,7 @@ def evaluate_multi_strategy_portfolios(
     records, _ = _load_strategy_records(csv_dir, plateau_csv)
     N = len(records)
     if N < min_k:
-        print(f"[提示] 有效策略数 {N} 少于 min_k={min_k}，无法构建组合。")
+        print(f"[提示] 有效策略数 {N}少于 min_k={min_k}，无法构建组合。")
         return
     max_k = min(max_k, N)
     total_combos = sum(math.comb(N, k) for k in range(min_k, max_k + 1))
@@ -997,7 +997,7 @@ def evaluate_multi_strategy_portfolios(
             "win_7": core["win_7"] / 100.0 if np.isfinite(core["win_7"]) else 0.0,
             "annual": bounded_positive(risk["annual"], 1.0),
             "balance": float(np.clip(core["q_min"] / 25.0, 0.0, 1.0))
-                       if np.isfinite(core["q_min"]) else 0.0,
+            if np.isfinite(core["q_min"]) else 0.0,
         }
         score = 100.0 * sum(score_weights[name] * value for name, value in components.items())
         if core["net"] <= 0:
@@ -1050,9 +1050,6 @@ def evaluate_multi_strategy_portfolios(
                   f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')} "
                   f"| 平滑后 {fmt(r['周期平滑盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
-            # print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
-            #       f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
-            #       f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
             print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
                   f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
                   f"| Profit Factor {fmt(r['Profit Factor'])}")
@@ -1079,6 +1076,9 @@ def evaluate_multi_strategy_portfolios(
                 if member_label not in member_alias_map:
                     member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
 
+                # 获取成员的平仓次数
+                trades = int(CNT[i, lo:hi + 1].sum())
+
                 rows.append({
                     "成员": member_label,
                     "成员编号": member_alias_map[member_label],
@@ -1086,6 +1086,7 @@ def evaluate_multi_strategy_portfolios(
                     "已实现MDD(M)": fmt(m["mdd"]),
                     "已实现Calmar": fmt(m["calmar"]),
                     "周期盈利率(%)": fmt(member_win),
+                    "平仓次数": trades,
                 })
 
             df_print = pd.DataFrame(rows)
@@ -1128,8 +1129,6 @@ def evaluate_multi_strategy_portfolios(
         processed += 1
         k = len(idxs)
         evaluated_by_k[k] = evaluated_by_k.get(k, 0) + 1
-        # if processed % 20000 == 0:
-        #     print(f"   ...已评估 {processed:,} 个候选 | 当前 K={k}")
         ii = list(idxs)
         n_days = hi - lo + 1
         sl = slice(lo, hi + 1)
@@ -1666,6 +1665,9 @@ def evaluate_multi_strategy_portfolios(
     return df_all
 
 
+# =====================================================================
+# 需要修改的函数 2：print_ranking_report_from_csv
+# =====================================================================
 def print_ranking_report_from_csv(
         ranking_csv="portfolio_multi_ranking.csv",
         csv_dir="./extracted_trades_csv",
@@ -1704,6 +1706,7 @@ def print_ranking_report_from_csv(
     day_ns = pd.date_range(g_start, periods=T + 1, freq="D").asi8
 
     PNL = np.zeros((len(records), T))
+    CNT = np.zeros((len(records), T))  # 新增用于统计平仓次数的矩阵
     event_data = []
 
     for i, r in enumerate(records):
@@ -1714,6 +1717,7 @@ def print_ranking_report_from_csv(
         si = np.minimum(si, ei)
         p = np.asarray(r["pnl"], dtype=float)
         np.add.at(PNL[i], ei, p)
+        np.add.at(CNT[i], ei, 1.0)  # 每遇到一笔平仓在当天次数+1
 
         order = np.argsort(closes.asi8, kind="stable")
         times = closes.asi8[order]
@@ -1771,8 +1775,6 @@ def print_ranking_report_from_csv(
             print(
                 f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 | 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
-            # print(
-            #     f"   分散化系数 {fmt(r['分散化系数'], 3)} | 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} | 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
             print(
                 f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M | 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 | Profit Factor {fmt(r['Profit Factor'])}")
             print(
@@ -1803,6 +1805,9 @@ def print_ranking_report_from_csv(
                 m = member_risk(i, lo, hi)
                 _, member_win = cycle_stats([i], [1.0], window_blowups(i, lo, hi))
 
+                # 获取成员平仓次数
+                trades = int(CNT[i, lo:hi + 1].sum())
+
                 if lbl not in member_alias_map:
                     member_alias_map[lbl] = f"成员{len(member_alias_map) + 1}"
 
@@ -1813,6 +1818,7 @@ def print_ranking_report_from_csv(
                     "已实现MDD(M)": fmt(m["mdd"]),
                     "已实现Calmar": fmt(m["calmar"]),
                     "周期盈利率(%)": fmt(member_win),
+                    "平仓次数": trades,
                 })
 
             if rows:
@@ -1820,6 +1826,7 @@ def print_ranking_report_from_csv(
                 display_cols = DISPLAY_COLS
                 print_table(df_print[display_cols])
         print()
+
 
 
 if __name__ == "__main__":
