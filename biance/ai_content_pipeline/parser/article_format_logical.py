@@ -11,6 +11,7 @@ media.local_mapping；生成文章含 topic、stance、article_info；另读取�
 import json
 import math
 import os
+import random
 import re
 import threading
 import time
@@ -18,6 +19,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+from app.ai_api.gemini_api import get_llm_content_local
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from biance.biance_squre_api import publish_to_binance_square
 from common.common_utils import (
@@ -642,10 +644,15 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         full_prompt = f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}"
         for attempt in range(1, LLM_MAX_RETRIES + 1):
             record["attempt_count"], record["raw_response"] = attempt, None
+            error_detail = ""
             try:
-                error_detail, raw_response = generate_gemini_content_playwright(
-                    full_prompt, model_name=model_name
-                )
+                if random.random() < 0.9:
+                    raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
+                else:
+                    error_detail, raw_response = generate_gemini_content_playwright(
+                        full_prompt, model_name=model_name
+                    )
+
                 record["raw_response"] = raw_response
                 if error_detail:
                     raise RuntimeError(f"文章生成接口返回异常: {error_detail}")
@@ -695,7 +702,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         coin, stance, record["attempt_count"], time.monotonic() - started,
     )
     return saved_record
-
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
     grouped = extract_and_group_valid_evidences()
