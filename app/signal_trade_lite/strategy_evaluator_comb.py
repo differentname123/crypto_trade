@@ -679,12 +679,37 @@ def evaluate_multi_strategy_portfolios(
         filter_roll_profit_win_rate_30=None,
         filter_roll_profit_win_rate_7=None,
         filter_roll_profit_win_rate_1=None,
-        search_mode="prune",  # [修改点] 默认开启剪枝搜索
-        beam_width=1000,
-        prune_tolerance=0.8,  # [新增] 下限容忍系数
-        prune_metric=("calmar", "周期盈利率(%)", "7日盈利窗口率(%)"),  # [修改点] 默认列表多指标评估
+        search_mode="hybrid",  # 有预算的分层搜索；exact/beam/prune 仍保留
+        beam_width=1000,  # 搜索种子数，与 top_n_per_k 的打印条数无关
+        prune_tolerance=0.8,  # 仅原 prune 模式使用
+        prune_metric=("calmar", "周期盈利率(%)", "7日盈利窗口率(%)"),
+        expand_top_m=30,  # hybrid：每个种子最多扩展多少个成员；None=全部
+        layer_max_evals=30000,  # hybrid：每层实际评估上限；None=不限
+        explore_ratio=0.20,  # hybrid：成员扩展、预算筛选和种子选择的随机探索占比
+        seed_family_cap=3,  # hybrid 缩减种子时，同一信号组合最多保留几种参数；0=不限
+        random_seed=2026,
+        rank_cycle_prior=20.0,  # 周期胜率向 50% 平滑的等效样本数；不是独立样本置信度
+        rank_dd_floor=0.05,  # 仅排序 Calmar 使用的 MDD 下限(M)，原回测指标不变
+        rank_weights=None,  # 可覆盖下方默认评分权重，自动归一化
 ):
-    """组合回测：加入了基于下限容忍的层级剪枝策略，以及精确搜索/近视搜索的支持。"""
+    """组合回测：统一综合排名，支持 exact/beam/prune/hybrid。
+
+    hybrid 在两策略候选上界不超过 layer_max_evals 时完整搜索 K=2；
+    高阶使用多指标种子、两两组合评分预选成员、随机探索和每层评估预算。
+    只要任一保留的父组合能扩展到子组合，就有机会评估；不要求所有父组合存活。
+    所有入榜指标仍由原来的共同窗口回测计算，预选分数不作为最终回测指标。
+
+    综合评分默认权重：Calmar 30%、平滑周期胜率20%、30日盈利率15%、
+    PF 10%、7日盈利率5%、年化净利10%、四段平衡10%。正向指标使用饱和映射，
+    防止 Calmar/PF 的极端值支配排名；净利<=0的组合再减100分。
+    这是一组可调整的排序偏好，不是未来收益预测或漏选概率保证。
+
+    top_n_per_k 只控制打印；CSV 保留所有已评估且通过原过滤的组合。
+    hybrid 不使用 prune_metric/prune_tolerance；max_combos 在此模式下保存已得结果
+    并标记未穷尽，原三种模式仍保留预算超限时报错的行为。
+    小样本对照可用 exact；或将 expand_top_m/layer_max_evals 设 None，
+    beam_width 设为足够大，使 hybrid 不发生任何近似淘汰。
+    """
     from functools import lru_cache
     import heapq
     count_bits = getattr(int, "bit_count", lambda value: bin(value).count("1"))
@@ -742,8 +767,8 @@ def evaluate_multi_strategy_portfolios(
 
     if weight_mode not in ("equal", "recommend"):
         raise ValueError("weight_mode 只能为 'equal' 或 'recommend'")
-    if search_mode not in ("exact", "beam", "prune"):
-        raise ValueError("search_mode 只能为 'exact', 'beam' 或 'prune'")
+    if search_mode not in ("exact", "beam", "prune", "hybrid"):
+        raise ValueError("search_mode 只能为 'exact', 'beam', 'prune' 或 'hybrid'")
     for name, value, minimum in (
             ("min_k", min_k, 1), ("max_k", max_k, 1),
             ("top_n_per_k", top_n_per_k, 0),
@@ -757,6 +782,33 @@ def evaluate_multi_strategy_portfolios(
         raise ValueError("max_combos 必须为正整数或 None")
     if min_k > max_k:
         raise ValueError("min_k 不能大于 max_k")
+    for name, value in (("expand_top_m", expand_top_m), ("layer_max_evals", layer_max_evals)):
+        if value is not None and (
+                isinstance(value, (bool, np.bool_)) or
+                not isinstance(value, (int, np.integer)) or value < 1):
+            raise ValueError(f"{name} 必须为正整数或 None")
+    for name, value in (("seed_family_cap", seed_family_cap), ("random_seed", random_seed)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f"{name} 必须为非负整数")
+    if not np.isfinite(explore_ratio) or not 0 <= explore_ratio < 1:
+        raise ValueError("explore_ratio 必须在 [0, 1) 内")
+    for name, value in (("rank_cycle_prior", rank_cycle_prior), ("rank_dd_floor", rank_dd_floor)):
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} 必须为有限正数")
+    score_weights = {
+        "calmar": 0.30, "cycle": 0.20, "win_30": 0.15, "pf": 0.10,
+        "win_7": 0.05, "annual": 0.10, "balance": 0.10,
+    }
+    if rank_weights is not None:
+        if not isinstance(rank_weights, dict) or set(rank_weights) - set(score_weights):
+            raise ValueError(f"rank_weights 只能包含 {list(score_weights)} 中的键")
+        score_weights.update(rank_weights)
+    if any(not np.isfinite(v) or v < 0 for v in score_weights.values()):
+        raise ValueError("评分权重必须为有限非负数")
+    score_weight_sum = sum(score_weights.values())
+    if not np.isfinite(score_weight_sum) or score_weight_sum <= 0:
+        raise ValueError("评分权重之和必须为有限正数")
+    score_weights = {key: value / score_weight_sum for key, value in score_weights.items()}
     filters = {
         30: filter_roll_profit_win_rate_30,
         7: filter_roll_profit_win_rate_7,
@@ -785,7 +837,9 @@ def evaluate_multi_strategy_portfolios(
         ([4] if filter_q_balance is not None else [])
     )
     print("=" * 112)
-    print("马丁组合评估 | 排序：完整爆仓周期盈利率 ↓ → 30日盈利窗口率 ↓")
+    print("马丁组合评估 | 排序：综合评分 ↓ → 平滑周期盈利率 ↓ → 排序Calmar ↓")
+    print("评分权重：" + " | ".join(f"{name} {value:.0%}" for name, value in score_weights.items()))
+    print(f"周期胜率向50%平滑，等效样本数={rank_cycle_prior:g}；排序Calmar的回撤下限={rank_dd_floor:g}M。")
     print(f"成员 {N} | K={min_k}～{max_k} | 最少共同窗口 {min_overlap_days} 天 | 权重 {weight_mode}")
     print("M=保证金归一化单位；回撤为日末已实现口径，初始权益=1M。")
     print("窗口按交易明细起止日交集推定；持仓重合按日统计，不区分多空方向。")
@@ -799,7 +853,13 @@ def evaluate_multi_strategy_portfolios(
     print(f"过滤：四段 {q_filter} | 盈利窗口率 {roll_filters}")
     budget_text = "不限" if max_combos is None else f"{max_combos:,}"
     print(f"搜索模式 {search_mode} | 理论组合 {total_combos:,} | 实际评估预算 {budget_text}")
-    if search_mode == "beam":
+    if search_mode == "hybrid":
+        per_parent = "全部" if expand_top_m is None else str(expand_top_m)
+        per_layer = "不限" if layer_max_evals is None else f"{layer_max_evals:,}"
+        print(f"混合搜索：种子≤{beam_width:,} | 每种子扩展≤{per_parent} | 每层评估≤{per_layer} "
+              f"| 探索比例 {explore_ratio:.0%} | 随机种子 {random_seed}")
+        print("两策略规模在层预算内时完整搜索；高阶保留多个指标方向的种子。近似搜索可能漏选。")
+    elif search_mode == "beam":
         print(f"近似搜索：每层保留至多 {beam_width:,} 个可扩展种子，可能遗漏优质组合。")
     elif search_mode == "prune":
         m_str = ", ".join(prune_metric) if isinstance(prune_metric, (list, tuple)) else str(prune_metric)
@@ -900,33 +960,92 @@ def evaluate_multi_strategy_portfolios(
     evaluated_by_k = {}
     insufficient_branches = 0
     beam_discarded = 0
+    extension_discarded = 0  # hybrid：省略的父->子扩展次数，不是去重后的组合数
+    budget_discarded = 0  # hybrid：已生成但未获评估预算的去重候选数
+    budget_stopped = False
+    generated_by_k = {}
+    retained_by_k = {}
+
+    def bounded_positive(value, scale):
+        if np.isnan(value) or value <= 0:
+            return 0.0
+        if np.isposinf(value):
+            return 1.0
+        return float(value / (value + scale))
+
+    def ranking_fields(core):
+        """缓存评分所需指标；只新增排序字段，不改变原回测口径。"""
+        if "_ranking" in core:
+            return core["_ranking"]
+        risk = realized_risk(core["daily"])
+        ii, sl, w = core["ii"], core["sl"], core["w"]
+        gp = float((POS[ii, sl] * w[:, None]).sum())
+        gl = float((NEG[ii, sl] * w[:, None]).sum())
+        pf = ratio(gp, abs(gl))
+        cycle_n = core["cycle_count"] if np.isfinite(core["cycle_win"]) else 0
+        cycle_wins = core["cycle_win"] / 100.0 * cycle_n if cycle_n else 0.0
+        smooth_cycle = (cycle_wins + 0.5 * rank_cycle_prior) / (cycle_n + rank_cycle_prior)
+        rank_calmar = risk["annual"] / max(risk["mdd"], rank_dd_floor)
+        components = {
+            "calmar": bounded_positive(rank_calmar, 3.0),
+            "cycle": smooth_cycle,
+            "win_30": core["win_30"] / 100.0 if np.isfinite(core["win_30"]) else 0.0,
+            "pf": bounded_positive(pf - 1.0, 2.0),
+            "win_7": core["win_7"] / 100.0 if np.isfinite(core["win_7"]) else 0.0,
+            "annual": bounded_positive(risk["annual"], 1.0),
+            "balance": float(np.clip(core["q_min"] / 25.0, 0.0, 1.0))
+                       if np.isfinite(core["q_min"]) else 0.0,
+        }
+        score = 100.0 * sum(score_weights[name] * value for name, value in components.items())
+        if core["net"] <= 0:
+            score -= 100.0
+        fields = {
+            "综合评分": score,
+            "周期平滑盈利率(%)": 100.0 * smooth_cycle,
+            "排序Calmar": rank_calmar,
+            "30日盈利窗口率(%)": core["win_30"],
+            "年化净利(M/年)": risk["annual"],
+            "已实现MDD(M)": risk["mdd"],
+            "最差30日收益(M)": core["worst_30"],
+            "重叠天数": core["n_days"],
+            "组合数量(K)": core["k"],
+            "_idx": ",".join(map(str, core["idxs"])),
+        }
+        core["_risk"], core["_pf"], core["_ranking"] = risk, pf, fields
+        core["_gp"], core["_gl"] = gp, gl
+        return fields
+
+    def ranking_key(row):
+        """打印、CSV 和搜索使用同一排序键；最后以成员编号稳定打破平分。"""
+        win_30 = row["30日盈利窗口率(%)"]
+        return (
+            row["综合评分"], row["周期平滑盈利率(%)"], row["排序Calmar"],
+            win_30 if np.isfinite(win_30) else -1.0,
+            row["年化净利(M/年)"], -row["已实现MDD(M)"], row["重叠天数"],
+            -row["组合数量(K)"], tuple(-int(i) for i in row["_idx"].split(",")),
+        )
 
     member_alias_map = {}
 
     def print_top_for_current_layer(current_k):
         """核心新增：每一层计算完毕即可结算该层并立马先打印结果"""
-        if current_k < min_k:
+        if current_k < min_k or top_n_per_k == 0:
             return
         layer_res = [r for r in results if r.get("组合数量(K)") == current_k]
         if not layer_res:
             return
 
-        df_layer = pd.DataFrame(layer_res)
-        df_layer["_scan_order"] = np.arange(len(df_layer))
-        df_layer.sort_values(
-            by=["周期盈利率(%)", "30日盈利窗口率(%)", "_scan_order"],
-            ascending=[False, False, True], na_position="last", inplace=True
-        )
-        df_layer.drop(columns="_scan_order", inplace=True)
-        df_k = df_layer.head(top_n_per_k)
+        df_k = pd.DataFrame(heapq.nlargest(top_n_per_k, layer_res, key=ranking_key))
 
         print("=" * 112)
         print(f"🏆 【{current_k} 策略组合】本层探索完毕，阶段结果 TOP {len(df_k)}")
-        print("   主排序：周期盈利率 ↓ → 30日盈利窗口率 ↓（N/A 排最后）")
+        print("   主排序：综合评分 ↓ → 平滑周期盈利率 ↓ → 排序Calmar ↓；CSV使用相同顺序")
         print("=" * 112)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
-            print(f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 "
-                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
+            print(f"\nNo.{rank} | 综合评分 {fmt(r['综合评分'], 3)} "
+                  f"| 完整周期 {int(r['完整周期数'])} 段 "
+                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')} "
+                  f"| 平滑后 {fmt(r['周期平滑盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
             print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
                   f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
@@ -1066,10 +1185,10 @@ def evaluate_multi_strategy_portfolios(
         q_ratios, q_min, q_str = core["q_ratios"], core["q_min"], core["q_str"]
         cycle_count, cycle_win, cycle_mean = core["cycle_count"], core["cycle_win"], core["cycle_mean"]
         _, worst_90 = rolling_stats(prefix, 90)
-        risk = realized_risk(daily)
-        gp = float((POS[ii, sl] * w[:, None]).sum())
-        gl = float((NEG[ii, sl] * w[:, None]).sum())
-        pf = ratio(gp, abs(gl))
+        rank_fields = ranking_fields(core)
+        risk = core["_risk"]
+        gp, gl = core["_gp"], core["_gl"]
+        pf = core["_pf"]
         member_metrics = [member_risk(i, lo, hi) for i in ii]
         mean_member_dd = float(np.mean([m["mdd"] for m in member_metrics]))
         div_dd = ratio(risk["mdd"], mean_member_dd)
@@ -1140,6 +1259,7 @@ def evaluate_multi_strategy_portfolios(
             "7日滚动胜率(%)": win_7, "1日滚动胜率(%)": win_1,
             "爆仓周期胜率(%)": cycle_win, "最差单段贡献(%)": q_min,
         })
+        row.update(rank_fields)
         return row
 
     if search_mode == "exact":
@@ -1182,9 +1302,7 @@ def evaluate_multi_strategy_portfolios(
                     if not can_expand:
                         continue
 
-                    cycle_score = core["cycle_win"] if np.isfinite(core["cycle_win"]) else -1.0
-                    roll_score = core["win_30"] if np.isfinite(core["win_30"]) else -1.0
-                    priority = (int(core["passed"]), cycle_score, roll_score, tuple(-j for j in idxs))
+                    priority = (int(core["passed"]),) + ranking_key(ranking_fields(core))
                     item = (priority, (idxs, lo, hi, child_mask))
                     expandable_count += 1
                     if len(next_heap) < beam_width:
@@ -1203,6 +1321,182 @@ def evaluate_multi_strategy_portfolios(
             if not frontier:
                 break
 
+    elif search_mode == "hybrid":
+        rng = np.random.default_rng(random_seed)
+        single_scores = np.zeros(N, dtype=float)
+        pair_scores = np.full((N, N), np.nan)
+        family_ids = {}
+        member_family = []
+        for key in sig_keys:
+            if key not in family_ids:
+                family_ids[key] = len(family_ids)
+            member_family.append(family_ids[key])
+
+        def mixed_shortlist(items, limit, key):
+            """确定性优选 + 无放回随机探索；未触及上限时不做任何淘汰。"""
+            if limit is None or len(items) <= limit:
+                return items
+            if limit <= 0:
+                return []
+            ordered = sorted(items, key=key, reverse=True)
+            random_n = (min(limit - 1, max(1, int(round(limit * explore_ratio))))
+                        if explore_ratio > 0 and limit > 1 else 0)
+            elite_n = limit - random_n
+            picked = ordered[:elite_n]
+            if random_n:
+                remaining = ordered[elite_n:]
+                positions = rng.choice(len(remaining), size=random_n, replace=False)
+                picked += [remaining[int(j)] for j in sorted(positions)]
+            return picked
+
+        def extension_scores(chosen, choices):
+            """用已评估的两两组合预估扩展价值；缺失两两评分时回退到单成员均分。"""
+            jj = np.asarray(choices, dtype=int)
+            if not chosen:
+                return single_scores[jj]
+            ii = np.asarray(chosen, dtype=int)
+            pair_values = pair_scores[np.ix_(ii, jj)]
+            fallback = (single_scores[ii, None] + single_scores[jj][None, :]) / 2.0
+            pair_values = np.where(np.isfinite(pair_values), pair_values, fallback)
+            return (0.55 * pair_values.mean(axis=0) + 0.25 * pair_values.min(axis=0)
+                    + 0.20 * single_scores[jj])
+
+        def select_frontier(nodes):
+            if len(nodes) <= beam_width:
+                return nodes
+            selected, selected_ids, family_counts = [], set(), {}
+
+            def take(ordered, quota):
+                added = 0
+                for node in ordered:
+                    if added >= quota or len(selected) >= beam_width:
+                        break
+                    idxs = node[0]
+                    if idxs in selected_ids:
+                        continue
+                    family = tuple(sorted(member_family[i] for i in idxs))
+                    if seed_family_cap and family_counts.get(family, 0) >= seed_family_cap:
+                        continue
+                    selected.append(node)
+                    selected_ids.add(idxs)
+                    family_counts[family] = family_counts.get(family, 0) + 1
+                    added += 1
+
+            by_score = sorted(nodes, key=lambda node: ranking_key(node[4]), reverse=True)
+            random_n = (min(beam_width - 1, max(1, int(round(beam_width * explore_ratio))))
+                        if explore_ratio > 0 and beam_width > 1 else 0)
+            quality_n = beam_width - random_n
+            main_n = max(1, int(quality_n * 0.70))
+            side_n = int(quality_n * 0.10)
+            take(by_score, main_n)
+            take(sorted(nodes, key=lambda node: (node[4]["排序Calmar"], ranking_key(node[4])),
+                        reverse=True), side_n)
+            take(sorted(nodes, key=lambda node: (node[4]["周期平滑盈利率(%)"], ranking_key(node[4])),
+                        reverse=True), side_n)
+            take(sorted(nodes, key=lambda node: (
+                node[4]["最差30日收益(M)"] if np.isfinite(node[4]["最差30日收益(M)"]) else -np.inf,
+                ranking_key(node[4])), reverse=True), quality_n - main_n - 2 * side_n)
+            if random_n:
+                take([nodes[int(j)] for j in rng.permutation(len(nodes))], random_n)
+            # 某个指标配额未填满时按总分补位；仍遵守信号族上限。
+            take(by_score, beam_width - len(selected))
+            return selected
+
+        full_pairs = (layer_max_evals is None or
+                      math.comb(len(active), 2) <= layer_max_evals)
+        frontier = []
+        for k in range(1, max_k + 1):
+            if max_combos is not None and processed >= max_combos:
+                budget_stopped = True
+                print(f"[提示] 达到总预算 {max_combos:,}，停止扩展并保存已发现结果。")
+                break
+            before = processed
+            before_extensions = extension_discarded
+            before_budget = budget_discarded
+            candidate_map = {}
+
+            if k == 1 or (k == 2 and full_pairs):
+                # K=1 不按单策略表现预先删成员；预算足够时 K=2 不受 K=1 种子筛选影响。
+                for idxs, lo, hi in exact_candidates(k):
+                    child_mask = active_mask
+                    for i in idxs:
+                        child_mask &= compatible[i]
+                    proxy = float(np.mean(single_scores[list(idxs)]))
+                    candidate_map[idxs] = (proxy, lo, hi, child_mask)
+            else:
+                for chosen, parent_lo, parent_hi, parent_mask, _ in frontier:
+                    choices = []
+                    candidates = parent_mask
+                    while candidates:
+                        bit = candidates & -candidates
+                        candidates ^= bit
+                        choices.append(bit.bit_length() - 1)
+                    proxies = extension_scores(chosen, choices)
+                    scored = list(zip(choices, map(float, proxies)))
+                    shortlist = mixed_shortlist(scored, expand_top_m, key=lambda item: (item[1], -item[0]))
+                    extension_discarded += len(scored) - len(shortlist)
+                    for i, proxy in shortlist:
+                        idxs = tuple(sorted(chosen + (i,)))
+                        # 全兼容掩码允许加入更小编号的成员；不依赖某个固定父节点存活。
+                        child_mask = parent_mask & compatible[i]
+                        if k < min_k and count_bits(child_mask) < min_k - k:
+                            insufficient_branches += 1
+                            continue
+                        lo = max(parent_lo, int(first_i[i]))
+                        hi = min(parent_hi, int(last_i[i]))
+                        previous = candidate_map.get(idxs)
+                        if previous is None or proxy > previous[0]:
+                            candidate_map[idxs] = (proxy, lo, hi, child_mask)
+
+            generated_by_k[k] = len(candidate_map)
+            limit = len(candidate_map)
+            if layer_max_evals is not None:
+                limit = min(limit, layer_max_evals)
+            if max_combos is not None:
+                remaining = max_combos - processed
+                if remaining < limit:
+                    budget_stopped = True
+                limit = min(limit, remaining)
+            candidates_to_evaluate = mixed_shortlist(
+                list(candidate_map.items()), limit,
+                key=lambda item: (item[1][0], tuple(-i for i in item[0])),
+            )
+            budget_discarded += len(candidate_map) - len(candidates_to_evaluate)
+            del candidate_map
+
+            next_nodes = []
+            for idxs, (_, lo, hi, child_mask) in sorted(candidates_to_evaluate, key=lambda item: item[0]):
+                core = evaluate_core(idxs, lo, hi, need_rank=True)
+                fields = ranking_fields(core)
+                if k == 1:
+                    single_scores[idxs[0]] = fields["综合评分"]
+                elif k == 2:
+                    a, b = idxs
+                    pair_scores[a, b] = pair_scores[b, a] = fields["综合评分"]
+                # 回测通过即可入榜，种子筛选不影响本层已经发现的有效结果。
+                if k >= min_k and core["passed"]:
+                    results.append(make_row(core))
+                if k < max_k and child_mask:
+                    if k < min_k and count_bits(child_mask) < min_k - k:
+                        insufficient_branches += 1
+                    else:
+                        next_nodes.append((idxs, lo, hi, child_mask, fields))
+
+            # 下一层会直接枚举全部二元组合时，没有必要裁剪单成员种子。
+            if k == 1 and full_pairs and max_k >= 2:
+                frontier = next_nodes
+            else:
+                frontier = select_frontier(next_nodes)
+            discarded = len(next_nodes) - len(frontier)
+            beam_discarded += discarded
+            retained_by_k[k] = len(frontier)
+            print(f"K={k}：生成 {generated_by_k[k]:,} 个去重候选 | 实际评估 {processed - before:,} "
+                  f"| 下层种子 {len(frontier):,} | 淘汰种子 {discarded:,} "
+                  f"| 预选省略扩展 {extension_discarded - before_extensions:,} 次 "
+                  f"| 预算省略 {budget_discarded - before_budget:,}")
+            print_top_for_current_layer(k)
+            if not frontier and not (k == 1 and full_pairs and max_k >= 2):
+                break
     elif search_mode == "prune":
         # ======================================================================
         # 新增的核心逻辑：基于容忍下限的高阶组合前向剪枝搜索（支持多指标列表）
@@ -1325,23 +1619,22 @@ def evaluate_multi_strategy_portfolios(
             if not frontier:
                 break
 
-    exhaustive = (search_mode == "exact") or (beam_discarded == 0)
+    exhaustive = ((search_mode == "exact") or
+                  (beam_discarded == 0 and extension_discarded == 0 and
+                   budget_discarded == 0 and not budget_stopped))
     coverage_text = "已穷尽所有结构可行候选" if exhaustive else "执行剪枝搜索，未穷尽全部候选"
     print(f"\n搜索统计：实际评估 {processed:,} | {coverage_text}")
     print(f"候选不足分支 {insufficient_branches:,} | 剪枝/近似淘汰种子 {beam_discarded:,}")
+    if search_mode == "hybrid":
+        print(f"成员预选省略扩展 {extension_discarded:,} 次（含不同父组合到同一子组合的路径） | "
+              f"预算省略去重候选 {budget_discarded:,}")
     print("已评估目标组合的过滤统计：" + " | ".join(f"{name} {count:,}" for name, count in skipped.items()))
     if not results:
         print("[提示] 本次搜索未发现通过当前过滤条件的组合。")
         return
 
-    results.sort(key=lambda row: (row["组合数量(K)"], tuple(map(int, row["_idx"].split(",")))))
+    results.sort(key=ranking_key, reverse=True)
     df_all = pd.DataFrame(results)
-    df_all["_scan_order"] = np.arange(len(df_all))
-    df_all.sort_values(
-        by=["周期盈利率(%)", "30日盈利窗口率(%)", "_scan_order"],
-        ascending=[False, False, True], na_position="last", inplace=True,
-    )
-    df_all.drop(columns="_scan_order", inplace=True)
     df_all.reset_index(drop=True, inplace=True)
     df_all["搜索模式"] = search_mode
     df_all["搜索是否穷尽"] = exhaustive
@@ -1352,6 +1645,14 @@ def evaluate_multi_strategy_portfolios(
         "beam_discarded": beam_discarded,
         "insufficient_branches": insufficient_branches,
         "required_overlap_days": required_days,
+        "extension_discarded": extension_discarded,
+        "budget_discarded": budget_discarded, "budget_stopped": budget_stopped,
+        "generated_by_k": generated_by_k, "retained_by_k": retained_by_k,
+        "beam_width": beam_width, "expand_top_m": expand_top_m,
+        "layer_max_evals": layer_max_evals, "explore_ratio": explore_ratio,
+        "seed_family_cap": seed_family_cap, "random_seed": random_seed,
+        "rank_weights": score_weights, "rank_cycle_prior": rank_cycle_prior,
+        "rank_dd_floor": rank_dd_floor,
     }
     output_parent = os.path.dirname(os.path.abspath(output_csv))
     os.makedirs(output_parent, exist_ok=True)
@@ -1530,20 +1831,26 @@ if __name__ == "__main__":
     #     plateau_csv=PLATEAU_CSV,
     # )
 
-    # Stage B: 穷举 K=2~5 组合并排名
+    # Stage B: 有预算的 K=2~5 组合搜索并排名
     evaluate_multi_strategy_portfolios(
         csv_dir="./extracted_trades_csv",
         plateau_csv=PLATEAU_CSV,
         output_csv="portfolio_multi_ranking.csv",
         min_k=2,
-        max_k=5,
+        max_k=10,
         top_n_per_k=50,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
-        search_mode="prune",  # 使用最新集成的层级容忍剪枝算法
-        prune_tolerance=1,  # 指标回落容忍度，0.8代表允许最大20%回撤
-        prune_metric=["calmar", "周期盈利率(%)"],  # [修改点] 默认按列表输入，多指标同时生效
+        search_mode="hybrid",  # 两策略尽量搜全；高阶按种子、成员扩展数和层预算限流
+        beam_width=3000,  # 每层最多1000个搜索种子，与打印前50条无关
+        expand_top_m=150,  # 每个种子最多尝试30个新成员
+        layer_max_evals=2000000,  # 每层最多实际回测30000个去重候选
+        explore_ratio=0.20,  # 保留20%的随机探索机会，减轻预选指标偏差
+        seed_family_cap=4,  # 种子不足以全留时，限制同一信号组合的参数变体占位
+        random_seed=2026,  # 固定数据、参数和随机种子可复现本次搜索
+        prune_tolerance=1,  # 仅切回 search_mode="prune" 时生效
+        prune_metric=["calmar", "周期盈利率(%)"],  # 仅原 prune 模式使用
     )
 
     # print_ranking_report_from_csv()
