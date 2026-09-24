@@ -1595,13 +1595,67 @@ def get_symbol_filename(symbol):
     return f"{base_name}_1h_history.csv"
 
 
-async def _async_fetch_and_update_history(proxy_url):
-    logger.info(f"[HIST_UPDATE] 🚀 开始执行历史数据更新任务...")
 
-    # 深度复用：基于上文基建的 _open_exchange 获取安全且注入代理的会话
-    exchange = await _open_exchange(proxy_url, "HIST_UPDATE", "[HIST_UPDATE]")
+
+# =====================================================================
+# 🚀 模块十：历史更新与收盘信号极速聚合 (新增融合模块)
+# =====================================================================
+
+async def _async_snipe_and_update_hourly_signals(target_timestamp_ms, proxy_url, required_days=70):
+    """
+    异步核心：卡点轮询收线 -> 增量更新历史 -> 严格校验连续性 -> 返回合格信号切片
+    """
+    log_prefix = "[SNIPE_SIGNAL]"
+    logger.info(f"{log_prefix} 🚀 启动一站式数据聚合引擎...")
+
+    exchange = await _open_exchange(proxy_url, "SNIPE_SIGNAL", log_prefix)
     try:
-        # 1. 获取币安当前所有 U本位永续合约，严格过滤掉已下线/未开盘合约，只取 USDT 本位
+        # 1. 时间边界计算：收缩到最近的整点小时
+        current_hour_ms = target_timestamp_ms - (target_timestamp_ms % (3600 * 1000))
+        next_hour_ms = current_hour_ms + (3600 * 1000)
+        wait_target_ms = next_hour_ms - 5000  # 提前 5s 进入轮询状态
+
+        required_kline_count = required_days * 24
+        # 多冗余拉取几天防止断层
+        max_history_ms = (required_days + 2) * 24 * 3600 * 1000
+
+        if not os.path.exists(DATA_DIR_V2):
+            os.makedirs(DATA_DIR_V2)
+
+        # 2. 战术休眠：如果时间还没到 提前5s 的阈值，先睡过去
+        now_ms = int(time.time() * 1000)
+        if now_ms < wait_target_ms:
+            sleep_sec = (wait_target_ms - now_ms) / 1000.0
+            logger.info(
+                f"{log_prefix} 💤 未到收线冲刺时间，休眠 [{sleep_sec:.1f}s] 至 [{_format_bj_time(wait_target_ms)}]")
+            await asyncio.sleep(sleep_sec)
+
+        # 3. 脉冲轮询：盯盘 BTC/USDT 确认本小时彻底收线
+        logger.info(
+            f"{log_prefix} 🎯 进入极速轮询阶段，盯盘 BTC/USDT 确认 [{_format_bj_time(current_hour_ms)}] K线收线...")
+        while True:
+            now_ms = int(time.time() * 1000)
+            try:
+                # 请求 limit=2 确保能看到 next_hour_ms 的新K线冒出来
+                klines = await _retry_async(
+                    lambda: exchange.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=2),
+                    "轮询 BTC/USDT 收线状态", log_prefix, attempts=1, delay=0.5
+                )
+                if klines and klines[-1][0] >= next_hour_ms:
+                    logger.info(
+                        f"{log_prefix} 🏁 观测到新小时 K 线产生，确认全市场 [{_format_bj_time(current_hour_ms)}] 已闭合！")
+                    break
+            except Exception:
+                pass  # 吞掉单次轮询异常，靠循环自愈
+
+            # 硬熔断保护：最多死等 60s
+            if now_ms > next_hour_ms + 60000:
+                logger.warning(f"{log_prefix} ⚠️ 轮询收线超时 60s，强制放行执行后续更新。")
+                break
+            await asyncio.sleep(0.5)
+
+        # 4. 获取符合条件的标的 (重新 load_markets 确保拿到最新上下币状态)
+        await _retry_async(lambda: exchange.load_markets(True), "刷新市场状态", log_prefix, attempts=3, delay=1.0)
         symbols = [
             s for s in exchange.symbols
             if exchange.market(s).get('linear')
@@ -1609,243 +1663,135 @@ async def _async_fetch_and_update_history(proxy_url):
                and exchange.market(s).get('info', {}).get('status') == 'TRADING'
                and s.endswith(':USDT')
         ]
-        logger.info(f"[HIST_UPDATE] 🔍 过滤后共发现 {len(symbols)} 个处于 TRADING 状态的 USDT 本位永续合约")
+        logger.info(f"{log_prefix} 🔍 全市场扫尾，发现 [{len(symbols)}] 个活跃 USDT 本位合约")
 
-        # 2. 计算最新的【已收盘】整点时间戳 (毫秒)
-        now_ms = int(time.time() * 1000)
-        current_hour_ms = now_ms - (now_ms % (3600 * 1000))
-        latest_closed_ms = current_hour_ms - (3600 * 1000)
-        max_history_ms = 71 * 24 * 3600 * 1000
-
+        # 5. 并发拉取更新与组装核对
         updated_count = 0
-        skipped_count = 0  # 统计因已最新而跳过的币种数量
-        if not os.path.exists(DATA_DIR_V2):
-            os.makedirs(DATA_DIR_V2)
+        skipped_count = 0
+        valid_data_dict = {}
+        invalid_symbols = []
 
         for symbol in symbols:
             file_name = get_symbol_filename(symbol)
             file_path = os.path.join(DATA_DIR_V2, file_name)
 
             df_local = pd.DataFrame()
-            start_fetch_ms = latest_closed_ms - max_history_ms
-            local_last_ms = 0
+            start_fetch_ms = current_hour_ms - max_history_ms
+            need_fetch = True
 
-            # 3. 判断本地文件状态，决定从哪个时间开始拉取
+            # -- A. 读取本地缓存决定拉取策略 --
             if os.path.exists(file_path):
                 try:
                     df_local = pd.read_csv(file_path)
                     if not df_local.empty and 'timestamp' in df_local.columns:
                         local_last_ms = int(df_local['timestamp'].iloc[-1])
-
-                        # --- 重大修改：如果本地数据已经完全对齐了最新收盘时间，直接跳过 ---
-                        if local_last_ms >= latest_closed_ms:
-                            logger.info(
-                                f"[HIST_UPDATE] ⏭️ {symbol} 本地数据已是最新 ({_format_bj_time(local_last_ms)})，跳过网络拉取，节约资源")
+                        if local_last_ms >= current_hour_ms:
+                            need_fetch = False
                             skipped_count += 1
-                            continue
-
-                        # 如果需要拉取，至少拉取 24 小时（如果本地数据很老，最多拉取 max_history_ms）
-                        start_fetch_ms = max(local_last_ms - (24 * 3600 * 1000), latest_closed_ms - max_history_ms)
+                        else:
+                            start_fetch_ms = max(local_last_ms - (24 * 3600 * 1000), current_hour_ms - max_history_ms)
                 except Exception as e:
-                    logger.warning(f"[HIST_UPDATE] ⚠️ {symbol} 本地文件读取失败，将重新全量拉取: {e}")
+                    logger.warning(f"{log_prefix} ⚠️ {symbol} 缓存损坏，触发全量回拉: {e}")
 
-            # 4. 分页拉取数据
-            all_new_klines = []
-            current_start = start_fetch_ms
+            df_combined = df_local
 
-            try:
-                while current_start <= latest_closed_ms:
-                    # 深度复用：基于上文基建的 _retry_async 规避代理抖动和接口限流
-                    klines = await _retry_async(
-                        lambda: exchange.fetch_ohlcv(symbol, '1h', since=current_start, limit=1500),
-                        f"拉取 {symbol} 1h历史数据", "[HIST_UPDATE]", attempts=3, delay=1.0)
+            # -- B. 增量拉取与合并 --
+            if need_fetch:
+                all_new_klines = []
+                curr_start = start_fetch_ms
 
-                    if not klines:
-                        break
+                try:
+                    while curr_start <= current_hour_ms:
+                        klines = await _retry_async(
+                            lambda: exchange.fetch_ohlcv(symbol, '1h', since=curr_start, limit=1500),
+                            f"拉取 {symbol} 历史", log_prefix, attempts=3, delay=1.0
+                        )
+                        if not klines:
+                            break
+                        valid_klines = [k for k in klines if k[0] <= current_hour_ms]
+                        all_new_klines.extend(valid_klines)
 
-                    valid_klines = [k for k in klines if k[0] <= latest_closed_ms]
-                    all_new_klines.extend(valid_klines)
+                        if len(klines) < 1500:
+                            break
+                        curr_start = klines[-1][0] + (3600 * 1000)
+                        await asyncio.sleep(0.05)
+                except Exception as e:
+                    logger.error(f"{log_prefix} ❌ {symbol} 数据拉取中断: {e}")
+                    continue
 
-                    if len(klines) < 1500:
-                        break
-                    current_start = klines[-1][0] + (3600 * 1000)
-                    await asyncio.sleep(0.05)
+                if all_new_klines:
+                    df_new = pd.DataFrame(all_new_klines, columns=KLINE_COLS)
+                    df_combined = pd.concat([df_local, df_new], ignore_index=True) if not df_local.empty else df_new
 
-            except Exception as e:
-                logger.error(f"[HIST_UPDATE] ❌ {symbol} 数据拉取致命失败，已跳过该币种: {e}")
+                    df_combined = df_combined.drop_duplicates(subset=['timestamp'], keep='last')
+                    df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
+                    df_combined['timestamp'] = df_combined['timestamp'].astype('int64')
+
+                    # 磁盘写入
+                    df_combined.tail(required_kline_count + 24).to_csv(file_path, index=False)
+                    updated_count += 1
+
+            # -- C. 严格校验器 (Data Validator) --
+            if df_combined.empty:
+                invalid_symbols.append((symbol, "数据最终为空"))
                 continue
 
-            if not all_new_klines:
-                logger.warning(f"[HIST_UPDATE] 🈳 {symbol} 未拉取到任何有效历史数据 "
-                               f"| 尝试拉取起点: {_format_bj_time(start_fetch_ms)} "
-                               f"(可能原因: 该合约刚刚上线不足1小时，或交易所该时间段无数据)")
-                continue
-
-            # 5. 合并、覆盖、裁切并保存
-            df_new = pd.DataFrame(all_new_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-
-            if not df_local.empty:
-                df_combined = pd.concat([df_local, df_new], ignore_index=True)
-            else:
-                df_combined = df_new
-
-            df_combined = df_combined.drop_duplicates(subset=['timestamp'], keep='last')
-            df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
-            df_combined = df_combined.tail(REQUIRED_KLINE_COUNT + 24)
-
-            # --- 🌟 强制毫秒级整型校验：确保写入 CSV 的 timestamp 绝对不会变成浮点数 ---
             df_combined['timestamp'] = df_combined['timestamp'].astype('int64')
+            df_check = df_combined.set_index('timestamp').sort_index()
 
-            df_combined.to_csv(file_path, index=False)
-            updated_count += 1
+            # 裁剪掉超越了 current_hour_ms 的未来冗余数据（如果缓存里本来就有）
+            df_check = df_check[df_check.index <= current_hour_ms]
 
-            # 单币处理完成后的统计日志
-            fetch_start = _format_bj_time(int(df_new['timestamp'].iloc[0]))
-            fetch_end = _format_bj_time(int(df_new['timestamp'].iloc[-1]))
-            file_start = _format_bj_time(int(df_combined['timestamp'].iloc[0]))
-            file_end = _format_bj_time(int(df_combined['timestamp'].iloc[-1]))
-            #
-            # logger.info(f"[HIST_UPDATE] ✅ {symbol} 更新成功 | "
-            #             f"增量拉取: [{fetch_start} ~ {fetch_end}] (共{len(df_new)}根) | "
-            #             f"最终文件: [{file_start} ~ {file_end}] (总{len(df_combined)}根)")
-
-        logger.info(
-            f"[HIST_UPDATE] 🎉 历史更新任务结束 | 成功拉取更新: {updated_count} 个 | 已经是最新免拉取跳过: {skipped_count} 个。")
-    finally:
-        await _shutdown_exchange(exchange)
-
-
-async def _async_get_realtime_signal_data(snapshot_timestamp_ms, proxy_url):
-    print(f"[{datetime.now()}] 开始构建实时信号数据...")
-
-    exchange = await _open_exchange(proxy_url, "SIGNAL", "[SIGNAL]")
-    try:
-        # 获取全市场最新快照，由于 fetch_tickers 内部会自动 load_markets，所以直接调用即可
-        tickers = await _retry_async(lambda: exchange.fetch_tickers(), "拉取全市场 Tickers", "[SIGNAL]", attempts=3,
-                                     delay=1.0)
-
-        current_hour_ms = snapshot_timestamp_ms - (snapshot_timestamp_ms % (3600 * 1000))
-        target_latest_closed_ms = current_hour_ms - (3600 * 1000)
-
-        valid_data_dict = {}
-        invalid_symbols = []
-
-        # 🌟 修复：必须通过 exchange.market(sym) 去读取状态，而不能用 Ticker 里的 info
-        target_symbols = []
-        for sym in tickers.keys():
-            if not sym.endswith(':USDT'):
+            if len(df_check) < required_kline_count:
+                invalid_symbols.append(
+                    (symbol, f"K线数量不足 (仅有 {len(df_check)} 根，需要 {required_kline_count} 根)"))
                 continue
 
-            market = exchange.market(sym)
-            if market and market.get('active') and market.get('info', {}).get('status') == 'TRADING':
-                target_symbols.append(sym)
+            # 截取最后的 required_kline_count 行 (70天)
+            tail_df = df_check.tail(required_kline_count)
 
-        for symbol in target_symbols:
-            file_name = get_symbol_filename(symbol)
-            file_path = os.path.join(DATA_DIR_V2, file_name)
-
-            # 如果最新行情里有，但本地没有 CSV 文件，精准抛出对应错误
-            if not os.path.exists(file_path):
-                invalid_symbols.append((symbol, "出现在了行情中，但本地实际没有对应的历史CSV文件"))
+            if tail_df.index[-1] != current_hour_ms:
+                invalid_symbols.append(
+                    (symbol, f"未能对齐目标收盘整点 (最后数据时间为 {_format_bj_time(tail_df.index[-1])})"))
                 continue
 
-            try:
-                df = pd.read_csv(file_path)
-            except Exception:
-                invalid_symbols.append((symbol, "本地 CSV 文件存在，但读取失败或损坏"))
-                continue
-
-            if df.empty or 'timestamp' not in df.columns:
-                invalid_symbols.append((symbol, "本地文件数据为空或没有 timestamp 列"))
-                continue
-
-            # 2. 数据合法性校验
-            if len(df) < REQUIRED_KLINE_COUNT:
-                invalid_symbols.append((symbol, f"历史数据长度不够 70天 (仅有 {len(df)} 根)"))
-                continue
-
-            local_last_ts = int(df['timestamp'].iloc[-1])
-            if local_last_ts != target_latest_closed_ms:
-                invalid_symbols.append((symbol,
-                                        f"历史数据有延迟，未能对齐上一个收盘整点 (期望:{_format_bj_time(target_latest_closed_ms)}，实际:{_format_bj_time(local_last_ts)})"))
-                continue
-
-            # ==========================================
-            # 修改处：保留毫秒级时间戳，不转 datetime
-            # ==========================================
-            df['timestamp'] = df['timestamp'].astype('int64')
-            df = df.set_index('timestamp').sort_index()
-
-            tail_df = df.tail(REQUIRED_KLINE_COUNT)
             time_diffs = tail_df.index.to_series().diff().dropna()
-
-            # 判断间隔是否恒为 1 小时 (3600 * 1000 毫秒)
             if not (time_diffs == 3600000).all():
-                invalid_symbols.append((symbol, "历史 K 线中存在断层/间断"))
+                invalid_symbols.append((symbol, "1小时K线内部存在断层/间断"))
                 continue
 
-            # 3. 拼接实时最新快照
-            live_price = tickers[symbol].get('last')
-            if live_price is None:
-                invalid_symbols.append((symbol, "Ticker 数据中缺失 last 价格"))
-                continue
+            # 测试合格，归档入库
+            valid_data_dict[symbol] = tail_df.reset_index()
 
-            # 使用毫秒级时间戳(整数)拼接最后一行
-            temp_row = pd.DataFrame([{
-                'timestamp': current_hour_ms,
-                'close': float(live_price)
-            }]).set_index('timestamp')
-
-            df_final = df[['close']].copy()
-            df_final = pd.concat([df_final, temp_row])
-            df_final = df_final.reset_index()
-
-            # 保险起见，强制确保最终 DataFrame 的 timestamp 为整数类型
-            df_final['timestamp'] = df_final['timestamp'].astype('int64')
-
-            valid_data_dict[symbol] = df_final
-
-        # 4. 统计与报告
-        print(f"\n--- 数据组装报告 ---")
-        print(f"✅ 合格币种数量: {len(valid_data_dict)}")
-
+        # 6. 归档总结
+        logger.info(f"\n=================== 信号交付报告 ===================")
+        logger.info(f"✅ 合格并发放信号币种: {len(valid_data_dict)} 个")
+        logger.info(f"🔄 IO统计: 拉取更新 {updated_count} 个 | 命中缓存跳过 {skipped_count} 个")
         if invalid_symbols:
-            print(f"❌ 剔除/跳过币种数量: {len(invalid_symbols)}")
-            print("详细未入选原因列表:")
-            for sym, reason in invalid_symbols:
-                print(f"   - {sym}: {reason}")
+            logger.info(f"❌ 淘汰剔除币种: {len(invalid_symbols)} 个")
+            # 出于控制台清爽，最多打印前 5 个淘汰原因
+            for sym, reason in invalid_symbols[:5]:
+                logger.info(f"   - {sym}: {reason}")
+            if len(invalid_symbols) > 5:
+                logger.info(f"   - ... (及其他 {len(invalid_symbols) - 5} 个)")
+        logger.info(f"====================================================\n")
 
         return valid_data_dict
     finally:
-        # --- 同样打上关闭补丁，消除恼人的警告信息 ---
-        try:
-            await exchange.close()
-            await asyncio.sleep(0.1)
-        except Exception:
-            pass
         await _shutdown_exchange(exchange)
 
 
-# =====================================================================
-# 对外暴露的同步封装 API
-# =====================================================================
-def fetch_and_update_history(proxy=None):
+def snipe_and_update_hourly_signals(target_timestamp_ms, proxy=None, required_days=70):
     """
-    同步接口：历史数据获取与本地更新。
-    自动通过 proxy 参数走底层基建装甲发起网络请求。
+    同步接口：历史数据拉取、收线卡点等待、以及数据核验组装的终极融合方法。
+
+    :param target_timestamp_ms: 目标时间戳(毫秒)，函数内部会自动将其向下取整为最近的小时边界。
+    :param proxy: 代理地址 (e.g., 'http://127.0.0.1:7890')
+    :param required_days: 需要连续不断的天数，默认为 70 天。
+    :return: dict 格式 {symbol: DataFrame(含timestamp等6列)}，只返回彻底合格的数据。
     """
     _ensure_no_running_loop()
-    return asyncio.run(_async_fetch_and_update_history(proxy))
-
-
-def get_realtime_signal_data(snapshot_timestamp_ms, proxy=None):
-    """
-    同步接口：实时拼接与状态校验。
-    自动通过 proxy 参数走底层基建装甲发起网络请求。
-    """
-    _ensure_no_running_loop()
-    return asyncio.run(_async_get_realtime_signal_data(snapshot_timestamp_ms, proxy))
-
+    return asyncio.run(_async_snipe_and_update_hourly_signals(target_timestamp_ms, proxy, required_days))
 
 # =====================================================================
 # 🚀 启动入口（已完美融通保留旧有功能与新整合功能的示例代码）
@@ -1869,18 +1815,10 @@ if __name__ == "__main__":
     # ==========================================
     # 🚀 新增融合功能演示 (实盘骨架)
     # ==========================================
-    # 步骤 1：每小时稍微空闲的时间 (比如 xx:02:00) 运行一次，更新历史数据库 (通过代理)
-    fetch_and_update_history(proxy='http://127.0.0.1:7890')
-
-    # 步骤 2：在要求极速响应的时刻 (比如 xx:00:01) 运行，组装数据 (通过代理)
-    now_ms = int(time.time() * 1000)
-    symbol_dfs = get_realtime_signal_data(now_ms, proxy='http://127.0.0.1:7890')
-    print()
-    # 步骤 3：直接传给模型计算
-    # btc_df = symbol_dfs.get('BTC/USDT:USDT') if 'symbol_dfs' in locals() else None
-    # if btc_df is not None:
-    #     for symbol, alt_df in symbol_dfs.items():
-    #         if symbol == 'BTC/USDT:USDT': continue
-    #         # alt_df = apply_signal_1671(alt_df, btc_df)
-    #         # print(f"{symbol} 信号: {alt_df.iloc[-1]['signal']}")
+    now_ms = int((time.time() - 60 * 60) * 1000)
+    valid_signals = snipe_and_update_hourly_signals(
+        target_timestamp_ms=now_ms,
+        proxy='http://127.0.0.1:7890',
+        required_days=70
+    )
     pass

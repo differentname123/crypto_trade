@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 
 from common_utils import setup_logger
-from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data, get_realtime_signal_data
+from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data, snipe_and_update_hourly_signals
 
 SIGNAL_COLS = [
     'time', 'action', 'coin', 'direction', 'event', 'price', 'reason',
@@ -2207,8 +2207,8 @@ def gen_pair_signal():
     """
     通用策略生成器：批量遍历多标的，执行统计套利策略。
     """
-    now_ms = int(time.time() * 1000)
-    symbol_dfs = get_realtime_signal_data(now_ms, proxy='http://127.0.0.1:7890')
+    now_ms = int((time.time() - 60 * 60) * 1000)
+    symbol_dfs = snipe_and_update_hourly_signals(now_ms, proxy='http://127.0.0.1:7890')
 
     btc_df = symbol_dfs.get('BTC/USDT:USDT')
     if btc_df is None or btc_df.empty:
@@ -2276,6 +2276,11 @@ def gen_pair_signal():
     other_cols = [c for c in final_df.columns if c not in core_cols]
     final_df = final_df[core_cols + other_cols]
 
+    # 将final_df保存到CSV文件中
+    output_path = os.path.join('signal_data', 'pair_signals.csv')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
+
     return final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
 # =============================================================================
 # 八、本地联调入口
@@ -2283,10 +2288,10 @@ def gen_pair_signal():
 if __name__ == '__main__':
     pair_df = gen_pair_signal()
 
-    target_time = (
-            datetime.now() - timedelta(minutes=1)
-    ).strftime('%Y-%m-%d %H:%M')
-
-    symbol_list = ['UNI/USDT:USDT']
-    signal = get_signal_factor_044_3(symbol_list[0])
-    print()
+    # target_time = (
+    #         datetime.now() - timedelta(minutes=1)
+    # ).strftime('%Y-%m-%d %H:%M')
+    #
+    # symbol_list = ['UNI/USDT:USDT']
+    # signal = get_signal_factor_044_3(symbol_list[0])
+    # print()
