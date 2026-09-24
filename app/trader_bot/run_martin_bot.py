@@ -72,9 +72,12 @@ if multiprocessing.current_process().name == "MainProcess":
 else:
     logger = logging.getLogger("martin_trader")
 
-# 交易所耦合只允许出现在 ex_api 适配层；更换平台时替换该模块即可。
-import binance_u_gateway as ex_api
-from binance_u_gateway import (
+# ============ 交易所选择 (binance / okx / bybit) ============
+EXCHANGE = "binance"
+
+# 交易所耦合只允许出现在 ex_api 适配层；更换平台时修改上方 EXCHANGE 变量即可。
+import exchange_gateway as ex_api
+from exchange_gateway import (
     ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
 )
 
@@ -85,7 +88,7 @@ from signal_generator import (
     get_signal_factor_044_10,
     get_signal_factor_044_5,
     get_signal_factor_044_3,
-    get_signal_factor_044_4,
+    get_signal_factor_044_4, get_signal_factor_007_1, get_signal_factor_044_8, get_signal_factor_024_3,
 
 )
 
@@ -98,6 +101,11 @@ SIGNAL_REGISTRY = {
     "factor_044_5": get_signal_factor_044_5,
     "factor_044_3": get_signal_factor_044_3,
     "factor_044_4": get_signal_factor_044_4,
+
+    "factor_007_1": get_signal_factor_007_1,
+
+    "factor_044_8": get_signal_factor_044_8,
+    "factor_024_3": get_signal_factor_024_3,
 
 }
 
@@ -696,7 +704,7 @@ class MartinConfig:
     """
 
     def __init__(self, strategy_id, symbol, signal_name,
-                 api_key="", secret_key="",
+                 account_name="myself",
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_mult=5.0,
                  layer_loss_budget_ratio=0.80,
@@ -709,8 +717,7 @@ class MartinConfig:
         self.strategy_id = str(strategy_id)
         self.symbol = symbol
         self.signal_name = signal_name
-        self.api_key = api_key
-        self.secret_key = secret_key
+        self.account_name = account_name
         self.first_qty = float(first_qty)
         self.first_notional = float(first_notional)
         self.step_pct = float(step_pct)
@@ -2829,7 +2836,9 @@ def run_single_strategy(cfg, shared_prices=None):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key, secret_key = cfg.api_key, cfg.secret_key
+    from exchange_adapter import get_credentials
+    creds = get_credentials(EXCHANGE, cfg.account_name)
+    api_key, secret_key = creds.get('api_key'), creds.get('api_secret')
     if not api_key or not secret_key:
         logger.critical(f"[进程/配置] API 密钥为空，拒绝启动 | 策略:[{cfg.strategy_id}]")
         return
@@ -2839,7 +2848,7 @@ def run_single_strategy(cfg, shared_prices=None):
         "https": "http://127.0.0.1:7890",
     }
 
-    exchange = safe_init_exchange(api_key, secret_key, proxies)
+    exchange = safe_init_exchange(api_key, secret_key, proxies, exchange_name=EXCHANGE, passphrase=creds.get('passphrase', ''))
     gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
@@ -2863,37 +2872,47 @@ def run_single_strategy(cfg, shared_prices=None):
 
 def main_app():
     """加载多组账户凭据，并根据账户灵活分配策略进程。"""
-    accounts = [
-        ("myself", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
-        ("ruru", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
-        ("qiqi", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
-        ("mama", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
-    ]
+    # accounts = ["myself", "ruru", "qiqi", "mama"]
+    accounts = ["ruru"]
 
     # 1. 公共策略模板（所有账号都会运行的基础策略）
+    # 1. 公共策略模板（所有账号都会运行的基础策略）
     strategy_templates = [
-        {"base_id": "S-AAVE-5", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.9,
-         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
-        {"base_id": "L-UNI-5", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_3",
-         "first_qty": 4, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.5,
-         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
-        {"base_id": "L-UNI-10", "symbol": "UNI/USDT:USDT", "signal_name": "factor_044_4",
-         "first_qty": 2, "step_pct": 1, "qty_mult": 2, "tp_pct": 0.7,
-         "max_loss_mult": 10, "layer_loss_budget_ratio": 1},
+        {"base_id": "SAAVE4", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
+         "first_qty": 0.1, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.6,
+         "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
+
+        {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
+         "first_qty": 3, "step_pct": 1.8, "tp_pct": 0.9, "qty_mult": 2,
+         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
+
+        {"base_id": "LRENDER7", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_3",
+         "first_qty": 10, "step_pct": 2, "tp_pct": 1.1, "qty_mult": 2,
+         "max_loss_mult": 7, "layer_loss_budget_ratio": 1},
+
+        {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
+         "first_qty": 10, "step_pct": 1.8, "tp_pct": 1.2, "qty_mult": 2,
+         "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
+
+        {"base_id": "LSOL6", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_3",
+         "first_qty": 0.1, "step_pct": 3, "tp_pct": 1.2, "qty_mult": 2,
+         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
+
+        {"base_id": "SUNI6", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_10",
+         "first_qty": 1, "step_pct": 2, "tp_pct": 0.9, "qty_mult": 2,
+         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
     ]
 
     configs = []
-    for suffix, api_key, secret_key in accounts:
+    for account_name in accounts:
         # 复制一份公共策略作为基础
         current_templates = list(strategy_templates)
         for template in current_templates:
             params = dict(template)
             base_id = params.pop("base_id")
             configs.append(MartinConfig(
-                strategy_id=f"{base_id}{suffix}",
-                api_key=api_key,
-                secret_key=secret_key,
+                strategy_id=f"{base_id}{account_name}",
+                account_name=account_name,
                 **params,
             ))
 

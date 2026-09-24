@@ -75,11 +75,11 @@ def format_ts_to_bj(ms_timestamp):
         '%Y-%m-%d %H:%M:%S')
 
 
-def get_config(key):
+def get_config(key=None):
     """
-    从 config.json 文件中获取指定字段的值
-    :param key: 配置字段名
-    :return: 配置字段值
+    从 config.json 文件中获取指定字段的值，或者返回完整配置
+    :param key: 配置字段名。如果为None，则返回完整的配置字典。
+    :return: 具体的配置字段值 或 完整的配置字典
     """
     # 获取当前脚本所在目录
     base_dir = Path(os.path.dirname(os.path.abspath(__file__))).resolve()
@@ -97,7 +97,11 @@ def get_config(key):
     except json.JSONDecodeError as e:
         raise ValueError(f"配置文件 '{config_file}' 格式错误: {e}")
 
-    # 获取指定字段的值
+    # 判断是否传入了 key，如果没有传入，则直接返回完整的 json 数据
+    if key is None:
+        return config_data
+
+    # 如果传入了 key，则获取指定字段的值
     if key not in config_data:
         raise KeyError(f"配置文件中缺少字段: {key}")
 
