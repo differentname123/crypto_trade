@@ -27,13 +27,14 @@
 
 import os
 import platform
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
 from common_utils import setup_logger
-from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data
+from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data, get_realtime_signal_data
 
 SIGNAL_COLS = [
     'time', 'action', 'coin', 'direction', 'event', 'price', 'reason',
@@ -2202,18 +2203,93 @@ def apply_signal_2384(alt_df, btc_df):
     return _generate_core_signal(alt_df, btc_df, beta_days=45, z_threshold=9.5)
 
 
+def gen_pair_signal():
+    """
+    通用策略生成器：批量遍历多标的，执行统计套利策略，并返回聚合后的信号表。
+    """
+    now_ms = int(time.time() * 1000)
+    # 假设 get_realtime_signal_data 返回格式为 {symbol: DataFrame}
+    symbol_dfs = get_realtime_signal_data(now_ms, proxy='http://127.0.0.1:7890')
+
+    # 1. 提取并预处理 BTC 基准数据
+    btc_df = symbol_dfs.get('BTC/USDT:USDT')
+    if btc_df is None or btc_df.empty:
+        return pd.DataFrame()  # 获取不到BTC大盘数据，直接阻断
+
+    # 确保 timestamp 被转为 DatetimeIndex，以适配 _generate_core_signal 的要求
+    if not pd.api.types.is_datetime64_any_dtype(btc_df['timestamp']):
+        btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
+    btc_df = btc_df.set_index('timestamp').sort_index()
+
+    # 用于存放所有触发信号的数据容器
+    signal_records = []
+
+    # 2. 遍历所有山寨币
+    for symbol, alt_df in symbol_dfs.items():
+        if symbol == 'BTC/USDT:USDT' or alt_df.empty:
+            continue
+
+        # 预处理山寨币数据
+        temp_df = alt_df.copy()
+        if not pd.api.types.is_datetime64_any_dtype(temp_df['timestamp']):
+            temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp'], unit='ms')
+        temp_df = temp_df.set_index('timestamp').sort_index()
+
+        coin_name = symbol.split('/')[0]  # 提取币名，例如 "UNI"
+
+        # -------------------------------------------------------------
+        # 执行策略 1671 (务必传入 temp_df.copy() 避免污染原始数据)
+        # -------------------------------------------------------------
+        df_1671 = apply_signal_1671(temp_df.copy(), btc_df)
+
+        # 过滤出有信号的行
+        hits_1671 = df_1671[df_1671['signal'] == True].copy()
+        if not hits_1671.empty:
+            hits_1671['symbol'] = symbol
+            hits_1671['coin_name'] = coin_name
+            hits_1671['strategy_name'] = 'pair_1671'  # 打上策略标签
+            signal_records.append(hits_1671)
+
+        # -------------------------------------------------------------
+        # 执行策略 2384 (同样传入 copy 后的数据，否则会覆盖1671的列)
+        # -------------------------------------------------------------
+        df_2384 = apply_signal_2384(temp_df.copy(), btc_df)
+
+        # 过滤出有信号的行
+        hits_2384 = df_2384[df_2384['signal'] == True].copy()
+        if not hits_2384.empty:
+            hits_2384['symbol'] = symbol
+            hits_2384['coin_name'] = coin_name
+            hits_2384['strategy_name'] = 'pair_2384'  # 打上策略标签
+            signal_records.append(hits_2384)
+
+    # 3. 合并并整理最终结果
+    if not signal_records:
+        # 如果没有任何信号，返回带表头的空DF，防止下游报错
+        return pd.DataFrame(columns=[
+            'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal'
+        ])
+
+    final_df = pd.concat(signal_records)
+
+    # 将 timestamp 从 index 还原为一列，方便后续写库或发单取用
+    final_df = final_df.reset_index()
+
+    # 调整列的顺序，把关键标识字段放前面（可选，让 DataFrame 打印出来更美观）
+    core_cols = ['timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal']
+    other_cols = [c for c in final_df.columns if c not in core_cols]
+    final_df = final_df[core_cols + other_cols]
+
+    # 可以按时间戳排序，保证发单顺序
+    final_df = final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
+
+    return final_df
+
 # =============================================================================
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
-    btc_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\trader_bot\data\BTC_USDT_USDT_1h_latest.csv')
-    btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
-    btc_df = btc_df.set_index('timestamp').sort_index()
-    alt_df = pd.read_csv(r'W:\project\python_project\crypto_trade\app\trader_bot\data\CTSI_USDT_USDT_1h_latest.csv')
-    alt_df['timestamp'] = pd.to_datetime(alt_df['timestamp'], unit='ms')
-    alt_df = alt_df.set_index('timestamp').sort_index()
-    final_df = apply_signal_2384(alt_df, btc_df)
-
+    pair_df = gen_pair_signal()
 
     target_time = (
             datetime.now() - timedelta(minutes=1)

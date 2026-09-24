@@ -1770,12 +1770,17 @@ async def _async_get_realtime_signal_data(snapshot_timestamp_ms, proxy_url):
                                         f"历史数据有延迟，未能对齐上一个收盘整点 (期望:{_format_bj_time(target_latest_closed_ms)}，实际:{_format_bj_time(local_last_ts)})"))
                 continue
 
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            # ==========================================
+            # 修改处：保留毫秒级时间戳，不转 datetime
+            # ==========================================
+            df['timestamp'] = df['timestamp'].astype('int64')
             df = df.set_index('timestamp').sort_index()
 
             tail_df = df.tail(REQUIRED_KLINE_COUNT)
             time_diffs = tail_df.index.to_series().diff().dropna()
-            if not (time_diffs == pd.Timedelta(hours=1)).all():
+
+            # 判断间隔是否恒为 1 小时 (3600 * 1000 毫秒)
+            if not (time_diffs == 3600000).all():
                 invalid_symbols.append((symbol, "历史 K 线中存在断层/间断"))
                 continue
 
@@ -1785,14 +1790,19 @@ async def _async_get_realtime_signal_data(snapshot_timestamp_ms, proxy_url):
                 invalid_symbols.append((symbol, "Ticker 数据中缺失 last 价格"))
                 continue
 
+            # 使用毫秒级时间戳(整数)拼接最后一行
             temp_row = pd.DataFrame([{
-                'timestamp': pd.to_datetime(current_hour_ms, unit='ms'),
-                'close': live_price
+                'timestamp': current_hour_ms,
+                'close': float(live_price)
             }]).set_index('timestamp')
 
             df_final = df[['close']].copy()
             df_final = pd.concat([df_final, temp_row])
             df_final = df_final.reset_index()
+
+            # 保险起见，强制确保最终 DataFrame 的 timestamp 为整数类型
+            df_final['timestamp'] = df_final['timestamp'].astype('int64')
+
             valid_data_dict[symbol] = df_final
 
         # 4. 统计与报告
@@ -1814,6 +1824,8 @@ async def _async_get_realtime_signal_data(snapshot_timestamp_ms, proxy_url):
         except Exception:
             pass
         await _shutdown_exchange(exchange)
+
+
 # =====================================================================
 # 对外暴露的同步封装 API
 # =====================================================================
