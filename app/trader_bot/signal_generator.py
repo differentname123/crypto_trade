@@ -2282,16 +2282,141 @@ def gen_pair_signal():
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
 
     return final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
+
+
+# =============================================================================
+# 因子 007_1: Z-Score 极度悲观后反弹做多 (LONG)
+# =============================================================================
+def generate_factor_007_1_signals(df):
+    """factor_007_1：Z-Score下探1440周期5%分位数后反弹，产生 LONG OPEN。"""
+    if df is None or len(df) < 1440:
+        return pd.DataFrame()
+
+    symbol, coin = _resolve_identity(df)
+    time_col = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    win_short, lag, win_long, q_low = 30, 5, 1440, 0.05
+    close = df['close'].astype(float)
+
+    z = (close - close.rolling(win_short).mean()) / close.rolling(win_short).std().replace(0, 1e-9)
+    signal = (z < z.rolling(win_long).quantile(q_low)) & (z > z.shift(lag))
+
+    hits = df[signal.fillna(False).astype(bool)].copy()
+    return _build_factor_result(
+        hits, time_col, symbol, coin, 'factor_007_1', 'LONG'
+    )
+
+
+def execute_trading_bot_workflow_factor_007_1(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_007_1：1m Z-Score极度悲观反弹做多。"""
+    return _run_factor_workflow(
+        'factor_007_1',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_007_1_signals,
+        'Z-Score分位数反弹做多信号生成',
+    )
+
+
+def get_signal_factor_007_1(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_007_1,
+        'factor_007_1',
+    )
+
+
+# =============================================================================
+# 因子 044_8: 长线低频假跌破 (LONG)
+# =============================================================================
+def generate_factor_044_8_signals(df):
+    """factor_044_8：梯度8 长线低频 (15根假跌破480根历史低点)，产生 LONG OPEN。"""
+    return _generate_false_break_signals(
+        df, 'factor_044_8', 'LONG', 15, 480
+    )
+
+
+def execute_trading_bot_workflow_factor_044_8(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_044_8：1m 长线低频假跌破做多。"""
+    return _run_factor_workflow(
+        'factor_044_8',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_044_8_signals,
+        '长线低频假跌破做多信号生成',
+    )
+
+
+def get_signal_factor_044_8(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_044_8,
+        'factor_044_8',
+    )
+
+
+# =============================================================================
+# 因子 024_3: 10周期K线重心均值突破 (LONG)
+# =============================================================================
+def generate_factor_024_3_signals(df):
+    """factor_024_3：10根K线重心均值突破1440根历史95%分位数，产生 LONG OPEN。"""
+    if df is None or len(df) < 1440:
+        return pd.DataFrame()
+
+    symbol, coin = _resolve_identity(df)
+    time_col = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    win_short, win_long, q_high = 10, 1440, 0.95
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+
+    k_pos = (close - low) / (high - low).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    threshold = mean_pos.rolling(win_long).quantile(q_high)
+
+    signal = mean_pos > threshold
+    hits = df[signal.fillna(False).astype(bool)].copy()
+    return _build_factor_result(
+        hits, time_col, symbol, coin, 'factor_024_3', 'LONG'
+    )
+
+
+def execute_trading_bot_workflow_factor_024_3(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_024_3：1m K线重心10周期高分位突破做多。"""
+    return _run_factor_workflow(
+        'factor_024_3',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_024_3_signals,
+        'K线重心10周期突破做多信号生成',
+    )
+
+
+def get_signal_factor_024_3(symbol):
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_024_3,
+        'factor_024_3',
+    )
+
+
 # =============================================================================
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
     pair_df = gen_pair_signal()
 
-    # target_time = (
-    #         datetime.now() - timedelta(minutes=1)
-    # ).strftime('%Y-%m-%d %H:%M')
-    #
-    # symbol_list = ['UNI/USDT:USDT']
-    # signal = get_signal_factor_044_3(symbol_list[0])
-    # print()
+    target_time = (
+            datetime.now() - timedelta(minutes=1)
+    ).strftime('%Y-%m-%d %H:%M')
+
+    symbol_list = ['SOL/USDT:USDT']
+    signal = get_signal_factor_024_3(symbol_list[0])
+    print()
