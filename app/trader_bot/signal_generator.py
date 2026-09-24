@@ -2203,12 +2203,12 @@ def apply_signal_2384(alt_df, btc_df):
     return _generate_core_signal(alt_df, btc_df, beta_days=45, z_threshold=9.5)
 
 
-def gen_pair_signal():
+def gen_pair_signal(proxy=None):
     """
     通用策略生成器：批量遍历多标的，执行统计套利策略。
     """
     now_ms = int((time.time() - 60 * 60) * 1000)
-    symbol_dfs = snipe_and_update_hourly_signals(now_ms, proxy='http://127.0.0.1:7890')
+    symbol_dfs = snipe_and_update_hourly_signals(now_ms, proxy=proxy)
 
     btc_df = symbol_dfs.get('BTC/USDT:USDT')
     if btc_df is None or btc_df.empty:
@@ -2266,23 +2266,73 @@ def gen_pair_signal():
     # 组装返回结果
     if not signal_records:
         return pd.DataFrame(columns=[
-            'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal'
+            'time', 'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal'
         ])
 
     final_df = pd.concat(signal_records).reset_index()
 
+    # ================= 修改核心开始 =================
+    # 1. 增加 1 小时偏移，将 K 线起始时间转换为信号落地(触发)时间
+    final_df['timestamp'] = final_df['timestamp'] + pd.Timedelta(hours=1)
+
+    # 2. 生成北京时间字符串列 (timestamp是无时区的UTC时间，需先localize再convert)
+    final_df['time'] = (
+        final_df['timestamp']
+        .dt.tz_localize('UTC')
+        .dt.tz_convert('Asia/Shanghai')
+        .dt.strftime('%Y-%m-%d %H:%M:%S')
+    )
+
     # 规范化列顺序
-    core_cols = ['timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal']
+    core_cols = ['time', 'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal']
     other_cols = [c for c in final_df.columns if c not in core_cols]
     final_df = final_df[core_cols + other_cols]
+
+    # 按时间顺序排序
+    final_df = final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
 
     # 将final_df保存到CSV文件中
     output_path = os.path.join('signal_data', 'pair_signals.csv')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
 
-    return final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
+    # ================= 日志输出：打印近 72 小时内的信号及倒计时 =================
+    logger = setup_logger()
+    # 当前实际机器时间的 UTC 无时区对象，用于与 timestamp(UTC) 运算
+    current_utc = pd.Timestamp.now('UTC').tz_localize(None)
 
+    limit_time = current_utc - pd.Timedelta(hours=72)
+
+    # 过滤出近72小时内触发的信号
+    recent_df = final_df[final_df['timestamp'] >= limit_time]
+
+    if not recent_df.empty:
+        logger.info(f"🎯 [Pair套利] 过去 72 小时内触发的信号 | 共计: [{len(recent_df)}] 条")
+        lines = []
+        for _, row in recent_df.iterrows():
+            # 计算距离72小时失效还剩下多少时间
+            expiry_time = row['timestamp'] + pd.Timedelta(hours=72)
+            time_left = expiry_time - current_utc
+            total_seconds = time_left.total_seconds()
+
+            if total_seconds <= 0:
+                time_left_str = "已失效"
+            else:
+                hours_left = int(total_seconds // 3600)
+                minutes_left = int((total_seconds % 3600) // 60)
+                time_left_str = f"{hours_left}小时{minutes_left}分钟"
+
+            lines.append(
+                f"\n  ► 🔴 开仓 | 触发时间: [{row['time']}] (北京时间) | 标的: [{row['symbol']:<14}] | "
+                f"策略: [{row['strategy_name']:<9}] | 触发价格: [{row['close']:>6.9f}] |  | Z-Score: [{row['z_score']:>6.2f}] | "
+                f"距72H失效剩余: [{time_left_str}]"
+            )
+        logger.info("\n".join(lines))
+    else:
+        logger.info("🎯 [Pair套利] 过去 72 小时内无新触发的信号。")
+    # =========================================================================
+
+    return final_df
 
 # =============================================================================
 # 因子 007_1: Z-Score 极度悲观后反弹做多 (LONG)
@@ -2411,7 +2461,7 @@ def get_signal_factor_024_3(symbol):
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
-    pair_df = gen_pair_signal()
+    pair_df = gen_pair_signal('http://127.0.0.1:7890')
 
     # target_time = (
     #         datetime.now() - timedelta(minutes=1)
