@@ -2055,7 +2055,6 @@ import numpy as np
 def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
     """
     底层核心信号生成器：计算 Z-Score、短期确认，并通过状态机生成最终开仓信号。
-    注意：传入的 df 必须包含 'close' 列，且 Index 为标准 1h 的 DatetimeIndex。
     """
     # 1. 对齐时间轴与基础字段
     df = pd.DataFrame(index=alt_df.index)
@@ -2079,7 +2078,6 @@ def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
     # 3. 长期 Beta 与 Z-Score 计算
     cov = df['ret_1h'].rolling(B, min_periods=B).cov(df['btc_ret_1h'])
     var = df['btc_ret_1h'].rolling(B, min_periods=B).var()
-    # var.where() 防止除以0或极小值导致无穷大
     df['beta_shifted'] = (cov / var.where(var > MIN_BTC_VAR)).shift(S)
     beta = df['beta_shifted']
 
@@ -2103,7 +2101,6 @@ def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
     var_s = df['btc_ret_1h'].rolling(S_B, min_periods=S_B).var()
     short_beta = (cov_s / var_s.where(var_s > MIN_BTC_VAR)).shift(S_C)
 
-    # 用向量化方式累加过去 12 小时的状态
     net_counts = np.zeros(len(df), dtype=int)
     up_counts = np.zeros(len(df), dtype=int)
     up_sums = np.zeros(len(df), dtype=float)
@@ -2126,7 +2123,6 @@ def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
         up_sums += np.where(up_mask, residual_lag, 0.0)
         up_negatives += (up_mask & (residual_lag < 0)).astype(int)
 
-    # 严格要求 12 个小时 K 线齐全，且 BTC 至少有 2 小时上涨 (N=2)
     complete = (net_counts == S_C)
     enough = complete & (up_counts >= 2)
 
@@ -2137,53 +2133,57 @@ def _generate_core_signal(alt_df, btc_df, beta_days, z_threshold):
     df['short_ready'] = enough & (mean_excess < 0.0) & (negative_ratio >= 0.0)
 
     # 5. 实盘信号状态机 (State Machine)
-    signals = []
+    # 初始化全为 False 的结果列表，确保与原表长度一致
+    signals = [False] * len(df)
+
     armed = False
     pending = False
     trigger_time = pd.NaT
     wait_time = pd.Timedelta(hours=12)
 
-    for row in df.itertuples():
-        z = row.z_score
-        ready = row.short_ready
-        now = row.Index
+    # 找到 Z-Score 真正出有效数据的第一行（跳过长达一两个月的预热期）
+    first_valid_idx = df['z_score'].first_valid_index()
 
-        signal_triggered = False
+    if first_valid_idx is not None:
+        start_loc = df.index.get_loc(first_valid_idx)
 
-        if not np.isfinite(z):
-            armed = pending = False
-            trigger_time = pd.NaT
-        elif -z_threshold <= z <= z_threshold:
-            # 回落至正常区间，重新填装子弹，取消正在等待的警报
-            armed = True
-            pending = False
-            trigger_time = pd.NaT
-        elif z > z_threshold:
-            # 持续处于做空极值区
-            if pending:
-                # 已经突破，正在熬时间
-                if (now - trigger_time) >= wait_time:
-                    if ready:
-                        signal_triggered = True
-                        pending = False  # 消耗信号，避免随后几小时重复开空
+        # 仅从有真实数据的行开始遍历，底层逻辑完全保持不变
+        for i, row in enumerate(df.iloc[start_loc:].itertuples(), start=start_loc):
+            z = row.z_score
+            ready = row.short_ready
+            now = row.Index
+
+            signal_triggered = False
+
+            if not np.isfinite(z):
+                armed = pending = False
+                trigger_time = pd.NaT
+            elif -z_threshold <= z <= z_threshold:
+                armed = True
+                pending = False
+                trigger_time = pd.NaT
+            elif z > z_threshold:
+                if pending:
+                    if (now - trigger_time) >= wait_time:
+                        if ready:
+                            signal_triggered = True
+                            pending = False
+                else:
+                    if armed:
+                        armed = False
+                        pending = True
+                        trigger_time = now
             else:
-                if armed:
-                    # 首次向上突破
-                    armed = False
-                    pending = True
-                    trigger_time = now
-        else:
-            # 处于反向极端区 (z < -z_threshold)，完全解除武装
-            armed = pending = False
-            trigger_time = pd.NaT
+                armed = pending = False
+                trigger_time = pd.NaT
 
-        signals.append(signal_triggered)
+            # 写回到对应的绝对索引位置
+            signals[i] = signal_triggered
 
     # 最终赋值并返回修改后的 alt_df
     alt_df['z_score'] = df['z_score']
     alt_df['signal'] = signals
     return alt_df
-
 
 # =========================================================
 # 面向你的两个专属策略的调用函数
@@ -2205,86 +2205,78 @@ def apply_signal_2384(alt_df, btc_df):
 
 def gen_pair_signal():
     """
-    通用策略生成器：批量遍历多标的，执行统计套利策略，并返回聚合后的信号表。
+    通用策略生成器：批量遍历多标的，执行统计套利策略。
     """
     now_ms = int(time.time() * 1000)
-    # 假设 get_realtime_signal_data 返回格式为 {symbol: DataFrame}
     symbol_dfs = get_realtime_signal_data(now_ms, proxy='http://127.0.0.1:7890')
 
-    # 1. 提取并预处理 BTC 基准数据
     btc_df = symbol_dfs.get('BTC/USDT:USDT')
     if btc_df is None or btc_df.empty:
-        return pd.DataFrame()  # 获取不到BTC大盘数据，直接阻断
+        return pd.DataFrame()
 
-    # 确保 timestamp 被转为 DatetimeIndex，以适配 _generate_core_signal 的要求
     if not pd.api.types.is_datetime64_any_dtype(btc_df['timestamp']):
         btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
     btc_df = btc_df.set_index('timestamp').sort_index()
 
-    # 用于存放所有触发信号的数据容器
+    # 最大预热期需 1464 根，保留最后 1600 根 (预热期 + 约5天多的状态机流转冗余)
+    MAX_BARS = 1600
+    btc_df = btc_df.tail(MAX_BARS)
+
     signal_records = []
 
-    # 2. 遍历所有山寨币
     for symbol, alt_df in symbol_dfs.items():
         if symbol == 'BTC/USDT:USDT' or alt_df.empty:
             continue
 
-        # 预处理山寨币数据
         temp_df = alt_df.copy()
         if not pd.api.types.is_datetime64_any_dtype(temp_df['timestamp']):
             temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp'], unit='ms')
-        temp_df = temp_df.set_index('timestamp').sort_index()
 
-        coin_name = symbol.split('/')[0]  # 提取币名，例如 "UNI"
+        # 同样截取安全边界数据
+        temp_df = temp_df.set_index('timestamp').sort_index().tail(MAX_BARS)
 
-        # -------------------------------------------------------------
-        # 执行策略 1671 (务必传入 temp_df.copy() 避免污染原始数据)
-        # -------------------------------------------------------------
+        # 脏数据拦截：如果连 1671 的最低预热门槛都达不到，直接跳过防报错
+        if len(temp_df) < 1470:
+            continue
+
+        coin_name = symbol.split('/')[0]
+
+        # -----------------------------
+        # 执行策略 1671
+        # -----------------------------
         df_1671 = apply_signal_1671(temp_df.copy(), btc_df)
-
-        # 过滤出有信号的行
         hits_1671 = df_1671[df_1671['signal'] == True].copy()
         if not hits_1671.empty:
             hits_1671['symbol'] = symbol
             hits_1671['coin_name'] = coin_name
-            hits_1671['strategy_name'] = 'pair_1671'  # 打上策略标签
+            hits_1671['strategy_name'] = 'pair_1671'
             signal_records.append(hits_1671)
 
-        # -------------------------------------------------------------
-        # 执行策略 2384 (同样传入 copy 后的数据，否则会覆盖1671的列)
-        # -------------------------------------------------------------
+        # -----------------------------
+        # 执行策略 2384
+        # -----------------------------
         df_2384 = apply_signal_2384(temp_df.copy(), btc_df)
-
-        # 过滤出有信号的行
         hits_2384 = df_2384[df_2384['signal'] == True].copy()
         if not hits_2384.empty:
             hits_2384['symbol'] = symbol
             hits_2384['coin_name'] = coin_name
-            hits_2384['strategy_name'] = 'pair_2384'  # 打上策略标签
+            hits_2384['strategy_name'] = 'pair_2384'
             signal_records.append(hits_2384)
 
-    # 3. 合并并整理最终结果
+    # 组装返回结果
     if not signal_records:
-        # 如果没有任何信号，返回带表头的空DF，防止下游报错
         return pd.DataFrame(columns=[
             'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal'
         ])
 
-    final_df = pd.concat(signal_records)
+    final_df = pd.concat(signal_records).reset_index()
 
-    # 将 timestamp 从 index 还原为一列，方便后续写库或发单取用
-    final_df = final_df.reset_index()
-
-    # 调整列的顺序，把关键标识字段放前面（可选，让 DataFrame 打印出来更美观）
+    # 规范化列顺序
     core_cols = ['timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal']
     other_cols = [c for c in final_df.columns if c not in core_cols]
     final_df = final_df[core_cols + other_cols]
 
-    # 可以按时间戳排序，保证发单顺序
-    final_df = final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
-
-    return final_df
-
+    return final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
 # =============================================================================
 # 八、本地联调入口
 # =============================================================================
