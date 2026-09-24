@@ -72,12 +72,9 @@ if multiprocessing.current_process().name == "MainProcess":
 else:
     logger = logging.getLogger("martin_trader")
 
-# ============ 交易所选择 (binance / okx / bybit) ============
-EXCHANGE = "binance"
-
-# 交易所耦合只允许出现在 ex_api 适配层；更换平台时修改上方 EXCHANGE 变量即可。
-import exchange_gateway as ex_api
-from exchange_gateway import (
+# 交易所耦合只允许出现在 ex_api 适配层；更换平台时替换该模块即可。
+import binance_u_gateway as ex_api
+from binance_u_gateway import (
     ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
 )
 
@@ -704,7 +701,7 @@ class MartinConfig:
     """
 
     def __init__(self, strategy_id, symbol, signal_name,
-                 account_name="myself",
+                 api_key="", secret_key="",
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_mult=5.0,
                  layer_loss_budget_ratio=0.80,
@@ -717,7 +714,8 @@ class MartinConfig:
         self.strategy_id = str(strategy_id)
         self.symbol = symbol
         self.signal_name = signal_name
-        self.account_name = account_name
+        self.api_key = api_key
+        self.secret_key = secret_key
         self.first_qty = float(first_qty)
         self.first_notional = float(first_notional)
         self.step_pct = float(step_pct)
@@ -2836,9 +2834,7 @@ def run_single_strategy(cfg, shared_prices=None):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    from exchange_adapter import get_credentials
-    creds = get_credentials(EXCHANGE, cfg.account_name)
-    api_key, secret_key = creds.get('api_key'), creds.get('api_secret')
+    api_key, secret_key = cfg.api_key, cfg.secret_key
     if not api_key or not secret_key:
         logger.critical(f"[进程/配置] API 密钥为空，拒绝启动 | 策略:[{cfg.strategy_id}]")
         return
@@ -2848,7 +2844,7 @@ def run_single_strategy(cfg, shared_prices=None):
         "https": "http://127.0.0.1:7890",
     }
 
-    exchange = safe_init_exchange(api_key, secret_key, proxies, exchange_name=EXCHANGE, passphrase=creds.get('passphrase', ''))
+    exchange = safe_init_exchange(api_key, secret_key, proxies)
     gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
@@ -2872,10 +2868,13 @@ def run_single_strategy(cfg, shared_prices=None):
 
 def main_app():
     """加载多组账户凭据，并根据账户灵活分配策略进程。"""
-    # accounts = ["myself", "ruru", "qiqi", "mama"]
-    accounts = ["ruru"]
+    accounts = [
+        # ("myself", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
+        ("ruru", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
+        # ("qiqi", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
+        # ("mama", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
+    ]
 
-    # 1. 公共策略模板（所有账号都会运行的基础策略）
     # 1. 公共策略模板（所有账号都会运行的基础策略）
     strategy_templates = [
         {"base_id": "SAAVE4", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
@@ -2904,15 +2903,16 @@ def main_app():
     ]
 
     configs = []
-    for account_name in accounts:
+    for suffix, api_key, secret_key in accounts:
         # 复制一份公共策略作为基础
         current_templates = list(strategy_templates)
         for template in current_templates:
             params = dict(template)
             base_id = params.pop("base_id")
             configs.append(MartinConfig(
-                strategy_id=f"{base_id}{account_name}",
-                account_name=account_name,
+                strategy_id=f"{base_id}{suffix}",
+                api_key=api_key,
+                secret_key=secret_key,
                 **params,
             ))
 
