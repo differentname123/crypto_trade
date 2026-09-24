@@ -53,12 +53,12 @@ import ccxt.async_support as ccxt
 import pandas as pd
 
 from common_utils import setup_logger
+logger = setup_logger( app_name="data_provider")
 
 # 解除 Pandas 控制台打印限制（便于人工核对数据）
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 1000)
 
-logger = setup_logger()
 
 # ----------------------------- 全局常量 -----------------------------
 MS_PER_DAY = 86_400_000
