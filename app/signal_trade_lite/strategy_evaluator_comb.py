@@ -1050,9 +1050,9 @@ def evaluate_multi_strategy_portfolios(
                   f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')} "
                   f"| 平滑后 {fmt(r['周期平滑盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
-            print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
-                  f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
-                  f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
+            # print(f"   分散化系数 {fmt(r['分散化系数'], 3)} "
+            #       f"| 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} "
+            #       f"| 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
             print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
                   f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
                   f"| Profit Factor {fmt(r['Profit Factor'])}")
@@ -1771,8 +1771,8 @@ def print_ranking_report_from_csv(
             print(
                 f"\nNo.{rank} | 完整周期 {int(r['完整周期数'])} 段 | 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
-            print(
-                f"   分散化系数 {fmt(r['分散化系数'], 3)} | 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} | 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
+            # print(
+            #     f"   分散化系数 {fmt(r['分散化系数'], 3)} | 平均两两持仓重合 {fmt(r['平均两两持仓重合(%)'], suffix='%')} | 最高两两持仓重合 {fmt(r['最高两两持仓重合(%)'], suffix='%')}")
             print(
                 f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M | 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 | Profit Factor {fmt(r['Profit Factor'])}")
             print(
