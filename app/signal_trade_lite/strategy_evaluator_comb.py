@@ -42,7 +42,10 @@ MDD_COL_CANDIDATES = ["max_drawdown", "max_drawdown_in_margin", "max_dd", "max_l
 BLOWUP_LOSS_THRESHOLD_M = 0.8  # 归一化后(M倍)单笔亏损超过该阈值视为爆仓(与原代码 -0.8*margin 等价)
 DAYS_PER_YEAR = 365.0
 INDEX_FILE = "_single_strategy_index.csv"  # Stage A 产出的元数据索引(Stage B 会读取, 且不会当成交易明细)
+DISPLAY_COLS = [
+    # "成员",
 
+    "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
 # =====================================================================
 # 目标参数清单 (可加 "multiplier" 字段来精确锁定加仓倍数, 强烈建议加)
 # =====================================================================
@@ -1086,7 +1089,7 @@ def evaluate_multi_strategy_portfolios(
                 })
 
             df_print = pd.DataFrame(rows)
-            display_cols = ["成员", "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
+            display_cols = DISPLAY_COLS
             print_table(df_print[display_cols])
         print()
 
@@ -1814,7 +1817,7 @@ def print_ranking_report_from_csv(
 
             if rows:
                 df_print = pd.DataFrame(rows)
-                display_cols = ["成员", "成员编号", "窗口净利(M)", "已实现MDD(M)", "已实现Calmar", "周期盈利率(%)"]
+                display_cols = DISPLAY_COLS
                 print_table(df_print[display_cols])
         print()
 

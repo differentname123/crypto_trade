@@ -1596,21 +1596,19 @@ def get_symbol_filename(symbol):
 
 
 async def _async_fetch_and_update_history(proxy_url):
-    print(f"[{datetime.now()}] 开始执行历史数据更新任务...")
+    logger.info(f"[HIST_UPDATE] 🚀 开始执行历史数据更新任务...")
 
     # 深度复用：基于上文基建的 _open_exchange 获取安全且注入代理的会话
     exchange = await _open_exchange(proxy_url, "HIST_UPDATE", "[HIST_UPDATE]")
     try:
-        # 1. 获取币安当前所有 U本位永续合约
-
-        # 1. 获取币安当前所有 U本位永续合约，且必须处于"交易中"的活跃状态
+        # 1. 获取币安当前所有 U本位永续合约，严格过滤掉已下线/未开盘合约
         symbols = [
             s for s in exchange.symbols
             if exchange.market(s).get('linear')
-               and exchange.market(s).get('active')  # CCXT 层面的活跃标识
-               and exchange.market(s).get('info', {}).get('status') == 'TRADING'  # 币安底层的状态校验
+               and exchange.market(s).get('active')
+               and exchange.market(s).get('info', {}).get('status') == 'TRADING'
         ]
-        print(f"共发现 {len(symbols)} 个 U本位永续合约")
+        logger.info(f"[HIST_UPDATE] 🔍 过滤后共发现 {len(symbols)} 个处于 TRADING 状态的 U本位永续合约")
 
         # 2. 计算最新的【已收盘】整点时间戳 (毫秒)
         now_ms = int(time.time() * 1000)
@@ -1638,7 +1636,7 @@ async def _async_fetch_and_update_history(proxy_url):
                         local_last_ms = int(df_local['timestamp'].iloc[-1])
                         start_fetch_ms = max(local_last_ms - (24 * 3600 * 1000), latest_closed_ms - max_history_ms)
                 except Exception as e:
-                    print(f"读取 {file_name} 失败，将重新全量拉取: {e}")
+                    logger.warning(f"[HIST_UPDATE] ⚠️ {symbol} 本地文件读取失败，将重新全量拉取: {e}")
 
             if not df_local.empty and local_last_ms >= latest_closed_ms and (latest_closed_ms - start_fetch_ms) <= (
                     24 * 3600 * 1000):
@@ -1667,10 +1665,14 @@ async def _async_fetch_and_update_history(proxy_url):
                     await asyncio.sleep(0.05)
 
             except Exception as e:
-                print(f"[{symbol}] 数据拉取失败: {e}")
+                logger.error(f"[HIST_UPDATE] ❌ {symbol} 数据拉取致命失败，已跳过该币种: {e}")
                 continue
 
             if not all_new_klines:
+                # 记录拉取为空的具体原因，方便后续排查
+                logger.warning(f"[HIST_UPDATE] 🈳 {symbol} 未拉取到任何有效历史数据 "
+                               f"| 尝试拉取起点: {_format_bj_time(start_fetch_ms)} "
+                               f"(可能原因: 该合约刚刚上线不足1小时，或交易所该时间段无数据)")
                 continue
 
             # 5. 合并、覆盖、裁切并保存
@@ -1688,11 +1690,20 @@ async def _async_fetch_and_update_history(proxy_url):
             df_combined.to_csv(file_path, index=False)
             updated_count += 1
 
-        print(f"[{datetime.now()}] 历史更新完成，成功更新了 {updated_count} 个合约。")
+            # --- 新增：单币处理完成后的统计日志 ---
+            fetch_start = _format_bj_time(int(df_new['timestamp'].iloc[0]))
+            fetch_end = _format_bj_time(int(df_new['timestamp'].iloc[-1]))
+            file_start = _format_bj_time(int(df_combined['timestamp'].iloc[0]))
+            file_end = _format_bj_time(int(df_combined['timestamp'].iloc[-1]))
+
+            logger.info(f"[HIST_UPDATE] ✅ {symbol} 更新成功 | "
+                        f"增量拉取: [{fetch_start} ~ {fetch_end}] (共{len(df_new)}根) | "
+                        f"最终文件: [{file_start} ~ {file_end}] (总{len(df_combined)}根)")
+
+        logger.info(f"[HIST_UPDATE] 🎉 历史更新完成，成功更新了 {updated_count} 个合约。")
     finally:
         # 深度复用：基于上文基建优雅释放资源防内存泄漏
         await _shutdown_exchange(exchange)
-
 
 async def _async_get_realtime_signal_data(snapshot_timestamp_ms, proxy_url):
     print(f"[{datetime.now()}] 开始构建实时信号数据...")
@@ -1826,7 +1837,7 @@ if __name__ == "__main__":
     # 🚀 新增融合功能演示 (实盘骨架)
     # ==========================================
     # 步骤 1：每小时稍微空闲的时间 (比如 xx:02:00) 运行一次，更新历史数据库 (通过代理)
-    # fetch_and_update_history(proxy='http://127.0.0.1:7890')
+    fetch_and_update_history(proxy='http://127.0.0.1:7890')
 
     # 步骤 2：在要求极速响应的时刻 (比如 xx:00:01) 运行，组装数据 (通过代理)
     now_ms = int(time.time() * 1000)
