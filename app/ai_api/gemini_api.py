@@ -40,7 +40,8 @@ from filelock import FileLock
 from google import genai
 from google.genai import types
 
-from common.common_utils import read_json
+from common.common_utils import read_json, get_config
+
 config_path = r'W:\project\python_project\crypto_trade\config\gemini_web.json'
 
 # ========== API Key 读取与管理 ==========
@@ -643,9 +644,483 @@ def analyze_images_gemini(
                 continue
 
     return f"所有 API Key 均尝试失败。最后一次错误: {last_error}"
+# -*- coding: utf-8 -*-
+"""
+Gemini 本地接口新增代码（Python 3.10+）
+
+集成方法：
+1. 安装依赖：python -m pip install requests
+2. 将本文件全部内容复制到原文件的 if __name__ == "__main__": 之前。
+   仅新增代码，不修改、覆盖或重新绑定原有函数。
+3. 配置 GEMINI_LOCAL_API_KEY 环境变量，或填写下方 LOCAL_API_KEY 的默认值。
+4. 在调用位置使用下面的新入口。原来的函数名仍保持原来的行为。
+
+新增入口：
+- chat_completion_local(...)：单次请求，返回 success/content/reasoning/raw 等字段。
+- get_llm_content_local(...)：本地纯文本调用，成功返回 str，失败抛出异常。
+- analyze_images_local(...)：本地单图/多图调用，成功返回 str，失败抛出异常。
+- get_llm_content_auto(...)：本地主备模型调用失败后，调用原 get_llm_content。
+- analyze_images_auto(...)：本地主备模型调用失败后，调用原 analyze_images_gemini。
+
+本地模型名称沿用你提供的网关配置，不作为 Google 官方模型名称使用。
+每个本地候选模型最多请求一次；临时错误会切换到备用模型。
+auto 入口遇到文件/参数错误或明确拒绝时不回退。
+auto 入口需与原代码处于同一模块，并沿用原函数的返回值与异常行为。
+原代码在模块导入时仍会读取 Google 配置；本新增块单独使用 local 入口时无此依赖。
+本文件没有自动运行的测试代码，也没有给新增函数添加 @with_proxy。
+
+用法（复制到原模块后）：
+    text = get_llm_content_local("你好，请介绍一下你自己。")
+    text = analyze_images_local("比较这些图片", [r"C:\\images\\a.jpg", r"C:\\images\\b.png"])
+    text = get_llm_content_auto("请解释一下量化交易。")
+    result = chat_completion_local("gemini-3.1-pro", "描述图片", image_path=r"C:\\images\\a.jpg")
+"""
+
+import base64 as _local_base64
+import mimetypes as _local_mimetypes
+import os as _local_os
+import time as _local_time
+from html import escape as _local_xml_escape
+
+import requests as _local_requests
+import base64 as _local_base64
+import functools as _local_functools
+import inspect as _local_inspect
+import logging as _local_logging
+import mimetypes as _local_mimetypes
+import os as _local_os
+import time as _local_time
+import uuid as _local_uuid
+from contextvars import ContextVar as _LocalContextVar
+from html import escape as _local_xml_escape
+
+# ==================== 本地接口配置（独立于 Google API Key） ====================
+LOCAL_API_BASE_URL = _local_os.getenv(
+    "GEMINI_LOCAL_API_BASE_URL", "http://127.0.0.1:8045/v1/chat/completions"
+)
+LOCAL_API_KEY = get_config("local_gemini_api_key")
+LOCAL_MODELS = ("gemini-3.8-flash", "gemini-3.1-pro")
+
+
+# ==================== 本地日志（不配置应用的 root logger） ====================
+LOCAL_PROMPT_PREVIEW_LENGTH = 20
+LOCAL_RESPONSE_PREVIEW_LENGTH = 100
+LOCAL_LOGGER = _local_logging.getLogger("gemini.local_api")
+if not LOCAL_LOGGER.handlers:
+    _local_handler = _local_logging.StreamHandler()
+    _local_handler.setFormatter(_local_logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    LOCAL_LOGGER.addHandler(_local_handler)
+    LOCAL_LOGGER.setLevel(_local_logging.INFO)
+    LOCAL_LOGGER.propagate = False
+
+_LOCAL_LOG_CONTEXT = _LocalContextVar("gemini_local_log_context", default=None)
+
+
+def _local_log_preview(value, limit: int, secret=None) -> str:
+    text = "" if value is None else str(value)
+    if isinstance(secret, str) and secret:
+        text = text.replace(secret, "***")
+    text = " ".join(text.split())
+    if limit <= 0:
+        return "已关闭预览"
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _local_log_event(level: str, event: str, model, detail: str):
+    context = _LOCAL_LOG_CONTEXT.get()
+    request_id = context["request_id"] if context else "-"
+    getattr(LOCAL_LOGGER, level)(
+        f"[{event}] 请求ID: [{request_id}] | 模型: [{model}] | {detail}"
+    )
+
+
+def _local_log_scope(function):
+    """每个最外层入口分配 ID；嵌套入口、重试、回退复用同一上下文。"""
+    @_local_functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        if _LOCAL_LOG_CONTEXT.get() is not None:
+            return function(*args, **kwargs)
+        token = _LOCAL_LOG_CONTEXT.set({
+            "request_id": _local_uuid.uuid4().hex[:12],
+            "started_at": _local_time.perf_counter(),
+            "attempt": 0,
+        })
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _LOCAL_LOG_CONTEXT.reset(token)
+    return wrapper
+
+
+def _local_log_request(function):
+    """记录每次本地请求；保留原参数、返回字典和异常传播方式。"""
+    signature = _local_inspect.signature(function)
+
+    @_local_log_scope
+    @_local_functools.wraps(function)
+    def wrapper(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        model, prompt = arguments["model"], arguments["prompt"]
+        api_key = arguments["api_key"]
+        api_key = LOCAL_API_KEY if api_key is None else api_key
+        context = _LOCAL_LOG_CONTEXT.get()
+        context["attempt"] += 1
+        attempt = context["attempt"]
+        started_at = _local_time.perf_counter()
+        attachments = "尚未解析"
+        try:
+            # 将迭代器只展开一次，日志与实际请求使用同一份路径。
+            if arguments["image_paths"] is not None:
+                arguments["image_paths"] = _local_normalize_paths(arguments["image_paths"])
+            paths = arguments["image_paths"]
+            if arguments["image_path"] is not None:
+                paths = _local_normalize_paths(arguments["image_path"])
+            attachments = _local_log_preview(paths or "无", 500, api_key)
+            prompt_length = len(prompt) if isinstance(prompt, str) else "未知"
+            _local_log_event("info", "任务启动", model,
+                f"提交 Gemini 本地请求 | 第 [{attempt}] 次 | 附件: [{attachments}] | "
+                f"Prompt长度: [{prompt_length}] | "
+                f"Prompt预览: [{_local_log_preview(prompt, LOCAL_PROMPT_PREVIEW_LENGTH, api_key)}]")
+            result = function(*bound.args, **bound.kwargs)
+        except Exception as exc:
+            _local_log_event("error", "任务失败", model,
+                f"第 [{attempt}] 次 | 附件: [{attachments}] | "
+                f"耗时: [{_local_time.perf_counter() - started_at:.2f} 秒] | "
+                f"错误类型: [{type(exc).__name__}] | 错误: [{_local_log_preview(exc, 1000, api_key)}]")
+            raise
+
+        elapsed = _local_time.perf_counter() - started_at
+        total_elapsed = _local_time.perf_counter() - context["started_at"]
+        detail = (f"第 [{attempt}] 次 | 附件: [{attachments}] | "
+                  f"HTTP: [{result.get('status_code') or '未收到响应'}] | "
+                  f"耗时: [{elapsed:.2f} 秒] | 累计耗时: [{total_elapsed:.2f} 秒]")
+        if result["success"]:
+            text = result["content"]
+            detail += (f" | 响应长度: [{len(text)}] | "
+                       f"响应预览: [{_local_log_preview(text, LOCAL_RESPONSE_PREVIEW_LENGTH, api_key)}]")
+            raw = result.get("raw")
+            usage = raw.get("usage") if isinstance(raw, dict) else None
+            if isinstance(usage, dict) and usage:
+                detail += (f" | Token: [输入={usage.get('prompt_tokens', '-')} / "
+                           f"输出={usage.get('completion_tokens', '-')} / 合计={usage.get('total_tokens', '-')}]")
+            _local_log_event("info", "任务完成", model, detail)
+        else:
+            _local_log_event("error", "任务失败", model,
+                f"{detail} | 错误: [{_local_log_preview(result.get('error'), 1000, api_key)}]")
+        return result
+    return wrapper
+
+
+def _local_call_google_with_logs(function, *, prompt, model_name, **kwargs):
+    """仅补充原 Google 入口的调用日志，不推断其字符串返回值是否为成功。"""
+    started_at = _local_time.perf_counter()
+    attachments = _local_log_preview(kwargs.get("image_paths") or "无", 500)
+    try:
+        result = function(prompt=prompt, model_name=model_name, **kwargs)
+    except Exception as exc:
+        _local_log_event("error", "回退失败", model_name,
+            f"附件: [{attachments}] | 耗时: [{_local_time.perf_counter() - started_at:.2f} 秒] | "
+            f"错误类型: [{type(exc).__name__}] | 错误: [{_local_log_preview(exc, 1000, LOCAL_API_KEY)}]")
+        raise
+    context = _LOCAL_LOG_CONTEXT.get()
+    total_elapsed = _local_time.perf_counter() - (context["started_at"] if context else started_at)
+    _local_log_event("info", "回退返回", model_name,
+        f"原 Gemini 入口已返回 | 附件: [{attachments}] | "
+        f"耗时: [{_local_time.perf_counter() - started_at:.2f} 秒] | 累计耗时: [{total_elapsed:.2f} 秒] | "
+        f"返回类型: [{type(result).__name__}] | 响应长度: [{len(result) if isinstance(result, str) else '-'}] | "
+        f"响应预览: [{_local_log_preview(result, LOCAL_RESPONSE_PREVIEW_LENGTH, LOCAL_API_KEY)}]")
+    return result
+
+
+class LocalGeminiAPIError(RuntimeError):
+    """本地服务调用失败；result 中保留错误详情，不把错误字符串当作生成内容。"""
+
+    def __init__(self, result: dict):
+        self.result = result
+        super().__init__(result.get("error") or "本地 API 调用失败")
+
+
+def encode_image_to_base64_local(image_path: str) -> tuple[str, str]:
+    """读取图片原始字节，返回 MIME 与 Base64；文件错误直接抛出。"""
+    if not _local_os.path.isfile(image_path):
+        raise FileNotFoundError(f"未找到指定的图片文件: {image_path}")
+    mime_type, _ = _local_mimetypes.guess_type(image_path)
+    if not mime_type or not mime_type.startswith("image/"):
+        mime_type = "image/jpeg"
+    with open(image_path, "rb") as image_file:
+        image_bytes = image_file.read()
+    if not image_bytes:
+        raise ValueError(f"图片文件为空: {image_path}")
+    return mime_type, _local_base64.b64encode(image_bytes).decode("ascii")
+
+
+def _local_normalize_paths(image_paths) -> list[str]:
+    if image_paths is None:
+        return []
+    if isinstance(image_paths, (str, _local_os.PathLike)):
+        image_paths = [image_paths]
+    return [_local_os.fspath(path) for path in image_paths]
+
+
+def _local_failure(model, error, *, status_code=None, raw=None,
+                   retryable=False, blocked=False, retry_after=None) -> dict:
+    return {
+        "success": False, "content": "", "reasoning": None, "raw": raw,
+        "model": model, "error": error, "status_code": status_code,
+        "retryable": retryable, "blocked": blocked, "retry_after": retry_after,
+    }
+
+
+@_local_log_request
+def chat_completion_local(
+        model: str,
+        prompt: str,
+        image_path: str | None = None,
+        api_base_url: str | None = None,
+        api_key: str | None = None,
+        temperature: float = 0.7,
+        timeout: float | tuple[float, float] = 120,
+        *,
+        image_paths=None,
+) -> dict:
+    """
+    单次调用本地 OpenAI 兼容接口，不进行自动重试。
+
+    image_path 与 image_paths 二选一；省略两者时发送纯文本。
+    timeout 直接传给 requests：数字为连接/读取等待秒数，也可传 (连接, 读取)。
+    它不是整个请求的严格总时限。
+    网络、HTTP、响应格式错误返回 success=False；参数/文件错误直接抛出。
+    """
+    api_base_url = LOCAL_API_BASE_URL if api_base_url is None else api_base_url
+    api_key = LOCAL_API_KEY if api_key is None else api_key
+    if not isinstance(api_key, str) or not api_key.strip():
+        raise ValueError("请配置 LOCAL_API_KEY / GEMINI_LOCAL_API_KEY，或传入 api_key。")
+    if not isinstance(api_base_url, str) or not api_base_url.strip():
+        raise ValueError("api_base_url 不能为空。")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("model 不能为空。")
+    if not isinstance(prompt, str):
+        raise TypeError("prompt 必须是字符串。")
+    if image_path is not None and image_paths is not None:
+        raise ValueError("image_path 和 image_paths 不能同时提供。")
+
+    paths = _local_normalize_paths(image_path if image_path is not None else image_paths)
+    if paths:
+        content = [{"type": "text", "text": prompt}]
+        content.append({
+            "type": "text",
+            "text": "每个 image_data 块对应一张图片。请按编号与 file_name 对应分析，避免混淆。",
+        })
+        for index, path in enumerate(paths, 1):
+            mime_type, encoded = encode_image_to_base64_local(path)
+            filename = _local_xml_escape(_local_os.path.basename(path))
+            content.extend([
+                {"type": "text", "text": f'<image_data index="{index}"><file_name>{filename}</file_name>'},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+                {"type": "text", "text": "</image_data>"},
+            ])
+    else:
+        content = prompt
+
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": temperature,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+    # 每次调用独立 Session，既不共享可变会话，也不读写进程的代理环境变量。
+    # trust_env=False 防止原代码 @with_proxy 设置的代理影响本地请求。
+    try:
+        with _local_requests.Session() as session:
+            session.trust_env = False
+            response = session.post(
+                api_base_url, headers=headers, json=payload, timeout=timeout,
+                allow_redirects=False,
+            )
+    except _local_requests.exceptions.RequestException as exc:
+        detail = str(exc).replace(api_key, "***")
+        return _local_failure(
+            model, f"本地请求失败: {detail}",
+            retryable=isinstance(exc, (
+                _local_requests.exceptions.ConnectionError,
+                _local_requests.exceptions.Timeout,
+            )),
+        )
+
+    status_code = response.status_code
+    if not 200 <= status_code < 300:
+        detail = response.text.replace(api_key, "***")[:1000]
+        retry_after = None
+        try:
+            # 支持网关常用的 Retry-After 秒数格式。
+            retry_after = max(0.0, float(response.headers.get("Retry-After", "")))
+        except (TypeError, ValueError):
+            pass
+        return _local_failure(
+            model, f"本地接口 HTTP {status_code}: {detail}", status_code=status_code,
+            retryable=status_code in (408, 429, 500, 502, 503, 504),
+            retry_after=retry_after,
+        )
+
+    try:
+        result = response.json()
+    except ValueError:
+        return _local_failure(model, "本地接口返回了非 JSON 响应。", status_code=status_code)
+    if not isinstance(result, dict):
+        return _local_failure(model, "本地接口 JSON 顶层不是对象。", raw=result, status_code=status_code)
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return _local_failure(
+            model, "本地接口缺少有效的 choices[0]，请查看 raw。", raw=result, status_code=status_code
+        )
+    choice = choices[0]
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return _local_failure(model, "本地接口缺少有效的 message。", raw=result, status_code=status_code)
+    if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
+        return _local_failure(
+            model, "本地模型明确拒绝了请求。", raw=result, status_code=status_code, blocked=True
+        )
+
+    text = message.get("content")
+    if isinstance(text, list):
+        text = "".join(
+            part["text"] for part in text
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    if not isinstance(text, str) or not text.strip():
+        failure = _local_failure(
+            model, "本地接口未返回正文 content，请查看 reasoning / raw。",
+            raw=result, status_code=status_code,
+        )
+        failure["reasoning"] = message.get("reasoning_content")
+        return failure
+    return {
+        "success": True, "content": text,
+        "reasoning": message.get("reasoning_content"), "raw": result,
+        "model": model, "status_code": status_code, "error": None,
+        "retryable": False, "blocked": False, "retry_after": None,
+    }
+
+
+def _local_generate_text(prompt, image_paths, model_name, back_model,
+                         retry_delay=2.0, **request_options) -> str:
+    """临时错误时切换备用模型；去重后每个模型最多尝试一次。"""
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name 不能为空。")
+    if back_model is not None and (not isinstance(back_model, str) or not back_model.strip()):
+        raise ValueError("back_model 必须是非空字符串或 None。")
+    if retry_delay < 0:
+        raise ValueError("retry_delay 不能小于 0。")
+    models = [model_name]
+    if back_model is not None and back_model != model_name:
+        models.append(back_model)
+    paths = _local_normalize_paths(image_paths)
+    for index, model in enumerate(models):
+        result = chat_completion_local(
+            model=model, prompt=prompt, image_paths=paths, **request_options
+        )
+        if result["success"]:
+            return result["content"]
+        if result["blocked"] or not result["retryable"] or index == len(models) - 1:
+            raise LocalGeminiAPIError(result)
+        delay = max(retry_delay, result.get("retry_after") or 0.0)
+        _local_log_event("warning", "任务重试", model,
+            f"第 [{index + 1}/{len(models)}] 次失败 | "
+            f"下一模型: [{models[index + 1]}] | 等待: [{delay:g} 秒] | "
+            f"原因: [{_local_log_preview(result.get('error'), 1000)}]")
+        if delay:
+            _local_time.sleep(delay)
+    raise RuntimeError("未配置本地模型。")
+
+
+@_local_log_scope
+def get_llm_content_local(
+        prompt: str = "你好，请介绍一下你自己。",
+        model_name: str = LOCAL_MODELS[0],
+        back_model: str | None = LOCAL_MODELS[1],
+        **request_options,
+) -> str:
+    """本地文本入口；可传 timeout/api_key/api_base_url/temperature/retry_delay。"""
+    return _local_generate_text(prompt, None, model_name, back_model, **request_options)
+
+
+@_local_log_scope
+def analyze_images_local(
+        prompt: str = "每张图片的内容是什么？",
+        image_paths=None,
+        model_name: str = LOCAL_MODELS[0],
+        back_model: str | None = LOCAL_MODELS[1],
+        **request_options,
+) -> str:
+    """本地图片入口；支持单个路径或路径列表，调用时必须提供图片。"""
+    paths = _local_normalize_paths(image_paths)
+    if not paths:
+        raise ValueError("请通过 image_paths 提供至少一张图片。")
+    return _local_generate_text(prompt, paths, model_name, back_model, **request_options)
+
+
+@_local_log_scope
+def get_llm_content_auto(
+        prompt: str = "你好，请介绍一下你自己。",
+        model_name: str = LOCAL_MODELS[0],
+        back_model: str | None = LOCAL_MODELS[1],
+        *,
+        google_model_name: str = "gemini-flash-latest",
+        google_back_model: str = "gemini-flash-lite-latest",
+        **request_options,
+) -> str | None:
+    """先调用本地服务；失败时调用原有 get_llm_content，返回值沿用原函数。"""
+    try:
+        return get_llm_content_local(prompt, model_name, back_model, **request_options)
+    except LocalGeminiAPIError as exc:
+        if exc.result.get("blocked"):
+            raise
+        google_function = globals().get("get_llm_content")
+        if not callable(google_function):
+            raise RuntimeError("找不到原 get_llm_content，请将新增代码放入原模块。") from exc
+        _local_log_event("warning", "任务回退", google_model_name,
+            f"本地调用失败，切换原 Gemini 文本入口 | 原因: [{_local_log_preview(exc, 1000)}]")
+        return _local_call_google_with_logs(
+            google_function, prompt=prompt, model_name=google_model_name, back_model=google_back_model
+        )
+
+
+@_local_log_scope
+def analyze_images_auto(
+        prompt: str = "每张图片的内容是什么？",
+        image_paths=None,
+        model_name: str = LOCAL_MODELS[0],
+        back_model: str | None = LOCAL_MODELS[1],
+        *,
+        google_model_name: str = "gemini-3-flash-preview",
+        **request_options,
+) -> str:
+    """先调用本地服务；失败时调用原有 analyze_images_gemini。"""
+    paths = _local_normalize_paths(image_paths)
+    try:
+        return analyze_images_local(prompt, paths, model_name, back_model, **request_options)
+    except LocalGeminiAPIError as exc:
+        if exc.result.get("blocked"):
+            raise
+        google_function = globals().get("analyze_images_gemini")
+        if not callable(google_function):
+            raise RuntimeError("找不到原 analyze_images_gemini，请将新增代码放入原模块。") from exc
+        _local_log_event("warning", "任务回退", google_model_name,
+            f"本地调用失败，切换原 Gemini 图片入口 | 原因: [{_local_log_preview(exc, 1000)}]")
+        return _local_call_google_with_logs(
+            google_function, prompt=prompt, image_paths=paths, model_name=google_model_name
+        )
+
 
 if __name__ == "__main__":
-    valid_all_api_keys()
+    # valid_all_api_keys()
     #
     # print("\n" + "=" * 20 + " 开始测试 " + "=" * 20)
     # print("[TEST] 正在测试 get_llm_content (这将触发第一次动态排序)")
@@ -656,3 +1131,49 @@ if __name__ == "__main__":
     # else:
     #     print(f"\n[FAIL] 内容生成失败{result}")
     # print(f"[INFO] 执行时间: {time.time() - start_time:.2f} 秒")
+
+    # 1. 本地纯文本调用
+    text = get_llm_content_local(
+        prompt="你好，请介绍一下你自己。",
+        model_name="gemini-3.8-flash",
+    )
+    print(text)
+
+    # 2. 本地图片分析，支持多张图片
+    text = analyze_images_local(
+        prompt="请分别描述这些图片，并标明对应的文件名。",
+        image_paths=[
+            r"C:\Users\zxh\Desktop\temp\test.jpg",
+        ],
+        model_name="gemini-3.1-pro",
+        back_model=None,  # 只使用指定模型
+    )
+    print(text)
+
+    # 3. 优先本地调用，失败后回退到你原有的 Gemini 文本函数
+    text = get_llm_content_auto(
+        prompt="请介绍一下 Python 的多线程。",
+    )
+    print(text)
+
+    # 4. 优先本地图片分析，失败后回退到原 analyze_images_gemini
+    text = analyze_images_auto(
+        prompt="描述图片内容。",
+        image_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg"],
+    )
+    print(text)
+
+    # 5. 需要获取完整返回信息时，使用底层入口
+    result = chat_completion_local(
+        model="gemini-3.1-pro",
+        prompt="描述图片内容。",
+        image_path=r"C:\Users\zxh\Desktop\temp\test.jpg",
+        timeout=120,
+    )
+
+    if result["success"]:
+        print(result["content"])
+        # result["reasoning"]：接口返回的 reasoning_content
+        # result["raw"]：原始 JSON 响应
+    else:
+        print(result["error"])
