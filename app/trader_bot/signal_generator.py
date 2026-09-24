@@ -2413,10 +2413,10 @@ def get_signal_factor_024_3(symbol):
 if __name__ == '__main__':
     pair_df = gen_pair_signal()
 
-    target_time = (
-            datetime.now() - timedelta(minutes=1)
-    ).strftime('%Y-%m-%d %H:%M')
-
-    symbol_list = ['SOL/USDT:USDT']
-    signal = get_signal_factor_024_3(symbol_list[0])
-    print()
+    # target_time = (
+    #         datetime.now() - timedelta(minutes=1)
+    # ).strftime('%Y-%m-%d %H:%M')
+    #
+    # symbol_list = ['SOL/USDT:USDT']
+    # signal = get_signal_factor_024_3(symbol_list[0])
+    # print()
