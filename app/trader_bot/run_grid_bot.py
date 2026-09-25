@@ -103,13 +103,8 @@ class GridConfig:
                  direction=GridDirection.LONG, account_name="myself"):
         self.account_name = account_name
         self.strategy_id = f"{account_name}_{strategy_id}"
-        # : 为兼容既有账本/OID保留 12 字符截断；不同长 ID 可能碰撞，main_app 仅能拦截本次配置集内的冲突。
-        if len(self.strategy_id) > 12:
-            shortened = self.strategy_id[:12]
-            logger.warning(
-                f"[配置/策略ID] 按兼容规则截断 | 原值:[{self.strategy_id}] | 截断值:[{shortened}] | 风险:[命名碰撞]"
-            )
-            self.strategy_id = shortened
+        # 完整策略ID（含账号与下划线）最多18字符；不截断，避免账本/OID命名碰撞。
+        OidCodec.validate_strategy_id(self.strategy_id)
         self.symbol, self.min_price, self.max_price = symbol, min_price, max_price
         self.price_ratio, self.quantity = price_ratio, quantity
         self.direction = GridDirection(direction)
@@ -217,30 +212,109 @@ class StatisticsThread(threading.Thread):
 
 
 class OidCodec:
-    """编解码 GD_{strategy}_{node}_{action}_{cycle}_{ms后缀}；strategy_id 可含下划线。"""
-    PREFIX = "GD"
+    """编解码 {strategy}_{node36:2}{action}{cycle36:3}{ms36:6}。
+
+    仅OID压缩节点号；内部/账本仍使用N000形式，轮次仍是整数。
+    strategy_id可含下划线，从最右侧分隔；完整OID最多31个ASCII字符。
+    """
+    DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+    STRATEGY_CHARS = frozenset(DIGITS + "ABCDEFGHIJKLMNOPQRSTUVWXYZ_-")
+    MAX_LENGTH = 31
+    NODE_WIDTH = 2
+    CYCLE_WIDTH = 3
+    STAMP_WIDTH = 6
+    TAIL_WIDTH = NODE_WIDTH + 1 + CYCLE_WIDTH + STAMP_WIDTH
+    MAX_STRATEGY_LENGTH = MAX_LENGTH - 1 - TAIL_WIDTH
+    MAX_NODE_INDEX = 36 ** NODE_WIDTH - 1
+    MAX_CYCLE = 36 ** CYCLE_WIDTH - 1
+    STAMP_MODULUS = 36 ** STAMP_WIDTH
+    _last_ms = -1
+    _stamp_lock = threading.Lock()
+
+    @classmethod
+    def validate_strategy_id(cls, strategy_id):
+        if not isinstance(strategy_id, str) or not 1 <= len(strategy_id) <= cls.MAX_STRATEGY_LENGTH:
+            raise ValueError(f"完整策略ID须为1~{cls.MAX_STRATEGY_LENGTH}字符（含账号与下划线）: {strategy_id!r}")
+        if any(char not in cls.STRATEGY_CHARS for char in strategy_id):
+            raise ValueError(f"策略ID仅允许ASCII字母、数字、下划线和连字符: {strategy_id!r}")
+
+    @classmethod
+    def _encode_fixed(cls, value, width, field):
+        if type(value) is not int or not 0 <= value < 36 ** width:
+            raise ValueError(f"OID字段[{field}]须为0~{36 ** width - 1}的整数: {value!r}")
+        chars = []
+        while value:
+            value, digit = divmod(value, 36)
+            chars.append(cls.DIGITS[digit])
+        return "".join(reversed(chars)).rjust(width, '0')
+
+    @classmethod
+    def encode_node(cls, node_id):
+        if (not isinstance(node_id, str) or not node_id.startswith('N')
+                or not node_id[1:].isascii() or not node_id[1:].isdigit()):
+            raise ValueError(f"非法内部节点ID: {node_id!r}")
+        index = int(node_id[1:])
+        if node_id != f"N{index:03d}":
+            raise ValueError(f"内部节点ID格式须为N000形式: {node_id!r}")
+        return cls._encode_fixed(index, cls.NODE_WIDTH, "node")
 
     @classmethod
     def build(cls, strategy_id, node_id, action, cycle):
-        # : 保留原 8 位毫秒后缀以兼容历史 OID；同节点同轮次在同一毫秒重复生成理论上仍可能碰撞。
-        return f"{cls.PREFIX}_{strategy_id}_{node_id}_{action.value}_{cycle}_{str(int(time.time() * 1000))[-8:]}"
+        cls.validate_strategy_id(strategy_id)
+        node = cls.encode_node(node_id)
+        if not isinstance(action, OrderAction):
+            raise ValueError(f"非法OID动作: {action!r}")
+        cycle_text = cls._encode_fixed(cycle, cls.CYCLE_WIDTH, "cycle")
+        # 6位覆盖约25.19天；进程内递增，避免同毫秒补挂或时钟回拨复用后缀。
+        with cls._stamp_lock:
+            cls._last_ms = max(time.time_ns() // 1_000_000, cls._last_ms + 1)
+            stamp = cls._encode_fixed(cls._last_ms % cls.STAMP_MODULUS, cls.STAMP_WIDTH, "ms")
+        oid = f"{strategy_id}_{node}{action.value}{cycle_text}{stamp}"
+        if len(oid) > cls.MAX_LENGTH:
+            raise ValueError(f"OID超出{cls.MAX_LENGTH}字符，禁止下单: {oid}")
+        return oid
 
     @classmethod
     def parse(cls, oid):
-        if not isinstance(oid, str):
+        if not isinstance(oid, str) or len(oid) > cls.MAX_LENGTH:
             return None
-        parts = oid.split('_')
-        if len(parts) < 6 or parts[0] != cls.PREFIX:
+        strategy_id, separator, tail = oid.rpartition('_')
+        if not separator or len(tail) != cls.TAIL_WIDTH:
+            return None
+        action_pos, cycle_start = cls.NODE_WIDTH, cls.NODE_WIDTH + 1
+        cycle_end = cycle_start + cls.CYCLE_WIDTH
+        numeric = tail[:action_pos] + tail[cycle_start:]
+        if any(char not in cls.DIGITS for char in numeric):
             return None
         try:
-            parsed = ParsedOid("_".join(parts[1:-4]), parts[-4], OrderAction(parts[-3]), int(parts[-2]))
+            cls.validate_strategy_id(strategy_id)
+            parsed = ParsedOid(
+                strategy_id, f"N{int(tail[:action_pos], 36):03d}",
+                OrderAction(tail[action_pos]), int(tail[cycle_start:cycle_end], 36),
+            )
         except (TypeError, ValueError):
             return None
-        return parsed if parsed.strategy_id and parsed.node_id else None
+        return parsed
+
+    @classmethod
+    def timestamp_hint(cls, oid, reference_ms):
+        """无交易所时间时，将6位后缀展开为距参考时间最近的毫秒值。
+
+        后缀不含纪元，只能在半个回绕周期内辅助排序，不能证明全局时间顺序。
+        """
+        stamp = int(oid[-cls.STAMP_WIDTH:], 36)
+        half = cls.STAMP_MODULUS // 2
+        return reference_ms + (stamp - reference_ms + half) % cls.STAMP_MODULUS - half
+
+    @classmethod
+    def belongs_to(cls, oid, strategy_id):
+        parsed = cls.parse(oid)
+        return parsed is not None and parsed.strategy_id == strategy_id
 
     @classmethod
     def prefix_for(cls, strategy_id):
-        return f"{cls.PREFIX}_{strategy_id}_"
+        cls.validate_strategy_id(strategy_id)
+        return f"{strategy_id}_"
 
 
 class GridLedger:
@@ -428,7 +502,14 @@ class GridNode:
         self._place_limit_order(action, price)
 
     def _new_oid(self, action):
-        return OidCodec.build(self.ctx.strategy_id, self.node_id, action, self.cycle_count)
+        try:
+            return OidCodec.build(self.ctx.strategy_id, self.node_id, action, self.cycle_count)
+        except ValueError as exc:
+            # 容量耗尽时停止该节点，清空旧指针，避免重复处理旧成交或用旧OID补挂。
+            self.state = NodeState.ERROR
+            self.active_client_oid = self.active_exchange_oid = ""
+            logger.critical(f"[节点/OID失败] 节点:【{self.node_id}】 | 轮次:[{self.cycle_count}] | 处理:[停止该节点，请人工处理] | 错误:[{exc}]")
+            raise
 
     def _place_limit_order(self, action, price):
         """WAL INTENT -> 交易所挂单 -> 结果落账；底层异常记录后继续向上抛。"""
@@ -497,6 +578,7 @@ def build_geometric_grid(config, broker, ctx):
         if low < config.min_price:
             break
         node_id = f"N{index:03d}"
+        OidCodec.encode_node(node_id)  # 铺单前检查容量，禁止截断/回绕节点号。
         open_price, close_price = (low, high) if is_long else (high, low)
         nodes[node_id] = GridNode(node_id, open_price, close_price, quantity, ctx)
         current_high, index = low, index + 1
@@ -546,11 +628,16 @@ class ReconciliationEngine:
             if parsed and parsed.strategy_id == self.strategy_id and parsed.node_id in nodes:
                 live[parsed.node_id].append((parsed.cycle, cid))
 
+        reference_ms = time.time_ns() // 1_000_000
         for node_id, orders in live.items():
             node = nodes[node_id]
             if node.state != NodeState.INIT:
                 continue
-            orders.sort(key=lambda item: (item[0], item[1].split('_')[-1]), reverse=True)
+            # 优先交易所完整时间；缺失时仅用展开后的毫秒后缀辅助排序。
+            orders.sort(key=lambda item: (
+                item[0], order_map[item[1]].ts or OidCodec.timestamp_hint(item[1], reference_ms),
+                OidCodec.timestamp_hint(item[1], reference_ms),
+            ), reverse=True)
             cid = orders[0][1]
             aligned += bool(self._align_and_emit(node, cid, order_map[cid], "在线单反向认领"))
 
@@ -604,7 +691,9 @@ class ReconciliationEngine:
     def _snapshot(self):
         """返回 {client_oid: UniOrder}；失败返回 None。"""
         try:
-            return self.broker.fetch_open_orders_map(OidCodec.prefix_for(self.strategy_id))
+            order_map = self.broker.fetch_open_orders_map(OidCodec.prefix_for(self.strategy_id))
+            # strategy_id可含下划线，前缀查询后还须精确匹配，防止混入其他策略。
+            return {cid: order for cid, order in order_map.items() if OidCodec.belongs_to(cid, self.strategy_id)}
         except Exception as exc:
             logger.error(f"[对账/快照失败] 策略:[{self.strategy_id}] | 可能原因:[网络/限频] | 错误:[{exc}]")
             return None
@@ -847,7 +936,7 @@ def query_all_open_orders_stats(exchange, symbols=None):
 
 
 def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
-    """人工诊断：按 OidCodec 归类本策略重复单、其他网格孤儿单和非网格单。"""
+    """人工诊断：按新OID格式归类；移除专用前缀后，仅能按结构识别网格单。"""
     orders = fetch_open_orders(exchange, symbol)
     node_orders, orphans, others = defaultdict(list), [], []
     for order in orders:
@@ -855,7 +944,7 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
         parsed = OidCodec.parse(cid)
         if parsed and parsed.strategy_id == strategy_id:
             node_orders[parsed.node_id].append(order)
-        elif cid.startswith(f"{OidCodec.PREFIX}_"):
+        elif parsed:
             orphans.append(order)
         else:
             others.append(order)
@@ -891,7 +980,7 @@ def main_app():
     ids = [config.strategy_id for config in configs]
     duplicates = sorted({strategy_id for strategy_id in ids if ids.count(strategy_id) > 1})
     if duplicates:
-        raise ValueError(f"策略ID截断后冲突，禁止启动以避免账本/OID串线: {duplicates}")
+        raise ValueError(f"完整策略ID重复，禁止启动以避免账本/OID串线: {duplicates}")
 
     processes = []
     for config in configs:
