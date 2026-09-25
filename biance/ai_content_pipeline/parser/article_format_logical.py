@@ -646,7 +646,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             record["attempt_count"], record["raw_response"] = attempt, None
             error_detail = ""
             try:
-                if random.random() < 0.9:
+                if random.random() < 1.9:
                     raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
                 else:
                     error_detail, raw_response = generate_gemini_content_playwright(
