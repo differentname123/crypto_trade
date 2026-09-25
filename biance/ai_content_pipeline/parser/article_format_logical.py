@@ -92,9 +92,13 @@ def is_need_formatting(post):
     video_duration = media.get("video_duration")
     if video_duration and video_duration > 0:
         return False
-    local_paths = list((media.get("local_mapping") or {}).values())
-    # : 原逻辑只检查路径非空，不检查文件存在，也不核对正文 URL 是否全部映射。
-    if any(not path for path in local_paths):
+    local_mapping = media.get("local_mapping") or {}
+    local_paths = list(local_mapping.values())
+    # 检查已映射路径非空且本地文件真实存在，并核对正文中的所有媒体 URL 均已完成映射
+    if any(not path or not os.path.isfile(path) for path in local_paths):
+        return False
+    text = (post.get("content") or {}).get("text_content") or ""
+    if any(not local_mapping.get(match.group(2)) for match in MEDIA_PATTERN.finditer(text)):
         return False
     # : 保留 >= 10 即拒绝的规则，实际最多 9 个映射；纯文本仍允许进入。
     if len(local_paths) >= MAX_MEDIA_COUNT:

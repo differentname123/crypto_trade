@@ -1115,13 +1115,13 @@ def get_llm_content_local(
 
     mode_desc = f"多模态图片({len(normalized_paths)}张)" if normalized_paths else "纯文本"
     total_max_attempts = len(candidate_models) * max_retries_per_model
-    _local_log_event(
-        "info",
-        "调度初始化",
-        " -> ".join(candidate_models),
-        f"模式: [{mode_desc}] | 候选模型数: [{len(candidate_models)}] | "
-        f"单模型最大尝试: [{max_retries_per_model}] | 总最大尝试上限: [{total_max_attempts}]",
-    )
+    # _local_log_event(
+    #     "info",
+    #     "调度初始化",
+    #     " -> ".join(candidate_models),
+    #     f"模式: [{mode_desc}] | 候选模型数: [{len(candidate_models)}] | "
+    #     f"单模型最大尝试: [{max_retries_per_model}] | 总最大尝试上限: [{total_max_attempts}]",
+    # )
 
     # 4. 多模型 × 单模型多轮重试主循环
     last_result = None
