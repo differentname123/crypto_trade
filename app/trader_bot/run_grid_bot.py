@@ -26,11 +26,28 @@ from enum import Enum
 from common_utils import get_config, setup_logger
 logger = setup_logger(app_name="grid_trader")
 
-from binance_u_gateway import (
-    ErrKind, ExecStatus, cancel_all_orders_of_symbol, cancel_order_by_id, execute_order,
-    fetch_last_price, fetch_market_precision, fetch_open_orders, format_price_amount,
-    safe_init_exchange, supports_cancel_all, sync_exchange_time,
-)
+# ===== 交易所平台选择 (仅需修改此处即可切换平台) =====
+EXCHANGE_PLATFORM = "binance"   # 可选: "binance" | "okx" | "bybit"
+# ====================================================
+
+from exchange_factory import get_gateway
+_gw = get_gateway(EXCHANGE_PLATFORM)
+
+# 平台无关的枚举类型 (走平台路由, 所有 gateway 均导出相同定义)
+ErrKind = _gw.ErrKind
+ExecStatus = _gw.ExecStatus
+
+# 以下函数全部走平台路由
+cancel_all_orders_of_symbol = _gw.cancel_all_orders_of_symbol
+cancel_order_by_id = _gw.cancel_order_by_id
+execute_order = _gw.execute_order
+fetch_last_price = _gw.fetch_last_price
+fetch_market_precision = _gw.fetch_market_precision
+fetch_open_orders = _gw.fetch_open_orders
+format_price_amount = _gw.format_price_amount
+safe_init_exchange = _gw.safe_init_exchange
+supports_cancel_all = _gw.supports_cancel_all
+sync_exchange_time = _gw.sync_exchange_time
 
 DATA_DIR = "bot_data"
 LOG_DIR = "logs"
@@ -303,13 +320,11 @@ class ExchangeBroker:
 
     def fetch_open_orders_map(self, coid_prefix):
         """返回 {client_oid: UniOrder}；UniOrder 由既有网关定义。"""
-        from binance_u_gateway import fetch_open_orders_map
-        return fetch_open_orders_map(self.exchange, self.symbol, coid_prefix)
+        return _gw.fetch_open_orders_map(self.exchange, self.symbol, coid_prefix)
 
     def fetch_order(self, client_oid):
         """返回 (UniOrder, err)；(None, None) 表示交易所明确查无此单。"""
-        from binance_u_gateway import fetch_order_uni
-        return fetch_order_uni(self.exchange, self.symbol, client_oid)
+        return _gw.fetch_order_uni(self.exchange, self.symbol, client_oid)
 
     def place_limit(self, action, amount, price, client_oid, position_side):
         """按 Hedge Mode 语义挂限价单；reduce_only=False 为既有外部契约。"""
@@ -752,13 +767,11 @@ def run_single_strategy(config):
             time.sleep(PARENT_WATCH_INTERVAL_SEC)
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
-    # 外部配置键的 "biance" 拼写属于既有配置契约，不能擅自纠正。
-    api_key = get_config(f"{config.account_name}_biance_api_copy_key")
-    secret_key = get_config(f"{config.account_name}_biance_api_copy_secret")
+    # 凭证加载与交易所实例化统一走平台路由, 切换 EXCHANGE_PLATFORM 即自动匹配对应配置键
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"
     }
-    exchange = safe_init_exchange(api_key, secret_key, proxies)
+    exchange = _gw.open_session(proxies, config.account_name)
     broker, ledger = ExchangeBroker(exchange, config.symbol), GridLedger(config.strategy_id)
     strategy = GridStrategy(config, broker, ledger)
     strategy.recover()
@@ -869,17 +882,9 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
 
 def main_app():
     """主进程仅生成配置、启动策略子进程并守护。"""
-    suffix = "0912"
+    suffix = "0925"
     configs = [
-        GridConfig(f"AVAX{suffix}", "AVAX/USDT:USDT", 2.5, 8.56, 1.3, 12, account_name="myself"),
-        GridConfig(f"BTC{suffix}", "BTC/USDT:USDT", 50000, 82363, 0.74, 0.001, account_name="myself"),
-        GridConfig(f"S-UNI{suffix}", "UNI/USDT:USDT", 5, 15, 1.54, 3, GridDirection.SHORT, "myself"),
-        GridConfig(f"AVAX{suffix}", "AVAX/USDT:USDT", 2.5, 8.56, 1.3, 12, account_name="mama"),
-        GridConfig(f"BTC{suffix}", "BTC/USDT:USDT", 50000, 82363, 0.74, 0.001, account_name="mama"),
-        GridConfig(f"SHORT-UNI{suffix}", "UNI/USDT:USDT", 5, 15, 1.54, 3, GridDirection.SHORT, "mama"),
-        GridConfig(f"AVAX{suffix}", "AVAX/USDT:USDT", 2.5, 8.56, 1.3, 12, account_name="ruru"),
-        GridConfig(f"BTC{suffix}", "BTC/USDT:USDT", 50000, 82363, 0.74, 0.001, account_name="ruru"),
-        GridConfig(f"SHORT-UNI{suffix}", "UNI/USDT:USDT", 5, 15, 1.54, 3, GridDirection.SHORT, "ruru"),
+        GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "ruru"),
 
 
     ]

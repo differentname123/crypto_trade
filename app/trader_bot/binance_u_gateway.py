@@ -281,8 +281,8 @@ def safe_init_exchange(api_key, secret_key, proxies):
 
 
 def open_session(proxies=None, account="mama"):
-    api_key = get_config(f"{account}_biance_api_key")
-    secret_key = get_config(f"{account}_biance_api_secret")
+    api_key = get_config(f"{account}_biance_api_copy_key")
+    secret_key = get_config(f"{account}_biance_api_copy_secret")
     return safe_init_exchange(api_key, secret_key, proxies)
 
 

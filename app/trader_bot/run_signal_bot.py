@@ -23,13 +23,40 @@ from signal_generator import (
     execute_trading_bot_workflow_ma_bottom_long, execute_trading_bot_workflow_short_fr,
     execute_trading_bot_workflow_top_long, execute_trading_bot_workflow_vol_fr_long,
 )
-from binance_u_gateway import (
-    OS_CANCELED, OS_FILLED, OS_OPEN, OS_REJECTED, amount_to_precision, build_client_oid,
-    cancel_order_by_id, execute_order, extract_order_view, fetch_open_orders_grouped,
-    fetch_order_by_id, fetch_positions_map, fetch_recent_orders_map, fetch_total_equity,
-    fetch_usdt_swap_changes, is_cancel_target_gone, make_open_order_stub, make_position_key,
-    safe_init_exchange, order_client_oid, order_exchange_oid, position_key_symbol, sync_exchange_time,
-)
+
+# ===== 交易所平台选择 (仅需修改此处即可切换平台) =====
+EXCHANGE_PLATFORM = "binance"   # 可选: "binance" | "okx" | "bybit"
+# ====================================================
+
+from exchange_factory import get_gateway
+_gw = get_gateway(EXCHANGE_PLATFORM)
+
+# 平台无关的常量 (走平台路由, 所有 gateway 均导出相同定义)
+OS_CANCELED = _gw.OS_CANCELED
+OS_FILLED = _gw.OS_FILLED
+OS_OPEN = _gw.OS_OPEN
+OS_REJECTED = _gw.OS_REJECTED
+
+# 以下函数全部走平台路由
+amount_to_precision = _gw.amount_to_precision
+build_client_oid = _gw.build_client_oid
+cancel_order_by_id = _gw.cancel_order_by_id
+execute_order = _gw.execute_order
+extract_order_view = _gw.extract_order_view
+fetch_open_orders_grouped = _gw.fetch_open_orders_grouped
+fetch_order_by_id = _gw.fetch_order_by_id
+fetch_positions_map = _gw.fetch_positions_map
+fetch_recent_orders_map = _gw.fetch_recent_orders_map
+fetch_total_equity = _gw.fetch_total_equity
+fetch_usdt_swap_changes = _gw.fetch_usdt_swap_changes
+is_cancel_target_gone = _gw.is_cancel_target_gone
+make_open_order_stub = _gw.make_open_order_stub
+make_position_key = _gw.make_position_key
+safe_init_exchange = _gw.safe_init_exchange
+order_client_oid = _gw.order_client_oid
+order_exchange_oid = _gw.order_exchange_oid
+position_key_symbol = _gw.position_key_symbol
+sync_exchange_time = _gw.sync_exchange_time
 
 # =============================================================================
 # L0. 常量定义与配置
@@ -264,7 +291,7 @@ def _cache_order(open_order_cache, symbol, exchange_oid, client_oid):
 class TradingWorker:
     """原子化交易单元，挂载其独立的 账户/网关/账本/状态。"""
 
-    def __init__(self, account_alias, strategy_name, api_key, api_secret):
+    def __init__(self, account_alias, strategy_name):
         self.account_alias = account_alias
         self.strategy_name = strategy_name
 
@@ -291,8 +318,8 @@ class TradingWorker:
             self.proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
             self.proxy_url = "http://127.0.0.1:7890"
 
-        # 打开独立的交易所会话，直接使用传入的 api凭证
-        self.exchange = safe_init_exchange(api_key, api_secret, self.proxies)
+        # 凭证加载与交易所实例化走平台路由, 切换 EXCHANGE_PLATFORM 即自动匹配
+        self.exchange = _gw.open_session(self.proxies, self.account_alias)
 
     def log(self, level, scope, message, **fields):
         """实例级日志门面，强制注入账户和策略上下文。"""
@@ -843,36 +870,13 @@ class TradingWorker:
 # =============================================================================
 
 # 请在此处配置你所需的账户与策略绑定关系，系统会自动并行调度
+# 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
 WORKER_CONFIGS = [
-    {
-        "account": "mama",
-        "strategy": "cross",
-        "api_key": get_config("mama_biance_api_copy_key"),
-        "api_secret": get_config("mama_biance_api_copy_secret")
-    },
-    {
-        "account": "myself",
-        "strategy": "cross",
-        "api_key": get_config("myself_biance_api_copy_key"),
-        "api_secret": get_config("myself_biance_api_copy_secret")
-    },
-    {
-        "account": "nana",
-        "strategy": "cross",
-        "api_key": get_config("nana_biance_api_copy_key"),
-        "api_secret": get_config("nana_biance_api_copy_secret")
-    },
-    {
-        "account": "qiqi",
-        "strategy": "cross",
-        "api_key": get_config("qiqi_biance_api_copy_key"),
-        "api_secret": get_config("qiqi_biance_api_copy_secret")
-    }, {
-        "account": "ruru",
-        "strategy": "cross",
-        "api_key": get_config("ruru_biance_api_copy_key"),
-        "api_secret": get_config("ruru_biance_api_copy_secret")
-    },
+    {"account": "mama",   "strategy": "cross"},
+    {"account": "myself", "strategy": "cross"},
+    {"account": "nana",   "strategy": "cross"},
+    {"account": "qiqi",   "strategy": "cross"},
+    {"account": "ruru",   "strategy": "cross"},
 ]
 
 
@@ -883,9 +887,7 @@ def _run_worker_process(cfg):
     """
     worker = TradingWorker(
         account_alias=cfg["account"],
-        strategy_name=cfg["strategy"],
-        api_key=cfg["api_key"],
-        api_secret=cfg["api_secret"]
+        strategy_name=cfg["strategy"]
     )
     worker.run()
 
