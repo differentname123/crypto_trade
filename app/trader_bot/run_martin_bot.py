@@ -1346,6 +1346,7 @@ class MartinCycle:
     def _probe(self, t, w):
         """单据点查裁决。只有拿到【确切回执】才允许拨到终态。"""
         o = self.ctx.gw.fetch_order(t.coid)
+
         if o is ORDER_NOT_FOUND:
             if t.role is OrderRole.SL and t.layer == 0 and not w.algo_ok:
                 logger.info(f"[对账] 条件单通道本轮降级, 暂不采信'订单不存在'回执, 保持原状 | "
@@ -1355,12 +1356,22 @@ class MartinCycle:
             logger.info(f"[对账] 交易所明确回执订单不存在 -> 置[{t.state.value}] | "
                         f"单据:[{t}] CID:[{t.coid}]")
             return
+
         if not isinstance(o, UniOrder):
             t.probes += 1
             if t.probes % PROBE_ALERT_EVERY == 0:
                 logger.critical(f"[对账] 单据连续[{t.probes}]次点查结果未知, 原地锁定不换号重发"
                                 f"(防重复下单), 请检查网络/接口状态 | 单据:[{t}] CID:[{t.coid}]")
             return
+
+        # 【新增修复】：拦截 ex_api 在接口降级时伪造的零成交终态（如 FAKE_CANCELED）
+        # 绝不在算法单通道不可靠时，误将存活的保护单判死
+        if o.is_terminal and float(o.filled or 0.0) <= 0:
+            if t.role is OrderRole.SL and t.layer == 0 and not w.algo_ok:
+                logger.info(f"[对账] 条件单通道本轮降级, 暂不采信伪造的零成交终态回执, 保持原状 | "
+                            f"状态:[{o.status}] CID:[{t.coid}]")
+                return
+
         self._absorb(t, o, w.ts)
         if o.status == "FILLED":
             t.state = OrderState.FILLED
@@ -1374,7 +1385,7 @@ class MartinCycle:
             else:
                 t.state = OrderState.NOT_PLACED
         else:
-            t.state = OrderState.LIVE      # 仍在盘口(快照滞后 / 条件单未触发)
+            t.state = OrderState.LIVE  # 仍在盘口(快照滞后 / 条件单未触发)
 
     def _handle_foreign(self, coid, o):
         """盘口出现"带本策略前缀但不在登记表"的单: 旧周期残留 / 手工单 / 极端丢档。"""
