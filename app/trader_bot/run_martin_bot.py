@@ -72,11 +72,20 @@ if multiprocessing.current_process().name == "MainProcess":
 else:
     logger = logging.getLogger("martin_trader")
 
-# 交易所耦合只允许出现在 ex_api 适配层；更换平台时替换该模块即可。
-import binance_u_gateway as ex_api
-from binance_u_gateway import (
-    ErrKind, ORDER_NOT_FOUND, UniOrder, make_fail_result, safe_init_exchange,
-)
+# ===== 交易所平台选择 (仅需修改此处即可切换平台) =====
+EXCHANGE_PLATFORM = "binance"   # 可选: "binance" | "okx" | "bybit"
+# ====================================================
+
+# 交易所耦合只允许出现在 ex_api 适配层；通过工厂按 EXCHANGE_PLATFORM 自动路由。
+from exchange_factory import get_gateway
+ex_api = get_gateway(EXCHANGE_PLATFORM)
+
+# 平台无关的类型/枚举/工具函数 (走平台路由, 所有 gateway 均导出相同定义)
+ErrKind = ex_api.ErrKind
+ORDER_NOT_FOUND = ex_api.ORDER_NOT_FOUND
+UniOrder = ex_api.UniOrder
+make_fail_result = ex_api.make_fail_result
+safe_init_exchange = ex_api.safe_init_exchange
 
 from signal_generator import (
     get_signal_factor_043_9,
@@ -701,7 +710,7 @@ class MartinConfig:
     """
 
     def __init__(self, strategy_id, symbol, signal_name,
-                 api_key="", secret_key="",
+                 account_name="",
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_mult=5.0,
                  layer_loss_budget_ratio=0.80,
@@ -714,8 +723,7 @@ class MartinConfig:
         self.strategy_id = str(strategy_id)
         self.symbol = symbol
         self.signal_name = signal_name
-        self.api_key = api_key
-        self.secret_key = secret_key
+        self.account_name = account_name
         self.first_qty = float(first_qty)
         self.first_notional = float(first_notional)
         self.step_pct = float(step_pct)
@@ -2529,9 +2537,9 @@ class DashboardThread(threading.Thread):
                 logger.info(f"[看板] 聚合异常(绝不影响交易主流程) | 错误:[{e}]")
 
     def _get_account_snapshot(self):
-        """只读采样 U 本位账户；同一 API Key 的进程共享短时文件缓存。"""
-        api_key = self.eng.cfg.api_key or ""
-        key_hash = hashlib.md5(api_key.encode('utf-8')).hexdigest() if api_key else "default"
+        """只读采样 U 本位账户；同一账户的进程共享短时文件缓存。"""
+        account_name = self.eng.cfg.account_name or "default"
+        key_hash = hashlib.md5(account_name.encode('utf-8')).hexdigest()
         cache_file = data_path(f"dash_cache_{key_hash}.json")
         now = time.time()
 
@@ -2834,17 +2842,13 @@ def run_single_strategy(cfg, shared_prices=None):
 
     threading.Thread(target=_parent_watchdog, daemon=True).start()
 
-    api_key, secret_key = cfg.api_key, cfg.secret_key
-    if not api_key or not secret_key:
-        logger.critical(f"[进程/配置] API 密钥为空，拒绝启动 | 策略:[{cfg.strategy_id}]")
-        return
-
+    # 凭证加载与交易所实例化统一走平台路由, 切换 EXCHANGE_PLATFORM 即自动匹配对应配置键
     proxies = None if platform.system().lower() == "linux" else {
         "http": "http://127.0.0.1:7890",
         "https": "http://127.0.0.1:7890",
     }
 
-    exchange = safe_init_exchange(api_key, secret_key, proxies)
+    exchange = ex_api.open_session(proxies, cfg.account_name)
     gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
 
@@ -2868,11 +2872,12 @@ def run_single_strategy(cfg, shared_prices=None):
 
 def main_app():
     """加载多组账户凭据，并根据账户灵活分配策略进程。"""
+    # 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
     accounts = [
-        # ("myself", get_config("myself_biance_api_copy_key"), get_config("myself_biance_api_copy_secret")),
-        ("ruru", get_config("ruru_biance_api_copy_key"), get_config("ruru_biance_api_copy_secret")),
-        # ("qiqi", get_config("qiqi_biance_api_copy_key"), get_config("qiqi_biance_api_copy_secret")),
-        # ("mama", get_config("mama_biance_api_copy_key"), get_config("mama_biance_api_copy_secret")),
+        # "myself",
+        "ruru",
+        # "qiqi",
+        # "mama",
     ]
 
     # 1. 公共策略模板（所有账号都会运行的基础策略）
@@ -2903,16 +2908,15 @@ def main_app():
     ]
 
     configs = []
-    for suffix, api_key, secret_key in accounts:
+    for account_name in accounts:
         # 复制一份公共策略作为基础
         current_templates = list(strategy_templates)
         for template in current_templates:
             params = dict(template)
             base_id = params.pop("base_id")
             configs.append(MartinConfig(
-                strategy_id=f"{base_id}{suffix}",
-                api_key=api_key,
-                secret_key=secret_key,
+                strategy_id=f"{base_id}{account_name}",
+                account_name=account_name,
                 **params,
             ))
 
