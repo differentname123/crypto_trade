@@ -58,7 +58,7 @@ SHELF_LIFE_SECONDS = {
 
 # : 数据库封装未提供关闭协议，保留原初始化方式；
 # 连接释放需在 gen_db_object/Manager 的既有实现中确认，不能猜测其 close/client 接口。
-
+MODEL_NAME_PRO = "gemini-pro-latest"
 
 def _publish_time_seconds(value):
     """统一秒/毫秒时间戳；无效或非有限数值显式报错，避免进入时间比较。"""
@@ -196,9 +196,13 @@ def gen_media_format_info(post):
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         raw_response, error_detail = "", ""
         try:
-            error_detail, raw_response = generate_gemini_content_playwright(
-                full_prompt, file_path=paths
-            )
+            if random.random() < 1.9:
+                raw_response = get_llm_content_local(prompt=full_prompt, image_paths=paths, model_name=MODEL_NAME_PRO)
+            else:
+                error_detail, raw_response = generate_gemini_content_playwright(
+                    full_prompt, file_path=paths
+                )
+
             # : 保留此阶段只按响应正文判断成功的行为；error_detail 非空是否必须失败待确认。
             format_info = string_to_object(raw_response)
             valid, error = check_format_info(format_info, list(mapping))
@@ -647,7 +651,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             error_detail = ""
             try:
                 if random.random() < 1.9:
-                    raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
+                    raw_response = get_llm_content_local(prompt=full_prompt, model_name=MODEL_NAME_PRO)
                 else:
                     error_detail, raw_response = generate_gemini_content_playwright(
                         full_prompt, model_name=model_name

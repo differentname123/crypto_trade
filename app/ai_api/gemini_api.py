@@ -700,7 +700,7 @@ LOCAL_API_BASE_URL = _local_os.getenv(
     "http://127.0.0.1:8317/v1/chat/completions",
 )
 LOCAL_API_KEY = get_config("local_gemini_api_key")
-LOCAL_MODELS = ("gemini-3.8-flash", "gemini-3.1-pro")
+LOCAL_MODELS = ("gemini-flash-latest", "gemini-pro-latest")
 
 
 # ==================== 本地日志（不配置应用的 root logger） ====================
@@ -889,12 +889,13 @@ def chat_completion_local(
         image_paths=None,
 ) -> dict:
     """
-    单次调用本地 OpenAI 兼容接口，不进行自动重试。
+    单次调用本地 OpenAI 兼容接口（底层执行器，保持签名与 @_local_log_request 完全兼容）。
 
-    image_path 与 image_paths 二选一；省略两者时发送纯文本。
-    timeout 直接传给 requests：数字为连接/读取等待秒数，也可传 (连接, 读取)。
-    它不是整个请求的严格总时限。
-    网络、HTTP、响应格式错误返回 success=False；参数/文件错误直接抛出。
+    核心增强：
+    1. 放宽网络异常重试范围：所有 RequestException（含流中断 ChunkedEncodingError 等）均可重试。
+    2. 扩展 HTTP 可重试状态码：覆盖 408, 409, 425, 429, 500, 502, 503, 504 及反代常见的 520-524。
+    3. 本地网关容错：将 HTTP 200 但非 JSON、缺少 choices、或返回空 content 标记为 retryable=True，
+       防止本地网关偶发返回空包时直接中断整个重试与降级链路。
     """
     api_base_url = LOCAL_API_BASE_URL if api_base_url is None else api_base_url
     api_key = LOCAL_API_KEY if api_key is None else api_key
@@ -911,11 +912,13 @@ def chat_completion_local(
 
     paths = _local_normalize_paths(image_path if image_path is not None else image_paths)
     if paths:
-        content = [{"type": "text", "text": prompt}]
-        content.append({
-            "type": "text",
-            "text": "每个 image_data 块对应一张图片。请按编号与 file_name 对应分析，避免混淆。",
-        })
+        content = [
+            {"type": "text", "text": prompt},
+            {
+                "type": "text",
+                "text": "每个 image_data 块对应一张图片。请按编号与 file_name 对应分析，避免混淆。",
+            },
+        ]
         for index, path in enumerate(paths, 1):
             mime_type, encoded = encode_image_to_base64_local(path)
             filename = _local_xml_escape(_local_os.path.basename(path))
@@ -935,58 +938,74 @@ def chat_completion_local(
     }
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
-    # 每次调用独立 Session，既不共享可变会话，也不读写进程的代理环境变量。
-    # trust_env=False 防止原代码 @with_proxy 设置的代理影响本地请求。
     try:
         with _local_requests.Session() as session:
             session.trust_env = False
             response = session.post(
-                api_base_url, headers=headers, json=payload, timeout=timeout,
+                api_base_url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
                 allow_redirects=False,
             )
     except _local_requests.exceptions.RequestException as exc:
         detail = str(exc).replace(api_key, "***")
+        # 只要不是 URL 格式错误等配置级异常，网络传输层面的异常全部允许重试
+        is_config_error = isinstance(exc, (
+            _local_requests.exceptions.InvalidURL,
+            _local_requests.exceptions.InvalidHeader,
+            _local_requests.exceptions.MissingSchema,
+            _local_requests.exceptions.InvalidSchema,
+        ))
         return _local_failure(
-            model, f"本地请求失败: {detail}",
-            retryable=isinstance(exc, (
-                _local_requests.exceptions.ConnectionError,
-                _local_requests.exceptions.Timeout,
-            )),
+            model,
+            f"本地网络请求异常 ({type(exc).__name__}): {detail}",
+            retryable=not is_config_error,
         )
 
     status_code = response.status_code
+    retryable_status_codes = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
     if not 200 <= status_code < 300:
         detail = response.text.replace(api_key, "***")[:1000]
         retry_after = None
         try:
-            # 支持网关常用的 Retry-After 秒数格式。
             retry_after = max(0.0, float(response.headers.get("Retry-After", "")))
         except (TypeError, ValueError):
             pass
         return _local_failure(
-            model, f"本地接口 HTTP {status_code}: {detail}", status_code=status_code,
-            retryable=status_code in (408, 429, 500, 502, 503, 504),
+            model,
+            f"本地接口 HTTP {status_code}: {detail}",
+            status_code=status_code,
+            retryable=status_code in retryable_status_codes,
             retry_after=retry_after,
         )
 
     try:
         result = response.json()
     except ValueError:
-        return _local_failure(model, "本地接口返回了非 JSON 响应。", status_code=status_code)
+        return _local_failure(
+            model, "本地接口返回了非 JSON 响应。", status_code=status_code, retryable=True
+        )
     if not isinstance(result, dict):
-        return _local_failure(model, "本地接口 JSON 顶层不是对象。", raw=result, status_code=status_code)
+        return _local_failure(
+            model, "本地接口 JSON 顶层不是对象。", raw=result, status_code=status_code, retryable=True
+        )
     choices = result.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         return _local_failure(
-            model, "本地接口缺少有效的 choices[0]，请查看 raw。", raw=result, status_code=status_code
+            model, "本地接口缺少有效的 choices[0]，请查看 raw。",
+            raw=result, status_code=status_code, retryable=True,
         )
     choice = choices[0]
     message = choice.get("message")
     if not isinstance(message, dict):
-        return _local_failure(model, "本地接口缺少有效的 message。", raw=result, status_code=status_code)
+        return _local_failure(
+            model, "本地接口缺少有效的 message。", raw=result, status_code=status_code, retryable=True
+        )
     if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
         return _local_failure(
-            model, "本地模型明确拒绝了请求。", raw=result, status_code=status_code, blocked=True
+            model, "本地模型明确拒绝了请求 (content_filter / refusal)。",
+            raw=result, status_code=status_code, blocked=True, retryable=False,
         )
 
     text = message.get("content")
@@ -997,17 +1016,237 @@ def chat_completion_local(
         )
     if not isinstance(text, str) or not text.strip():
         failure = _local_failure(
-            model, "本地接口未返回正文 content，请查看 reasoning / raw。",
-            raw=result, status_code=status_code,
+            model,
+            "本地接口未返回正文 content（空回复），请查看 reasoning / raw。",
+            raw=result,
+            status_code=status_code,
+            retryable=True,  # 空回复在本地逆向网关中属于典型偶发故障，允许进入重试
         )
         failure["reasoning"] = message.get("reasoning_content")
         return failure
+
     return {
-        "success": True, "content": text,
-        "reasoning": message.get("reasoning_content"), "raw": result,
-        "model": model, "status_code": status_code, "error": None,
-        "retryable": False, "blocked": False, "retry_after": None,
+        "success": True,
+        "content": text,
+        "reasoning": message.get("reasoning_content"),
+        "raw": result,
+        "model": model,
+        "status_code": status_code,
+        "error": None,
+        "retryable": False,
+        "blocked": False,
+        "retry_after": None,
     }
+
+
+@_local_log_scope
+def get_llm_content_local(
+        prompt: str = "你好，请介绍一下你自己。",
+        image_paths=None,
+        model_name: str = LOCAL_MODELS[0],
+        back_model: str | list[str] | tuple[str, ...] | None = LOCAL_MODELS[1],
+        *,
+        image_path: str | None = None,
+        max_retries_per_model: int = 3,
+        retry_delay: float = 2.0,
+        backoff_factor: float = 1.5,
+        max_retry_delay: float = 30.0,
+        raise_on_error: bool = True,
+        **request_options,
+) -> str | None:
+    """
+    完备的本地多模态统一调用入口（同时支持纯文本、单图、多图，内置多级重试与主备模型自动降级）。
+
+    参数说明：
+    - prompt: 提示词文本。
+    - image_paths: 可选。支持传 None（纯文本）、单张图片路径字符串/Path、或多张图片路径列表/可迭代对象。
+    - model_name: 主模型名称，默认 LOCAL_MODELS[0]。
+    - back_model: 备用模型，支持传单个模型名字符串、多个备用模型列表/元组，或 None（禁用备用模型）。
+    - image_path: 关键字参数，兼容单图调用习惯（与 image_paths 二选一即可）。
+    - max_retries_per_model: 单个模型最大尝试次数（默认 3 次，即首次调用 + 最多 2 次同模型重试）。
+    - retry_delay: 初始重试等待秒数（默认 2.0 秒）。
+    - backoff_factor: 指数退避乘数（默认 1.5，每次重试等待时间按 retry_delay * (backoff_factor ** n) 增长）。
+    - max_retry_delay: 单次重试最大等待秒数上限（默认 30.0 秒，若服务端返回更大的 Retry-After 则优先遵从服务端）。
+    - raise_on_error: 全部尝试均失败时，True 抛出 LocalGeminiAPIError，False 则记录日志并返回 None。
+    - **request_options: 透传给 chat_completion_local 的底层参数（如 timeout, temperature, api_key, api_base_url）。
+    """
+    # 1. 基础参数校验
+    if not isinstance(prompt, str):
+        raise TypeError("prompt 必须是字符串。")
+    if not isinstance(model_name, str) or not model_name.strip():
+        raise ValueError("model_name 不能为空。")
+    if max_retries_per_model < 1:
+        raise ValueError("max_retries_per_model 必须大于等于 1。")
+    if retry_delay < 0 or backoff_factor < 1.0 or max_retry_delay < 0:
+        raise ValueError("重试延迟参数不合法：请确保 retry_delay >= 0, backoff_factor >= 1.0, max_retry_delay >= 0。")
+    if image_path is not None and image_paths is not None:
+        raise ValueError("image_path 和 image_paths 不能同时提供。")
+
+    # 2. 构建去重后的候选模型链（支持单个或多个备用模型）
+    candidate_models = [model_name.strip()]
+    if back_model is not None:
+        if isinstance(back_model, str):
+            back_list = [back_model]
+        elif isinstance(back_model, (list, tuple)):
+            back_list = list(back_model)
+        else:
+            raise ValueError("back_model 必须是非空字符串、字符串列表/元组或 None。")
+
+        for bm in back_list:
+            if not isinstance(bm, str) or not bm.strip():
+                raise ValueError("back_model 中包含空或非字符串的模型名称。")
+            bm_clean = bm.strip()
+            if bm_clean not in candidate_models:
+                candidate_models.append(bm_clean)
+
+    # 3. 统一归一化并预校验图片路径（避免带着不存在的文件进入重试循环）
+    raw_paths = image_path if image_path is not None else image_paths
+    normalized_paths = _local_normalize_paths(raw_paths)
+    if normalized_paths:
+        for path in normalized_paths:
+            if not _local_os.path.isfile(path):
+                error_msg = f"未找到指定的图片文件: {path}"
+                _local_log_event("error", "参数预检失败", candidate_models[0], error_msg)
+                raise FileNotFoundError(error_msg)
+            if _local_os.path.getsize(path) == 0:
+                error_msg = f"图片文件为空 (0 字节): {path}"
+                _local_log_event("error", "参数预检失败", candidate_models[0], error_msg)
+                raise ValueError(error_msg)
+
+    mode_desc = f"多模态图片({len(normalized_paths)}张)" if normalized_paths else "纯文本"
+    total_max_attempts = len(candidate_models) * max_retries_per_model
+    _local_log_event(
+        "info",
+        "调度初始化",
+        " -> ".join(candidate_models),
+        f"模式: [{mode_desc}] | 候选模型数: [{len(candidate_models)}] | "
+        f"单模型最大尝试: [{max_retries_per_model}] | 总最大尝试上限: [{total_max_attempts}]",
+    )
+
+    # 4. 多模型 × 单模型多轮重试主循环
+    last_result = None
+    error_history = []
+    global_attempt = 0
+
+    for model_idx, current_model in enumerate(candidate_models):
+        for retry_idx in range(max_retries_per_model):
+            global_attempt += 1
+            result = chat_completion_local(
+                model=current_model,
+                prompt=prompt,
+                image_paths=normalized_paths if normalized_paths else None,
+                **request_options,
+            )
+
+            # 调用成功：直接返回正文
+            if result["success"]:
+                if global_attempt > 1:
+                    _local_log_event(
+                        "info",
+                        "重试恢复",
+                        current_model,
+                        f"在第 [{global_attempt}/{total_max_attempts}] 次总尝试 "
+                        f"(模型 [{current_model}] 第 [{retry_idx + 1}/{max_retries_per_model}] 次) 成功恢复！",
+                    )
+                return result["content"]
+
+            last_result = result
+            err_msg = result.get("error") or "未知错误"
+            status_code = result.get("status_code") or "无状态码"
+            error_history.append(
+                f"[{current_model}#尝试{retry_idx + 1}(HTTP:{status_code})]: {err_msg}"
+            )
+
+            # 若触发明确的安全拒绝 (blocked)，属于内容本身违规，停止一切重试与模型切换
+            if result.get("blocked"):
+                _local_log_event(
+                    "error",
+                    "请求被拒",
+                    current_model,
+                    f"模型明确拒绝请求 (blocked=True)，终止后续重试 | 原因: [{_local_log_preview(err_msg, 500)}]",
+                )
+                if raise_on_error:
+                    raise LocalGeminiAPIError(result)
+                return None
+
+            # 若属于不可重试错误（例如 401 密钥错误、400 参数格式错误、404 模型不存在）
+            if not result.get("retryable"):
+                # 如果是 404/400 等可能与特定模型名绑定的错误，且还有备用模型，则直接跳出当前模型尝试下一个模型
+                if model_idx < len(candidate_models) - 1:
+                    next_model = candidate_models[model_idx + 1]
+                    _local_log_event(
+                        "warning",
+                        "模型降级",
+                        current_model,
+                        f"遇到当前模型不可重试错误 (HTTP: [{status_code}])，跳过本模型剩余重试，"
+                        f"立即切换备用模型: [{next_model}] | 原因: [{_local_log_preview(err_msg, 500)}]",
+                    )
+                    break
+                else:
+                    _local_log_event(
+                        "error",
+                        "终止重试",
+                        current_model,
+                        f"遇到不可重试错误且已无备用模型 | 原因: [{_local_log_preview(err_msg, 500)}]",
+                    )
+                    if raise_on_error:
+                        raise LocalGeminiAPIError(result)
+                    return None
+
+            # 计算退避等待时间
+            has_more_retries_in_current = (retry_idx < max_retries_per_model - 1)
+            has_next_model = (model_idx < len(candidate_models) - 1)
+
+            if has_more_retries_in_current:
+                # 同模型内指数退避：retry_delay * (backoff_factor ** retry_idx)
+                computed_delay = min(max_retry_delay, retry_delay * (backoff_factor ** retry_idx))
+                delay = max(computed_delay, result.get("retry_after") or 0.0)
+                _local_log_event(
+                    "warning",
+                    "同模型重试",
+                    current_model,
+                    f"本模型第 [{retry_idx + 1}/{max_retries_per_model}] 次失败 "
+                    f"(总第 [{global_attempt}/{total_max_attempts}] 次) | "
+                    f"等待 [{delay:.2f} 秒] 后进行本模型第 [{retry_idx + 2}] 次尝试 | "
+                    f"原因: [{_local_log_preview(err_msg, 500)}]",
+                )
+                if delay > 0:
+                    _local_time.sleep(delay)
+
+            elif has_next_model:
+                # 当前模型次数已用尽，切换到下一个备用模型（切换模型时使用基础 retry_delay 避免等待过长）
+                next_model = candidate_models[model_idx + 1]
+                delay = max(retry_delay, result.get("retry_after") or 0.0)
+                _local_log_event(
+                    "warning",
+                    "跨模型切换",
+                    current_model,
+                    f"模型 [{current_model}] 的 [{max_retries_per_model}] 次尝试已全部耗尽 | "
+                    f"等待 [{delay:.2f} 秒] 后切换至备用模型: [{next_model}] | "
+                    f"最后原因: [{_local_log_preview(err_msg, 500)}]",
+                )
+                if delay > 0:
+                    _local_time.sleep(delay)
+
+    # 5. 所有候选模型与重试次数全部耗尽
+    summary_error = f"所有本地模型均调用失败（共尝试 {global_attempt} 次）。轨迹: {' -> '.join(error_history)}"
+    _local_log_event(
+        "error",
+        "任务彻底失败",
+        " -> ".join(candidate_models),
+        _local_log_preview(summary_error, 1500),
+    )
+
+    if last_result is None:
+        last_result = _local_failure(model_name, summary_error)
+    else:
+        last_result = dict(last_result)
+        last_result["error"] = summary_error
+        last_result["error_history"] = error_history
+
+    if raise_on_error:
+        raise LocalGeminiAPIError(last_result)
+    return None
 
 
 def _local_generate_text(prompt, image_paths, model_name, back_model,
@@ -1039,17 +1278,6 @@ def _local_generate_text(prompt, image_paths, model_name, back_model,
         if delay:
             _local_time.sleep(delay)
     raise RuntimeError("未配置本地模型。")
-
-
-@_local_log_scope
-def get_llm_content_local(
-        prompt: str = "你好，请介绍一下你自己。",
-        model_name: str = LOCAL_MODELS[0],
-        back_model: str | None = LOCAL_MODELS[1],
-        **request_options,
-) -> str:
-    """本地文本入口；可传 timeout/api_key/api_base_url/temperature/retry_delay。"""
-    return _local_generate_text(prompt, None, model_name, back_model, **request_options)
 
 
 @_local_log_scope
@@ -1141,7 +1369,7 @@ if __name__ == "__main__":
     print(text)
 
     # 2. 本地图片分析，支持多张图片
-    text = analyze_images_local(
+    text = get_llm_content_local(
         prompt="请分别描述这些图片，并标明对应的文件名。",
         image_paths=[
             r"C:\Users\zxh\Desktop\temp\test.jpg",
