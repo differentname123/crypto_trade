@@ -12,12 +12,14 @@ import datetime
 import json
 import ntpath
 import os
+import random
 import re
 import tempfile
 import threading
 import time
 from copy import deepcopy
 
+from app.ai_api.gemini_api import get_llm_content_local
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from biance.biance_playwright import comment_on_binance_post, get_auth_tokens_robust
 from biance.biance_squre_api import (
@@ -38,7 +40,7 @@ SCHEDULE_INTERVAL_SEC = 3600
 COMMENT_SEND_INTERVAL_SEC = 60
 ACCOUNT_STATS_SYNC_INTERVAL_SEC = 3600
 LLM_MAX_RETRIES = 3
-GEMINI_MODEL = "gemini-3.7-flash"
+GEMINI_MODEL = "gemini-3.8-flash"
 MAX_SUCCESSFUL_SENDS = 3
 MAX_REPLAY_DAYS = 7
 MAX_DAILY_SUCCESS_PER_ACCOUNT = 100
@@ -352,6 +354,12 @@ def gen_promo_comment(post):
             error_detail, raw_response = generate_gemini_content_playwright(
                 full_prompt, model_name=GEMINI_MODEL
             )
+            if random.random() < 1.9:
+                raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
+            else:
+                error_detail, raw_response = generate_gemini_content_playwright(
+                    full_prompt, model_name=GEMINI_MODEL
+                )
             comment_info = string_to_object(raw_response)
             is_valid, error_message = check_comment_info(comment_info)
             if not is_valid:
