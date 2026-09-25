@@ -1066,7 +1066,7 @@ def get_llm_content_local(
     - max_retries_per_model: 单个模型最大尝试次数（默认 3 次，即首次调用 + 最多 2 次同模型重试）。
     - retry_delay: 初始重试等待秒数（默认 2.0 秒）。
     - backoff_factor: 指数退避乘数（默认 1.5，每次重试等待时间按 retry_delay * (backoff_factor ** n) 增长）。
-    - max_retry_delay: 单次重试最大等待秒数上限（默认 30.0 秒，若服务端返回更大的 Retry-After 则优先遵从服务端）。
+    - max_retry_delay: 单次重试常规指数退避上限（默认 30.0 秒；含服务端 Retry-After 在内的单次最终冷却硬上限为 600.0 秒）。
     - raise_on_error: 全部尝试均失败时，True 抛出 LocalGeminiAPIError，False 则记录日志并返回 None。
     - **request_options: 透传给 chat_completion_local 的底层参数（如 timeout, temperature, api_key, api_base_url）。
     """
@@ -1124,6 +1124,7 @@ def get_llm_content_local(
     # )
 
     # 4. 多模型 × 单模型多轮重试主循环
+    MAX_SINGLE_COOLDOWN = 600.0  # 单次冷却硬性上限：10分钟 (600秒)
     last_result = None
     error_history = []
     global_attempt = 0
@@ -1193,14 +1194,14 @@ def get_llm_content_local(
                         raise LocalGeminiAPIError(result)
                     return None
 
-            # 计算退避等待时间
+            # 计算退避等待时间（单次等待强制不超过 600 秒 / 10 分钟）
             has_more_retries_in_current = (retry_idx < max_retries_per_model - 1)
             has_next_model = (model_idx < len(candidate_models) - 1)
 
             if has_more_retries_in_current:
-                # 同模型内指数退避：retry_delay * (backoff_factor ** retry_idx)
+                # 同模型内指数退避：retry_delay * (backoff_factor ** retry_idx)，且最终单次等待不超过 600 秒
                 computed_delay = min(max_retry_delay, retry_delay * (backoff_factor ** retry_idx))
-                delay = max(computed_delay, result.get("retry_after") or 0.0)
+                delay = min(MAX_SINGLE_COOLDOWN, max(computed_delay, result.get("retry_after") or 0.0))
                 _local_log_event(
                     "warning",
                     "同模型重试",
@@ -1214,9 +1215,9 @@ def get_llm_content_local(
                     _local_time.sleep(delay)
 
             elif has_next_model:
-                # 当前模型次数已用尽，切换到下一个备用模型（切换模型时使用基础 retry_delay 避免等待过长）
+                # 当前模型次数已用尽，切换到下一个备用模型，单次等待同样不超过 600 秒
                 next_model = candidate_models[model_idx + 1]
-                delay = max(retry_delay, result.get("retry_after") or 0.0)
+                delay = min(MAX_SINGLE_COOLDOWN, max(retry_delay, result.get("retry_after") or 0.0))
                 _local_log_event(
                     "warning",
                     "跨模型切换",
