@@ -2885,10 +2885,10 @@ def main_app():
     """加载多组账户凭据，并根据账户灵活分配策略进程。"""
     # 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
     accounts = [
-        # "myself",
+        "myself",
         "ruru",
-        # "qiqi",
-        # "mama",
+        "qiqi",
+        "mama",
     ]
 
     # 1. 公共策略模板（所有账号都会运行的基础策略）  金额按照 900 的总保证金来算的，其实 理论最大杠杆只能够是 2.22倍
