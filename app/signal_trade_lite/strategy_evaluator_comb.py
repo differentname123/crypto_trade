@@ -1125,7 +1125,7 @@ def evaluate_multi_strategy_portfolios(
         min_overlap_days=180,
         weight_mode="equal",
         max_combos=None,
-        filter_q_balance=10.0,
+        filter_q_balance=15.0,
         filter_roll_profit_win_rate_30=None,
         filter_roll_profit_win_rate_7=None,
         filter_roll_profit_win_rate_1=None,
@@ -2320,9 +2320,9 @@ if __name__ == "__main__":
         explore_ratio=0.20,  # 保留20%的随机探索机会，减轻预选指标偏差
         seed_family_cap=4,  # 种子不足以全留时，限制同一信号组合的参数变体占位
         random_seed=2026,  # 固定数据、参数和随机种子可复现本次搜索
-        rank_weights={"annual": 0.19, "balance": 0.01},
+        rank_weights={"annual": 5.19, "balance": 0.01},
         prune_tolerance=1,  # 仅切回 search_mode="prune" 时生效
-        prune_metric=["calmar", "周期盈利率(%)"],  # 仅原 prune 模式使用
+        prune_metric=["calmar"],  # 仅原 prune 模式使用
     )
 
     # print_ranking_report_from_csv()
