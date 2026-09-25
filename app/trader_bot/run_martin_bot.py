@@ -2891,30 +2891,30 @@ def main_app():
         # "mama",
     ]
 
-    # 1. 公共策略模板（所有账号都会运行的基础策略）
+    # 1. 公共策略模板（所有账号都会运行的基础策略）  金额按照 900 的总保证金来算的，其实 理论最大杠杆只能够是 2.22倍
     strategy_templates = [
         {"base_id": "SAAVE4", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 0.1, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.6,
+         "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.6,
          "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
 
         {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
-         "first_qty": 3, "step_pct": 1.8, "tp_pct": 0.9, "qty_mult": 2,
+         "first_qty": 6, "step_pct": 1.8, "tp_pct": 0.9, "qty_mult": 2,
          "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
 
-        {"base_id": "LRENDER7", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_3",
-         "first_qty": 10, "step_pct": 2, "tp_pct": 1.1, "qty_mult": 2,
-         "max_loss_mult": 7, "layer_loss_budget_ratio": 1},
+        {"base_id": "LRENDER5", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_3",
+         "first_qty": 21, "step_pct": 2, "tp_pct": 1.1, "qty_mult": 2,
+         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
 
         {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
-         "first_qty": 10, "step_pct": 1.8, "tp_pct": 1.2, "qty_mult": 2,
+         "first_qty": 26, "step_pct": 1.8, "tp_pct": 1.2, "qty_mult": 2,
          "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
 
-        {"base_id": "LSOL6", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_3",
-         "first_qty": 0.1, "step_pct": 3, "tp_pct": 1.2, "qty_mult": 2,
-         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
+        {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_3",
+         "first_qty": 0.13, "step_pct": 2.5, "tp_pct": 1.2, "qty_mult": 2,
+         "max_loss_mult": 10, "layer_loss_budget_ratio": 1},
 
         {"base_id": "SUNI6", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 1, "step_pct": 2, "tp_pct": 0.9, "qty_mult": 2,
+         "first_qty": 2, "step_pct": 2, "tp_pct": 0.9, "qty_mult": 2,
          "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
     ]
 
