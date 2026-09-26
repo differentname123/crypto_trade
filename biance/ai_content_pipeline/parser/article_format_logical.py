@@ -200,7 +200,7 @@ def gen_media_format_info(post):
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         raw_response, error_detail = "", ""
         try:
-            if random.random() < 1.9:
+            if random.random() < -1.9:
                 raw_response = get_llm_content_local(prompt=full_prompt, image_paths=paths, model_name=MODEL_NAME_PRO)
             else:
                 error_detail, raw_response = generate_gemini_content_playwright(
