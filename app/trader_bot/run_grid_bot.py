@@ -103,7 +103,8 @@ class GridConfig:
                  direction=GridDirection.LONG, account_name="myself"):
         self.account_name = account_name
         self.strategy_id = f"{account_name}_{strategy_id}"
-        # 完整策略ID（含账号与下划线）最多18字符；不截断，避免账本/OID命名碰撞。
+        # 完整策略ID（含账号与下划线）最多18字符；截断
+        self.strategy_id = self.strategy_id[:18]
         OidCodec.validate_strategy_id(self.strategy_id)
         self.symbol, self.min_price, self.max_price = symbol, min_price, max_price
         self.price_ratio, self.quantity = price_ratio, quantity
@@ -974,7 +975,10 @@ def main_app():
     suffix = "0925"
     configs = [
         GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "ruru"),
-
+        GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "nana"),
+        GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "mama"),
+        GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "qiqi"),
+        GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "myself"),
 
     ]
     ids = [config.strategy_id for config in configs]
