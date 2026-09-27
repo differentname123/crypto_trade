@@ -351,9 +351,6 @@ def gen_promo_comment(post):
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         error_detail = None
         try:
-            error_detail, raw_response = generate_gemini_content_playwright(
-                full_prompt, model_name=GEMINI_MODEL
-            )
             if random.random() < 1.9:
                 raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
             else:

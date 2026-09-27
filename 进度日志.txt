@@ -2488,6 +2488,8 @@ d
                 gemini web
             Mag1cFall/AIStudio2API
                 aistudio web
+            yukkcat/chatgpt2api:
+                chatgpt web
 
 
 
