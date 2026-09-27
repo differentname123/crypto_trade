@@ -2886,7 +2886,7 @@ def main_app():
     # 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
     accounts = [
         "myself",
-        # "ruru",
+        "ruru",
         "qiqi",
         "mama",
         "nana",
