@@ -1,0 +1,42 @@
+zexadev/gemini-web2api-go：
+    作用: 将 gemini web转换为api
+    步骤：
+        1.下载相应的桌面端程序，然运行，默认控制面板为http://localhost:8083/admin/
+        2.配置账号，可用这个插件复制cookie“https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm?hl=zh-CN&utm_source=ext_sidebar”
+        3.配置代理“http://127.0.0.1:7890”
+
+    注意点：
+        启动位置："C:\Users\zxh\Desktop\gemini-web2api-go_v4.20.1_windows_amd64.exe - 快捷方式.lnk"
+        控制面板：http://localhost:8083/admin/
+
+
+yukkcat/chatgpt2api：
+    作用: 将 chatgpt web转换为api
+    步骤：
+        1.使用docker运行
+
+    注意点：
+        1.启动就是docker里面
+        2.控制面板：http://127.0.0.1:3000/#/
+
+
+Mag1cFall/AIStudio2API：
+    作用: 将 aistudio web转换为api
+    步骤：
+        1.启动地址："C:\Users\zxh\Desktop\aistudio2api.exe - 快捷方式.lnk"
+
+    注意点：
+        1.控制面板：http://127.0.0.1:2048
+
+
+router-for-me/EasyCLIProxyAPI
+    作用: 将 antigravity  auth转换为api
+    步骤：
+        1.启动地址："C:\Users\zxh\Desktop\EasyCLIProxyAPI.exe - 快捷方式.lnk"
+
+    注意点：
+        1.控制面板：http://127.0.0.1:8317/management.html#/
+
+作用：
+    1. 将普通账号在各个渠道（网页端、桌面端、CLI、免费层）的可用模型，通过开源工具转换为代码可直接调用的标准 API 格式。
+    2. 核心原则：互不冲突的独立额度池全部保留叠加，严格量化模型价值与每周总额度。
