@@ -1185,10 +1185,21 @@ def evaluate_multi_strategy_portfolios(
         net = float(cum[-1])
         annual = net * DAYS_PER_YEAR / len(daily)
         mdd = float(dd.max())
+
+        # 新增：识别每次“跌破前高 -> 重回前高”的独立回撤波段，取波段最深点的 90% 分位数
+        is_uw = dd > 0
+        if is_uw.any():
+            starts = np.flatnonzero(is_uw & ~np.r_[False, is_uw[:-1]])
+            ep_peaks = np.maximum.reduceat(dd, starts)
+            ep_dd_p90 = float(np.quantile(ep_peaks, 0.90))
+        else:
+            ep_dd_p90 = 0.0
+
         return {
             "net": net, "annual": annual, "mdd": mdd,
+            "ep_dd_p90": ep_dd_p90,
             "relative_dd": float(np.max(dd / (1.0 + peak)) * 100.0),
-            "underwater": _max_true_run(dd > 0),
+            "underwater": _max_true_run(is_uw),
             "calmar": ratio(annual, mdd),
         }
 
@@ -1495,17 +1506,18 @@ def evaluate_multi_strategy_portfolios(
         print("   主排序：综合评分 ↓ → 平滑周期盈利率 ↓ → 排序Calmar ↓；CSV使用相同顺序")
         print("=" * 112)
         for rank, (_, r) in enumerate(df_k.iterrows(), 1):
+            # 1) 已去掉：| 平滑后 ...
             print(f"\nNo.{rank} | 综合评分 {fmt(r['综合评分'], 3)} "
                   f"| 完整周期 {int(r['完整周期数'])} 段 "
-                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')} "
-                  f"| 平滑后 {fmt(r['周期平滑盈利率(%)'], suffix='%')}")
+                  f"| 周期盈利率 {fmt(r['周期盈利率(%)'], suffix='%')}")
             print(f"   窗口 {r['重叠起']} ~ {r['重叠止']} | 共 {int(r['重叠天数'])} 天")
             print(f"   收益 | 净利润 {fmt(r['组合净利(M)'])} M "
                   f"| 年化净利润 {fmt(r['年化净利(M/年)'], 3)} M/年 "
                   f"| Profit Factor {fmt(r['Profit Factor'])}")
+            # 2) 已去掉：相对最大回撤(%)，新增：波段90%回撤
             print(f"   已实现风险 | 最大回撤 {fmt(r['已实现MDD(M)'])} M "
+                  f"| 波段90%回撤 {fmt(r['波段90%回撤(M)'])} M "
                   f"| 爆仓共振指数 {fmt(r.get('爆仓共振指数', r['已实现MDD(M)'] * current_k))} "
-                  f"| 相对最大回撤 {fmt(r['相对已实现MDD(%)'], suffix='%')} "
                   f"| 最长水下期 {int(r['最长水下期(天)'])} 天 "
                   f"| 已实现 Calmar {fmt(r['已实现Calmar'])}")
             print(f"   滚动尾部 | 最差7日收益 {fmt(r['最差7日收益(M)'])} M "
@@ -1524,8 +1536,6 @@ def evaluate_multi_strategy_portfolios(
                 _, member_win, _ = cycle_stats((i,), (1.0,), window_blowups(i, lo, hi))
 
                 member_label = records[i]["label"]
-
-                # 获取成员的平仓次数
                 trades = int(CNT[i, lo:hi + 1].sum())
 
                 rows.append({
@@ -1533,6 +1543,7 @@ def evaluate_multi_strategy_portfolios(
                     "成员编号": member_alias_map[member_label],
                     "窗口净利(M)": fmt(m["net"]),
                     "已实现MDD(M)": fmt(m["mdd"]),
+                    "波段90%回撤(M)": fmt(m["ep_dd_p90"]),
                     "已实现Calmar": fmt(m["calmar"]),
                     "周期盈利率(%)": fmt(member_win),
                     "平仓次数": trades,
@@ -1542,7 +1553,6 @@ def evaluate_multi_strategy_portfolios(
             display_cols = DISPLAY_COLS
             print_table(df_print[display_cols])
         print()
-
     def exact_candidates(target_k):
         def visit(chosen, candidates, lo, hi):
             nonlocal insufficient_branches
@@ -1676,6 +1686,7 @@ def evaluate_multi_strategy_portfolios(
             "组合净利(M)": net, "年化净利(M/年)": risk["annual"],
             "组合总收益(M)": gp, "组合总亏损(M)": gl, "Profit Factor": pf,
             "已实现MDD(M)": risk["mdd"],
+            "波段90%回撤(M)": risk["ep_dd_p90"],  # <--- 新增此行
             "爆仓共振指数": risk["mdd"] * k,
             "相对已实现MDD(%)": risk["relative_dd"],
             "最长水下期(天)": risk["underwater"], "已实现Calmar": risk["calmar"],
