@@ -2313,7 +2313,7 @@ if __name__ == "__main__":
         plateau_csv=PLATEAU_CSV,
         output_csv="portfolio_multi_ranking.csv",
         min_k=2,
-        max_k=10,
+        max_k=7,
         top_n_per_k=50,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
         min_overlap_days=180,
@@ -2321,7 +2321,7 @@ if __name__ == "__main__":
         search_mode="hybrid",  # 两策略尽量搜全；高阶按种子、成员扩展数和层预算限流
         beam_width=3000,  # 每层最多1000个搜索种子，与打印前50条无关
         expand_top_m=150,  # 每个种子最多尝试30个新成员
-        layer_max_evals=2000000,  # 每层最多实际回测30000个去重候选
+        layer_max_evals=4000000,  # 每层最多实际回测30000个去重候选
         explore_ratio=0.20,  # 保留20%的随机探索机会，减轻预选指标偏差
         seed_family_cap=4,  # 种子不足以全留时，限制同一信号组合的参数变体占位
         random_seed=2026,  # 固定数据、参数和随机种子可复现本次搜索
