@@ -1361,7 +1361,6 @@ def evaluate_multi_strategy_portfolios(
         flags = np.asarray(r["is_blowup"], dtype=bool)[order]
         event_data.append((times, prefix, np.unique(times[flags])))
 
-    # sig_keys = [r["signal_key"][:5] for r in records]
     sig_keys = [(r["symbol"], r["direction"]) for r in records]
     active = [i for i in range(N) if last_i[i] - first_i[i] + 1 >= required_days]
     active_mask = sum(1 << i for i in active)
@@ -1414,8 +1413,8 @@ def evaluate_multi_strategy_portfolios(
     evaluated_by_k = {}
     insufficient_branches = 0
     beam_discarded = 0
-    extension_discarded = 0  # hybrid：省略的父->子扩展次数，不是去重后的组合数
-    budget_discarded = 0  # hybrid：已生成但未获评估预算的去重候选数
+    extension_discarded = 0
+    budget_discarded = 0
     budget_stopped = False
     generated_by_k = {}
     retained_by_k = {}
@@ -1428,7 +1427,6 @@ def evaluate_multi_strategy_portfolios(
         return float(value / (value + scale))
 
     def ranking_fields(core):
-        """缓存评分所需指标；只新增排序字段，不改变原回测口径。"""
         if "_ranking" in core:
             return core["_ranking"]
         risk = realized_risk(core["daily"])
@@ -1470,7 +1468,6 @@ def evaluate_multi_strategy_portfolios(
         return fields
 
     def ranking_key(row):
-        """打印、CSV 和搜索使用同一排序键；最后以成员编号稳定打破平分。"""
         win_30 = row["30日盈利窗口率(%)"]
         return (
             row["综合评分"], row["周期平滑盈利率(%)"], row["排序Calmar"],
@@ -1479,10 +1476,12 @@ def evaluate_multi_strategy_portfolios(
             -row["组合数量(K)"], tuple(-int(i) for i in row["_idx"].split(",")),
         )
 
-    member_alias_map = {}
+    # ==========================================
+    # 修改点：在外部一次性固定分配“成员编号”，不再动态生成
+    # ==========================================
+    member_alias_map = {r["label"]: f"成员{i+1}" for i, r in enumerate(records)}
 
     def print_top_for_current_layer(current_k):
-        """核心新增：每一层计算完毕即可结算该层并立马先打印结果"""
         if current_k < min_k or top_n_per_k == 0:
             return
         layer_res = [r for r in results if r.get("组合数量(K)") == current_k]
@@ -1525,8 +1524,6 @@ def evaluate_multi_strategy_portfolios(
                 _, member_win, _ = cycle_stats((i,), (1.0,), window_blowups(i, lo, hi))
 
                 member_label = records[i]["label"]
-                if member_label not in member_alias_map:
-                    member_alias_map[member_label] = f"成员{len(member_alias_map) + 1}"
 
                 # 获取成员的平仓次数
                 trades = int(CNT[i, lo:hi + 1].sum())
@@ -1793,7 +1790,6 @@ def evaluate_multi_strategy_portfolios(
             member_family.append(family_ids[key])
 
         def mixed_shortlist(items, limit, key):
-            """确定性优选 + 无放回随机探索；未触及上限时不做任何淘汰。"""
             if limit is None or len(items) <= limit:
                 return items
             if limit <= 0:
@@ -1810,7 +1806,6 @@ def evaluate_multi_strategy_portfolios(
             return picked
 
         def extension_scores(chosen, choices):
-            """用已评估的两两组合预估扩展价值；缺失两两评分时回退到单成员均分。"""
             jj = np.asarray(choices, dtype=int)
             if not chosen:
                 return single_scores[jj]
@@ -1858,7 +1853,6 @@ def evaluate_multi_strategy_portfolios(
                 ranking_key(node[4])), reverse=True), quality_n - main_n - 2 * side_n)
             if random_n:
                 take([nodes[int(j)] for j in rng.permutation(len(nodes))], random_n)
-            # 某个指标配额未填满时按总分补位；仍遵守信号族上限。
             take(by_score, beam_width - len(selected))
             return selected
 
@@ -1876,7 +1870,6 @@ def evaluate_multi_strategy_portfolios(
             candidate_map = {}
 
             if k == 1 or (k == 2 and full_pairs):
-                # K=1 不按单策略表现预先删成员；预算足够时 K=2 不受 K=1 种子筛选影响。
                 for idxs, lo, hi in exact_candidates(k):
                     child_mask = active_mask
                     for i in idxs:
@@ -1897,7 +1890,6 @@ def evaluate_multi_strategy_portfolios(
                     extension_discarded += len(scored) - len(shortlist)
                     for i, proxy in shortlist:
                         idxs = tuple(sorted(chosen + (i,)))
-                        # 全兼容掩码允许加入更小编号的成员；不依赖某个固定父节点存活。
                         child_mask = parent_mask & compatible[i]
                         if k < min_k and count_bits(child_mask) < min_k - k:
                             insufficient_branches += 1
@@ -1933,7 +1925,6 @@ def evaluate_multi_strategy_portfolios(
                 elif k == 2:
                     a, b = idxs
                     pair_scores[a, b] = pair_scores[b, a] = fields["综合评分"]
-                # 回测通过即可入榜，种子筛选不影响本层已经发现的有效结果。
                 if k >= min_k and core["passed"]:
                     results.append(make_row(core))
                 if k < max_k and child_mask:
@@ -1942,7 +1933,6 @@ def evaluate_multi_strategy_portfolios(
                     else:
                         next_nodes.append((idxs, lo, hi, child_mask, fields))
 
-            # 下一层会直接枚举全部二元组合时，没有必要裁剪单成员种子。
             if k == 1 and full_pairs and max_k >= 2:
                 frontier = next_nodes
             else:
@@ -1958,9 +1948,6 @@ def evaluate_multi_strategy_portfolios(
             if not frontier and not (k == 1 and full_pairs and max_k >= 2):
                 break
     elif search_mode == "prune":
-        # ======================================================================
-        # 新增的核心逻辑：基于容忍下限的高阶组合前向剪枝搜索（支持多指标列表）
-        # ======================================================================
         combo_metrics_cache = {}
         frontier = [((), 0, T - 1, active_mask)]
 
@@ -1981,7 +1968,6 @@ def evaluate_multi_strategy_portfolios(
                     i = bit.bit_length() - 1
                     idxs = chosen + (i,)
 
-                    # 1. 回溯查询 K-1 阶所有直系父节点的指标
                     if k > 1:
                         parent_metrics_list = []
                         valid_parents = True
@@ -1997,7 +1983,6 @@ def evaluate_multi_strategy_portfolios(
                     else:
                         parent_metrics_list = []
 
-                    # 获取新的交集约束
                     child_mask = candidates & compatible[i]
                     lo = max(parent_lo, int(first_i[i]))
                     hi = min(parent_hi, int(last_i[i]))
@@ -2010,7 +1995,6 @@ def evaluate_multi_strategy_portfolios(
                     if core is None:
                         continue
 
-                    # 2. 提取核心指标(兼容提取多指标至字典)
                     current_metrics = {}
                     risk_cache = None
                     if any(m.lower() == "calmar" for m in p_metrics):
@@ -2043,7 +2027,6 @@ def evaluate_multi_strategy_portfolios(
                         else:
                             current_metrics[m_name] = -np.inf
 
-                    # 3. 容忍下限验证(要求所有的指标都不产生断崖式恶化)
                     pruned = False
                     if k > 1 and parent_metrics_list:
                         for m_name in p_metrics:
@@ -2061,7 +2044,6 @@ def evaluate_multi_strategy_portfolios(
                         beam_discarded += 1
                         continue
 
-                    # 4. 保留“半成品”数据至缓存
                     combo_metrics_cache[idxs] = current_metrics
 
                     if k >= min_k and core["passed"]:
@@ -2223,7 +2205,10 @@ def print_ranking_report_from_csv(
         if np.isneginf(value): return "-∞" + suffix
         return f"{value:.{digits}f}" + suffix
 
-    member_alias_map = {}
+    # ==========================================
+    # 修改点：提前按 records 中加载的顺序固定映射
+    # ==========================================
+    member_alias_map = {r["label"]: f"成员{i+1}" for i, r in enumerate(records)}
 
     # 按照 K 的大小进行分组打印
     for k in sorted(df_all["组合数量(K)"].unique()):
@@ -2275,9 +2260,6 @@ def print_ranking_report_from_csv(
                 # 获取成员平仓次数
                 trades = int(CNT[i, lo:hi + 1].sum())
 
-                if lbl not in member_alias_map:
-                    member_alias_map[lbl] = f"成员{len(member_alias_map) + 1}"
-
                 rows.append({
                     "成员": lbl,
                     "成员编号": member_alias_map[lbl],
@@ -2293,7 +2275,6 @@ def print_ranking_report_from_csv(
                 display_cols = DISPLAY_COLS
                 print_table(df_print[display_cols])
         print()
-
 
 if __name__ == "__main__":
     PLATEAU_CSV = "strategy_leaderboard_100800_files_plateau.csv"  # 若无平原表填 None
@@ -2316,7 +2297,29 @@ if __name__ == "__main__":
         max_k=7,
         top_n_per_k=50,
         allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
-        min_overlap_days=180,
+        min_overlap_days=700,
+        weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
+        search_mode="hybrid",  # 两策略尽量搜全；高阶按种子、成员扩展数和层预算限流
+        beam_width=3000,  # 每层最多1000个搜索种子，与打印前50条无关
+        expand_top_m=150,  # 每个种子最多尝试30个新成员
+        layer_max_evals=4000000,  # 每层最多实际回测30000个去重候选
+        explore_ratio=0.20,  # 保留20%的随机探索机会，减轻预选指标偏差
+        seed_family_cap=4,  # 种子不足以全留时，限制同一信号组合的参数变体占位
+        random_seed=2026,  # 固定数据、参数和随机种子可复现本次搜索
+        rank_weights={"calmar": 5, "balance": 0.01},
+        prune_tolerance=1,  # 仅切回 search_mode="prune" 时生效
+        prune_metric=["calmar"],  # 仅原 prune 模式使用
+    )
+
+    evaluate_multi_strategy_portfolios(
+        csv_dir="./extracted_trades_csv",
+        plateau_csv=PLATEAU_CSV,
+        output_csv="portfolio_multi_ranking.csv",
+        min_k=2,
+        max_k=7,
+        top_n_per_k=50,
+        allow_same_signal=False,  # 想看"同信号不同 Margin"的叠加效果时改 True
+        min_overlap_days=1000,
         weight_mode="equal",  # 或 "recommend" 按你备注里的推荐次数加权
         search_mode="hybrid",  # 两策略尽量搜全；高阶按种子、成员扩展数和层预算限流
         beam_width=3000,  # 每层最多1000个搜索种子，与打印前50条无关
