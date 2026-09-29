@@ -714,7 +714,7 @@ def evaluate_multi_strategy_portfolios(
     active = [
         i for i in range(N)
         if last_i[i] - first_i[i] + 1 >= required_days
-           and realized_risk(PNL[i, first_i[i]:last_i[i] + 1])["calmar"] >= 1
+           and realized_risk(PNL[i, first_i[i]:last_i[i] + 1])["calmar"] >= 0.5
     ]
 
     active_mask = sum(1 << i for i in active)
