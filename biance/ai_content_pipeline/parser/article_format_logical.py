@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.ai_api.gemini_api import get_llm_content_local
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
-from biance.biance_squre_api import publish_to_binance_square
+from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -58,7 +58,7 @@ SHELF_LIFE_SECONDS = {
 
 # : 数据库封装未提供关闭协议，保留原初始化方式；
 # 连接释放需在 gen_db_object/Manager 的既有实现中确认，不能猜测其 close/client 接口。
-MODEL_NAME_PRO = "gemini-pro-latest"
+MODEL_NAME_PRO = "gpt-6-luna-max"
 
 def _publish_time_seconds(value):
     """统一秒/毫秒时间戳；无效或非有限数值显式报错，避免进入时间比较。"""
@@ -255,7 +255,23 @@ def process_and_save_single_post(post, post_manager):
             "| 排查: [检查帖子字段、提示词/媒体路径及数据库连接]",
             post_id,
         )
+FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 
+def fetch_post(post_manager):
+    """按币种顺序及综合推荐流采集后统一入库，保留重复帖子和接口参数。
+    入参：提供 upsert_posts([帖子字典]) 的管理器；无返回。
+    """
+    started = time.monotonic()
+    posts = []
+    for token in FEED_TOKENS:
+        posts.extend(fetch_binance_feed(token=token, count=100, orderBy=1))
+    posts.extend(fetch_binance_feed(count=100))
+    if posts:
+        post_manager.upsert_posts(posts)
+    logger.info(
+        f"[采集/完成] 推荐流已处理 | 币种数: 【{len(FEED_TOKENS)}】"
+        f" | 入库条目: 【{len(posts)}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
+    )
 
 def format_image_article():
     """轮询原帖并以 5 个工作线程提取论据；失败按原策略等待后重试。"""
@@ -263,6 +279,7 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
+            fetch_post(post_manager)
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
             if not posts:
                 time.sleep(60)

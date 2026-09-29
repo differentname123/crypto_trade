@@ -705,7 +705,8 @@ class MartinConfig:
     """
     一个实例 = 一个独立子进程 = 一本独立账本 = 一个独立 OID 命名空间。
     同一币种可配置多个(不同 signal / 不同马丁参数), 互不干扰。
-    层数不由配置指定: 由首单名义价值 × max_loss_mult 得到周期亏损预算后推导。
+    层数不由配置指定: 由首单名义价值 × max_loss_mult 得到周期亏损预算后推导,
+    并在全局止损价确定后自动剔除距止损价不足 min_sl_dist_pct(默认 step_pct)的尾层。
     first_notional > 0 时首单名义价值取 first_notional, 否则取信号原价 × first_qty。
     """
 
@@ -714,6 +715,7 @@ class MartinConfig:
                  first_qty=0.0, first_notional=0.0,
                  step_pct=2.0, qty_mult=2.0, tp_pct=0.8, max_loss_mult=5.0,
                  layer_loss_budget_ratio=0.80,
+                 min_sl_dist_pct=None,
                  max_signal_age_sec=31,
                  entry_timeout_sec=900,
                  max_cycle_sec=0,
@@ -731,6 +733,9 @@ class MartinConfig:
         self.tp_pct = float(tp_pct)
         self.max_loss_mult = float(max_loss_mult)
         self.layer_loss_budget_ratio = float(layer_loss_budget_ratio)
+        # 未显式指定时, 默认使用 step_pct 作为各层开仓价距全局止损价的最小安全距离(%)
+        self.min_sl_dist_pct = (float(tp_pct) if min_sl_dist_pct is None
+                                else float(min_sl_dist_pct))
         self.max_signal_age_sec = float(max_signal_age_sec)
         self.entry_timeout_sec = float(entry_timeout_sec)
         self.max_cycle_sec = float(max_cycle_sec)
@@ -741,11 +746,8 @@ class MartinConfig:
     def validate(self):
         """启动前强校验: 配置错了直接拒绝启动, 绝不带病上线。"""
         errs = []
-        # ========= 核心修改处：放宽至 16 位 =========
         if not self.strategy_id or len(self.strategy_id) > 16 or not self.strategy_id.isalnum():
             errs.append("strategy_id 必须为 1~16 位纯字母数字(它是 OID 命名空间与账本名)")
-        # ============================================
-
         if self.signal_name not in SIGNAL_REGISTRY:
             errs.append(f"signal_name[{self.signal_name}] 未在 SIGNAL_REGISTRY 中注册")
         if self.first_qty <= 0 and self.first_notional <= 0:
@@ -758,15 +760,15 @@ class MartinConfig:
             errs.append("tp_pct 必须在 (0,50] 区间")
         if not isfinite(self.max_loss_mult) or self.max_loss_mult <= 0:
             errs.append("max_loss_mult 必须为有限数且 > 0")
-        # 保留原有可接受边界，避免擅自改变业务参数语义
         if not (0.1 <= self.layer_loss_budget_ratio <= 1):
             errs.append("layer_loss_budget_ratio 必须在 [0.1,1] 区间")
+        if not isfinite(self.min_sl_dist_pct) or not (0 <= self.min_sl_dist_pct <= 50):
+            errs.append("min_sl_dist_pct 必须在 [0,50] 区间")
         if not errs:
             return
         logger.critical(f"[配置] 校验失败[{len(errs)}]项, 拒绝启动 | 策略:[{self.strategy_id}] "
                         f"问题清单: " + " || ".join(errs))
         raise SystemExit(1)
-
 class SignalGate:
     """
     信号闸门: 只认干净标准化的 DataFrame。
@@ -879,9 +881,8 @@ class BlueprintBuilder:
       * 亏损预算: 信号原价 × first_qty × max_loss_mult; first_notional > 0 时改用其作为名义价值
       * 加仓价: 第 i 层价 = 第 i-1 层【理论均价】的等比偏离 (avg * (1 - sign*step_pct%))
       * 止盈价: 第 i 层止盈 = 第 i 层【理论均价】的等比偏离 (avg * (1 + sign*tp_pct%))
-      * 止损价: 按最后一层满仓时恰好亏 max_loss_usdt 反解, 全周期唯一固定
-    层数判定: 仅当"下一层成交后浮亏 <= max_loss_usdt * layer_loss_budget_ratio"时才允许铺该层;
-    唯一硬顶 HARD_MAX_LAYERS 纯粹是防死循环的物理底线。
+      * 止损价: 按未裁剪前的最后一层满仓时恰好亏 max_loss_usdt 反解, 全周期唯一固定
+      * 尾层裁剪: 全局止损价固定不变, 剔除开仓价距止损价不足 min_sl_dist_pct(默认 step_pct)的深层
     """
 
     @staticmethod
@@ -949,7 +950,7 @@ class BlueprintBuilder:
                                 f"底线:[{spec.min_notional}U] 请加大 first_qty/first_notional")
                     return None
             elif loss_at_fill > budget:
-                logger.info(f"[蓝图] 第[{i}]层成交后浮亏将超出亏损预算, 层数在此收口(本周期只铺{i}层) | "
+                logger.info(f"[蓝图] 第[{i}]层成交后浮亏将超出亏损预算, 理论层数在此收口(初算{i}层) | "
                             f"该层浮亏:[{loss_at_fill:.2f}U] 预算:[{budget:.2f}U] "
                             f"(={max_loss_usdt}×{cfg.layer_loss_budget_ratio})")
                 break
@@ -964,26 +965,55 @@ class BlueprintBuilder:
         if not layers:
             logger.info("[蓝图] 未能生成任何合法层, 丢弃信号 | 请检查 first_qty/tick/step 与最小名义价值")
             return None
-        if len(layers) == 1:
-            logger.info(f"[蓝图] ⚠️ 仅能生成[1]层, 马丁结构退化为单笔交易 | "
-                        f"请检查 max_loss_mult[{cfg.max_loss_mult}] 与首单规模的配比是否合理")
 
-        # ---------- 全局唯一止损价: 最后一层满仓时恰好亏 max_loss_usdt ----------
-        final_avg = acc_cost / acc_qty
-        deepest = layers[-1].price
-        sl = spec.round_price(final_avg - sign * max_loss_usdt / acc_qty,
+        # ---------- 全局唯一止损价: 按未裁剪前的最后一层满仓时恰好亏 max_loss_usdt 反解 ----------
+        raw_final_avg = acc_cost / acc_qty
+        raw_deepest = layers[-1].price
+        sl = spec.round_price(raw_final_avg - sign * max_loss_usdt / acc_qty,
                               "up" if d is Direction.LONG else "down")
         if d is Direction.LONG and sl <= 0:
-            # : 原行为会把非正止损价夹到极低保护位，实际风险可能显著超过 max_loss_usdt。
-            # 该处属于业务风险边界，重构不擅自改为“丢弃信号”。
             sl = spec.round_price(max(spec.tick_size, p0 * 0.02), "up")
             logger.critical(f"[蓝图] 满仓止损价算出非正数(最大亏损远超满仓名义价值), 已夹到极低保护位 | "
                             f"保护位:[{sl}] 注意: 实际亏损可能远超[{max_loss_usdt}U]")
-        if (d is Direction.LONG and sl >= deepest) or (d is Direction.SHORT and sl <= deepest):
+        if (d is Direction.LONG and sl >= raw_deepest) or (d is Direction.SHORT and sl <= raw_deepest):
             logger.critical(f"[蓝图] 全局止损价与最深层价位置颠倒, 参数异常, 丢弃信号 | "
-                            f"止损价:[{sl}] 最深层价:[{deepest}] 方向:[{d.value}] "
+                            f"止损价:[{sl}] 最深层价:[{raw_deepest}] 方向:[{d.value}] "
                             f"(请调大 max_loss_mult 或调小 step_pct/qty_mult)")
             return None
+
+        # ---------- 尾层安全垫裁剪: 全局止损价 sl 保持不变, 剔除距 sl 不足 min_sl_dist_pct 的层 ----------
+        min_dist = cfg.min_sl_dist_pct
+        pruned_info = []
+        while layers:
+            lp = layers[-1]
+            # 以该层开仓价为基准计算到 sl 的有向距离百分比 (与日志 abs(sl / deepest - 1) 口径完全一致)
+            dist_pct = sign * (lp.price - sl) / lp.price * 100.0
+            if dist_pct < min_dist - 1e-9:
+                pruned_info.append(f"L{lp.layer}@{lp.price:.8g}(距止损{dist_pct:.3f}%)")
+                layers.pop()
+                rows.pop()
+            else:
+                break
+
+        if pruned_info:
+            logger.info(f"[蓝图] 已剔除[{len(pruned_info)}]个距全局止损价不足[{min_dist}%]的尾层"
+                        f"(全局止损价[{sl:.8g}]保持不变) | 剔除清单:[{', '.join(reversed(pruned_info))}] "
+                        f"| 最终保留层数:[{len(layers)}]")
+
+        if not layers:
+            logger.critical(f"[蓝图] 剔除过近止损层后无剩余有效层(首单距全局止损已不足[{min_dist}%]), "
+                            f"丢弃信号 | 首单价:[{p0}] 止损价:[{sl}]")
+            return None
+        if len(layers) == 1:
+            logger.info(f"[蓝图] ⚠️ 仅能生成[1]层有效层, 马丁结构退化为单笔交易 | "
+                        f"请检查 max_loss_mult[{cfg.max_loss_mult}] 与 min_sl_dist_pct[{min_dist}%] 配比")
+
+        # 用裁剪后的最终有效层刷新汇总展示指标 (sl 保持原值不变)
+        acc_qty = rows[-1][3]
+        acc_cost = rows[-1][4]
+        final_avg = rows[-1][5]
+        deepest = layers[-1].price
+        actual_sl_loss = sign * (final_avg - sl) * acc_qty
 
         table = "\n".join(
             f"{r[0]:>3} {r[1]:>14.8g} {r[2]:>12.8g} {r[3]:>12.8g} {r[4]:>12.2f} "
@@ -995,8 +1025,8 @@ class BlueprintBuilder:
             f"{'理论均价':>14} {'该层止盈价':>14} {'该层浮亏U':>10}\n{table}\n"
             f"最大名义价值:[{acc_cost:.2f}U] 满仓均价:[{final_avg:.8g}] 全局固定止损价:[{sl:.8g}]"
             f"(距满仓均价 {abs(sl / final_avg - 1) * 100:.3f}%, "
-            f"距最深层成交价 {abs(sl / deepest - 1) * 100:.3f}%)\n"
-            f"周期亏损预算:[{max_loss_usdt}U] "
+            f"距最深层成交价 {abs(sl / deepest - 1) * 100:.3f}%, 最小止损间距要求 {min_dist}%)\n"
+            f"周期亏损预算:[{max_loss_usdt:.2f}U] 裁剪后满仓止损实际亏损:[{actual_sl_loss:.2f}U] "
             f"(首单名义价值{first_order_notional}U×亏损倍数{cfg.max_loss_mult}) 止盈:[{cfg.tp_pct}%] "
             f"间距:[{cfg.step_pct}% 相对当层理论均价等比] 倍数:[{cfg.qty_mult}]\n"
             f"=======================================================================")
@@ -2054,6 +2084,7 @@ class MartinCycle:
         return {
             "sig_ts": self.signal_ts, "dir": self.direction.value,
             "base": self.bp.base_price, "step_pct": self.ctx.cfg.step_pct,
+            "min_sl_dist_pct": self.ctx.cfg.min_sl_dist_pct,
             "mult": self.ctx.cfg.qty_mult, "tp_pct": self.ctx.cfg.tp_pct,
             "max_loss": self.bp.max_loss_usdt, "max_loss_mult": self.bp.max_loss_mult,
             "sl": self.bp.sl_price,
@@ -2892,32 +2923,32 @@ def main_app():
         "nana",
 
     ]
-
+    layer_loss_budget_ratio = 1
     # 1. 公共策略模板（所有账号都会运行的基础策略）  金额按照 900 的总保证金来算的，其实 理论最大杠杆只能够是 2.22倍
     strategy_templates = [
         {"base_id": "SAAVE4", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
          "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.6,
-         "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 4, "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
          "first_qty": 6, "step_pct": 1.8, "tp_pct": 0.9, "qty_mult": 2,
-         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 6, "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LRENDER5", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_3",
          "first_qty": 21, "step_pct": 2, "tp_pct": 1.1, "qty_mult": 2,
-         "max_loss_mult": 5, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 5, "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
          "first_qty": 26, "step_pct": 1.8, "tp_pct": 1.2, "qty_mult": 2,
-         "max_loss_mult": 4, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 4, "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_3",
          "first_qty": 0.13, "step_pct": 2.5, "tp_pct": 1.2, "qty_mult": 2,
-         "max_loss_mult": 10, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 10, "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "SUNI6", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_10",
          "first_qty": 2, "step_pct": 2, "tp_pct": 0.9, "qty_mult": 2,
-         "max_loss_mult": 6, "layer_loss_budget_ratio": 1},
+         "max_loss_mult": 6, "layer_loss_budget_ratio": layer_loss_budget_ratio},
     ]
 
     configs = []
