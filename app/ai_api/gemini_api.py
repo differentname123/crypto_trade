@@ -67,7 +67,7 @@ LOCAL_API_BASE_URL = _local_os.getenv(
     "http://127.0.0.1:3000/v1/chat/completions",
 )
 LOCAL_API_KEY = get_config("local_gemini_api_key")
-LOCAL_MODELS = ("gemini-flash-latest", "gemini-pro-latest")
+LOCAL_MODELS = ("gpt-5.6", "gemini-pro-latest")
 
 # ========== API Key 读取与管理 ==========
 
@@ -1365,7 +1365,6 @@ if __name__ == "__main__":
     # 1. 本地纯文本调用
     text = get_llm_content_local(
         prompt="你好，请介绍一下你自己。",
-        model_name="gemini-3.8-flash",
     )
     print(text)
 
@@ -1375,35 +1374,6 @@ if __name__ == "__main__":
         image_paths=[
             r"C:\Users\zxh\Desktop\temp\test.jpg",
         ],
-        model_name="gemini-3.1-pro",
         back_model=None,  # 只使用指定模型
     )
     print(text)
-
-    # 3. 优先本地调用，失败后回退到你原有的 Gemini 文本函数
-    text = get_llm_content_auto(
-        prompt="请介绍一下 Python 的多线程。",
-    )
-    print(text)
-
-    # 4. 优先本地图片分析，失败后回退到原 analyze_images_gemini
-    text = analyze_images_auto(
-        prompt="描述图片内容。",
-        image_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg"],
-    )
-    print(text)
-
-    # 5. 需要获取完整返回信息时，使用底层入口
-    result = chat_completion_local(
-        model="gemini-3.1-pro",
-        prompt="描述图片内容。",
-        image_path=r"C:\Users\zxh\Desktop\temp\test.jpg",
-        timeout=120,
-    )
-
-    if result["success"]:
-        print(result["content"])
-        # result["reasoning"]：接口返回的 reasoning_content
-        # result["raw"]：原始 JSON 响应
-    else:
-        print(result["error"])
