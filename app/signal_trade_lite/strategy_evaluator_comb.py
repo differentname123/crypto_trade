@@ -1126,6 +1126,7 @@ def evaluate_multi_strategy_portfolios(
         weight_mode="equal",
         max_combos=None,
         filter_q_balance=15.0,
+        filter_q4_min=18.0,  # 新增：最近阶段(Q4)最低利润贡献百分比阈值，设 None 为关闭
         filter_roll_profit_win_rate_30=None,
         filter_roll_profit_win_rate_7=None,
         filter_roll_profit_win_rate_1=None,
@@ -1361,7 +1362,8 @@ def evaluate_multi_strategy_portfolios(
         flags = np.asarray(r["is_blowup"], dtype=bool)[order]
         event_data.append((times, prefix, np.unique(times[flags])))
 
-    sig_keys = [r["signal_key"][:5] for r in records]
+    # sig_keys = [r["signal_key"][:5] for r in records]
+    sig_keys = [(r["symbol"], r["direction"]) for r in records]
     active = [i for i in range(N) if last_i[i] - first_i[i] + 1 >= required_days]
     active_mask = sum(1 << i for i in active)
     compatible = [0] * N
@@ -1607,7 +1609,11 @@ def evaluate_multi_strategy_portfolios(
             q_ratios = [float("nan")] * 4
             q_min = float("nan")
             q_str = "N/A（总净利≤0或窗口不足4天）"
-        q_failed = filter_q_balance is not None and (not np.isfinite(q_min) or q_min < filter_q_balance)
+        q_failed = (
+                (filter_q_balance is not None and (not np.isfinite(q_min) or q_min < filter_q_balance))
+                or (filter_q4_min is not None and (not np.isfinite(q_ratios[3]) or q_ratios[3] < filter_q4_min))
+        )
+
         passed = not roll_failed and not q_failed
         if k >= min_k:
             if roll_failed:
