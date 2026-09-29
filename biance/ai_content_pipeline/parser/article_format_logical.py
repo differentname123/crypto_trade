@@ -60,6 +60,10 @@ SHELF_LIFE_SECONDS = {
 # 连接释放需在 gen_db_object/Manager 的既有实现中确认，不能猜测其 close/client 接口。
 MODEL_NAME_PRO = "gpt-6-luna-max"
 MODEL_NAME_PRO = "gemini-3.1-pro-thinking"
+
+MODEL_NAME_PRO = "gpt-5.6"
+
+
 def _publish_time_seconds(value):
     """统一秒/毫秒时间戳；无效或非有限数值显式报错，避免进入时间比较。"""
     try:

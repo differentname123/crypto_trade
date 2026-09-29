@@ -43,6 +43,31 @@ from google.genai import types
 from common.common_utils import read_json, get_config
 
 config_path = r'W:\project\python_project\crypto_trade\config\gemini_web.json'
+import base64 as _local_base64
+import mimetypes as _local_mimetypes
+import os as _local_os
+import time as _local_time
+from html import escape as _local_xml_escape
+
+import requests as _local_requests
+import base64 as _local_base64
+import functools as _local_functools
+import inspect as _local_inspect
+import logging as _local_logging
+import mimetypes as _local_mimetypes
+import os as _local_os
+import time as _local_time
+import uuid as _local_uuid
+from contextvars import ContextVar as _LocalContextVar
+from html import escape as _local_xml_escape
+
+# ==================== 本地接口配置（独立于 Google API Key） ====================
+LOCAL_API_BASE_URL = _local_os.getenv(
+    "GEMINI_LOCAL_API_BASE_URL",
+    "http://127.0.0.1:3000/v1/chat/completions",
+)
+LOCAL_API_KEY = get_config("local_gemini_api_key")
+LOCAL_MODELS = ("gemini-flash-latest", "gemini-pro-latest")
 
 # ========== API Key 读取与管理 ==========
 
@@ -676,31 +701,6 @@ auto 入口需与原代码处于同一模块，并沿用原函数的返回值与
     result = chat_completion_local("gemini-3.1-pro", "描述图片", image_path=r"C:\\images\\a.jpg")
 """
 
-import base64 as _local_base64
-import mimetypes as _local_mimetypes
-import os as _local_os
-import time as _local_time
-from html import escape as _local_xml_escape
-
-import requests as _local_requests
-import base64 as _local_base64
-import functools as _local_functools
-import inspect as _local_inspect
-import logging as _local_logging
-import mimetypes as _local_mimetypes
-import os as _local_os
-import time as _local_time
-import uuid as _local_uuid
-from contextvars import ContextVar as _LocalContextVar
-from html import escape as _local_xml_escape
-
-# ==================== 本地接口配置（独立于 Google API Key） ====================
-LOCAL_API_BASE_URL = _local_os.getenv(
-    "GEMINI_LOCAL_API_BASE_URL",
-    "http://127.0.0.1:8083/v1/chat/completions",
-)
-LOCAL_API_KEY = get_config("local_gemini_api_key")
-LOCAL_MODELS = ("gemini-flash-latest", "gemini-pro-latest")
 
 
 # ==================== 本地日志（不配置应用的 root logger） ====================
