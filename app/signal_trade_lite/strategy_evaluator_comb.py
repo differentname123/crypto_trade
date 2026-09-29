@@ -1373,7 +1373,12 @@ def evaluate_multi_strategy_portfolios(
         event_data.append((times, prefix, np.unique(times[flags])))
 
     sig_keys = [(r["symbol"], r["direction"]) for r in records]
-    active = [i for i in range(N) if last_i[i] - first_i[i] + 1 >= required_days]
+    active = [
+        i for i in range(N)
+        if last_i[i] - first_i[i] + 1 >= required_days
+           and realized_risk(PNL[i, first_i[i]:last_i[i] + 1])["calmar"] >= 1
+    ]
+
     active_mask = sum(1 << i for i in active)
     compatible = [0] * N
     blocked_same = blocked_window = 0
