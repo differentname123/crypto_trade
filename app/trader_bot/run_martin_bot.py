@@ -2933,23 +2933,23 @@ def main_app():
     # 1. 公共策略模板（所有账号都会运行的基础策略）  最大回撤 0.69 M | 波段90%回撤 0.45 M
     strategy_templates = [
         {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT", "signal_name": "factor_044_4",
-         "first_qty": 0.01, "step_pct": 1,  "tp_pct": 0.7,"max_loss_mult": 7, "qty_mult": 2,
+         "first_qty": 0.001, "step_pct": 1,  "tp_pct": 0.7,"max_loss_mult": 7, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 0.01, "step_pct": 2.5,  "tp_pct": 1.1,"max_loss_mult": 10, "qty_mult": 2,
+         "first_qty": 183, "step_pct": 2.5,  "tp_pct": 1.1,"max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
-         "first_qty": 0.01, "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
+         "first_qty": 17.3, "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
-         "first_qty": 0.01, "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
+         "first_qty": 43.2, "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_1",
-         "first_qty": 0.01, "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
+         "first_qty": 0.71, "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
     ]
 
