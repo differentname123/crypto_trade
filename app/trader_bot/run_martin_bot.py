@@ -2465,6 +2465,12 @@ class MartinEngine:
     # ---------------- IDLE ----------------
     def _idle_tick(self):
         time.sleep(self.cfg.idle_poll_interval_sec)
+
+        # 跑完当前周期后自动退出进程（全部跑完后主程序自动结束）
+        logger.info(f"[停机] 当前无进行中周期，按只平不开模式自动退出 | 策略:[{self.cfg.strategy_id}]")
+        self.stop_flag = True
+        return
+
         sig = self.gate.poll()          # 先查信号: 无信号则一次网络请求都不发
         if sig is None:
             return
