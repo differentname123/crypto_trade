@@ -3,6 +3,11 @@
 [功能摘要] 跨周期信号交易执行系统：按策略原子单元隔离，通过 REST 快照、CSV 账本对账与时间窗信号执行完成开平仓闭环。
 [多点并发支持版本] 面向对象重构：支持多账号、多策略以 Thread Worker 形式并行运行，通过独立账本与上下文隔离。
 """
+import ctypes
+import gc
+import hashlib
+import io
+import json
 import multiprocessing
 import os
 import platform
@@ -16,6 +21,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from common_utils import setup_logger, get_config
+from data_provider import InterProcessMutex
 from signal_generator import (
     execute_trading_bot_high_fr_bear_div_short, execute_trading_bot_oi_decay_short,
     execute_trading_bot_vwap_reclaim_long, execute_trading_bot_workflow_XSR_long,
@@ -103,6 +109,19 @@ def _log(scope, message, **fields):
     """统一人类可扫描日志：核心字段始终使用 [] 包裹。"""
     detail = " | ".join(f"{key}: [{value}]" for key, value in fields.items())
     return f"[{scope}] {message}" + (f" | {detail}" if detail else "")
+
+
+def _release_idle_memory():
+    """每轮结束后释放不可达对象，并在支持 malloc_trim 的 Linux 上尝试归还空闲页。"""
+    gc.collect()
+    if platform.system().lower() == "linux":
+        try:
+            trim = ctypes.CDLL(None).malloc_trim
+            trim.argtypes = [ctypes.c_size_t]
+            trim.restype = ctypes.c_int
+            trim(0)
+        except (AttributeError, OSError):
+            pass
 
 
 # =============================================================================
@@ -788,6 +807,117 @@ class TradingWorker:
                  StrategyIntersection=len(holding_symbols), FinalCount=len(final_symbols), Symbols=final_symbols)
         return final_symbols
 
+    def _get_shared_cross_signal(self, target_time_str, workflow):
+        """仅复用固定标的、无账户状态的 cross；缓存故障退回原工作流。"""
+        try:
+            target = pd.Timestamp(target_time_str)
+            target = (target.tz_localize("Asia/Shanghai") if target.tzinfo is None
+                      else target.tz_convert("Asia/Shanghai"))
+            target_ms = int(target.value // 1_000_000)
+            target_ms -= target_ms % 60_000
+
+            # 【极简方案】：直接用 策略名+目标时间 做唯一标识，删掉吹毛求疵的代码哈希
+            signature = {"version": 1, "strategy": self.strategy_name, "target_ms": target_ms}
+            key = f"{self.strategy_name}_{target_ms}"
+
+            snapshot_dir = os.path.join(DATA_DIR, "_signal_snapshots")
+            os.makedirs(snapshot_dir, mode=0o700, exist_ok=True)
+            snapshot_path = os.path.join(snapshot_dir, f"{key}.json")
+            mutex = InterProcessMutex(os.path.join(snapshot_dir, f"{key}.lock"))
+        except Exception as exc:
+            self.log("warning", "SIGNAL/SHARE", "信号复用初始化失败，使用原工作流", Reason=exc)
+            return workflow(target_time_str, proxy_url=self.proxy_url, dedupe=True)
+
+        def _read_snapshot():
+            try:
+                with open(snapshot_path, "r", encoding="utf-8") as snapshot:
+                    payload = json.load(snapshot)
+                age = time.time() - float(payload["created_at"])
+
+                # 完整快照保留 24h；不完整缺口(complete=False)仅保留 300s 供本轮 Follower 复用
+                ttl = 86400 if payload.get("complete") is True else 300
+                if payload.get("signature") != signature or not (-60 <= age <= ttl):
+                    return None
+
+                result = pd.read_json(io.StringIO(json.dumps(payload["table"])),
+                                      orient="table", precise_float=True)
+                required = {"time", "action", "coin", "direction", "event", "price",
+                            "max_weight", "STRATEGY_NAME", "symbol"}
+                if not result.empty and not required.issubset(result.columns):
+                    return None
+                result.attrs.update(payload.get("attrs", {}))
+                return result
+            except FileNotFoundError:
+                return None
+            except Exception as exc:
+                self.log("warning", "SIGNAL/SHARE", "信号快照不可用，将重新计算", Reason=exc)
+                return None
+
+        hit = _read_snapshot()
+        if hit is not None:
+            self.log("info", "SIGNAL/SHARE", "复用同策略信号快照", Rows=len(hit), Target=target_time_str)
+            return hit
+
+        lock_timeout = max(180.0, (target_ms + 120_000) / 1000.0 - time.time() + 600.0)
+        # 获取锁失败降级时，必须明确告知底层恢复去重机制
+        if not mutex.acquire(timeout=lock_timeout):
+            self.log("warning", "SIGNAL/SHARE", "信号锁等待失败，使用原工作流", Timeout=lock_timeout)
+            return workflow(target_time_str, proxy_url=self.proxy_url, dedupe=True)
+
+        try:
+            hit = _read_snapshot()
+            if hit is not None:
+                self.log("info", "SIGNAL/SHARE", "等待后复用同策略信号快照", Rows=len(hit), Target=target_time_str)
+                return hit
+
+            # 明确当选 Leader，写快照时关闭底层重复去重
+            result = workflow(target_time_str, proxy_url=self.proxy_url, dedupe=False)
+            if isinstance(result, pd.DataFrame):
+                tmp_path = f"{snapshot_path}.{uuid.uuid4().hex}.tmp"
+                try:
+                    table = json.loads(
+                        result.to_json(
+                            orient="table",
+                            date_format="iso",
+                            date_unit="ns",
+                            double_precision=15,
+                            index=False,
+                        )
+                    )
+                    is_complete = bool(result.attrs.get("signal_snapshot_complete", False))
+                    payload = {"signature": signature, "created_at": time.time(), "complete": is_complete,
+                               "table": table, "attrs": result.attrs}
+                    with open(tmp_path, "w", encoding="utf-8") as snapshot:
+                        json.dump(payload, snapshot, ensure_ascii=False, allow_nan=False,
+                                  default=lambda value: value.isoformat() if hasattr(value, "isoformat") else str(
+                                      value))
+                    os.replace(tmp_path, snapshot_path)
+
+                    # 顺带清理过期快照和随时间堆积的历史无用锁文件
+                    with os.scandir(snapshot_dir) as entries:
+                        for entry in entries:
+                            if (entry.name.startswith(f"{self.strategy_name}_")
+                                    and entry.name.endswith((".json", ".lock"))
+                                    and entry.stat().st_mtime < time.time() - 86400):
+                                try:
+                                    os.remove(entry.path)
+                                except OSError:
+                                    pass
+                except Exception as exc:
+                    self.log("warning", "SIGNAL/SHARE", "信号快照保存失败，保留本次计算结果", Reason=exc)
+                finally:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+            return result
+        finally:
+            try:
+                mutex.release()
+            except Exception as exc:
+                self.log("warning", "SIGNAL/SHARE", "信号锁释放异常", Reason=exc)
+
     def get_signal_df(self, target_time_str, position_cache):
         config = STRATEGY_CONFIGS.get(self.strategy_name)
         if config is None:
@@ -796,6 +926,8 @@ class TradingWorker:
 
         _, _, workflow, rank_mode, top_n = config
         if rank_mode is None:
+            if self.strategy_name == "cross":
+                return self._get_shared_cross_signal(target_time_str, workflow)
             return workflow(target_time_str, proxy_url=self.proxy_url)
 
         symbols = self.build_monitor_symbols(position_cache, top_n, rank_mode)
@@ -863,6 +995,9 @@ class TradingWorker:
                          Reason=exc, Hint="查看堆栈定位未被局部隔离的异常")
                 self.logger.error(f"\n{traceback.format_exc()}")
                 time.sleep(30)
+            finally:
+                signal_df = position_cache = open_order_cache = None
+                _release_idle_memory()
 
 
 # =============================================================================
@@ -919,3 +1054,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

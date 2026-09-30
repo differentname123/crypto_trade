@@ -1107,10 +1107,18 @@ def build_4h_cross_section(logger, minute_klines_list, time_offset='0h'):
         if raw is None or raw.empty:
             continue
 
-        coin = raw['coin_name'].iloc[0]
-        frame = raw.copy()
-        frame['timestamp'] = pd.to_datetime(frame['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
-        frame = frame.set_index('timestamp').sort_index()
+        if isinstance(raw.index, pd.DatetimeIndex) and 'timestamp' not in raw.columns:
+            coin = raw['coin_name'].iloc[0] if 'coin_name' in raw.columns else raw.attrs['coin_name']
+            frame = raw
+            if frame.index.tz is not None:
+                frame = frame.tz_convert('UTC').tz_localize(None)
+            if not frame.index.is_monotonic_increasing:
+                frame = frame.sort_index()
+        else:
+            coin = raw['coin_name'].iloc[0]
+            frame = raw.copy()
+            frame['timestamp'] = pd.to_datetime(frame['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
+            frame = frame.set_index('timestamp').sort_index()
         bars = frame['close'].resample('4h', offset=time_offset).agg(
             open='first', high='max', low='min', close='last'
         ).dropna(how='all')
@@ -1406,17 +1414,13 @@ def run_strategy_simulation(df_cross_section, strategy_params, trade_mode, initi
 def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
     """
     4H 多参数流水线：矩阵 -> 状态机 -> +4h执行时刻 -> 北京时间/毫秒戳 -> 最新发单 -> 汇总落盘。
-
-    入参形貌:
-      minute_klines_list=[DataFrame(timestamp, close, coin_name, symbol)]
-      strategy_params_list=[{STRATEGY_NAME,TIME_OFFSET,TRADE_MODE,MOM_WINDOW,VOL_WINDOW,
-                             BTC_TREND_WINDOW,MAX_WEIGHT,TOP_K}]
-    出参: 全量 4H 交易账本 DataFrame。
     """
     coin_to_symbol = {
-        df['coin_name'].iloc[0]: df['symbol'].iloc[0]
+        (df['coin_name'].iloc[0] if 'coin_name' in df.columns else df.attrs['coin_name']):
+        (df['symbol'].iloc[0] if 'symbol' in df.columns else df.attrs['symbol'])
         for df in minute_klines_list
-        if df is not None and not df.empty and {'coin_name', 'symbol'} <= set(df.columns)
+        if df is not None and not df.empty
+        and all(key in df.columns or key in df.attrs for key in ('coin_name', 'symbol'))
     }
 
     all_ledgers = []
@@ -1462,8 +1466,6 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
             )
             ledger['STRATEGY_NAME'] = name
 
-            # common_utils: 缺少 symbol 映射时按原逻辑假定 USDT 永续后缀；
-            # 若交易所支持多结算币需重新定义。
             ledger['symbol'] = ledger['coin'].map(coin_to_symbol).fillna(
                 ledger['coin'] + '/USDT:USDT'
             )
@@ -1502,7 +1504,8 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
 
     if not all_ledgers:
         logger.info('[流水线/收官] 结果: [所有策略均未产生交易账本]')
-        return pd.DataFrame()
+        # 【最终方案】：统一使用带字段列结构的空表返回，避免 `orient="table"` 序列化崩溃
+        return pd.DataFrame(columns=SIGNAL_COLS)
 
     output_path = os.path.join('signal_data', 'live_simulation_logs.csv')
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -1515,13 +1518,9 @@ def run_live_pipeline(minute_klines_list, strategy_params_list, logger):
     )
     return final_ledger
 
-def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
+def execute_trading_bot_workflow_cross(target_time, proxy_url=None, dedupe=True):
     """
     4H横截面入口：按最大指标窗口反推预热天数，拉取1m数据，再执行多参数流水线。
-
-    common_utils: 原接口在“完全无行情”时返回空字符串，而其他入口返回 DataFrame；为保持调用兼容继续保留。
-    common_utils: Grid_No.43629 的 MAX_WEIGHT=2.6 允许空头/理论目标权重超过100%；
-           这是业务参数，不在技术重构中改动。
     """
     strategy_params_list = [
         {
@@ -1578,20 +1577,40 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
         use_ws=True,
         use_rest=True,
         proxy_url=proxy_url,
+        dedupe=dedupe,  # 传递此参数，只有上层 Leader 才会传入 False
     )
 
     fetched, missing = [], []
+    cache_complete = True
+    target_ts = pd.Timestamp(target_time)
+    target_ts = (target_ts.tz_localize('Asia/Shanghai') if target_ts.tzinfo is None
+                 else target_ts.tz_convert('Asia/Shanghai'))
+    target_ms = int(target_ts.value // 1_000_000)
+    target_ms -= target_ms % 60_000
     for symbol in symbol_list:
-        frame = _frame_of(result_map, symbol)
-        if frame.empty:
+        frame = result_map.pop(symbol, None) if result_map else None
+        if frame is None or frame.empty:
             missing.append(symbol)
+            cache_complete = False
             continue
 
         _warn_data_gap(logger, 'Cross', symbol, frame, expected_rows)
-        frame = frame.copy()
-        frame['coin_name'] = symbol.split('/')[0]
-        frame['symbol'] = symbol
-        fetched.append(frame)
+        timestamps = frame['timestamp'].to_numpy()
+        cache_complete = cache_complete and (
+            len(frame) == expected_rows and timestamps[-1] == target_ms
+            and timestamps[0] == target_ms - lookback_days * 86_400_000
+            and bool(np.all(np.diff(timestamps) == 60_000))
+        )
+        close_frame = frame[['close']].copy()
+        close_frame.index = pd.to_datetime(frame['timestamp'], unit='ms', utc=True).dt.tz_localize(None)
+        close_frame.attrs['coin_name'] = symbol.split('/')[0]
+        close_frame.attrs['symbol'] = symbol
+        fetched.append(close_frame)
+        del frame, timestamps, close_frame
+
+    if result_map:
+        result_map.clear()
+    del result_map
 
     if missing:
         logger.warning(
@@ -1604,14 +1623,17 @@ def execute_trading_bot_workflow_cross(target_time, proxy_url=None):
             '❌ [Cross/致命] 可用标的数: [0] | 当前动作: [组装横截面矩阵] | '
             '结果: [终止] | 排查线索: [检查网络/代理/data_provider]'
         )
-        return ''
+        empty_df = pd.DataFrame(columns=SIGNAL_COLS)
+        empty_df.attrs['signal_snapshot_complete'] = False
+        return empty_df
 
     logger.info(
         f"✅ [Cross/取数完成] 标的到位: [{len(fetched)}/{len(symbol_list)}] | "
         f"结果: [开始多参数推演]"
     )
-    return run_live_pipeline(fetched, strategy_params_list, logger)
-
+    result = run_live_pipeline(fetched, strategy_params_list, logger)
+    result.attrs['signal_snapshot_complete'] = bool(cache_complete)
+    return result
 
 # =============================================================================
 # 七、1m 因子信号：共用生成器、共用工作流、兼容适配器
@@ -2512,12 +2534,14 @@ def get_signal_factor_024_1(symbol):
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
-    # pair_df = gen_pair_signal('http://127.0.0.1:7890')
+    pair_df = gen_pair_signal('http://127.0.0.1:7890')
 
-    target_time = (
-            datetime.now() - timedelta(minutes=1)
-    ).strftime('%Y-%m-%d %H:%M')
+    # target_time = (
+    #         datetime.now() - timedelta(minutes=1)
+    # ).strftime('%Y-%m-%d %H:%M')
+    #
+    # symbol_list = ['SOL/USDT:USDT']
+    # signal = get_signal_factor_024_3(symbol_list[0])
+    # print()
 
-    symbol_list = ['SOL/USDT:USDT']
-    signal = get_signal_factor_024_1(symbol_list[0])
-    print()
+

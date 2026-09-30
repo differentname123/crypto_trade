@@ -66,7 +66,7 @@ KLINE_COLS = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
 FUNDING_COLS = ['timestamp', 'fundingRate', 'symbol']
 OI_COLS = ['timestamp', 'oi_amount']
 
-MAX_CACHE_ROWS = 525_600  # 单币缓存行数上限（≈1 年 1m K 线），防磁盘无限膨胀
+MAX_CACHE_ROWS = 220_000  # 单币缓存基础行数上限（≈153 天 1m K 线），长请求按需扩大
 HARD_DEADLINE_MS = 60_000  # 目标收盘后最多再死等 60s，随后硬熔断交卷
 EXCHANGE_TIMEOUT_MS = 15_000  # 单请求超时，放宽以吸收网络小抖动（抵御 WinError 64 闪断）
 _TF_UNIT_MS = {'s': 1000, 'm': 60_000, 'h': 3_600_000, 'd': 86_400_000, 'w': 604_800_000}
@@ -683,9 +683,6 @@ def _maybe_dispatch_dedupe_gc(snapshot_dir, lock_dir, keep_sec, log_prefix=""):
         pass
 
 
-# =====================================================================
-# 🗄️ 模块二：K 线缓存装载与后台落盘
-# =====================================================================
 def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_dir="data", log_prefix=""):
     """
     智能装载 K 线本地缓存，决定每个币真正需要联网补拉的起点。
@@ -703,29 +700,54 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
         if not os.path.exists(path):
             continue
         try:
-            df = _read_csv_guarded(path, timeout=5.0, log_prefix=log_prefix)
-            if df.empty or 'timestamp' not in df.columns:
-                continue
+            mutex = InterProcessMutex(_csv_rw_lock_path(path))
+            got_lock = mutex.acquire(timeout=5.0)
+            try:
+                for attempt in range(3):
+                    try:
+                        reader = pd.read_csv(path, usecols=KLINE_COLS, chunksize=50_000)
+                        break
+                    except Exception:
+                        if attempt == 2:
+                            raise
+                        time.sleep(0.1)
+                file_min, sub_min, sub_max = None, None, None
+                with reader:
+                    for df in reader:
+                        if df.empty:
+                            continue
+                        chunk_min = int(df['timestamp'].min())
+                        file_min = chunk_min if file_min is None else min(file_min, chunk_min)
+                        sub_df = df[df['timestamp'] >= start_time_ms]
+                        if sub_df.empty:
+                            continue
 
-            # values.tolist() 比 iterrows 快百倍，是主线程不被几十万行缓存拖死的关键
-            for row in df[KLINE_COLS].values.tolist():
-                ts = int(row[0])
-                memory_pool[sym][ts] = [ts] + row[1:]
-            loaded_rows += len(df)
+                        # values.tolist() 比 iterrows 快百倍，是主线程不被几十万行缓存拖死的关键
+                        for row in sub_df[KLINE_COLS].values.tolist():
+                            ts = int(row[0])
+                            memory_pool[sym][ts] = [ts] + row[1:]
+                        chunk_start, chunk_end = int(sub_df['timestamp'].min()), int(sub_df['timestamp'].max())
+                        sub_min = chunk_start if sub_min is None else min(sub_min, chunk_start)
+                        sub_max = chunk_end if sub_max is None else max(sub_max, chunk_end)
+                # 块尾的 DataFrame/row 不应与下一个币种的装载重叠驻留。
+                df = sub_df = row = None
+            finally:
+                if got_lock:
+                    mutex.release()
 
-            if int(df['timestamp'].min()) > start_time_ms:
+            unique_rows = len(memory_pool[sym])
+            loaded_rows += unique_rows
+            if file_min is None or file_min > start_time_ms or sub_min is None:
                 continue
-            sub_df = df[df['timestamp'] >= start_time_ms]
-            if sub_df.empty:
-                continue
-            sub_min, sub_max = int(sub_df['timestamp'].min()), int(sub_df['timestamp'].max())
             expected_rows = (sub_max - sub_min) // timeframe_ms + 1
-            if len(sub_df) < expected_rows or (sub_min - start_time_ms) > timeframe_ms:
+            if unique_rows < expected_rows or (sub_min - start_time_ms) > timeframe_ms:
                 continue
 
-            fetch_since_map[sym] = int(df['timestamp'].max())
+            fetch_since_map[sym] = sub_max
             hits += 1
         except Exception as e:
+            memory_pool[sym].clear()
+            df = sub_df = row = None
             broken.append(f"{sym}({e})")
 
     earliest = _format_bj_time(min(fetch_since_map.values())) if fetch_since_map else 'N/A'
@@ -737,46 +759,73 @@ def load_local_cache(symbol_list, start_time_ms, timeframe_ms, timeframe, cache_
     return memory_pool, fetch_since_map
 
 
-def _write_kline_cache_files(full_dfs, cache_dir, timeframe, log_prefix=""):
+def _write_kline_cache_files(full_dfs, cache_dir, timeframe, log_prefix="",
+                             max_cache_rows=None, consume_pool=False):
     """
     （后台线程专用）K 线缓存落盘：文件级跨进程读写锁 + merge-on-write + 原子覆盖。
-    merge-on-write 的意义：磁盘上可能有「其它进程」刚写入的新行，先读出来合并再覆盖，
-    timestamp 去重保留本进程内存池的值（keep='last'），彻底消除后写者覆盖前写者的丢帧。
-    入参形貌：full_dfs={symbol: DataFrame[KLINE_COLS]}
     """
     t0 = time.time()
     io_size, merged_rows, no_lock, failed = 0, 0, [], []
     os.makedirs(cache_dir, exist_ok=True)
 
-    for symbol, df in full_dfs.items():
+    row_limit = max(MAX_CACHE_ROWS, int(max_cache_rows or 0))
+    file_count = len(full_dfs)
+    for symbol in list(full_dfs):
+        old_df = out_df = None
+        if consume_pool:
+            item = full_dfs.pop(symbol)
+            if isinstance(item, pd.DataFrame):
+                df = item.iloc[-row_limit:].reset_index(drop=True) if len(item) > row_limit else item
+            else:
+                klines = sorted(item.values(), key=lambda k: k[0])[-row_limit:]
+                df = pd.DataFrame(klines, columns=KLINE_COLS)
+                item.clear()
+                del klines
+            del item
+        else:
+            df = full_dfs[symbol]
+
         path = _cache_path(cache_dir, symbol, f"{timeframe}_latest.csv")
         mutex = InterProcessMutex(_csv_rw_lock_path(path))
-        got_lock = mutex.acquire(timeout=60.0)  # 抢不到锁也不放弃落盘，退化为无锁覆写
+        got_lock = mutex.acquire(timeout=60.0)
+
+        # 【最终方案】：拿不到锁说明别的进程在写，直接放弃，绝不无锁覆写截断历史
         if not got_lock:
             no_lock.append(symbol)
+            df = out_df = old_df = None
+            continue
 
         try:
             out_df = df
-            if got_lock and os.path.exists(path):
+            if os.path.exists(path):
                 try:
-                    # 已持锁，必须直连 pd.read_csv（_read_csv_guarded 会再抢同一把锁，线程锁不可重入）
-                    old_df = pd.read_csv(path)
-                    if not old_df.empty and 'timestamp' in old_df.columns:
+                    # 尝试 3 次读取，吸收磁盘 IO 瞬时抖动
+                    old_df = None
+                    for attempt in range(3):
+                        try:
+                            old_df = pd.read_csv(path, usecols=KLINE_COLS)
+                            break
+                        except Exception:
+                            if attempt == 2: raise
+                            time.sleep(0.1)
+
+                    if old_df is not None and not old_df.empty and 'timestamp' in old_df.columns:
                         before = len(df)
-                        out_df = (pd.concat([old_df.reindex(columns=KLINE_COLS), df.reindex(columns=KLINE_COLS)],
-                                            ignore_index=True)
+                        out_df = (pd.concat([old_df, df], ignore_index=True)
                                   .dropna(subset=['timestamp'])
                                   .drop_duplicates(subset=['timestamp'], keep='last')
                                   .sort_values('timestamp')
+                                  .iloc[-row_limit:]
                                   .reset_index(drop=True))
-                        if len(out_df) > MAX_CACHE_ROWS:
-                            out_df = out_df.iloc[-MAX_CACHE_ROWS:].reset_index(drop=True)
                         merged_rows += max(0, len(out_df) - before)
                 except Exception as e:
-                    logger.warning(f"{log_prefix} [DISK] ⚠️ {symbol} 旧缓存合并失败，退化为直接覆写 "
-                                   f"（可能丢失其它进程刚写入的行） | 错误=[{e}]")
-                    out_df = df
+                    # 【最终方案】：无论合并还是读取报错，直接 continue 放弃本次写盘，保护旧缓存
+                    logger.warning(f"{log_prefix} [DISK] ⚠️ {symbol} 旧缓存处理失败，跳过覆写保护历史 | 错误=[{e}]")
+                    continue
 
+            old_df = None
+            if len(out_df) > row_limit:
+                out_df = out_df.iloc[-row_limit:].reset_index(drop=True)
             tmp_path = f"{path}.{uuid.uuid4().hex}.tmp"
             try:
                 out_df.to_csv(tmp_path, index=False)
@@ -792,34 +841,48 @@ def _write_kline_cache_files(full_dfs, cache_dir, timeframe, log_prefix=""):
         finally:
             if got_lock:
                 mutex.release()
+            df = out_df = old_df = None
 
-    summary = (f"{log_prefix} [DISK] 💾 后台守护落盘完毕 | 文件=[{len(full_dfs)}] 合并新增行=[{merged_rows}] "
+    summary = (f"{log_prefix} [DISK] 💾 后台守护落盘完毕 | 文件=[{file_count}] 合并新增行=[{merged_rows}] "
                f"体积=[{io_size / (1024 * 1024):.2f}MB] 耗时=[{time.time() - t0:.3f}s]")
     if no_lock:
-        summary += f" | ⚠️ 抢锁超时降级覆写=[{len(no_lock)}] {no_lock[:3]}"
+        summary += f" | ⚠️ 抢锁超时跳过覆写=[{len(no_lock)}] {no_lock[:3]}"
     logger.info(summary)
     if failed:
         logger.error(f"{log_prefix} [DISK] ❌ 部分币种缓存落盘失败，下次运行需重新回拉这段历史 "
                      f"| 失败=[{len(failed)}] 明细={failed[:5]}")
 
 
-def dispatch_kline_background_save(memory_pool_copy, timeframe, cache_dir="data", log_prefix=""):
+def dispatch_kline_background_save(memory_pool_copy, timeframe, cache_dir="data", log_prefix="",
+                                    max_cache_rows=None):
     """
     主线程金蝉脱壳：把「巨量排序 + DataFrame 构建 + 落盘」整体交给非守护线程
     （daemon=False 保证进程退出前一定写完），主线程立刻交付数据给业务。
     入参形貌：memory_pool_copy={symbol: {ts: [ts,o,h,l,c,v]}}
+    调用后所有权交给后台线程，调用方及其协程不得继续读写该池；名称保留以兼容原关键字参数。
     """
 
     def _task():
         try:
-            full_dfs = {}
-            for sym, pool in memory_pool_copy.items():
-                klines = sorted(pool.values(), key=lambda k: k[0])[-MAX_CACHE_ROWS:]
-                full_dfs[sym] = pd.DataFrame(klines, columns=KLINE_COLS)
-            _write_kline_cache_files(full_dfs, cache_dir, timeframe, log_prefix)
+            _write_kline_cache_files(memory_pool_copy, cache_dir, timeframe, log_prefix,
+                                     max_cache_rows=max_cache_rows, consume_pool=True)
         except Exception as e:
             # 后台线程无异常接收方，按原设计仅告警：本次缓存未更新，但已交付的数据不受影响
             logger.error(f"{log_prefix} [DISK] ❌ 后台落盘流水线崩溃，本轮缓存未更新（不影响已交付数据） | 错误=[{e}]")
+        finally:
+            memory_pool_copy.clear()
+            # 主循环可能已先进入休眠，后台最终释放后再尝试归还空闲页。
+            import gc
+            gc.collect()
+            if os.name == 'posix':
+                try:
+                    import ctypes
+                    trim = ctypes.CDLL(None).malloc_trim
+                    trim.argtypes = [ctypes.c_size_t]
+                    trim.restype = ctypes.c_int
+                    trim(0)
+                except (AttributeError, OSError):
+                    pass
 
     threading.Thread(target=_task, daemon=False).start()
 
@@ -1004,8 +1067,7 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     """
     K 线狙击主编排。链路：建连 → 缓存装载 → HIST-1 历史追赶 → 休眠至 target →
     HIST-2 缺口二次补齐 + WS 点火 → 收盘前 5s 点燃脉冲 REST → 全员收线放行（或 60s 硬熔断）
-    → O(1) 切片交付 → 全量内存池丢后台落盘。
-    出参形貌：{symbol: DataFrame[KLINE_COLS]}
+    → 逐币销毁 memory_pool 并构建紧凑 DataFrame → 后台落盘 & 主线程立即返回。
     """
     t_start = time.time()
     log_prefix = f"[T-{uuid.uuid4().hex[:4].upper()}]"
@@ -1014,8 +1076,6 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
     try:
         timeframe_ms, target_time_ms, start_time_ms, target_close_time_ms = parse_time_params(
             exchange, timeframe, days, target_time_str)
-        # logger.info(f"{log_prefix} [INIT] 🚀 K线极速引擎发车 | 目标=[{_format_bj_time(target_time_ms)}(+0800)] "
-        #             f"周期=[{timeframe}] 天数=[{days}] 币种=[{len(symbol_list)}] 双擎=[WS:{use_ws} REST:{use_rest}]")
 
         memory_pool, fetch_since_map = load_local_cache(
             symbol_list, start_time_ms, timeframe_ms, timeframe, log_prefix=log_prefix)
@@ -1028,14 +1088,14 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
             data_processor(queue, symbol_list, target_time_ms, timeframe_ms,
                            completion_event, memory_pool, processor_stats))
 
-        # 阶段一：首波历史追赶（能否命中缓存决定这里的网络量级）
+        # 阶段一：首波历史追赶
         hist_tracker_1 = {'done': 0, 'total': len(symbol_list), 'max_cost': 0, 'fetched_rows': 0,
                           'latest_ts': 0, 'phase': 'HIST-1', 'log_prefix': log_prefix}
         history_tasks = [asyncio.create_task(
             fetch_historical_rest(exchange, sym, timeframe, fetch_since_map[sym], queue, hist_tracker_1))
             for sym in symbol_list]
 
-        # 战术休眠一：睡到目标 K 线开盘，醒来立刻做缺口二次补齐，为收盘冲刺卸压
+        # 战术休眠一：睡到目标 K 线开盘，醒来立刻做缺口二次补齐
         sleep_to_target = target_time_ms - exchange.milliseconds()
         if sleep_to_target > 0:
             logger.info(f"{log_prefix} [SYNC] 💤 一阶段战术休眠（等目标K线开盘） | 睡眠=[{sleep_to_target / 1000:.1f}s] "
@@ -1057,15 +1117,13 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         # 战术休眠二：死等到收盘前 5s，再瞬间点爆无延迟脉冲 REST
         sleep_to_rest = target_close_time_ms - 5000 - exchange.milliseconds()
         if sleep_to_rest > 0:
-            # logger.info(f"{log_prefix} [SYNC] 💤 二阶段挂起（等收线冲刺窗口） | 睡眠=[{sleep_to_rest / 1000:.1f}s] "
-            #             f"下一动作=[点燃REST脉冲轮询]")
             await asyncio.sleep(sleep_to_rest / 1000)
 
         if use_rest:
             engine_tasks.append(asyncio.create_task(
                 fetch_realtime_rest_polling(exchange, symbol_list, timeframe, queue)))
 
-        # 等待全员收线；超过「收盘 + 60s」硬熔断，宁可交付残缺也绝不挂死
+        # 等待全员收线；超过「收盘 + 60s」硬熔断
         try:
             timeout = max(0.1, (target_close_time_ms + HARD_DEADLINE_MS - exchange.milliseconds()) / 1000)
             await asyncio.wait_for(completion_event.wait(), timeout=timeout)
@@ -1075,7 +1133,6 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
                            f"| 未到达=[{len(lag_symbols)}] 点名={lag_symbols[:5]}"
                            f"（可能原因：该币成交极度稀疏 / WS 与 REST 双通道均被网络阻断）")
 
-        # 确保尽力而为的历史分页全部交卷，并把队列排空，让最后交付的缺口尽可能补齐
         await asyncio.gather(*history_tasks, return_exceptions=True)
         await queue.join()
 
@@ -1087,30 +1144,42 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
                     f"吞吐=[ws:{throughput.get('WS', 0)} rest:{throughput.get('REST_POLL', 0)} "
                     f"hist:{throughput.get('HIST', 0)}] 点名={processor_stats['details']}")
 
-        # 发令枪响：强杀双擎与消费者（历史任务已自然跑完）
         all_tasks = engine_tasks + [processor_task]
         for task in all_tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*all_tasks, return_exceptions=True)
 
-        # 主线程只做 O(1) 切片，绝不碰全量排序（几十万行的脏活交给后台线程）
-        final_dfs, gaps = {}, []
+        # 逐币 pop 销毁 memory_pool，过滤未闭合新线，建 DataFrame
+        final_dfs, save_dfs, gaps = {}, {}, []
         expected_rows = int((target_time_ms - start_time_ms) / timeframe_ms) + 1
+        row_limit = max(MAX_CACHE_ROWS, expected_rows)
+
         for sym in symbol_list:
-            klines = [k for ts, k in memory_pool[sym].items() if start_time_ms <= ts <= target_time_ms]
+            pool = memory_pool.pop(sym, {})
+            klines = [k for ts, k in pool.items() if start_time_ms <= ts <= target_time_ms]
+            pool.clear()
+            del pool
             klines.sort(key=lambda k: k[0])
-            final_dfs[sym] = pd.DataFrame(klines, columns=KLINE_COLS)
-            if len(klines) < expected_rows:
-                gaps.append(f"{sym}(缺{expected_rows - len(klines)})")
+            df = pd.DataFrame(klines, columns=KLINE_COLS)
+            del klines
+
+            final_dfs[sym] = df
+            # 【最终方案】：接受约60MB的拷贝成本，彻底切断底层数组引用，实现绝对的线程安全隔离
+            save_dfs[sym] = df.copy(deep=True)
+
+            if len(df) < expected_rows:
+                gaps.append(f"{sym}(缺{expected_rows - len(df)})")
+            del df
+        memory_pool.clear()
+
         if gaps:
             logger.warning(f"{log_prefix} [CHECK] ⚠️ 交付数据存在断缺，请评估是否影响指标计算 "
-                           f"| 涉及=[{len(gaps)}/{len(symbol_list)}] 应有行数=[{expected_rows}] 明细={gaps[:5]}"
-                           f"（可能原因：该币上线较晚 / 交易所历史本身缺失 / 历史分页请求失败）")
+                           f"| 涉及=[{len(gaps)}/{len(symbol_list)}] 应有行数=[{expected_rows}] 明细={gaps[:5]}")
 
-        # 后台交接：全量清洗与落盘扔给子线程慢慢跑，主线程立刻返回
-        dispatch_kline_background_save({sym: pool.copy() for sym, pool in memory_pool.items()},
-                                       timeframe, cache_dir="data", log_prefix=log_prefix)
+        # 后台交接
+        dispatch_kline_background_save(save_dfs, timeframe, cache_dir="data", log_prefix=log_prefix,
+                                       max_cache_rows=row_limit)
 
         logger.info(f"{log_prefix} [EXIT] 🎉 主任务零阻塞闪现交付 "
                     f"| 区间=[{_format_bj_time(start_time_ms)} ~ {_format_bj_time(target_time_ms)}] "
@@ -1118,7 +1187,6 @@ async def _async_core_sniping_orchestrator(symbol_list, timeframe, days, target_
         return final_dfs
     finally:
         await _shutdown_exchange(exchange)
-
 
 # =====================================================================
 # 🗃️ 模块六：记录型缓存通用层（资金费率 / OI 共用）
