@@ -64,7 +64,7 @@ from html import escape as _local_xml_escape
 # ==================== 本地接口配置（独立于 Google API Key） ====================
 LOCAL_API_BASE_URL = _local_os.getenv(
     "GEMINI_LOCAL_API_BASE_URL",
-    "http://127.0.0.1:3000/v1/chat/completions",
+    "http://127.0.0.1:8083/v1/chat/completions",
 )
 LOCAL_API_KEY = get_config("local_gemini_api_key")
 LOCAL_MODELS = ("gpt-5.6", "gemini-pro-latest")

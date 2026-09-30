@@ -61,7 +61,7 @@ SHELF_LIFE_SECONDS = {
 MODEL_NAME_PRO = "gpt-6-luna-max"
 MODEL_NAME_PRO = "gemini-3.1-pro-thinking"
 
-MODEL_NAME_PRO = "gpt-5.6"
+# MODEL_NAME_PRO = "gpt-5.6"
 
 
 def _publish_time_seconds(value):
