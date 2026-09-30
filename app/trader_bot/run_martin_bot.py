@@ -940,7 +940,7 @@ class BlueprintBuilder:
             n_qty = acc_qty + qty
             n_cost = acc_cost + price * qty
             n_avg = n_cost / n_qty
-            loss_at_fill = sign * (n_avg - price) * n_qty          # 该层成交瞬间浮亏(>=0)
+            loss_at_fill = sign * (n_avg - price) * n_qty  # 该层成交瞬间浮亏(>=0)
 
             if i == 0:
                 # 首单必须满足最小名义价值; 不能只丢一层(会破坏马丁结构), 只能整个信号作废
@@ -968,18 +968,12 @@ class BlueprintBuilder:
 
         # ---------- 全局唯一止损价: 按未裁剪前的最后一层满仓时恰好亏 max_loss_usdt 反解 ----------
         raw_final_avg = acc_cost / acc_qty
-        raw_deepest = layers[-1].price
         sl = spec.round_price(raw_final_avg - sign * max_loss_usdt / acc_qty,
                               "up" if d is Direction.LONG else "down")
         if d is Direction.LONG and sl <= 0:
             sl = spec.round_price(max(spec.tick_size, p0 * 0.02), "up")
             logger.critical(f"[蓝图] 满仓止损价算出非正数(最大亏损远超满仓名义价值), 已夹到极低保护位 | "
                             f"保护位:[{sl}] 注意: 实际亏损可能远超[{max_loss_usdt}U]")
-        if (d is Direction.LONG and sl >= raw_deepest) or (d is Direction.SHORT and sl <= raw_deepest):
-            logger.critical(f"[蓝图] 全局止损价与最深层价位置颠倒, 参数异常, 丢弃信号 | "
-                            f"止损价:[{sl}] 最深层价:[{raw_deepest}] 方向:[{d.value}] "
-                            f"(请调大 max_loss_mult 或调小 step_pct/qty_mult)")
-            return None
 
         # ---------- 尾层安全垫裁剪: 全局止损价 sl 保持不变, 剔除距 sl 不足 min_sl_dist_pct 的层 ----------
         min_dist = cfg.min_sl_dist_pct
@@ -1013,6 +1007,11 @@ class BlueprintBuilder:
         acc_cost = rows[-1][4]
         final_avg = rows[-1][5]
         deepest = layers[-1].price
+        if (d is Direction.LONG and sl >= deepest) or (d is Direction.SHORT and sl <= deepest):
+            logger.critical(f"[蓝图] 全局止损价与最深层价位置颠倒, 参数异常, 丢弃信号 | "
+                            f"止损价:[{sl}] 最深层价:[{deepest}] 方向:[{d.value}] "
+                            f"(请调大 max_loss_mult 或调小 step_pct/qty_mult)")
+            return None
         actual_sl_loss = sign * (final_avg - sl) * acc_qty
 
         table = "\n".join(
