@@ -94,7 +94,7 @@ from signal_generator import (
     get_signal_factor_044_10,
     get_signal_factor_044_5,
     get_signal_factor_044_3,
-    get_signal_factor_044_4, get_signal_factor_007_1, get_signal_factor_044_8, get_signal_factor_024_3,
+    get_signal_factor_044_4, get_signal_factor_007_1, get_signal_factor_044_8, get_signal_factor_024_3, get_signal_factor_024_1
 
 )
 
@@ -112,6 +112,7 @@ SIGNAL_REGISTRY = {
 
     "factor_044_8": get_signal_factor_044_8,
     "factor_024_3": get_signal_factor_024_3,
+    "factor_024_1": get_signal_factor_024_1,
 
 }
 
@@ -2466,10 +2467,10 @@ class MartinEngine:
     def _idle_tick(self):
         time.sleep(self.cfg.idle_poll_interval_sec)
 
-        # 跑完当前周期后自动退出进程（全部跑完后主程序自动结束）
-        logger.info(f"[停机] 当前无进行中周期，按只平不开模式自动退出 | 策略:[{self.cfg.strategy_id}]")
-        self.stop_flag = True
-        return
+        # # 跑完当前周期后自动退出进程（全部跑完后主程序自动结束）
+        # logger.info(f"[停机] 当前无进行中周期，按只平不开模式自动退出 | 策略:[{self.cfg.strategy_id}]")
+        # self.stop_flag = True
+        # return
 
         sig = self.gate.poll()          # 先查信号: 无信号则一次网络请求都不发
         if sig is None:
@@ -2929,31 +2930,27 @@ def main_app():
 
     ]
     layer_loss_budget_ratio = 1
-    # 1. 公共策略模板（所有账号都会运行的基础策略）  金额按照 900 的总保证金来算的，其实 理论最大杠杆只能够是 2.22倍
+    # 1. 公共策略模板（所有账号都会运行的基础策略）  最大回撤 0.69 M | 波段90%回撤 0.45 M
     strategy_templates = [
-        {"base_id": "SAAVE4", "symbol": "AAVE/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 0.3, "step_pct": 1.5, "qty_mult": 2, "tp_pct": 0.6,
-         "max_loss_mult": 4, "layer_loss_budget_ratio": layer_loss_budget_ratio},
+        {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT", "signal_name": "factor_044_4",
+         "first_qty": 0.01, "step_pct": 1,  "tp_pct": 0.7,"max_loss_mult": 7, "qty_mult": 2,
+         "layer_loss_budget_ratio": layer_loss_budget_ratio},
+
+        {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT", "signal_name": "factor_043_10",
+         "first_qty": 0.01, "step_pct": 2.5,  "tp_pct": 1.1,"max_loss_mult": 10, "qty_mult": 2,
+         "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
-         "first_qty": 6, "step_pct": 1.8, "tp_pct": 0.9, "qty_mult": 2,
-         "max_loss_mult": 6, "layer_loss_budget_ratio": layer_loss_budget_ratio},
-
-        {"base_id": "LRENDER5", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_3",
-         "first_qty": 21, "step_pct": 2, "tp_pct": 1.1, "qty_mult": 2,
-         "max_loss_mult": 5, "layer_loss_budget_ratio": layer_loss_budget_ratio},
+         "first_qty": 0.01, "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
+         "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
-         "first_qty": 26, "step_pct": 1.8, "tp_pct": 1.2, "qty_mult": 2,
-         "max_loss_mult": 4, "layer_loss_budget_ratio": layer_loss_budget_ratio},
+         "first_qty": 0.01, "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
+         "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
-        {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_3",
-         "first_qty": 0.13, "step_pct": 2.5, "tp_pct": 1.2, "qty_mult": 2,
-         "max_loss_mult": 10, "layer_loss_budget_ratio": layer_loss_budget_ratio},
-
-        {"base_id": "SUNI6", "symbol": "UNI/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 2, "step_pct": 2, "tp_pct": 0.9, "qty_mult": 2,
-         "max_loss_mult": 6, "layer_loss_budget_ratio": layer_loss_budget_ratio},
+        {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_1",
+         "first_qty": 0.01, "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
+         "layer_loss_budget_ratio": layer_loss_budget_ratio},
     ]
 
     configs = []

@@ -2458,15 +2458,66 @@ def get_signal_factor_024_3(symbol):
 
 
 # =============================================================================
+# 因子 024_1: 3周期K线重心均值突破 (LONG)
+# =============================================================================
+def generate_factor_024_1_signals(df):
+    """
+    factor_024_1：3根K线重心均值突破1440根历史95%分位数，产生 LONG OPEN。
+    """
+    if df is None or len(df) < 1440:
+        return pd.DataFrame()
+
+    symbol, coin = _resolve_identity(df)
+    time_col = _pick_column(df, ['timestamp', 'open_time', 'time', 'ts'], 'kline')
+
+    win_short, win_long, q_high = 3, 1440, 0.95
+    high = df['high'].astype(float)
+    low = df['low'].astype(float)
+    close = df['close'].astype(float)
+
+    k_pos = (close - low) / (high - low).replace(0, 1e-9)
+    mean_pos = k_pos.rolling(win_short).mean()
+    threshold = mean_pos.rolling(win_long).quantile(q_high)
+
+    signal = mean_pos > threshold
+    hits = df[signal.fillna(False).astype(bool)].copy()
+
+    return _build_factor_result(
+        hits, time_col, symbol, coin, 'factor_024_1', 'LONG'
+    )
+
+
+def execute_trading_bot_workflow_factor_024_1(
+        target_time=None, symbol_list=None, proxy_url=None):
+    """factor_024_1：1m K线重心3周期高分位突破做多。"""
+    return _run_factor_workflow(
+        'factor_024_1',
+        target_time,
+        symbol_list,
+        proxy_url,
+        generate_factor_024_1_signals,
+        'K线重心3周期突破做多信号生成',
+    )
+
+
+def get_signal_factor_024_1(symbol):
+    """供外部或单标的独立调用的 024_1 因子适配器"""
+    return _get_factor_signal(
+        symbol,
+        execute_trading_bot_workflow_factor_024_1,
+        'factor_024_1',
+    )
+
+# =============================================================================
 # 八、本地联调入口
 # =============================================================================
 if __name__ == '__main__':
-    pair_df = gen_pair_signal('http://127.0.0.1:7890')
+    # pair_df = gen_pair_signal('http://127.0.0.1:7890')
 
-    # target_time = (
-    #         datetime.now() - timedelta(minutes=1)
-    # ).strftime('%Y-%m-%d %H:%M')
-    #
-    # symbol_list = ['SOL/USDT:USDT']
-    # signal = get_signal_factor_024_3(symbol_list[0])
-    # print()
+    target_time = (
+            datetime.now() - timedelta(minutes=1)
+    ).strftime('%Y-%m-%d %H:%M')
+
+    symbol_list = ['SOL/USDT:USDT']
+    signal = get_signal_factor_024_1(symbol_list[0])
+    print()
