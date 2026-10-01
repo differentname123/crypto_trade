@@ -309,6 +309,10 @@ def probe_models(json_path):
         models_page = client.models.list()
         # : 沿用仅处理当前页 data 的规则，不自动翻页、去重或按模型能力筛选。
         available_models = sorted(model.id for model in models_page.data)
+        # 排除 包含 music video image 等一眼就不是文本模型
+        available_models = [m for m in available_models if not re.search(r"\b(music|video|image)\b", m, re.I)]
+
+
         _log(f"[模型探测/列表] 获取完成 | 模型数: [{len(available_models)}]"
              f" | 模型预览: [{_preview(available_models, 2000)}]")
     except Exception as exc:
@@ -330,7 +334,7 @@ def probe_models(json_path):
         report["details"].append({
             "model_name": model_id,
             "status": result.get("status"),
-            "content": result.get("content"),
+            "content": result.get("content")[:1000],
             "total_time_seconds": result.get("metrics", {}).get("total_time_seconds", 0.0),
             "error_history": result.get("error_history", []),
         })
@@ -338,6 +342,7 @@ def probe_models(json_path):
              f" | 模型: [{model_id}] | 结果: [{result.get('status')}]"
              f" | 成功数: [{report['success_count']}] | trace_id: [{result.get('trace_id')}]")
         time.sleep(0.5)
+        br
 
     try:
         save_json(json_path, report)
