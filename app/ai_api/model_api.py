@@ -310,7 +310,7 @@ def probe_models(json_path):
         # : 沿用仅处理当前页 data 的规则，不自动翻页、去重或按模型能力筛选。
         available_models = sorted(model.id for model in models_page.data)
         _log(f"[模型探测/列表] 获取完成 | 模型数: [{len(available_models)}]"
-             f" | 模型预览: [{_preview(available_models, 200)}]")
+             f" | 模型预览: [{_preview(available_models, 2000)}]")
     except Exception as exc:
         report["error"] = _redact(f"[模型探测失败] 获取模型列表失败: {type(exc).__name__}: {exc}")
         _log(f"❌ [模型探测/列表] 获取失败，将保存空报告 | 原因: [{report['error']}]"
