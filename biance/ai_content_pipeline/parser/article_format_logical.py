@@ -19,8 +19,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
-from app.ai_api.gemini_api import get_llm_content_local
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
+from app.ai_api.model_api import generate_content
 from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
@@ -204,8 +204,11 @@ def gen_media_format_info(post):
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         raw_response, error_detail = "", ""
         try:
-            if random.random() < -1.9:
-                raw_response = get_llm_content_local(prompt=full_prompt, image_paths=paths, model_name=MODEL_NAME_PRO)
+            if random.random() < 1.9:
+                # raw_response = get_llm_content_local(prompt=full_prompt, image_paths=paths, model_name=MODEL_NAME_PRO)
+                result = generate_content(prompt=full_prompt, file_paths=paths, model="gemini-3.8-flash-thinking")
+                raw_response = result.get("content", "")
+
             else:
                 error_detail, raw_response = generate_gemini_content_playwright(
                     full_prompt, file_path=paths
@@ -512,7 +515,7 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
         return False, "ok 的 reason 必须为 null"
     material_by_id = {item["id"]: item for item in materials}
     used_ids, selected_images = article_info["used_material_ids"], article_info["image_placeholders"]
-    if not 1 <= len(used_ids) <= 3 or any(item not in material_by_id for item in used_ids):
+    if not 1 <= len(used_ids) <= 10 or any(item not in material_by_id for item in used_ids):
         return False, "used_material_ids 必须引用实际存在的 1—3 条素材"
     if len(selected_images) > 3:
         return False, "最多使用 3 张图片"
@@ -676,7 +679,8 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             error_detail = ""
             try:
                 if random.random() < 1.9:
-                    raw_response = get_llm_content_local(prompt=full_prompt, model_name=MODEL_NAME_PRO)
+                    result = generate_content(prompt=full_prompt, model=MODEL_NAME_PRO)
+                    raw_response = result.get("content", "")
                 else:
                     error_detail, raw_response = generate_gemini_content_playwright(
                         full_prompt, model_name=model_name

@@ -134,7 +134,7 @@ def generate_content(
     file_paths: list[str] = None,
     fallback_model: str = None,
     max_retries_per_model: int = 3,
-    timeout: float = 60.0,
+    timeout: float = 360.0,
 ) -> dict:
     """同步调用；每模型最多尝试指定次数，包含首次请求。
 
@@ -301,7 +301,7 @@ def probe_models(json_path: str) -> dict:
             model=model_id,
             file_paths=None,
             max_retries_per_model=1,
-            timeout=30.0
+            timeout=360
         )
 
         is_success = result.get("status") == "✅ 成功"
