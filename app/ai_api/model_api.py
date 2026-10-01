@@ -7,14 +7,15 @@ import os
 import re
 import time
 import uuid
+from datetime import datetime, timezone, timedelta
 from html import escape
 from pathlib import Path
 
 from openai import OpenAI
 
-__all__ = ["generate_content"]
+__all__ = ["generate_content", "probe_models"]
 
-from common.common_utils import setup_logger, get_config
+from common.common_utils import setup_logger, get_config,read_json,save_json
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
@@ -250,12 +251,94 @@ def generate_content(
     return result
 
 
+def probe_models(json_path: str) -> dict:
+    """探测可用模型并逐一测试其连通性，最后将结果保存至指定的 JSON 文件。"""
+    bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    prompt = "你是谁，简单的介绍一下自己，能够画一只小狗或者生成小狗的视频吗，或者创作一首歌"
+
+    client = None
+    available_models = []
+
+    try:
+        if not API_KEY:
+            raise ValueError("未配置 API 密钥，请检查环境变量或配置文件。")
+        # 建立客户端获取模型列表
+        client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=15.0)
+        models_page = client.models.list()
+        available_models = [m.id for m in models_page.data]
+        _log(f"[模型探测] 接口返回总计支持模型数量: {len(available_models)}")
+    except Exception as e:
+        error_msg = _redact(f"[模型探测失败] 获取模型列表失败: {type(e).__name__}: {e}")
+        _log(error_msg)
+        # 获取列表就失败的话，记录一个空的结果并返回
+        report = {
+            "test_time_bj": bj_time,
+            "total_models": 0,
+            "success_count": 0,
+            "details": [],
+            "error": error_msg
+        }
+        save_json(json_path, report)
+        return report
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    total_models = len(available_models)
+    success_count = 0
+    details = []
+
+    # 遍历探测所有模型
+    for model_id in available_models:
+        _log(f"[开始探测模型] {model_id}")
+
+        # 探测不需要多次重试，超时时间设置短些
+        result = generate_content(
+            prompt=prompt,
+            model=model_id,
+            file_paths=None,
+            max_retries_per_model=1,
+            timeout=30.0
+        )
+
+        is_success = result.get("status") == "✅ 成功"
+        if is_success:
+            success_count += 1
+
+        details.append({
+            "model_name": model_id,
+            "status": result.get("status"),
+            "content": result.get("content"),
+            "total_time_seconds": result.get("metrics", {}).get("total_time_seconds", 0.0),
+            "error_history": result.get("error_history", [])
+        })
+
+        # 短暂休眠避免因并发触发频率限制
+        time.sleep(0.5)
+
+    report = {
+        "test_time_bj": bj_time,
+        "total_models": total_models,
+        "success_count": success_count,
+        "details": details
+    }
+
+    save_json(json_path, report)
+    _log(f"[探测完成] 总计模型: {total_models}, 成功可用: {success_count}。结果已保存至: {json_path}")
+
+    return report
+
+
 if __name__ == "__main__":
-    result = generate_content(
-        prompt="你是谁，请分别描述这些图片，并标明对应的文件名。",
-        model="gemini-3.8-flash",
-        file_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg",
-                    r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png"
-                    ]
-    )
-    print(_redact(result))
+    # result = generate_content(
+    #     prompt="你是谁，请分别描述这些图片，并标明对应的文件名。",
+    #     model="gemini-3.8-flash",
+    #     file_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg",
+    #                 r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png"
+    #                 ]
+    # )
+    # print(_redact(result))
+    probe_models("model_probe_results.json")
