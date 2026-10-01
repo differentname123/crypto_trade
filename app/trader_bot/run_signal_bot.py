@@ -1012,6 +1012,8 @@ WORKER_CONFIGS = [
     {"account": "nana",   "strategy": "cross"},
     {"account": "qiqi",   "strategy": "cross"},
     {"account": "ruru",   "strategy": "cross"},
+    {"account": "yanglin", "strategy": "cross"},
+
 ]
 
 
