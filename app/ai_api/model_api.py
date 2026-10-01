@@ -75,12 +75,42 @@ class _RedactingFormatter(logging.Formatter):
     def format(self, record):
         return _redact(self.original.format(record))
 
+class _RedactingFormatter(logging.Formatter):
+    """沿用现有 Formatter 的格式，最后统一脱敏，包括异常堆栈。"""
+    def __init__(self, original=None):
+        super().__init__()
+        self.original = original or logging.Formatter()
+
+    def format(self, record):
+        return _redact(self.original.format(record))
+
+# ==========================================
+# 👇 1. 在本地定义拦截器 👇
+# ==========================================
+class BlockHttpLogsFilter(logging.Filter):
+    def filter(self, record):
+        # 根据日志所属的库拦截
+        if record.name.startswith(("httpx", "httpcore", "openai", "urllib3")):
+            return False
+        # 根据函数名拦截
+        if record.funcName in ["_send_single_request", "send"]:
+            return False
+        return True
+
 
 logger = setup_logger(app_name="model_api")
+
+# 实例化过滤器
+http_filter = BlockHttpLogsFilter()
+
+# 遍历已经绑定在这个 logger 上的所有 Handler（控制台、文件等）
 for handler in logger.handlers:
+    # 动态注入 HTTP 拦截器
+    handler.addFilter(http_filter)
+
+    # 动态注入你的脱敏 Formatter（保留你的原有逻辑）
     if not isinstance(handler.formatter, _RedactingFormatter):
         handler.setFormatter(_RedactingFormatter(handler.formatter))
-
 
 def _build_content(prompt, file_paths):
     content = [{"type": "text", "text": prompt}]
@@ -260,7 +290,10 @@ def probe_models(json_path: str) -> dict:
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=15.0)
         models_page = client.models.list()
         available_models = [m.id for m in models_page.data]
-        _log(f"[模型探测] 接口返回总计支持模型数量: {len(available_models)}")
+        # 对available_models进行排序，方便后续查看
+        available_models.sort()
+
+        _log(f"[模型探测] 接口返回总计支持模型数量: {len(available_models)} ：{available_models}")
     except Exception as e:
         error_msg = _redact(f"[模型探测失败] 获取模型列表失败: {type(e).__name__}: {e}")
         _log(error_msg)
