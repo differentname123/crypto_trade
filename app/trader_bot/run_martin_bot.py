@@ -3136,12 +3136,12 @@ def run_single_strategy(cfg, shared_prices=None, shared_signal=None,
 def main_app():
     """按账户启动交易进程；每个信号键独立计算，并监控信号发布进度。"""
     accounts = [
-        "myself",
-        "ruru",
+        # "myself",
+        # "ruru",
         "qiqi",
-        "mama",
+        # "mama",
         "nana",
-        "yanglin",
+        # "yanglin",
     ]
 
     # 覆盖分钟收盘等待与正常计算耗时；只告警，不自动重启或操作持仓。
