@@ -4,7 +4,7 @@
 择时马丁交易引擎 | 信号驱动 + 单写者串行状态机 + WAL账本 + 订单全生命周期登记表
 ================================================================================
 [功能摘要]
-  每个 MartinConfig 独占一个子进程: 空闲期轮询外部择时信号, 拿到有效开仓信号后, 依据
+  每个 MartinConfig 独占一个子进程: 空闲期读取共享择时信号, 拿到有效开仓信号后, 依据
   【加仓间距/加仓倍数/首单名义价值的亏损倍数】一次性算死整张马丁蓝图(层数由周期亏损预算决定),
   周期亏损预算 max_loss_usdt = 首单名义价值 × max_loss_mult, 随蓝图固定并写入 WAL;
   把所有层的限价开仓单铺到盘口; 随后每 2 秒一个 Tick 串行维护止盈/止损, 直到周期收尾回到空闲态。
@@ -13,6 +13,7 @@
 [输入数据]
   1. 择时信号 get_signal_x(symbol) -> pd.DataFrame, 核心列:
      timestamp(ms) / event(OPEN|CLOSE) / direction(LONG|SHORT) / price;
+     每个(信号名,交易对)独占一个计算进程, 交易进程只读取最新开仓信号的精简快照;
   2. 交易所快照: 最新价、本策略 OID 前缀的在线挂单(普通单 + 算法条件单)、positionSide 实际持仓;
   3. 本地 WAL 账本 martin_data/martin_ledger_{strategy_id}.csv(冷启动断点续传的唯一依据);
   4. 静态配置 MartinConfig + 交易所交易规格 InstrumentSpec(tick/step/minQty/minNotional)。
@@ -87,33 +88,20 @@ UniOrder = ex_api.UniOrder
 make_fail_result = ex_api.make_fail_result
 safe_init_exchange = ex_api.safe_init_exchange
 
-from signal_generator import (
-    get_signal_factor_043_9,
-    get_signal_factor_043_10,
-    get_signal_factor_044_1,
-    get_signal_factor_044_10,
-    get_signal_factor_044_5,
-    get_signal_factor_044_3,
-    get_signal_factor_044_4, get_signal_factor_007_1, get_signal_factor_044_8, get_signal_factor_024_3, get_signal_factor_024_1
-
-)
-
-# 信号源按字符串注册，保证 MartinConfig 可跨进程序列化。
+# 这里只登记函数名; signal_generator 仅在信号计算进程内导入。
+# 主进程、Manager 与交易进程不主动加载信号模块及其历史行情/因子缓存。
 SIGNAL_REGISTRY = {
-    "factor_044_1": get_signal_factor_044_1,
-    "factor_043_10": get_signal_factor_043_10,
-    "factor_043_9": get_signal_factor_043_9,
-    "factor_044_10": get_signal_factor_044_10,
-    "factor_044_5": get_signal_factor_044_5,
-    "factor_044_3": get_signal_factor_044_3,
-    "factor_044_4": get_signal_factor_044_4,
-
-    "factor_007_1": get_signal_factor_007_1,
-
-    "factor_044_8": get_signal_factor_044_8,
-    "factor_024_3": get_signal_factor_024_3,
-    "factor_024_1": get_signal_factor_024_1,
-
+    "factor_044_1": "get_signal_factor_044_1",
+    "factor_043_10": "get_signal_factor_043_10",
+    "factor_043_9": "get_signal_factor_043_9",
+    "factor_044_10": "get_signal_factor_044_10",
+    "factor_044_5": "get_signal_factor_044_5",
+    "factor_044_3": "get_signal_factor_044_3",
+    "factor_044_4": "get_signal_factor_044_4",
+    "factor_007_1": "get_signal_factor_007_1",
+    "factor_044_8": "get_signal_factor_044_8",
+    "factor_024_3": "get_signal_factor_024_3",
+    "factor_024_1": "get_signal_factor_024_1",
 }
 
 # ==============================================================================
@@ -147,6 +135,8 @@ TIME_SYNC_SEC = 3600.0           # 主循环定时维护: 与交易所重新校�
 SHARED_PRICE_CACHE_SEC = 1.5    # 同币种跨进程最新价共享缓存时效
 DASHBOARD_CACHE_SEC = 30.0      # 同账户看板快照跨进程缓存时效
 STARTUP_PREVIEW_SEC = 10        # 启动前蓝图预览确认窗口
+SIGNAL_REFRESH_SEC = 1.0        # 同一信号键的计算间隔上限; 更短的空闲轮询配置仍优先
+SIGNAL_READ_SEC = 0.1           # 空闲态检查共享快照的间隔; 不请求网络、不计算因子
 
 # 账本与单实例锁的【固定绝对目录】: 无论从哪个工作目录启动, 同一 strategy_id 只可能有一个实例
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_data")
@@ -770,17 +760,68 @@ class MartinConfig:
         logger.critical(f"[配置] 校验失败[{len(errs)}]项, 拒绝启动 | 策略:[{self.strategy_id}] "
                         f"问题清单: " + " || ".join(errs))
         raise SystemExit(1)
+class SharedSignal:
+    """每个信号键一份固定大小快照: 发布时间(monotonic)、信号毫秒时间戳、方向、价格。"""
+
+    def __init__(self, ctx):
+        self._data = ctx.RawArray("d", 4)
+        self._lock = ctx.Lock()
+
+    def publish(self, latest):
+        # 计算、解析、日志全部在锁外; 只在锁内复制四个数, 不让读者等待计算。
+        values = (time.monotonic(), *(latest or (0.0, 0.0, 0.0)))
+        if not self._lock.acquire(timeout=SIGNAL_READ_SEC):
+            return False
+        try:
+            self._data[:] = values
+        finally:
+            self._lock.release()
+        return True
+
+    def read(self):
+        # 即使写进程异常退出并遗留锁, 交易进程也立即返回, 绝不阻塞主线程。
+        if not self._lock.acquire(False):
+            return None
+        try:
+            return tuple(self._data)
+        finally:
+            self._lock.release()
+
+
+def _latest_open_signal(func, symbol):
+    """只在信号进程执行; 沿用原来的最新非未来 OPEN 行选择规则。"""
+    df = func(symbol)
+    if df is None or df.empty:
+        return None
+    open_df = df[df['event'].astype(str).str.upper() == "OPEN"]
+    if open_df.empty:
+        return None
+    current_ts = int(time.time() * 1000)
+    open_df = open_df[open_df['timestamp'] <= current_ts]
+    if open_df.empty:
+        return None
+    row = open_df.sort_values(by='timestamp', ascending=True).iloc[-1]
+    direction_str = str(row['direction']).upper()
+    if direction_str not in (Direction.LONG.value, Direction.SHORT.value):
+        logger.info(f"[信号] 方向字段无法识别, 丢弃该行 | direction:[{direction_str}]")
+        return None
+    return (int(row['timestamp']),
+            1.0 if direction_str == Direction.LONG.value else -1.0,
+            float(row['price']))
+
+
 class SignalGate:
     """
-    信号闸门: 只认干净标准化的 DataFrame。
-    期望列: timestamp(ms) / event(OPEN|CLOSE) / direction(LONG|SHORT) / price(float)。
-    watermark_ts 为已消费水位线, 保证同一信号永不被重复消费。
+    信号闸门: 只读取本信号键的共享快照, 不导入信号模块、不计算 DataFrame。
+    watermark_ts 与时效检查仍由各策略独立维护, 某账户消费不影响其它账户。
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, shared_signal=None):
         self.cfg = cfg
-        self.func = SIGNAL_REGISTRY[cfg.signal_name]
+        self.shared_signal = shared_signal
         self.watermark_ts = 0
+        self._last_returned_ts = 0
+        self._retry_after = 0.0
 
     def set_watermark(self, ts):
         self.watermark_ts = max(self.watermark_ts, int(ts or 0))
@@ -788,43 +829,49 @@ class SignalGate:
     def poll(self):
         """返回 Signal 或 None。信号源故障不得打断引擎, 故此处刻意吞掉异常并告警。"""
         try:
-            df = self.func(self.cfg.symbol)
-            if df is None or df.empty:
+            snapshot = self.shared_signal.read() if self.shared_signal is not None else None
+            if snapshot is None:
                 return None
-
-            open_df = df[df['event'].astype(str).str.upper() == "OPEN"].copy()
-            if open_df.empty:
+            published, ts, direction_code, px = snapshot
+            if published <= 0:
                 return None
-
+            ts = int(ts)
             current_ts = int(time.time() * 1000)
-            open_df = open_df[open_df['timestamp'] <= current_ts]
-            if open_df.empty:
+            if ts <= self.watermark_ts or ts > current_ts:
                 return None
-
-            open_df = open_df.sort_values(by='timestamp', ascending=True)
-            row = open_df.iloc[-1]
-
-            direction_str = str(row['direction']).upper()
-            if direction_str not in (Direction.LONG.value, Direction.SHORT.value):
-                logger.info(f"[信号] 方向字段无法识别, 丢弃该行 | direction:[{direction_str}]")
+            if direction_code not in (1.0, -1.0):
                 return None
-
-            ts, px = int(row['timestamp']), float(row['price'])
-            if ts <= self.watermark_ts:
-                return None
-
             age_sec = (current_ts - ts) / 1000.0
             if age_sec > self.cfg.max_signal_age_sec:
                 logger.info(f"[信号] 信号已过期, 拒绝追单(避免在错误价位铺马丁) | 滞后:[{age_sec:.1f}s] "
                             f"上限:[{self.cfg.max_signal_age_sec}s] 信号ts:[{ts}]")
                 self.set_watermark(ts)
                 return None
+            if time.monotonic() - published > self.cfg.max_signal_age_sec:
+                return None  # 单调时钟兜底, 防系统时间回拨使停更快照重新变得有效。
 
-            return Signal(Direction(direction_str), px, ts, self.cfg.signal_name)
+            direction = Direction.LONG if direction_code == 1.0 else Direction.SHORT
+            return Signal(direction, px, ts, self.cfg.signal_name)
         except Exception as e:
-            logger.error(f"[信号] 读取信号源失败, 本轮视为无信号(请检查 {self.cfg.signal_name} "
-                         f"返回的列是否为 timestamp/event/direction/price) | 错误:[{e}]")
+            logger.error(f"[信号] 读取共享信号失败, 本轮视为无信号 | "
+                         f"信号:[{self.cfg.signal_name}] 错误:[{e}]")
             return None
+
+    def wait(self, timeout):
+        """空闲态短步检查; 新信号立即返回, 同一未消费信号的重试仍按原空闲间隔限速。"""
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+        while True:
+            sig = self.poll()
+            now = time.monotonic()
+            if sig is not None and (sig.signal_ts != self._last_returned_ts
+                                    or now >= self._retry_after):
+                self._last_returned_ts = sig.signal_ts
+                self._retry_after = now + timeout
+                return sig
+            if now >= deadline:
+                return None
+            time.sleep(min(SIGNAL_READ_SEC, deadline - now))
 
 # ==============================================================================
 # 7. 马丁蓝图 (价格全静态固化: 开仓价 / 每层止盈价 / 全局止损价)
@@ -2096,13 +2143,13 @@ class MartinCycle:
 # 11. 引擎主循环 (全系统唯一写者)
 # ==============================================================================
 class MartinEngine:
-    def __init__(self, cfg, gw, ledger):
+    def __init__(self, cfg, gw, ledger, shared_signal=None):
         self.cfg = cfg
         self.gw = gw
         self.ledger = ledger
         self.ctx = None
         self.spec = None
-        self.gate = SignalGate(cfg)
+        self.gate = SignalGate(cfg, shared_signal)
         self.state = EngineState.IDLE
         self.cycle = None
         self.last_price = 0.0
@@ -2465,14 +2512,12 @@ class MartinEngine:
 
     # ---------------- IDLE ----------------
     def _idle_tick(self):
-        time.sleep(self.cfg.idle_poll_interval_sec)
-
         # # 跑完当前周期后自动退出进程（全部跑完后主程序自动结束）
         # logger.info(f"[停机] 当前无进行中周期，按只平不开模式自动退出 | 策略:[{self.cfg.strategy_id}]")
         # self.stop_flag = True
         # return
 
-        sig = self.gate.poll()          # 先查信号: 无信号则一次网络请求都不发
+        sig = self.gate.wait(self.cfg.idle_poll_interval_sec)  # 先查共享信号, 无信号不请求交易所
         if sig is None:
             return
         logger.info(f"[信号] 收到有效开仓信号 | {sig}")
@@ -2856,13 +2901,77 @@ class DashboardThread(threading.Thread):
 # ==============================================================================
 # 13. 进程编排
 # ==============================================================================
-def run_single_strategy(cfg, shared_prices=None):
+def group_signal_configs(configs):
+    """同信号名、同交易对合并; 采用该组最短轮询间隔, 默认不超过 1 秒。"""
+    refresh_sec = float(SIGNAL_REFRESH_SEC)
+    if not isfinite(refresh_sec) or refresh_sec <= 0:
+        raise ValueError("SIGNAL_REFRESH_SEC 必须为有限正数")
+    groups = {}
+    for cfg in configs:
+        if cfg.signal_name not in SIGNAL_REGISTRY:
+            raise ValueError(f"signal_name[{cfg.signal_name}] 未在 SIGNAL_REGISTRY 中注册")
+        interval = float(cfg.idle_poll_interval_sec)
+        if not isfinite(interval) or interval <= 0:
+            raise ValueError(f"策略[{cfg.strategy_id}] idle_poll_interval_sec 必须为有限正数")
+        key = (cfg.signal_name, cfg.symbol)
+        groups[key] = min(groups.get(key, refresh_sec), interval)
+    return groups
+
+
+def run_signal_worker(signal_name, symbol, shared_signal, interval_sec):
+    """每个信号键唯一的计算入口; 与交易主线程及其它信号进程完全独立。"""
+    global logger
+    safe_symbol = symbol.replace("/", "_").replace(":", "_")
+    logger = setup_logger(app_name=f"SIG_{signal_name}_{safe_symbol}", force_reset=True)
+    parent = multiprocessing.parent_process()
+
+    def _parent_watchdog():
+        while True:
+            if parent is not None and not parent.is_alive():
+                os._exit(0)
+            time.sleep(2)
+
+    threading.Thread(target=_parent_watchdog, daemon=True).start()
+    try:
+        from importlib import import_module
+        func = getattr(import_module("signal_generator"), SIGNAL_REGISTRY[signal_name])
+        if not callable(func):
+            raise TypeError(f"{SIGNAL_REGISTRY[signal_name]} 不是可调用函数")
+    except Exception as e:
+        shared_signal.publish(None)
+        logger.critical(f"[信号/启动] 加载信号函数失败, 本信号停止提供开仓信号 | "
+                        f"信号:[{signal_name}] 交易对:[{symbol}] 错误:[{e}]", exc_info=True)
+        return
+
+    logger.info(f"[信号/启动] 唯一计算进程就绪 | 信号:[{signal_name}] 交易对:[{symbol}] "
+                f"计算间隔:[{interval_sec}s] PID:[{os.getpid()}]")
+    while True:
+        started = time.monotonic()
+        try:
+            latest = _latest_open_signal(func, symbol)
+        except Exception as e:
+            latest = None  # 故障必须清空上一轮结果, 不把旧结果伪装成本轮计算成功。
+            logger.error(f"[信号] 计算失败, 本轮视为无信号(请检查 {signal_name} "
+                         f"返回的列是否为 timestamp/event/direction/price) | 错误:[{e}]")
+        if not shared_signal.publish(latest):
+            logger.error(f"[信号] 共享快照暂时无法写入, 本轮跳过并在下轮重试; "
+                         f"若持续出现请检查进程状态 | 信号:[{signal_name}] 交易对:[{symbol}]")
+        # 以本轮开始时间计时; 计算超过间隔则立即进入下一轮, 不再额外睡满一轮。
+        nap = interval_sec - (time.monotonic() - started)
+        if nap > 0:
+            time.sleep(nap)
+
+
+def run_single_strategy(cfg, shared_prices=None, shared_signal=None):
     """子进程入口：独立日志、单实例锁、父进程看门狗、冷启动与主循环。"""
     global logger
     safe_symbol = cfg.symbol.replace("/", "_").replace(":", "_")
     logger = setup_logger(app_name=f"MT_{cfg.strategy_id}_{safe_symbol}", force_reset=True)
     logger.info(f"[进程/启动] 子进程日志就绪 | 策略:[{cfg.strategy_id}] "
                 f"交易对:[{cfg.symbol}] 信号:[{cfg.signal_name}] PID:[{os.getpid()}]")
+    if shared_signal is None:
+        logger.critical("[进程/启动] 未注入共享信号, 拒绝启动; 请通过 main_app 编排进程")
+        return
 
     lock_path = data_path(f"martin_{cfg.strategy_id}.lock")
     lock_fd = None
@@ -2898,7 +3007,7 @@ def run_single_strategy(cfg, shared_prices=None):
 
     exchange = ex_api.open_session(proxies, cfg.account_name)
     gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)
-    engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id))
+    engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id), shared_signal)
 
     def _on_term(signum, frame):
         logger.critical(f"[进程] 收到信号[{signum}], 优雅退出(不平仓, 保留交易所止盈止损单)")
@@ -2972,23 +3081,70 @@ def main_app():
         logger.critical(f"[系统/启动] strategy_id 重复，拒绝启动 | 当前配置:[{ids}]")
         return
 
-    manager = multiprocessing.Manager()
-    shared_prices = manager.dict()
-    procs = []
-    for cfg in configs:
-        proc = multiprocessing.Process(target=run_single_strategy, args=(cfg, shared_prices))
-        proc.daemon = True
-        proc.start()
-        procs.append(proc)
-        logger.info(f"[系统/进程] 已拉起策略进程 | 策略:[{cfg.strategy_id}] "
-                    f"交易对:[{cfg.symbol}] 信号:[{cfg.signal_name}] PID:[{proc.pid}]")
-
-    logger.info(f"[系统/启动] 全部策略进程已启动 | 进程数:[{len(procs)}] 数据目录:[{DATA_DIR}]")
     try:
+        signal_groups = group_signal_configs(configs)
+    except ValueError as e:
+        logger.critical(f"[系统/启动] 信号分组配置无效, 拒绝启动 | 错误:[{e}]")
+        return
+
+    # 保留系统原有启动方式, 所有共享对象及进程来自同一上下文。
+    # 主进程不导入信号模块, 因此 fork 的交易进程也不会继承信号计算进程的缓存。
+    ctx = multiprocessing.get_context()
+    manager = ctx.Manager()
+    shared_prices = manager.dict()
+    shared_signals = {key: SharedSignal(ctx) for key in signal_groups}
+    signal_procs = {}
+    procs = []
+    try:
+        for key, interval_sec in signal_groups.items():
+            proc = ctx.Process(target=run_signal_worker,
+                               args=(*key, shared_signals[key], interval_sec))
+            proc.daemon = True
+            proc.start()
+            signal_procs[key] = proc
+            logger.info(f"[系统/信号] 已拉起唯一信号进程 | 信号:[{key[0]}] "
+                        f"交易对:[{key[1]}] PID:[{proc.pid}]")
+
+        for cfg in configs:
+            key = (cfg.signal_name, cfg.symbol)
+            proc = ctx.Process(target=run_single_strategy,
+                               args=(cfg, shared_prices, shared_signals[key]))
+            proc.daemon = True
+            proc.start()
+            procs.append(proc)
+            logger.info(f"[系统/进程] 已拉起策略进程 | 策略:[{cfg.strategy_id}] "
+                        f"交易对:[{cfg.symbol}] 信号:[{cfg.signal_name}] PID:[{proc.pid}]")
+
+        logger.info(f"[系统/启动] 全部策略进程已启动 | 策略进程:[{len(procs)}] "
+                    f"信号计算进程:[{len(signal_procs)}] 数据目录:[{DATA_DIR}]")
+        failed_signals = set()
         for proc in procs:
-            proc.join()
+            while proc.is_alive():
+                proc.join(timeout=1.0)
+                for key, signal_proc in signal_procs.items():
+                    if signal_proc.is_alive():
+                        continue
+                    shared_signals[key].publish(None)  # 清空若暂时争锁失败, 下一轮仍会重试。
+                    if key not in failed_signals:
+                        failed_signals.add(key)
+                        logger.critical(f"[系统/信号] 信号进程已退出, 该信号暂停新开仓; "
+                                        f"已有周期仍由原交易进程维护止盈止损, 请排查后重启 | "
+                                        f"信号:[{key[0]}] 交易对:[{key[1]}] "
+                                        f"退出码:[{signal_proc.exitcode}]")
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统/退出] 主进程收到中断，daemon 子进程将随主进程退出")
+    finally:
+        # 策略全部退出或父进程退出时回收信号进程; 不发任何交易所请求。
+        for proc in signal_procs.values():
+            if proc.is_alive():
+                proc.terminate()
+        for proc in signal_procs.values():
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=1.0)
+        for shared_signal in shared_signals.values():
+            shared_signal.publish(None)
 
 
 # ==============================================================================
@@ -3040,4 +3196,5 @@ def admin_cancel_strategy(exchange, symbol, strategy_id):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main_app()
