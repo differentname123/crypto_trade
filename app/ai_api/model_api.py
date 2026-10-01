@@ -91,6 +91,8 @@ for handler in logger.handlers:
 
 def _build_content(prompt, file_paths):
     content = [{"type": "text", "text": prompt}]
+    if not file_paths:
+        return content
     content.append({
         "type": "text",
         "text": f"【系统提示】用户上传了 {len(file_paths)} 个附件，请根据 "
@@ -176,7 +178,7 @@ def generate_content(
         paths = list(file_paths or [])
         # 只组装一次：本地附件错误立即终止，所有重试及降级共用同一份 messages。
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            # {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": _build_content(prompt, paths)},
         ]
         if not API_KEY:
