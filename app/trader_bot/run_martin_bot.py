@@ -3155,25 +3155,53 @@ def main_app():
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT",
-         "signal_name": "factor_043_10", "first_qty": 122,
+         "signal_name": "factor_043_10", "first_qty": 1,
          "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT",
-         "signal_name": "factor_007_1", "first_qty": 20,
+         "signal_name": "factor_007_1", "first_qty": 1,
          "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT",
-         "signal_name": "factor_044_8", "first_qty": 75.5,
+         "signal_name": "factor_044_8", "first_qty": 1,
          "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT",
-         "signal_name": "factor_024_1", "first_qty": 0.5,
+         "signal_name": "factor_024_1", "first_qty": 0.005,
          "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
     ]
+
+
+    # strategy_templates = [
+    #     {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT",
+    #      "signal_name": "factor_044_4", "first_qty": 0.001,
+    #      "step_pct": 1, "tp_pct": 0.7, "max_loss_mult": 7, "qty_mult": 2,
+    #      "layer_loss_budget_ratio": layer_loss_budget_ratio},
+    #
+    #     {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT",
+    #      "signal_name": "factor_043_10", "first_qty": 122,
+    #      "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
+    #      "layer_loss_budget_ratio": layer_loss_budget_ratio},
+    #
+    #     {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT",
+    #      "signal_name": "factor_007_1", "first_qty": 20,
+    #      "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
+    #      "layer_loss_budget_ratio": layer_loss_budget_ratio},
+    #
+    #     {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT",
+    #      "signal_name": "factor_044_8", "first_qty": 75.5,
+    #      "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
+    #      "layer_loss_budget_ratio": layer_loss_budget_ratio},
+    #
+    #     {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT",
+    #      "signal_name": "factor_024_1", "first_qty": 0.5,
+    #      "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
+    #      "layer_loss_budget_ratio": layer_loss_budget_ratio},
+    # ]
 
     configs = []
     for account_name in accounts:
