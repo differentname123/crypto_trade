@@ -3028,8 +3028,7 @@ def run_single_strategy(cfg, shared_prices=None, shared_signal=None):
 
 
 def main_app():
-    """加载多组账户凭据，并根据账户灵活分配策略进程。"""
-    # 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
+    """按账户启动交易进程；每个信号键独立计算，并监控信号发布进度。"""
     accounts = [
         "myself",
         "ruru",
@@ -3037,35 +3036,41 @@ def main_app():
         "mama",
         "nana",
         "yanglin",
-
     ]
+
+    # 覆盖分钟收盘等待与正常计算耗时；只告警，不自动重启或操作持仓。
+    signal_stall_warn_sec = 120.0
     layer_loss_budget_ratio = 1
-    # 1. 公共策略模板（所有账号都会运行的基础策略）  最大回撤 0.69 M | 波段90%回撤 0.45 M 目前 都以 BTC 开 0.001 的初始数量来计算其它币的数量的，公式为 每个比的保证金相同，都应该为 0.001 * btc 价格 * 7
+
     strategy_templates = [
-        {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT", "signal_name": "factor_044_4",
-         "first_qty": 0.001, "step_pct": 1,  "tp_pct": 0.7,"max_loss_mult": 7, "qty_mult": 2,
+        {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT",
+         "signal_name": "factor_044_4", "first_qty": 0.001,
+         "step_pct": 1, "tp_pct": 0.7, "max_loss_mult": 7, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
-        {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT", "signal_name": "factor_043_10",
-         "first_qty": 122, "step_pct": 2.5,  "tp_pct": 1.1,"max_loss_mult": 10, "qty_mult": 2,
+        {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT",
+         "signal_name": "factor_043_10", "first_qty": 122,
+         "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
-        {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT", "signal_name": "factor_007_1",
-         "first_qty": 20, "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
+        {"base_id": "LNEAR6", "symbol": "NEAR/USDT:USDT",
+         "signal_name": "factor_007_1", "first_qty": 20,
+         "step_pct": 1.8, "tp_pct": 0.9, "max_loss_mult": 6, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
-        {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT", "signal_name": "factor_044_8",
-         "first_qty": 75.5, "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
+        {"base_id": "LRENDER4", "symbol": "RENDER/USDT:USDT",
+         "signal_name": "factor_044_8", "first_qty": 75.5,
+         "step_pct": 1.8, "tp_pct": 1.2, "max_loss_mult": 4, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
-        {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT", "signal_name": "factor_024_1",
-         "first_qty": 0.5, "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
+        {"base_id": "LSOL10", "symbol": "SOL/USDT:USDT",
+         "signal_name": "factor_024_1", "first_qty": 0.5,
+         "step_pct": 2.5, "tp_pct": 1.1, "max_loss_mult": 10, "qty_mult": 2,
          "layer_loss_budget_ratio": layer_loss_budget_ratio},
     ]
 
     configs = []
     for account_name in accounts:
-        # 复制一份公共策略作为基础
         current_templates = list(strategy_templates)
         for template in current_templates:
             params = dict(template)
@@ -3076,7 +3081,7 @@ def main_app():
                 **params,
             ))
 
-    ids = [c.strategy_id for c in configs]
+    ids = [cfg.strategy_id for cfg in configs]
     if len(set(ids)) != len(ids):
         logger.critical(f"[系统/启动] strategy_id 重复，拒绝启动 | 当前配置:[{ids}]")
         return
@@ -3084,22 +3089,30 @@ def main_app():
     try:
         signal_groups = group_signal_configs(configs)
     except ValueError as e:
-        logger.critical(f"[系统/启动] 信号分组配置无效, 拒绝启动 | 错误:[{e}]")
+        logger.critical(f"[系统/启动] 信号分组配置无效，拒绝启动 | 错误:[{e}]")
         return
 
-    # 保留系统原有启动方式, 所有共享对象及进程来自同一上下文。
-    # 主进程不导入信号模块, 因此 fork 的交易进程也不会继承信号计算进程的缓存。
     ctx = multiprocessing.get_context()
     manager = ctx.Manager()
     shared_prices = manager.dict()
     shared_signals = {key: SharedSignal(ctx) for key in signal_groups}
+
     signal_procs = {}
+    signal_last_publish = {}
+    failed_signals = set()
+    stalled_signals = set()
     procs = []
+
     try:
         for key, interval_sec in signal_groups.items():
-            proc = ctx.Process(target=run_signal_worker,
-                               args=(*key, shared_signals[key], interval_sec))
+            proc = ctx.Process(
+                target=run_signal_worker,
+                args=(*key, shared_signals[key], interval_sec),
+            )
             proc.daemon = True
+
+            # 首次尚未发布时，从启动时间计时，覆盖导入或首次调用卡住的情况。
+            signal_last_publish[key] = time.monotonic()
             proc.start()
             signal_procs[key] = proc
             logger.info(f"[系统/信号] 已拉起唯一信号进程 | 信号:[{key[0]}] "
@@ -3107,8 +3120,10 @@ def main_app():
 
         for cfg in configs:
             key = (cfg.signal_name, cfg.symbol)
-            proc = ctx.Process(target=run_single_strategy,
-                               args=(cfg, shared_prices, shared_signals[key]))
+            proc = ctx.Process(
+                target=run_single_strategy,
+                args=(cfg, shared_prices, shared_signals[key]),
+            )
             proc.daemon = True
             proc.start()
             procs.append(proc)
@@ -3117,24 +3132,56 @@ def main_app():
 
         logger.info(f"[系统/启动] 全部策略进程已启动 | 策略进程:[{len(procs)}] "
                     f"信号计算进程:[{len(signal_procs)}] 数据目录:[{DATA_DIR}]")
-        failed_signals = set()
+
         for proc in procs:
             while proc.is_alive():
                 proc.join(timeout=1.0)
+
                 for key, signal_proc in signal_procs.items():
-                    if signal_proc.is_alive():
+                    if not signal_proc.is_alive():
+                        # 若暂时争锁失败，下一轮继续尝试清空。
+                        shared_signals[key].publish(None)
+                        if key not in failed_signals:
+                            failed_signals.add(key)
+                            logger.critical(
+                                f"[系统/信号] 信号进程已退出，该信号暂停新开仓；"
+                                f"已有周期继续由交易进程维护，请排查后重启 | "
+                                f"信号:[{key[0]}] 交易对:[{key[1]}] "
+                                f"退出码:[{signal_proc.exitcode}]"
+                            )
                         continue
-                    shared_signals[key].publish(None)  # 清空若暂时争锁失败, 下一轮仍会重试。
-                    if key not in failed_signals:
-                        failed_signals.add(key)
-                        logger.critical(f"[系统/信号] 信号进程已退出, 该信号暂停新开仓; "
-                                        f"已有周期仍由原交易进程维护止盈止损, 请排查后重启 | "
-                                        f"信号:[{key[0]}] 交易对:[{key[1]}] "
-                                        f"退出码:[{signal_proc.exitcode}]")
+
+                    # read() 非阻塞；读取不到时沿用上次成功发布的时间。
+                    snapshot = shared_signals[key].read()
+                    if snapshot is not None:
+                        # 即使本轮没有 OPEN，publish(None) 也会更新时间，
+                        # 因此不会把“没有开仓信号”误判为生产者卡住。
+                        published = snapshot[0]
+                        if published > signal_last_publish[key]:
+                            signal_last_publish[key] = published
+
+                    gap = time.monotonic() - signal_last_publish[key]
+                    if gap > signal_stall_warn_sec:
+                        if key not in stalled_signals:
+                            stalled_signals.add(key)
+                            logger.critical(
+                                f"[系统/信号] 进程仍存活，但已[{gap:.1f}s]未观察到新发布；"
+                                f"请检查行情请求、信号函数或共享锁 | "
+                                f"信号:[{key[0]}] 交易对:[{key[1]}] "
+                                f"PID:[{signal_proc.pid}] "
+                                f"已有周期继续由交易进程维护"
+                            )
+                    elif key in stalled_signals:
+                        stalled_signals.remove(key)
+                        logger.info(
+                            f"[系统/信号] 共享快照已恢复更新 | "
+                            f"信号:[{key[0]}] 交易对:[{key[1]}] "
+                            f"距最近发布:[{gap:.1f}s]"
+                        )
+
     except (KeyboardInterrupt, SystemExit):
         logger.info("[系统/退出] 主进程收到中断，daemon 子进程将随主进程退出")
     finally:
-        # 策略全部退出或父进程退出时回收信号进程; 不发任何交易所请求。
         for proc in signal_procs.values():
             if proc.is_alive():
                 proc.terminate()
@@ -3145,7 +3192,6 @@ def main_app():
                 proc.join(timeout=1.0)
         for shared_signal in shared_signals.values():
             shared_signal.publish(None)
-
 
 # ==============================================================================
 # 14. 运维工具 (人工排障用, 与主流程解耦)
