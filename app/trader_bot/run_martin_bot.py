@@ -2927,6 +2927,7 @@ def main_app():
         "qiqi",
         "mama",
         "nana",
+        "yanglin",
 
     ]
     layer_loss_budget_ratio = 1
