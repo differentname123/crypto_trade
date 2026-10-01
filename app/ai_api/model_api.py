@@ -252,7 +252,10 @@ def generate_content(
 
 if __name__ == "__main__":
     result = generate_content(
-        prompt="请用一句话解释什么是 Python 闭包。",
+        prompt="你是谁，请分别描述这些图片，并标明对应的文件名。",
         model="gemini-3.8-flash",
+        file_paths=[r"C:\Users\zxh\Desktop\temp\test.jpg",
+                    r"C:\Users\zxh\Desktop\temp\cdcf1d36-1214-40a1-9166-47ddda572ea7.png"
+                    ]
     )
     print(_redact(result))
