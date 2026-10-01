@@ -120,6 +120,7 @@ QTY_EPS_RATIO = 1e-9             # 浮点比较用的极小量
 OVERFILL_TOLERANCE = 1.02        # I4: 累计开仓成交 / 蓝图总量 的容忍上限
 SL_BREACH_CONFIRM_SEC = 5.0      # 现价击穿止损价后等条件单自己触发的宽限, 超时则主动强平
 POSITION_CACHE_SEC = 5.0         # 实际持仓轻量缓存(常规对齐用); 高危路径与新成交后强制击穿
+POSITION_SHARED_LOCK_WAIT_SEC = 0.3  # 常规持仓共享刷新最多等 300ms; 超时重查缓存后实时兜底
 MAX_CONSECUTIVE_ERRORS = 20      # 主循环连续异常次数上限
 HARD_MAX_LAYERS = 50             # 【物理硬顶】纯防死循环底线; 真实层数由周期亏损预算 max_loss_usdt 决定
 FORCE_CLOSE_MAX_ATTEMPTS = 3     # 市价强平最大尝试次数, 超出转 STOPPED 等人工介入
@@ -133,7 +134,8 @@ CLOSING_STUCK_SEC = 120.0        # 收尾阶段单据持续卡在非终态的容
 POS_PROBE_MAX_UNKNOWN = 20       # 收尾阶段实际持仓连续查询失败的轮数上限, 超出转 STOPPED
 TIME_SYNC_SEC = 3600.0           # 主循环定时维护: 与交易所重新校时的间隔(对抗本地时钟漂移)
 SHARED_PRICE_CACHE_SEC = 1.5    # 同币种跨进程最新价共享缓存时效
-DASHBOARD_CACHE_SEC = 30.0      # 同账户看板快照跨进程缓存时效
+DASHBOARD_CACHE_SEC = 120.0     # 同账户看板快照跨进程缓存时效(与原看板汇总周期一致)
+DASHBOARD_LOCK_WAIT_SEC = 5.0   # 只读看板最多等待同账户刷新 5 秒; 不阻塞交易线程
 STARTUP_PREVIEW_SEC = 10        # 启动前蓝图预览确认窗口
 SIGNAL_REFRESH_SEC = 1.0        # 同一信号键的计算间隔上限; 更短的空闲轮询配置仍优先
 SIGNAL_READ_SEC = 0.1           # 空闲态检查共享快照的间隔; 不请求网络、不计算因子
@@ -375,10 +377,23 @@ class ExchangeGateway:
     换交易所(OKX/模拟盘/回测)只需替换顶部 ex_api 的 import, 本类与状态机一行都不用改。
     """
 
-    def __init__(self, exchange, symbol, shared_prices=None):
+    def __init__(self, exchange, symbol, shared_prices=None,
+                 shared_positions=None, position_lock=None, account_name=""):
         self.ex = exchange
         self.symbol = symbol
         self.shared_prices = shared_prices
+        self.shared_positions = shared_positions
+        self.position_lock = position_lock
+        self.position_cache_key = (EXCHANGE_PLATFORM, account_name or "default")
+        self._position_snapshot_ts = 0.0  # 单调时钟; 保留原快照时间, 避免两级缓存叠加
+        if self.shared_positions is not None and self.position_lock is not None:
+            missing = [name for name in ("fetch_positions_map", "make_position_key")
+                       if not callable(getattr(ex_api, name, None))]
+            if missing:
+                self.shared_positions = None
+                self.position_lock = None
+                logger.info(f"[网关] 适配层缺少共享持仓接口, 已回到原实时查询 | "
+                            f"接口:[{', '.join(missing)}]")
         # 【禁用 ccxt 内置重试】所有重试必须归状态机统一管理, 杜绝"以为发一次实际发两次"
         try:
             ex_api.disable_builtin_retry(self.ex)
@@ -469,11 +484,66 @@ class ExchangeGateway:
             return None
         return order
 
-    def fetch_position_qty(self, position_side):
+    def fetch_position_qty(self, position_side, force=False):
         """用于夹逼平仓量与外部干预识别, 绝不参与均价计算(双向持仓下该数字为全账户共享)。"""
+
+        def cached_position():
+            try:
+                cached = self.shared_positions.get(self.position_cache_key) or {}
+                ts = float(cached.get("ts") or 0.0)
+                positions = cached.get("positions")
+                if not isinstance(positions, dict) or not 0 <= time.monotonic() - ts < POSITION_CACHE_SEC:
+                    return None
+                key = ex_api.make_position_key(self.symbol, position_side)
+                if key not in positions:
+                    return ts, None  # 快照有效但目标缺键; 走原实时接口复核, 不推定零仓位
+                qty = abs(float(positions[key]))
+                return (ts, qty) if isfinite(qty) else None
+            except Exception:
+                return None  # 共享设施故障时回到原实时查询, 不把故障当作零仓位
+
         try:
+            # 常规查询共享同账户全部交易对的快照; 高危 force 路径仍走原实时接口。
+            if not force and self.shared_positions is not None and self.position_lock is not None:
+                cached = cached_position()
+                if cached is None:
+                    try:
+                        acquired = self.position_lock.acquire(timeout=POSITION_SHARED_LOCK_WAIT_SEC)
+                    except Exception:
+                        acquired = False
+                    if acquired:
+                        try:
+                            cached = cached_position()  # 争锁期间其它进程可能已经刷新
+                            if cached is None:
+                                self._throttle()
+                                started = time.monotonic()
+                                positions = ex_api.fetch_positions_map(self.ex)
+                                if (not isinstance(positions, dict)
+                                        or any(not isfinite(float(q)) for q in positions.values())):
+                                    raise ValueError("账户持仓快照不是有效数量映射")
+                                key = ex_api.make_position_key(self.symbol, position_side)
+                                qty = abs(float(positions[key])) if key in positions else None
+                                cached = started, qty
+                                try:
+                                    self.shared_positions[self.position_cache_key] = {
+                                        "ts": started, "positions": positions,
+                                    }
+                                except Exception:
+                                    pass  # 写缓存失败仍使用本次真实查询结果, 不重复全账户请求
+                        finally:
+                            self.position_lock.release()
+                    else:
+                        cached = cached_position()  # 超时后再查一次, 避免错过刚发布的快照
+                if cached is not None and cached[1] is not None:
+                    self._position_snapshot_ts, qty = cached
+                    return qty
+                # 缺键或等锁后仍无有效快照时实时复核; 请求异常不追加重复查询。
             self._throttle()
-            return ex_api.fetch_position_qty(self.ex, self.symbol, position_side)
+            started = time.monotonic()
+            qty = ex_api.fetch_position_qty(self.ex, self.symbol, position_side)
+            if qty is not None:
+                self._position_snapshot_ts = started
+            return qty
         except Exception as e:
             logger.info(f"[网关] 拉取真实持仓失败(结果未知, 上层将走保守夹逼) | "
                         f"方向:[{position_side}] 错误:[{e}]")
@@ -1245,17 +1315,17 @@ class CycleCtx:
         self.gw = gw
         self.ledger = ledger
         self.spec = spec
-        self._pos_cache = (0.0, "", None)     # (缓存时间, positionSide, 数量)
+        self._pos_cache = (0.0, "", None)     # (原快照的单调时钟时间, positionSide, 数量)
 
     def position(self, position_side, force=False):
         """出参: 实际持仓量, 或 None(查询失败/结果未知)。绝不缓存失败结果, 也绝不让 None 穿透缓存。"""
         ts, side, qty = self._pos_cache
         if (not force and qty is not None and side == position_side
-                and time.time() - ts < POSITION_CACHE_SEC):
+                and 0 <= time.monotonic() - ts < POSITION_CACHE_SEC):
             return qty
-        q = self.gw.fetch_position_qty(position_side)
+        q = self.gw.fetch_position_qty(position_side, force=force)
         if q is not None:
-            self._pos_cache = (time.time(), position_side, q)
+            self._pos_cache = (self.gw._position_snapshot_ts, position_side, q)
         return q
 
 
@@ -2614,11 +2684,12 @@ class MartinEngine:
 # 12. 只读看板线程 —— 绝不参与任何决策, 绝不修改任何状态
 # ==============================================================================
 class DashboardThread(threading.Thread):
-    def __init__(self, engine, interval_sec=120):
+    def __init__(self, engine, interval_sec=120, shared_lock=None):
         super().__init__(daemon=True)
         self.eng = engine
         self.interval = interval_sec
         self.t0 = time.time()
+        self.shared_lock = shared_lock
 
     def run(self):
         logger.info(f"[看板] 状态看板线程启动(只读) | 汇总周期:[{self.interval}s]")
@@ -2634,21 +2705,54 @@ class DashboardThread(threading.Thread):
         account_name = self.eng.cfg.account_name or "default"
         key_hash = hashlib.md5(account_name.encode('utf-8')).hexdigest()
         cache_file = data_path(f"dash_cache_{key_hash}.json")
-        now = time.time()
+
+        def read_cache():
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cached_data = json.load(f)
+                    age = time.time() - os.fstat(f.fileno()).st_mtime
+                if isinstance(cached_data, dict) and "equity" in cached_data:
+                    cached_data["latency_ms"] = 0
+                    return cached_data, age
+            except Exception:
+                pass
+            return None, None
+
+        cached, age = read_cache()
+        if cached is not None and 0 <= age < DASHBOARD_CACHE_SEC:
+            return cached
+
+        acquired = False
+        if self.shared_lock is not None:
+            try:
+                acquired = self.shared_lock.acquire(timeout=DASHBOARD_LOCK_WAIT_SEC)
+            except Exception:
+                pass
+            if not acquired:
+                cached, age = read_cache()
+                if cached is not None and 0 <= age < DASHBOARD_CACHE_SEC:
+                    return cached
+                result = cached if cached is not None else {
+                    "equity": None, "positions": None, "normal_orders": None,
+                    "algo_orders": None, "orders": None, "latency_ms": 0, "errors": [],
+                }
+                detail = f"缓存已过期({age:.0f}s)" if cached is not None else "暂无缓存"
+                result["errors"] = list(result.get("errors") or []) + [
+                    f"同账户看板刷新锁繁忙或不可用，{detail}，本轮不重复采样",
+                ]
+                return result
 
         try:
-            if os.path.exists(cache_file):
-                mtime = os.path.getmtime(cache_file)
-                if now - mtime < DASHBOARD_CACHE_SEC:
-                    with open(cache_file, 'r', encoding='utf-8') as f:
-                        cached_data = json.load(f)
-                        if isinstance(cached_data, dict) and "equity" in cached_data:
-                            cached_data["latency_ms"] = 0  # 标识为缓存命中，耗时设为 0
-                            return cached_data
-                else:
-                    os.utime(cache_file, (now, now))
-        except Exception:
-            pass  # 看板缓存仅用于观测；读取异常按原设计降级为真实请求。
+            cached, age = read_cache()  # 取得锁后再次核实, 只允许一个进程刷新
+            if cached is not None and 0 <= age < DASHBOARD_CACHE_SEC:
+                return cached
+            return self._fetch_account_snapshot(cache_file)
+        finally:
+            if acquired:
+                self.shared_lock.release()
+
+    def _fetch_account_snapshot(self, cache_file):
+        """缓存过期后采样; 仅看板线程调用, 原四个接口及失败归集口径保持不变。"""
 
         started = time.perf_counter()
         ex = self.eng.gw.ex
@@ -2962,7 +3066,8 @@ def run_signal_worker(signal_name, symbol, shared_signal, interval_sec):
             time.sleep(nap)
 
 
-def run_single_strategy(cfg, shared_prices=None, shared_signal=None):
+def run_single_strategy(cfg, shared_prices=None, shared_signal=None,
+                        shared_positions=None, position_lock=None, dashboard_lock=None):
     """子进程入口：独立日志、单实例锁、父进程看门狗、冷启动与主循环。"""
     global logger
     safe_symbol = cfg.symbol.replace("/", "_").replace(":", "_")
@@ -3006,7 +3111,8 @@ def run_single_strategy(cfg, shared_prices=None, shared_signal=None):
     }
 
     exchange = ex_api.open_session(proxies, cfg.account_name)
-    gw = ExchangeGateway(exchange, cfg.symbol, shared_prices)
+    gw = ExchangeGateway(exchange, cfg.symbol, shared_prices,
+                         shared_positions, position_lock, cfg.account_name)
     engine = MartinEngine(cfg, gw, MartinLedger(cfg.strategy_id), shared_signal)
 
     def _on_term(signum, frame):
@@ -3022,7 +3128,7 @@ def run_single_strategy(cfg, shared_prices=None, shared_signal=None):
     if not engine.boot():
         logger.critical("[进程] 冷启动检查未通过, 进程退出")
         return
-    DashboardThread(engine, interval_sec=120).start()
+    DashboardThread(engine, interval_sec=120, shared_lock=dashboard_lock).start()
     time.sleep(random.uniform(0.1, 2.0))  # 打散多进程 Tick，降低同刻公共接口突发请求。
     engine.run_forever()
 
@@ -3095,6 +3201,10 @@ def main_app():
     ctx = multiprocessing.get_context()
     manager = ctx.Manager()
     shared_prices = manager.dict()
+    shared_positions = manager.dict()
+    account_names = {cfg.account_name or "default" for cfg in configs}
+    position_locks = {name: ctx.Lock() for name in account_names}
+    dashboard_locks = {name: ctx.Lock() for name in account_names}
     shared_signals = {key: SharedSignal(ctx) for key in signal_groups}
 
     signal_procs = {}
@@ -3122,7 +3232,9 @@ def main_app():
             key = (cfg.signal_name, cfg.symbol)
             proc = ctx.Process(
                 target=run_single_strategy,
-                args=(cfg, shared_prices, shared_signals[key]),
+                args=(cfg, shared_prices, shared_signals[key], shared_positions,
+                      position_locks[cfg.account_name or "default"],
+                      dashboard_locks[cfg.account_name or "default"]),
             )
             proc.daemon = True
             proc.start()

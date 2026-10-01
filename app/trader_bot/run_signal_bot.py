@@ -1007,12 +1007,12 @@ class TradingWorker:
 # 请在此处配置你所需的账户与策略绑定关系，系统会自动并行调度
 # 凭证由 gateway 的 open_session 按 EXCHANGE_PLATFORM 自动从配置文件读取，无需硬编码
 WORKER_CONFIGS = [
-    {"account": "mama",   "strategy": "cross"},
-    {"account": "myself", "strategy": "cross"},
+    # {"account": "mama",   "strategy": "cross"},
+    # {"account": "myself", "strategy": "cross"},
     {"account": "nana",   "strategy": "cross"},
     {"account": "qiqi",   "strategy": "cross"},
-    {"account": "ruru",   "strategy": "cross"},
-    {"account": "yanglin", "strategy": "cross"},
+    # {"account": "ruru",   "strategy": "cross"},
+    # {"account": "yanglin", "strategy": "cross"},
 
 ]
 
