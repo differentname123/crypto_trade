@@ -46,8 +46,8 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 40, "备注": "来源gemini_web"},
 
 
-    {"model_name": "gemini-3.1-pro-preview-max", "权重": 20, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.8-flash-max", "权重": 40, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 20, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.8-flash", "权重": 40, "备注": "来源aistudio_web"},
 
 
     {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 20, "备注": "来源antigravity"},
@@ -683,3 +683,4 @@ if __name__ == "__main__":
     # )
     # print(_redact(result))
     probe_models("model_probe_results.json")
+    # generate_content(prompt="证明黎曼猜想", model="gemini-web-3.8-flash-thinking-max")
