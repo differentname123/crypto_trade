@@ -206,7 +206,7 @@ def gen_media_format_info(post):
         try:
             if random.random() < 1.9:
                 # raw_response = get_llm_content_local(prompt=full_prompt, image_paths=paths, model_name=MODEL_NAME_PRO)
-                result = generate_content(prompt=full_prompt, file_paths=paths, model="gemini-3.8-flash-thinking")
+                result = generate_content(prompt=full_prompt, file_paths=paths)
                 raw_response = result.get("content", "")
 
             else:
@@ -679,7 +679,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             error_detail = ""
             try:
                 if random.random() < 1.9:
-                    result = generate_content(prompt=full_prompt, model=MODEL_NAME_PRO)
+                    result = generate_content(prompt=full_prompt)
                     raw_response = result.get("content", "")
                 else:
                     error_detail, raw_response = generate_gemini_content_playwright(
