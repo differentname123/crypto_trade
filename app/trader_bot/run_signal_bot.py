@@ -23,6 +23,7 @@ import pandas as pd
 from common_utils import setup_logger, get_config
 from data_provider import InterProcessMutex
 from signal_generator import (
+    PAIR_STRATEGY_PREFIX, execute_trading_bot_workflow_pair,
     execute_trading_bot_high_fr_bear_div_short, execute_trading_bot_oi_decay_short,
     execute_trading_bot_vwap_reclaim_long, execute_trading_bot_workflow_XSR_long,
     execute_trading_bot_workflow_bottom_powder_short, execute_trading_bot_workflow_cross,
@@ -93,6 +94,7 @@ _EX_TO_LEDGER_STATUS = {OS_FILLED: ST_FILLED, OS_CANCELED: ST_CANCELED, OS_REJEC
 # Shape: strategy -> (interval_minutes, preload_ahead_minutes, workflow, rank_mode, top_n)
 STRATEGY_CONFIGS = {
     "cross": (60, PRELOAD_AHEAD_MIN, execute_trading_bot_workflow_cross, None, None),
+    "pair": (60, PRELOAD_AHEAD_MIN, execute_trading_bot_workflow_pair, None, None),
     "top_long": (60, PRELOAD_AHEAD_MIN, execute_trading_bot_workflow_top_long, "top", BEST_TOP_N),
     "ma_bottom_long": (5, 0.5, execute_trading_bot_workflow_ma_bottom_long, "bottom", BEST_TOP_N),
     "XSR_long": (30, 1, execute_trading_bot_workflow_XSR_long, "bottom", 10),
@@ -285,12 +287,36 @@ def _active_opens(df):
     opens = df[df["event"].astype(str).str.strip().str.upper() == EVENT_OPEN]
     if opens.empty: return opens
     filled = pd.to_numeric(opens["filled_amount"], errors="coerce").fillna(0)
-    return opens[(~opens["record_id"].astype(str).isin(_closed_open_ids(df))) & (filled > 0)]
+    pair_mask = opens["strategy_name"].astype(str).str.startswith(PAIR_STRATEGY_PREFIX)
+    legacy = opens[(~pair_mask) & (~opens["record_id"].astype(str).isin(_closed_open_ids(df))) & (filled > 0)]
+    if not pair_mask.any():
+        return legacy
+
+    # 仅pair按批次累计实平量；撤单前的部分成交也必须扣除，PENDING禁止重发。
+    closes = df[df["event"].astype(str).str.strip().str.upper() == EVENT_CLOSE].copy()
+    closes["filled_amount"] = pd.to_numeric(closes["filled_amount"], errors="coerce").fillna(0)
+    closed_amounts = closes.groupby("linked_open_id")["filled_amount"].sum()
+    blocked_ids = set(closes.loc[closes["exec_status"].isin([ST_PENDING, ST_MANUAL_CLOSED]), "linked_open_id"].astype(str))
+    pair = opens[pair_mask].copy()
+    ids = pair["record_id"].astype(str)
+    pair["filled_amount"] = (filled[pair_mask] - ids.map(closed_amounts).fillna(0)).clip(lower=0)
+    pair = pair[(pair["filled_amount"] > 0) & (~ids.isin(blocked_ids))]
+    return pd.concat([legacy, pair]).sort_index()
 
 
 def _find_open_to_close(ssd_df):
     active = _active_opens(ssd_df)
     return None if active.empty else active.iloc[-1]
+
+
+def _pair_scheduler_now():
+    return pd.Timestamp.now('Asia/Shanghai').tz_localize(None).to_pydatetime()
+
+
+def _next_pair_run(now):
+    """整点后10秒前启动仍执行本小时；其他策略保留原调度。"""
+    hour = now.replace(minute=0, second=0, microsecond=0)
+    return hour if now <= hour + timedelta(seconds=10) else hour + timedelta(hours=1)
 
 
 def _has_pending_order(open_order_cache, sig):
@@ -545,6 +571,11 @@ class TradingWorker:
         ssd_key = sig["ssd_key"]
         ssd_df = _filter_ssd(ledger_df, sig)
 
+        if (sig["strategy_name"].startswith(PAIR_STRATEGY_PREFIX)
+                and ssd_df["event"].astype(str).str.upper().eq(EVENT_OPEN).any()):
+            self.log("info", "OPEN/SKIP", "Pair整点批次已有开仓记录，禁止重复提交", SSD=ssd_key)
+            return
+
         if _has_pending_order(open_order_cache, sig):
             self.log("warning", "OPEN/SKIP", "检测到同信号挂单，阻止重复发单", SSD=ssd_key, Prefix=sig["prefix"])
             return
@@ -593,6 +624,11 @@ class TradingWorker:
         actual_position = abs(position_cache.get(sig["pos_key"], 0.0))
 
         if actual_position <= 0:
+            if (sig["strategy_name"].startswith(PAIR_STRATEGY_PREFIX)
+                    and ((ledger_df["symbol"] == sig["symbol"]) & (ledger_df["direction"] == sig["direction"])
+                         & (ledger_df["event"] == EVENT_CLOSE) & (ledger_df["exec_status"] == ST_PENDING)).any()):
+                self.log("info", "CLOSE/SKIP", "Pair持仓已被未完成平仓请求预占，暂不核销本批次", SSD=ssd_key)
+                return
             self.ledger.append(make_record(
                 sig, 0, 0, ST_MANUAL_CLOSED, sig["client_oid"], "",
                 error_msg="平仓时交易所无持仓, 逻辑核销", linked_open_id=linked_open_id,
@@ -627,6 +663,9 @@ class TradingWorker:
 
         if result.ok:
             _cache_order(open_order_cache, sig["symbol"], result.exchange_oid, sig["client_oid"])
+            if sig["strategy_name"].startswith(PAIR_STRATEGY_PREFIX):
+                # 同轮补处理多个批次时，已接受的请求保守预占总持仓，避免复用旧快照。
+                position_cache[sig["pos_key"]] = max(0.0, actual_position - amount)
 
         level = "info" if result.ok else "error"
         self.log(level, "CLOSE/ORDER", "平仓请求已完成",
@@ -660,7 +699,13 @@ class TradingWorker:
         if getattr(times.dt, "tz", None) is not None:
             times = times.dt.tz_localize(None)
 
-        valid = signal_df[(times >= lower) & (times <= upper)]
+        if self.strategy_name == "pair":
+            events = signal_df["event"].astype(str).str.upper()
+            valid = signal_df[((events == EVENT_OPEN) & (times == target_time))
+                              | ((events == EVENT_CLOSE) & (times <= target_time))]
+            valid = valid.sort_values(["signal_timestamp_ms", "event", "symbol"])
+        else:
+            valid = signal_df[(times >= lower) & (times <= upper)]
 
         if valid.empty:
             self.log("info", "EXEC/SUMMARY", "本轮没有落入执行窗口的信号",
@@ -808,7 +853,7 @@ class TradingWorker:
         return final_symbols
 
     def _get_shared_cross_signal(self, target_time_str, workflow):
-        """仅复用固定标的、无账户状态的 cross；缓存故障退回原工作流。"""
+        """复用无账户状态的cross/pair；各策略独立缓存，故障退回原工作流。"""
         try:
             target = pd.Timestamp(target_time_str)
             target = (target.tz_localize("Asia/Shanghai") if target.tzinfo is None
@@ -926,7 +971,7 @@ class TradingWorker:
 
         _, _, workflow, rank_mode, top_n = config
         if rank_mode is None:
-            if self.strategy_name == "cross":
+            if self.strategy_name in ("cross", "pair"):
                 return self._get_shared_cross_signal(target_time_str, workflow)
             return workflow(target_time_str, proxy_url=self.proxy_url)
 
@@ -940,14 +985,16 @@ class TradingWorker:
 
         while True:
             try:
-                now = datetime.now()
+                now = _pair_scheduler_now() if self.strategy_name == "pair" else datetime.now()
                 config = STRATEGY_CONFIGS.get(self.strategy_name)
                 interval_minutes, preload_ahead = (config[0], config[1]) if config else (60, PRELOAD_AHEAD_MIN)
 
                 add_minutes = interval_minutes - (now.minute % interval_minutes)
                 next_run = now.replace(second=0, microsecond=0) + timedelta(minutes=add_minutes)
+                if self.strategy_name == "pair":
+                    next_run = _next_pair_run(now)
                 preload_time = next_run - timedelta(minutes=preload_ahead)
-                target_time_str = (next_run - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
+                target_time_str = (next_run if self.strategy_name == "pair" else next_run - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M")
 
                 self.log("info", "SCHED/PLAN", "下一轮计划已计算",
                          NextRun=next_run.strftime("%Y-%m-%d %H:%M:%S"),
@@ -980,6 +1027,12 @@ class TradingWorker:
                     time.sleep(60)
                     continue
 
+                if self.strategy_name == "pair":
+                    trigger_at = next_run + timedelta(seconds=10)
+                    current = _pair_scheduler_now()
+                    if current < trigger_at:
+                        time.sleep((trigger_at - current).total_seconds())
+
                 signal_df = self.get_signal_df(target_time_str, position_cache)
 
                 if signal_df is not None and not signal_df.empty:
@@ -1011,6 +1064,8 @@ WORKER_CONFIGS = [
     # {"account": "myself", "strategy": "cross"},
     {"account": "nana",   "strategy": "cross"},
     {"account": "qiqi",   "strategy": "cross"},
+    {"account": "nana",   "strategy": "pair"},
+    {"account": "qiqi",   "strategy": "pair"},
     # {"account": "ruru",   "strategy": "cross"},
     # {"account": "yanglin", "strategy": "cross"},
 

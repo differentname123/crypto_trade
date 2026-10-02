@@ -28,13 +28,17 @@
 import os
 import platform
 import time
+import uuid
 from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 
 from common_utils import setup_logger
-from data_provider import snipe_kline_data, snipe_funding_rate_data, snipe_oi_data, snipe_and_update_hourly_signals
+from data_provider import (
+    InterProcessMutex, snipe_kline_data, snipe_funding_rate_data, snipe_oi_data,
+    snipe_and_update_hourly_signals,
+)
 
 SIGNAL_COLS = [
     'time', 'action', 'coin', 'direction', 'event', 'price', 'reason',
@@ -2225,136 +2229,204 @@ def apply_signal_2384(alt_df, btc_df):
     return _generate_core_signal(alt_df, btc_df, beta_days=45, z_threshold=9.5)
 
 
-def gen_pair_signal(proxy=None):
-    """
-    通用策略生成器：批量遍历多标的，执行统计套利策略。
-    """
-    now_ms = int((time.time() - 60 * 60) * 1000)
-    symbol_dfs = snipe_and_update_hourly_signals(now_ms, proxy=proxy)
+PAIR_STRATEGY_PREFIX = 'PAIR_SHORT_'
+PAIR_WEIGHT = 0.3
+PAIR_HOLD_HOURS = 72
+PAIR_HISTORY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'signal_data', 'signal_history_pair_short.csv',
+)
+PAIR_SIGNAL_COLS = SIGNAL_COLS + [
+    'generated_at', 'source_strategies', 'source_signal_timestamp_ms', 'close_due_timestamp_ms',
+]
 
-    btc_df = symbol_dfs.get('BTC/USDT:USDT')
-    if btc_df is None or btc_df.empty:
-        return pd.DataFrame()
 
-    if not pd.api.types.is_datetime64_any_dtype(btc_df['timestamp']):
-        btc_df['timestamp'] = pd.to_datetime(btc_df['timestamp'], unit='ms')
-    btc_df = btc_df.set_index('timestamp').sort_index()
+def _pair_now():
+    return pd.Timestamp.now('UTC')
 
-    # 最大预热期需 1464 根，保留最后 1600 根 (预热期 + 约5天多的状态机流转冗余)
-    MAX_BARS = 1600
-    btc_df = btc_df.tail(MAX_BARS)
 
-    signal_records = []
+def _pair_target_hour(value):
+    """runner 的无时区目标按北京时间解释；内部统一 UTC 整点。"""
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize('Asia/Shanghai')
+    return ts.tz_convert('UTC').floor('h')
 
-    for symbol, alt_df in symbol_dfs.items():
-        if symbol == 'BTC/USDT:USDT' or alt_df.empty:
-            continue
 
-        temp_df = alt_df.copy()
-        if not pd.api.types.is_datetime64_any_dtype(temp_df['timestamp']):
-            temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp'], unit='ms')
-
-        # 同样截取安全边界数据
-        temp_df = temp_df.set_index('timestamp').sort_index().tail(MAX_BARS)
-
-        # 脏数据拦截：如果连 1671 的最低预热门槛都达不到，直接跳过防报错
-        if len(temp_df) < 1470:
-            continue
-
-        coin_name = symbol.split('/')[0]
-
-        # -----------------------------
-        # 执行策略 1671
-        # -----------------------------
-        df_1671 = apply_signal_1671(temp_df.copy(), btc_df)
-        hits_1671 = df_1671[df_1671['signal'] == True].copy()
-        if not hits_1671.empty:
-            hits_1671['symbol'] = symbol
-            hits_1671['coin_name'] = coin_name
-            hits_1671['strategy_name'] = 'pair_1671'
-            signal_records.append(hits_1671)
-
-        # -----------------------------
-        # 执行策略 2384
-        # -----------------------------
-        df_2384 = apply_signal_2384(temp_df.copy(), btc_df)
-        hits_2384 = df_2384[df_2384['signal'] == True].copy()
-        if not hits_2384.empty:
-            hits_2384['symbol'] = symbol
-            hits_2384['coin_name'] = coin_name
-            hits_2384['strategy_name'] = 'pair_2384'
-            signal_records.append(hits_2384)
-
-    # 组装返回结果
-    if not signal_records:
-        return pd.DataFrame(columns=[
-            'time', 'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal'
-        ])
-
-    final_df = pd.concat(signal_records).reset_index()
-
-    # ================= 修改核心开始 =================
-    # 1. 增加 1 小时偏移，将 K 线起始时间转换为信号落地(触发)时间
-    final_df['timestamp'] = final_df['timestamp'] + pd.Timedelta(hours=1)
-
-    # 2. 生成北京时间字符串列 (timestamp是无时区的UTC时间，需先localize再convert)
-    final_df['time'] = (
-        final_df['timestamp']
-        .dt.tz_localize('UTC')
-        .dt.tz_convert('Asia/Shanghai')
-        .dt.strftime('%Y-%m-%d %H:%M:%S')
+def _pair_kline_frame(frame, last_bar):
+    frame = frame.copy()
+    timestamps = frame['timestamp']
+    frame['timestamp'] = (
+        pd.to_datetime(timestamps, unit='ms', utc=True)
+        if pd.api.types.is_numeric_dtype(timestamps)
+        else pd.to_datetime(timestamps, utc=True)
     )
+    frame = frame.drop_duplicates('timestamp', keep='last').set_index('timestamp').sort_index()
+    return frame.loc[frame.index <= last_bar].tail(1600)
 
-    # 规范化列顺序
-    core_cols = ['time', 'timestamp', 'symbol', 'coin_name', 'strategy_name', 'close', 'z_score', 'signal']
-    other_cols = [c for c in final_df.columns if c not in core_cols]
-    final_df = final_df[core_cols + other_cols]
 
-    # 按时间顺序排序
-    final_df = final_df.sort_values(by=['timestamp', 'symbol', 'strategy_name'])
+def _collect_pair_hits(symbol_dfs, hour):
+    """历史只作预热，只接受刚闭合的小时K线；两个参数组按币合并。"""
+    last_bar = hour - pd.Timedelta(hours=1)
+    btc_source = symbol_dfs.get('BTC/USDT:USDT')
+    btc_df = (_pair_kline_frame(btc_source, last_bar)
+              if btc_source is not None and not btc_source.empty else None)
+    btc_ready = btc_df is not None and last_bar in btc_df.index
+    hits, prices, complete = [], {}, btc_ready
+    # 逐币准备预热数据，不额外保留一份全市场1600根K线副本。
+    for symbol, source in symbol_dfs.items():
+        if symbol == 'BTC/USDT:USDT' or source is None or source.empty:
+            continue
+        alt_df = _pair_kline_frame(source, last_bar)
+        if last_bar not in alt_df.index:
+            complete = False
+            continue
+        price = float(alt_df.loc[last_bar, 'close'])
+        if np.isfinite(price) and price > 0:
+            prices[symbol] = price
+        # 保留原1671最低预热门槛；BTC缺失时行情仍可供历史CLOSE估值。
+        if not btc_ready or len(alt_df) < 1470:
+            continue
+        sources = []
+        for name, apply_signal in [('pair_1671', apply_signal_1671), ('pair_2384', apply_signal_2384)]:
+            result = apply_signal(alt_df.copy(), btc_df)
+            if bool(result.loc[last_bar, 'signal']):
+                sources.append(name)
+        if sources and symbol in prices:
+            hits.append((symbol, prices[symbol], ','.join(sources)))
+    return hits, prices, complete
 
-    # 将final_df保存到CSV文件中
-    output_path = os.path.join('signal_data', 'pair_signals.csv')
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    final_df.to_csv(output_path, index=False, encoding='utf-8-sig')
 
-    # ================= 日志输出：打印近 72 小时内的信号及倒计时 =================
-    logger = setup_logger()
-    # 当前实际机器时间的 UTC 无时区对象，用于与 timestamp(UTC) 运算
-    current_utc = pd.Timestamp.now('UTC').tz_localize(None)
+def _read_pair_history(history_file):
+    if not os.path.exists(history_file):
+        return pd.DataFrame(columns=PAIR_SIGNAL_COLS)
+    # 不将损坏历史当作空历史，否则会重开仓并丢失72H计时。
+    history = pd.read_csv(history_file)
+    if not set(PAIR_SIGNAL_COLS).issubset(history.columns):
+        raise ValueError(f'Pair生成历史列不完整: {history_file}')
+    for column in ['signal_timestamp_ms', 'source_signal_timestamp_ms', 'close_due_timestamp_ms']:
+        history[column] = pd.to_numeric(history[column], errors='raise').astype('int64')
+    history['price'] = pd.to_numeric(history['price'], errors='raise')
+    pd.to_datetime(history['generated_at'], utc=True, errors='raise')
+    expected_due = history['source_signal_timestamp_ms'] + PAIR_HOLD_HOURS * 3600_000
+    expected_time = history['signal_timestamp_ms'].map(_fmt_bjt)
+    if (history[['generated_at', 'STRATEGY_NAME', 'symbol', 'coin', 'event']].isna().any().any()
+            or not (np.isfinite(history['price']) & (history['price'] > 0)).all()
+            or not history['close_due_timestamp_ms'].eq(expected_due).all()
+            or not history['time'].eq(expected_time).all()
+            or not history['event'].isin(['OPEN', 'CLOSE']).all()
+            or not history['direction'].eq('SHORT').all()
+            or not history['STRATEGY_NAME'].str.startswith(PAIR_STRATEGY_PREFIX).all()
+            or history.duplicated(['STRATEGY_NAME', 'symbol', 'event']).any()):
+        raise ValueError(f'Pair生成历史记录无效: {history_file}')
+    return history[PAIR_SIGNAL_COLS]
 
-    limit_time = current_utc - pd.Timedelta(hours=72)
 
-    # 过滤出近72小时内触发的信号
-    recent_df = final_df[final_df['timestamp'] >= limit_time]
-
-    if not recent_df.empty:
-        logger.info(f"🎯 [Pair套利] 过去 72 小时内触发的信号 | 共计: [{len(recent_df)}] 条")
-        lines = []
-        for _, row in recent_df.iterrows():
-            # 计算距离72小时失效还剩下多少时间
-            expiry_time = row['timestamp'] + pd.Timedelta(hours=72)
-            time_left = expiry_time - current_utc
-            total_seconds = time_left.total_seconds()
-
-            if total_seconds <= 0:
-                time_left_str = "已失效"
-            else:
-                hours_left = int(total_seconds // 3600)
-                minutes_left = int((total_seconds % 3600) // 60)
-                time_left_str = f"{hours_left}小时{minutes_left}分钟"
-
-            lines.append(
-                f"\n  ► 🔴 开仓 | 触发时间: [{row['time']}] (北京时间) | 标的: [{row['symbol']:<14}] | "
-                f"策略: [{row['strategy_name']:<9}] | 触发价格: [{row['close']:>6.9f}] |  | Z-Score: [{row['z_score']:>6.2f}] | "
-                f"距72H失效剩余: [{time_left_str}]"
+def _sync_pair_history(history_file, new_opens, hour, generated_at, prices):
+    """只读写生成信号历史，不接触执行账本或实际持仓。"""
+    history_file = os.path.abspath(history_file)
+    os.makedirs(os.path.dirname(history_file), exist_ok=True)
+    mutex = InterProcessMutex(history_file + '.lock')
+    if not mutex.acquire(timeout=180):
+        raise TimeoutError(f'无法锁定Pair生成历史: {history_file}')
+    tmp_path = f'{history_file}.{uuid.uuid4().hex}.tmp'
+    try:
+        history = _read_pair_history(history_file)
+        keys = {(row.STRATEGY_NAME, row.symbol, row.event) for row in history.itertuples(index=False)}
+        additions = []
+        for record in new_opens:
+            key = (record['STRATEGY_NAME'], record['symbol'], 'OPEN')
+            if key not in keys:
+                additions.append(record)
+                keys.add(key)
+        opens = history[history['event'] == 'OPEN'].to_dict('records') + additions.copy()
+        now_ms = int(hour.value // 1_000_000)
+        for opened in opens:
+            key = (opened['STRATEGY_NAME'], opened['symbol'], 'CLOSE')
+            due_ms = int(opened['close_due_timestamp_ms'])
+            if due_ms > now_ms or key in keys:
+                continue
+            price = prices.get(opened['symbol'], float(opened['price']))
+            reason = 'Pair 72H整点批次到期'
+            if opened['symbol'] not in prices:
+                reason += '；行情缺失，估值沿用OPEN价格'
+            closed = _build_record(
+                opened['STRATEGY_NAME'], opened['symbol'], opened['coin'], 'CLOSE', 'SHORT',
+                price, reason, due_ms, 0.0, PAIR_WEIGHT,
             )
-        logger.info("\n".join(lines))
-    else:
-        logger.info("🎯 [Pair套利] 过去 72 小时内无新触发的信号。")
-    # =========================================================================
+            closed.update({
+                'generated_at': generated_at.isoformat(),
+                'source_strategies': opened['source_strategies'],
+                'source_signal_timestamp_ms': opened['source_signal_timestamp_ms'],
+                'close_due_timestamp_ms': due_ms,
+            })
+            additions.append(closed)
+            keys.add(key)
+        if additions:
+            new_rows = pd.DataFrame(additions, columns=PAIR_SIGNAL_COLS)
+            history = new_rows if history.empty else pd.concat([history, new_rows], ignore_index=True)
+            history = history.sort_values(['signal_timestamp_ms', 'event', 'symbol']).reset_index(drop=True)
+            history.to_csv(tmp_path, index=False, encoding='utf-8-sig')
+            os.replace(tmp_path, history_file)
+        return history
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        finally:
+            mutex.release()
 
-    return final_df
+
+def gen_pair_signal(proxy=None, target_time=None, history_file=None):
+    """
+    山寨币做空标准事件：每小时合并1671/2384，首次生成整点+72H生成CLOSE。
+
+    保留 gen_pair_signal(proxy) 接口。旧 pair_signals.csv 是原始命中快照，
+    不作为已生成OPEN迁移；新的持久历史允许同币种不同小时独立计时。
+    """
+    started_at = _pair_now()
+    hour = _pair_target_hour(target_time) if target_time is not None else started_at.floor('h')
+    if hour > started_at.floor('h'):
+        raise ValueError('Pair目标整点不能晚于当前时间')
+    logger = setup_logger()
+    hits, prices, complete = [], {}, False
+    try:
+        last_bar_ms = int((hour - pd.Timedelta(hours=1)).value // 1_000_000)
+        symbol_dfs = snipe_and_update_hourly_signals(last_bar_ms, proxy=proxy)
+        hits, prices, complete = _collect_pair_hits(symbol_dfs or {}, hour)
+    except Exception as exc:
+        logger.warning(f'[Pair/SIGNAL] 取数或计算失败，仅处理历史到期CLOSE | Reason: [{exc}]')
+
+    generated_at = _pair_now()
+    generated_hour = generated_at.floor('h')
+    new_opens = []
+    if hour == generated_hour:
+        signal_ms = int(generated_hour.value // 1_000_000)
+        due_ms = signal_ms + PAIR_HOLD_HOURS * 3600_000
+        strategy_name = PAIR_STRATEGY_PREFIX + generated_hour.tz_convert('Asia/Shanghai').strftime('%Y%m%d%H')
+        for symbol, price, sources in hits:
+            record = _build_record(
+                strategy_name, symbol, symbol.split('/')[0], 'OPEN', 'SHORT', price,
+                f'Pair山寨币做空；来源: {sources}', signal_ms, PAIR_WEIGHT, PAIR_WEIGHT,
+            )
+            record.update({
+                'generated_at': generated_at.isoformat(), 'source_strategies': sources,
+                'source_signal_timestamp_ms': int(hour.value // 1_000_000),
+                'close_due_timestamp_ms': due_ms,
+            })
+            new_opens.append(record)
+    else:
+        complete = False
+        logger.warning('[Pair/SIGNAL] 目标小时已过期，禁止补开历史OPEN，仅处理到期CLOSE')
+
+    history = _sync_pair_history(history_file or PAIR_HISTORY_FILE, new_opens, generated_hour, generated_at, prices)
+    history.attrs['signal_snapshot_complete'] = complete
+    logger.info(f'[Pair/SIGNAL] 整点批次: [{_fmt_bjt(hour)}] | 合并命中: [{len(new_opens)}] | 历史事件: [{len(history)}]')
+    return history
+
+
+def execute_trading_bot_workflow_pair(target_time, proxy_url=None, dedupe=True):
+    """适配runner；即便共享Leader关闭取数去重，生成历史仍永久按批次去重。"""
+    return gen_pair_signal(proxy=proxy_url, target_time=target_time)
 
 # =============================================================================
 # 因子 007_1: Z-Score 极度悲观后反弹做多 (LONG)
@@ -2520,7 +2592,6 @@ def execute_trading_bot_workflow_factor_024_1(
         generate_factor_024_1_signals,
         'K线重心3周期突破做多信号生成',
     )
-
 
 def get_signal_factor_024_1(symbol):
     """供外部或单标的独立调用的 024_1 因子适配器"""
