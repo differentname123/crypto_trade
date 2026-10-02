@@ -447,7 +447,7 @@ def generate_content(
     file_paths=None,
     fallback_model_list=None,
     max_retries_per_model=3,
-    timeout=360.0,
+    timeout=600,
     preset_model_group="medium",
 ):
     """同步生成文本；file_paths 为路径 list/tuple，不修改调用参数。
