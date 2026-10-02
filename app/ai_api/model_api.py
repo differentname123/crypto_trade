@@ -6,11 +6,18 @@
 """Python 3.9+；依赖 openai 和项目已有的 common.common_utils。"""
 
 import base64
+import errno
+import json
 import logging
 import math
+import os
+import random
 import re
+import tempfile
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -19,10 +26,48 @@ from openai import OpenAI
 
 from common.common_utils import get_config, save_json, setup_logger
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 __all__ = ["generate_content", "probe_models"]
 
 BASE_URL = get_config("local_api_url")
 API_KEY = get_config("local_api_key")
+
+# 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
+HIGH_MODEL_LIST = [
+    {"model_name": "gpt-6-astra-max", "权重": 1, "备注": "来源codex 订阅账号"},
+    {"model_name": "gpt-6.1-sol-max", "权重": 5, "备注": "来源codex 订阅账号"},
+
+]
+MEDIUM_MODEL_LIST = [
+    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 10, "备注": "来源antigravity"},
+
+    {"model_name": "gemini-3.1-pro-preview-max", "权重": 10, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.8-flash-max", "权重": 20, "备注": "来源aistudio_web"},
+
+    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 20, "备注": "来源gemini_web"},
+
+    {"model_name": "gpt-5.6-terra-max", "权重": 10, "备注": "来源codex 免费"},
+
+]
+LOW_MODEL_LIST = [
+    {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
+    {"model_name": "gemini-aistudio-3.8-flash-max", "权重": 1, "备注": "来源aistudio_web"},
+
+]
+
+# 默认固定在本模块同目录，不随调用程序的工作目录变化。
+# 若多个程序使用本模块的不同副本，请将环境变量设为同一个本地绝对路径。
+MODEL_USAGE_JSON_PATH = Path(
+    os.environ.get("MODEL_USAGE_JSON_PATH")
+    or Path(__file__).resolve().with_name("model_usage.json")
+).expanduser().resolve()
+MODEL_USAGE_LOCK_TIMEOUT = 10.0
+_MODEL_USAGE_THREAD_LOCK = threading.Lock()
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".log", ".py", ".json", ".jsonl", ".csv", ".tsv",
@@ -157,21 +202,267 @@ def _build_content(prompt, file_paths):
     return content
 
 
+def _select_models(model, fallback_model_list, preset_model_group):
+    """显式模型使用指定备用列表；未指定模型时，按预制组生成完整尝试顺序。"""
+    if model is not None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model 必须是非空字符串或 None")
+        if fallback_model_list is not None and not isinstance(fallback_model_list, (list, tuple)):
+            raise ValueError("fallback_model_list 必须是模型名列表或 None")
+        models = [model]
+        seen = {model}
+        for fallback in fallback_model_list or []:
+            if not isinstance(fallback, str) or not fallback.strip():
+                raise ValueError("fallback_model_list 中的每个模型名必须是非空字符串")
+            if fallback not in seen:
+                models.append(fallback)
+                seen.add(fallback)
+        return models
+
+    if not isinstance(preset_model_group, str) or preset_model_group not in ("high", "medium", "low"):
+        raise ValueError("preset_model_group 必须是 high、medium 或 low")
+    group = {
+        "high": HIGH_MODEL_LIST,
+        "medium": MEDIUM_MODEL_LIST,
+        "low": LOW_MODEL_LIST,
+    }[preset_model_group]
+    if not isinstance(group, (list, tuple)) or not group:
+        raise ValueError(f"{preset_model_group} 预制模型组必须是非空列表")
+    names = []
+    weights = []
+    seen = set()
+    for item in group:
+        if not isinstance(item, dict):
+            raise ValueError("预制模型组中的每个元素必须是 dict")
+        name = item.get("model_name")
+        weight = item.get("权重")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("预制模型组中的 model_name 必须是非空字符串")
+        if name in seen:
+            raise ValueError(f"预制模型组包含重复模型：{name}")
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not math.isfinite(weight) or weight < 0):
+            raise ValueError(f"模型 {name} 的权重必须是有限的非负数")
+        names.append(name)
+        weights.append(weight)
+        seen.add(name)
+    largest_weight = max(weights)
+    if largest_weight <= 0:
+        raise ValueError("预制模型组至少需要一个权重大于 0 的模型")
+    # 归一化避免多个很大的有限权重相加后溢出；不改变相对概率。
+    primary = random.choices(names, weights=[w / largest_weight for w in weights], k=1)[0]
+    fallbacks = [name for name in names if name != primary]
+    random.shuffle(fallbacks)
+    return [primary] + fallbacks
+
+
+def _beijing_now():
+    """带时区和微秒的北京时间；统一格式可以比较事件先后，避免后写入覆盖更新事件。"""
+    return datetime.now(_BEIJING_TIMEZONE).isoformat(timespec="microseconds")
+
+
+def _new_model_usage_event(model_name, trace_id, call_time_bj=None):
+    """仅在本次调用内暂存事件，不提前写盘，也不记录模型正在使用等状态。"""
+    return {
+        "model_name": model_name,
+        "status": "⚠️ 中断",
+        "call_time_bj": call_time_bj or _beijing_now(),
+        "finished_time_bj": None,
+        "duration_seconds": 0.0,
+        "error": None,
+        "http_status": None,
+        "response_model": None,
+        "trace_id": trace_id,
+    }
+
+
+def _reset_model_usage_lock_after_fork():
+    """fork 后重建线程锁，避免子进程继承其他线程已持有的锁。"""
+    global _MODEL_USAGE_THREAD_LOCK
+    _MODEL_USAGE_THREAD_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_model_usage_lock_after_fork)
+
+
+@contextmanager
+def _model_usage_file_lock(path):
+    """同一线程锁加操作系统文件锁；只在统计读改写时持有，等待最多指定秒数。"""
+    deadline = time.monotonic() + MODEL_USAGE_LOCK_TIMEOUT
+    thread_lock = _MODEL_USAGE_THREAD_LOCK
+    if not thread_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+        raise TimeoutError("等待模型统计线程锁超时")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 不锁 JSON 本身：os.replace 会替换它。此锁文件必须保留，不能用完就删除。
+        lock_path = path.with_name(path.name + ".lock")
+        with lock_path.open("a+b") as lock_file:
+            locked = False
+            try:
+                while not locked:
+                    try:
+                        if os.name == "nt":
+                            lock_file.seek(0)
+                            # Windows 允许锁定文件末尾以后的字节，无需向锁文件写占位内容。
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        locked = True
+                    except OSError as exc:
+                        if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK, errno.EINTR):
+                            raise
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("等待模型统计文件锁超时") from exc
+                        time.sleep(min(0.05, remaining))
+                yield
+            finally:
+                if locked:
+                    try:
+                        if os.name == "nt":
+                            lock_file.seek(0)
+                            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        else:
+                            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except OSError as exc:
+                        # 随后仍关闭文件句柄；解锁异常不覆盖请求结果或正在传播的中断。
+                        _log(f"[模型统计/解锁] 显式解锁失败 | 原因: [{type(exc).__name__}: {exc}]",
+                             logging.WARNING)
+    finally:
+        thread_lock.release()
+
+
+def _atomic_write_model_usage(path, data):
+    """同目录临时文件先完整写入并 fsync，再替换正式 JSON，避免留下半个文件。"""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=path.name + ".", suffix=".tmp", delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(data, temporary_file, ensure_ascii=False, indent=2, allow_nan=False)
+            temporary_file.write("\n")
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        # Windows 必须先关闭临时文件，再进行替换。
+        os.replace(temporary_path, path)
+        temporary_path = None
+        if os.name == "posix":
+            # 文件内容之外，再尽力同步目录项；部分文件系统不支持目录 fsync。
+            directory_fd = None
+            try:
+                directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                os.fsync(directory_fd)
+            except OSError as exc:
+                _log(f"[模型统计/同步] JSON 已替换，目录同步失败"
+                     f" | 原因: [{type(exc).__name__}: {exc}]", logging.WARNING)
+            finally:
+                if directory_fd is not None:
+                    os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                _log(f"[模型统计/清理] 临时文件删除失败"
+                     f" | 原因: [{type(exc).__name__}: {exc}]", logging.WARNING)
+
+
+def _save_model_usage(events):
+    """取得独占锁后读取最新 JSON，只合并本次增量；坏文件不清空、不覆盖。"""
+    path = Path(MODEL_USAGE_JSON_PATH).expanduser().resolve()
+    with _model_usage_file_lock(path):
+        existed = True
+        try:
+            with path.open("r", encoding="utf-8-sig") as usage_file:
+                data = json.load(usage_file)
+        except FileNotFoundError:
+            existed = False
+            data = {}
+        if not isinstance(data, dict) or any(not isinstance(value, dict) for value in data.values()):
+            raise ValueError("模型统计 JSON 必须是以模型名为 key、dict 为 value 的对象；原文件保留")
+
+        for event in events:
+            record = data.setdefault(event["model_name"], {})
+            for key in ("总共调用次数", "成功次数", "失败次数", "中断次数", "准备失败次数"):
+                value = record.setdefault(key, 0)
+                if type(value) is not int or value < 0:
+                    raise ValueError(f"模型统计字段 {key} 必须是非负整数；原文件保留")
+            if record["总共调用次数"] != record["成功次数"] + record["失败次数"] + record["中断次数"]:
+                raise ValueError("模型统计的调用次数与成功/失败/中断次数不一致；原文件保留")
+            duration = record.setdefault("累计请求耗时秒", 0.0)
+            if (isinstance(duration, bool) or not isinstance(duration, (int, float))
+                    or not math.isfinite(duration) or duration < 0):
+                raise ValueError("累计请求耗时秒必须是有限的非负数；原文件保留")
+            for key in ("最近调用时间（北京时间）", "最近完成时间（北京时间）",
+                        "最近报错信息时间（北京时间）", "最近成功时间（北京时间）"):
+                value = record.setdefault(key, None)
+                if value is not None and not isinstance(value, str):
+                    raise ValueError(f"模型统计字段 {key} 必须是字符串或 null；原文件保留")
+            record.setdefault("最近报错信息", None)
+
+            status = event["status"]
+            if status == "❌ 准备失败":
+                record["准备失败次数"] += 1
+            else:
+                record["总共调用次数"] += 1
+                count_key = {"✅ 成功": "成功次数", "❌ 失败": "失败次数", "⚠️ 中断": "中断次数"}[status]
+                record[count_key] += 1
+                record["累计请求耗时秒"] = round(duration + event["duration_seconds"], 6)
+            total = record["总共调用次数"]
+            record["成功率"] = round(record["成功次数"] / total, 6) if total else 0.0
+            record["平均请求耗时秒"] = round(record["累计请求耗时秒"] / total, 6) if total else 0.0
+
+            call_time = event["call_time_bj"]
+            finished_time = event["finished_time_bj"]
+            if not record["最近调用时间（北京时间）"] or call_time >= record["最近调用时间（北京时间）"]:
+                record["最近调用时间（北京时间）"] = call_time
+            if not record["最近完成时间（北京时间）"] or finished_time >= record["最近完成时间（北京时间）"]:
+                record["最近完成时间（北京时间）"] = finished_time
+                record["status"] = status
+                record["最近HTTP状态码"] = event["http_status"]
+                record["最近响应模型"] = event["response_model"]
+                record["最近trace_id"] = event["trace_id"]
+            if status == "✅ 成功" and (
+                not record["最近成功时间（北京时间）"] or finished_time >= record["最近成功时间（北京时间）"]
+            ):
+                record["最近成功时间（北京时间）"] = finished_time
+            if event["error"] and (
+                not record["最近报错信息时间（北京时间）"] or finished_time >= record["最近报错信息时间（北京时间）"]
+            ):
+                record["最近报错信息"] = event["error"]
+                record["最近报错信息时间（北京时间）"] = finished_time
+        if events or not existed:
+            _atomic_write_model_usage(path, data)
+
+
 def generate_content(
     prompt,
-    model,
+    model=None,
     file_paths=None,
-    fallback_model=None,
+    fallback_model_list=None,
     max_retries_per_model=3,
     timeout=360.0,
+    preset_model_group="medium",
 ):
     """同步生成文本；file_paths 为路径 list/tuple，不修改调用参数。
 
     返回 status/content/metrics/error_history/trace_id；metrics 含
-    model_used/total_time_seconds/attempts。尝试次数包含首次请求，总耗时包含附件读取、等待和清理。
+    model_used/total_time_seconds/attempts。尝试次数包含首次请求，总耗时包含附件读取、等待、清理和统计保存。
     普通异常按既有契约返回失败字典；KeyboardInterrupt/SystemExit 等系统级中断继续传播。
+
+    model=None 时按 preset_model_group 的权重选主模型，组内其余模型随机排序备用，
+    此时 fallback_model_list 由模型组自动生成；显式 model 时使用传入的备用模型名列表，
+    保留顺序并去重，preset_model_group 不参与选择。零权重模型不作为主模型，但仍可备用。
+    每次请求（含重试/切换/中断）按请求模型名统计，在 finally 中一次合并写盘。
+    能确定模型的准备失败单独计数，不计入请求次数或成功率；无法确定模型时不虚构模型名。
     """
     started = time.perf_counter()
+    called_at_bj = _beijing_now()
     trace_id = uuid.uuid4().hex
     result = {
         "status": "❌ 失败",
@@ -182,15 +473,13 @@ def generate_content(
     }
     metrics = result["metrics"]
     client = None
+    selected_model = model if isinstance(model, str) and model.strip() else None
+    usage_events = []
     try:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt 必须是非空字符串")
-        if not isinstance(model, str) or not model.strip():
-            raise ValueError("model 必须是非空字符串")
-        if fallback_model is not None and (
-            not isinstance(fallback_model, str) or not fallback_model.strip()
-        ):
-            raise ValueError("fallback_model 必须是非空字符串或 None")
+        models = _select_models(model, fallback_model_list, preset_model_group)
+        selected_model = models[0]
         if type(max_retries_per_model) is not int or max_retries_per_model < 1:
             raise ValueError("max_retries_per_model 必须是正整数")
         if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
@@ -205,9 +494,6 @@ def generate_content(
             raise ValueError("未配置 API 密钥，请检查配置项 local_api_key")
         # : timeout 沿用 SDK 请求超时语义，不是整个调用的总时限。
         client = OpenAI(base_url=BASE_URL, api_key=API_KEY, max_retries=0, timeout=timeout)
-        models = [model]
-        if fallback_model and fallback_model != model:
-            models.append(fallback_model)
 
         # : 沿用所有普通请求异常均重试/降级的规则，包括鉴权失败和无有效文本响应。
         for model_index, current_model in enumerate(models):
@@ -223,6 +509,8 @@ def generate_content(
                 request_started = time.perf_counter()
                 status_code = None
                 usage = None
+                request_event = _new_model_usage_event(current_model, trace_id)
+                usage_events.append(request_event)
                 try:
                     raw = client.chat.completions.with_raw_response.create(
                         model=current_model, messages=messages, stream=False,
@@ -241,11 +529,15 @@ def generate_content(
                     completion_log = (f"[文本网关/完成] 已取得有效文本 | 响应模型: [{metrics['model_used']}]"
                                       f" | 响应预览: [{_preview(reply)}]")
                     level = logging.INFO
+                    request_event["status"] = "✅ 成功"
+                    request_event["response_model"] = response.model or current_model
                 except Exception as exc:
                     status_code = getattr(exc, "status_code", None) or status_code
                     error = _redact(f"[尝试{metrics['attempts']}] model: {current_model}"
                                     f" | Error: {type(exc).__name__}: {exc}")
                     result["error_history"].append(error)
+                    request_event["status"] = "❌ 失败"
+                    request_event["error"] = error
                     terminal = attempt == max_retries_per_model and model_index == len(models) - 1
                     if attempt < max_retries_per_model:
                         action = f"等待 {delay:g} 秒后重试"
@@ -264,6 +556,14 @@ def generate_content(
                                       f" | 下一步: [{action}] | 原因: [{_preview(error)}]"
                                       f" | 可能原因与排查: [{hint}]")
                     level = logging.ERROR if terminal else logging.WARNING
+                except BaseException as exc:
+                    request_event["status"] = "⚠️ 中断"
+                    request_event["error"] = _redact(f"[请求中断] {type(exc).__name__}: {exc}")
+                    raise
+                finally:
+                    request_event["http_status"] = status_code
+                    request_event["duration_seconds"] = round(time.perf_counter() - request_started, 6)
+                    request_event["finished_time_bj"] = _beijing_now()
                 _log(f"{completion_log} | {context} | HTTP: [{status_code or 'N/A'}]"
                      f" | 本次耗时: [{time.perf_counter() - request_started:.3f}s]"
                      f" | 累计耗时: [{time.perf_counter() - started:.3f}s] | Token用量: [{usage}]", level)
@@ -275,15 +575,32 @@ def generate_content(
     except Exception as exc:
         error = _redact(f"[处理失败] {type(exc).__name__}: {exc}")
         result["error_history"].append(error)
+        if not usage_events and selected_model is not None:
+            preparation_event = _new_model_usage_event(selected_model, trace_id, called_at_bj)
+            preparation_event["status"] = "❌ 准备失败"
+            preparation_event["error"] = error
+            preparation_event["finished_time_bj"] = _beijing_now()
+            usage_events.append(preparation_event)
         _log(f"❌ [文本网关/调用] 准备请求或执行重试流程失败 | trace_id: [{trace_id}]"
              f" | 原因: [{error}] | 排查: [检查调用参数、附件路径/格式/编码及网关配置]", logging.ERROR)
     finally:
-        cleanup_error = _close_client(client, f"generate_content / trace_id={trace_id}")
-        if cleanup_error:
-            result["error_history"].append(cleanup_error)
-        metrics["total_time_seconds"] = round(time.perf_counter() - started, 3)
-        if result["status"] == "❌ 失败":
-            result["content"] = "调用失败：" + "；".join(result["error_history"][-3:])
+        try:
+            cleanup_error = _close_client(client, f"generate_content / trace_id={trace_id}")
+            if cleanup_error:
+                result["error_history"].append(cleanup_error)
+        finally:
+            try:
+                _save_model_usage(usage_events)
+            except Exception as exc:
+                # 统计故障对调用方可见，但不把成功的模型请求改判为失败。
+                stats_error = _redact(f"[模型统计/保存失败] {type(exc).__name__}: {exc}")
+                result["error_history"].append(stats_error)
+                _log(f"[模型统计/保存] 本次统计未能保存 | trace_id: [{trace_id}]"
+                     f" | 路径: [{MODEL_USAGE_JSON_PATH}] | 原因: [{stats_error}]", logging.ERROR)
+            finally:
+                metrics["total_time_seconds"] = round(time.perf_counter() - started, 3)
+                if result["status"] == "❌ 失败":
+                    result["content"] = "调用失败：" + "；".join(result["error_history"][-3:])
     return result
 
 
@@ -342,7 +659,6 @@ def probe_models(json_path):
              f" | 模型: [{model_id}] | 结果: [{result.get('status')}]"
              f" | 成功数: [{report['success_count']}] | trace_id: [{result.get('trace_id')}]")
         time.sleep(0.5)
-        br
 
     try:
         save_json(json_path, report)
