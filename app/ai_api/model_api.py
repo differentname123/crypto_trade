@@ -46,7 +46,8 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 40, "备注": "来源gemini_web"},
 
 
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 20, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 10, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.7-flash", "权重": 10, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 40, "备注": "来源aistudio_web"},
 
 
