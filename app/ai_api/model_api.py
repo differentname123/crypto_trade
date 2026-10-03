@@ -52,12 +52,12 @@ MEDIUM_MODEL_LIST = [
 
 
     {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 20, "备注": "来源antigravity"},
-    # {"model_name": "gpt-5.6-terra-max", "权重": 10, "备注": "来源codex 免费"},
+    {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
 
 ]
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
-    # {"model_name": "gemini-web-3.5-flash-lite-thinking-max", "权重": 1, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.5-flash-lite-thinking-max", "权重": 0, "备注": "来源gemini_web"},
 
 ]
 
