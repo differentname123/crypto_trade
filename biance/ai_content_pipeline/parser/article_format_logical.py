@@ -39,7 +39,7 @@ LLM_MAX_RETRIES = 3
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
 ARTICLE_MATERIAL_LIMIT = 20
-ARTICLE_POST_USAGE_LIMIT = 5
+ARTICLE_POST_USAGE_LIMIT = 2
 ARTICLE_MAX_CHARS = 260
 ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 STATE_FILE = "account_publish_state.json"
@@ -49,10 +49,10 @@ TOPIC_COOLDOWN_SECONDS = 12 * 3600
 PUBLISH_POLL_SECONDS = 600
 MEDIA_PATTERN = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
 SHELF_LIFE_SECONDS = {
-    "hours": 24 * 3600,
-    "days": 7 * 24 * 3600,
-    "weeks": 30 * 24 * 3600,
-    "long": 30 * 24 * 3600,
+    "hours": 2 * 3600,
+    "days": 1 * 24 * 3600,
+    "weeks": 7 * 24 * 3600,
+    "long": 15 * 24 * 3600,
     "unknown": 24 * 3600,
 }
 
@@ -1005,7 +1005,12 @@ def _run_task(task):
 
 
 if __name__ == "__main__":
-    tasks = (generate_analysis_articles, format_image_article, auto_publish_articles)
+    tasks = (
+        generate_analysis_articles,
+        format_image_article,
+
+        auto_publish_articles
+             )
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
