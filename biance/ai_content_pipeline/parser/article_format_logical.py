@@ -61,6 +61,7 @@ SHELF_LIFE_SECONDS = {
 MODEL_NAME_PRO = "gpt-6-luna-max"
 MODEL_NAME_PRO = "gemini-3.1-pro-thinking"
 
+
 # MODEL_NAME_PRO = "gpt-5.6"
 
 
@@ -262,7 +263,10 @@ def process_and_save_single_post(post, post_manager):
             "| 排查: [检查帖子字段、提示词/媒体路径及数据库连接]",
             post_id,
         )
+
+
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
+
 
 def fetch_post(post_manager):
     """按币种顺序及综合推荐流采集后统一入库，保留重复帖子和接口参数。
@@ -279,6 +283,7 @@ def fetch_post(post_manager):
         f"[采集/完成] 推荐流已处理 | 币种数: 【{len(FEED_TOKENS)}】"
         f" | 入库条目: 【{len(posts)}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
     )
+
 
 def format_image_article():
     """轮询原帖并以 5 个工作线程提取论据；失败按原策略等待后重试。"""
@@ -325,6 +330,7 @@ def format_image_article():
                 "| 排查: [数据库访问或工作线程出现异常]"
             )
             time.sleep(60)
+
 
 def clear_all_media_format_batch():
     """手动清理查询范围内的 logic_mul；无入参，非 None 字段置空后批量回写。"""
@@ -384,9 +390,9 @@ def transform_mlus(mlu_list):
                 "media": {"local_mapping": evidence.get("source_local_mapping") or {}},
             })
         if not all(
-            image.get("image_id") in source_mapping
-            and isinstance(image.get("context"), str) and image["context"].strip()
-            for image in images
+                image.get("image_id") in source_mapping
+                and isinstance(image.get("context"), str) and image["context"].strip()
+                for image in images
         ):
             logger.warning(
                 "[文章/配图] 当前论据取消整组配图并保留文字 | 帖子: [%s] "
@@ -735,6 +741,8 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         coin, stance, record["attempt_count"], time.monotonic() - started,
     )
     return saved_record
+
+
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
     grouped = extract_and_group_valid_evidences()
@@ -883,6 +891,7 @@ def _publish_articles_once(article_manager):
             "已调用本地和数据库状态回写" if success else error,
         )
 
+
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
     article_manager = GeneratedArticleManager(gen_db_object())
@@ -1007,10 +1016,10 @@ def _run_task(task):
 if __name__ == "__main__":
     tasks = (
         generate_analysis_articles,
-        format_image_article,
+        # format_image_article,
 
-        auto_publish_articles
-             )
+        # auto_publish_articles
+    )
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
