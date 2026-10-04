@@ -652,10 +652,36 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         # [修改点 1]：调用应用层自行封装的查重逻辑
         usage_counts = get_post_usage_counts(article_manager, BINANCE_SOURCE, post_ids)
 
-        selected = [
-                       item for item in candidates
-                       if usage_counts.get(item["source_post_id"], 0) <= ARTICLE_POST_USAGE_LIMIT
-                   ][:ARTICLE_MATERIAL_LIMIT]
+        # ------------------- 新增重构的抽取逻辑 -------------------
+        # 1. 过滤：小于 ARTICLE_POST_USAGE_LIMIT 是硬性规定
+        filtered_candidates = [
+            item for item in candidates
+            if usage_counts.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
+        ]
+
+        # 2. 按 dimension 和 shelf_life 组合进行分组
+        groups = {}
+        for item in filtered_candidates:
+            key = (item.get("dimension"), item.get("shelf_life"))
+            groups.setdefault(key, []).append(item)
+
+        # 3. 每组内部按 impact_weight 降序排序
+        for key in groups:
+            groups[key].sort(key=lambda x: x.get("impact_weight", 0), reverse=True)
+
+        # 4. 轮询抽取，优先保证各个组合都有，且数量均衡
+        selected = []
+        while groups and len(selected) < ARTICLE_MATERIAL_LIMIT:
+            # 每次轮询时，优先挑选当前队首 impact_weight 最大的组合进行抽取
+            sorted_keys = sorted(groups.keys(), key=lambda k: groups[k][0].get("impact_weight", 0), reverse=True)
+            for k in sorted_keys:
+                if len(selected) >= ARTICLE_MATERIAL_LIMIT:
+                    break
+                selected.append(groups[k].pop(0))
+                # 如果该组合的材料已经被抽空，则移除该组
+                if not groups[k]:
+                    del groups[k]
+        # --------------------------------------------------------
 
         if not selected:
             record["status"] = "skip"
@@ -742,9 +768,9 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
     )
     return saved_record
 
-
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
+    allowed_stances = {"看多", "看空"}
     grouped = extract_and_group_valid_evidences()
     groups = [
         (coin, stance, evidences)
@@ -762,7 +788,7 @@ def generate_analysis_articles_once():
     # : 此处仅保证单实例串行；多实例共享引用次数仍需数据库锁或事务能力。
     results = [
         generate_and_save_analysis_article(coin, stance, evidences, article_manager)
-        for coin, stance, evidences in groups
+        for coin, stance, evidences in groups if stance in allowed_stances and evidences
     ]
     logger.info(
         "[文章/本轮完成] 分组处理结束 | 总数: [%s] | 成功: [%s] | 跳过: [%s] | 失败: [%s]",
@@ -1016,9 +1042,8 @@ def _run_task(task):
 if __name__ == "__main__":
     tasks = (
         generate_analysis_articles,
-        # format_image_article,
-
-        # auto_publish_articles
+        format_image_article,
+        auto_publish_articles
     )
     threads = []
     for task in tasks:
