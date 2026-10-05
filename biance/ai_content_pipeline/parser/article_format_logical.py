@@ -830,13 +830,14 @@ def _publish_articles_once(article_manager):
         "publish_status": {"$ne": "success"},
     }
 
-    # [修改点 4]：调用 Manager 的通用查找接口 find_articles
     candidates = article_manager.find_articles(query=query) or []
 
+    # [优化] 在内存中过滤掉重试次数达到或超过 3 次的失败文章，防止死循环发帖触发风控
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
            and len(article.get("article_info", {}).get("image_placeholders", [])) >= 2
+           and article.get("publish_attempts", 0) < 3
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
     logger.info(
@@ -869,15 +870,6 @@ def _publish_articles_once(article_manager):
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
             text = f"{text}\n\n#{topic}"
 
-        # api_key = get_config(f"{account}_square_api_key")
-        # if not api_key:
-        #     logger.error(
-        #         "[发布/账号] 当前账号无法发布 | 账号: [%s] | 结果: [本轮跳过] "
-        #         "| 原因: [未读取到 API Key] | 排查: [检查对应账号配置]",
-        #         account,
-        #     )
-        #     continue
-
         image_mapping = info.get("image_mapping", {})
         image_path_list = []
         for placeholder, mapping in image_mapping.items():
@@ -887,12 +879,14 @@ def _publish_articles_once(article_manager):
         started = time.monotonic()
         stage, api_result = "调用发布接口", "未知"
         user_data_dir = get_config(f"{account}_browser_session_dir")
+
+        # 记录当前的尝试次数
+        current_attempts = article.get("publish_attempts", 0) + 1
+
         try:
-            # success = publish_to_binance_square(api_key=api_key, text_content=text)
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_path_list, user_data_dir=user_data_dir
             )
-
 
             api_result = "成功" if success else "失败"
             if success:
@@ -900,17 +894,29 @@ def _publish_articles_once(article_manager):
                 account_state["last_publish_time"] = now
                 if topic:
                     account_state["topic_publish_history"][topic] = now
-                changes = {"publish_status": "success", "published_by": account, "publish_time": now}
+
+                # [新增] 将重试次数和 binance 返回的 post_id 一起更新到数据库
+                changes = {
+                    "publish_status": "success",
+                    "published_by": account,
+                    "publish_time": now,
+                    "binance_post_id": post_id,
+                    "publish_attempts": current_attempts
+                }
             else:
-                error = "发帖失败（可能是网络不通、Key失效或达到每日上限）"
+                # [优化] 把接口的 err 详细原因写到本地日志和状态里，方便定位
+                error = f"发帖失败（网络不通/被限流/内容违规）- 详请: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
-                changes = {"publish_status": "failed", "last_error": error}
+                changes = {
+                    "publish_status": "failed",
+                    "last_error": error,
+                    "publish_attempts": current_attempts
+                }
 
             stage = "写入账号状态文件"
             save_json(STATE_FILE, state)
             stage = "回写数据库发布状态"
 
-            # [修改点 5]：回写状态更新为调用纯净的 upsert 接口
             article.update(changes)
             article_manager.upsert_articles([article])
 
@@ -919,17 +925,18 @@ def _publish_articles_once(article_manager):
                 f"发布阶段[{stage}]失败 | 账号: [{account}] | 文章: [{article.get('_id')}] "
                 f"| 主题: [{topic}] | 接口结果: [{api_result}]；请核对远端结果与本地状态"
             ) from exc
+
         if success:
             articles.pop(selected_index)
+
         log = logger.info if success else logger.error
         log(
             "[发布/文章] 接口调用及状态回写结束 | 账号: [%s] | 主题: [%s] | 文章: [%s] "
             "| 评分: [%s] | 耗时: [%.2f 秒] | 结果: [%s] | 说明: [%s]",
             account, topic, article.get("_id"), info.get("score"), time.monotonic() - started,
-            "发布成功" if success else "发布失败",
+            "发布成功" if success else f"发布失败(重试次数:{current_attempts}/3)",
             "已调用本地和数据库状态回写" if success else error,
         )
-
 
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
@@ -1054,8 +1061,8 @@ def _run_task(task):
 
 if __name__ == "__main__":
     tasks = [
-        # generate_analysis_articles,
-        # format_image_article,
+        generate_analysis_articles,
+        format_image_article,
         auto_publish_articles
     ]
     threads = []
