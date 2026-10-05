@@ -44,7 +44,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_ruru"
+USER_DATA_DIR = r"W:\temp\biance_yang"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -1045,11 +1045,17 @@ def _read_api_verdict(page, watcher):
 #                              核心：提交一条评论
 # ==============================================================================
 
-def _submit_comment(page, editor_container, comment, image_path=None, url_info_list=None):
+# ==============================================================================
+#                              核心：提交一条评论
+# ==============================================================================
+
+def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None):
     """
     在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→ 发送校验。
     ⚠️ 业务顺序保持线上潜规则：超链接先注入垫底，随后强制光标置顶，让正文顶在超链接之前。
-    入参形貌: url_info_list = [{"text": str, "url": str}, ...]。返回评论ID(str) 或 None。
+    入参形貌: url_info_list = [{"text": str, "url": str}, ...]
+              image_path_list = [str, str, ...] 或单 str
+    返回评论ID(str) 或 None。
     """
     comment = str(comment) if comment else ""
 
@@ -1059,23 +1065,46 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     # ---- 步骤 1：唤醒富文本编辑器 ----
     real_editor = _wake_editor(page, editor_container)
 
-    # ---- 步骤 2：注入图片（失败降级为纯文本，不中断）----
-    if image_path and os.path.exists(image_path):
+    # ---- 步骤 2：注入图片（支持多图，严格遵循列表顺序）----
+    valid_images = []
+    if image_path_list:
+        # 兼容旧版调用传单字符串的情况
+        if isinstance(image_path_list, str):
+            image_path_list = [image_path_list]
+        for p in image_path_list:
+            if os.path.exists(p):
+                valid_images.append(p)
+            else:
+                logger.warning(f"[编辑器/图片] 图片路径不存在，已跳过: <{p}>")
+
+    if valid_images:
+        file_input = editor_container.locator('input[type="file"]').first
         try:
-            editor_container.locator('input[type="file"]').first.set_input_files(image_path, timeout=15000)
+            # 【策略 A】: 原生列表批量注入 (底层严格按照 List 顺序构建 DOM FileList)
+            file_input.set_input_files(valid_images, timeout=15000)
             mounted = False
             try:
+                # 等待最后一张图片（缩略图）渲染出来，确保全部按序挂载完毕
                 expect(editor_container.locator(
                     "img[src^='blob'],img[src^='http'],img[src^='data:'],[class*='thumb'],[class*='preview'] img"
-                ).first).to_be_visible(timeout=12000)
+                ).nth(len(valid_images) - 1)).to_be_visible(timeout=15000)
                 mounted = True
             except Exception:
                 page.wait_for_timeout(3500)  # 等不到缩略图则退回固定等待
-            logger.info(
-                f"[编辑器/图片] 图片挂载完毕 | 路径: <{image_path}> | 缩略图可见: 【{mounted}】 | 结果: [Success]")
+            logger.info(f"[编辑器/图片] 图片批量挂载完毕 | 数量: 【{len(valid_images)}】张 | "
+                        f"缩略图全可见: 【{mounted}】 | 结果: [Success]")
         except Exception as e:
-            logger.warning(f"[编辑器/图片] 图片上传失败，本条评论自动降级为纯文本 | 路径: <{image_path}> "
-                           f"| 可能原因: 【文件损坏/格式不支持/上传控件未渲染: {str(e)[:150]}】")
+            logger.warning(f"[编辑器/图片] 批量注入失败，可能前端缺失 multiple 属性。进入逐张降级保序上传模式 | "
+                           f"错误: 【{str(e)[:150]}】")
+            # 【策略 B】: 降级为逐张物理排队注入 (对抗不支持 multiple 的远古控件)
+            try:
+                for idx, img_path in enumerate(valid_images):
+                    file_input.set_input_files(img_path, timeout=5000)
+                    page.wait_for_timeout(1000)  # 强制给前端留出读取并追加 UI 的时间，保证顺序
+                logger.info(f"[编辑器/图片] 逐张降级上传完毕 | 数量: 【{len(valid_images)}】张 | 结果: [Success]")
+            except Exception as sub_e:
+                logger.warning(f"[编辑器/图片] 逐张降级上传依然失败，本条自动降级为纯文本 | "
+                               f"致命错误: 【{str(sub_e)[:150]}】")
 
     # ---- 步骤 3：注入超链接（先注入，让超链接垫底）----
     links = [u for u in (url_info_list or []) if isinstance(u, dict)] if isinstance(url_info_list, list) else []
@@ -1097,7 +1126,6 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     # ---- 步骤 4：注入正文 ----
     if comment.strip():
         logger.info(f"[编辑器/正文] 开始键入正文 | 字符数: 【{len(comment)}】 | 分块: 【{TYPE_CHUNK_SIZE}】")
-        # ⚠️ 与线上一致：此处绝不再 click 编辑器，否则光标会跳回已注入的超链接内部
         page.wait_for_timeout(800)
         _type_body(page, real_editor, comment)
         page.wait_for_timeout(500)
@@ -1118,11 +1146,6 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             _type_body(page, real_editor, comment)
             page.wait_for_timeout(500)
 
-        # ==============================================================================
-        # 🚀 [核心修复]: 强制状态同步 (State Resync)
-        # 应对 ProseMirror + React 状态脱帧导致“发送按钮置灰”的终极杀招。
-        # 将光标切到末尾，模拟一次真实的交互触发 onChange。
-        # ==============================================================================
         logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
         try:
             _focus_editor_end(page, real_editor)
@@ -1142,18 +1165,11 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
         editor_container.get_by_role("button", name=RE_SEND).first,
     ]
 
-    # ==============================================================================
-    # 🚀 [核心修复]: 严格的按钮状态断言
-    # 绝不用 JS 原生去点一个 Disabled 的按钮，那会制造假希望并导致幽灵超时。
-    # ==============================================================================
     try:
         send_button = _pick_trusted_send_button(send_btn_cands) or _interact_fallback_locators(
             send_btn_cands, action="wait", timeout=5000, desc="发送按钮")
-
-        # 必须等待它变成 enable（亮黄色）
         expect(send_button).to_be_enabled(timeout=8000)
     except PlaywrightTimeoutError:
-        # 如果依然是 disabled，立即存证并终止，不要去点
         _forensics(page, "btn_disabled_fatal", {
             "btn_html": send_button.evaluate("el => el.outerHTML") if send_button else "none",
             "editor_text": real_editor.inner_text() if real_editor else "none"
@@ -1194,31 +1210,20 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
             _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
             raise Exception("发送按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
 
-        # ==============================================================================
-        # 🚀 [新增加固]: 嗅探并处理「关注以回复」权限拦截弹窗
-        # ==============================================================================
         try:
-            # 宽泛正则：兼容中英文环境下的“关注并回复”按钮
             RE_FOLLOW_AND_REPLY = re.compile(r"关注并回复|Follow and [R|r]eply", re.IGNORECASE)
             follow_reply_btn = page.locator("div[role='dialog'], [class*='modal']").get_by_role(
                 "button", name=RE_FOLLOW_AND_REPLY
             ).first
 
-            # 给弹窗 1.5 秒的渲染时间，如果没有弹窗会平滑超时 pass
             if follow_reply_btn.is_visible(timeout=1500):
                 logger.info("[发送/权限] 触发了「仅限关注者评论」限制，正在自动点击【关注并回复】")
-
-                # ⚠️ 核心细节：清空 Watcher 之前捕获的 70007 失败响应，防止 _read_api_verdict 误判
                 watcher.primary.clear()
                 watcher.secondary.clear()
-
-                # 点击关注并回复，这会触发真正的发帖请求
                 follow_reply_btn.click(timeout=3000)
-                page.wait_for_timeout(500)  # 给予接口一点缓冲时间
+                page.wait_for_timeout(500)
         except Exception as bypass_e:
-            # 没找到弹窗或点击失败都不阻塞，交由后续的 API 判据来决定生死
             pass
-        # ==============================================================================
 
         api_success, comment_id = _read_api_verdict(page, watcher)
     except PlaywrightTimeoutError as e:
@@ -1226,7 +1231,6 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     finally:
         watcher.close()
 
-    # ---- 步骤 6：DOM 兜底校验（编辑器被大幅清空即视为发送成功）----
     if api_success:
         return comment_id
 
@@ -1245,7 +1249,6 @@ def _submit_comment(page, editor_container, comment, image_path=None, url_info_l
     })
     raise Exception(f"发送已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
                     f"媒体 {media_before}→{media_after}），疑似发送按钮失效、内容被前端校验拦下或网络堵塞。")
-
 
 # ==============================================================================
 #                              URL / 帖子ID 解析
@@ -1365,7 +1368,7 @@ def _locate_post_creator(page):
 # ==============================================================================
 # 新增 2：自动发帖主入口函数
 # ==============================================================================
-def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
+def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_DIR,
                         url_info_list=None, debug=False):
     """
     主控入口：调度浏览器打开广场主页并执行【独立发帖】全流程。
@@ -1375,9 +1378,10 @@ def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
     if not os.path.isdir(user_data_dir):
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
+    img_count = len(image_path_list) if isinstance(image_path_list, list) else (1 if image_path_list else 0)
     square_url = "https://www.binance.com/zh-CN/square"
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化发帖 | URL: <{square_url}> "
-                f"| 正文: 【{len(str(content or ''))}字】 | 图片: <{image_path or '无'}> "
+                f"| 正文: 【{len(str(content or ''))}字】 | 图片数量: 【{img_count}】张 "
                 f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
@@ -1417,7 +1421,6 @@ def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
 
                 install_overlay_guard(page)
 
-                # 导航到币安广场主页
                 response = page.goto(square_url, timeout=60000, wait_until="domcontentloaded")
                 _dismiss_overlays(page, aggressive=False, desc="square-nav")
                 report_guard_hits(page, "square-nav")
@@ -1433,14 +1436,13 @@ def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
 
                 check_for_crash(page)
 
-                # 定位主页顶部的发帖区，无需滚动直接捕获
                 try:
                     editor_container = _locate_post_creator(page)
                 except Exception as e:
                     return f"无法定位发帖区: {e}", False, None
 
-                # 🚀 核心复用：将发帖容器和数据送入已有的通用表单填报动作引擎
-                post_id = _submit_comment(page, editor_container, content, image_path, url_info_list)
+                # 🚀 传入 image_path_list 列表
+                post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list)
 
                 logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
                 return None, True, post_id
@@ -1474,7 +1476,7 @@ def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
         return error_info, False, None
 
 
-def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=USER_DATA_DIR,
+def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_dir=USER_DATA_DIR,
                             url_info_list=None, debug=False):
     """
     主控入口：调度浏览器打开帖子并执行评论全流程。
@@ -1485,25 +1487,23 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
     post_id = extract_binance_post_id(post_url)
+    img_count = len(image_path_list) if isinstance(image_path_list, list) else (1 if image_path_list else 0)
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化评论 | 帖子ID: 【{post_id}】 | URL: <{post_url}> "
-                f"| 正文: 【{len(str(comment or ''))}字】 | 图片: <{image_path or '无'}> "
+                f"| 正文: 【{len(str(comment or ''))}字】 | 图片数量: 【{img_count}】张 "
                 f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
-    # 🚀 [核心修复] 彻底禁止 Chrome 恢复上次崩溃/未关闭的会话，从底层斩断假死
     anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
-
     offscreen_args = [
                          '--disable-blink-features=AutomationControlled', '--disable-gpu',
                          '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
                          '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
                          '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
                          '--disable-breakpad',
-                         '--force-device-scale-factor=1',  # 防离屏窗口 DPI 漂移导致坐标点击偏移
+                         '--force-device-scale-factor=1',
                          '--hide-scrollbars',
                      ] + anti_freeze_args
 
-    # 🚀 [核心修复] 去掉可见模式下的 --disable-gpu，防止 Windows 有头模式下渲染死锁白屏
     debug_args = [
                      '--disable-blink-features=AutomationControlled', '--start-maximized',
                      '--window-position=0,0'
@@ -1521,7 +1521,6 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                 context.set_default_timeout(60000)
                 context.set_default_navigation_timeout(60000)
 
-                # 🚀 [核心修复] 绝对不复用 context.pages[0]，强制创建崭新页面，并关闭所有历史垃圾页面
                 page = context.new_page()
                 for old_page in context.pages:
                     if old_page != page:
@@ -1531,12 +1530,9 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
                             pass
                 page.bring_to_front()
 
-                # 🚀 必须在 goto 之前武装守卫：init_script 只对之后的导航生效
                 install_overlay_guard(page)
 
-                # 🚀 [核心修复] 等待级别降级为 domcontentloaded，避免被第三方死链卡死
                 response = page.goto(post_url, timeout=60000, wait_until="domcontentloaded")
-
                 _dismiss_overlays(page, aggressive=False, desc="post-nav")
                 report_guard_hits(page, "post-nav")
 
@@ -1548,7 +1544,6 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
 
                 check_for_crash(page)
 
-                # 定位编辑器前再清障：引导浮层会给 body 加 scroll-lock 让 PageDown 失效
                 _dismiss_overlays(page, aggressive=False, desc="pre-scroll")
                 try:
                     editor_container = _smart_scroll_to_editor(page)
@@ -1560,7 +1555,8 @@ def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=US
 
                 check_for_crash(page)
 
-                comment_id = _submit_comment(page, editor_container, comment, image_path, url_info_list)
+                # 🚀 传入 image_path_list 列表
+                comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list)
                 logger.info(
                     f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
                 return None, True, comment_id
@@ -1778,7 +1774,7 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
     # login_and_save_session()                                  # 初次手动登录并固化 Session
-    # open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
+    open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
     # cookies, csrf = get_auth_tokens_robust(USER_DATA_DIR)     # 提取脱机 API 凭证
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
@@ -1788,7 +1784,7 @@ if __name__ == "__main__":
 
 
     err, success, c_id = comment_on_binance_post(
-        post_url=test_url, comment=test_msg, image_path=test_img, url_info_list=test_links, debug=True
+        post_url=test_url, comment=test_msg, image_path_list=test_img, url_info_list=test_links, debug=True
     )
 
     if success:
@@ -1798,7 +1794,7 @@ if __name__ == "__main__":
 
 
     err, success, c_id = create_binance_post(
-        content=test_msg, image_path=test_img, url_info_list=test_links, debug=True
+        content=test_msg, image_path_list=test_img, url_info_list=test_links, debug=True
     )
 
     if success:

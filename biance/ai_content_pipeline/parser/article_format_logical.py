@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
+from biance.biance_playwright import create_binance_post
 from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
@@ -835,7 +836,7 @@ def _publish_articles_once(article_manager):
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-           and len(article.get("article_info", {}).get("image_placeholders", [])) == 0
+           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 2
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
     logger.info(
@@ -868,19 +869,31 @@ def _publish_articles_once(article_manager):
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
             text = f"{text}\n\n#{topic}"
 
-        api_key = get_config(f"{account}_square_api_key")
-        if not api_key:
-            logger.error(
-                "[发布/账号] 当前账号无法发布 | 账号: [%s] | 结果: [本轮跳过] "
-                "| 原因: [未读取到 API Key] | 排查: [检查对应账号配置]",
-                account,
-            )
-            continue
+        # api_key = get_config(f"{account}_square_api_key")
+        # if not api_key:
+        #     logger.error(
+        #         "[发布/账号] 当前账号无法发布 | 账号: [%s] | 结果: [本轮跳过] "
+        #         "| 原因: [未读取到 API Key] | 排查: [检查对应账号配置]",
+        #         account,
+        #     )
+        #     continue
+
+        image_mapping = info.get("image_mapping", {})
+        image_path_list = []
+        for placeholder, mapping in image_mapping.items():
+            local_path = mapping.get("local_path")
+            image_path_list.append(local_path if local_path else None)
 
         started = time.monotonic()
         stage, api_result = "调用发布接口", "未知"
+        user_data_dir = get_config(f"{account}_browser_session_dir")
         try:
-            success = publish_to_binance_square(api_key=api_key, text_content=text)
+            # success = publish_to_binance_square(api_key=api_key, text_content=text)
+            err, success, post_id = create_binance_post(
+                content=text, image_path_list=image_path_list, user_data_dir=user_data_dir
+            )
+
+
             api_result = "成功" if success else "失败"
             if success:
                 account_state["total_success"] += 1
@@ -1040,11 +1053,11 @@ def _run_task(task):
 
 
 if __name__ == "__main__":
-    tasks = (
-        generate_analysis_articles,
-        format_image_article,
+    tasks = [
+        # generate_analysis_articles,
+        # format_image_article,
         auto_publish_articles
-    )
+    ]
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)
