@@ -1802,6 +1802,6 @@ if __name__ == "__main__":
     )
 
     if success:
-        logger.info(f"\n[结果/Final] 🎉 ======== 自动评论任务圆满成功 ======== | 评论ID: 【{c_id}】")
+        logger.info(f"\n[结果/Final] 🎉 ======== 自动发帖任务圆满成功 ======== | 发帖ID: 【{c_id}】")
     else:
         logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
