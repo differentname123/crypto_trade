@@ -44,7 +44,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_yang"
+USER_DATA_DIR = r"W:\temp\biance_ruru"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -63,8 +63,9 @@ NEWLINE_SAFE_MODE = False
 RE_MORE = re.compile(r"更多|More|Options|Expand", re.IGNORECASE)
 RE_ADD_LINK = re.compile(r"添加链接|Add link|Insert link", re.IGNORECASE)
 RE_CONFIRM = re.compile(r"确认|Confirm|OK|Save|Add", re.IGNORECASE)
-RE_SEND = re.compile(r"回复|发送|评论|Reply|Comment|Send|Post", re.IGNORECASE)
-RE_SEND_EXACT = re.compile(r"^(回复|发送|评论|Reply|Comment|Send|Post)$", re.IGNORECASE)
+
+RE_SEND = re.compile(r"回复|发送|评论|发文|发布|Reply|Comment|Send|Post|Publish", re.IGNORECASE)
+RE_SEND_EXACT = re.compile(r"^(回复|发送|评论|发文|发布|Reply|Comment|Send|Post|Publish)$", re.IGNORECASE)
 
 # 引导浮层"确认关闭"类按钮：刻意不含「取消/Cancel」，避免误取消业务弹窗
 RE_DISMISS = re.compile(
@@ -631,9 +632,12 @@ def _smart_scroll_to_editor(page, max_scrolls=20):
     raise Exception(f"向下滚动 {max_scrolls} 次仍未找到评论输入区，疑似死链、风控滑块拦截或 body 被 scroll-lock 锁死。")
 
 
+# ==============================================================================
+# 修改 2：修改原有的 _resolve_wake_target 函数，加入发帖框的 placeholder
+# ==============================================================================
 def _resolve_wake_target(editor_container):
     """
-    解析"点哪里能唤醒编辑器"的候选（保持原首选选择器，仅显式排除右上角搜索框）。
+    解析"点哪里能唤醒编辑器"的候选（兼容评论区和广场主页发帖区）。
     """
     cands = (
         editor_container.locator(
@@ -641,8 +645,9 @@ def _resolve_wake_target(editor_container):
             ':not([placeholder*="Search"]):not([aria-label*="搜索"]):not([aria-label*="Search"]),'
             'input[placeholder]:not([type="search"]):not([placeholder*="搜索"]):not([placeholder*="Search"])'
         ).first,
+        # 🚀 专门新增针对广场发帖区特征的识别
         editor_container.get_by_placeholder(
-            re.compile(r"(发布您的回复|发布你的回复|写下你的|说点什么|发表评论|回复|评论|Reply|Comment|Write|Post)")
+            re.compile(r"(分享您的洞见|Share your insights|分享你的|发布您的回复|发布你的回复|写下你的|说点什么|发表评论|回复|评论|Reply|Comment|Write|Post)", re.IGNORECASE)
         ).first,
         editor_container.locator('div[contenteditable="true"].ProseMirror').first,
         editor_container.locator('div[contenteditable="true"]').first,
@@ -655,8 +660,6 @@ def _resolve_wake_target(editor_container):
         except Exception:
             continue
     return editor_container.locator('input, div[contenteditable="true"]').first
-
-
 def _wake_editor(page, editor_container, max_round=4):
     """
     唤醒富文本编辑器（业务动作不变：点击输入区让 ProseMirror 变为可编辑）。
@@ -1326,6 +1329,151 @@ def _verify_page_ready(page, response, post_id):
     return None
 
 
+# ==============================================================================
+# 新增 1：主页发帖区定位器（基于你提供的 HTML 特征）
+# ==============================================================================
+def _locate_post_creator(page):
+    """
+    精准锁定广场主页最顶部的发帖区容器（包含编辑器、工具栏和发文按钮的宏大容器）。
+    """
+    # 策略 1：基于 HTML 提供的高度特定 class 定位 (最稳定)
+    precise_locator = page.locator("div.short-editor-inner").first
+    try:
+        if precise_locator.is_visible(timeout=3000):
+            logger.info("[定位/DOM] 已精确锁定主页发帖区作用域 (基于 short-editor-inner)")
+            return precise_locator
+    except Exception:
+        pass
+
+    # 策略 2：基于占位符或发文按钮的向上溯源
+    try:
+        fallback_input = page.get_by_placeholder(re.compile(r"分享您的洞见|Share your insights", re.IGNORECASE)).first
+        if fallback_input.is_visible(timeout=3000):
+            container = fallback_input.locator(
+                "xpath=ancestor::div[has(div[@contenteditable='true'] or input[@type='file'])][1]")
+            if container.count() > 0:
+                logger.info("[定位/DOM] 已锁定主页发帖区作用域 (基于占位符溯源)")
+                return container.first
+    except Exception:
+        pass
+
+    # 策略 3：兜底，在主页上发帖区永远是第一个富文本编辑器
+    logger.warning("[定位/DOM] 精确定位与溯源均未命中，降级为锁定页面首个富文本容器")
+    return page.locator('div:has(div[contenteditable="true"].ProseMirror), div:has(input[type="file"])').first
+
+
+# ==============================================================================
+# 新增 2：自动发帖主入口函数
+# ==============================================================================
+def create_binance_post(content, image_path=None, user_data_dir=USER_DATA_DIR,
+                        url_info_list=None, debug=False):
+    """
+    主控入口：调度浏览器打开广场主页并执行【独立发帖】全流程。
+    复用底层高度解耦的 _submit_comment 动作链路。
+    返回 Tuple(错误信息(str|None), 是否成功(bool), 帖子ID(str|None))。
+    """
+    if not os.path.isdir(user_data_dir):
+        return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
+
+    square_url = "https://www.binance.com/zh-CN/square"
+    logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化发帖 | URL: <{square_url}> "
+                f"| 正文: 【{len(str(content or ''))}字】 | 图片: <{image_path or '无'}> "
+                f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
+                f"\n{'=' * 70}")
+
+    anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
+    offscreen_args = [
+                         '--disable-blink-features=AutomationControlled', '--disable-gpu',
+                         '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
+                         '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+                         '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
+                         '--disable-breakpad', '--force-device-scale-factor=1', '--hide-scrollbars',
+                     ] + anti_freeze_args
+
+    debug_args = [
+                     '--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'
+                 ] + anti_freeze_args
+
+    try:
+        with sync_playwright() as p:
+            context = None
+            try:
+                context = _launch_persistent(
+                    p, user_data_dir,
+                    args=debug_args if debug else offscreen_args,
+                    viewport=None if debug else {'width': 1920, 'height': 1080},
+                )
+                context.set_default_timeout(60000)
+                context.set_default_navigation_timeout(60000)
+
+                page = context.new_page()
+                for old_page in context.pages:
+                    if old_page != page:
+                        try:
+                            old_page.close()
+                        except Exception:
+                            pass
+                page.bring_to_front()
+
+                install_overlay_guard(page)
+
+                # 导航到币安广场主页
+                response = page.goto(square_url, timeout=60000, wait_until="domcontentloaded")
+                _dismiss_overlays(page, aggressive=False, desc="square-nav")
+                report_guard_hits(page, "square-nav")
+
+                if response and response.status >= 400:
+                    return f"广场主页加载异常 (HTTP {response.status})", False, None
+
+                try:
+                    page.locator("a[href*='login']").first.wait_for(state="visible", timeout=3000)
+                    return "页面探测到 Login 按钮，本地 Cookie 可能已过期失效。", False, None
+                except PlaywrightTimeoutError:
+                    pass
+
+                check_for_crash(page)
+
+                # 定位主页顶部的发帖区，无需滚动直接捕获
+                try:
+                    editor_container = _locate_post_creator(page)
+                except Exception as e:
+                    return f"无法定位发帖区: {e}", False, None
+
+                # 🚀 核心复用：将发帖容器和数据送入已有的通用表单填报动作引擎
+                post_id = _submit_comment(page, editor_container, content, image_path, url_info_list)
+
+                logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
+                return None, True, post_id
+
+            except BusinessErrorException as biz_e:
+                error_info = f"[业务拦截] {biz_e}"
+                logger.error(f"[任务/Main] 发帖被服务端业务规则阻断 | 原因: 【{error_info}】")
+                return error_info, False, None
+
+            except Exception as e:
+                is_timeout = isinstance(e, PlaywrightTimeoutError)
+                error_info = f"[{type(e).__name__}] {e}"
+                if context and context.pages:
+                    try:
+                        _forensics(context.pages[0], "post_error", {"url": square_url, "error": error_info[:2000]})
+                    except Exception:
+                        pass
+                _alert_failure_scene(error_info)
+                return error_info, False, None
+
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return error_info, False, None
+
+
 def comment_on_binance_post(post_url, comment, image_path=None, user_data_dir=USER_DATA_DIR,
                             url_info_list=None, debug=False):
     """
@@ -1630,16 +1778,27 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
     # login_and_save_session()                                  # 初次手动登录并固化 Session
-    open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
+    # open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
     # cookies, csrf = get_auth_tokens_robust(USER_DATA_DIR)     # 提取脱机 API 凭证
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
-    test_img = r"C:\Users\zxh\Desktop\temp\a6c98436-42f9-4aa9-bab8-.png"
+    test_img = r"E:\chrome\1759239193.png"
     test_links = [{"text": "带单", "url": "https://www.binance.com/zh-CN/square/post/309692475255842"}]
+
 
     err, success, c_id = comment_on_binance_post(
         post_url=test_url, comment=test_msg, image_path=test_img, url_info_list=test_links, debug=True
+    )
+
+    if success:
+        logger.info(f"\n[结果/Final] 🎉 ======== 自动评论任务圆满成功 ======== | 评论ID: 【{c_id}】")
+    else:
+        logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
+
+
+    err, success, c_id = create_binance_post(
+        content=test_msg, image_path=test_img, url_info_list=test_links, debug=True
     )
 
     if success:
