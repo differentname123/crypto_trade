@@ -19,6 +19,8 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
+import ccxt
+
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post
@@ -429,6 +431,13 @@ def extract_and_group_valid_evidences():
     返回 {coin: {stance: [论据]}}；论据追加 source_post_id、publish_time、
     source_text_content、source_image_mapping，支持脱离原帖使用。
     """
+    allowed_stances = {"看多", "看空"}
+    active_usdt_symbols_path = "active_usdt_symbols.json"
+    active_usdt_symbols = read_json(active_usdt_symbols_path)
+
+    # 提前将 active_usdt_symbols 转换为全大写字符串，用于后续不区分大小写的 in 判断
+    active_usdt_symbols_str = str(active_usdt_symbols).upper()
+
     started = time.monotonic()
     post_manager = UniversalPostManager(gen_db_object())
     posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
@@ -457,6 +466,11 @@ def extract_and_group_valid_evidences():
             coins, stance = evidence.get("coins", []), evidence.get("stance")
             if not isinstance(coins, list) or not coins or not stance:
                 continue
+
+            # 新增过滤条件 1：只保留 allowed_stances 允许的 stance
+            if stance not in allowed_stances:
+                continue
+
             enriched = {
                 **evidence,
                 "source_post_id": post.get("post_id", "UNKNOWN"),
@@ -466,7 +480,8 @@ def extract_and_group_valid_evidences():
             }
             for coin in coins:
                 coin = str(coin).strip().upper()
-                if coin:
+                # 新增过滤条件 2：coin(即topic)必须出现在 active_usdt_symbols 中 (此处依靠 in 判断)
+                if coin and (coin in active_usdt_symbols_str):
                     grouped[coin][stance].append(enriched)
     for stances in grouped.values():
         for evidences in stances.values():
@@ -481,7 +496,6 @@ def extract_and_group_valid_evidences():
         invalid_times, time.monotonic() - started,
     )
     return result
-
 
 def check_article_info(article_info, materials, image_mapping, max_chars):
     """校验文章与证据链；article_info 必须含下方六字段。
@@ -771,7 +785,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
 
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
-    allowed_stances = {"看多", "看空"}
     grouped = extract_and_group_valid_evidences()
     groups = [
         (coin, stance, evidences)
@@ -789,7 +802,7 @@ def generate_analysis_articles_once():
     # : 此处仅保证单实例串行；多实例共享引用次数仍需数据库锁或事务能力。
     results = [
         generate_and_save_analysis_article(coin, stance, evidences, article_manager)
-        for coin, stance, evidences in groups if stance in allowed_stances and evidences
+        for coin, stance, evidences in groups
     ]
     logger.info(
         "[文章/本轮完成] 分组处理结束 | 总数: [%s] | 成功: [%s] | 跳过: [%s] | 失败: [%s]",
@@ -836,7 +849,7 @@ def _publish_articles_once(article_manager):
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 2
+           # and len(article.get("article_info", {}).get("image_placeholders", [])) >= 2
            and article.get("publish_attempts", 0) < 3
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
