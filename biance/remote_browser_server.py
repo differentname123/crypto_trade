@@ -82,7 +82,7 @@ class BrowserEngine:
                 except Exception as e:
                     print(f"[引擎] 初始导航超时或异常 (可忽略): {e}")
 
-                print("[引擎] 浏览器已就绪，开始推流与监听控制...")
+                print("[引擎] 浏览器已就绪，开始监听控制...")
 
                 # 主控循环
                 while self.is_running:
@@ -103,17 +103,18 @@ class BrowserEngine:
                     except Exception as e:
                         print(f"[操作] 指令执行异常: {e}")
 
-                    # 2. 截取最新画面并塞入共享内存 (MJPEG)
+                    # 2. 截取最新画面并塞入共享内存
                     try:
                         # 【优化带宽】降低质量至 15 (极高压缩率)，足以辨认按钮位置
                         frame = page.screenshot(type="jpeg", quality=15)
                         self.current_frame = frame
                     except Exception as e:
-                        # 页面加载、崩溃或关闭时可能截图失败，暂避即可
+                        # 页面加载、崩溃或弹窗等会导致截图失败，打印错误防止死锁被隐藏
+                        # print(f"[引擎] 截图警告 (可能正在跳转): {e}")
                         pass
 
-                    # 【优化带宽】控制推流帧率下降到约 5 FPS，大幅降低传输开销
-                    time.sleep(0.2)
+                    # 【控制帧率】主循环睡眠时间控制抓取频率，0.25秒约等于 4 FPS
+                    time.sleep(0.25)
 
                     # 退出循环，执行安全释放
                 context.close()
@@ -122,6 +123,7 @@ class BrowserEngine:
             print(f"[引擎] 崩溃: {e}")
         finally:
             self.is_running = False
+            self.current_frame = None
 
 
 # 实例化全局单例引擎
@@ -158,9 +160,13 @@ HTML_TEMPLATE = """
             background: #000;
             position: relative;
             box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         /* 禁止图片拖拽选中，确保纯粹的点击事件 */
-        #browser-screen { width: 100%; height: 100%; object-fit: contain; cursor: crosshair; user-select: none; -webkit-user-drag: none; }
+        #browser-screen { width: 100%; height: 100%; object-fit: contain; cursor: crosshair; user-select: none; -webkit-user-drag: none; display: none; }
+        .placeholder { color: #555; position: absolute; }
         .status { margin-top: 10px; color: #888; }
     </style>
 </head>
@@ -173,18 +179,22 @@ HTML_TEMPLATE = """
         </select>
         <button class="btn-refresh" onclick="refreshAccounts()">🔄 刷新列表</button>
         <button class="btn-start" onclick="startEngine()">▶ 启动 / 连接</button>
-        <button class="btn-stop" onclick="sendCommand('/stop')">⏹ 安全断开</button>
+        <button class="btn-stop" onclick="stopEngine()">⏹ 安全断开</button>
     </div>
 
     <div class="screen-container">
-        <!-- MJPEG 流式传输源 -->
-        <img id="browser-screen" src="" alt="等待浏览器启动..." />
+        <div class="placeholder" id="placeholder">等待浏览器启动...</div>
+        <!-- 前端主动拉取的实时画面 -->
+        <img id="browser-screen" src="" alt="屏幕" />
     </div>
     <div class="status" id="log">状态: 未连接</div>
 
     <script>
         // 初始化拉取账号列表
         window.onload = refreshAccounts;
+
+        let snapshotTimer = null;
+        let isFetchingFrame = false;
 
         function refreshAccounts() {
             document.getElementById('log').innerText = '正在实时拉取错误账号列表...';
@@ -211,15 +221,6 @@ HTML_TEMPLATE = """
                 });
         }
 
-        function sendCommand(endpoint) {
-            document.getElementById('log').innerText = '正在发送指令...';
-            fetch(endpoint)
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('log').innerText = data.msg;
-                });
-        }
-
         function startEngine() {
             const sel = document.getElementById('accountSelect');
             if (!sel.value) {
@@ -237,18 +238,78 @@ HTML_TEMPLATE = """
             .then(data => {
                 document.getElementById('log').innerText = data.msg;
                 if (data.status === 'ok') {
-                    // 延迟刷新视频流，留给 Playwright 1秒启动时间
-                    setTimeout(() => {
-                        document.getElementById('browser-screen').src = "/video_feed?" + new Date().getTime();
-                    }, 1000);
+                    // 开始前端主动轮询拉取画面
+                    startPolling();
                 }
             });
+        }
+
+        function stopEngine() {
+            document.getElementById('log').innerText = '正在发送停止指令...';
+            fetch('/stop')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('log').innerText = data.msg;
+                    stopPolling();
+                    document.getElementById('browser-screen').style.display = 'none';
+                    document.getElementById('placeholder').style.display = 'block';
+                    document.getElementById('placeholder').innerText = '浏览器已断开';
+                });
+        }
+
+        // --- 核心改动：前端短连接防堵塞轮询获取单帧画面 ---
+        function startPolling() {
+            if (snapshotTimer) clearInterval(snapshotTimer);
+            document.getElementById('placeholder').style.display = 'none';
+            document.getElementById('browser-screen').style.display = 'block';
+
+            // 每 300 毫秒（约 3.3 FPS）主动拉取一次最新画面，彻底告别僵尸流和线程耗尽
+            snapshotTimer = setInterval(fetchSingleFrame, 300); 
+        }
+
+        function stopPolling() {
+            if (snapshotTimer) {
+                clearInterval(snapshotTimer);
+                snapshotTimer = null;
+            }
+        }
+
+        function fetchSingleFrame() {
+            // 如果上一帧因为网络慢还没加载完，直接跳过这一次请求，绝不堵塞队列
+            if (isFetchingFrame) return; 
+
+            isFetchingFrame = true;
+            fetch('/snapshot')
+                .then(response => {
+                    if (response.status === 200) {
+                        return response.blob();
+                    } else if (response.status === 204) {
+                        // 204 No Content 代表引擎刚启动，第一帧还没截出来，正常现象
+                        return null; 
+                    }
+                    throw new Error('未运行');
+                })
+                .then(blob => {
+                    if (blob) {
+                        const url = URL.createObjectURL(blob);
+                        const img = document.getElementById('browser-screen');
+                        // 当图片渲染完毕后释放内存，防止内存泄漏
+                        img.onload = () => URL.revokeObjectURL(url); 
+                        img.src = url;
+                    }
+                })
+                .catch(err => {
+                    // 忽略报错，可能服务正在重启
+                })
+                .finally(() => {
+                    isFetchingFrame = false;
+                });
         }
 
         // 核心：处理画面点击并按比例映射坐标
         const screenEl = document.getElementById('browser-screen');
         screenEl.addEventListener('mousedown', function(e) {
-            if (!this.src || this.src.endsWith('undefined')) return;
+            if (this.style.display === 'none') return;
 
             // 获取当前 img 标签在页面上的实际物理大小和位置
             const rect = this.getBoundingClientRect();
@@ -317,21 +378,15 @@ def handle_click():
     return jsonify({"status": "ok"})
 
 
-def mjpeg_generator():
-    """将 Playwright 的 JPEG 截图打包为 HTTP 混合替换流 (MJPEG)"""
-    while True:
-        if engine.is_running and engine.current_frame:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + engine.current_frame + b'\r\n')
-        else:
-            # 浏览器未启动时，发送空流防止前端报错，降低休眠时间
-            time.sleep(0.5)
-        time.sleep(0.05)
+# --- 核心改动：用单帧快照接口取代长连接推流接口 ---
+@app.route('/snapshot')
+def get_snapshot():
+    """返回最新的一帧单张图片（短连接，用完即释放线程）"""
+    if not engine.is_running or not engine.current_frame:
+        # 引擎未准备好时返回 204 无内容，避免前端报错
+        return Response(status=204)
 
-
-@app.route('/video_feed')
-def video_feed():
-    return Response(mjpeg_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(engine.current_frame, mimetype='image/jpeg')
 
 
 # ==============================================================================
@@ -339,7 +394,7 @@ def video_feed():
 # ==============================================================================
 if __name__ == '__main__':
     print("===================================================")
-    print(" 🕸️ Web 控制台启动成功！")
+    print(" 🕸️ Web 控制台启动成功！(已升级为无堵塞轮询架构)")
     print(" 🔗 请在浏览器中打开: http://127.0.0.1:5000")
     print("===================================================")
     # 不使用 reloader，防止后台线程被创建多次
