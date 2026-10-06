@@ -48,8 +48,17 @@ ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 STATE_FILE = "account_publish_state.json"
 ACCOUNTS = [
     "myself",
+    "mama",
+    "ruru",
 
-            "ruru"]
+    # "yang",
+    # "daniang",
+
+    # "zhouling",
+    "qiqi",
+    # "yanglin"
+
+]
 ACCOUNT_COOLDOWN_SECONDS = 3600
 TOPIC_COOLDOWN_SECONDS = 12 * 3600
 PUBLISH_POLL_SECONDS = 600
@@ -500,6 +509,7 @@ def extract_and_group_valid_evidences():
     )
     return result
 
+
 def check_article_info(article_info, materials, image_mapping, max_chars):
     """校验文章与证据链；article_info 必须含下方六字段。
     materials 含 id/visual_evidence，image_mapping 为真实 ASSET 来源映射；
@@ -847,6 +857,7 @@ def generate_analysis_articles_once():
     )
     return results
 
+
 def generate_analysis_articles():
     """文章生成后台线程：完成后等 1 小时；无分组或本轮异常时等 60 秒。"""
     while True:
@@ -937,7 +948,6 @@ def _publish_articles_once(article_manager):
                 "type": "future"
             }
 
-
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_path_list, user_data_dir=user_data_dir, chart_info=target_chart
             )
@@ -991,6 +1001,7 @@ def _publish_articles_once(article_manager):
             "发布成功" if success else f"发布失败(重试次数:{current_attempts}/3)",
             "已调用本地和数据库状态回写" if success else error,
         )
+
 
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
