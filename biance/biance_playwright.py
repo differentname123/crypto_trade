@@ -87,7 +87,39 @@ COOKIE_SELECTORS = (
     "button:has-text('Accept All')",
     "button:has-text('Allow All')",
 )
+_CARET_TO_TAIL_JS = r"""
+(element) => {
+    element.focus();
+    if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        range.collapse(false); // false = 折叠到绝对尾部
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+    }
+    return true;
+}
+"""
 
+def _force_caret_to_tail(page, real_editor, tag=""):
+    """
+    把光标绝对锁定到编辑器文本的尾部。
+    对抗 ProseMirror 中普通 `End` 键只到行尾导致的光标乱窜问题。
+    """
+    try:
+        real_editor.evaluate(_CARET_TO_TAIL_JS)
+    except Exception as e:
+        logger.warning(f"[编辑器/光标] Range 置底执行异常，降级为键盘方案 | 场景: <{tag}> | 详情: 【{str(e)[:120]}】")
+
+    # 兜底：使用 Control+End (Win) 或 Meta+End (Mac) 跳到整个文档末尾
+    for combo in ("Control+End", "Meta+End", "End"):
+        try:
+            real_editor.press(combo, timeout=2000)
+            break
+        except Exception:
+            continue
+    page.wait_for_timeout(300)
 # 编辑器保护白名单：任何清障动作都不许碰到含这些元素的容器
 EDITOR_GUARD_SELECTOR = '.ProseMirror,[contenteditable="true"],input[type="file"],textarea'
 
@@ -1052,7 +1084,7 @@ def _read_api_verdict(page, watcher):
 
 def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None, chart_info=None):
     """
-    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[图表垫底]→ 发送校验。
+    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[强制光标置底]→[图表]→ 发送校验。
     入参形貌: url_info_list = [{"text": str, "url": str}, ...]
               image_path_list = [str, str, ...] 或单 str
               chart_info = {"coin": "BTC", "bridge": "USDT", "type": "future"}
@@ -1149,7 +1181,8 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 
         logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
         try:
-            _focus_editor_end(page, real_editor)
+            # 💡 核心修复点 1：状态同步前也强制锁死光标到底部，不留给前端跳焦点的机会
+            _force_caret_to_tail(page, real_editor, tag="resync")
             real_editor.press("Space")
             page.wait_for_timeout(100)
             real_editor.press("Backspace")
@@ -1159,20 +1192,20 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 
         logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
 
-    # ---- 步骤 4.5：注入图表（移动到此处，确保追加在文字末尾）----
+    # ---- 步骤 4.5：注入图表（移动到此处，确保追加在整个文档的绝对末尾）----
     if chart_info:
         logger.info("[编辑器/图表] 准备在正文末尾注入图表...")
         _dismiss_overlays(page, aggressive=False, desc="pre-chart")
 
-        # 强制将光标移至编辑器末尾
-        _focus_editor_end(page, real_editor)
+        # 💡 核心修复点 2：图表注入前，强制光标到整个文本的绝对末尾
+        _force_caret_to_tail(page, real_editor, tag="before-chart")
 
-        # 模拟敲击回车，让图表组件另起一行显示（可选，但推荐，以保证排版美观）
+        # 安全换行，确保图表在正文下方另起一行（Shift+Enter 防止误触发发送）
         try:
-            real_editor.press("Enter")
+            real_editor.press("Shift+Enter")
             page.wait_for_timeout(200)
         except Exception:
-            page.keyboard.press("Enter")
+            page.keyboard.press("Shift+Enter")
             page.wait_for_timeout(200)
 
         _inject_chart(page, editor_container, chart_info)
@@ -1268,6 +1301,7 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
     })
     raise Exception(f"发送已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
                     f"媒体 {media_before}→{media_after}），疑似发送按钮失效、内容被前端校验拦下或网络堵塞。")
+
 
 # ==============================================================================
 #                              URL / 帖子ID 解析
@@ -1889,6 +1923,9 @@ def _inject_chart(page, editor_container, chart_info):
         return False
 
 
+
+
+
 # ==============================================================================
 #                                   启动入口
 # ==============================================================================
@@ -1922,3 +1959,35 @@ if __name__ == "__main__":
         logger.info(f"\n[结果/Final] 🎉 ======== 自动发帖任务圆满成功 ======== | 发帖ID: 【{c_id}】")
     else:
         logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
+
+
+    # 1. 拟定发帖文案
+    test_content = "交易所的估值天花板，正在被真实的线下消费捅破。\n\n何一确认：币安支付现已接入日本全国 PayPay 商户。这不是小圈子里的链上自嗨，而是把加密支付直接接进了主流线下商业网络。\n\n多数人看 BNB，眼光始终停留在手续费折扣和打新挖矿。但当它跳出交易所围墙、切入真实世界的支付场景时，流动性就不再只是投机筹码，而是有了实体刚需做托底。\n\n靠发预告撑不起长线，能在街头实体里跑通闭环的生态，基本盘只会越来越硬。"
+
+    # 2. 配置目标图表 (支持 type="future" 合约 或 type="spot" 现货)
+    target_chart = {
+        "coin": "BTC",
+        "bridge": "USDT",
+        "type": "future"
+    }
+
+    # 3. 可选：附带跳转链接 / 图片
+    test_links = [
+        {"text": "更多行情", "url": "https://www.binance.com"}
+    ]
+    test_images = [r"E:\chrome\1759239193.png"]  # 如需测试图片可传: [r"E:\chrome\1759239193.png"]
+
+    # 4. 调用发帖函数（建议保持 debug=True，方便直接观察搜索框输入和列表点击动作）
+    err, success, p_id = create_binance_post(
+        content=test_content,
+        image_path_list=test_images,
+        url_info_list=test_links,
+        chart_info=target_chart,
+        user_data_dir=USER_DATA_DIR,
+        debug=True
+    )
+
+    if success:
+        logger.info(f"\n[结果/Final] 🎉 ======== 带图表发帖任务成功 ======== | 帖子ID: 【{p_id}】")
+    else:
+        logger.error(f"\n[结果/Final] ❌ ======== 带图表发帖任务失败 ======== | 错误原因:\n{err}")
