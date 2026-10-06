@@ -894,7 +894,7 @@ def _publish_articles_once(article_manager):
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-           # and len(article.get("article_info", {}).get("image_placeholders", [])) >= 2
+           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
            and article.get("publish_attempts", 0) < 3
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
