@@ -11,10 +11,6 @@ from common.common_utils import read_json
 # ==============================================================================
 #                                   运行配置与环境
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_yang"
-
-error_dir_list = read_json("error_dir_list.json")
-
 HOME_URL = "https://www.binance.com/zh-CN/square"
 VIEWPORT_WIDTH = 1920
 VIEWPORT_HEIGHT = 1080
@@ -39,10 +35,12 @@ class BrowserEngine:
         self.thread = None
         self.cmd_queue = queue.Queue()
         self.current_frame = None  # 存放最新一帧截图的二进制流
+        self.user_data_dir = None  # 存放当前使用的动态目录
 
-    def start(self):
+    def start(self, user_data_dir):
         if self.is_running:
             return False
+        self.user_data_dir = user_data_dir
         self.is_running = True
         self.thread = threading.Thread(target=self._run_browser_loop, daemon=True)
         self.thread.start()
@@ -63,11 +61,11 @@ class BrowserEngine:
 
     def _run_browser_loop(self):
         """完全独立的单线程，负责维持 Playwright 运转、接收指令和不断截图"""
-        print(f"[引擎] 正在挂载目录启动: {USER_DATA_DIR}")
+        print(f"[引擎] 正在挂载目录启动: {self.user_data_dir}")
         try:
             with sync_playwright() as p:
                 context = p.chromium.launch_persistent_context(
-                    user_data_dir=USER_DATA_DIR,
+                    user_data_dir=self.user_data_dir,
                     channel="chrome",
                     headless=False,
                     args=OFFSCREEN_ARGS,
@@ -86,7 +84,7 @@ class BrowserEngine:
 
                 print("[引擎] 浏览器已就绪，开始推流与监听控制...")
 
-                # 主控循环（约 10-15 FPS，平衡 CPU 占用）
+                # 主控循环
                 while self.is_running:
                     # 1. 处理来自 Flask Web 的队列指令
                     try:
@@ -107,16 +105,17 @@ class BrowserEngine:
 
                     # 2. 截取最新画面并塞入共享内存 (MJPEG)
                     try:
-                        # 使用 jpeg 格式和质量压缩来降低延迟
-                        frame = page.screenshot(type="jpeg", quality=40)
+                        # 【优化带宽】降低质量至 15 (极高压缩率)，足以辨认按钮位置
+                        frame = page.screenshot(type="jpeg", quality=15)
                         self.current_frame = frame
                     except Exception as e:
                         # 页面加载、崩溃或关闭时可能截图失败，暂避即可
                         pass
 
-                    time.sleep(0.08)  # 控制推流帧率，约 12 FPS
+                    # 【优化带宽】控制推流帧率下降到约 5 FPS，大幅降低传输开销
+                    time.sleep(0.2)
 
-                # 退出循环，执行安全释放
+                    # 退出循环，执行安全释放
                 context.close()
                 print("[引擎] 上下文已关闭，文件锁已安全释放。")
         except Exception as e:
@@ -142,15 +141,17 @@ HTML_TEMPLATE = """
     <title>币安自动化 - 远程接管台</title>
     <style>
         body { font-family: -apple-system, system-ui; background: #121212; color: #fff; margin: 0; padding: 20px; display: flex; flex-direction: column; align-items: center; }
-        .controls { margin-bottom: 20px; display: flex; gap: 15px; }
+        .controls { margin-bottom: 20px; display: flex; gap: 15px; align-items: center; flex-wrap: wrap; justify-content: center; }
         button { padding: 10px 20px; font-size: 16px; cursor: pointer; border: none; border-radius: 5px; font-weight: bold; }
+        select { padding: 10px; font-size: 16px; border-radius: 5px; background: #222; color: #fff; border: 1px solid #555; max-width: 400px;}
+        .btn-refresh { background: #3498db; color: #fff; }
         .btn-start { background: #00c087; color: #000; }
         .btn-stop { background: #f6465d; color: #fff; }
         .screen-container {
             width: 90vw;
             max-width: 1200px;
             /* 强制与浏览器实际比例 16:9 保持一致，确保坐标等比映射绝对精确 */
-            aspect-ratio: 1920 / 1080; 
+            aspect-ratio: 1920 / 1080;
             border: 2px solid #333;
             border-radius: 8px;
             overflow: hidden;
@@ -165,34 +166,90 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <h2>🚀 Binance Playwright 远程接管台</h2>
+
     <div class="controls">
-        <button class="btn-start" onclick="sendCommand('/start')">▶ 启动 / 连接浏览器</button>
-        <button class="btn-stop" onclick="sendCommand('/stop')">⏹ 安全断开并释放</button>
+        <select id="accountSelect">
+            <option value="">加载中...</option>
+        </select>
+        <button class="btn-refresh" onclick="refreshAccounts()">🔄 刷新列表</button>
+        <button class="btn-start" onclick="startEngine()">▶ 启动 / 连接</button>
+        <button class="btn-stop" onclick="sendCommand('/stop')">⏹ 安全断开</button>
     </div>
 
     <div class="screen-container">
         <!-- MJPEG 流式传输源 -->
-        <img id="browser-screen" src="/video_feed" alt="等待浏览器启动..." />
+        <img id="browser-screen" src="" alt="等待浏览器启动..." />
     </div>
     <div class="status" id="log">状态: 未连接</div>
 
     <script>
+        // 初始化拉取账号列表
+        window.onload = refreshAccounts;
+
+        function refreshAccounts() {
+            document.getElementById('log').innerText = '正在实时拉取错误账号列表...';
+            fetch('/accounts')
+                .then(r => r.json())
+                .then(res => {
+                    if(res.status === 'ok') {
+                        const sel = document.getElementById('accountSelect');
+                        sel.innerHTML = '';
+                        if (res.data.length === 0) {
+                            sel.innerHTML = '<option value="">(列表为空)</option>';
+                        } else {
+                            res.data.forEach(dir => {
+                                const opt = document.createElement('option');
+                                opt.value = dir;
+                                opt.textContent = dir;
+                                sel.appendChild(opt);
+                            });
+                        }
+                        document.getElementById('log').innerText = '账号列表刷新成功 (共 ' + res.data.length + ' 个)';
+                    } else {
+                        document.getElementById('log').innerText = '拉取列表失败: ' + res.msg;
+                    }
+                });
+        }
+
         function sendCommand(endpoint) {
-            document.getElementById('log').innerText = '正在发送请求...';
+            document.getElementById('log').innerText = '正在发送指令...';
             fetch(endpoint)
                 .then(r => r.json())
                 .then(data => {
                     document.getElementById('log').innerText = data.msg;
-                    if (endpoint === '/start') {
-                        // 刷新流以防缓存卡死
-                        document.getElementById('browser-screen').src = "/video_feed?" + new Date().getTime();
-                    }
                 });
+        }
+
+        function startEngine() {
+            const sel = document.getElementById('accountSelect');
+            if (!sel.value) {
+                alert("请先选择一个有效的账号目录！");
+                return;
+            }
+
+            document.getElementById('log').innerText = '正在请求启动: ' + sel.value;
+            fetch('/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ user_data_dir: sel.value })
+            })
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('log').innerText = data.msg;
+                if (data.status === 'ok') {
+                    // 延迟刷新视频流，留给 Playwright 1秒启动时间
+                    setTimeout(() => {
+                        document.getElementById('browser-screen').src = "/video_feed?" + new Date().getTime();
+                    }, 1000);
+                }
+            });
         }
 
         // 核心：处理画面点击并按比例映射坐标
         const screenEl = document.getElementById('browser-screen');
         screenEl.addEventListener('mousedown', function(e) {
+            if (!this.src || this.src.endsWith('undefined')) return;
+
             // 获取当前 img 标签在页面上的实际物理大小和位置
             const rect = this.getBoundingClientRect();
 
@@ -222,10 +279,29 @@ def index():
     return render_template_string(HTML_TEMPLATE)
 
 
-@app.route('/start')
+@app.route('/accounts', methods=['GET'])
+def get_accounts():
+    """实时读取 error_dir_list.json 返回给前端"""
+    try:
+        dir_list = read_json("error_user_data_dir.json")
+        if not isinstance(dir_list, list):
+            dir_list = []
+        return jsonify({"status": "ok", "data": dir_list})
+    except Exception as e:
+        return jsonify({"status": "error", "msg": str(e)})
+
+
+@app.route('/start', methods=['POST'])
 def start_browser():
-    success = engine.start()
-    return jsonify({"status": "ok", "msg": "浏览器启动成功" if success else "浏览器已经在运行中"})
+    """接收前端传来的具体目录，挂载并启动浏览器"""
+    data = request.json
+    user_data_dir = data.get("user_data_dir")
+
+    if not user_data_dir:
+        return jsonify({"status": "error", "msg": "未提供账号目录"})
+
+    success = engine.start(user_data_dir)
+    return jsonify({"status": "ok", "msg": "浏览器启动成功" if success else "浏览器已经在运行中，请先停止当前运行账号"})
 
 
 @app.route('/stop')
