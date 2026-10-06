@@ -928,6 +928,8 @@ def _publish_articles_once(article_manager):
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
             text = f"{text}\n\n#{topic}"
 
+        text += "👇"
+
         image_mapping = info.get("image_mapping", {})
         image_path_list = []
         for placeholder, mapping in image_mapping.items():
