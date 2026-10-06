@@ -699,12 +699,18 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         # --------------------------------------------------------
 
         if not selected:
+            reason_msg = "本分组没有有效论据，或原帖使用次数均已超过允许阈值。"
             record["status"] = "skip"
             record["article_info"] = {
                 "status": "skip", "text": "", "image_placeholders": [], "used_material_ids": [],
-                "score": None, "reason": "本分组没有有效论据，或原帖使用次数均已超过允许阈值。",
+                "score": None, "reason": reason_msg,
                 "image_mapping": {},
             }
+            # [新增日志] 记录本地因素材耗尽触发的跳过
+            logger.info(
+                "[文章/跳过] 本地拦截 | 币种: [%s] | 立场: [%s] | 原因: [%s]",
+                coin, stance, reason_msg
+            )
             return record
 
         materials, image_mapping = transform_mlus(selected)
@@ -770,7 +776,15 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             "| 结果: [返回错误记录，不入库] | 排查: [检查素材、提示词读取、数据库查询及模型响应]",
             coin, stance, record["attempt_count"],
         )
+
     if record["status"] != "ok":
+        # [新增日志] 如果是大模型主动返回的 skip，打印具体原因
+        if record["status"] == "skip":
+            skip_reason = (record.get("article_info") or {}).get("reason", "大模型未说明原因")
+            logger.info(
+                "[文章/跳过] 模型拒签 | 币种: [%s] | 立场: [%s] | 尝试: [%s] | 原因: [%s]",
+                coin, stance, record["attempt_count"], skip_reason
+            )
         return record
 
     # [修改点 3]：清洗数据结构后再交由 manager 入库
@@ -782,6 +796,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         coin, stance, record["attempt_count"], time.monotonic() - started,
     )
     return saved_record
+
 
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
@@ -804,14 +819,30 @@ def generate_analysis_articles_once():
         generate_and_save_analysis_article(coin, stance, evidences, article_manager)
         for coin, stance, evidences in groups
     ]
+
+    # [新增修改]：细化本轮完成后的日志统计，区分两种不同的跳过原因
+    success_cnt = sum(1 for item in results if item["status"] == "ok")
+    error_cnt = sum(1 for item in results if item["status"] == "error")
+
+    local_skip_cnt = 0
+    llm_skip_cnt = 0
+    for item in results:
+        if item["status"] == "skip":
+            reason = (item.get("article_info") or {}).get("reason", "")
+            if "超过允许阈值" in reason or "没有有效论据" in reason:
+                local_skip_cnt += 1
+            else:
+                llm_skip_cnt += 1
+
+    total_skip = local_skip_cnt + llm_skip_cnt
+
     logger.info(
-        "[文章/本轮完成] 分组处理结束 | 总数: [%s] | 成功: [%s] | 跳过: [%s] | 失败: [%s]",
-        len(results), sum(item["status"] == "ok" for item in results),
-        sum(item["status"] == "skip" for item in results),
-        sum(item["status"] == "error" for item in results),
+        "[文章/本轮完成] 分组处理结束 | 总数: [%s] | 成功: [%s] | 失败: [%s] "
+        "| 跳过总计: [%s] (素材耗尽拦截: %s, 大模型拒签: %s)",
+        len(results), success_cnt, error_cnt,
+        total_skip, local_skip_cnt, llm_skip_cnt
     )
     return results
-
 
 def generate_analysis_articles():
     """文章生成后台线程：完成后等 1 小时；无分组或本轮异常时等 60 秒。"""
