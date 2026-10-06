@@ -44,7 +44,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_yang"
+USER_DATA_DIR = r"W:\temp\biance_myself"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -1049,12 +1049,13 @@ def _read_api_verdict(page, watcher):
 #                              核心：提交一条评论
 # ==============================================================================
 
-def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None):
+
+def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None, chart_info=None):
     """
-    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→ 发送校验。
-    ⚠️ 业务顺序保持线上潜规则：超链接先注入垫底，随后强制光标置顶，让正文顶在超链接之前。
+    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[图表垫底]→ 发送校验。
     入参形貌: url_info_list = [{"text": str, "url": str}, ...]
               image_path_list = [str, str, ...] 或单 str
+              chart_info = {"coin": "BTC", "bridge": "USDT", "type": "future"}
     返回评论ID(str) 或 None。
     """
     comment = str(comment) if comment else ""
@@ -1120,7 +1121,7 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
         _dismiss_overlays(page, aggressive=False, desc=f"pre-link-{idx}")
         _inject_single_link(page, editor_container, real_editor, link_text, link_url, idx)
 
-    # ---- 核心潜规则：强制光标置顶，防止正文写进超链接之后 ----
+    # ---- 核心潜规则：强制光标置顶，防止正文写进超链接或历史残留物之后 ----
     _force_caret_to_head(page, real_editor, tag="before-body")
 
     # ---- 步骤 4：注入正文 ----
@@ -1157,6 +1158,24 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
             logger.warning(f"[编辑器/同步] 状态唤醒动作异常，但继续主流程: {str(sync_e)[:100]}")
 
         logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
+
+    # ---- 步骤 4.5：注入图表（移动到此处，确保追加在文字末尾）----
+    if chart_info:
+        logger.info("[编辑器/图表] 准备在正文末尾注入图表...")
+        _dismiss_overlays(page, aggressive=False, desc="pre-chart")
+
+        # 强制将光标移至编辑器末尾
+        _focus_editor_end(page, real_editor)
+
+        # 模拟敲击回车，让图表组件另起一行显示（可选，但推荐，以保证排版美观）
+        try:
+            real_editor.press("Enter")
+            page.wait_for_timeout(200)
+        except Exception:
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(200)
+
+        _inject_chart(page, editor_container, chart_info)
 
     # ---- 步骤 5：定位并点击发送 ----
     _dismiss_overlays(page, aggressive=False, desc="pre-send")
@@ -1369,7 +1388,7 @@ def _locate_post_creator(page):
 # 新增 2：自动发帖主入口函数
 # ==============================================================================
 def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_DIR,
-                        url_info_list=None, debug=False):
+                        url_info_list=None, chart_info=None, debug=True):
     """
     主控入口：调度浏览器打开广场主页并执行【独立发帖】全流程。
     复用底层高度解耦的 _submit_comment 动作链路。
@@ -1379,10 +1398,12 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
     img_count = len(image_path_list) if isinstance(image_path_list, list) else (1 if image_path_list else 0)
+    has_chart = "是" if chart_info else "否"
     square_url = "https://www.binance.com/zh-CN/square"
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化发帖 | URL: <{square_url}> "
                 f"| 正文: 【{len(str(content or ''))}字】 | 图片数量: 【{img_count}】张 "
-                f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
+                f"| 链接数: 【{len(url_info_list or [])}】 | 包含图表: 【{has_chart}】 "
+                f"| 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
     anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
@@ -1441,8 +1462,8 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
                 except Exception as e:
                     return f"无法定位发帖区: {e}", False, None
 
-                # 🚀 传入 image_path_list 列表
-                post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list)
+                # 🚀 传入所有的附件参数，包括 chart_info
+                post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list, chart_info)
 
                 logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
                 return None, True, post_id
@@ -1475,12 +1496,12 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
         logger.error(error_info)
         return error_info, False, None
 
-
 def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_dir=USER_DATA_DIR,
-                            url_info_list=None, debug=False):
+                            url_info_list=None, chart_info=None, debug=False):
     """
     主控入口：调度浏览器打开帖子并执行评论全流程。
-    入参形貌: url_info_list = [{"text": str, "url": str}, ...]。
+    入参形貌: url_info_list = [{"text": str, "url": str}, ...]
+              chart_info = {"coin": "BTC", "bridge": "USDT", "type": "future"}
     返回 Tuple(错误信息(str|None), 是否成功(bool), 评论ID(str|None))。
     """
     if not os.path.isdir(user_data_dir):
@@ -1488,9 +1509,11 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
 
     post_id = extract_binance_post_id(post_url)
     img_count = len(image_path_list) if isinstance(image_path_list, list) else (1 if image_path_list else 0)
+    has_chart = "是" if chart_info else "否"
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化评论 | 帖子ID: 【{post_id}】 | URL: <{post_url}> "
                 f"| 正文: 【{len(str(comment or ''))}字】 | 图片数量: 【{img_count}】张 "
-                f"| 链接数: 【{len(url_info_list or [])}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
+                f"| 链接数: 【{len(url_info_list or [])}】 | 包含图表: 【{has_chart}】 "
+                f"| 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
     anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
@@ -1555,8 +1578,8 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
 
                 check_for_crash(page)
 
-                # 🚀 传入 image_path_list 列表
-                comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list)
+                # 🚀 传入所有的附件参数，包括 chart_info
+                comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list, chart_info)
                 logger.info(
                     f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
                 return None, True, comment_id
@@ -1766,6 +1789,104 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
                 except Exception:
                     pass
             logger.info("[人工/Manual] 👋 窗口已关闭，控制权收回，系统资源已释放。\n")
+
+
+def _inject_chart(page, editor_container, chart_info):
+    """
+    注入图表卡片逻辑：
+    1. 点击图表图标
+    2. 输入目标币种 (coin)
+    3. 拦截 /trade/widget/list 接口，解析返回的 JSON
+    4. 匹配 coin, bridge, type，找到目标对应的精确索引
+    5. 点击前端列表中对应索引的项
+    """
+    if not chart_info or not isinstance(chart_info, dict):
+        return False
+
+    coin = str(chart_info.get("coin", "")).strip()
+    bridge = str(chart_info.get("bridge", "")).strip()
+    c_type = str(chart_info.get("type", "")).strip()
+
+    if not coin:
+        logger.warning("[编辑器/图表] 未提供有效的 coin，跳过图表注入")
+        return False
+
+    logger.info(f"[编辑器/图表] 开始注入图表 | 目标: {coin}-{bridge} ({c_type})")
+
+    try:
+        # 1. 点击图表图标 (依靠特定的 SVG path 识别)
+        chart_icon = _interact_fallback_locators([
+            editor_container.locator('svg path[d^="M17.123 1.803"]').locator(".."),
+            editor_container.locator('.trade-widget-icon, [class*="widget-icon"]').first
+        ], action="click", timeout=5000, desc="添加图表图标")
+        page.wait_for_timeout(500)
+
+        # 2. 定位搜索框
+        search_input = _interact_fallback_locators([
+            page.locator('input[aria-label*="搜索币种"], input[placeholder*="搜索币种"]').first,
+            page.locator('.bn-textField-input').first
+        ], action="wait", timeout=5000, desc="图表搜索框")
+
+        # 3. 设置接口拦截器并填入内容
+        # 币安的前端可能会发多次请求，我们需要确保拿到 keyword 匹配的那一次
+        def is_target_request(response):
+            if "pgc/trade/widget/list" in response.url and response.request.method == "POST":
+                try:
+                    post_data = response.request.post_data_json
+                    if post_data and post_data.get("keyword", "").upper() == coin.upper():
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        with page.expect_response(is_target_request, timeout=10000) as response_info:
+            search_input.fill(coin)
+            # 模拟真实输入停顿，触发前端防抖(debounce)发请求
+            page.wait_for_timeout(800)
+
+        # 4. 解析接口响应，寻找目标索引
+        resp = response_info.value
+        body = resp.json()
+        items = body.get("data", [])
+
+        if not items:
+            raise Exception(f"接口未返回任何关于 {coin} 的数据")
+
+        target_index = -1
+        for i, item in enumerate(items):
+            if (str(item.get("coin", "")).upper() == coin.upper() and
+                    str(item.get("bridge", "")).upper() == bridge.upper() and
+                    str(item.get("type", "")).lower() == c_type.lower()):
+                target_index = i
+                break
+
+        if target_index == -1:
+            raise Exception(f"接口返回的数据中未找到匹配 {coin}-{bridge}-{c_type} 的项")
+
+        logger.info(f"[编辑器/图表] 匹配成功 | 目标在列表中的索引为: 【{target_index}】")
+
+        # 5. 在 DOM 中点击对应索引的列表项
+        # 列表容器通常包含 cursor-pointer 和 hover 效果
+        list_items = page.locator('div.overflow-y-auto > div.cursor-pointer')
+
+        # 等待元素渲染
+        list_items.nth(target_index).wait_for(state="visible", timeout=5000)
+
+        # 点击指定索引的项
+        list_items.nth(target_index).click(timeout=3000)
+        page.wait_for_timeout(800)
+
+        logger.info("[编辑器/图表] 图表注入成功 | 结果: [Success]")
+        return True
+
+    except Exception as e:
+        logger.warning(f"[编辑器/图表] 图表注入失败，已跳过 | 原因: 【{str(e)[:150]}】 | 结果: [Skipped]")
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+        return False
 
 
 # ==============================================================================

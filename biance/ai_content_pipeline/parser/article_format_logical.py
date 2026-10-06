@@ -47,7 +47,7 @@ ARTICLE_MAX_CHARS = 260
 ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 STATE_FILE = "account_publish_state.json"
 ACCOUNTS = [
-    # "yang",
+    "myself",
 
             "ruru"]
 ACCOUNT_COOLDOWN_SECONDS = 3600
@@ -931,8 +931,15 @@ def _publish_articles_once(article_manager):
         current_attempts = article.get("publish_attempts", 0) + 1
 
         try:
+            target_chart = {
+                "coin": topic,
+                "bridge": "USDT",
+                "type": "future"
+            }
+
+
             err, success, post_id = create_binance_post(
-                content=text, image_path_list=image_path_list, user_data_dir=user_data_dir
+                content=text, image_path_list=image_path_list, user_data_dir=user_data_dir, chart_info=target_chart
             )
 
             api_result = "成功" if success else "失败"
