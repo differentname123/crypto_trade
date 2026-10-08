@@ -24,7 +24,7 @@ import ccxt
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post
-from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed
+from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -872,6 +872,23 @@ def generate_analysis_articles():
             time.sleep(60)
 
 
+def add_hot_topic_to_article(text, tag_count=5):
+
+    hot_topic_list = fetch_binance_hot_hashtags()
+    # 获取 所有的 hashtag list
+    hashtags = [hot_topic["hashtag"] for hot_topic in hot_topic_list]
+
+    # 尝试获取 tag_count 个随机的 hashtag
+    selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
+
+    # 将这些 hashtag 添加到文章末尾
+    text += "\n" + " ".join(f"{tag}\n" for tag in selected_hashtags)
+
+    return text
+
+
+
+
 def _publish_articles_once(article_manager):
     """执行一轮账号调度；发布后回写。"""
     now = time.time()
@@ -927,6 +944,8 @@ def _publish_articles_once(article_manager):
             pattern = rf"(?<!\$)\b{re.escape(topic)}\b"
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
             text = f"{text}\n\n#{topic}"
+
+        text = add_hot_topic_to_article(text)  # 添加热门话题标签
 
         text += "\n\n👇"
 
