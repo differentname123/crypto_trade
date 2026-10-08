@@ -3140,7 +3140,7 @@ def main_app():
         # "ruru",
         "qiqi",
         # "mama",
-        "nana",
+        # "nana",
         # "yanglin",
     ]
 
@@ -3149,10 +3149,10 @@ def main_app():
     layer_loss_budget_ratio = 1
 
     strategy_templates = [
-        {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT",
-         "signal_name": "factor_044_4", "first_qty": 0.001,
-         "step_pct": 1, "tp_pct": 0.7, "max_loss_mult": 7, "qty_mult": 2,
-         "layer_loss_budget_ratio": layer_loss_budget_ratio},
+        # {"base_id": "LBTC7", "symbol": "BTC/USDT:USDT",
+        #  "signal_name": "factor_044_4", "first_qty": 0.001,
+        #  "step_pct": 1, "tp_pct": 0.7, "max_loss_mult": 7, "qty_mult": 2,
+        #  "layer_loss_budget_ratio": layer_loss_budget_ratio},
 
         {"base_id": "SLDO10", "symbol": "LDO/USDT:USDT",
          "signal_name": "factor_043_10", "first_qty": 1,

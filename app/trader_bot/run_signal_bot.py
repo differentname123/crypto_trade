@@ -1064,7 +1064,7 @@ WORKER_CONFIGS = [
     # {"account": "myself", "strategy": "cross"},
     # {"account": "nana",   "strategy": "cross"},
     # {"account": "qiqi",   "strategy": "cross"},
-    {"account": "nana",   "strategy": "pair"},
+    # {"account": "nana",   "strategy": "pair"},
     {"account": "qiqi",   "strategy": "pair"},
     # {"account": "ruru",   "strategy": "cross"},
     # {"account": "yanglin", "strategy": "cross"},
