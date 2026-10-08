@@ -2081,9 +2081,89 @@ def fetch_binance_hot_hashtags(session=None, max_retries=3):
     return []
 
 
+def fetch_binance_futures_top_search(business_enum="USDT_FUTURES", session=None, max_retries=3):
+    """
+    获取币安合约热搜榜数据 (公开接口，无需登录)。
+
+    :param business_enum: 业务类型，默认 "USDT_FUTURES" (U本位合约)
+    :param session: 外部传入的 requests.Session() 对象，用于连接池复用
+    :param max_retries: 最大重试次数
+    :return: 包含热搜币种的列表，即原始响应中 data 字段 (List格式)
+    """
+    url = "https://www.binance.com/bapi/composite/v1/public/future/external/topSearchList"
+
+    # 将 url 中的参数提取到 params 字典中，代码更优雅
+    params = {
+        "businessEnum": business_enum
+    }
+
+    # 精简 Headers：过滤掉 curl 中杂乱的个人特征 (cookie, token等)，只保留过 WAF 必要的伪装
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+    }
+
+    req_client = session if session else requests
+    retry_count = 0
+    label = f"合约热搜榜:{business_enum}"
+
+    while retry_count < max_retries:
+        response = None
+        try:
+            # 这是一个标准的 GET 请求
+            response = req_client.get(
+                url,
+                headers=headers,
+                params=params,
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            json_resp = response.json()
+
+            # 校验业务层状态 (code 为 000000 且 success 为 true)
+            if json_resp.get("code") == "000000" and json_resp.get("success"):
+                # 直接提取内层 data 列表并返回
+                data_list = json_resp.get("data", [])
+                logger.info(f"✅ [{label}] 成功 | 提取到 {len(data_list)} 个热搜币种")
+                return data_list
+            else:
+                logger.error(
+                    f"❌ [{label}] API 业务错误 | Code: {json_resp.get('code')} | Msg: {json_resp.get('message')}")
+                return []
+
+        except Exception as e:
+            detail = ""
+            if response is not None:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:200]}"
+
+            retry_count += 1
+            logger.warning(
+                f"🚨 [{label}] 请求失败 "
+                f"(第 {retry_count}/{max_retries} 次){detail} | 异常: {e}"
+            )
+
+            if retry_count >= max_retries:
+                logger.error(f"❌ [{label}] 连续失败达到 {max_retries} 次上限，终止采集。")
+                break
+
+            # 失败后随机休眠 1~3 秒再重试，防风控
+            import time, random
+            time.sleep(random.uniform(1.0, 3.0))
+
+    return []
+
 if __name__ == "__main__":
-    # 获取热门标签
-    hot_topic = fetch_binance_hot_hashtags()
+    # # 获取热门标签
+    # hot_topic = fetch_binance_hot_hashtags()
+
+    # 测试获取合约热搜榜
+    top_search_list = fetch_binance_futures_top_search()
 
 
     # 查询目标用户的回复列表 不需要cookie

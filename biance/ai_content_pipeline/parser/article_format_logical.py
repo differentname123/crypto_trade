@@ -24,7 +24,8 @@ import ccxt
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post
-from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags
+from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags, \
+    fetch_binance_futures_top_search
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -872,18 +873,26 @@ def generate_analysis_articles():
             time.sleep(60)
 
 
-def add_hot_topic_to_article(text, tag_count=2):
-
+def add_hot_topic_to_article(text, topic, tag_count=2):
     hot_topic_list = fetch_binance_hot_hashtags()
     # 获取 所有的 hashtag list
     hashtags = [hot_topic["hashtag"] for hot_topic in hot_topic_list]
-
     # 尝试获取 tag_count 个随机的 hashtag
     selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
 
-    # 将这些 hashtag 添加到文章末尾
-    text += "\n" + " ".join(f"{tag}\n" for tag in selected_hashtags)
+    other_tags = [f"#{topic}", f"${topic}"]
 
+    top_search_list = fetch_binance_futures_top_search()
+    if top_search_list:
+        top_search_symbol = top_search_list[0]["symbol"]
+        other_tags.append(f"#{top_search_symbol}")
+        other_tags.append(f"${top_search_symbol}")
+
+    # 计算中间位置，利用切片将 other_tags 插入到 selected_hashtags 的中间
+    mid_idx = (len(selected_hashtags) + 1) // 2
+    all_tags = selected_hashtags[:mid_idx] + other_tags + selected_hashtags[mid_idx:]
+
+    text += "\n" + "\n".join(all_tags)
     return text
 
 
@@ -943,9 +952,8 @@ def _publish_articles_once(article_manager):
         if topic:
             pattern = rf"(?<!\$)\b{re.escape(topic)}\b"
             text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
-            text = f"{text}\n\n#{topic}"
 
-        text = add_hot_topic_to_article(text)  # 添加热门话题标签
+        text = add_hot_topic_to_article(text, topic)  # 添加热门话题标签
 
         text += "\n\n👇"
 
