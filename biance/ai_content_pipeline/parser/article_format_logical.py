@@ -955,7 +955,7 @@ def _publish_articles_once(article_manager):
         text = info.get("text", "")
         if topic:
             pattern = rf"(?<!\$)\b{re.escape(topic)}\b"
-            text = re.sub(pattern, lambda match: "$" + topic, text, flags=re.IGNORECASE)
+            text = re.sub(pattern, lambda match: "$" + topic + " ", text, flags=re.IGNORECASE)
 
         text = add_hot_topic_to_article(text, topic)  # 添加热门话题标签
 
