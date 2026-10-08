@@ -880,13 +880,13 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     # 尝试获取 tag_count 个随机的 hashtag
     selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
 
-    other_tags = [f"#{topic}", f"${topic}"]
+    other_tags = [f"#{topic}", f"${topic} "]
 
     top_search_list = fetch_binance_futures_top_search()
     if top_search_list:
         top_search_symbol = top_search_list[0]["symbol"]
         other_tags.append(f"#{top_search_symbol}")
-        other_tags.append(f"${top_search_symbol}")
+        other_tags.append(f"${top_search_symbol} ")
 
     # 计算中间位置，利用切片将 other_tags 插入到 selected_hashtags 的中间
     mid_idx = (len(selected_hashtags) + 1) // 2
