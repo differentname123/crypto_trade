@@ -2011,7 +2011,81 @@ def fetch_binance_square_replies(
     return results
 
 
+def fetch_binance_hot_hashtags(session=None, max_retries=3):
+    """
+    获取币安广场热门话题 (Hashtag) 列表 (公开接口，无需登录)。
+
+    :param session: 外部传入的 requests.Session() 对象，用于连接池复用
+    :param max_retries: 最大重试次数
+    :return: 包含热门话题详情的列表，即原始响应中 data 里面的 data 字段
+    """
+    url = "https://www.binance.com/bapi/composite/v2/public/pgc/hashtag/hot-list"
+
+    # 精简 Headers：不需要携带 Cookie，满足公开接口即可
+    headers = {
+        "accept": "*/*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "clienttype": "web",
+        "content-type": "application/json",
+        "lang": "zh-CN",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+    }
+
+    req_client = session if session else requests
+    retry_count = 0
+    label = "获取热门话题"
+
+    while retry_count < max_retries:
+        response = None
+        try:
+            # 该接口通常是 GET 请求获取数据
+            response = req_client.get(
+                url,
+                headers=headers,
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+
+            json_resp = response.json()
+
+            # 校验业务层状态
+            if json_resp.get("code") == "000000" and json_resp.get("success"):
+                # 直接提取内层 data 列表
+                hot_list = json_resp.get("data", {}).get("data", [])
+                logger.info(f"✅ [{label}] 成功 | 提取到 {len(hot_list)} 个热门话题")
+                return hot_list
+            else:
+                logger.error(
+                    f"❌ [{label}] API 业务错误 | Code: {json_resp.get('code')} | Msg: {json_resp.get('message')}")
+                return []
+
+        except Exception as e:
+            detail = ""
+            if response is not None:
+                detail = f" | HTTP {response.status_code} | 服务器返回: {response.text[:200]}"
+
+            retry_count += 1
+            logger.warning(
+                f"🚨 [{label}] 请求失败 "
+                f"(第 {retry_count}/{max_retries} 次){detail} | 异常: {e}"
+            )
+
+            if retry_count >= max_retries:
+                logger.error(f"❌ [{label}] 连续失败达到 {max_retries} 次上限，终止采集。")
+                break
+
+            # 失败后随机休眠 1~3 秒再重试，防风控
+            time.sleep(random.uniform(1.0, 3.0))
+
+    return []
+
+
 if __name__ == "__main__":
+    # 获取热门标签
+    hot_topic = fetch_binance_hot_hashtags()
+
+
     # 查询目标用户的回复列表 不需要cookie
     target_square_uid = "3-VuV48ZMljCq9G1FM_auA"
     cookies = ""
