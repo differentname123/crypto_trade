@@ -885,6 +885,10 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     top_search_list = fetch_binance_futures_top_search()
     if top_search_list:
         top_search_symbol = top_search_list[0]["symbol"]
+        # 将 top_search_symbol 的 USDT 或者 USDC 去除
+        top_search_symbol = top_search_symbol.replace("USDT", "").replace("USDC", "")
+
+
         other_tags.append(f"#{top_search_symbol}")
         other_tags.append(f"${top_search_symbol} ")
 
