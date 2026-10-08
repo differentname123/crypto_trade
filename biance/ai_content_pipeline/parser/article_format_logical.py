@@ -895,7 +895,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     # 计算中间位置，利用切片将 other_tags 插入到 selected_hashtags 的中间
     mid_idx = (len(selected_hashtags) + 1) // 2
     all_tags = selected_hashtags[:mid_idx] + other_tags + selected_hashtags[mid_idx:]
-
+    logger.info("[文章/标签] 已添加热门话题标签 | 主题: [%s] | 标签: [%s]", topic, all_tags)
     text += "\n" + "\n".join(all_tags)
     return text
 
