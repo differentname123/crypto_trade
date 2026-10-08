@@ -872,7 +872,7 @@ def generate_analysis_articles():
             time.sleep(60)
 
 
-def add_hot_topic_to_article(text, tag_count=5):
+def add_hot_topic_to_article(text, tag_count=2):
 
     hot_topic_list = fetch_binance_hot_hashtags()
     # 获取 所有的 hashtag list
