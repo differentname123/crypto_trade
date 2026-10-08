@@ -972,12 +972,12 @@ def inspect_orphan_and_duplicate_orders(exchange, symbol, strategy_id):
 
 def main_app():
     """主进程仅生成配置、启动策略子进程并守护。"""
-    suffix = "0925"
+    suffix = "1009"
     configs = [
         # GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "ruru"),
         # GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "nana"),
         # GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "mama"),
-        GridConfig(f"LONG-DOGE{suffix}", "DOGE/USDT:USDT", 0.05, 0.09, 1, 100, GridDirection.SHORT, "qiqi"),
+        GridConfig(f"LONG-DOGE{suffix}", "DOGE/USDT:USDT", 0.05, 0.09, 1, 100, GridDirection.LONG, "qiqi"),
         # GridConfig(f"SHORT-QNT{suffix}", "QNT/USDT:USDT", 86, 300, 2.5, 0.1, GridDirection.SHORT, "myself"),
 
     ]
