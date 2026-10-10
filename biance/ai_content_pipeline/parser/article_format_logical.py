@@ -15,6 +15,7 @@ import random
 import re
 import threading
 import time
+import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -23,9 +24,9 @@ import ccxt
 
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
-from biance.biance_playwright import create_binance_post
+from biance.biance_playwright import create_binance_post, get_auth_tokens_robust
 from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags, \
-    fetch_binance_futures_top_search
+    fetch_binance_futures_top_search, like_and_bookmark
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -1156,8 +1157,59 @@ def _run_task(task):
         )
         raise
 
+def hudong():
+    cookie_map_info = {}
+    for acc in ACCOUNTS:
+        try:
+            browser_session_dir = get_config(f"{acc}_browser_session_dir")
+            cookies, csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
+            if cookies and csrf_token:
+                cookie_map_info[acc] = {
+                    "cookies": cookies,
+                    "csrf_token": csrf_token
+                }
+        except Exception as e:
+            traceback.print_exc()
+            logger.error("[互动/获取] 账号 [%s] 获取 cookie/csrf_token 失败: %s", acc, str(e))
+
+    # 查询24小时内发布的帖子，并且没有被互动过的帖子
+    article_manager = GeneratedArticleManager(gen_db_object())
+    now = datetime.now(timezone.utc)
+    twenty_four_hours_ago = now - timedelta(hours=24)
+
+    # 使用 find_articles 来查询
+    articles = article_manager.find_articles(
+        query={
+            "status": "ok",
+            "publish_status": "success",
+            "publish_time": {"$gte": twenty_four_hours_ago.timestamp()}
+        }
+    )
+    # 过滤出没有被互动过的帖子
+    articles_to_interact = [article for article in articles if not article.get("interacted")]
+
+    # 提取出所有 binance_post_id
+    post_ids = [article.get("binance_post_id") for article in articles_to_interact if article.get("binance_post_id")]
+
+    like_and_bookmark(post_ids, cookie_map_info)
+
+
+    # 修改这些帖子的 interacted 字段为 True
+    for article in articles_to_interact:
+        article["interacted"] = True
+        # 增加一个字段记录互动时间
+        article["interaction_time"] = now.timestamp()
+
+    # 更新保存
+    article_manager.upsert_articles(articles_to_interact)
+
+
+
 
 if __name__ == "__main__":
+    # hudong()
+
+
     tasks = [
         generate_analysis_articles,
         format_image_article,

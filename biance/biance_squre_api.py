@@ -1696,73 +1696,47 @@ def fetch_binance_user_profile(username, session=None, timeout=10, max_retries=3
     return {}
 
 
-def like_and_bookmark(target_post_id_list):
+def like_and_bookmark(target_post_id_list, cookie_map_info):
     """
     执行核心点赞与收藏交互。
-    [数据形貌] target_post_id_list: 包含目标帖子或评论 ID (字符串/数字) 的列表。
+
+    :param target_post_id_list: 包含目标帖子或评论 ID (字符串/数字) 的列表。
+    :param cookie_map_info: 字典，包含各个账号的凭证信息。
+                            格式要求: {"account_name": {"cookies": "...", "csrf_token": "..."}}
     """
     if not target_post_id_list:
+        logger.info("[互动任务/过滤] 目标帖子列表为空，无操作执行。")
         return
-
-    processed_posts_id_file = "processed_posts_id.json"
-    # 假设 read_json 在文件不存在时返回空列表或 None，兜底为 []
-    processed_ids_list = read_json(processed_posts_id_file) or []
-    processed_ids_set = set(processed_ids_list)
-
-    # 提前计算差集，获取真正需要处理的新 ID
-    pending_ids = [pid for pid in target_post_id_list if pid not in processed_ids_set]
-
-    if not pending_ids:
-        logger.info(
-            f"[互动任务/过滤] 目标全命中缓存，无新数据 | 关键参数: [输入数量: {len(target_post_id_list)}] | 结果: [流程提前终止]")
-        return
-
-    # 加载账号凭证信息 (仅在有增量任务时才执行，减少无效读取)
-    account_list = ["dahao", "nana", "jie", "mama", "ruru", "yang", "daniang"]
-    cookie_map_info = {}
-    for acc in account_list:
-        try:
-            browser_session_dir = get_config(f"{acc}_browser_session_dir")
-            my_cookies, my_csrf_token, user_info = get_auth_tokens_robust(browser_session_dir)
-            if my_cookies and my_csrf_token:
-                cookie_map_info[acc] = {
-                    "cookies": my_cookies,
-                    "csrf_token": my_csrf_token
-                }
-        except Exception as e:
-            logger.warning(
-                f"[互动任务/鉴权] 获取账号脱机凭证失败，该账号将被跳过 | 关键参数: [账号: {acc}] | 结果: [跳过] - 原因: {e}")
 
     if not cookie_map_info:
-        logger.error("[互动任务/鉴权] 所有预设账号均无法提取有效凭证 | 结果: [当前批次互动任务中止]")
+        logger.error("[互动任务/鉴权] 未提供有效的 cookie_map_info | 结果: [当前批次互动任务中止]")
         return
 
-    for post_id in pending_ids:
+    for post_id in target_post_id_list:
         for acc, info in cookie_map_info.items():
             try:
-                cookies = info["cookies"]
-                csrf_token = info["csrf_token"]
+                cookies = info.get("cookies")
+                csrf_token = info.get("csrf_token")
 
+                if not cookies or not csrf_token:
+                    logger.warning(f"[互动任务/鉴权] 账号 {acc} 缺少完整的 cookies 或 csrf_token | 结果: [跳过该账号]")
+                    continue
+
+                # 执行收藏与点赞
                 toggle_binance_bookmark(post_id, "add", cookies, csrf_token)
                 toggle_binance_like(post_id, "like", cookies, csrf_token)
 
                 logger.info(
-                    f"[互动任务/执行] 单账号互动API调用成功 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [执行完毕]")
+                    f"[互动任务/执行] 单账号互动API调用成功 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [执行完毕]"
+                )
             except Exception as e:
-
                 logger.error(
-                    f"[互动任务/执行] 调用收藏或点赞API失败，可能是网络超时或鉴权失效 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [操作未达预期] - 详情: {e}")
+                    f"[互动任务/执行] 调用收藏或点赞API失败，可能是网络超时或鉴权失效 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [操作未达预期] - 详情: {e}"
+                )
 
-        processed_ids_list.append(post_id)
-
-    try:
-        save_json(processed_posts_id_file, processed_ids_list)
-        logger.info(
-            f"[互动任务/收尾] 批次处理状态已持久化 | 关键参数: [本次新增处理数: {len(pending_ids)}, 总量: {len(processed_ids_list)}] | 结果: [游标更新成功]")
-    except Exception as e:
-        logger.error(
-            f"[互动任务/收尾] 持久化状态文件失败，可能导致下次重复点赞 | 关键参数: [文件路径: {processed_posts_id_file}] | 结果: [抛出异常] - 详情: {e}")
-        raise
+    logger.info(
+        f"[互动任务/收尾] 批次互动执行完成 | 关键参数: [处理目标数: {len(target_post_id_list)}, 动用账号数: {len(cookie_map_info)}]"
+    )
 
 
 def delete_binance_square_content(
