@@ -44,21 +44,21 @@ HIGH_MODEL_LIST = [
 
 ]
 MEDIUM_MODEL_LIST = [
-    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 20, "备注": "来源gemini_web"},
-    {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 10, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 1, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 1, "备注": "来源gemini_web"},
 
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 10, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 2, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.7-flash", "权重": 0, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.8-flash", "权重": 20, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
 
-    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 20, "备注": "来源antigravity"},
+    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
     {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
 
 ]
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
-    {"model_name": "gemini-web-3.5-flash-lite-thinking-max", "权重": 0, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.6-flash-thinking-max", "权重": 0, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
 ]
 
@@ -684,5 +684,5 @@ if __name__ == "__main__":
     #                 ]
     # )
     # print(_redact(result))
-    probe_models("model_probe_results.json")
-    # generate_content(prompt="证明黎曼猜想", model="gemini-web-3.8-flash-thinking-max")
+    # probe_models("model_probe_results.json")
+    generate_content(prompt="证明黎曼猜想", model="gemini-web-3.6-flash-thinking-max")
