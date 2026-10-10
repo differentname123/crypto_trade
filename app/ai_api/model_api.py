@@ -686,4 +686,4 @@ if __name__ == "__main__":
     # )
     # print(_redact(result))
     # probe_models("model_probe_results.json")
-    generate_content(prompt="证明黎曼猜想", model="gemini-web-3.6-flash-thinking-max")
+    generate_content(prompt="证明黎曼猜想", model="antigravity-preview-latest")
