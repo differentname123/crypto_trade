@@ -19,8 +19,8 @@ import threading
 import time
 from copy import deepcopy
 
-from app.ai_api.gemini_api import get_llm_content_local
 from app.ai_api.gemini_playwright import generate_gemini_content_playwright
+from app.ai_api.model_api import generate_content
 from biance.biance_playwright import comment_on_binance_post, get_auth_tokens_robust
 from biance.biance_squre_api import (
     delete_binance_square_content,
@@ -42,7 +42,7 @@ ACCOUNT_STATS_SYNC_INTERVAL_SEC = 3600
 LLM_MAX_RETRIES = 3
 GEMINI_MODEL = "gemini-3.8-flash"
 MAX_SUCCESSFUL_SENDS = 3
-MAX_REPLAY_DAYS = 7
+MAX_REPLAY_DAYS = 1
 MAX_DAILY_SUCCESS_PER_ACCOUNT = 100
 DELETE_INTERVAL_SEC = 3600
 VERIFY_INTERVAL_SEC = 300
@@ -352,7 +352,7 @@ def gen_promo_comment(post):
         error_detail = None
         try:
             if random.random() < 1.9:
-                raw_response = get_llm_content_local(prompt=full_prompt, model_name="gemini-3.1-pro")
+                raw_response = generate_content(prompt=full_prompt, preset_model_group="low")
             else:
                 error_detail, raw_response = generate_gemini_content_playwright(
                     full_prompt, model_name=GEMINI_MODEL
@@ -1030,7 +1030,14 @@ def _run_task(task):
 
 
 if __name__ == "__main__":
-    tasks = (send_promo_comments, gen_all_promo_comments, delete_old_replay, verify_promo_comments_task)
+    tasks = (
+            send_promo_comments,
+             gen_all_promo_comments,
+             delete_old_replay,
+
+             verify_promo_comments_task
+
+    )
     threads = []
     for task in tasks:
         thread = threading.Thread(target=_run_task, args=(task,), name=task.__name__)

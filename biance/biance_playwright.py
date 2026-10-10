@@ -44,7 +44,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\biance_mama"
+USER_DATA_DIR = r"W:\temp\biance_ruru"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
 TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
