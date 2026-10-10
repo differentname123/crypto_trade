@@ -360,7 +360,7 @@ def get_hot_coin():
     :return:
     """
     hot_coin_list = []
-    top_k = 3
+    top_k = 2
     # 获取合约热搜榜
     hot_future_coins = fetch_binance_future_hot_coins()
     hot_future_coins = hot_future_coins[:top_k]
@@ -1064,6 +1064,9 @@ def _publish_articles_once(article_manager):
         len(articles), len(ACCOUNTS),
     )
 
+    # [修改] 定义同一个账户发布同一个币种的冷却时间：2小时 (7200秒)
+    ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600
+
     for account in ACCOUNTS:
         account_state = state[account]
         remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("last_publish_time", 0))
@@ -1072,13 +1075,16 @@ def _publish_articles_once(article_manager):
             continue
         if not articles:
             continue
+
+        # [修改] 校验：当前账号在 2小时 内不能发布同一个 topic (币种) 的文章
         selected_index = next((
             index for index, article in enumerate(articles)
             if now - account_state["topic_publish_history"].get(article.get("topic", ""), 0)
-               >= TOPIC_COOLDOWN_SECONDS
+               >= ACCOUNT_TOPIC_COOLDOWN_SECONDS
         ), None)
+
         if selected_index is None:
-            logger.debug("[发布/账号] 候选主题均在 12 小时冷却期内 | 账号: [%s]", account)
+            logger.debug("[发布/账号] 候选主题均在 2 小时冷却期内 | 账号: [%s]", account)
             continue
 
         article = articles[selected_index]
@@ -1132,7 +1138,7 @@ def _publish_articles_once(article_manager):
                     "publish_attempts": current_attempts
                 }
             else:
-                # [优化] 把接口的 err 详细原因写到本地日志和状态里，方便定位 (已修复多行字符串语法错误)
+                # [优化] 把接口的 err 详细原因写到本地日志和状态里，方便定位
                 error = f"发帖失败（网络不通/被限流/内容违规）\n详请: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
                 changes = {
@@ -1165,7 +1171,6 @@ def _publish_articles_once(article_manager):
             "发布成功" if success else f"发布失败(重试次数:{current_attempts}/3)",
             "已调用本地和数据库状态回写" if success else error,
         )
-
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
     article_manager = GeneratedArticleManager(gen_db_object())
@@ -1383,7 +1388,7 @@ if __name__ == "__main__":
         generate_analysis_articles,
         format_image_article,
         hudong,
-        # auto_publish_articles
+        auto_publish_articles
     ]
     threads = []
     for task in tasks:
