@@ -1712,7 +1712,22 @@ def like_and_bookmark(target_post_id_list, cookie_map_info):
         logger.error("[互动任务/鉴权] 未提供有效的 cookie_map_info | 结果: [当前批次互动任务中止]")
         return
 
-    for post_id in target_post_id_list:
+    total_posts = len(target_post_id_list)
+    total_accounts = len(cookie_map_info)
+
+    # 全局统计指标
+    global_like_success = 0
+    global_bookmark_success = 0
+    global_like_fail = 0
+    global_bookmark_fail = 0
+
+    logger.info(f"[互动任务/开始] 准备处理 {total_posts} 个帖子，动用 {total_accounts} 个账号参与互动")
+
+    for index, post_id in enumerate(target_post_id_list, 1):
+        # 单个帖子的统计指标
+        post_like_success = 0
+        post_bookmark_success = 0
+
         for acc, info in cookie_map_info.items():
             try:
                 cookies = info.get("cookies")
@@ -1722,22 +1737,45 @@ def like_and_bookmark(target_post_id_list, cookie_map_info):
                     logger.warning(f"[互动任务/鉴权] 账号 {acc} 缺少完整的 cookies 或 csrf_token | 结果: [跳过该账号]")
                     continue
 
-                # 执行收藏与点赞
-                toggle_binance_bookmark(post_id, "add", cookies, csrf_token)
-                toggle_binance_like(post_id, "like", cookies, csrf_token)
+                # 执行收藏与点赞，并接收返回值以统计成功数量
+                bookmark_res = toggle_binance_bookmark(post_id, "add", cookies, csrf_token)
+                like_res = toggle_binance_like(post_id, "like", cookies, csrf_token)
 
-                logger.info(
-                    f"[互动任务/执行] 单账号互动API调用成功 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [执行完毕]"
-                )
+                if bookmark_res:
+                    post_bookmark_success += 1
+                    global_bookmark_success += 1
+                else:
+                    global_bookmark_fail += 1
+
+                if like_res:
+                    post_like_success += 1
+                    global_like_success += 1
+                else:
+                    global_like_fail += 1
+
             except Exception as e:
+                global_bookmark_fail += 1
+                global_like_fail += 1
                 logger.error(
-                    f"[互动任务/执行] 调用收藏或点赞API失败，可能是网络超时或鉴权失效 | 关键参数: [账号: {acc}, 目标ID: {post_id}] | 结果: [操作未达预期] - 详情: {e}"
+                    f"[互动任务/执行异常] 账号: {acc}, 目标ID: {post_id} | 详情: {e}"
                 )
 
-    logger.info(
-        f"[互动任务/收尾] 批次互动执行完成 | 关键参数: [处理目标数: {len(target_post_id_list)}, 动用账号数: {len(cookie_map_info)}]"
-    )
+        # 每一个帖子处理完毕后，输出一行进度与统计日志
+        logger.info(
+            f"[互动任务/进度] ({index}/{total_posts}) 帖子ID: {post_id} | "
+            f"🌟收藏成功: {post_bookmark_success}/{total_accounts} | "
+            f"💖点赞成功: {post_like_success}/{total_accounts}"
+        )
 
+    # 所有帖子处理完毕，输出最终的总览统计日志
+    logger.info(
+        f"========== 🏁 互动任务总览 ==========\n"
+        f" 🎯 处理帖子总数: {total_posts}\n"
+        f" 👥 动用账号总数: {total_accounts}\n"
+        f" 🌟 累计收藏: {global_bookmark_success} 成功 / {global_bookmark_fail} 失败\n"
+        f" 💖 累计点赞: {global_like_success} 成功 / {global_like_fail} 失败\n"
+        f"======================================"
+    )
 
 def delete_binance_square_content(
         content_id: str,

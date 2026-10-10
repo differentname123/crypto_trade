@@ -1157,7 +1157,12 @@ def _run_task(task):
         )
         raise
 
-def hudong():
+
+def _hudong_once(article_manager):
+    """执行一次互动任务：获取账号凭证，并对24小时内未互动的帖子进行点赞和收藏。"""
+    logger.info("[互动/开始] 开始执行帖子互动(点赞/收藏)任务")
+    started = time.monotonic()
+
     cookie_map_info = {}
     for acc in ACCOUNTS:
         try:
@@ -1168,51 +1173,85 @@ def hudong():
                     "cookies": cookies,
                     "csrf_token": csrf_token
                 }
+                logger.debug("[互动/账号] 账号 [%s] 凭证获取成功", acc)
+            else:
+                logger.warning("[互动/账号] 账号 [%s] 获取到的凭证不完整，跳过该账号", acc)
         except Exception as e:
-            traceback.print_exc()
-            logger.error("[互动/获取] 账号 [%s] 获取 cookie/csrf_token 失败: %s", acc, str(e))
+            logger.error("[互动/异常] 账号 [%s] 获取 cookie/csrf_token 失败: %s", acc, str(e), exc_info=True)
 
-    # 查询24小时内发布的帖子，并且没有被互动过的帖子
-    article_manager = GeneratedArticleManager(gen_db_object())
+    if not cookie_map_info:
+        logger.warning("[互动/中断] 所有账号均未能获取有效凭证，本轮互动跳过")
+        return
+
     now = datetime.now(timezone.utc)
     twenty_four_hours_ago = now - timedelta(hours=24)
 
-    # 使用 find_articles 来查询
+    # 使用 find_articles 来查询近24小时成功发布的帖子
     articles = article_manager.find_articles(
         query={
             "status": "ok",
             "publish_status": "success",
             "publish_time": {"$gte": twenty_four_hours_ago.timestamp()}
         }
-    )
+    ) or []
+
     # 过滤出没有被互动过的帖子
     articles_to_interact = [article for article in articles if not article.get("interacted")]
 
     # 提取出所有 binance_post_id
     post_ids = [article.get("binance_post_id") for article in articles_to_interact if article.get("binance_post_id")]
 
-    like_and_bookmark(post_ids, cookie_map_info)
+    if not post_ids:
+        logger.info("[互动/完成] 近 24 小时内没有需要互动的新帖子 | 耗时: [%.2f 秒]", time.monotonic() - started)
+        return
 
+    logger.info("[互动/执行] 匹配到需互动的帖子 | 帖子数量: [%s] | 参与互动账号数: [%s]", len(post_ids),
+                len(cookie_map_info))
 
-    # 修改这些帖子的 interacted 字段为 True
+    try:
+        like_and_bookmark(post_ids, cookie_map_info)
+    except Exception as e:
+        logger.error("[互动/执行] 调用 like_and_bookmark 接口失败: %s", str(e), exc_info=True)
+        return
+
+    # 修改这些帖子的 interacted 字段并准备回写
     for article in articles_to_interact:
         article["interacted"] = True
-        # 增加一个字段记录互动时间
         article["interaction_time"] = now.timestamp()
 
-    # 更新保存
-    article_manager.upsert_articles(articles_to_interact)
+    try:
+        article_manager.upsert_articles(articles_to_interact)
+        logger.info(
+            "[互动/完成] 本轮互动已完成并成功回写数据库 | 成功标记帖子数: [%s] | 耗时: [%.2f 秒]",
+            len(post_ids), time.monotonic() - started
+        )
+    except Exception as e:
+        logger.error("[互动/回写] 互动状态回写数据库失败: %s", str(e), exc_info=True)
 
+
+def hudong():
+    """互动后台线程：每 60 分钟（3600秒）执行一次帖子点赞/收藏。"""
+    article_manager = GeneratedArticleManager(gen_db_object())
+    while True:
+        try:
+            _hudong_once(article_manager)
+        except Exception:
+            logger.exception(
+                "[互动/轮询] 本轮任务中断 | 结果: [3600 秒后重新尝试] "
+                "| 排查: [检查互动接口、账号状态或数据库连接]"
+            )
+        finally:
+            # 严格控制每 60 分钟运行一次
+            time.sleep(3600)
 
 
 
 if __name__ == "__main__":
-    # hudong()
-
 
     tasks = [
         generate_analysis_articles,
         format_image_article,
+        hudong,
         auto_publish_articles
     ]
     threads = []
