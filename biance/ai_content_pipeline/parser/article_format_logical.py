@@ -879,7 +879,11 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     # 获取 所有的 hashtag list
     hashtags = [hot_topic["hashtag"] for hot_topic in hot_topic_list]
     # 尝试获取 tag_count 个随机的 hashtag
-    selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
+    # selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
+    selected_hashtags = []
+    if len(hashtags) > 0:
+        selected_hashtags.append(hashtags[0]["hashtag"])
+
 
     other_tags = [f"#{topic}", f"${topic} "]
 
