@@ -1044,6 +1044,8 @@ def _publish_articles_once(article_manager):
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
     article_manager = GeneratedArticleManager(gen_db_object())
+    time.sleep(60)
+
     while True:
         try:
             _publish_articles_once(article_manager)
@@ -1236,7 +1238,6 @@ def _hudong_once(article_manager):
 def hudong():
     """互动后台线程：每 60 分钟（3600秒）执行一次帖子点赞/收藏。"""
     article_manager = GeneratedArticleManager(gen_db_object())
-    time.sleep(60)
     while True:
         try:
             _hudong_once(article_manager)
