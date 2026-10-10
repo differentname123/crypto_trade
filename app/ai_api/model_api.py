@@ -38,17 +38,18 @@ API_KEY = get_config("local_api_key")
 
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
 HIGH_MODEL_LIST = [
-    {"model_name": "gpt-6-astra-max", "权重": 1, "备注": "来源codex 订阅账号"},
-    {"model_name": "gpt-6.1-sol-max", "权重": 5, "备注": "来源codex 订阅账号"},
+    {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
+    {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
+    {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
 MEDIUM_MODEL_LIST = [
-    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 40, "备注": "来源gemini_web"},
+    {"model_name": "gemini-web-3.8-flash-thinking-max", "权重": 20, "备注": "来源gemini_web"},
     {"model_name": "gemini-web-3.1-pro-thinking-max", "权重": 10, "备注": "来源gemini_web"},
 
-    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 20, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 10, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.7-flash", "权重": 0, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.8-flash", "权重": 40, "备注": "来源aistudio_web"},
+    {"model_name": "gemini-aistudio-3.8-flash", "权重": 20, "备注": "来源aistudio_web"},
 
 
     {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 20, "备注": "来源antigravity"},

@@ -26,7 +26,7 @@ from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post, get_auth_tokens_robust
 from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags, \
-    fetch_binance_future_hot_coins, like_and_bookmark
+    fetch_binance_future_hot_coins, like_and_bookmark, fetch_binance_spot_hot_coins
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -39,7 +39,7 @@ BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
 MAX_MEDIA_COUNT = 10
-MAX_CONCURRENCY = 3
+MAX_CONCURRENCY = 10
 LLM_MAX_RETRIES = 3
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
@@ -301,6 +301,90 @@ def fetch_post(post_manager):
         f" | 入库条目: 【{len(posts)}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
     )
 
+def fetch_hot_post(post_manager, token_list):
+    """按币种顺序及综合推荐流采集后统一入库，保留重复帖子和接口参数。
+    入参：提供 upsert_posts([帖子字典]) 的管理器；无返回。
+    """
+    started = time.monotonic()
+    posts = []
+    for token in token_list:
+        posts.extend(fetch_binance_feed(token=token, count=100, orderBy=1)) #  1 代表热门，2 代表最新
+        posts.extend(fetch_binance_feed(token=token, count=100, orderBy=2))
+
+    posts.extend(fetch_binance_feed(count=200))
+    if posts:
+        post_manager.upsert_posts(posts)
+    logger.info(
+        f"[采集/完成] 推荐流已处理 | 币种数: 【{len(FEED_TOKENS)}】"
+        f" | 入库条目: 【{len(posts)}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
+    )
+
+
+def get_top_k_movers(top_k=5):
+    import ccxt
+
+    proxies = {
+        "http": "http://127.0.0.1:7890",
+        "https": "http://127.0.0.1:7890",
+    }
+
+    exchange = ccxt.binance({
+        'enableRateLimit': True,
+        'options': {'defaultType': 'future'},
+        'proxies': proxies
+    })
+
+    tickers = exchange.fetch_tickers()
+
+    valid_tickers = []
+    for symbol, ticker_data in tickers.items():
+        if symbol.endswith(':USDT') and ticker_data.get('percentage') is not None:
+            valid_tickers.append({
+                'symbol': symbol,
+                'percentage': ticker_data['percentage']
+            })
+
+    valid_tickers.sort(key=lambda x: x['percentage'], reverse=True)
+
+    top_gainers = valid_tickers[:top_k]
+    top_losers = valid_tickers[-top_k:][::-1]
+
+    return {
+        "top_gainers": top_gainers,
+        "top_losers": top_losers
+    }
+
+def get_hot_coin():
+    """
+    获取热门的币
+    :return:
+    """
+    hot_coin_list = []
+    top_k = 3
+    # 获取合约热搜榜
+    hot_future_coins = fetch_binance_future_hot_coins()
+    hot_future_coins = hot_future_coins[:top_k]
+    for hot_future_coin in hot_future_coins:
+        hot_coin = hot_future_coin.get("symbol").replace("USDT", "").replace("USDC", "")
+        hot_coin_list.append(hot_coin)
+    # 获取现货热榜
+    hot_spot_coins = fetch_binance_spot_hot_coins()
+    hot_spot_coins = hot_spot_coins[:top_k]
+    for hot_spot_coin in hot_spot_coins:
+        hot_coin = hot_spot_coin.get("symbol").replace("USDT", "").replace("USDC", "")
+        hot_coin_list.append(hot_coin)
+
+    coin_info = get_top_k_movers(top_k)
+    all_items = coin_info['top_gainers'] + coin_info['top_losers']
+
+    # 提取并截断出基础币种名称（将 'US/USDT:USDT' 截取为 'US'）
+    symbol_list = [item['symbol'].split('/')[0] for item in all_items]
+    hot_coin_list.extend(symbol_list)
+    hot_coin_list = list(set(hot_coin_list))
+    logger.info(f"[币种/热榜] 热门币种列表长度{len(hot_coin_list)}: {hot_coin_list}")
+    return hot_coin_list
+
+
 
 def format_image_article():
     """轮询原帖并以 5 个工作线程提取论据；失败按原策略等待后重试。"""
@@ -308,7 +392,8 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_post(post_manager)
+            hot_coin_list = get_hot_coin()
+            fetch_hot_post(post_manager, hot_coin_list)
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
             if not posts:
                 time.sleep(60)
@@ -445,6 +530,7 @@ def extract_and_group_valid_evidences():
     返回 {coin: {stance: [论据]}}；论据追加 source_post_id、publish_time、
     source_text_content、source_image_mapping，支持脱离原帖使用。
     """
+    hot_coin_list = get_hot_coin()
     allowed_stances = {"看多", "看空"}
     active_usdt_symbols_path = "active_usdt_symbols.json"
     active_usdt_symbols = read_json(active_usdt_symbols_path)
@@ -470,7 +556,7 @@ def extract_and_group_valid_evidences():
             invalid_times += 1
             continue
         age = now - publish_time
-        if age > 30 * 24 * 3600 or age < -3600:
+        if age > 7 * 24 * 3600 or age < -3600:
             continue
         source_mapping = build_source_image_mapping(post)
         for evidence in logic_mul["evidences"]:
@@ -484,6 +570,9 @@ def extract_and_group_valid_evidences():
             # 新增过滤条件 1：只保留 allowed_stances 允许的 stance
             if stance not in allowed_stances:
                 continue
+
+            # 新增过滤条件 2,只保留 hot_coin_list 中的币种，不区分大小写
+            coins = [coin for coin in coins if str(coin).strip().upper() in map(str.upper, hot_coin_list)]
 
             enriched = {
                 **evidence,
@@ -578,7 +667,7 @@ def get_post_usage_counts(article_manager, source, post_ids):
     if not unique_ids:
         return counts
     articles = article_manager.find_articles(
-        query={'source': source, 'status': 'ok', 'post_id_list': {'$in': unique_ids}},
+        query={'source': source, 'status': 'ok', 'publish_status': 'success', 'post_id_list': {'$in': unique_ids}},
         limit=0
     )
     for article in articles:
@@ -713,7 +802,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
                     del groups[k]
         # --------------------------------------------------------
 
-        if not selected:
+        if len(selected) < 5:
             reason_msg = "本分组没有有效论据，或原帖使用次数均已超过允许阈值。"
             record["status"] = "skip"
             record["article_info"] = {
@@ -747,7 +836,7 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             error_detail = ""
             try:
                 if random.random() < 1.9:
-                    result = generate_content(prompt=full_prompt)
+                    result = generate_content(prompt=full_prompt, preset_model_group="medium")
                     raw_response = result.get("content", "")
                 else:
                     error_detail, raw_response = generate_gemini_content_playwright(
@@ -905,8 +994,6 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     return text
 
 
-
-
 def _publish_articles_once(article_manager):
     """执行一轮账号调度；发布后回写。"""
     now = time.time()
@@ -924,13 +1011,19 @@ def _publish_articles_once(article_manager):
     }
 
     candidates = article_manager.find_articles(query=query) or []
+    hot_coin_list = get_hot_coin()
+
+    # [新增] 将热门币种列表转换为小写集合，方便后续进行不区分大小写的匹配 (O(1) 查找效率)
+    hot_coins_lower = {str(coin).lower() for coin in (hot_coin_list or [])}
 
     # [优化] 在内存中过滤掉重试次数达到或超过 3 次的失败文章，防止死循环发帖触发风控
+    # [新增] 过滤条件：文章的 topic 必须在 hot_coin_list 中（不区分大小写）
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
            and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
            and article.get("publish_attempts", 0) < 3
+           and (article.get("topic") or "").lower() in hot_coins_lower
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
     logger.info(
@@ -1006,8 +1099,8 @@ def _publish_articles_once(article_manager):
                     "publish_attempts": current_attempts
                 }
             else:
-                # [优化] 把接口的 err 详细原因写到本地日志和状态里，方便定位
-                error = f"发帖失败（网络不通/被限流/内容违规）- 详请: {err}"
+                # [优化] 把接口的 err 详细原因写到本地日志和状态里，方便定位 (已修复多行字符串语法错误)
+                error = f"发帖失败（网络不通/被限流/内容违规）\n详请: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
                 changes = {
                     "publish_status": "failed",
@@ -1039,7 +1132,6 @@ def _publish_articles_once(article_manager):
             "发布成功" if success else f"发布失败(重试次数:{current_attempts}/3)",
             "已调用本地和数据库状态回写" if success else error,
         )
-
 
 def auto_publish_articles():
     """发布后台线程：沿用独立数据库对象，每轮结束后等待 10 分钟。"""
