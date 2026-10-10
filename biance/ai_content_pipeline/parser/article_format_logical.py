@@ -882,7 +882,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     # selected_hashtags = random.sample(hashtags, min(tag_count, len(hashtags)))
     selected_hashtags = []
     if len(hashtags) > 0:
-        selected_hashtags.append(hashtags[0]["hashtag"])
+        selected_hashtags.append(hashtags[0])
 
 
     other_tags = [f"#{topic}", f"${topic} "]
@@ -1236,6 +1236,7 @@ def _hudong_once(article_manager):
 def hudong():
     """互动后台线程：每 60 分钟（3600秒）执行一次帖子点赞/收藏。"""
     article_manager = GeneratedArticleManager(gen_db_object())
+    time.sleep(60)
     while True:
         try:
             _hudong_once(article_manager)
