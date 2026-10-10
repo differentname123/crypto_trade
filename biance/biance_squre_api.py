@@ -1849,8 +1849,9 @@ def fetch_binance_square_replies(
         csrf_token: str,
         limit: int = 0,
         time_offset: int = -1,
+        filter_type: str = "ALL",  # 【修改1】增加 filter_type 参数，默认改为 ALL。还有 REPLY 这个值
 ) -> list:
-    """查询币安广场指定用户的回复列表并精简数据"""
+    """查询币安广场指定用户的动态列表并精简数据"""
     base_url = "https://www.binance.com/bapi/composite/v2/friendly/pgc/content/queryUserProfilePageContentsWithFilter"
 
     headers = {
@@ -1878,7 +1879,7 @@ def fetch_binance_square_replies(
             params = {
                 "targetSquareUid": target_square_uid,
                 "timeOffset": current_offset,
-                "filterType": "REPLY",
+                "filterType": filter_type,  # 【修改1】此处应用动态参数
             }
 
             logger.info(f"正在拉取第 {page} 页数据, timeOffset={current_offset}...")
@@ -1920,72 +1921,91 @@ def fetch_binance_square_replies(
                 logger.info(f"第 {page} 页没有查询到回复内容 (contents 为空)，停止翻页。")
                 break
 
-            logger.info(f"第 {page} 页成功获取到 {len(contents)} 组回复互动。")
+            logger.info(f"第 {page} 页成功获取到 {len(contents)} 组互动数据。")
 
             # 4. 数据解析与精简（强化多层级逻辑与空指针防护）
             for item in contents:
                 reply_post_list = item.get("replyPostList") or []
 
-                if not reply_post_list:
-                    continue
+                # 【修改2】：增加分支判断，兼容 ALL (包含原创) 和 REPLY (纯回复)
+                if reply_post_list:
+                    # ==========================================
+                    # 分支 A：有嵌套回复列表，走原来的完整解析逻辑
+                    # ==========================================
+                    outer_id = item.get("id")  # 当前互动事件的精确ID
+                    my_reply = {}
+                    origin_post = {}
+                    target_idx = -1
 
-                outer_id = item.get("id")  # 当前互动事件的精确ID
-
-                my_reply = {}
-                origin_post = {}
-                target_idx = -1
-
-                # 策略 A: 先通过外层精确 ID 匹配目标回复节点 (最准确)
-                for i, post in enumerate(reply_post_list):
-                    if post.get("id") == outer_id:
-                        my_reply = post
-                        target_idx = i
-                        break
-
-                # 策略 B: 如果 ID 匹配失败（防范 API 变更），降级通过 target_square_uid 匹配
-                if target_idx == -1:
+                    # 策略 A: 先通过外层精确 ID 匹配目标回复节点 (最准确)
                     for i, post in enumerate(reply_post_list):
-                        if post.get("squareUid") == target_square_uid:
+                        if post.get("id") == outer_id:
                             my_reply = post
                             target_idx = i
                             break
 
-                # 策略 C: 实在匹配不到，采用保守后备方案：最后一条当自己，倒数第二条当父级
-                if target_idx == -1:
-                    my_reply = reply_post_list[-1]
-                    target_idx = len(reply_post_list) - 1
+                    # 策略 B: 如果 ID 匹配失败（防范 API 变更），降级通过 target_square_uid 匹配
+                    if target_idx == -1:
+                        for i, post in enumerate(reply_post_list):
+                            if post.get("squareUid") == target_square_uid:
+                                my_reply = post
+                                target_idx = i
+                                break
 
-                # 定位父节点 (origin_post)
-                # 逻辑：目标节点的上一层即为直系被回复节点。如果目标节点已经是第0个，则其自身作为origin_post避免越界。
-                if target_idx > 0:
-                    origin_post = reply_post_list[target_idx - 1]
+                    # 策略 C: 实在匹配不到，采用保守后备方案：最后一条当自己，倒数第二条当父级
+                    if target_idx == -1:
+                        my_reply = reply_post_list[-1]
+                        target_idx = len(reply_post_list) - 1
+
+                    # 定位父节点 (origin_post)
+                    if target_idx > 0:
+                        origin_post = reply_post_list[target_idx - 1]
+                    else:
+                        origin_post = reply_post_list[0]
+
+                    origin_post = origin_post or {}
+                    my_reply = my_reply or {}
+
+                    raw_hyperlinks = my_reply.get("hyperlinkList") or []
+                    clean_links = [
+                        link.get("url")
+                        for link in raw_hyperlinks
+                        if isinstance(link, dict) and link.get("url")
+                    ]
+
+                    simplified_item = {
+                        "reply_id": my_reply.get("id"),
+                        "reply_text": my_reply.get("bodyTextOnly") or "",
+                        "reply_time": my_reply.get("firstReleaseTime"),
+                        "reply_links": clean_links,
+                        "parent_post_id": my_reply.get("parentContentId") or origin_post.get("id"),
+                        "parent_post_author": origin_post.get("displayName") or origin_post.get("username") or "",
+                        "parent_post_text": origin_post.get("bodyTextOnly") or "",
+                    }
+
                 else:
-                    origin_post = reply_post_list[0]
+                    # ==========================================
+                    # 分支 B：非回复内容 (原创帖/文章)，直接读取本体
+                    # ==========================================
+                    my_reply = item or {}
 
-                # 【可选】：如果你无论嵌套多少层，都只想提取最上面的“原帖(Yi He)”，
-                # 可以把上面这句 if...else 替换为： origin_post = reply_post_list[0]
+                    raw_hyperlinks = my_reply.get("hyperlinkList") or []
+                    clean_links = [
+                        link.get("url")
+                        for link in raw_hyperlinks
+                        if isinstance(link, dict) and link.get("url")
+                    ]
 
-                # 确保取出的对象是字典类型
-                origin_post = origin_post or {}
-                my_reply = my_reply or {}
-
-                # 提取链接信息
-                raw_hyperlinks = my_reply.get("hyperlinkList") or []
-                clean_links = [
-                    link.get("url")
-                    for link in raw_hyperlinks
-                    if isinstance(link, dict) and link.get("url")
-                ]
-
-                simplified_item = {
-                    "reply_id": my_reply.get("id"),
-                    "reply_text": my_reply.get("bodyTextOnly") or "",
-                    "reply_time": my_reply.get("firstReleaseTime"),
-                    "reply_links": clean_links,
-                    "parent_post_id": my_reply.get("parentContentId") or origin_post.get("id"),
-                    "parent_post_author": origin_post.get("displayName") or origin_post.get("username") or "",
-                    "parent_post_text": origin_post.get("bodyTextOnly") or "",
-                }
+                    # 格式保持 100% 统一，缺失的父节点信息用空字符串填充
+                    simplified_item = {
+                        "reply_id": my_reply.get("id"),
+                        "reply_text": my_reply.get("bodyTextOnly") or "",
+                        "reply_time": my_reply.get("firstReleaseTime"),
+                        "reply_links": clean_links,
+                        "parent_post_id": "",
+                        "parent_post_author": "",
+                        "parent_post_text": "",
+                    }
 
                 results.append(simplified_item)
 
@@ -2166,12 +2186,12 @@ if __name__ == "__main__":
     top_search_list = fetch_binance_futures_top_search()
 
 
-    # 查询目标用户的回复列表 不需要cookie
-    target_square_uid = "3-VuV48ZMljCq9G1FM_auA"
-    cookies = ""
-    csrf_token = ""
-    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
-                                           limit=1000)
+    # # 查询目标用户的回复列表 不需要cookie
+    # target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
+    # cookies = ""
+    # csrf_token = ""
+    # replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
+    #                                        limit=1000)
     print()
     #
     #

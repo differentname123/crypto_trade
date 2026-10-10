@@ -821,8 +821,13 @@ def delete_old_replay():
                     # : 仅依赖 time_offset 获取最多 1000 条，不逐条核验日期，也不补充分页。
                     replies = fetch_binance_square_replies(
                         target_square_uid=user_info.get("squareUid"),
+                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,filter_type="reply"
+                    )
+                    posts = fetch_binance_square_replies(
+                        target_square_uid=user_info.get("squareUid"),
                         cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,
                     )
+                    replies.extend(replies)
                     if not replies:
                         continue
                     before_deleted, before_failed = deleted, failed
