@@ -686,4 +686,4 @@ if __name__ == "__main__":
     # )
     # print(_redact(result))
     # probe_models("model_probe_results.json")
-    generate_content(prompt="证明黎曼猜想", model="antigravity-preview-latest")
+    generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it")
