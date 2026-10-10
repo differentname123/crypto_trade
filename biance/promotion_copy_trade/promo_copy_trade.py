@@ -42,7 +42,7 @@ ACCOUNT_STATS_SYNC_INTERVAL_SEC = 3600
 LLM_MAX_RETRIES = 3
 GEMINI_MODEL = "gemini-3.8-flash"
 MAX_SUCCESSFUL_SENDS = 3
-MAX_REPLAY_DAYS = 1
+MAX_REPLAY_DAYS = 7
 MAX_DAILY_SUCCESS_PER_ACCOUNT = 100
 DELETE_INTERVAL_SEC = 3600
 VERIFY_INTERVAL_SEC = 300
@@ -821,7 +821,7 @@ def delete_old_replay():
                     # : 仅依赖 time_offset 获取最多 1000 条，不逐条核验日期，也不补充分页。
                     replies = fetch_binance_square_replies(
                         target_square_uid=user_info.get("squareUid"),
-                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,filter_type="reply"
+                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,filter_type="REPLY"
                     )
                     posts = fetch_binance_square_replies(
                         target_square_uid=user_info.get("squareUid"),

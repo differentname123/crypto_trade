@@ -2186,12 +2186,12 @@ if __name__ == "__main__":
     top_search_list = fetch_binance_futures_top_search()
 
 
-    # # 查询目标用户的回复列表 不需要cookie
-    # target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
-    # cookies = ""
-    # csrf_token = ""
-    # replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
-    #                                        limit=1000)
+    # 查询目标用户的回复列表 不需要cookie
+    target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
+    cookies = ""
+    csrf_token = ""
+    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
+                                           limit=1000)
     print()
     #
     #
