@@ -786,13 +786,13 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
 
         # 3. 每组内部按 impact_weight 降序排序
         for key in groups:
-            groups[key].sort(key=lambda x: x.get("impact_weight", 0), reverse=True)
+            groups[key].sort(key=lambda x: (x.get("impact_weight", 0), random.random()), reverse=True)
 
         # 4. 轮询抽取，优先保证各个组合都有，且数量均衡
         selected = []
         while groups and len(selected) < ARTICLE_MATERIAL_LIMIT:
-            # 每次轮询时，优先挑选当前队首 impact_weight 最大的组合进行抽取
-            sorted_keys = sorted(groups.keys(), key=lambda k: groups[k][0].get("impact_weight", 0), reverse=True)
+            # 每次轮询时，优先挑选当前队首 impact_weight 最大的组合进行抽取，然后相同权重的组合随机打乱顺序，保证公平性
+            sorted_keys = sorted(groups.keys(), key=lambda k: (groups[k][0].get("impact_weight", 0), random.random()), reverse=True)
             for k in sorted_keys:
                 if len(selected) >= ARTICLE_MATERIAL_LIMIT:
                     break
@@ -900,7 +900,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         coin, stance, record["attempt_count"], time.monotonic() - started,
     )
     return saved_record
-
 
 def generate_analysis_articles_once():
     """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
