@@ -827,7 +827,7 @@ def delete_old_replay():
                         target_square_uid=user_info.get("squareUid"),
                         cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,
                     )
-                    replies.extend(replies)
+                    replies.extend(posts)
                     if not replies:
                         continue
                     before_deleted, before_failed = deleted, failed
