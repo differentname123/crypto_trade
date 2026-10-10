@@ -65,7 +65,7 @@ USER_DATA_DIR_LIST = [
 DELETE_USER_DATA_DIR_LIST = [
     r"W:\temp\biance_nana", r"W:\temp\biance_yang", r"W:\temp\biance_daniang",
     r"W:\temp\biance_mama", r"W:\temp\biance_jie", r"W:\temp\biance_qiqi",
-    r"W:\temp\biance_zhouling", r"W:\temp\biance_yanglin", r"W:\temp\biance_ruru",
+    r"W:\temp\biance_zhouling", r"W:\temp\biance_yanglin", r"W:\temp\biance_ruru",r"W:\temp\biance_myself",
 ]
 USER_ACCOUNT_USAGE_FILE = r"W:\project\python_project\crypto_trade\biance\promotion_copy_trade\biance_account_usage.json"
 LEAD_DETAIL_URL = "https://www.binance.com/zh-CN/square/post/362858558969979"
