@@ -26,7 +26,7 @@ from app.ai_api.gemini_playwright import generate_gemini_content_playwright
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post, get_auth_tokens_robust
 from biance.biance_squre_api import publish_to_binance_square, fetch_binance_feed, fetch_binance_hot_hashtags, \
-    fetch_binance_futures_top_search, like_and_bookmark
+    fetch_binance_future_hot_coins, like_and_bookmark
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
 )
@@ -887,7 +887,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
 
     other_tags = [f"#{topic}", f"${topic} "]
 
-    top_search_list = fetch_binance_futures_top_search()
+    top_search_list = fetch_binance_future_hot_coins()
     if top_search_list:
         top_search_symbol = top_search_list[0]["symbol"]
         # 将 top_search_symbol 的 USDT 或者 USDC 去除
