@@ -634,8 +634,8 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
         return False, f"正文非空白字符数超过 {max_chars}"
     if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
         return False, "正文不能包含图片或视频占位符"
-    if type(article_info["score"]) is not int or not 0 <= article_info["score"] <= 10:
-        return False, "score 必须是 0—10 的整数"
+    if type(article_info["score"]) is not float or not 0 <= article_info["score"] <= 10:
+        return False, "score 必须是 0—10 的数"
     if article_info["reason"] is not None:
         return False, "ok 的 reason 必须为 null"
     material_by_id = {item["id"]: item for item in materials}
@@ -741,9 +741,8 @@ def prepare_article_record_for_db(article_data):
 # 待修改的原有逻辑函数 (更新为调用上面的封装以及 Manager 提供的新接口)
 # =========================================================================
 
-def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
-    """为一个币种/立场生成文章；ev_list 为已按权重排序的增强论据。"""
-    started = time.monotonic()
+def build_article_task(coin, stance, ev_list, article_manager):
+    """构建单次文章生成任务所需的数据（包括筛选论据、生成 brief 等）"""
     brief = {
         "task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS, "recent_openings": []},
         "materials": [],
@@ -757,80 +756,102 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         "raw_response": None, "model_name": model_name, "prompt_version": "0920v1.0",
         "attempt_count": 0,
     }
-    try:
-        candidates = [
-            evidence for evidence in ev_list
-            if isinstance(evidence, dict)
-               and isinstance(evidence.get("source_post_id"), (str, int))
-               and not isinstance(evidence.get("source_post_id"), bool)
-               and evidence.get("source_post_id") not in (None, "", "UNKNOWN")
-               and isinstance(evidence.get("core_fact"), str) and evidence["core_fact"].strip()
-        ]
-        post_ids = list(dict.fromkeys(item["source_post_id"] for item in candidates))
 
-        # [修改点 1]：调用应用层自行封装的查重逻辑
-        usage_counts = get_post_usage_counts(article_manager, BINANCE_SOURCE, post_ids)
+    candidates = [
+        evidence for evidence in ev_list
+        if isinstance(evidence, dict)
+           and isinstance(evidence.get("source_post_id"), (str, int))
+           and not isinstance(evidence.get("source_post_id"), bool)
+           and evidence.get("source_post_id") not in (None, "", "UNKNOWN")
+           and isinstance(evidence.get("core_fact"), str) and evidence["core_fact"].strip()
+    ]
+    post_ids = list(dict.fromkeys(item["source_post_id"] for item in candidates))
 
-        # ------------------- 新增重构的抽取逻辑 -------------------
-        # 1. 过滤：小于 ARTICLE_POST_USAGE_LIMIT 是硬性规定
-        filtered_candidates = [
-            item for item in candidates
-            if usage_counts.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
-        ]
+    # 查询引用次数
+    usage_counts = get_post_usage_counts(article_manager, BINANCE_SOURCE, post_ids)
 
-        # 2. 按 dimension 和 shelf_life 组合进行分组
-        groups = {}
-        for item in filtered_candidates:
-            key = (item.get("dimension"), item.get("shelf_life"))
-            groups.setdefault(key, []).append(item)
+    # 1. 过滤：小于 ARTICLE_POST_USAGE_LIMIT 是硬性规定
+    filtered_candidates = [
+        item for item in candidates
+        if usage_counts.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
+    ]
 
-        # 3. 每组内部按 impact_weight 降序排序
-        for key in groups:
-            groups[key].sort(key=lambda x: (x.get("impact_weight", 0), random.random()), reverse=True)
+    # 2. 按 dimension 和 shelf_life 组合进行分组
+    groups = {}
+    for item in filtered_candidates:
+        key = (item.get("dimension"), item.get("shelf_life"))
+        groups.setdefault(key, []).append(item)
 
-        # 4. 轮询抽取，优先保证各个组合都有，且数量均衡
-        selected = []
-        while groups and len(selected) < ARTICLE_MATERIAL_LIMIT:
-            # 每次轮询时，优先挑选当前队首 impact_weight 最大的组合进行抽取，然后相同权重的组合随机打乱顺序，保证公平性
-            sorted_keys = sorted(groups.keys(), key=lambda k: (groups[k][0].get("impact_weight", 0), random.random()), reverse=True)
-            for k in sorted_keys:
-                if len(selected) >= ARTICLE_MATERIAL_LIMIT:
-                    break
-                selected.append(groups[k].pop(0))
-                # 如果该组合的材料已经被抽空，则移除该组
-                if not groups[k]:
-                    del groups[k]
-        # --------------------------------------------------------
+    # 3. 每组内部按 impact_weight 降序排序，加入随机因子保证多次调用的随机性
+    for key in groups:
+        groups[key].sort(key=lambda x: (x.get("impact_weight", 0), random.random()), reverse=True)
 
-        if len(selected) < 5:
-            reason_msg = "本分组没有有效论据，或原帖使用次数均已超过允许阈值。"
-            record["status"] = "skip"
-            record["article_info"] = {
-                "status": "skip", "text": "", "image_placeholders": [], "used_material_ids": [],
-                "score": None, "reason": reason_msg,
-                "image_mapping": {},
-            }
-            # [新增日志] 记录本地因素材耗尽触发的跳过
-            logger.info(
-                "[文章/跳过] 本地拦截 | 币种: [%s] | 立场: [%s] | 原因: [%s]",
-                coin, stance, reason_msg
-            )
-            return record
+    # 4. 轮询抽取，优先保证各个组合都有，且数量均衡
+    selected = []
+    while groups and len(selected) < ARTICLE_MATERIAL_LIMIT:
+        sorted_keys = sorted(groups.keys(), key=lambda k: (groups[k][0].get("impact_weight", 0), random.random()),
+                             reverse=True)
+        for k in sorted_keys:
+            if len(selected) >= ARTICLE_MATERIAL_LIMIT:
+                break
+            selected.append(groups[k].pop(0))
+            if not groups[k]:
+                del groups[k]
 
-        materials, image_mapping = transform_mlus(selected)
-        brief["materials"] = materials
-
-        # [修改点 2]：调用应用层自行封装的开头记录拉取逻辑
-        brief["task"]["recent_openings"] = get_recent_openings(article_manager, BINANCE_SOURCE, coin, stance)
-
-        record["material_post_mapping"] = {
-            material["id"]: evidence["source_post_id"]
-            for material, evidence in zip(materials, selected)
+    if len(selected) < 5:
+        reason_msg = "本分组没有有效论据，或原帖使用次数均已超过允许阈值。"
+        record["status"] = "skip"
+        record["article_info"] = {
+            "status": "skip", "text": "", "image_placeholders": [], "used_material_ids": [],
+            "score": None, "reason": reason_msg,
+            "image_mapping": {},
         }
-        prompt = read_file_to_str(ARTICLE_PROMPT_FILE_PATH)
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise ValueError(f"文章提示词为空或读取失败: {ARTICLE_PROMPT_FILE_PATH}")
-        full_prompt = f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}"
+        return {"is_skip": True, "record": record, "coin": coin, "stance": stance, "reason": reason_msg}
+
+    materials, image_mapping = transform_mlus(selected)
+    brief["materials"] = materials
+    brief["task"]["recent_openings"] = get_recent_openings(article_manager, BINANCE_SOURCE, coin, stance)
+
+    record["material_post_mapping"] = {
+        material["id"]: evidence["source_post_id"]
+        for material, evidence in zip(materials, selected)
+    }
+    prompt = read_file_to_str(ARTICLE_PROMPT_FILE_PATH)
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"文章提示词为空或读取失败: {ARTICLE_PROMPT_FILE_PATH}")
+    full_prompt = f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}"
+
+    return {
+        "is_skip": False,
+        "record": record,
+        "full_prompt": full_prompt,
+        "materials": materials,
+        "image_mapping": image_mapping,
+        "coin": coin,
+        "stance": stance,
+        "model_name": model_name
+    }
+
+
+def execute_article_task(task_data, article_manager):
+    """执行单个文章生成任务（请求大模型、校验及入库）"""
+    if task_data.get("is_skip"):
+        logger.info(
+            "[文章/跳过] 本地拦截 | 币种: [%s] | 立场: [%s] | 原因: [%s]",
+            task_data["coin"], task_data["stance"], task_data["reason"]
+        )
+        return task_data["record"]
+
+    record = task_data["record"]
+    full_prompt = task_data["full_prompt"]
+    materials = task_data["materials"]
+    image_mapping = task_data["image_mapping"]
+    coin = task_data["coin"]
+    stance = task_data["stance"]
+    model_name = task_data["model_name"]
+
+    started = time.monotonic()
+    try:
         for attempt in range(1, LLM_MAX_RETRIES + 1):
             record["attempt_count"], record["raw_response"] = attempt, None
             error_detail = ""
@@ -876,13 +897,12 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
         record["status"], record["article_info"] = "error", None
         record["error_message"] = f"{type(exc).__name__}: {exc}"
         logger.exception(
-            "[文章/生成] 当前分组失败 | 币种: [%s] | 立场: [%s] | 尝试: [%s] "
+            "[文章/生成] 当前任务失败 | 币种: [%s] | 立场: [%s] | 尝试: [%s] "
             "| 结果: [返回错误记录，不入库] | 排查: [检查素材、提示词读取、数据库查询及模型响应]",
             coin, stance, record["attempt_count"],
         )
 
     if record["status"] != "ok":
-        # [新增日志] 如果是大模型主动返回的 skip，打印具体原因
         if record["status"] == "skip":
             skip_reason = (record.get("article_info") or {}).get("reason", "大模型未说明原因")
             logger.info(
@@ -891,7 +911,6 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
             )
         return record
 
-    # [修改点 3]：清洗数据结构后再交由 manager 入库
     saved_record = prepare_article_record_for_db(record)
     article_manager.upsert_articles([saved_record])
 
@@ -901,8 +920,9 @@ def generate_and_save_analysis_article(coin, stance, ev_list, article_manager):
     )
     return saved_record
 
+
 def generate_analysis_articles_once():
-    """串行处理所有分组，确保前组保存后再查询后组引用次数；返回文章记录列表。"""
+    """获取数据、构建扁平化任务列表，然后使用并发度 5 批量生成文章"""
     grouped = extract_and_group_valid_evidences()
     groups = [
         (coin, stance, evidences)
@@ -911,26 +931,41 @@ def generate_analysis_articles_once():
     non_empty = sum(bool(evidences) for _, _, evidences in groups)
     logger.info(
         "[文章/本轮计划] 已整理候选论据 | 币种: [%s] | 分组: [%s] | 非空分组: [%s] "
-        "| 条目: [%s，含跨组重复] | 模型调用上限: [%s，含重试 %s] "
+        "| 条目: [%s，含跨组重复] | 模型调用上限(含多份生成): [%s，含重试 %s] "
         "| 选材: [原帖使用次数 <= %s，每组前 %s 条；无素材时不调用模型]",
         len(grouped), len(groups), non_empty, sum(len(items) for _, _, items in groups),
-        non_empty, non_empty * LLM_MAX_RETRIES, ARTICLE_POST_USAGE_LIMIT, ARTICLE_MATERIAL_LIMIT,
+        non_empty * 5, non_empty * 5 * LLM_MAX_RETRIES, ARTICLE_POST_USAGE_LIMIT, ARTICLE_MATERIAL_LIMIT,
     )
     article_manager = GeneratedArticleManager(gen_db_object())
-    # : 此处仅保证单实例串行；多实例共享引用次数仍需数据库锁或事务能力。
-    results = [
-        generate_and_save_analysis_article(coin, stance, evidences, article_manager)
-        for coin, stance, evidences in groups
-    ]
 
-    # [新增修改]：细化本轮完成后的日志统计，区分两种不同的跳过原因
-    success_cnt = sum(1 for item in results if item["status"] == "ok")
-    error_cnt = sum(1 for item in results if item["status"] == "error")
+    # 1. 构建扁平化的本轮所有 task (相同的 coin 和 stance 生成 5 个独立的 brief 任务)
+    tasks = []
+    for coin, stance, evidences in groups:
+        for _ in range(5):
+            task_data = build_article_task(coin, stance, evidences, article_manager)
+            tasks.append(task_data)
+
+    # 2. 以并行度为 5，并发执行所有提取好的 brief 文章生成任务
+    results = []
+    if tasks:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(execute_article_task, task_data, article_manager)
+                for task_data in tasks
+            ]
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    logger.exception(f"[文章/执行] 并发生成时发生异常: {exc}")
+
+    success_cnt = sum(1 for item in results if item.get("status") == "ok")
+    error_cnt = sum(1 for item in results if item.get("status") == "error")
 
     local_skip_cnt = 0
     llm_skip_cnt = 0
     for item in results:
-        if item["status"] == "skip":
+        if item.get("status") == "skip":
             reason = (item.get("article_info") or {}).get("reason", "")
             if "超过允许阈值" in reason or "没有有效论据" in reason:
                 local_skip_cnt += 1
@@ -940,13 +975,12 @@ def generate_analysis_articles_once():
     total_skip = local_skip_cnt + llm_skip_cnt
 
     logger.info(
-        "[文章/本轮完成] 分组处理结束 | 总数: [%s] | 成功: [%s] | 失败: [%s] "
+        "[文章/本轮完成] 扁平化并发处理结束 | 总生成请求数: [%s] | 成功: [%s] | 失败: [%s] "
         "| 跳过总计: [%s] (素材耗尽拦截: %s, 大模型拒签: %s)",
         len(results), success_cnt, error_cnt,
         total_skip, local_skip_cnt, llm_skip_cnt
     )
     return results
-
 
 def generate_analysis_articles():
     """文章生成后台线程：完成后等 1 小时；无分组或本轮异常时等 60 秒。"""
@@ -1349,7 +1383,7 @@ if __name__ == "__main__":
         generate_analysis_articles,
         format_image_article,
         hudong,
-        auto_publish_articles
+        # auto_publish_articles
     ]
     threads = []
     for task in tasks:
