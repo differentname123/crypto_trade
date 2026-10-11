@@ -7,14 +7,20 @@
     判据来确认成败，失败自动落地故障现场。
 
 [输入数据]
-    - post_url      : 目标帖子 URL(str)，用于解析 post_id 做删帖/重定向校验
-    - comment       : 评论正文(str)，允许多行
-    - image_path    : 本地图片物理路径(str|None)，文件缺失或上传失败自动降级为纯文本
-    - url_info_list : 超链接清单，Shape: [{"text": <锚文本>, "url": <地址>}, ...]
-    - user_data_dir : Chrome 持久化目录，承载 Cookie / CSRF 登录态
+- post_url
+: 目标帖子 URL(str)，用于解析 post_id 做删帖/重定向校验
+-     comment
+: 评论正文(str)，允许多行
+-     image_path
+: 本地图片物理路径(str|None)，文件缺失或上传失败自动降级为纯文本
+-     url_info_list
+: 超链接清单，Shape: [{"text": <锚文本>, "url": <地址>}, ...]
+- user_data_dir
+: Chrome 持久化目录，承载 Cookie / CSRF 登录态
 
 [数据流转/交互]
-    1. 凭证挂载：launch_persistent_context 复用 User Data 目录 → 免登录浏览器上下文
+1.
+凭证挂载：launch_persistent_context 复用 User Data 目录 → 免登录浏览器上下文
     2. 浮层免疫：goto 之前武装守卫(init_script 预置引导flag + JS看门狗 + locator_handler)
     3. 落地体检：HTTP 状态 → post_id 是否漂移(重定向/删帖) → 登录态 → 平台软拦截 → 崩溃探测
     4. 作用域隔离：PageDown 步进探底锁定 div.feed-post-editor，之后所有操作只在该容器内进行
@@ -23,8 +29,10 @@
     7. 失败留证：_forensics 落地 png / html / json(含视口中心遮挡诊断)，供人工复盘
 
 [输出数据]
-    - 返回 Tuple(错误信息|None, 是否成功|bool, 评论ID|None)
-    - 副作用：结构化终端日志；失败现场文件 forensic_*.png/.html/.json；浏览器上下文关闭
+-
+返回 Tuple(错误信息|None, 是否成功|bool, 评论ID|None)
+-
+副作用：结构化终端日志；失败现场文件 forensic_*.png/.html/.json；浏览器上下文关闭
 =========================================================================================
 """
 import json
@@ -40,17 +48,16 @@ from playwright.sync_api import sync_playwright, expect, TimeoutError as Playwri
 
 from common.common_utils import setup_logger
 
-
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
 USER_DATA_DIR = r"W:\temp\biance_ruru"
 LOGIN_URL = "https://www.binance.com/zh-CN/login"
 
-TYPE_CHUNK_SIZE = 80            # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
-TYPE_DELAY_MS = 60              # 逐字键入延迟(ms)，模拟真人输入
-API_WAIT_TIMEOUT_MS = 10000     # 发送后等待提交接口响应的上限
-GUARD_INTERVAL_MS = 700         # 页面内 JS 看门狗轮询间隔
+TYPE_CHUNK_SIZE = 80  # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
+TYPE_DELAY_MS = 60  # 逐字键入延迟(ms)，模拟真人输入
+API_WAIT_TIMEOUT_MS = 10000  # 发送后等待提交接口响应的上限
+GUARD_INTERVAL_MS = 700  # 页面内 JS 看门狗轮询间隔
 
 # ⚠️ 换行安全模式：False(默认，线上行为) —— 正文中的 \n 直接作 Enter 送出；
 #    True(可选加固) —— 改用 Shift+Enter，防止"Enter=发送"导致内容截断提前发出。
@@ -102,6 +109,7 @@ _CARET_TO_TAIL_JS = r"""
 }
 """
 
+
 def _force_caret_to_tail(page, real_editor, tag=""):
     """
     把光标绝对锁定到编辑器文本的尾部。
@@ -120,6 +128,8 @@ def _force_caret_to_tail(page, real_editor, tag=""):
         except Exception:
             continue
     page.wait_for_timeout(300)
+
+
 # 编辑器保护白名单：任何清障动作都不许碰到含这些元素的容器
 EDITOR_GUARD_SELECTOR = '.ProseMirror,[contenteditable="true"],input[type="file"],textarea'
 
@@ -327,6 +337,7 @@ def _forensics(page, tag, extra=None):
 
     logger.warning(f"[存证/Forensic] 故障现场已落盘 | 文件前缀: <{base_path}> | 页面诊断: 【{payload.get('page_diag')}】")
     return base_path
+
 
 _HIT_TEST_JS = r"""
 (el) => {
@@ -627,7 +638,8 @@ def install_overlay_guard(page):
     except TypeError:
         pass  # 老版本 Playwright 签名不支持 no_wait_after，退化为兼容模式
     except Exception as e:
-        logger.warning(f"[守卫/Guard] locator_handler 不可用(需 Playwright>=1.42)，退化为手动清障 | 原因: 【{str(e)[:120]}】")
+        logger.warning(
+            f"[守卫/Guard] locator_handler 不可用(需 Playwright>=1.42)，退化为手动清障 | 原因: 【{str(e)[:120]}】")
         return
 
     try:
@@ -635,6 +647,7 @@ def install_overlay_guard(page):
         logger.info("[守卫/Guard] 浮层免疫已武装（兼容模式：无 no_wait_after）")
     except Exception as e:
         logger.warning(f"[守卫/Guard] locator_handler 挂载失败，退化为手动清障 | 原因: 【{str(e)[:120]}】")
+
 
 def report_guard_hits(page, stage=""):
     """读取 JS 看门狗战果，便于事后定位"到底自动关掉了什么浮层"。"""
@@ -679,7 +692,9 @@ def _resolve_wake_target(editor_container):
         ).first,
         # 🚀 专门新增针对广场发帖区特征的识别
         editor_container.get_by_placeholder(
-            re.compile(r"(分享您的洞见|Share your insights|分享你的|发布您的回复|发布你的回复|写下你的|说点什么|发表评论|回复|评论|Reply|Comment|Write|Post)", re.IGNORECASE)
+            re.compile(
+                r"(分享您的洞见|Share your insights|分享你的|发布您的回复|发布你的回复|写下你的|说点什么|发表评论|回复|评论|Reply|Comment|Write|Post)",
+                re.IGNORECASE)
         ).first,
         editor_container.locator('div[contenteditable="true"].ProseMirror').first,
         editor_container.locator('div[contenteditable="true"]').first,
@@ -692,6 +707,8 @@ def _resolve_wake_target(editor_container):
         except Exception:
             continue
     return editor_container.locator('input, div[contenteditable="true"]').first
+
+
 def _wake_editor(page, editor_container, max_round=4):
     """
     唤醒富文本编辑器（业务动作不变：点击输入区让 ProseMirror 变为可编辑）。
@@ -756,7 +773,8 @@ def _wake_editor(page, editor_container, max_round=4):
             logger.warning(f"[编辑器/唤醒] 第{rnd}轮唤醒未生效（ProseMirror 仍不可编辑），升级策略重试")
 
     _forensics(page, "wake_fail", {"last_hit_test": last_hit})
-    raise Exception(f"编辑器唤醒失败（{max_round}级降级全部失效），疑似浮层持续拦截或前端结构变更。最后命中测试: {last_hit}")
+    raise Exception(
+        f"编辑器唤醒失败（{max_round}级降级全部失效），疑似浮层持续拦截或前端结构变更。最后命中测试: {last_hit}")
 
 
 _CARET_PROBE_JS = r"""
@@ -1077,17 +1095,15 @@ def _read_api_verdict(page, watcher):
 #                              核心：提交一条评论
 # ==============================================================================
 
-# ==============================================================================
-#                              核心：提交一条评论
-# ==============================================================================
 
-
-def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None, chart_info=None):
+def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None, chart_info=None,
+                    sentiment=None):
     """
-    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[强制光标置底]→[图表]→ 发送校验。
+    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[强制光标置底]→[图表]→[情绪标签]→ 发送校验。
     入参形貌: url_info_list = [{"text": str, "url": str}, ...]
               image_path_list = [str, str, ...] 或单 str
               chart_info = {"coin": "BTC", "bridge": "USDT", "type": "future"}
+              sentiment = "看多" | "看空" | None
     返回评论ID(str) 或 None。
     """
     comment = str(comment) if comment else ""
@@ -1209,6 +1225,10 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
             page.wait_for_timeout(200)
 
         _inject_chart(page, editor_container, chart_info)
+
+    # ---- 步骤 4.6：注入情绪标签（看多/看空）----
+    if sentiment:
+        _inject_sentiment(page, editor_container, sentiment)
 
     # ---- 步骤 5：定位并点击发送 ----
     _dismiss_overlays(page, aggressive=False, desc="pre-send")
@@ -1356,7 +1376,7 @@ def _verify_page_ready(page, response, post_id):
     if post_id:
         landed = unquote(page.url)
         if post_id not in landed:
-            page.wait_for_timeout(2000)   # 给 SPA 的 replaceState 一点滞后余量
+            page.wait_for_timeout(2000)  # 给 SPA 的 replaceState 一点滞后余量
             landed = unquote(page.url)
         if post_id not in landed:
             editor_alive = True
@@ -1422,7 +1442,7 @@ def _locate_post_creator(page):
 # 新增 2：自动发帖主入口函数
 # ==============================================================================
 def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_DIR,
-                        url_info_list=None, chart_info=None, debug=True):
+                        url_info_list=None, chart_info=None, sentiment=None, debug=True):
     """
     主控入口：调度浏览器打开广场主页并执行【独立发帖】全流程。
     复用底层高度解耦的 _submit_comment 动作链路。
@@ -1437,6 +1457,7 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化发帖 | URL: <{square_url}> "
                 f"| 正文: 【{len(str(content or ''))}字】 | 图片数量: 【{img_count}】张 "
                 f"| 链接数: 【{len(url_info_list or [])}】 | 包含图表: 【{has_chart}】 "
+                f"| 情绪标签: 【{sentiment or '无'}】 "
                 f"| 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
@@ -1496,8 +1517,9 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
                 except Exception as e:
                     return f"无法定位发帖区: {e}", False, None
 
-                # 🚀 传入所有的附件参数，包括 chart_info
-                post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list, chart_info)
+                # 🚀 传入所有的附件参数，包括 chart_info 和 sentiment
+                post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list, chart_info,
+                                          sentiment)
 
                 logger.info(f"[任务/Main] 帖子发布成功 | 帖子关联ID: 【{post_id}】 | 结果: [Success]")
                 return None, True, post_id
@@ -1530,8 +1552,9 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
         logger.error(error_info)
         return error_info, False, None
 
+
 def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_dir=USER_DATA_DIR,
-                            url_info_list=None, chart_info=None, debug=False):
+                            url_info_list=None, chart_info=None, sentiment=None, debug=False):
     """
     主控入口：调度浏览器打开帖子并执行评论全流程。
     入参形貌: url_info_list = [{"text": str, "url": str}, ...]
@@ -1547,6 +1570,7 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动自动化评论 | 帖子ID: 【{post_id}】 | URL: <{post_url}> "
                 f"| 正文: 【{len(str(comment or ''))}字】 | 图片数量: 【{img_count}】张 "
                 f"| 链接数: 【{len(url_info_list or [])}】 | 包含图表: 【{has_chart}】 "
+                f"| 情绪标签: 【{sentiment or '无'}】 "
                 f"| 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
@@ -1612,8 +1636,9 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
 
                 check_for_crash(page)
 
-                # 🚀 传入所有的附件参数，包括 chart_info
-                comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list, chart_info)
+                # 🚀 传入所有的附件参数，包括 chart_info 和 sentiment
+                comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list,
+                                             chart_info, sentiment)
                 logger.info(
                     f"[任务/Main] 评论发送成功 | 帖子ID: 【{post_id}】 | 评论ID: 【{comment_id}】 | 结果: [Success]")
                 return None, True, comment_id
@@ -1754,8 +1779,9 @@ def get_auth_tokens_robust(user_data_dir):
                 source = "context-cookies(binance域)"
 
             if not cookie:
-                logger.warning(f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 目录: <{user_data_dir}> | 请求: 【{req.method} {req.url}】 "
-                               f"| 排查方向: 【浏览器当前是否处于登录态】")
+                logger.warning(
+                    f"[凭证/Auth] 提取失败：捕获到请求但无任何合法凭据 | 目录: <{user_data_dir}> | 请求: 【{req.method} {req.url}】 "
+                    f"| 排查方向: 【浏览器当前是否处于登录态】")
                 return None, None, None
 
             has_p20t = "p20t=" in cookie
@@ -1779,7 +1805,8 @@ def get_auth_tokens_robust(user_data_dir):
                             break
                 except Exception as e:
                     # 即使 JSON 解析崩溃也直接吞掉，绝不能影响凭证返回
-                    logger.debug(f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略) | 目录: <{user_data_dir}> | 详情: {e}")
+                    logger.debug(
+                        f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略) | 目录: <{user_data_dir}> | 详情: {e}")
 
             # 返回 3 个元素
             return cookie, csrf, user_data
@@ -1828,7 +1855,8 @@ def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com
 def _inject_chart(page, editor_container, chart_info):
     """
     注入图表卡片逻辑：
-    1. 点击图表图标
+1.
+点击图表图标
     2. 输入目标币种 (coin)
     3. 拦截 /trade/widget/list 接口，解析返回的 JSON
     4. 匹配 coin, bridge, type，找到目标对应的精确索引
@@ -1923,7 +1951,48 @@ def _inject_chart(page, editor_container, chart_info):
         return False
 
 
+def _inject_sentiment(page, editor_container, sentiment):
+    """
+    注入情绪（看多/看空）图标逻辑：
+    识别特征：共用同一个 SVG path（M20.91 6.861...），"看空"的 SVG 多了 style="transform: rotateX(180deg);"。
+    """
+    if not sentiment or sentiment not in ["看多", "看空"]:
+        return
 
+    logger.info(f"[编辑器/情绪] 准备点击情绪标签 | 目标: 【{sentiment}】")
+    try:
+        # 1. 根据核心 path 寻找对应的包含该情绪图标的 SVG 集合
+        svg_locators = editor_container.locator('svg').filter(has=page.locator('path[d^="M20.91 6.861"]'))
+        count = svg_locators.count()
+        if count == 0:
+            logger.warning(f"[编辑器/情绪] 未找到对应的情绪图标，已跳过 | 目标: 【{sentiment}】")
+            return
+
+        target_svg = None
+        for i in range(count):
+            svg_node = svg_locators.nth(i)
+            # 通过获取 style 属性判断是否被 rotateX(180deg) 翻转
+            style_str = svg_node.get_attribute("style") or ""
+            is_bear = "rotateX(180deg)" in style_str
+
+            if sentiment == "看空" and is_bear:
+                target_svg = svg_node
+                break
+            elif sentiment == "看多" and not is_bear:
+                target_svg = svg_node
+                break
+
+        if target_svg:
+            # 情绪按钮通常存在于父级 div，点击其父级容器触发选中
+            target_svg.locator("..").click(timeout=3000)
+            page.wait_for_timeout(500)
+            logger.info(f"[编辑器/情绪] 情绪标签点击成功 | 结果: [Success]")
+        else:
+            logger.warning(
+                f"[编辑器/情绪] 页面存在情绪图标，但未找到匹配 【{sentiment}】 状态的图标元素 | 结果: [Skipped]")
+
+    except Exception as e:
+        logger.warning(f"[编辑器/情绪] 情绪标签点击异常，已跳过 | 原因: 【{str(e)[:150]}】 | 结果: [Skipped]")
 
 
 # ==============================================================================
@@ -1932,14 +2001,13 @@ def _inject_chart(page, editor_container, chart_info):
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
     # login_and_save_session()                                  # 初次手动登录并固化 Session
-    open_browser_for_manual_use(USER_DATA_DIR)                # 人工接管调试
+    open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
     # cookies, csrf = get_auth_tokens_robust(USER_DATA_DIR)     # 提取脱机 API 凭证
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
     test_img = r"E:\chrome\1759239193.png"
     test_links = [{"text": "带单", "url": "https://www.binance.com/zh-CN/square/post/309692475255842"}]
-
 
     err, success, c_id = comment_on_binance_post(
         post_url=test_url, comment=test_msg, image_path_list=test_img, url_info_list=test_links, debug=True
@@ -1950,7 +2018,6 @@ if __name__ == "__main__":
     else:
         logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
 
-
     err, success, c_id = create_binance_post(
         content=test_msg, image_path_list=test_img, url_info_list=test_links, debug=True
     )
@@ -1959,7 +2026,6 @@ if __name__ == "__main__":
         logger.info(f"\n[结果/Final] 🎉 ======== 自动发帖任务圆满成功 ======== | 发帖ID: 【{c_id}】")
     else:
         logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
-
 
     # 1. 拟定发帖文案
     test_content = "交易所的估值天花板，正在被真实的线下消费捅破。\n\n何一确认：币安支付现已接入日本全国 PayPay 商户。这不是小圈子里的链上自嗨，而是把加密支付直接接进了主流线下商业网络。\n\n多数人看 BNB，眼光始终停留在手续费折扣和打新挖矿。但当它跳出交易所围墙、切入真实世界的支付场景时，流动性就不再只是投机筹码，而是有了实体刚需做托底。\n\n靠发预告撑不起长线，能在街头实体里跑通闭环的生态，基本盘只会越来越硬。"

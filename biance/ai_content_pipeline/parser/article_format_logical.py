@@ -904,6 +904,7 @@ def _publish_articles_once(article_manager):
             continue
         article = articles[selected_index]
         info, topic = article.get("article_info", {}), article.get("topic", "")
+        stance = article.get("stance", "")
         started = time.monotonic()
         stage, api_result = "准备正文、媒体及账号配置", "尚未调用"
         try:
@@ -919,7 +920,7 @@ def _publish_articles_once(article_manager):
             stage, api_result = "调用发布接口", "未知"
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
-                chart_info={"coin": topic, "bridge": "USDT", "type": "future"},
+                chart_info={"coin": topic, "bridge": "USDT", "type": "future"},sentiment=stance
             )
             api_result = "成功" if success else "失败"
             if success:
