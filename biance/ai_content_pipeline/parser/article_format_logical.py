@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 import ccxt
 
 from app.ai_api.model_api import generate_content
-from biance.biance_playwright import create_binance_post, get_auth_tokens_robust
+from biance.biance_playwright import create_binance_post, get_auth_tokens_robust, comment_on_binance_post
 from biance.biance_squre_api import (
     fetch_binance_feed, fetch_binance_future_hot_coins, fetch_binance_hot_hashtags,
     fetch_binance_spot_hot_coins, like_and_bookmark,
@@ -924,6 +924,7 @@ def _publish_articles_once(article_manager):
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
                 chart_info={"coin": topic, "bridge": "USDT", "type": "future"},sentiment=stance
             )
+            post_id = str(post_id)
             api_result = "成功" if success else "失败"
             if success:
                 account_state["total_success"] += 1
@@ -1081,6 +1082,38 @@ def _run_task(task):
         )
         raise
 
+def interact_comment(god_comments, other_account_list, post_id, stance):
+    interact_comment_info = {}
+    # 将 other_account_list 打乱顺序
+    other_account_list = random.sample(other_account_list, len(other_account_list))
+
+    for account_name, comment_text in zip(other_account_list, god_comments):
+        user_data_dir = get_config(f"{account_name}_browser_session_dir")
+        try:
+            # : 仅发布 follower_perspective，链接固定；模型 link_target 和 reply_draft 不用于发布。
+            error, success, comment_id = comment_on_binance_post(
+                post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
+                comment=comment_text,
+                user_data_dir=user_data_dir,sentiment=stance,
+                debug=True
+            )
+            comment_id = str(comment_id) if comment_id else ""
+            interact_comment_info[f"{comment_text}"] = {
+                "account": account_name,
+                "comment_id": comment_id,
+                "success": success,
+                "error_info": error,
+            }
+        except Exception as send_error:
+            record_error = None
+            logger.error(
+                f"[发布/调用异常] 发帖请求异常，实际结果未知，请检查登录、网络和接口响应"
+                f" | 帖子: 【{post_id}】 | 账号: 【{account_name}】 | 异常: 【{send_error!r}】"
+                f" | 失败计数: 【{'已记录' if record_error is None else repr(record_error)}】"
+                f" | 结果: 【保留原始发送异常并向外抛出】"
+            )
+    return interact_comment_info
+
 
 def _hudong_once(article_manager):
     """对近 24 小时已发布且未互动的文章点赞收藏；文章含 binance_post_id/interacted。
@@ -1131,6 +1164,16 @@ def _hudong_once(article_manager):
         )
         return
     for article in pending:
+        post_owner = article.get("published_by")
+        god_comments = article.get("article_info", {}).get("god_comments", [])
+        post_id = article.get("binance_post_id")
+        stance = article.get("stance")
+        # 排除 ACCOUNTS 中的 post_owner
+        other_account_list = [account for account in ACCOUNTS if account != post_owner]
+        comment_interact_info = interact_comment(god_comments, other_account_list, post_id, stance)
+        article["comment_interact_info"] = comment_interact_info
+
+
         article["interacted"], article["interaction_time"] = True, now.timestamp()
     try:
         article_manager.upsert_articles(pending)
