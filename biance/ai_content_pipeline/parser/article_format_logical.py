@@ -874,7 +874,7 @@ def _publish_articles_once(article_manager):
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-        and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
+        and len(article.get("article_info", {}).get("image_placeholders", [])) >= 0
         and article.get("publish_attempts", 0) < PUBLISH_MAX_ATTEMPTS
         and (article.get("topic") or "").lower() in hot_coins
     ]

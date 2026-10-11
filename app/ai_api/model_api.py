@@ -689,7 +689,9 @@ if __name__ == "__main__":
     # )
     # print(_redact(result))
     # probe_models("model_probe_results.json")
-    # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it")
+    # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-api-key-4-31b-it-max")
         generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-alias")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-high")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
+
