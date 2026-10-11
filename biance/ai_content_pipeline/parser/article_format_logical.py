@@ -504,11 +504,11 @@ def extract_and_group_valid_evidences():
 
 
 def check_article_info(article_info, materials, image_mapping, max_chars):
-    """校验文章与证据链；article_info 必须含下方六字段。
+    """校验文章与证据链；article_info 必须含下方七字段。
     materials 含 id/visual_evidence，image_mapping 为真实 ASSET 来源映射；
     返回 (是否合法, 错误文本)，不修改输入。
     """
-    keys = {"status", "text", "image_placeholders", "used_material_ids", "score", "reason"}
+    keys = {"status", "text", "god_comments", "image_placeholders", "used_material_ids", "score", "reason"}
     error = _key_error(article_info, keys, "文章")
     if error:
         return False, error
@@ -516,16 +516,17 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
         return False, "status 必须为 ok 或 skip"
     if not isinstance(article_info["text"], str):
         return False, "text 必须是字符串"
-    for key in ("image_placeholders", "used_material_ids"):
+    for key in ("god_comments", "image_placeholders", "used_material_ids"):
         values = article_info[key]
         if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
             return False, f"{key} 必须是非空字符串组成的列表，列表本身可为空"
-        if len(values) != len(set(values)):
+        if key in ("image_placeholders", "used_material_ids") and len(values) != len(set(values)):
             return False, f"{key} 不允许重复"
     if article_info["status"] == "skip":
         if (article_info["text"] != "" or article_info["image_placeholders"]
-                or article_info["used_material_ids"] or article_info["score"] is not None):
-            return False, "skip 必须清空正文、图片、采用素材，score 必须为 null"
+                or article_info["used_material_ids"] or article_info["god_comments"] or article_info[
+                    "score"] is not None):
+            return False, "skip 必须清空正文、图片、神评、采用素材，score 必须为 null"
         if not isinstance(article_info["reason"], str) or not article_info["reason"].strip():
             return False, "skip 必须说明 reason"
         return True, ""
@@ -537,14 +538,16 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
     if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
         return False, "正文不能包含图片或视频占位符"
     if type(article_info["score"]) not in (int, float) or not 0 <= article_info["score"] <= 10:
-
         return False, "score 必须是 0—10 的浮点数，不能是整数或布尔值"
     if article_info["reason"] is not None:
         return False, "ok 的 reason 必须为 null"
+    if not 1 <= len(article_info["god_comments"]):
+        return False, "ok 状态下 god_comments 必须包含 1 条神评"
+
     material_by_id = {item["id"]: item for item in materials}
     used_ids, selected_images = article_info["used_material_ids"], article_info["image_placeholders"]
-    if not 1 <= len(used_ids) <= 10 or any(item not in material_by_id for item in used_ids):
-        return False, "used_material_ids 必须引用实际存在的 1—10 条素材"
+    if not 3 <= len(used_ids) or any(item not in material_by_id for item in used_ids):
+        return False, "used_material_ids 必须引用实际存在的 3 条素材"
     if len(selected_images) > 3:
         return False, "最多使用 3 张图片"
     allowed_images = set()
@@ -561,7 +564,6 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
     if any(item not in allowed_images or item not in image_mapping for item in selected_images):
         return False, "图片必须来自已采用素材，且存在真实来源映射"
     return True, ""
-
 
 def get_post_usage_counts(article_manager, source, post_ids):
     """统计已成功发布文章对原帖的引用次数；输入平台和原帖 ID 序列，返回 {post_id: 次数}。
