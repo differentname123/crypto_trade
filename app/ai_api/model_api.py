@@ -60,7 +60,9 @@ MEDIUM_MODEL_LIST = [
 
 ]
 LOW_MODEL_LIST = [
+    {"model_name": "gemma-api-key-4-31b-it-max", "权重": 1, "备注": "来源api key aistudio "},
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
+
     {"model_name": "gemini-web-3.6-flash-thinking-max", "权重": 0, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
 ]
@@ -688,4 +690,7 @@ if __name__ == "__main__":
     # )
     # print(_redact(result))
     # probe_models("model_probe_results.json")
-    generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it")
+    # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it")
+    for i in range(10):
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-api-key-4-31b-it-max")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-alias")
