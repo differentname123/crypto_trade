@@ -34,3 +34,8 @@
         - 每周估算：[待详细量化] 每天应该有200积分可调用普通模型200次
 
 
+    6. 【额度池】aistudio api key
+        - 可用模型：[3.8flash以及以下 并且还有大量的gemma]
+        - 转换工具：mew api 这个项目
+        - 原始额度：每天 20 次 .gemma 1.4万次
+        - 每周估算：http://localhost:3001/usage-logs/common

@@ -52,6 +52,12 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
 
+    {"model_name": "gemini-api-key-3.8-flash", "权重": 1, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-api-key-3.7-flash", "权重": 1, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-api-key-3.6-flash", "权重": 1, "备注": "来源api key aistudio"},
+
+
+
     {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
     {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 1, "备注": "来源antigravity"},
 
@@ -62,7 +68,11 @@ MEDIUM_MODEL_LIST = [
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
+    {"model_name": "gemma-api-key-4-31b-it", "权重": 1, "备注": "来源api key aistudio "},
+
     {"model_name": "gemini-web-3.6-flash-thinking-max", "权重": 0, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
+
+    {"model_name": "gemini-antigravity-3.7-flash", "权重": 0, "备注": "来源antigravity"},
 
 ]
 
@@ -691,7 +701,5 @@ if __name__ == "__main__":
     # probe_models("model_probe_results.json")
     # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-alias")
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-high")
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-api-key-3.8-flash")
 
