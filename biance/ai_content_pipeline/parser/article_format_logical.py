@@ -263,8 +263,8 @@ def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     for token in token_list:
         token_count += 1
         for order in orders:
-            posts.extend(fetch_binance_feed(token=token, count=100, orderBy=order))
-    posts.extend(fetch_binance_feed(count=feed_count))
+            posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
+    posts.extend(fetch_binance_feed(count=feed_count * 2))
     if posts:
         post_manager.upsert_posts(posts)
     logger.info(
@@ -280,7 +280,7 @@ def fetch_post(post_manager):
 
 def fetch_hot_post(post_manager, token_list):
     """采集指定币种的热门/最新流和综合流；token_list 为币种序列，管理器接收 [帖子]。"""
-    _fetch_and_save_posts(post_manager, token_list, (1, 2), 200)
+    _fetch_and_save_posts(post_manager, token_list, (1, 2), 100)
 
 
 def get_top_k_movers(top_k=5):
