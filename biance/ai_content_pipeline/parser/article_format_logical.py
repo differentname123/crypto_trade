@@ -58,7 +58,7 @@ ACCOUNT_COOLDOWN_SECONDS = 3600
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600
 PUBLISH_MAX_ATTEMPTS = 3
 PUBLISH_POLL_SECONDS = 600
-INTERACTION_INTERVAL_SECONDS = 600
+INTERACTION_INTERVAL_SECONDS = 1200
 MEDIA_PATTERN = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
 SHELF_LIFE_SECONDS = {
     "hours": 2 * 3600, "days": 24 * 3600, "weeks": 7 * 24 * 3600,
@@ -921,7 +921,9 @@ def _publish_articles_once(article_manager):
             stage, api_result = "调用发布接口", "未知"
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
-                chart_info={"coin": topic, "bridge": "USDT", "type": "future"},sentiment=stance
+                chart_info={"coin": topic, "bridge": "USDT", "type": "future"},sentiment=stance,
+                debug=False
+
             )
             post_id = str(post_id)
             api_result = "成功" if success else "失败"
@@ -1094,7 +1096,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance):
                 post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
                 comment=comment_text,
                 user_data_dir=user_data_dir,sentiment=stance,
-                debug=True
+                # debug=True
             )
             comment_id = str(comment_id) if comment_id else ""
             interact_comment_info[f"{comment_text}"] = {
