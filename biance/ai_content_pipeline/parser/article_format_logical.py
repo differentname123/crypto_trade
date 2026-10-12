@@ -655,7 +655,7 @@ def build_article_task(coin, stance, ev_list, article_manager):
     full_prompt/materials/image_mapping/model_name，record 保留生成与错误追踪字段。
     """
     brief = {
-        "task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS, "recent_openings": []},
+        "task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS},
         "materials": [],
     }
     # : 此字段仅保留历史记录契约；实际调用 medium 模型组，不能据此认定实际模型。
@@ -705,7 +705,6 @@ def build_article_task(coin, stance, ev_list, article_manager):
         return {"is_skip": True, "record": record, "coin": coin, "stance": stance, "reason": reason}
     materials, image_mapping = transform_mlus(selected)
     brief["materials"] = materials
-    brief["task"]["recent_openings"] = get_recent_openings(article_manager, BINANCE_SOURCE, coin, stance)
     record["material_post_mapping"] = {
         material["id"]: evidence["source_post_id"] for material, evidence in zip(materials, selected)
     }
@@ -1257,7 +1256,7 @@ def get_need_check_article_info():
 
 if __name__ == "__main__":
 
-    get_need_check_article_info()
+    # get_need_check_article_info()
     tasks = [
         generate_analysis_articles,
         format_image_article,
