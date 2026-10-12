@@ -44,7 +44,7 @@ MAX_CONCURRENCY = 10
 LLM_MAX_RETRIES = 3
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
-ARTICLE_MATERIAL_LIMIT = 50
+ARTICLE_MATERIAL_LIMIT = 20
 ARTICLE_MIN_MATERIALS = 5
 ARTICLE_POST_USAGE_LIMIT = 2
 ARTICLE_MAX_CHARS = 260
@@ -546,7 +546,7 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
 
     material_by_id = {item["id"]: item for item in materials}
     used_ids, selected_images = article_info["used_material_ids"], article_info["image_placeholders"]
-    if not 3 <= len(used_ids) or any(item not in material_by_id for item in used_ids):
+    if not 0 <= len(used_ids) or any(item not in material_by_id for item in used_ids):
         return False, "used_material_ids 必须引用实际存在的 3 条素材"
     if len(selected_images) > 3:
         return False, "最多使用 3 张图片"
