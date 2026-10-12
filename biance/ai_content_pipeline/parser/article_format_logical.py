@@ -909,7 +909,7 @@ def _publish_articles_once(article_manager):
         started = time.monotonic()
         stage, api_result = "准备正文、媒体及账号配置", "尚未调用"
         try:
-            text = info.get("text", "")
+            text = f"${topic} {info.get("text", "")}"
             if topic:
                 text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda match: "$" + topic + " ",
                               text, flags=re.IGNORECASE)
