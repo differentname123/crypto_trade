@@ -1204,38 +1204,38 @@ def hudong():
             time.sleep(INTERACTION_INTERVAL_SECONDS)
 
 
-def clean_article_data(data_list):
+def clean_article_records(raw_records):
+    """清洗文章数据列表，仅保留目标字段结构。
+
+    :param raw_records: 包含原始 MongoDB 导出的字典列表
+    :return: 清洗后的结构化数据列表
     """
-    接受包含原始字典数据的列表，返回清洗和重组后的列表。
-    """
-    cleaned_list = []
+    cleaned_records = []
 
-    for item in data_list:
-        # 提取原始的 article_info，如果不存在则赋空字典防报错
-        original_article_info = item.get('article_info', {})
+    for item in raw_records:
+        if not isinstance(item, dict):
+            continue
 
-        # 1. 组装目标格式的 article_info
-        cleaned_article_info = {
-            'status': original_article_info.get('status'),
-            'text': original_article_info.get('text'),
-            'god_comments': original_article_info.get('god_comments', []),
-            'image_placeholders': original_article_info.get('image_placeholders', []),
-            'used_material_ids': original_article_info.get('used_material_ids', []),
-            'score': original_article_info.get('score')
-        }
+        raw_info = item.get("article_info") or {}
+        raw_brief = item.get("creation_brief") or {}
 
-        # 2. 【修正这里】提取 creation_brief，它在原始数据的最外层 (item 中)，而不是 article_info 中
-        creation_brief = item.get('creation_brief', {})
-
-        # 3. 组合成新的字典结构
         cleaned_item = {
-            'article_info': cleaned_article_info,
-            'creation_brief': creation_brief
+            "article_info": {
+                "text": raw_info.get("text", ""),
+                "god_comments": raw_info.get("god_comments", []),
+                "image_placeholders": raw_info.get("image_placeholders", []),
+                "used_material_ids": raw_info.get("used_material_ids", []),
+            },
+            "creation_brief": {
+                "task": raw_brief.get("task", {}),
+                "materials": raw_brief.get("materials", []),
+            },
         }
 
-        cleaned_list.append(cleaned_item)
+        cleaned_records.append(cleaned_item)
 
-    return cleaned_list
+    return cleaned_records
+
 def get_need_check_article_info():
     """
     组装待审查的文章信息
@@ -1247,10 +1247,10 @@ def get_need_check_article_info():
         "status": "ok", "publish_status": {"$ne": "success"},
     }) or []
 
-    cleaned_data = clean_article_data(candidates)
+    cleaned_data = clean_article_records(candidates)
     # 随机选择 50个
     random.shuffle(cleaned_data)
-    selected_data = cleaned_data[:50]
+    selected_data = cleaned_data[:20]
 
     logger.info("[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s]", len(candidates), len(selected_data))
 
