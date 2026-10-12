@@ -1204,7 +1204,60 @@ def hudong():
             time.sleep(INTERACTION_INTERVAL_SECONDS)
 
 
+def clean_article_data(data_list):
+    """
+    接受包含原始字典数据的列表，返回清洗和重组后的列表。
+    """
+    cleaned_list = []
+
+    for item in data_list:
+        # 提取原始的 article_info，如果不存在则赋空字典防报错
+        original_article_info = item.get('article_info', {})
+
+        # 1. 组装目标格式的 article_info
+        cleaned_article_info = {
+            'status': original_article_info.get('status'),
+            'text': original_article_info.get('text'),
+            'god_comments': original_article_info.get('god_comments', []),
+            'image_placeholders': original_article_info.get('image_placeholders', []),
+            'used_material_ids': original_article_info.get('used_material_ids', []),
+            'score': original_article_info.get('score')
+        }
+
+        # 2. 【修正这里】提取 creation_brief，它在原始数据的最外层 (item 中)，而不是 article_info 中
+        creation_brief = item.get('creation_brief', {})
+
+        # 3. 组合成新的字典结构
+        cleaned_item = {
+            'article_info': cleaned_article_info,
+            'creation_brief': creation_brief
+        }
+
+        cleaned_list.append(cleaned_item)
+
+    return cleaned_list
+def get_need_check_article_info():
+    """
+    组装待审查的文章信息
+    :return:
+    """
+    article_manager = GeneratedArticleManager(gen_db_object())
+    candidates = article_manager.find_articles(query={
+        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
+        "status": "ok", "publish_status": {"$ne": "success"},
+    }) or []
+
+    cleaned_data = clean_article_data(candidates)
+    # 随机选择 50个
+    random.shuffle(cleaned_data)
+    selected_data = cleaned_data[:50]
+
+    logger.info("[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s]", len(candidates), len(selected_data))
+
+
 if __name__ == "__main__":
+
+    get_need_check_article_info()
     tasks = [
         generate_analysis_articles,
         format_image_article,
