@@ -38,8 +38,8 @@ API_KEY = get_config("local_api_key")
 
 # 示例模型名沿用原需求；请按网关实际支持的模型补充，每个模型名在组内只出现一次。
 HIGH_MODEL_LIST = [
-    {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
-    {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
+    # {"model_name": "gpt-6-astra-max", "权重": 0, "备注": "来源codex 订阅账号"},
+    # {"model_name": "gpt-6.1-sol-max", "权重": 1, "备注": "来源codex 订阅账号"},
     {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
 ]
@@ -61,8 +61,8 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
     {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
-    {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
-    {"model_name": "gpt-6-codex-sol-max", "权重": 0, "备注": "来源codex 付费"},
+    # {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
+    # {"model_name": "gpt-6-codex-sol-max", "权重": 0, "备注": "来源codex 付费"},
 
 ]
 LOW_MODEL_LIST = [
