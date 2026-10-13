@@ -54,9 +54,9 @@ MEDIUM_MODEL_LIST = [
 
 
 
-    {"model_name": "gemini-api-key-3.8-flash", "权重": 1, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-api-key-3.7-flash", "权重": 1, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-api-key-3.6-flash", "权重": 1, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-api-key-3.7-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
 
 
 
