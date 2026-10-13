@@ -36,7 +36,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
 logger = setup_logger(app_name="media_format")
-
+prompt_version = "1014"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -664,7 +664,7 @@ def build_article_task(coin, stance, ev_list, article_manager):
         "source": BINANCE_SOURCE, "topic": coin, "stance": stance, "status": "processing",
         "creation_brief": brief, "material_post_mapping": {}, "post_id_list": [],
         "prompt_file_path": ARTICLE_PROMPT_FILE_PATH, "model_name": model_name,
-        "prompt_version": "0920v1.0", "article_info": None, "error_message": None,
+        "prompt_version": prompt_version, "article_info": None, "error_message": None,
         "error_history": [], "raw_response": None, "attempt_count": 0,
     }
     candidates = [
@@ -869,13 +869,19 @@ def _publish_articles_once(article_manager):
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
         "status": "ok", "publish_status": {"$ne": "success"},
     }) or []
+    # 并且要求 prompt_version 与当前一致，避免旧 prompt 生成的文章被发布。
+    candidates = [
+        article for article in candidates
+        if article.get("prompt_version") == prompt_version
+    ]
+
     hot_coins = {str(coin).lower() for coin in (get_hot_coin() or [])}
     # : 原实现要求至少一张图，与旧注释“无图”相反；按实际筛选保留含图要求。
     # : 次数限制只在本轮入口检查，失败文章可被后续账号继续尝试，单轮可能超过上限。
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
+           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 0
            and article.get("publish_attempts", 0) < PUBLISH_MAX_ATTEMPTS
            and (article.get("topic") or "").lower() in hot_coins
     ]
@@ -1334,17 +1340,19 @@ def delete_old_post():
                             latest_price = get_latest_crypto_price(topic)
                             if latest_price is not None:
                                 cur_p = float(latest_price)
-                                price_change_pct = (cur_p - pub_p) / pub_p
-                                article["price_change_pct"] = round(price_change_pct, 4)
+                                # 根据多空直接计算实际收益百分比（正数为盈利，负数为亏损）
+                                price_diff_pct = (cur_p - pub_p) / pub_p
+                                profit_pct = price_diff_pct if stance == "看多" else -price_diff_pct
+                                article["profit_pct"] = round(profit_pct, 4)
                                 price_updated = True
 
-                                if stance == "看多" and price_change_pct <= -0.2:
+                                if stance == "看多" and profit_pct <= -0.2:
                                     should_delete = True
-                                    adverse_pct = abs(price_change_pct) * 100
+                                    adverse_pct = abs(profit_pct) * 100
                                     delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 20%)"
-                                elif stance == "看空" and price_change_pct >= 0.5:
+                                elif stance == "看空" and profit_pct <= -0.5:
                                     should_delete = True
-                                    adverse_pct = price_change_pct * 100
+                                    adverse_pct = abs(profit_pct) * 100
                                     delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 50%)"
                     except Exception as p_err:
                         logger.warning(
@@ -1505,7 +1513,6 @@ def delete_old_post():
             account_errors, DELETE_INTERVAL_SEC,
         )
         time.sleep(DELETE_INTERVAL_SEC)
-
 def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
     """
     根据指定关键字查询最近拉取的帖子。
