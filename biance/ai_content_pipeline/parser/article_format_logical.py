@@ -1500,8 +1500,81 @@ def delete_old_post():
         )
         time.sleep(DELETE_INTERVAL_SEC)
 
-if __name__ == "__main__":
 
+def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
+    """
+    根据指定关键字查询最近拉取的帖子。
+
+    :param target_key: 帖子正文必须包含的关键字
+    :param hours: 最近的小时数 (默认 6 小时)
+    :param min_views: 最低浏览量门槛 (默认 1000)
+    :return: 包含清洗后干净元素（正文、图片列表、流量表现）的字典列表，按浏览量降序排列。
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+
+    # 按照秒级时间戳计算边界（基于示例中 publish_time = 1791680925 为秒级）
+    start_time = time.time() - (hours * 3600)
+
+    # 组装 MongoDB 原生查询条件与排序规则
+    query = {
+        "source": BINANCE_SOURCE,
+        "publish_time": {"$gte": start_time},
+        "engagement.view_count": {"$gte": min_views},
+        "content.text_content": {"$regex": target_key, "$options": "i"}  # 忽略大小写
+    }
+    sort_condition = [("engagement.view_count", -1)]
+
+    posts = []
+    try:
+        # 首选：如果底层对外暴露了 collection，直接利用 MongoDB 引擎进行筛选排序（性能最优）
+        if hasattr(post_manager, 'collection'):
+            cursor = post_manager.collection.find(query).sort(sort_condition)
+            posts = list(cursor)
+        # 次选：如果 post_manager 像 article_manager 一样具有 find_posts 方法
+        elif hasattr(post_manager, 'find_posts'):
+            posts = post_manager.find_posts(query=query, sort=sort_condition)
+        else:
+            # 兜底：兼容内存中过滤模式，拉取最新数据后再进行字段比对和排序
+            raw_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=5000)
+            for p in raw_posts:
+                pub_time = p.get("publish_time", 0)
+                views = p.get("engagement", {}).get("view_count", 0)
+                text = p.get("content", {}).get("text_content", "") or ""
+
+                if pub_time >= start_time and views >= min_views and target_key.lower() in text.lower():
+                    posts.append(p)
+            # 在内存中按浏览量降序排列
+            posts.sort(key=lambda x: x.get("engagement", {}).get("view_count", 0), reverse=True)
+
+    except Exception as e:
+        logger.error(f"❌ [数据/查询] 关键字热门帖子查询失败 | 关键字: [{target_key}] | 异常: [{e}]")
+        return []
+
+    # 结果数据清洗，仅保留：正文内容、图片列表、流量表现
+    cleaned_results = []
+    for post in posts:
+        content_dict = post.get("content") or {}
+        media_dict = post.get("media") or {}
+        engagement_dict = post.get("engagement") or {}
+
+        cleaned_item = {
+            "text_content": content_dict.get("text_content", ""),
+            "images": media_dict.get("images", []),
+            "engagement": {
+                "view_count": engagement_dict.get("view_count", 0),
+                "like_count": engagement_dict.get("like_count", 0),
+                "comment_count": engagement_dict.get("comment_count", 0)
+            }
+        }
+        cleaned_results.append(cleaned_item)
+
+    logger.info(
+        f"[数据/查询] 关键字热门帖查询完成 | 关键字: [{target_key}] | 时长: [{hours}h] | 匹配数量: [{len(cleaned_results)}]")
+    return cleaned_results
+
+
+if __name__ == "__main__":
+    # query_hot_posts_by_keyword(target_key="gtc")
     # get_need_check_article_info()
     tasks = [
         generate_analysis_articles,
