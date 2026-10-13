@@ -26,7 +26,8 @@ from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post, get_auth_tokens_robust, comment_on_binance_post
 from biance.biance_squre_api import (
     fetch_binance_feed, fetch_binance_future_hot_coins, fetch_binance_hot_hashtags,
-    fetch_binance_spot_hot_coins, like_and_bookmark, get_latest_crypto_price,
+    fetch_binance_spot_hot_coins, like_and_bookmark, get_latest_crypto_price, fetch_binance_square_replies,
+    delete_binance_square_content,
 )
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
@@ -1258,6 +1259,92 @@ def get_need_check_article_info():
     selected_data = cleaned_data[:20]
 
     logger.info("[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s]", len(candidates), len(selected_data))
+
+MAX_REPLAY_DAYS = 7
+
+DELETE_INTERVAL_SEC = 3600 * 24
+def delete_old_post():
+    """每小时按账号清理历史回复；沿用逐条、逐账号及整轮异常隔离，不中断后续轮次。
+    身份响应含 squareUid；回复列表项含 reply_id，删除接口接收字符串 ID。
+    """
+    while True:
+        started = time.monotonic()
+        deleted = failed = account_errors = 0
+        ACCOUNTS.reverse()  # 恢复交替反转顺序
+        logger.info(f"[历史清理/开始] 准备查询历史回复 | 账号数: 【{len(ACCOUNTS)}】")
+        try:
+            cutoff_ms = int((time.time() - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
+            for account_name in ACCOUNTS:
+                browser_session_dir = get_config(f"{account_name}_browser_session_dir")
+                try:
+                    cookies, token, user_info = get_auth_tokens_robust(browser_session_dir)
+                    if not user_info or "squareUid" not in user_info:
+                        account_errors += 1
+                        logger.warning(
+                            f"[历史清理/身份缺失] 无法取得 squareUid，可能是登录失效"
+                            f" | 账号: 【{account_name}】 | 结果: 【跳过该账号】"
+                        )
+                        continue
+                    # : 仅依赖 time_offset 获取最多 1000 条，不逐条核验日期，也不补充分页。
+                    replies = fetch_binance_square_replies(
+                        target_square_uid=user_info.get("squareUid"),
+                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,filter_type="REPLY"
+                    )
+                    posts = fetch_binance_square_replies(
+                        target_square_uid=user_info.get("squareUid"),
+                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,
+                    )
+                    replies.extend(posts)
+                    if not replies:
+                        continue
+                    before_deleted, before_failed = deleted, failed
+                    for item in replies:
+                        raw_reply_id = item.get("reply_id")
+                        if not raw_reply_id:
+                            continue
+                        reply_id = str(raw_reply_id)
+                        try:
+                            success = delete_binance_square_content(
+                                content_id=reply_id, cookies=cookies, csrf_token=token
+                            )
+                        except Exception as exc:
+                            failed += 1
+                            logger.error(
+                                f"[历史清理/请求异常] 删除回复异常，可能是网络或身份凭证失效"
+                                f" | 账号: 【{account_name}】 | 回复: 【{reply_id}】 | 异常: 【{exc!r}】"
+                                f" | 结果: 【继续处理其余回复】"
+                            )
+                            continue
+                        if success:
+                            deleted += 1
+                            continue
+                        failed += 1
+                        logger.warning(
+                            f"[历史清理/删除失败] 接口未确认删除，可能是回复已不存在或权限不足"
+                            f" | 账号: 【{account_name}】 | 回复: 【{reply_id}】 | 结果: 【继续处理】"
+                        )
+                    logger.info(
+                        f"[历史清理/账号完成] 已处理接口返回的回复 | 账号: 【{account_name}】"
+                        f" | 删除成功: 【{deleted - before_deleted}】 | 删除失败: 【{failed - before_failed}】"
+                    )
+                except Exception as exc:
+                    account_errors += 1
+                    logger.error(
+                        f"[历史清理/账号异常] 身份获取或回复处理失败，请检查账号会话及接口数据"
+                        f" | 账号目录: 【{browser_session_dir}】 | 异常: 【{exc!r}】 | 结果: 【继续其他账号】"
+                    )
+        except Exception as exc:
+            logger.error(
+                f"[历史清理/本轮异常] 清理任务中断，请检查配置和接口数据"
+                f" | 异常: 【{exc!r}】 | 结果: 【本轮停止，下轮继续】"
+            )
+        logger.info(
+            f"[历史清理/本轮小结] 本轮处理结束 | 删除成功: 【{deleted}】 | 删除失败: 【{failed}】"
+            f" | 账号异常: 【{account_errors}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
+            f" | 休眠: 【{DELETE_INTERVAL_SEC} 秒】"
+        )
+        time.sleep(DELETE_INTERVAL_SEC)
+
 
 
 if __name__ == "__main__":
