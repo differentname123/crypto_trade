@@ -1261,91 +1261,229 @@ def get_need_check_article_info():
     logger.info("[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s]", len(candidates), len(selected_data))
 
 MAX_REPLAY_DAYS = 7
+DELETE_INTERVAL_SEC = 3600  # 调整为每小时检查一次，确保及时发现并清理逆向帖子
 
-DELETE_INTERVAL_SEC = 3600 * 24
+
 def delete_old_post():
-    """每小时按账号清理历史回复；沿用逐条、逐账号及整轮异常隔离，不中断后续轮次。
-    身份响应含 squareUid；回复列表项含 reply_id，删除接口接收字符串 ID。
+    """按账号巡检并清理帖子与回复：
+
+    1. 对数据库中已发布的帖子进行实时行情与时效比对，若逆向 20% 或超时则调用接口删除并更新数据库状态；
+    2. 对远端历史流进行兜底超时清理；仅当删除的帖子存在于数据库时才维护 delete_time 和 delete_reason。
     """
+    article_manager = GeneratedArticleManager(gen_db_object())
+
     while True:
         started = time.monotonic()
-        deleted = failed = account_errors = 0
-        ACCOUNTS.reverse()  # 恢复交替反转顺序
-        logger.info(f"[历史清理/开始] 准备查询历史回复 | 账号数: 【{len(ACCOUNTS)}】")
+        deleted_reverse = deleted_timeout = failed = account_errors = 0
+        deleted_post_ids = set()
+        now = time.time()
+        ACCOUNTS.reverse()  # 轮询账号交替顺序
+
+        logger.info("[历史清理/开始] 启动帖子清理轮询 | 账号数: [%s]", len(ACCOUNTS))
+
+        # 1. 预先获取各账号凭证
+        credentials = {}
+        for account_name in ACCOUNTS:
+            try:
+                session_dir = get_config(f"{account_name}_browser_session_dir")
+                cookies, token, user_info = get_auth_tokens_robust(session_dir)
+                if cookies and token:
+                    credentials[account_name] = {
+                        "cookies": cookies,
+                        "csrf_token": token,
+                        "user_info": user_info or {},
+                    }
+                else:
+                    logger.warning("[历史清理/凭证缺失] 无法取得账号凭证 | 账号: [%s]", account_name)
+            except Exception as exc:
+                account_errors += 1
+                logger.error("[历史清理/凭证异常] 获取账号凭证失败 | 账号: [%s] | 异常: [%r]", account_name, exc)
+
+        # 2. 检查数据库中已成功发布、未标记删除的代码帖子（检查逆向 20% 与超时）
         try:
-            cutoff_ms = int((time.time() - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
-            for account_name in ACCOUNTS:
-                browser_session_dir = get_config(f"{account_name}_browser_session_dir")
-                try:
-                    cookies, token, user_info = get_auth_tokens_robust(browser_session_dir)
-                    if not user_info or "squareUid" not in user_info:
-                        account_errors += 1
+            published_articles = article_manager.find_articles(query={
+                "publish_status": "success",
+                "binance_post_id": {"$exists": True, "$ne": None},
+                "delete_time": {"$exists": False},
+            }) or []
+
+            logger.info("[历史清理/数据库巡检] 待检测有效文章: [%s 条]", len(published_articles))
+
+            for article in published_articles:
+                post_id = str(article.get("binance_post_id") or "").strip()
+                if not post_id:
+                    continue
+
+                account_name = article.get("published_by")
+                topic = article.get("topic")
+                stance = article.get("stance")
+                publish_price = article.get("publish_price")
+                publish_time = article.get("publish_time")
+
+                should_delete = False
+                delete_reason = None
+
+                # A. 逆向 20% 检测
+                if topic and stance in ("看多", "看空") and publish_price is not None:
+                    try:
+                        pub_p = float(publish_price)
+                        if pub_p > 0:
+                            latest_price = get_latest_crypto_price(topic)
+                            if latest_price is not None:
+                                cur_p = float(latest_price)
+                                price_change_pct = (cur_p - pub_p) / pub_p
+                                if stance == "看多" and price_change_pct <= -0.2:
+                                    should_delete = True
+                                    adverse_pct = abs(price_change_pct) * 100
+                                    delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 20%)"
+                                elif stance == "看空" and price_change_pct >= 0.2:
+                                    should_delete = True
+                                    adverse_pct = price_change_pct * 100
+                                    delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 20%)"
+                    except Exception as p_err:
                         logger.warning(
-                            f"[历史清理/身份缺失] 无法取得 squareUid，可能是登录失效"
-                            f" | 账号: 【{account_name}】 | 结果: 【跳过该账号】"
+                            "[历史清理/行情检测异常] 帖子: [%s] | 币种: [%s] | 异常: [%r]",
+                            post_id, topic, p_err,
+                        )
+
+                # B. 超时检测（未触发逆向时进行）
+                if not should_delete and publish_time is not None:
+                    try:
+                        pub_time_sec = _publish_time_seconds(publish_time)
+                        elapsed_seconds = now - pub_time_sec
+                        if elapsed_seconds >= MAX_REPLAY_DAYS * 24 * 3600:
+                            should_delete = True
+                            elapsed_days = elapsed_seconds / (24 * 3600)
+                            delete_reason = f"超时 (已发布 {elapsed_days:.2f} 天, 基准: {MAX_REPLAY_DAYS} 天)"
+                    except Exception as t_err:
+                        logger.warning(
+                            "[历史清理/时间转换异常] 帖子: [%s] | 发布时间: [%s] | 异常: [%r]",
+                            post_id, publish_time, t_err,
+                        )
+
+                # C. 执行删除并更新数据库
+                if should_delete:
+                    cred = credentials.get(account_name)
+                    if not cred:
+                        logger.warning(
+                            "[历史清理/无法删除] 对应账号凭证不可用，跳过本次处理 | 账号: [%s] | 帖子: [%s]",
+                            account_name, post_id,
                         )
                         continue
-                    # : 仅依赖 time_offset 获取最多 1000 条，不逐条核验日期，也不补充分页。
+
+                    try:
+                        success = delete_binance_square_content(
+                            content_id=post_id,
+                            cookies=cred["cookies"],
+                            csrf_token=cred["csrf_token"],
+                        )
+                        if success:
+                            deleted_post_ids.add(post_id)
+                            article["delete_time"] = time.time()
+                            article["delete_reason"] = delete_reason
+                            article_manager.upsert_articles([article])
+
+                            if delete_reason and delete_reason.startswith("逆向"):
+                                deleted_reverse += 1
+                            else:
+                                deleted_timeout += 1
+
+                            logger.info(
+                                "[历史清理/删除成功] 帖子: [%s] | 账号: [%s] | 原因: [%s]",
+                                post_id, account_name, delete_reason,
+                            )
+                        else:
+                            failed += 1
+                            logger.warning(
+                                "[历史清理/删除未确认] 接口未确认成功 | 帖子: [%s] | 账号: [%s]",
+                                post_id, account_name,
+                            )
+                    except Exception as exc:
+                        failed += 1
+                        logger.error(
+                            "[历史清理/删除请求异常] 帖子: [%s] | 账号: [%s] | 异常: [%r]",
+                            post_id, account_name, exc,
+                        )
+        except Exception as exc:
+            logger.error("[历史清理/巡检异常] 数据库帖子扫描或删除处理中断 | 异常: [%r]", exc)
+
+        # 3. 兜底清理远端历史回复与帖子（超过 MAX_REPLAY_DAYS）
+        try:
+            cutoff_ms = int((now - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
+            for account_name in ACCOUNTS:
+                cred = credentials.get(account_name)
+                if not cred:
+                    continue
+
+                user_info = cred.get("user_info") or {}
+                square_uid = user_info.get("squareUid")
+                if not square_uid:
+                    continue
+
+                try:
                     replies = fetch_binance_square_replies(
-                        target_square_uid=user_info.get("squareUid"),
-                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,filter_type="REPLY"
-                    )
+                        target_square_uid=square_uid,
+                        cookies=cred["cookies"], csrf_token=cred["csrf_token"],
+                        limit=1000, time_offset=cutoff_ms, filter_type="REPLY",
+                    ) or []
                     posts = fetch_binance_square_replies(
-                        target_square_uid=user_info.get("squareUid"),
-                        cookies=cookies, csrf_token=token, limit=1000, time_offset=cutoff_ms,
-                    )
+                        target_square_uid=square_uid,
+                        cookies=cred["cookies"], csrf_token=cred["csrf_token"],
+                        limit=1000, time_offset=cutoff_ms,
+                    ) or []
                     replies.extend(posts)
-                    if not replies:
-                        continue
-                    before_deleted, before_failed = deleted, failed
+
                     for item in replies:
                         raw_reply_id = item.get("reply_id")
                         if not raw_reply_id:
                             continue
                         reply_id = str(raw_reply_id)
+
+                        # 已在本轮被删除的直接跳过
+                        if reply_id in deleted_post_ids:
+                            continue
+
                         try:
                             success = delete_binance_square_content(
-                                content_id=reply_id, cookies=cookies, csrf_token=token
+                                content_id=reply_id,
+                                cookies=cred["cookies"],
+                                csrf_token=cred["csrf_token"],
                             )
                         except Exception as exc:
                             failed += 1
                             logger.error(
-                                f"[历史清理/请求异常] 删除回复异常，可能是网络或身份凭证失效"
-                                f" | 账号: 【{account_name}】 | 回复: 【{reply_id}】 | 异常: 【{exc!r}】"
-                                f" | 结果: 【继续处理其余回复】"
+                                "[历史清理/远端删除异常] 账号: [%s] | ID: [%s] | 异常: [%r]",
+                                account_name, reply_id, exc,
                             )
                             continue
+
                         if success:
-                            deleted += 1
-                            continue
-                        failed += 1
-                        logger.warning(
-                            f"[历史清理/删除失败] 接口未确认删除，可能是回复已不存在或权限不足"
-                            f" | 账号: 【{account_name}】 | 回复: 【{reply_id}】 | 结果: 【继续处理】"
-                        )
-                    logger.info(
-                        f"[历史清理/账号完成] 已处理接口返回的回复 | 账号: 【{account_name}】"
-                        f" | 删除成功: 【{deleted - before_deleted}】 | 删除失败: 【{failed - before_failed}】"
-                    )
+                            deleted_timeout += 1
+                            deleted_post_ids.add(reply_id)
+                            # 仅更新数据库中已有的帖子；非代码发送的帖子不维护数据库
+                            matched_articles = article_manager.find_articles(query={"binance_post_id": reply_id})
+                            if matched_articles:
+                                del_now = time.time()
+                                for matched in matched_articles:
+                                    matched["delete_time"] = del_now
+                                    matched["delete_reason"] = f"超时 (基准: {MAX_REPLAY_DAYS} 天)"
+                                article_manager.upsert_articles(matched_articles)
+                                logger.info("[历史清理/回写完成] 更新数据库已有帖子删除状态 | ID: [%s]", reply_id)
+                        else:
+                            failed += 1
                 except Exception as exc:
                     account_errors += 1
-                    logger.error(
-                        f"[历史清理/账号异常] 身份获取或回复处理失败，请检查账号会话及接口数据"
-                        f" | 账号目录: 【{browser_session_dir}】 | 异常: 【{exc!r}】 | 结果: 【继续其他账号】"
-                    )
+                    logger.error("[历史清理/远端拉取异常] 账号: [%s] | 异常: [%r]", account_name, exc)
         except Exception as exc:
-            logger.error(
-                f"[历史清理/本轮异常] 清理任务中断，请检查配置和接口数据"
-                f" | 异常: 【{exc!r}】 | 结果: 【本轮停止，下轮继续】"
-            )
+            logger.error("[历史清理/兜底本轮异常] 远端列表清理过程发生异常: [%r]", exc)
+
         logger.info(
-            f"[历史清理/本轮小结] 本轮处理结束 | 删除成功: 【{deleted}】 | 删除失败: 【{failed}】"
-            f" | 账号异常: 【{account_errors}】 | 耗时: 【{time.monotonic() - started:.2f} 秒】"
-            f" | 休眠: 【{DELETE_INTERVAL_SEC} 秒】"
+            "[历史清理/本轮小结] 耗时: [%.2f 秒] | 逆向删除: [%s] | 超时删除: [%s] "
+            "| 失败: [%s] | 账号异常: [%s] | 下次检查: [%s 秒后]",
+            time.monotonic() - started, deleted_reverse, deleted_timeout, failed,
+            account_errors, DELETE_INTERVAL_SEC,
         )
         time.sleep(DELETE_INTERVAL_SEC)
-
-
 
 if __name__ == "__main__":
 
@@ -1354,7 +1492,8 @@ if __name__ == "__main__":
         generate_analysis_articles,
         format_image_article,
         hudong,
-        auto_publish_articles
+        auto_publish_articles,
+        delete_old_post,  # 新增删除帖子的 task 线程
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
     for thread in threads:
