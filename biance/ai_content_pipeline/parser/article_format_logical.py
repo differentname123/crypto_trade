@@ -1322,6 +1322,7 @@ def delete_old_post():
 
                 should_delete = False
                 delete_reason = None
+                price_updated = False
 
                 # A. 逆向 20% 检测
                 if topic and stance in ("看多", "看空") and publish_price is not None:
@@ -1332,6 +1333,9 @@ def delete_old_post():
                             if latest_price is not None:
                                 cur_p = float(latest_price)
                                 price_change_pct = (cur_p - pub_p) / pub_p
+                                article["price_change_pct"] = round(price_change_pct, 4)
+                                price_updated = True
+
                                 if stance == "看多" and price_change_pct <= -0.2:
                                     should_delete = True
                                     adverse_pct = abs(price_change_pct) * 100
@@ -1362,6 +1366,7 @@ def delete_old_post():
                         )
 
                 # C. 执行删除并更新数据库
+                deleted_successfully = False
                 if should_delete:
                     cred = credentials.get(account_name)
                     if not cred:
@@ -1369,40 +1374,50 @@ def delete_old_post():
                             "[历史清理/无法删除] 对应账号凭证不可用，跳过本次处理 | 账号: [%s] | 帖子: [%s]",
                             account_name, post_id,
                         )
-                        continue
+                    else:
+                        try:
+                            success = delete_binance_square_content(
+                                content_id=post_id,
+                                cookies=cred["cookies"],
+                                csrf_token=cred["csrf_token"],
+                            )
+                            if success:
+                                deleted_successfully = True
+                                deleted_post_ids.add(post_id)
+                                article["delete_time"] = time.time()
+                                article["delete_reason"] = delete_reason
+                                article_manager.upsert_articles([article])
 
-                    try:
-                        success = delete_binance_square_content(
-                            content_id=post_id,
-                            cookies=cred["cookies"],
-                            csrf_token=cred["csrf_token"],
-                        )
-                        if success:
-                            deleted_post_ids.add(post_id)
-                            article["delete_time"] = time.time()
-                            article["delete_reason"] = delete_reason
-                            article_manager.upsert_articles([article])
+                                if delete_reason and delete_reason.startswith("逆向"):
+                                    deleted_reverse += 1
+                                else:
+                                    deleted_timeout += 1
 
-                            if delete_reason and delete_reason.startswith("逆向"):
-                                deleted_reverse += 1
+                                logger.info(
+                                    "[历史清理/删除成功] 帖子: [%s] | 账号: [%s] | 原因: [%s]",
+                                    post_id, account_name, delete_reason,
+                                )
                             else:
-                                deleted_timeout += 1
-
-                            logger.info(
-                                "[历史清理/删除成功] 帖子: [%s] | 账号: [%s] | 原因: [%s]",
-                                post_id, account_name, delete_reason,
-                            )
-                        else:
+                                failed += 1
+                                logger.warning(
+                                    "[历史清理/删除未确认] 接口未确认成功 | 帖子: [%s] | 账号: [%s]",
+                                    post_id, account_name,
+                                )
+                        except Exception as exc:
                             failed += 1
-                            logger.warning(
-                                "[历史清理/删除未确认] 接口未确认成功 | 帖子: [%s] | 账号: [%s]",
-                                post_id, account_name,
+                            logger.error(
+                                "[历史清理/删除请求异常] 帖子: [%s] | 账号: [%s] | 异常: [%r]",
+                                post_id, account_name, exc,
                             )
-                    except Exception as exc:
-                        failed += 1
-                        logger.error(
-                            "[历史清理/删除请求异常] 帖子: [%s] | 账号: [%s] | 异常: [%r]",
-                            post_id, account_name, exc,
+
+                # 未成功删除但计算了最新涨跌幅，同步更新数据库
+                if not deleted_successfully and price_updated:
+                    try:
+                        article_manager.upsert_articles([article])
+                    except Exception as u_err:
+                        logger.warning(
+                            "[历史清理/涨跌幅回写异常] 帖子: [%s] | 异常: [%r]",
+                            post_id, u_err,
                         )
         except Exception as exc:
             logger.error("[历史清理/巡检异常] 数据库帖子扫描或删除处理中断 | 异常: [%r]", exc)
