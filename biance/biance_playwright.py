@@ -153,44 +153,6 @@ class BusinessErrorException(Exception):
 #                            浏览器 / 通用底层工具
 # ==============================================================================
 
-def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True):
-    """统一的持久化上下文启动口，已修复 DevTools 快捷键失效问题"""
-    kwargs = {
-        "channel": "chrome",
-        "user_data_dir": user_data_dir,
-        "headless": False,
-        "args": args
-    }
-
-    # 🚀 核心修复 1：彻底关闭 Playwright 的内部视口模拟机制
-    if viewport:
-        kwargs["viewport"] = viewport
-    else:
-        # 必须显式传入 no_viewport=True，否则 Playwright 会默认 800x600 模拟并劫持输入
-        kwargs["no_viewport"] = True
-
-        # 🚀 核心修复 2：剔除那些会破坏 Chrome 原生快捷键的默认参数
-    ignored_args = []
-    if hide_automation:
-        ignored_args.append("--enable-automation")
-
-    # 恢复 Chrome 底层负责路由部分快捷键的组件
-    ignored_args.extend([
-        "--disable-extensions",
-        "--disable-default-apps",
-        "--disable-component-extensions-with-background-pages"
-    ])
-    kwargs["ignore_default_args"] = ignored_args
-
-    context = p.chromium.launch_persistent_context(**kwargs)
-
-    # 🚀 核心修复 3：主动赋予环境剪贴板读写权限，防止 Ctrl+C / Ctrl+V 被沙箱静默拦截
-    try:
-        context.grant_permissions(['clipboard-read', 'clipboard-write'])
-    except Exception as e:
-        logger.warning(f"[环境] 剪贴板权限授予失败，可能影响 F12 粘贴: {e}")
-
-    return context
 
 
 def clean_browser_cache(user_data_dir):
@@ -1717,8 +1679,46 @@ def login_and_save_session():
                 except Exception:
                     pass
 
+def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True, debug=False):
+    """统一的持久化上下文启动口，已修复 DevTools 快捷键失效问题"""
+    kwargs = {
+        "channel": "chrome",
+        "user_data_dir": user_data_dir,
+        "headless": not debug,
+        "args": args
+    }
 
-def get_auth_tokens_robust(user_data_dir):
+    # 🚀 核心修复 1：彻底关闭 Playwright 的内部视口模拟机制
+    if viewport:
+        kwargs["viewport"] = viewport
+    else:
+        # 必须显式传入 no_viewport=True，否则 Playwright 会默认 800x600 模拟并劫持输入
+        kwargs["no_viewport"] = True
+
+        # 🚀 核心修复 2：剔除那些会破坏 Chrome 原生快捷键的默认参数
+    ignored_args = []
+    if hide_automation:
+        ignored_args.append("--enable-automation")
+
+    # 恢复 Chrome 底层负责路由部分快捷键的组件
+    ignored_args.extend([
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-component-extensions-with-background-pages"
+    ])
+    kwargs["ignore_default_args"] = ignored_args
+
+    context = p.chromium.launch_persistent_context(**kwargs)
+
+    # 🚀 核心修复 3：主动赋予环境剪贴板读写权限，防止 Ctrl+C / Ctrl+V 被沙箱静默拦截
+    try:
+        context.grant_permissions(['clipboard-read', 'clipboard-write'])
+    except Exception as e:
+        logger.warning(f"[环境] 剪贴板权限授予失败，可能影响 F12 粘贴: {e}")
+
+    return context
+
+def get_auth_tokens_robust(user_data_dir, debug=False):
     """
     以真实浏览器请求为样本提取脱机 API 凭证，同时顺带提取 User Data。
     流程：Headed 打开广场作者页 → 拦截首个非 OPTIONS 的 `pgc/user/client` 请求 → 取其 csrftoken/cookie；
@@ -1745,6 +1745,7 @@ def get_auth_tokens_robust(user_data_dir):
                 args=['--disable-blink-features=AutomationControlled'],
                 viewport={'width': 1280, 'height': 720},
                 hide_automation=False,
+                debug=debug,
             )
             page = context.pages[0] if context.pages else context.new_page()
 
