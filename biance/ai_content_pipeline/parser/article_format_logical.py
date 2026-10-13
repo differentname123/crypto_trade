@@ -1271,7 +1271,7 @@ def delete_old_post():
     2. 对远端历史流进行兜底超时清理；仅当删除的帖子存在于数据库时才维护 delete_time 和 delete_reason。
     """
     article_manager = GeneratedArticleManager(gen_db_object())
-
+    time.sleep(120)
     while True:
         started = time.monotonic()
         deleted_reverse = deleted_timeout = failed = account_errors = 0
