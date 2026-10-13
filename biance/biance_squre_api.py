@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 
+import ccxt
 import requests
 
 from biance.biance_playwright import get_auth_tokens_robust
@@ -2190,6 +2191,108 @@ def fetch_binance_spot_hot_coins(currency="USD", session=None, max_retries=3):
 
     return []
 
+
+def get_latest_crypto_price(coin_name: str, proxy: str = "http://127.0.0.1:7890") -> float | None:
+    """
+    使用 ccxt 获取指定币种最新价格（优先查询U本位合约，查不到则降级查询现货）
+
+    :param coin_name: 币种名称/交易对，例如: "BTC", "$BTC", "BTC/USDT", "BTCUSDT", "PEPE"
+    :param proxy: HTTP代理地址，默认 "http://127.0.0.1:7890"，若传 None 或空串则直连
+    :return: 浮点型最新价格，若均查询不到则返回 None
+    """
+    if not coin_name or not isinstance(coin_name, str):
+        logger.warning("⚠️ [价格查询] 传入的币种名称无效")
+        return None
+
+    # 1. 清洗币种名称
+    clean_name = coin_name.replace('$', '').strip().upper()
+
+    # 2. 统一提取基础币 (base) 与计价币 (quote)
+    quote_candidates = ["USDT", "USDC", "FDUSD", "BUSD"]
+    base_coin = clean_name
+    specified_quote = None
+
+    if '/' in clean_name:
+        parts = clean_name.split('/')
+        base_coin, specified_quote = parts[0], parts[1]
+    elif ':' in clean_name:  # 兼容 ccxt 合约写法如 BTC/USDT:USDT
+        base_coin = clean_name.split(':')[0].split('/')[0]
+    else:
+        for q in quote_candidates:
+            if clean_name.endswith(q) and len(clean_name) > len(q):
+                base_coin = clean_name[:-len(q)]
+                specified_quote = q
+                break
+
+    # 3. 构造优先级尝试的计价币列表
+    quotes_to_try = [specified_quote] if specified_quote else ["USDT", "USDC"]
+
+    # 4. 配置 ccxt 基础参数（含代理）
+    exchange_config = {
+        'timeout': 10000,
+        'enableRateLimit': True,
+    }
+    if proxy:
+        exchange_config['proxies'] = {
+            'http': proxy,
+            'https': proxy
+        }
+
+    # ============================================================
+    # 阶段一：优先探测 U本位永续合约 (Swap / Future)
+    # ============================================================
+    try:
+        future_exchange = ccxt.binance({
+            **exchange_config,
+            'options': {'defaultType': 'future'}
+        })
+
+        for q in quotes_to_try:
+            # ccxt 合约标准格式通常为 BTC/USDT:USDT
+            future_symbols = [f"{base_coin}/{q}:{q}", f"{base_coin}/{q}"]
+            for sym in future_symbols:
+                try:
+                    ticker = future_exchange.fetch_ticker(sym)
+                    price = ticker.get('last') or ticker.get('close')
+                    if price:
+                        price = float(price)
+                        logger.info(f"✅ [价格查询-合约命中] {coin_name} -> 交易对: {sym} | 最新价: {price}")
+                        return price
+                except (ccxt.BadSymbol, ccxt.OrderBookEmpty):
+                    continue
+                except Exception as e:
+                    logger.debug(f"🔍 [价格查询] 合约探测 {sym} 失败: {e}")
+    except Exception as e:
+        logger.debug(f"🔍 [价格查询] 合约通道初始化或查询失败: {e}")
+
+    # ============================================================
+    # 阶段二：降级探测 现货 (Spot)
+    # ============================================================
+    try:
+        spot_exchange = ccxt.binance({
+            **exchange_config,
+            'options': {'defaultType': 'spot'}
+        })
+
+        for q in quotes_to_try:
+            sym = f"{base_coin}/{q}"
+            try:
+                ticker = spot_exchange.fetch_ticker(sym)
+                price = ticker.get('last') or ticker.get('close')
+                if price:
+                    price = float(price)
+                    logger.info(f"✅ [价格查询-现货命中] {coin_name} -> 交易对: {sym} | 最新价: {price}")
+                    return price
+            except (ccxt.BadSymbol, ccxt.OrderBookEmpty):
+                continue
+            except Exception as e:
+                logger.debug(f"🔍 [价格查询] 现货探测 {sym} 失败: {e}")
+    except Exception as e:
+        logger.debug(f"🔍 [价格查询] 现货通道初始化或查询失败: {e}")
+
+    logger.warning(f"❌ [价格查询失败] {coin_name} 合约与现货均未找到报价")
+    return None
+
 def fetch_binance_future_hot_coins(business_enum="USDT_FUTURES", session=None, max_retries=3):
     """
     获取币安合约热搜榜数据 (公开接口，无需登录)。
@@ -2268,6 +2371,10 @@ def fetch_binance_future_hot_coins(business_enum="USDT_FUTURES", session=None, m
     return []
 
 if __name__ == "__main__":
+    # 获取实时指定币价格
+    latest_price = get_latest_crypto_price("US")
+
+
     # # 获取热门标签
     # hot_topic = fetch_binance_hot_hashtags()
 

@@ -26,7 +26,7 @@ from app.ai_api.model_api import generate_content
 from biance.biance_playwright import create_binance_post, get_auth_tokens_robust, comment_on_binance_post
 from biance.biance_squre_api import (
     fetch_binance_feed, fetch_binance_future_hot_coins, fetch_binance_hot_hashtags,
-    fetch_binance_spot_hot_coins, like_and_bookmark,
+    fetch_binance_spot_hot_coins, like_and_bookmark, get_latest_crypto_price,
 )
 from common.common_utils import (
     get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
@@ -64,8 +64,6 @@ SHELF_LIFE_SECONDS = {
     "hours": 2 * 3600, "days": 24 * 3600, "weeks": 7 * 24 * 3600,
     "long": 15 * 24 * 3600, "unknown": 24 * 3600,
 }
-
-
 
 
 def _publish_time_seconds(value):
@@ -565,6 +563,7 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
         return False, "图片必须来自已采用素材，且存在真实来源映射"
     return True, ""
 
+
 def get_post_usage_counts(article_manager, source, post_ids):
     """统计已成功发布文章对原帖的引用次数；输入平台和原帖 ID 序列，返回 {post_id: 次数}。
     管理器返回含 post_id_list 的文章；同一篇文章内同帖只计一次。
@@ -670,9 +669,9 @@ def build_article_task(coin, stance, ev_list, article_manager):
     candidates = [
         item for item in ev_list
         if isinstance(item, dict) and isinstance(item.get("source_post_id"), (str, int))
-        and not isinstance(item.get("source_post_id"), bool)
-        and item["source_post_id"] not in ("", "UNKNOWN")
-        and isinstance(item.get("core_fact"), str) and item["core_fact"].strip()
+           and not isinstance(item.get("source_post_id"), bool)
+           and item["source_post_id"] not in ("", "UNKNOWN")
+           and isinstance(item.get("core_fact"), str) and item["core_fact"].strip()
     ]
     usage_counts = get_post_usage_counts(
         article_manager, BINANCE_SOURCE, list(dict.fromkeys(item["source_post_id"] for item in candidates)),
@@ -875,9 +874,9 @@ def _publish_articles_once(article_manager):
     articles = [
         article for article in candidates
         if isinstance(article.get("article_info", {}), dict)
-        and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
-        and article.get("publish_attempts", 0) < PUBLISH_MAX_ATTEMPTS
-        and (article.get("topic") or "").lower() in hot_coins
+           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 1
+           and article.get("publish_attempts", 0) < PUBLISH_MAX_ATTEMPTS
+           and (article.get("topic") or "").lower() in hot_coins
     ]
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
     logger.info(
@@ -898,7 +897,7 @@ def _publish_articles_once(article_manager):
         selected_index = next((
             index for index, article in enumerate(articles)
             if now - account_state["topic_publish_history"].get(article.get("topic", ""), 0)
-            >= ACCOUNT_TOPIC_COOLDOWN_SECONDS
+               >= ACCOUNT_TOPIC_COOLDOWN_SECONDS
         ), None)
         if selected_index is None:
             logger.debug("[发布/账号] 所有候选主题仍在冷却 | 账号: [%s]", account)
@@ -921,12 +920,13 @@ def _publish_articles_once(article_manager):
             stage, api_result = "调用发布接口", "未知"
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
-                chart_info={"coin": topic, "bridge": "USDT", "type": "future"},sentiment=stance,
+                chart_info={"coin": topic, "bridge": "USDT", "type": "future"}, sentiment=stance,
                 debug=False
 
             )
             post_id = str(post_id)
             api_result = "成功" if success else "失败"
+            latest_price = get_latest_crypto_price(topic)
             if success:
                 account_state["total_success"] += 1
                 account_state["last_publish_time"] = now
@@ -935,11 +935,15 @@ def _publish_articles_once(article_manager):
                 changes = {
                     "publish_status": "success", "published_by": account, "publish_time": now,
                     "binance_post_id": post_id, "publish_attempts": attempts,
+                    "publish_price": latest_price
                 }
             else:
                 error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
-                changes = {"publish_status": "failed", "last_error": error, "publish_attempts": attempts}
+                changes = {"publish_status": "failed", "last_error": error, "publish_attempts": attempts,
+                           "publish_price": latest_price
+
+                           }
             # : 保留先文件后数据库的非事务写入；接口抛异常不累计次数，回写失败可能导致重复发布。
             stage = "写入账号状态文件"
             save_json(STATE_FILE, state)
@@ -978,7 +982,6 @@ def auto_publish_articles():
             )
         finally:
             time.sleep(PUBLISH_POLL_SECONDS)
-
 
 
 def build_search_text(post):
@@ -1083,6 +1086,7 @@ def _run_task(task):
         )
         raise
 
+
 def interact_comment(god_comments, other_account_list, post_id, stance):
     interact_comment_info = {}
     # 将 other_account_list 打乱顺序
@@ -1095,7 +1099,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance):
             error, success, comment_id = comment_on_binance_post(
                 post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
                 comment=comment_text,
-                user_data_dir=user_data_dir,sentiment=stance,
+                user_data_dir=user_data_dir, sentiment=stance,
                 # debug=True
             )
             comment_id = str(comment_id) if comment_id else ""
@@ -1174,7 +1178,6 @@ def _hudong_once(article_manager):
         comment_interact_info = interact_comment(god_comments, other_account_list, post_id, stance)
         article["comment_interact_info"] = comment_interact_info
 
-
         article["interacted"], article["interaction_time"] = True, now.timestamp()
     try:
         article_manager.upsert_articles(pending)
@@ -1236,6 +1239,7 @@ def clean_article_records(raw_records):
         cleaned_records.append(cleaned_item)
 
     return cleaned_records
+
 
 def get_need_check_article_info():
     """
