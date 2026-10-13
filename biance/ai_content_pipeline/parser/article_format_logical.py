@@ -1342,10 +1342,10 @@ def delete_old_post():
                                     should_delete = True
                                     adverse_pct = abs(price_change_pct) * 100
                                     delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 20%)"
-                                elif stance == "看空" and price_change_pct >= 0.2:
+                                elif stance == "看空" and price_change_pct >= 0.5:
                                     should_delete = True
                                     adverse_pct = price_change_pct * 100
-                                    delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 20%)"
+                                    delete_reason = f"逆向 {adverse_pct:.2f}% (基准: 50%)"
                     except Exception as p_err:
                         logger.warning(
                             "[历史清理/行情检测异常] 帖子: [%s] | 币种: [%s] | 异常: [%r]",
