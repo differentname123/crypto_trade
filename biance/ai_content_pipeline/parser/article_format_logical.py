@@ -1272,6 +1272,8 @@ def delete_old_post():
     """
     article_manager = GeneratedArticleManager(gen_db_object())
     time.sleep(120)
+    beijing_tz = timezone(timedelta(hours=8))
+
     while True:
         started = time.monotonic()
         deleted_reverse = deleted_timeout = failed = account_errors = 0
@@ -1386,6 +1388,7 @@ def delete_old_post():
                                 deleted_post_ids.add(post_id)
                                 article["delete_time"] = time.time()
                                 article["delete_reason"] = delete_reason
+                                article["check_time"] = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
                                 article_manager.upsert_articles([article])
 
                                 if delete_reason and delete_reason.startswith("逆向"):
@@ -1413,6 +1416,7 @@ def delete_old_post():
                 # 未成功删除但计算了最新涨跌幅，同步更新数据库
                 if not deleted_successfully and price_updated:
                     try:
+                        article["check_time"] = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
                         article_manager.upsert_articles([article])
                     except Exception as u_err:
                         logger.warning(
@@ -1479,9 +1483,11 @@ def delete_old_post():
                             matched_articles = article_manager.find_articles(query={"binance_post_id": reply_id})
                             if matched_articles:
                                 del_now = time.time()
+                                bj_now = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
                                 for matched in matched_articles:
                                     matched["delete_time"] = del_now
                                     matched["delete_reason"] = f"超时 (基准: {MAX_REPLAY_DAYS} 天)"
+                                    matched["check_time"] = bj_now
                                 article_manager.upsert_articles(matched_articles)
                                 logger.info("[历史清理/回写完成] 更新数据库已有帖子删除状态 | ID: [%s]", reply_id)
                         else:
@@ -1499,7 +1505,6 @@ def delete_old_post():
             account_errors, DELETE_INTERVAL_SEC,
         )
         time.sleep(DELETE_INTERVAL_SEC)
-
 
 def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
     """
