@@ -26,7 +26,10 @@ from PIL import Image, UnidentifiedImageError
 # 大模型视觉接口支持的标准光栅图片格式
 ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
 import ccxt
-
+from common.common_utils import (
+    get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
+)
+logger = setup_logger(app_name="media_format")
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import (
     create_binance_post, get_auth_tokens_robust, comment_on_binance_post,
@@ -36,13 +39,11 @@ from biance.biance_squre_api import (
     fetch_binance_spot_hot_coins, like_and_bookmark, get_latest_crypto_price,
     fetch_binance_square_replies, delete_binance_square_content,
 )
-from common.common_utils import (
-    get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
-)
+
+
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
-logger = setup_logger(app_name="media_format")
 prompt_version = "1014-2"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
