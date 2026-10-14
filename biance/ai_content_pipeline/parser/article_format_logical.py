@@ -1,12 +1,13 @@
 """
-[功能摘要] 并行采集帖子并提取论据、生成分析文章、发布币安广场图文及执行点赞收藏。
-[输入数据] MongoDB 原帖含 post_id/publish_time/content.text_content/media.local_mapping；
+[功能摘要] 并行采集帖子、50帖批量初筛、提取有效论据、生成分析文章、发布币安广场图文、执行点赞收藏评论及逆向/超时删帖。
+[输入数据] MongoDB 原帖含 post_id/publish_time/content.text_content/media.local_mapping/pre_screen/logic_mul；
 文章含 topic/stance/article_info；另读取提示词、交易币种、浏览器配置及账号状态文件。
-[数据流转/交互] 热榜与行情 → 采集入库 → 媒体编号 → 模型提取 evidences → 回写 logic_mul；
+[数据流转/交互] 热榜与行情 → 采集入库 → 50帖批量初筛回写 pre_screen → 通过初筛帖媒体编号 → 模型提取 evidences → 回写 logic_mul；
 论据按时效/币种/立场分组 → 按已发布引用次数选材 → 模型生成/校验 → 文章入库；
 近 6 小时含图文章 → 评分/冷却筛选 → 浏览器发布 → 账号文件和数据库回写；
-近 24 小时已发布文章 → 获取账号凭证 → 点赞收藏 → 回写互动标记。
-[输出数据] 帖子论据、生成文章、远端发布与互动结果，以及本地账号状态和分阶段日志。
+近 24 小时已发布文章 → 获取账号凭证 → 点赞收藏评论 → 回写互动标记；
+已发布文章每小时巡检 → 逆向亏损达标或超时7天 → 自动删帖并回写状态。
+[输出数据] 帖子初筛标记、帖子论据、生成文章、远端发布与互动结果，以及本地账号状态和分阶段日志。
 """
 
 import json
@@ -36,16 +37,22 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
 logger = setup_logger(app_name="media_format")
-prompt_version = "1014-1"
+prompt_version = "1014-2"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
 MAX_MEDIA_COUNT = 10
 MAX_CONCURRENCY = 20
 LLM_MAX_RETRIES = 3
+
+# 提示词文件路径与批量初筛配置
+PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
-ARTICLE_MATERIAL_LIMIT = 20
+PRE_SCREEN_BATCH_SIZE = 50
+PRE_SCREEN_CONCURRENCY = 5
+
+ARTICLE_MATERIAL_LIMIT = 10
 ARTICLE_MIN_MATERIALS = 5
 ARTICLE_POST_USAGE_LIMIT = 2
 ARTICLE_MAX_CHARS = 260
@@ -62,8 +69,11 @@ PUBLISH_POLL_SECONDS = 600
 INTERACTION_INTERVAL_SECONDS = 1200
 MEDIA_PATTERN = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
 SHELF_LIFE_SECONDS = {
-    "hours": 2 * 3600, "days": 24 * 3600, "weeks": 7 * 24 * 3600,
-    "long": 15 * 24 * 3600, "unknown": 24 * 3600,
+    "hours": 2 * 3600,
+    "days": 24 * 3600,
+    "weeks": 7 * 24 * 3600,
+    "long": 15 * 24 * 3600,
+    "unknown": 24 * 3600,
 }
 
 
@@ -91,9 +101,10 @@ def _key_error(data, expected_keys, label):
     return ""
 
 
-def is_need_formatting(post):
-    """判断是否需提取论据；post 含 logic_mul、media、publish_time，返回布尔值。"""
-    if post.get("logic_mul"):
+def _is_valid_raw_post(post):
+    """公共基础物理条件校验：非视频、本地媒体映射完整且少于上限、发布时间在有效期内。"""
+    post_id = post.get("post_id")
+    if post_id is None or str(post_id).strip() == "":
         return False
     media = post.get("media") or {}
     video_duration = media.get("video_duration")
@@ -104,12 +115,187 @@ def is_need_formatting(post):
     if any(not path or not os.path.isfile(path) for path in local_paths):
         return False
     text = (post.get("content") or {}).get("text_content") or ""
+    if not text.strip():
+        return False
     if any(not local_mapping.get(match.group(2)) for match in MEDIA_PATTERN.finditer(text)):
         return False
     if len(local_paths) >= MAX_MEDIA_COUNT:
         return False
     publish_time = _publish_time_seconds(post.get("publish_time", 0))
     return (time.time() - publish_time) / 3600 <= POST_MAX_AGE_HOURS
+
+
+def is_need_pre_screening(post):
+    """判断是否需要进行批量初筛：未提取过 logic_mul、未经过当前版本 pre_screen、且满足基础帖子条件。"""
+    if post.get("logic_mul"):
+        return False
+    pre_screen = post.get("pre_screen")
+    if isinstance(pre_screen, dict) and pre_screen.get("prompt_version") == prompt_version:
+        if isinstance(pre_screen.get("no_evidence"), bool):
+            return False
+    return _is_valid_raw_post(post)
+
+
+def is_need_formatting(post):
+    """判断是否需多模态提取论据：未提取过 logic_mul、已通过初筛（no_evidence 为 False）、且满足基础条件。"""
+    if post.get("logic_mul"):
+        return False
+    pre_screen = post.get("pre_screen")
+    if not isinstance(pre_screen, dict) or pre_screen.get("prompt_version") != prompt_version:
+        return False
+    if pre_screen.get("no_evidence") is not False:
+        return False
+    return _is_valid_raw_post(post)
+
+
+def build_pre_screen_item(post):
+    """将单篇原帖转换为初筛输入格式：{"post_id": "...", "text_content": "...", "images": ["image1", ...]}。"""
+    raw_text = (post.get("content") or {}).get("text_content") or ""
+    image_count = sum(1 for match in MEDIA_PATTERN.finditer(raw_text) if match.group(1) != "视频")
+    # 剥离媒体占位符 URL 并压缩多余空白，降低输入 Token 消耗
+    clean_text = MEDIA_PATTERN.sub("", raw_text).strip()
+    return {
+        "post_id": str(post.get("post_id", "")).strip(),
+        "text_content": clean_text,
+        "images": [f"image{i}" for i in range(1, image_count + 1)],
+    }
+
+
+def check_pre_screen_info(json_data, expected_post_ids):
+    """校验批量初筛返回结果：顶层为以 post_id 为 key 的字典，每个值为 {no_evidence: bool, reason: str}。"""
+    if not isinstance(json_data, dict):
+        return False, "初筛返回最外层必须是字典"
+    expected_set = {str(pid) for pid in expected_post_ids}
+    actual_set = {str(k) for k in json_data.keys()}
+    missing = expected_set - actual_set
+    if missing:
+        return False, f"初筛返回缺少 post_id: {', '.join(sorted(missing)[:10])}"
+
+    item_keys = {"no_evidence", "reason"}
+    for pid in expected_set:
+        item = json_data.get(pid)
+        label = f"post[{pid}]"
+        error = _key_error(item, item_keys, label)
+        if error:
+            return False, error
+        if not isinstance(item["no_evidence"], bool):
+            return False, f"{label}.no_evidence 必须是布尔值"
+        if not isinstance(item["reason"], str) or not item["reason"].strip():
+            return False, f"{label}.reason 必须是非空字符串"
+    return True, ""
+
+
+def gen_pre_screen_batch_info(batch_posts, prompt_template):
+    """对单批次（最多 50 条）帖子调用大模型进行初筛，不上传图片文件，返回 {post_id: {no_evidence, reason}}。"""
+    batch_items = [build_pre_screen_item(post) for post in batch_posts]
+    expected_ids = [item["post_id"] for item in batch_items]
+    full_prompt = f"{prompt_template}\n{json.dumps(batch_items, ensure_ascii=False)}"
+
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        raw_response = ""
+        try:
+            result = generate_content(prompt=full_prompt, preset_model_group="low")
+            raw_response = result.get("content", "")
+            screen_info = string_to_object(raw_response)
+            valid, error = check_pre_screen_info(screen_info, expected_ids)
+            if not valid:
+                raise ValueError(error)
+            return {str(k): v for k, v in screen_info.items()}
+        except Exception as exc:
+            exhausted = attempt == LLM_MAX_RETRIES
+            delay = 0 if exhausted else 2 ** attempt
+            log = logger.error if exhausted else logger.warning
+            log(
+                "%s[初筛/批次] 模型调用或数据校验失败 | 批次大小: [%s] | 首帖ID: [%s] | 尝试: [%s/%s] "
+                "| 原因: [%s] | 响应摘要: [%s] | 后续: [%s]",
+                "❌ " if exhausted else "", len(batch_posts),
+                expected_ids[0] if expected_ids else "NONE",
+                attempt, LLM_MAX_RETRIES, exc, repr(raw_response)[:500],
+                "跳过本批，等待下轮扫描" if exhausted else f"{delay} 秒后重试",
+                exc_info=exhausted,
+            )
+            if exhausted:
+                return {}
+            time.sleep(delay)
+    return {}
+
+
+def process_and_save_pre_screen_batch(batch_posts, post_manager, prompt_template):
+    """执行单批次 50 帖初筛并将结果回写至每个 post['pre_screen']，返回 (通过数, 淘汰数)。"""
+    started = time.monotonic()
+    screen_map = gen_pre_screen_batch_info(batch_posts, prompt_template)
+    if not screen_map:
+        return 0, 0
+
+    updated_posts = []
+    passed_count = filtered_count = 0
+    for post in batch_posts:
+        pid = str(post.get("post_id", "")).strip()
+        res = screen_map.get(pid)
+        if not res:
+            continue
+        no_evidence = bool(res["no_evidence"])
+        post["pre_screen"] = {
+            "no_evidence": no_evidence,
+            "reason": res["reason"].strip(),
+            "prompt_version": prompt_version,
+            "screen_time": time.time(),
+        }
+        updated_posts.append(post)
+        if no_evidence:
+            filtered_count += 1
+        else:
+            passed_count += 1
+
+    if updated_posts:
+        post_manager.upsert_posts(updated_posts)
+
+    logger.info(
+        "[初筛/回写] 批次初筛完成并落库 | 批次总数: [%s] | 保留(有论据可能): [%s] | 淘汰(大概率无论据): [%s] | 耗时: [%.2f 秒]",
+        len(updated_posts), passed_count, filtered_count, time.monotonic() - started,
+    )
+    return passed_count, filtered_count
+
+
+def batch_pre_screen_posts(posts, post_manager):
+    """对所有待初筛帖子按 50 条一组进行批量初筛并更新数据库。"""
+    need_screen_posts = [post for post in posts if is_need_pre_screening(post)]
+    if not need_screen_posts:
+        logger.info("[初筛/计划] 当前无待初筛新帖")
+        return
+
+    prompt_template = read_file_to_str(PRE_SCREEN_PROMPT_FILE_PATH)
+    if not isinstance(prompt_template, str) or not prompt_template.strip():
+        raise ValueError(f"初筛提示词为空或读取失败: {PRE_SCREEN_PROMPT_FILE_PATH}")
+
+    batches = [
+        need_screen_posts[i:i + PRE_SCREEN_BATCH_SIZE]
+        for i in range(0, len(need_screen_posts), PRE_SCREEN_BATCH_SIZE)
+    ]
+    logger.info(
+        "[初筛/计划] 待初筛帖子分组完成 | 待初筛总数: [%s] | 每批数量: [%s] | 批次数: [%s] | 并发上限: [%s]",
+        len(need_screen_posts), PRE_SCREEN_BATCH_SIZE, len(batches), min(PRE_SCREEN_CONCURRENCY, len(batches)),
+    )
+
+    started = time.monotonic()
+    total_passed = total_filtered = 0
+    with ThreadPoolExecutor(max_workers=PRE_SCREEN_CONCURRENCY) as executor:
+        futures = [
+            executor.submit(process_and_save_pre_screen_batch, batch, post_manager, prompt_template)
+            for batch in batches
+        ]
+        for future in as_completed(futures):
+            try:
+                passed, filtered = future.result()
+                total_passed += passed
+                total_filtered += filtered
+            except Exception:
+                logger.exception("❌ [初筛/执行] 单个初筛批次执行异常 | 后续: [继续其他批次]")
+
+    logger.info(
+        "[初筛/汇总] 本轮批量初筛全部结束 | 扫描待初筛: [%s] | 成功保留: [%s] | 成功淘汰: [%s] | 总耗时: [%.2f 秒]",
+        len(need_screen_posts), total_passed, total_filtered, time.monotonic() - started,
+    )
 
 
 def normalize_post_media(post_data):
@@ -145,7 +331,6 @@ def check_format_info(json_data, placeholders):
     if not isinstance(json_data["evidences"], list):
         return False, "evidences 必须是列表"
 
-    # 更新字段集合：废弃 coins，改为 target_coin，新增 raw_hook
     evidence_keys = {
         "target_coin", "stance", "dimension", "core_fact",
         "logic_link", "raw_hook", "impact_weight", "shelf_life", "images", "impact_reason"
@@ -164,14 +349,12 @@ def check_format_info(json_data, placeholders):
         if error:
             return False, error
 
-        # 标的校验：单一主语、非空、必须大写 (宏观为 MARKET)
         target_coin = evidence["target_coin"]
         if not isinstance(target_coin, str) or not target_coin.strip():
             return False, f"{label}.target_coin 必须是非空字符串"
         if target_coin != target_coin.upper():
             return False, f"{label}.target_coin 必须为大写英文字符串: {target_coin!r}"
 
-        # 文本事实与逻辑断言字段校验
         if not isinstance(evidence["core_fact"], str) or not evidence["core_fact"].strip():
             return False, f"{label}.core_fact 必须是非空字符串"
         if not isinstance(evidence["logic_link"], str):
@@ -179,7 +362,6 @@ def check_format_info(json_data, placeholders):
         if not isinstance(evidence["raw_hook"], str):
             return False, f"{label}.raw_hook 必须是字符串（允许为空字符串）"
 
-        # 普通人开仓冲动权重 (1~5 整数，防止 bool 穿透)
         weight = evidence["impact_weight"]
         if not isinstance(weight, int) or isinstance(weight, bool) or not 1 <= weight <= 5:
             return False, f"{label}.impact_weight 必须是 1—5 的整数，不能是布尔值"
@@ -208,6 +390,7 @@ def check_format_info(json_data, placeholders):
             if not usable and not reason.strip():
                 return False, f"{image_label} 不可用时必须说明 unusable_reason"
     return True, ""
+
 
 def gen_media_format_info(post):
     """提取并校验论据；post 含 post_id/content.text_content/media.local_mapping。
@@ -267,6 +450,7 @@ def process_and_save_single_post(post, post_manager):
             "| 排查: [检查帖子字段、提示词和媒体路径、数据库连接]", post_id,
         )
 
+
 def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     """按币种/排序采集后统一回写；管理器接收 [帖子字典]，其余为币种序列和接口参数。
     保留接口调用顺序与重复帖子，返回 None。
@@ -298,7 +482,6 @@ def fetch_hot_post(post_manager, token_list):
 
 def get_top_k_movers(top_k=5):
     """按合约涨跌幅取两端；返回 {top_gainers/top_losers: [{symbol, percentage}]}。"""
-    # : ccxt 版本及资源释放契约未给出，保留原客户端用法；需在依赖侧确认会话回收。
     exchange = ccxt.binance({
         "enableRateLimit": True,
         "options": {"defaultType": "future"},
@@ -311,7 +494,6 @@ def get_top_k_movers(top_k=5):
          if symbol.endswith(":USDT") and ticker.get("percentage") is not None),
         key=lambda item: item["percentage"], reverse=True,
     )
-    # : 保留原切片语义；top_k=0 时跌幅榜会包含全部条目，暂不新增参数限制。
     return {"top_gainers": ranked[:top_k], "top_losers": ranked[-top_k:][::-1]}
 
 
@@ -330,7 +512,7 @@ def get_hot_coin():
 
 
 def format_image_article():
-    """轮询采集、筛选及并发提取；批次异常沿用 60 秒后重试的策略。"""
+    """轮询采集、50帖批量初筛、筛选及并发多模态提取；批次异常沿用 60 秒后重试的策略。"""
     while True:
         try:
             started = time.monotonic()
@@ -341,11 +523,15 @@ def format_image_article():
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
                 time.sleep(60)
                 continue
-            # : 保留前置筛选中任一坏帖中断本轮的行为，未改成逐帖跳过。
+
+            # 第一步：对尚未初筛的帖子按 50 条一组进行批量初筛，并回写 post['pre_screen']
+            batch_pre_screen_posts(posts, post_manager)
+
+            # 第二步：筛选出通过初筛（pre_screen.no_evidence == False）且未提取 logic_mul 的帖子进行逐帖多模态提取
             valid_posts = [post for post in posts if is_need_formatting(post)]
             logger.info(
-                "[帖子/计划] 前置筛选完成 | 扫描: [%s] | 待提取: [%s] | 跳过: [%s] "
-                "| 线程上限: [%s] | 规则: [无论据、非视频、本地媒体少于 %s 个、%s 小时内]",
+                "[帖子/计划] 精提前置筛选完成 | 扫描: [%s] | 通过初筛待提取: [%s] | 跳过: [%s] "
+                "| 线程上限: [%s] | 规则: [初筛通过、无论据、非视频、本地媒体少于 %s 个、%s 小时内]",
                 len(posts), len(valid_posts), len(posts) - len(valid_posts),
                 min(MAX_CONCURRENCY, len(valid_posts)), MAX_MEDIA_COUNT, POST_MAX_AGE_HOURS,
             )
@@ -355,10 +541,10 @@ def format_image_article():
                                for post in valid_posts]
                     for future in as_completed(futures):
                         future.result()
-            # : 原查询未分页；满额缩短等待不能保证后续记录被扫描。
+
             delay = 5 if len(posts) >= POST_QUERY_LIMIT else 3600
             logger.info(
-                "[帖子/完成] 本批线程已结束 | 扫描: [%s] | 已提交: [%s] | 耗时: [%.2f 秒] "
+                "[帖子/完成] 本批线程已结束 | 扫描: [%s] | 已提交精提: [%s] | 耗时: [%.2f 秒] "
                 "| 下次扫描: [%s 秒后] | 单帖结果: [见帖子日志]",
                 len(posts), len(valid_posts), time.monotonic() - started, delay,
             )
@@ -366,22 +552,26 @@ def format_image_article():
         except Exception:
             logger.exception(
                 "❌ [帖子/轮询] 本轮中断 | 后续: [60 秒后重新初始化并重试] "
-                "| 排查: [检查热榜/采集服务、代理、帖子字段及数据库]"
+                "| 排查: [检查热榜/采集服务、初筛提示词、代理、帖子字段及数据库]"
             )
             time.sleep(60)
 
 
 def clear_all_media_format_batch():
-    """手动清理查询范围内的 logic_mul；无入参，非 None 字段置空后批量回写。"""
+    """手动清理查询范围内的 logic_mul 与 pre_screen；无入参，非 None 字段置空后批量回写。"""
     post_manager = UniversalPostManager(gen_db_object())
     posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
-    updates = [post for post in posts if post.get("logic_mul") is not None]
+    updates = [
+        post for post in posts
+        if post.get("logic_mul") is not None or post.get("pre_screen") is not None
+    ]
     for post in updates:
         post["logic_mul"] = None
+        post["pre_screen"] = None
     if updates:
         post_manager.upsert_posts(updates)
     logger.info(
-        "[数据/清理] logic_mul 清理完成 | 扫描: [%s] | 更新: [%s]",
+        "[数据/清理] logic_mul 与 pre_screen 清理完成 | 扫描: [%s] | 更新: [%s]",
         len(posts), len(updates),
     )
 
@@ -416,7 +606,7 @@ def transform_mlus(mlu_list):
             "id": f"M{index}",
             "fact": evidence.get("core_fact", ""),
             "underlying_logic": evidence.get("logic_link", ""),
-            "raw_hook": evidence.get("raw_hook", ""),  # 将提取到的高感染力金句透传给下游文章生成模型
+            "raw_hook": evidence.get("raw_hook", ""),
             "visual_evidence": None,
         }
         materials.append(material)
@@ -462,6 +652,7 @@ def transform_mlus(mlu_list):
         material["visual_evidence"] = visual_items[0] if len(visual_items) == 1 else visual_items
     return materials, image_mapping
 
+
 def extract_and_group_valid_evidences():
     """按时效/币种/立场筛选并按权重排序，返回 {coin: {stance: [论据]}}。
     论据追加 source_post_id/publish_time/source_text_content/source_image_mapping。
@@ -474,7 +665,6 @@ def extract_and_group_valid_evidences():
     grouped = defaultdict(lambda: defaultdict(list))
     now, invalid_times = time.time(), 0
     for post in posts:
-        # 过滤得到当前 提示词版本的
         prompt_ver = (post.get("logic_mul") or {}).get("prompt_version")
         if prompt_ver != prompt_version:
             continue
@@ -493,11 +683,10 @@ def extract_and_group_valid_evidences():
         source_mapping = build_source_image_mapping(post)
         for evidence in logic_mul["evidences"]:
             images = evidence.get("images", [])
-            if len(images) < 1 or any(image.get("usable") is not True for image in images):
+            if len(images) < 0 or any(image.get("usable") is not True for image in images):
                 continue
             duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
 
-            # 适配 target_coin (兼容旧版 coins 列表兜底)
             target_coin = str(evidence.get("target_coin") or "").strip().upper()
             if not target_coin and isinstance(evidence.get("coins"), list):
                 candidate_coins = [str(c).strip().upper() for c in evidence["coins"] if str(c).strip()]
@@ -520,7 +709,6 @@ def extract_and_group_valid_evidences():
     for stances in grouped.values():
         for evidences in stances.values():
             evidences.sort(key=lambda item: item.get("impact_weight", 0), reverse=True)
-    # JSON 往返保留原序列化约束，并让跨组论据互不共享可变对象。
     result = json.loads(json.dumps(grouped))
     log = logger.warning if invalid_times else logger.info
     log(
@@ -530,6 +718,7 @@ def extract_and_group_valid_evidences():
         invalid_times, time.monotonic() - started,
     )
     return result
+
 
 def check_article_info(article_info, materials, image_mapping, max_chars):
     """校验文章与证据链；article_info 必须含下方七字段。
@@ -566,16 +755,16 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
     if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
         return False, "正文不能包含图片或视频占位符"
     if type(article_info["score"]) not in (int, float) or not 0 <= article_info["score"] <= 10:
-        return False, "score 必须是 0—10 的浮点数，不能是整数或布尔值"
+        return False, "score 必须是 0—10 的数值，不能是布尔值"
     if article_info["reason"] is not None:
         return False, "ok 的 reason 必须为 null"
-    if not 1 <= len(article_info["god_comments"]):
-        return False, "ok 状态下 god_comments 必须包含 1 条神评"
+    if len(article_info["god_comments"]) < 1:
+        return False, "ok 状态下 god_comments 必须至少包含 1 条神评"
 
     material_by_id = {item["id"]: item for item in materials}
     used_ids, selected_images = article_info["used_material_ids"], article_info["image_placeholders"]
-    if not 0 <= len(used_ids) or any(item not in material_by_id for item in used_ids):
-        return False, "used_material_ids 必须引用实际存在的 3 条素材"
+    if len(used_ids) < 1 or any(item not in material_by_id for item in used_ids):
+        return False, "used_material_ids 必须引用实际存在的素材且不能为空"
     if len(selected_images) > 3:
         return False, "最多使用 3 张图片"
     allowed_images = set()
@@ -687,7 +876,6 @@ def build_article_task(coin, stance, ev_list, article_manager):
         "task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS},
         "materials": [],
     }
-    # : 此字段仅保留历史记录契约；实际调用 medium 模型组，不能据此认定实际模型。
     model_name = "gemini-3.1-pro-preview"
     record = {
         "source": BINANCE_SOURCE, "topic": coin, "stance": stance, "status": "processing",
@@ -816,7 +1004,6 @@ def generate_analysis_articles_once():
     grouped = extract_and_group_valid_evidences()
     groups = [(coin, stance, items) for coin, stances in grouped.items() for stance, items in stances.items()]
     article_manager = GeneratedArticleManager(gen_db_object())
-    # : 仍在执行前构建全部任务；未为未发布文章或本轮并发任务预占原帖引用次数。
     tasks = [build_article_task(coin, stance, items, article_manager)
              for coin, stance, items in groups for _ in range(ARTICLE_VARIANTS)]
     local_skips = sum(bool(task.get("is_skip")) for task in tasks)
@@ -870,7 +1057,6 @@ def generate_analysis_articles():
 
 def add_hot_topic_to_article(text, topic, tag_count=2):
     """追加热门话题和币种标签，返回新正文；text/topic 为字符串。"""
-    # : 保留 tag_count 未参与选择、仅取首个热话题的规则；标签不去重、不重新限长。
     hashtags = [item["hashtag"] for item in fetch_binance_hot_hashtags()]
     tags = hashtags[:1] + [f"#{topic}", f"${topic} "]
     hot_coins = fetch_binance_future_hot_coins()
@@ -1009,11 +1195,11 @@ def _publish_articles_once(article_manager):
 
     # 3. 逐层过滤并统计每个类别过滤掉的文章数量
     filter_stats = {
-        "prompt_version_mismatch": 0,  # 提示词版本不符
-        "invalid_article_info": 0,     # article_info 结构异常或图片占位符非法
-        "exceed_max_attempts": 0,      # 发布尝试次数达到上限
-        "not_hot_coin": 0,             # 主题不在当前热门币种列表内
-        "duplicate_image": 0,          # 使用了最近 6 小时内已发布成功帖子的图片
+        "prompt_version_mismatch": 0,
+        "invalid_article_info": 0,
+        "exceed_max_attempts": 0,
+        "not_hot_coin": 0,
+        "duplicate_image": 0,
     }
     articles = []
 
@@ -1074,7 +1260,6 @@ def _publish_articles_once(article_manager):
             logger.debug("[发布/账号] 仍在冷却 | 账号: [%s] | 剩余: [%s 秒]", account, int(remaining))
             continue
 
-        # 挑选满足同账号同主题冷却、且未与本轮前序已发布文章发生图片冲突的候选文章
         selected_index = None
         for index, cand in enumerate(articles):
             if now - account_state["topic_publish_history"].get(cand.get("topic", ""), 0) < ACCOUNT_TOPIC_COOLDOWN_SECONDS:
@@ -1108,7 +1293,6 @@ def _publish_articles_once(article_manager):
                     flags=re.IGNORECASE,
                 )
             text = add_hot_topic_to_article(text, topic) + "\n\n\n\n\n\n👇"
-            # 修复原逻辑覆盖问题：基于已追加标签的 text 补充开头 $topic，而非重置为 info.get('text', '')
             if topic and not text.startswith(f"${topic}"):
                 text = f"${topic} {text}"
 
@@ -1135,7 +1319,6 @@ def _publish_articles_once(article_manager):
                     "binance_post_id": post_id, "publish_attempts": attempts,
                     "publish_price": latest_price,
                 }
-                # 实时将本篇新发布成功的图片加入已用集合，防止同轮后续账号重复使用
                 new_img_addrs, _ = _extract_article_images(article)
                 used_image_addrs.update(new_img_addrs)
             else:
@@ -1170,7 +1353,6 @@ def _publish_articles_once(article_manager):
 def auto_publish_articles():
     """发布后台任务：独立管理器，每轮结束后等 600 秒。"""
     article_manager = GeneratedArticleManager(gen_db_object())
-    # time.sleep(60)
     while True:
         try:
             _publish_articles_once(article_manager)
@@ -1182,6 +1364,7 @@ def auto_publish_articles():
             )
         finally:
             time.sleep(PUBLISH_POLL_SECONDS)
+
 
 def build_search_text(post):
     """生成搜索文本；post.content 含 text_content/mentioned_coins。
@@ -1288,18 +1471,15 @@ def _run_task(task):
 
 def interact_comment(god_comments, other_account_list, post_id, stance):
     interact_comment_info = {}
-    # 将 other_account_list 打乱顺序
     other_account_list = random.sample(other_account_list, len(other_account_list))
 
     for account_name, comment_text in zip(other_account_list, god_comments):
         user_data_dir = get_config(f"{account_name}_browser_session_dir")
         try:
-            # : 仅发布 follower_perspective，链接固定；模型 link_target 和 reply_draft 不用于发布。
             error, success, comment_id = comment_on_binance_post(
                 post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
                 comment=comment_text,
                 user_data_dir=user_data_dir, sentiment=stance,
-                # debug=True
             )
             comment_id = str(comment_id) if comment_id else ""
             interact_comment_info[f"{comment_text}"] = {
@@ -1372,11 +1552,9 @@ def _hudong_once(article_manager):
         god_comments = article.get("article_info", {}).get("god_comments", [])
         post_id = article.get("binance_post_id")
         stance = article.get("stance")
-        # 排除 ACCOUNTS 中的 post_owner
         other_account_list = [account for account in ACCOUNTS if account != post_owner]
         comment_interact_info = interact_comment(god_comments, other_account_list, post_id, stance)
         article["comment_interact_info"] = comment_interact_info
-
         article["interacted"], article["interaction_time"] = True, now.timestamp()
     try:
         article_manager.upsert_articles(pending)
@@ -1393,7 +1571,7 @@ def _hudong_once(article_manager):
 
 
 def hudong():
-    """互动后台任务：每轮结束后等待 3600 秒，沿用异常后继续轮询的策略。"""
+    """互动后台任务：每轮结束后等待 INTERACTION_INTERVAL_SECONDS 秒，沿用异常后继续轮询的策略。"""
     article_manager = GeneratedArticleManager(gen_db_object())
     while True:
         try:
@@ -1408,20 +1586,13 @@ def hudong():
 
 
 def clean_article_records(raw_records):
-    """清洗文章数据列表，仅保留目标字段结构。
-
-    :param raw_records: 包含原始 MongoDB 导出的字典列表
-    :return: 清洗后的结构化数据列表
-    """
+    """清洗文章数据列表，仅保留目标字段结构。"""
     cleaned_records = []
-
     for item in raw_records:
         if not isinstance(item, dict):
             continue
-
         raw_info = item.get("article_info") or {}
         raw_brief = item.get("creation_brief") or {}
-
         cleaned_item = {
             "article_info": {
                 "text": raw_info.get("text", ""),
@@ -1434,20 +1605,12 @@ def clean_article_records(raw_records):
                 "materials": raw_brief.get("materials", []),
             },
         }
-
         cleaned_records.append(cleaned_item)
-
     return cleaned_records
 
 
 def get_need_check_article_info():
-    """
-    组装待审查的文章信息，并查询关联材料的原始帖子数据。
-
-    :return: (selected_data, cleaned_source_posts) 两个列表:
-             1. selected_data: 清洗后的待审查文章数据列表
-             2. cleaned_source_posts: 清洗后的原帖列表，元素包含 text_content 与 logic_mul
-    """
+    """组装待审查的文章信息，并查询关联材料的原始帖子数据。"""
     article_manager = GeneratedArticleManager(gen_db_object())
     candidates = article_manager.find_articles(query={
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
@@ -1455,17 +1618,11 @@ def get_need_check_article_info():
         "publish_status": {"$ne": "success"},
     }) or []
 
-    # 按照版本过滤
     candidates = [article for article in candidates if article.get("prompt_version") == prompt_version]
-
-    # 1. 优先对原始候选记录打乱并抽取 20 篇，保留原始 material_post_mapping 字段
     random.shuffle(candidates)
     selected_candidates = candidates[:10]
-
-    # 2. 清洗待审查文章结构
     selected_data = clean_article_records(selected_candidates)
 
-    # 3. 收集抽取文章中所有材料对应的原始帖子 post_id
     raw_post_ids = set()
     for article in selected_candidates:
         mapping = article.get("material_post_mapping") or {}
@@ -1475,11 +1632,9 @@ def get_need_check_article_info():
                     raw_post_ids.add(str(post_id).strip())
 
     cleaned_source_posts = []
-    # 4. 根据 post_id 批量查询 post_manager 里的原帖并清洗
     if raw_post_ids:
         post_manager = UniversalPostManager(gen_db_object())
         id_list = list(raw_post_ids)
-        # 兼容 post_id 字段在 MongoDB 中存储为字符串或整型数值的情况
         query_ids = list(id_list) + [int(i) for i in id_list if i.isdigit()]
         query = {"post_id": {"$in": query_ids}}
 
@@ -1496,7 +1651,6 @@ def get_need_check_article_info():
         except Exception as exc:
             logger.error(f"❌ [文章/待审查] 查询原帖素材失败 | 异常: {exc}")
 
-        # 5. 清洗原帖字段，仅保留 text_content 和 logic_mul
         for post in raw_posts:
             if not isinstance(post, dict):
                 continue
@@ -1510,22 +1664,19 @@ def get_need_check_article_info():
         "[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s] | 关联原帖素材: [%s]",
         len(candidates), len(selected_data), len(cleaned_source_posts)
     )
-
     return selected_data, cleaned_source_posts
 
 
 MAX_REPLAY_DAYS = 7
-DELETE_INTERVAL_SEC = 3600  # 调整为每小时检查一次，确保及时发现并清理逆向帖子
+DELETE_INTERVAL_SEC = 3600
 
 
 def delete_old_post():
     """按账号巡检并清理帖子与回复：
-
-    1. 对数据库中已发布的帖子进行实时行情与时效比对，若逆向 20% 或超时则调用接口删除并更新数据库状态；
+    1. 对数据库中已发布的帖子进行实时行情与时效比对，若逆向达标或超时则调用接口删除并更新数据库状态；
     2. 对远端历史流进行兜底超时清理；仅当删除的帖子存在于数据库时才维护 delete_time 和 delete_reason。
     """
     article_manager = GeneratedArticleManager(gen_db_object())
-    # time.sleep(120)
     beijing_tz = timezone(timedelta(hours=8))
 
     while True:
@@ -1536,7 +1687,6 @@ def delete_old_post():
 
         logger.info("[历史清理/开始] 启动帖子清理轮询 | 账号数: [%s]", len(ACCOUNTS))
 
-        # 1. 预先获取各账号凭证
         credentials = {}
         for account_name in ACCOUNTS:
             try:
@@ -1554,7 +1704,6 @@ def delete_old_post():
                 account_errors += 1
                 logger.error("[历史清理/凭证异常] 获取账号凭证失败 | 账号: [%s] | 异常: [%r]", account_name, exc)
 
-        # 2. 检查数据库中已成功发布、未标记删除的代码帖子（检查逆向 20% 与超时）
         try:
             published_articles = article_manager.find_articles(query={
                 "publish_status": "success",
@@ -1579,7 +1728,6 @@ def delete_old_post():
                 delete_reason = None
                 price_updated = False
 
-                # A. 逆向 20% 检测
                 if topic and stance in ("看多", "看空") and publish_price is not None:
                     try:
                         pub_p = float(publish_price)
@@ -1587,7 +1735,6 @@ def delete_old_post():
                             latest_price = get_latest_crypto_price(topic)
                             if latest_price is not None:
                                 cur_p = float(latest_price)
-                                # 根据多空直接计算实际收益百分比（正数为盈利，负数为亏损）
                                 price_diff_pct = (cur_p - pub_p) / pub_p
                                 profit_pct = price_diff_pct if stance == "看多" else -price_diff_pct
                                 article["profit_pct"] = round(profit_pct, 4)
@@ -1607,7 +1754,6 @@ def delete_old_post():
                             post_id, topic, p_err,
                         )
 
-                # B. 超时检测（未触发逆向时进行）
                 if not should_delete and publish_time is not None:
                     try:
                         pub_time_sec = _publish_time_seconds(publish_time)
@@ -1622,7 +1768,6 @@ def delete_old_post():
                             post_id, publish_time, t_err,
                         )
 
-                # C. 执行删除并更新数据库
                 deleted_successfully = False
                 if should_delete:
                     cred = credentials.get(account_name)
@@ -1668,7 +1813,6 @@ def delete_old_post():
                                 post_id, account_name, exc,
                             )
 
-                # 未成功删除但计算了最新涨跌幅，同步更新数据库
                 if not deleted_successfully and price_updated:
                     try:
                         article["check_time"] = datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -1681,9 +1825,9 @@ def delete_old_post():
         except Exception as exc:
             logger.error("[历史清理/巡检异常] 数据库帖子扫描或删除处理中断 | 异常: [%r]", exc)
 
-        # 3. 兜底清理远端历史回复与帖子（超过 MAX_REPLAY_DAYS）
         try:
             cutoff_ms = int((now - MAX_REPLAY_DAYS * 24 * 60 * 60) * 1000)
+
             for account_name in ACCOUNTS:
                 cred = credentials.get(account_name)
                 if not cred:
@@ -1713,7 +1857,6 @@ def delete_old_post():
                             continue
                         reply_id = str(raw_reply_id)
 
-                        # 已在本轮被删除的直接跳过
                         if reply_id in deleted_post_ids:
                             continue
 
@@ -1734,7 +1877,6 @@ def delete_old_post():
                         if success:
                             deleted_timeout += 1
                             deleted_post_ids.add(reply_id)
-                            # 仅更新数据库中已有的帖子；非代码发送的帖子不维护数据库
                             matched_articles = article_manager.find_articles(query={"binance_post_id": reply_id})
                             if matched_articles:
                                 del_now = time.time()
@@ -1760,56 +1902,41 @@ def delete_old_post():
             account_errors, DELETE_INTERVAL_SEC,
         )
         time.sleep(DELETE_INTERVAL_SEC)
+
+
 def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
-    """
-    根据指定关键字查询最近拉取的帖子。
-
-    :param target_key: 帖子正文必须包含的关键字
-    :param hours: 最近的小时数 (默认 6 小时)
-    :param min_views: 最低浏览量门槛 (默认 1000)
-    :return: 包含清洗后干净元素（正文、图片列表、流量表现）的字典列表，按浏览量降序排列。
-    """
+    """根据指定关键字查询最近拉取的帖子。"""
     post_manager = UniversalPostManager(gen_db_object())
-
-    # 按照秒级时间戳计算边界（基于示例中 publish_time = 1791680925 为秒级）
     start_time = time.time() - (hours * 3600)
 
-    # 组装 MongoDB 原生查询条件与排序规则
     query = {
         "source": BINANCE_SOURCE,
         "publish_time": {"$gte": start_time},
         "engagement.view_count": {"$gte": min_views},
-        "content.text_content": {"$regex": target_key, "$options": "i"}  # 忽略大小写
+        "content.text_content": {"$regex": target_key, "$options": "i"}
     }
     sort_condition = [("engagement.view_count", -1)]
 
     posts = []
     try:
-        # 首选：如果底层对外暴露了 collection，直接利用 MongoDB 引擎进行筛选排序（性能最优）
         if hasattr(post_manager, 'collection'):
             cursor = post_manager.collection.find(query).sort(sort_condition)
             posts = list(cursor)
-        # 次选：如果 post_manager 像 article_manager 一样具有 find_posts 方法
         elif hasattr(post_manager, 'find_posts'):
             posts = post_manager.find_posts(query=query, sort=sort_condition)
         else:
-            # 兜底：兼容内存中过滤模式，拉取最新数据后再进行字段比对和排序
             raw_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=5000)
             for p in raw_posts:
                 pub_time = p.get("publish_time", 0)
                 views = p.get("engagement", {}).get("view_count", 0)
                 text = p.get("content", {}).get("text_content", "") or ""
-
                 if pub_time >= start_time and views >= min_views and target_key.lower() in text.lower():
                     posts.append(p)
-            # 在内存中按浏览量降序排列
             posts.sort(key=lambda x: x.get("engagement", {}).get("view_count", 0), reverse=True)
-
     except Exception as e:
         logger.error(f"❌ [数据/查询] 关键字热门帖子查询失败 | 关键字: [{target_key}] | 异常: [{e}]")
         return []
 
-    # 结果数据清洗，仅保留：正文内容、图片列表、流量表现
     cleaned_results = []
     for post in posts:
         content_dict = post.get("content") or {}
@@ -1840,7 +1967,7 @@ if __name__ == "__main__":
         format_image_article,
         hudong,
         auto_publish_articles,
-        delete_old_post,  # 新增删除帖子的 task 线程
+        delete_old_post,
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
     for thread in threads:
