@@ -881,6 +881,62 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     return text + "\n" + "\n".join(tags)
 
 
+COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
+
+
+def _build_publish_text_list(text):
+    """按 '$+币名' 将正文切分为 text_list：
+    1. 包含币名的元素格式为 {"text": "$COIN", "delay": 2}，且末尾绝不包含换行或空白；
+    2. 紧跟在币名后的下一个元素开头强制增加一个换行 '\\n'；
+    3. 非币名元素的 delay 统一为 0。
+    """
+    if not text:
+        return []
+
+    text_list = []
+    last_end = 0
+    prev_was_coin = False
+
+    for match in COIN_TAG_PATTERN.finditer(text):
+        start, end = match.span()
+        before_seg = text[last_end:start]
+
+        if prev_was_coin:
+            cleaned_before = before_seg.lstrip(" \t\r\n")
+            text_list.append({
+                "text": f"\n{cleaned_before}" if cleaned_before else "\n",
+                "delay": 0,
+            })
+        elif before_seg:
+            text_list.append({
+                "text": before_seg,
+                "delay": 0,
+            })
+
+        coin_text = match.group(0).rstrip(" \t\r\n")
+        text_list.append({
+            "text": coin_text,
+            "delay": 2,
+        })
+        last_end = end
+        prev_was_coin = True
+
+    tail_seg = text[last_end:]
+    if prev_was_coin:
+        cleaned_tail = tail_seg.lstrip(" \t\r\n")
+        text_list.append({
+            "text": f"\n{cleaned_tail}" if cleaned_tail else "\n",
+            "delay": 0,
+        })
+    elif tail_seg:
+        text_list.append({
+            "text": tail_seg,
+            "delay": 0,
+        })
+
+    return text_list
+
+
 def _publish_articles_once(article_manager):
     """调度并发布一轮；管理器返回含 topic/article_info/publish_attempts 的文章列表。
     article_info 含 text/score/image_placeholders/image_mapping；回写账号状态及发布字段，无返回。
@@ -944,11 +1000,17 @@ def _publish_articles_once(article_manager):
         started = time.monotonic()
         stage, api_result = "准备正文、媒体及账号配置", "尚未调用"
         try:
-            text = f"${topic} {info.get("text", "")}"
+            text = info.get('text', '')
             if topic:
                 text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda match: "$" + topic + " ",
                               text, flags=re.IGNORECASE)
-            text = add_hot_topic_to_article(text, topic) + "\n\n👇"
+            text = add_hot_topic_to_article(text, topic) + "\n\n\n\n\n\n👇"
+            # 如果 text 不是以 $ 开头，则在开头加上 $topic，且不重复添加。
+            if not text.startswith(f"${topic}"):
+                text = f"${topic} {info.get('text', '')}"
+
+
+            text_list = _build_publish_text_list(text)
             # : 沿用完整 image_mapping 的插入顺序，不按占位符再次筛选；缺失路径传 None。
             image_paths = [mapping.get("local_path") or None for mapping in info.get("image_mapping", {}).values()]
             user_data_dir = get_config(f"{account}_browser_session_dir")
@@ -957,8 +1019,7 @@ def _publish_articles_once(article_manager):
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
                 chart_info={"coin": topic, "bridge": "USDT", "type": "future"}, sentiment=stance,
-                debug=False
-
+                debug=True, text_list=text_list
             )
             post_id = str(post_id)
             api_result = "成功" if success else "失败"
@@ -1006,7 +1067,7 @@ def _publish_articles_once(article_manager):
 def auto_publish_articles():
     """发布后台任务：独立管理器，启动后等 60 秒，每轮结束后等 600 秒。"""
     article_manager = GeneratedArticleManager(gen_db_object())
-    time.sleep(60)
+    # time.sleep(60)
     while True:
         try:
             _publish_articles_once(article_manager)
@@ -1362,7 +1423,7 @@ def delete_old_post():
     2. 对远端历史流进行兜底超时清理；仅当删除的帖子存在于数据库时才维护 delete_time 和 delete_reason。
     """
     article_manager = GeneratedArticleManager(gen_db_object())
-    time.sleep(120)
+    # time.sleep(120)
     beijing_tz = timezone(timedelta(hours=8))
 
     while True:
