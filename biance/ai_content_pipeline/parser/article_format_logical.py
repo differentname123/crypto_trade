@@ -245,15 +245,42 @@ def process_and_save_pre_screen_batch(batch_posts, post_manager, prompt_template
 
 # 原帖列表、管理器 → 50帖一批并发初筛；保留批次异常隔离，成功结果原地更新供精提使用。
 def batch_pre_screen_posts(posts, post_manager):
+    # 统计总帖数（若 posts 可能是迭代器，建议先转为 list 或取 len）
+    total_posts = len(posts)
     pending = [post for post in posts if is_need_pre_screening(post)]
+    skipped_count = total_posts - len(pending)
+
     if not pending:
-        logger.info("[初筛/计划] 当前无待初筛新帖")
+        logger.info(
+            "[初筛/计划] 当前无待初筛新帖 | 接收总数: [%s] | 全部已跳过/已处理",
+            total_posts
+        )
         return
+
     prompt = read_file_to_str(PRE_SCREEN_PROMPT_FILE_PATH)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError(f"初筛提示词为空或读取失败: {PRE_SCREEN_PROMPT_FILE_PATH}")
+
     batches = [pending[index:index + PRE_SCREEN_BATCH_SIZE]
                for index in range(0, len(pending), PRE_SCREEN_BATCH_SIZE)]
+
+    # 🚀 在实际执行前输出详尽统计日志
+    logger.info(
+        "🚀 [初筛/启动] 任务就绪开始执行 | 接收总数: [%s] | 待初筛: [%s] (%.1f%%) | 跳过: [%s] "
+        "| 划分批次: [%s] | 单批上限: [%s] | 并发上限: [%s] "
+        "| 首帖ID: [%s] | 末帖ID: [%s] | 提示词字数: [%s]",
+        total_posts,
+        len(pending),
+        (len(pending) / total_posts * 100) if total_posts > 0 else 0.0,
+        skipped_count,
+        len(batches),
+        PRE_SCREEN_BATCH_SIZE,
+        PRE_SCREEN_CONCURRENCY,
+        pending[0].get("post_id", "N/A"),
+        pending[-1].get("post_id", "N/A"),
+        len(prompt),
+    )
+
     started = time.monotonic()
     passed = filtered = failed = 0
     with ThreadPoolExecutor(max_workers=PRE_SCREEN_CONCURRENCY) as executor:
@@ -273,13 +300,13 @@ def batch_pre_screen_posts(posts, post_manager):
                     "| 后续: [继续其他批次] | 排查: [检查帖子字段与数据库连接]",
                     batch[0].get("post_id"), len(batch),
                 )
+
     logger.info(
         "[初筛/汇总] 本轮结束 | 待筛: [%s] | 批次: [%s] | 每批上限: [%s] | 并发上限: [%s] "
         "| 通过: [%s] | 淘汰: [%s] | 失败批次: [%s] | 耗时: [%.2f 秒]",
         len(pending), len(batches), PRE_SCREEN_BATCH_SIZE, PRE_SCREEN_CONCURRENCY,
         passed, filtered, failed, time.monotonic() - started,
     )
-
 
 # post{content.text_content,media.local_mapping} → (正文,路径列表,{占位符:路径})；重复URL保留出现顺序。
 def normalize_post_media(post_data):
