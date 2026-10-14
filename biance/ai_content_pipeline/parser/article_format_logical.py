@@ -36,7 +36,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
 logger = setup_logger(app_name="media_format")
-prompt_version = "1014"
+prompt_version = "1015"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -479,6 +479,9 @@ def extract_and_group_valid_evidences():
             continue
         source_mapping = build_source_image_mapping(post)
         for evidence in logic_mul["evidences"]:
+            images = evidence.get("images", [])
+            if len(images) < 1 or any(image.get("usable") is not True for image in images):
+                continue
             duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
             coins, stance = evidence.get("coins", []), evidence.get("stance")
             if age > duration or not isinstance(coins, list) or not coins or stance not in ("看多", "看空"):
