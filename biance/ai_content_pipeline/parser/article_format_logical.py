@@ -19,7 +19,12 @@ import time
 from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+import stat
+from functools import lru_cache
+from PIL import Image, UnidentifiedImageError
 
+# 大模型视觉接口支持的标准光栅图片格式
+ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
 import ccxt
 
 from app.ai_api.model_api import generate_content
@@ -133,6 +138,46 @@ def _generate_validated_info(action, prompt, validator, context, **model_kwargs)
 
 # post{post_id,publish_time,content.text_content,media.local_mapping/video_duration} → bool。
 # : 媒体上限按映射项计数并排除恰好10项，视频只看时长字段，未来时间仍可能通过；保留原边界。
+# (绝对路径, 修改时间纳秒, 字节大小) → bool；校验结构完整性与全像素解码，缓存结果避免初筛与精提重复解码。
+@lru_cache(maxsize=32768)
+def _verify_image_integrity(abs_path, mtime_ns, file_size):
+    try:
+        # 1. 校验文件头、格式枚举、尺寸及容器结构（如PNG CRC校验）
+        with Image.open(abs_path) as img:
+            fmt = (img.format or "").upper()
+            if fmt not in ALLOWED_IMAGE_FORMATS:
+                return False
+            width, height = img.size
+            if width <= 0 or height <= 0:
+                return False
+            img.verify()
+
+        # 2. verify() 后重新打开并调用 load() 强制解码全部像素流，拦截半截/截断图（Truncated Image）
+        with Image.open(abs_path) as img:
+            img.load()
+        return True
+    except (UnidentifiedImageError, OSError, SyntaxError, ValueError, TypeError, Image.DecompressionBombError):
+        return False
+    except Exception:
+        return False
+
+
+# 本地图片路径 → bool；校验文件存在、非0字节且为未损坏的合法图片。
+def _is_valid_image_file(path):
+    if not isinstance(path, str) or not path.strip():
+        return False
+    try:
+        abs_path = os.path.abspath(path)
+        stat_info = os.stat(abs_path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(stat_info.st_mode) or stat_info.st_size <= 0:
+        return False
+    return _verify_image_integrity(abs_path, stat_info.st_mtime_ns, stat_info.st_size)
+
+
+# post{post_id,publish_time,content.text_content,media.local_mapping/video_duration} → bool。
+# 先完成全部内存级校验与48小时时效过滤，最后再执行磁盘文件存在性与图片损坏检验。
 def _is_valid_raw_post(post):
     post_id = post.get("post_id")
     if post_id is None or not str(post_id).strip():
@@ -143,14 +188,15 @@ def _is_valid_raw_post(post):
         return False
     mapping = media.get("local_mapping") or {}
     paths = list(mapping.values())
-    if len(paths) >= MAX_MEDIA_COUNT or any(not path or not os.path.isfile(path) for path in paths):
+    if len(paths) >= MAX_MEDIA_COUNT or any(not path for path in paths):
         return False
     text = (post.get("content") or {}).get("text_content") or ""
     if not text.strip() or any(not mapping.get(match.group(2)) for match in MEDIA_PATTERN.finditer(text)):
         return False
     publish_time = _publish_time_seconds(post.get("publish_time", 0))
-    return (time.time() - publish_time) / 3600 <= POST_MAX_AGE_HOURS
-
+    if (time.time() - publish_time) / 3600 > POST_MAX_AGE_HOURS:
+        return False
+    return all(_is_valid_image_file(path) for path in paths)
 
 # 原帖{logic_mul,pre_screen{prompt_version,no_evidence},content,media,publish_time} → bool。
 def is_need_pre_screening(post):
