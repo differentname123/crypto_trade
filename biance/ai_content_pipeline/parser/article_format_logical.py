@@ -238,6 +238,7 @@ def process_and_save_single_post(post, post_manager):
     post_id = post.get("post_id", "UNKNOWN_ID") if isinstance(post, dict) else "UNKNOWN_ID"
     try:
         format_info = gen_media_format_info(post)
+        format_info["prompt_version"] = prompt_version
         if not format_info:
             return
         post["logic_mul"] = format_info
@@ -460,6 +461,11 @@ def extract_and_group_valid_evidences():
     grouped = defaultdict(lambda: defaultdict(list))
     now, invalid_times = time.time(), 0
     for post in posts:
+        # 过滤得到当前 提示词版本的
+        prompt_ver = (post.get("logic_mul") or {}).get("prompt_version")
+        if prompt_ver != prompt_version:
+            continue
+
         logic_mul, raw_time = post.get("logic_mul"), post.get("publish_time")
         if not isinstance(logic_mul, dict) or not logic_mul.get("evidences") or not raw_time:
             continue
