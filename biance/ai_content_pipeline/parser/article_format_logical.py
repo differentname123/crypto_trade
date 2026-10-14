@@ -709,13 +709,13 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_hot_post(post_manager, get_hot_coin())
+            # fetch_hot_post(post_manager, get_hot_coin())
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
             if not posts:
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
                 time.sleep(60)
                 continue
-            batch_pre_screen_posts(posts, post_manager)
+            # batch_pre_screen_posts(posts, post_manager)
             valid_posts = [post for post in posts if is_need_formatting(post)]
             logger.info(
                 "[帖子/计划] 初筛后精提 | 扫描: [%s] | 待精提: [%s] | 跳过: [%s] | 并发上限: [%s]",
@@ -2317,12 +2317,12 @@ if __name__ == "__main__":
     # data = get_need_check_pre_screen_info(limit=1000)
 
     tasks = [
-        generate_analysis_articles,
+        # generate_analysis_articles,
         generate_viral_articles,
-        format_image_article,
-        hudong,
-        auto_publish_articles,
-        delete_old_post
+        # format_image_article,
+        # hudong,
+        # auto_publish_articles,
+        # delete_old_post
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
     for thread in threads:
