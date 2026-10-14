@@ -1009,7 +1009,6 @@ def _publish_articles_once(article_manager):
             if not text.startswith(f"${topic}"):
                 text = f"${topic} {info.get('text', '')}"
 
-
             text_list = _build_publish_text_list(text)
             # : 沿用完整 image_mapping 的插入顺序，不按占位符再次筛选；缺失路径传 None。
             image_paths = [mapping.get("local_path") or None for mapping in info.get("image_mapping", {}).values()]
