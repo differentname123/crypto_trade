@@ -2319,7 +2319,7 @@ if __name__ == "__main__":
     tasks = [
         # generate_analysis_articles,
         generate_viral_articles,
-        # format_image_article,
+        format_image_article,
         # hudong,
         # auto_publish_articles,
         # delete_old_post
