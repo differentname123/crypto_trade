@@ -36,7 +36,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
 logger = setup_logger(app_name="media_format")
-prompt_version = "1015"
+prompt_version = "1014-1"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -1291,6 +1291,9 @@ def get_need_check_article_info():
         "status": "ok",
         "publish_status": {"$ne": "success"},
     }) or []
+
+    # 按照版本过滤
+    candidates = [article for article in candidates if article.get("prompt_version") == prompt_version]
 
     # 1. 优先对原始候选记录打乱并抽取 20 篇，保留原始 material_post_mapping 字段
     random.shuffle(candidates)
