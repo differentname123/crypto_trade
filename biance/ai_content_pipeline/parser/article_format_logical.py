@@ -1,12 +1,13 @@
 """
-[功能摘要] 采集币安广场帖子，经初筛和论据提取生成分析文章，再调度发布、互动与历史清理。
+[功能摘要] 采集币安广场帖子，经初筛和论据提取生成分析文章，同时支持高流量帖子两阶段筛查与洗稿重塑，再调度发布、互动与历史清理。
 [输入数据] MongoDB 原帖 {post_id, publish_time, content.text_content, media.local_mapping,
-pre_screen, logic_mul}；文章 {topic, stance, article_info}；提示词、币种文件、账号配置与状态文件。
-[数据流转/交互] 热榜/行情 → 采集入库 → 每批50帖初筛回写 pre_screen → 媒体编号/模型提取回写 logic_mul；
-论据按时效/币种/立场分组 → 按已发布引用次数选材 → 模型生成/校验 → 文章入库；
+pre_screen, logic_mul, viral_screen}；文章 {type, topic, stance, article_info}；提示词、币种文件、账号配置与状态文件。
+[数据流转/交互] 热榜/行情 → 采集入库 → 每批50帖初筛回写 pre_screen → 媒体编号/模型提取回写 logic_mul → 24h且浏览>1000帖回写 viral_screen；
+论据按时效/币种/立场分组 → 按已发布引用次数选材 → 模型生成/校验 → 分析文章(type=analysis)入库；
+高潜单帖(usable=true, viral_score>=4) → 1对1洗稿与神评生成/校验 → 高流量文章(type=viral)入库；
 近6小时文章 → 评分/图片去重/账号冷却 → 浏览器发布 → 保存账号与数据库状态；
 近24小时已发文章 → 凭证/点赞/收藏/评论 → 互动回写；已发文章与远端历史 → 行情/7天边界 → 删除回写。
-[输出数据] 初筛标记、论据、文章、发布/互动/删除状态及聚合日志；外部依赖继续由原项目提供。
+[输出数据] 初筛标记、论据、高流量筛查标记、文章(含type区分)、发布/互动/删除状态及聚合日志；外部依赖继续由原项目提供。
 """
 
 import json
@@ -55,6 +56,15 @@ LLM_MAX_RETRIES = 3
 PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
+VIRAL_STAGE1_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖可用性筛选.txt"
+VIRAL_STAGE2_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖洗稿和神评生成.txt"
+
+ARTICLE_TYPE_ANALYSIS = "analysis"
+ARTICLE_TYPE_VIRAL = "viral"
+VIRAL_POST_MAX_AGE_HOURS = 24
+VIRAL_MIN_VIEW_COUNT = 1000
+VIRAL_MIN_SCORE = 4
+
 PRE_SCREEN_BATCH_SIZE = 50
 PRE_SCREEN_CONCURRENCY = 5
 ARTICLE_MATERIAL_LIMIT = 10
@@ -199,6 +209,7 @@ def _is_valid_raw_post(post):
         return False
     return all(_is_valid_image_file(path) for path in paths)
 
+
 # 原帖{logic_mul,pre_screen{prompt_version,no_evidence},content,media,publish_time} → bool。
 def is_need_pre_screening(post):
     if post.get("logic_mul"):
@@ -215,6 +226,29 @@ def is_need_formatting(post):
     screen = post.get("pre_screen")
     if (post.get("logic_mul") or not isinstance(screen, dict)
             or screen.get("prompt_version") != prompt_version or screen.get("no_evidence") is not False):
+        return False
+    return _is_valid_raw_post(post)
+
+
+# post{viral_screen,engagement.view_count,publish_time,content,media} → bool；仅筛查24h内且浏览量>1000的纯图文帖。
+def is_need_viral_screening(post):
+    screen = post.get("viral_screen")
+    if (isinstance(screen, dict) and screen.get("prompt_version") == prompt_version
+            and isinstance(screen.get("usable"), bool)):
+        return False
+    engagement = post.get("engagement") or {}
+    view_count = engagement.get("view_count", 0)
+    if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
+        return False
+    try:
+        publish_time = _publish_time_seconds(post.get("publish_time", 0))
+    except ValueError:
+        return False
+    age_hours = (time.time() - publish_time) / 3600
+    if age_hours > VIRAL_POST_MAX_AGE_HOURS or age_hours < -1:
+        return False
+    text = (post.get("content") or {}).get("text_content") or ""
+    if any(match.group(1) == "视频" for match in MEDIA_PATTERN.finditer(text)):
         return False
     return _is_valid_raw_post(post)
 
@@ -355,6 +389,7 @@ def batch_pre_screen_posts(posts, post_manager):
         passed, filtered, failed, time.monotonic() - started,
     )
 
+
 # post{content.text_content,media.local_mapping} → (正文,路径列表,{占位符:路径})；重复URL保留出现顺序。
 def normalize_post_media(post_data):
     text = (post_data.get("content") or {}).get("text_content") or ""
@@ -468,6 +503,140 @@ def process_and_save_single_post(post, post_manager):
         )
 
 
+# 高流量第一阶段模型输出、原文图片占位符集合 → (bool,错误文本)；严格契合单帖可用性筛选提示词规范。
+def check_viral_stage1_info(json_data, placeholders):
+    if not isinstance(json_data, dict):
+        return False, "高流量初筛最外层必须是字典"
+    expected_keys = {
+        "usable", "reject_reason", "viral_score", "viral_reason", "topic_tag",
+        "perspective_strategy", "core_soul", "rewrite_direction", "valid_images",
+    }
+    error = _key_error(json_data, expected_keys, "viral_screen")
+    if error:
+        return False, error
+    usable = json_data["usable"]
+    if not isinstance(usable, bool):
+        return False, "viral_screen.usable 必须是布尔值"
+    reject_reason = json_data["reject_reason"]
+    if not isinstance(reject_reason, str):
+        return False, "viral_screen.reject_reason 必须是字符串"
+    if usable and reject_reason.strip():
+        return False, "usable 为 true 时 reject_reason 必须为空字符串"
+    if not usable and not reject_reason.strip():
+        return False, "usable 为 false 时必须说明 reject_reason"
+    score = json_data["viral_score"]
+    if not isinstance(score, int) or isinstance(score, bool) or not 1 <= score <= 5:
+        return False, "viral_screen.viral_score 必须是 1—5 的整数，不能是布尔值"
+    if not isinstance(json_data["viral_reason"], str) or not json_data["viral_reason"].strip():
+        return False, "viral_screen.viral_reason 必须是非空字符串"
+    allowed_tags = (
+        "搞钱与盈亏", "情感与两性", "奇葩与吃瓜", "人性与潜规则",
+        "职场与生存", "搞笑与整活", "无效噪音",
+    )
+    if json_data["topic_tag"] not in allowed_tags:
+        return False, f"viral_screen.topic_tag 取值不合法: {json_data['topic_tag']!r}"
+    allowed_strategies = ("第一人称直发", "吃瓜转述视角", "去黑话降维重塑")
+    strategy = json_data["perspective_strategy"]
+    core_soul = json_data["core_soul"]
+    rewrite_direction = json_data["rewrite_direction"]
+    for field_name, value in (
+        ("perspective_strategy", strategy),
+        ("core_soul", core_soul),
+        ("rewrite_direction", rewrite_direction),
+    ):
+        if not isinstance(value, str):
+            return False, f"viral_screen.{field_name} 必须是字符串"
+    if not usable:
+        if strategy != "" or core_soul != "" or rewrite_direction != "":
+            return False, "usable 为 false 时 perspective_strategy/core_soul/rewrite_direction 必须为空字符串"
+        if json_data["valid_images"] != []:
+            return False, "usable 为 false 时 valid_images 必须为空列表"
+    else:
+        if strategy not in allowed_strategies:
+            return False, f"viral_screen.perspective_strategy 取值不合法: {strategy!r}"
+        if not core_soul.strip():
+            return False, "usable 为 true 时 core_soul 必须是非空字符串"
+        if not rewrite_direction.strip():
+            return False, "usable 为 true 时 rewrite_direction 必须是非空字符串"
+    valid_images = json_data["valid_images"]
+    if not isinstance(valid_images, list):
+        return False, "viral_screen.valid_images 必须是列表"
+    if len(valid_images) > 3:
+        return False, "viral_screen.valid_images 最多保留 3 张图片"
+    seen_ids = set()
+    for index, image in enumerate(valid_images, 1):
+        image_label = f"valid_images[{index}]"
+        error = _key_error(image, {"image_id", "image_content"}, image_label)
+        if error:
+            return False, error
+        image_id = image["image_id"]
+        if not isinstance(image_id, str) or image_id not in placeholders:
+            return False, f"{image_label}.image_id 未出现在原文: {image_id!r}"
+        if image_id in seen_ids:
+            return False, f"{image_label}.image_id 不允许重复: {image_id!r}"
+        seen_ids.add(image_id)
+        if not isinstance(image["image_content"], str) or not image["image_content"].strip():
+            return False, f"{image_label}.image_content 必须是非空字符串"
+    return True, ""
+
+
+# 原帖 → 高流量第一阶段可用性与爆款潜力筛查字典。
+def gen_viral_stage1_info(post):
+    text, paths, mapping = normalize_post_media(post)
+    prompt = f"{read_file_to_str(VIRAL_STAGE1_PROMPT_FILE_PATH)}\n{text}"
+    return _generate_validated_info(
+        "高流量/筛查", prompt, lambda response: check_viral_stage1_info(response, list(mapping)),
+        f"帖子ID={post.get('post_id', 'UNKNOWN_ID')}", file_paths=paths,
+    )
+
+
+# 单篇高流量候选原帖 → 执行第一阶段筛查并回写 viral_screen；保留单帖异常隔离。
+def process_and_save_single_viral_post(post, post_manager):
+    started = time.monotonic()
+    post_id = post.get("post_id", "UNKNOWN_ID") if isinstance(post, dict) else "UNKNOWN_ID"
+    try:
+        info = gen_viral_stage1_info(post)
+        if not info:
+            return False
+        info["prompt_version"] = prompt_version
+        info["screen_time"] = time.time()
+        post["viral_screen"] = info
+        post_manager.upsert_posts([post])
+        logger.info(
+            "[高流量/回写] 单帖筛查已保存 | 帖子: [%s] | 可用: [%s] | 潜力分: [%s] | 赛道: [%s] | 耗时: [%.2f 秒]",
+            post_id, info["usable"], info["viral_score"], info["topic_tag"], time.monotonic() - started,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "❌ [高流量/筛查] 当前帖子筛查失败 | 帖子: [%s] | 后续: [继续其他任务] "
+            "| 排查: [检查帖子字段、提示词、媒体路径及数据库]", post_id,
+        )
+        return False
+
+
+# 原帖列表、管理器 → 筛选24h内且浏览量>1000的待审帖并发执行第一阶段可用性筛查。
+def batch_screen_viral_posts(posts, post_manager):
+    pending = [post for post in posts if is_need_viral_screening(post)]
+    logger.info(
+        "[高流量/计划] 第一阶段筛查就绪 | 扫描: [%s] | 待筛查(24h且浏览>%s): [%s] | 跳过: [%s] | 并发上限: [%s]",
+        len(posts), VIRAL_MIN_VIEW_COUNT, len(pending), len(posts) - len(pending), MAX_CONCURRENCY,
+    )
+    if not pending:
+        return
+    started = time.monotonic()
+    succeeded = 0
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENCY) as executor:
+        futures = [executor.submit(process_and_save_single_viral_post, post, post_manager) for post in pending]
+        for future in as_completed(futures):
+            if future.result():
+                succeeded += 1
+    logger.info(
+        "[高流量/汇总] 第一阶段筛查完成 | 待筛查: [%s] | 成功回写: [%s] | 耗时: [%.2f 秒]",
+        len(pending), succeeded, time.monotonic() - started,
+    )
+
+
 # 币种序列、排序参数 → 采集并 upsert_posts([post])；保留接口顺序和重复帖子。
 def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     started = time.monotonic()
@@ -520,6 +689,7 @@ def get_top_k_movers(top_k=5):
         except Exception as close_err:
             logger.debug("[行情/释放] CCXT 客户端释放异常（已忽略）: %s", close_err)
 
+
 # 合约/现货热榜与涨跌榜各前2项 → 去重币种列表；沿用集合的无序返回。
 def get_hot_coin():
     top_k, coins = 2, []
@@ -533,7 +703,7 @@ def get_hot_coin():
     return coins
 
 
-# 采集 → 批量初筛原地回写 → 并发精提；保留无帖60秒、满批5秒、普通批次1小时的轮询节奏。
+# 采集 → 批量初筛原地回写 → 并发精提 → 高流量第一阶段筛查；保留无帖60秒、满批5秒、普通批次1小时的轮询节奏。
 def format_image_article():
     while True:
         try:
@@ -557,6 +727,7 @@ def format_image_article():
                                for post in valid_posts]
                     for future in as_completed(futures):
                         future.result()
+            batch_screen_viral_posts(posts, post_manager)
             delay = 5 if len(posts) >= POST_QUERY_LIMIT else 3600
             logger.info(
                 "[帖子/完成] 本轮线程结束 | 扫描: [%s] | 已提交: [%s] | 耗时: [%.2f 秒] "
@@ -672,6 +843,7 @@ def extract_and_group_valid_evidences():
             if any(image.get("usable") is not True for image in evidence.get("images", [])):
                 continue
             duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
+
             target_coin = str(evidence.get("target_coin") or "").strip().upper()
             if not target_coin and isinstance(evidence.get("coins"), list):
                 candidate_coins = [str(coin).strip().upper() for coin in evidence["coins"] if str(coin).strip()]
@@ -800,6 +972,7 @@ def get_recent_openings(article_manager, source, topic, stance, limit=5):
 # → 补齐默认字段的浅拷贝；post_id_list只来自实际采用素材，保留原帖ID类型。
 def prepare_article_record_for_db(article_data):
     record = dict(article_data)
+    record.setdefault("type", ARTICLE_TYPE_ANALYSIS)
     for key in ("source", "topic", "stance"):
         if not isinstance(record.get(key), str) or not record[key].strip():
             raise ValueError(f"文章缺失有效字段: {key}")
@@ -841,8 +1014,8 @@ def build_article_task(coin, stance, ev_list, article_manager):
     brief = {"task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS}, "materials": []}
     model_name = "gemini-3.1-pro-preview"
     record = {
-        "source": BINANCE_SOURCE, "topic": coin, "stance": stance, "status": "processing",
-        "creation_brief": brief, "material_post_mapping": {}, "post_id_list": [],
+        "source": BINANCE_SOURCE, "type": ARTICLE_TYPE_ANALYSIS, "topic": coin, "stance": stance,
+        "status": "processing", "creation_brief": brief, "material_post_mapping": {}, "post_id_list": [],
         "prompt_file_path": ARTICLE_PROMPT_FILE_PATH, "model_name": model_name,
         "prompt_version": prompt_version, "article_info": None, "error_message": None,
         "error_history": [], "raw_response": None, "attempt_count": 0,
@@ -1000,6 +1173,302 @@ def generate_analysis_articles():
             logger.exception(
                 "❌ [文章/轮询] 本轮中断 | 后续: [60 秒后重新查询] "
                 "| 排查: [检查热榜、论据、提示词与数据库；保存结果不确定时先核对记录]"
+            )
+            time.sleep(60)
+
+
+# 管理器、来源、候选post_id序列 → 已生成高流量文章(type=viral, status=ok)的原帖ID字符串集合。
+def get_remodeled_viral_post_ids(article_manager, source, post_ids):
+    raw_ids = list(dict.fromkeys(post_ids))
+    if not raw_ids:
+        return set()
+    str_ids = [str(pid).strip() for pid in raw_ids if str(pid).strip()]
+    int_ids = [int(pid) for pid in str_ids if pid.isdigit()]
+    query_ids = list(dict.fromkeys([*raw_ids, *str_ids, *int_ids]))
+    articles = article_manager.find_articles(
+        query={
+            "source": source,
+            "type": ARTICLE_TYPE_VIRAL,
+            "status": "ok",
+            "post_id_list": {"$in": query_ids},
+        },
+        limit=0,
+    ) or []
+    used = set()
+    for article in articles:
+        for pid in article.get("post_id_list", []):
+            if pid is not None:
+                used.add(str(pid).strip())
+    return used
+
+
+# 数据库当前版本 viral_screen → 满足 usable==True、viral_score>=4、24h内且浏览>1000的待重塑原帖列表（优先5分神帖）。
+def extract_valid_viral_posts(article_manager):
+    started = time.monotonic()
+    post_manager = UniversalPostManager(gen_db_object())
+    posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    now = time.time()
+    candidates = []
+    for post in posts:
+        screen = post.get("viral_screen")
+        if not isinstance(screen, dict) or screen.get("prompt_version") != prompt_version:
+            continue
+        if screen.get("usable") is not True:
+            continue
+        score = screen.get("viral_score", 0)
+        if not isinstance(score, int) or isinstance(score, bool) or score < VIRAL_MIN_SCORE:
+            continue
+        engagement = post.get("engagement") or {}
+        view_count = engagement.get("view_count", 0)
+        if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
+            continue
+        try:
+            publish_time = _publish_time_seconds(post.get("publish_time", 0))
+        except ValueError:
+            continue
+        age_hours = (now - publish_time) / 3600
+        if age_hours > VIRAL_POST_MAX_AGE_HOURS or age_hours < -1:
+            continue
+        text = (post.get("content") or {}).get("text_content") or ""
+        if any(match.group(1) == "视频" for match in MEDIA_PATTERN.finditer(text)):
+            continue
+        if not _is_valid_raw_post(post):
+            continue
+        source_mapping = build_source_image_mapping(post)
+        valid_images = screen.get("valid_images", [])
+        if not isinstance(valid_images, list) or any(
+            not isinstance(img, dict) or img.get("image_id") not in source_mapping
+            for img in valid_images
+        ):
+            continue
+        candidates.append((post, score, view_count, publish_time))
+
+    candidate_ids = [item[0].get("post_id") for item in candidates if item[0].get("post_id") is not None]
+    remodeled_ids = get_remodeled_viral_post_ids(article_manager, BINANCE_SOURCE, candidate_ids)
+    filtered = [
+        item for item in candidates
+        if str(item[0].get("post_id", "")).strip() not in remodeled_ids
+    ]
+    filtered.sort(key=lambda item: (item[1], item[2], item[3]), reverse=True)
+    result = [item[0] for item in filtered]
+    logger.info(
+        "[高流量/选材] 已筛选待重塑神帖 | 扫描: [%s] | 达标(>=4分): [%s] | 已重塑跳过: [%s] | 待生成: [%s] | 耗时: [%.2f 秒]",
+        len(posts), len(candidates), len(candidates) - len(result), len(result), time.monotonic() - started,
+    )
+    return result
+
+
+# 第二阶段模型返回 {post_text,bait_comments,selected_images,self_eval_score} → (bool,错误文本)。
+def check_viral_article_info(raw_info, valid_images, image_mapping, max_chars):
+    expected_keys = {"post_text", "bait_comments", "selected_images", "self_eval_score"}
+    error = _key_error(raw_info, expected_keys, "高流量文章")
+    if error:
+        return False, error
+    text = raw_info["post_text"]
+    if not isinstance(text, str) or not text.strip():
+        return False, "post_text 必须是非空字符串"
+    if len(re.sub(r"\s", "", text)) > max_chars:
+        return False, f"post_text 非空白字符数超过 {max_chars}"
+    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
+        return False, "post_text 不能包含图片或视频占位符"
+    comments = raw_info["bait_comments"]
+    if (not isinstance(comments, list) or not 2 <= len(comments) <= 3
+            or any(not isinstance(item, str) or not item.strip() for item in comments)):
+        return False, "bait_comments 必须是包含 2—3 条非空字符串的列表"
+    selected_images = raw_info["selected_images"]
+    if not isinstance(selected_images, list) or any(not isinstance(item, str) or not item for item in selected_images):
+        return False, "selected_images 必须是非空字符串组成的列表"
+    if len(selected_images) != len(set(selected_images)):
+        return False, "selected_images 不允许重复"
+    if len(selected_images) > 3:
+        return False, "selected_images 最多使用 3 张图片"
+    allowed_ids = [item["image_id"] for item in valid_images if isinstance(item, dict) and "image_id" in item]
+    allowed_set = set(allowed_ids)
+    if any(item not in allowed_set or item not in image_mapping for item in selected_images):
+        return False, "selected_images 必须来自第一阶段 valid_images 且存在真实来源映射"
+    score = raw_info["self_eval_score"]
+    if type(score) not in (int, float) or not 0 <= score <= 10:
+        return False, "self_eval_score 必须是 0—10 的数值，不能是布尔值"
+    return True, ""
+
+
+# 单篇高潜原帖 → 构建第二阶段单帖洗稿与神评生成任务数据。
+def build_viral_article_task(post):
+    post_id = post.get("post_id")
+    post_id_str = str(post_id or "").strip()
+    screen = post["viral_screen"]
+    topic = screen.get("topic_tag") or "奇葩与吃瓜"
+    stance = screen.get("perspective_strategy") or "吃瓜转述视角"
+    normalized_text, _, _ = normalize_post_media(post)
+    source_mapping = build_source_image_mapping(post)
+    valid_images = [
+        {"image_id": img["image_id"], "image_content": img["image_content"]}
+        for img in screen.get("valid_images", [])
+        if isinstance(img, dict) and img.get("image_id") in source_mapping
+    ]
+    image_mapping = {
+        img["image_id"]: {
+            "source": BINANCE_SOURCE,
+            "source_post_id": post_id,
+            "original_image_id": img["image_id"],
+            "original_image_id_list": [img["image_id"]],
+            **source_mapping[img["image_id"]],
+        }
+        for img in valid_images
+    }
+    brief = {
+        "original_post": {
+            "post_id": post_id_str,
+            "text_content": normalized_text,
+        },
+        "stage1_guide": {
+            "viral_score": screen.get("viral_score"),
+            "viral_reason": screen.get("viral_reason", ""),
+            "topic_tag": topic,
+            "perspective_strategy": stance,
+            "core_soul": screen.get("core_soul", ""),
+            "rewrite_direction": screen.get("rewrite_direction", ""),
+            "valid_images": valid_images,
+        },
+    }
+    model_name = "gemini-3.1-pro-preview"
+    record = {
+        "source": BINANCE_SOURCE,
+        "type": ARTICLE_TYPE_VIRAL,
+        "topic": topic,
+        "stance": stance,
+        "status": "processing",
+        "creation_brief": brief,
+        "material_post_mapping": {"M1": post_id},
+        "post_id_list": [post_id],
+        "prompt_file_path": VIRAL_STAGE2_PROMPT_FILE_PATH,
+        "model_name": model_name,
+        "prompt_version": prompt_version,
+        "article_info": None,
+        "error_message": None,
+        "error_history": [],
+        "raw_response": None,
+        "attempt_count": 0,
+    }
+    prompt = read_file_to_str(VIRAL_STAGE2_PROMPT_FILE_PATH)
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"高流量文章提示词为空或读取失败: {VIRAL_STAGE2_PROMPT_FILE_PATH}")
+    return {
+        "record": record,
+        "full_prompt": f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}",
+        "valid_images": valid_images,
+        "image_mapping": image_mapping,
+        "post_id": post_id_str,
+        "topic": topic,
+        "stance": stance,
+        "model_name": model_name,
+    }
+
+
+# 执行单篇高流量帖子洗稿重塑任务并写入 GeneratedArticleManager（type="viral"）。
+def execute_viral_article_task(task_data, article_manager):
+    record = task_data["record"]
+    post_id, topic, stance = task_data["post_id"], task_data["topic"], task_data["stance"]
+    started = time.monotonic()
+    image_mapping = task_data["image_mapping"]
+    valid_images = task_data["valid_images"]
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        record["attempt_count"], record["raw_response"] = attempt, None
+        try:
+            result = generate_content(prompt=task_data["full_prompt"], preset_model_group="medium")
+            record["raw_response"] = result.get("content", "")
+            raw_info = string_to_object(record["raw_response"])
+            valid, error = check_viral_article_info(raw_info, valid_images, image_mapping, ARTICLE_MAX_CHARS)
+            if not valid:
+                raise ValueError(error)
+            selected_images = raw_info["selected_images"]
+            info = {
+                "status": "ok",
+                "text": raw_info["post_text"],
+                "god_comments": raw_info["bait_comments"],
+                "image_placeholders": selected_images,
+                "used_material_ids": ["M1"],
+                "score": float(raw_info["self_eval_score"]),
+                "reason": None,
+                "image_mapping": {key: dict(image_mapping[key]) for key in selected_images},
+                "post_text": raw_info["post_text"],
+                "bait_comments": raw_info["bait_comments"],
+                "selected_images": selected_images,
+                "self_eval_score": float(raw_info["self_eval_score"]),
+            }
+            record["article_info"], record["status"], record["error_message"] = info, "ok", None
+            break
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            record["error_history"].append({
+                "attempt": attempt, "error_message": error_message, "raw_response": record["raw_response"],
+            })
+            exhausted = attempt == LLM_MAX_RETRIES
+            if exhausted:
+                record.update(status="error", article_info=None, error_message=error_message)
+            log = logger.error if exhausted else logger.warning
+            log(
+                "%s[高流量/生成] 模型调用或校验失败 | 原帖: [%s] | 赛道: [%s] | 视角: [%s] | 尝试: [%s/%s] "
+                "| 原因: [%s] | 后续: [%s] | 排查: [检查模型服务、返回字段与配图引用]",
+                "❌ " if exhausted else "", post_id, topic, stance, attempt, LLM_MAX_RETRIES, exc,
+                "返回错误记录，不入库" if exhausted else f"{2 ** attempt} 秒后重试", exc_info=exhausted,
+            )
+            if exhausted:
+                return record
+            time.sleep(2 ** attempt)
+    saved_record = prepare_article_record_for_db(record)
+    article_manager.upsert_articles([saved_record])
+    logger.info(
+        "[高流量/完成] 已重塑并入库 | 原帖: [%s] | 赛道: [%s] | 视角: [%s] | 评分: [%s] | 尝试: [%s] | 耗时: [%.2f 秒]",
+        post_id, topic, stance, saved_record["article_info"]["score"],
+        record["attempt_count"], time.monotonic() - started,
+    )
+    return saved_record
+
+
+# 单轮高流量文章重塑：筛选高潜单帖 → 1对1构建重塑任务 → 并发生成并存入 GeneratedArticleManager。
+def generate_viral_articles_once():
+    started = time.monotonic()
+    manager = GeneratedArticleManager(gen_db_object())
+    posts = extract_valid_viral_posts(manager)
+    tasks = [build_viral_article_task(post) for post in posts]
+    logger.info(
+        "[高流量/计划] 单帖重塑任务就绪 | 待重塑任务: [%s] | 并发上限: [%s] | 模型调用上限: [%s，含重试]",
+        len(tasks), ARTICLE_CONCURRENCY, len(tasks) * LLM_MAX_RETRIES,
+    )
+    results, raised_count = [], 0
+    if tasks:
+        with ThreadPoolExecutor(max_workers=ARTICLE_CONCURRENCY) as executor:
+            futures = {executor.submit(execute_viral_article_task, task, manager): task for task in tasks}
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception:
+                    raised_count += 1
+                    logger.exception(
+                        "❌ [高流量/执行] 任务异常结束 | 原帖: [%s] | 赛道: [%s] | 后续: [继续其他任务] "
+                        "| 排查: [检查任务字段与数据库；保存失败时先核对入库结果]",
+                        task["post_id"], task["topic"],
+                    )
+    counts = Counter(item.get("status") for item in results)
+    logger.info(
+        "[高流量/汇总] 本轮重塑结束 | 任务: [%s] | 成功: [%s] | 失败: [%s] | 耗时: [%.2f 秒]",
+        len(tasks), counts["ok"], counts["error"] + raised_count, time.monotonic() - started,
+    )
+    return results
+
+
+# 持续轮询生成高流量重塑文章；有返回记录等待600秒，无记录或异常等待60秒。
+def generate_viral_articles():
+    while True:
+        try:
+            results = generate_viral_articles_once()
+            time.sleep(ARTICLE_GENERATION_INTERVAL_SECONDS if results else 60)
+        except Exception:
+            logger.exception(
+                "❌ [高流量/轮询] 本轮中断 | 后续: [60 秒后重新查询] "
+                "| 排查: [检查原帖筛查结果、提示词与数据库]"
             )
             time.sleep(60)
 
@@ -1222,6 +1691,7 @@ def _publish_articles_once(article_manager):
             attempts, PUBLISH_MAX_ATTEMPTS, time.monotonic() - started, api_result,
             "远端发布与本地回写完成" if success else error,
         )
+
 
 # 单轮函数、管理器、间隔 → 持续轮询；仅在调度边界打印一次未处理异常，保留失败后继续的策略。
 def _poll_task(task, manager, interval, action):
@@ -1613,6 +2083,7 @@ def _delete_old_posts_once(article_manager):
         )
     try:
         cutoff_ms = int((now - MAX_REPLAY_DAYS * 24 * 3600) * 1000)
+
         for account in ACCOUNTS:
             credential = credentials.get(account)
             if not credential:
@@ -1745,6 +2216,8 @@ def _run_task(task):
             "| 排查: [检查对应链路的数据、文件权限与外部服务]", task.__name__,
         )
         raise
+
+
 def get_need_check_pre_screen_info(
     limit=100,
     no_evidence_filter=None,
@@ -1757,9 +2230,9 @@ def get_need_check_pre_screen_info(
 
     :param limit: 返回的最大样本数（设为 0 或 None 则返回全部匹配记录）
     :param no_evidence_filter:
-        - None: 返回全部已初筛帖子
-        - True: 仅返回被判定为【大概率无论据（已淘汰）】的帖子（用于排查“误杀/漏提”）
-        - False: 仅返回被判定为【可能有论据（已保留）】的帖子（用于排查“放水/多花钱”）
+        * None: 返回全部已初筛帖子
+        * True: 仅返回被判定为【大概率无论据（已淘汰）】的帖子（用于排查“误杀/漏提”）
+        * False: 仅返回被判定为【可能有论据（已保留）】的帖子（用于排查“放水/多花钱”）
     :param only_current_version: 是否仅筛选当前 prompt_version 的初筛记录
     :param random_sample: 是否随机打乱抽样（避免集中看到同一时段或单一币种的帖子）
     :param save_path: 可选文件路径（如 "pre_screen_review.json"），传入后自动保存为 JSON 文件
@@ -1837,14 +2310,15 @@ def get_need_check_pre_screen_info(
     )
     return review_list
 
+
 if __name__ == "__main__":
     # query_hot_posts_by_keyword(target_key="gtc")
     # get_need_check_article_info()
     # data = get_need_check_pre_screen_info(limit=1000)
 
-
     tasks = [
         generate_analysis_articles,
+        generate_viral_articles,
         format_image_article,
         hudong,
         auto_publish_articles,
