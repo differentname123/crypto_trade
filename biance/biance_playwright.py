@@ -154,7 +154,6 @@ class BusinessErrorException(Exception):
 # ==============================================================================
 
 
-
 def clean_browser_cache(user_data_dir):
     """清理浏览器冗余缓存目录、保留登录凭证。单项删除失败按原设计静默忽略（尽力而为，不阻断主流程）。"""
     if not os.path.exists(user_data_dir):
@@ -266,7 +265,6 @@ def _forensics(page, tag, extra=None):
     统一存证：截图 + HTML + JSON（自动附带"视口中心是谁挡住的"诊断与看门狗战果）。
     所有降级 / 失败路径都应调用，杜绝"死无对证"。extra 形貌: 任意可 JSON 序列化的 dict。
     """
-    # 统一存证目录名称，可根据需要修改
     save_dir = "forensics_logs"
     try:
         os.makedirs(save_dir, exist_ok=True)
@@ -316,7 +314,6 @@ _HIT_TEST_JS = r"""
     if (!top) return {ok:false, reason:'no-element-at-point'};
     if (top === el || el.contains(top) || top.contains(el)) return {ok:true};
 
-    // 向上追溯遮挡者，取其最外层 fixed 高层级祖先，便于整层处理
     let blocker = top, hop = 0;
     while (blocker.parentElement && hop < 12) {
         const st = window.getComputedStyle(blocker);
@@ -368,7 +365,6 @@ _NUKE_OVERLAY_JS = r"""
         try { return n.querySelector(guardSelector) !== null; } catch (e) { return false; }
     };
 
-    // 1) 解除 scroll-lock（引导 / modal 几乎必配 body{overflow:hidden}）
     for (const el of [document.body, document.documentElement]) {
         try {
             const st = window.getComputedStyle(el);
@@ -385,7 +381,6 @@ _NUKE_OVERLAY_JS = r"""
         } catch (e) {}
     }
 
-    // 2) 清理覆盖视口中心的高层级浮层
     const cx = window.innerWidth / 2, cy = window.innerHeight / 2;
     const total = window.innerWidth * window.innerHeight;
     document.querySelectorAll('body *').forEach(n => {
@@ -398,7 +393,6 @@ _NUKE_OVERLAY_JS = r"""
             const ratio = (r.width * r.height) / total;
             const coversCenter = (r.left <= cx && r.right >= cx && r.top <= cy && r.bottom >= cy);
             const z = parseInt(st.zIndex || '0', 10);
-            // 判定：大面积遮罩(>=55%) 或 覆盖视口中心且层级很高
             if ((ratio >= 0.55 || (coversCenter && z >= 100)) && !isProtected(n)) {
                 killed.push({
                     tag: n.tagName,
@@ -427,14 +421,13 @@ _INSIDE_EDITOR_JS = """
 def _dismiss_overlays(page, aggressive=False, desc=""):
     """
     分级清障（绝不触碰任何含编辑器的容器）：
-      L1 —— 按语义点掉 Cookie 横幅 / 引导浮层（最安全，让前端正确写 localStorage，后续不再弹）
+      L1 —— 按语义点掉 Cookie 横幅 / 引导浮层
       L2 —— 点弹窗关闭图标 / 按 Escape
       L3 —— aggressive=True 时物理移除遮罩 + 解 scroll-lock（兜底）
     返回：本次是否执行过任何清障动作(bool)。
     """
     acted = False
 
-    # ---- L1-a：Cookie 横幅（OneTrust z-index 极高，必须先吃掉）----
     for sel in COOKIE_SELECTORS:
         try:
             loc = page.locator(sel).first
@@ -446,7 +439,6 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
         except Exception:
             pass
 
-    # ---- L1-b：引导浮层「好的 / 知道了 / Got it」，由宽泛到兜底三级候选 ----
     makers = (
         lambda: page.get_by_role("button", name=RE_DISMISS),
         lambda: page.locator(
@@ -468,7 +460,7 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
                     if not item.is_visible(timeout=300):
                         continue
                     if item.evaluate(_INSIDE_EDITOR_JS, EDITOR_GUARD_SELECTOR):
-                        continue  # 白名单保护：绝不点击编辑器所在容器内的按钮
+                        continue
                     txt = (item.inner_text() or "").strip()[:20]
                     item.click(timeout=2500, no_wait_after=True, force=True)
                     acted = True
@@ -479,7 +471,6 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
         except Exception:
             pass
 
-    # ---- L2：关闭图标 / Escape ----
     if not acted:
         try:
             close_ic = page.locator(
@@ -499,7 +490,6 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
         except Exception:
             pass
 
-    # ---- L3：物理歼灭 + 解锁滚动 ----
     if aggressive:
         try:
             killed = page.evaluate(_NUKE_OVERLAY_JS, EDITOR_GUARD_SELECTOR)
@@ -517,7 +507,6 @@ def _dismiss_overlays(page, aggressive=False, desc=""):
 
 _GUARD_INIT_JS = r"""
 (() => {
-  // ---- A. 预置常见引导"已读"flag（命中即彻底不弹；未命中也无副作用）----
   try {
     const HINT = /guide|tip|tour|onboard|popup|first|newbie|intro|welcome|banner/i;
     const SCOPE = /square|thread|post|short|feed|bibi|social/i;
@@ -531,7 +520,6 @@ _GUARD_INIT_JS = r"""
       .forEach(k => { try { localStorage.setItem(k, 'true'); } catch (e) {} });
   } catch (e) {}
 
-  // ---- B. 常驻看门狗：见引导按钮就点、见 scroll-lock 就解 ----
   const RE = /^\s*(好的|好|知道了|我知道了|明白了|明白|了解|开始使用|立即体验|下一步|完成|跳过|不再提示|不再显示|以后再说|稍后|OK|Okay|Got it|I see|Understood|Skip|Next|Continue|Dismiss|Later)\s*$/i;
   const GUARD_SEL = '.ProseMirror,[contenteditable="true"],input[type="file"],textarea';
 
@@ -551,7 +539,7 @@ _GUARD_INIT_JS = r"""
         if (!t || t.length > 12 || !RE.test(t)) continue;
         const box = n.closest("div[role='dialog'],[class*='modal'],[class*='mask'],"
                               + "[class*='guide'],[class*='popup'],[class*='tour']") || n.parentElement;
-        if (box && box.querySelector(GUARD_SEL)) continue;   // 白名单保护
+        if (box && box.querySelector(GUARD_SEL)) continue;
         const r = n.getBoundingClientRect();
         if (r.width > 0 && r.height > 0) {
           n.click();
@@ -585,7 +573,6 @@ def install_overlay_guard(page):
     ).filter(has_text=RE_DISMISS).first
 
     def _on_overlay():
-        # 🚀 [核心修复] 兜底防死锁：如果常规点击没能关掉浮层，直接用 JS 强制将其物理隐藏
         acted = _dismiss_overlays(page, aggressive=False, desc="locator_handler")
         if not acted:
             try:
@@ -598,7 +585,7 @@ def install_overlay_guard(page):
         logger.info("[守卫/Guard] 浮层免疫已武装 | 机制: 【预置flag + JS看门狗 + locator_handler自愈】")
         return
     except TypeError:
-        pass  # 老版本 Playwright 签名不支持 no_wait_after，退化为兼容模式
+        pass
     except Exception as e:
         logger.warning(
             f"[守卫/Guard] locator_handler 不可用(需 Playwright>=1.42)，退化为手动清障 | 原因: 【{str(e)[:120]}】")
@@ -639,9 +626,6 @@ def _smart_scroll_to_editor(page, max_scrolls=20):
     raise Exception(f"向下滚动 {max_scrolls} 次仍未找到评论输入区，疑似死链、风控滑块拦截或 body 被 scroll-lock 锁死。")
 
 
-# ==============================================================================
-# 修改 2：修改原有的 _resolve_wake_target 函数，加入发帖框的 placeholder
-# ==============================================================================
 def _resolve_wake_target(editor_container):
     """
     解析"点哪里能唤醒编辑器"的候选（兼容评论区和广场主页发帖区）。
@@ -652,7 +636,6 @@ def _resolve_wake_target(editor_container):
             ':not([placeholder*="Search"]):not([aria-label*="搜索"]):not([aria-label*="Search"]),'
             'input[placeholder]:not([type="search"]):not([placeholder*="搜索"]):not([placeholder*="Search"])'
         ).first,
-        # 🚀 专门新增针对广场发帖区特征的识别
         editor_container.get_by_placeholder(
             re.compile(
                 r"(分享您的洞见|Share your insights|分享你的|发布您的回复|发布你的回复|写下你的|说点什么|发表评论|回复|评论|Reply|Comment|Write|Post)",
@@ -760,7 +743,7 @@ _CARET_TO_HEAD_JS = r"""
     if (typeof window.getSelection !== "undefined" && typeof document.createRange !== "undefined") {
         const range = document.createRange();
         range.selectNodeContents(element);
-        range.collapse(true);           // true = 折叠到头部
+        range.collapse(true);
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
@@ -773,8 +756,6 @@ _CARET_TO_HEAD_JS = r"""
 def _force_caret_to_head(page, real_editor, tag=""):
     """
     把光标锁定到编辑器文本的绝对头部——这是保证「正文顶在已注入超链接之前」的关键潜规则。
-    加固：用 locator.evaluate 规避框架重渲染导致的 stale handle；再补 Ctrl+Home 让 ProseMirror
-    内部 selection 与浏览器 selection 同步；最后回报偏移量便于日志核验。
     """
     try:
         real_editor.evaluate(_CARET_TO_HEAD_JS)
@@ -804,8 +785,6 @@ def _force_caret_to_head(page, real_editor, tag=""):
 def _inject_single_link(page, editor_container, real_editor, link_text, link_url, idx):
     """
     在富文本末尾唤起「更多 → 添加链接」弹窗，注入单条超链接并校验上屏。
-    入参形貌: link_text / link_url 均为已清洗非空字符串（link_url 已补全协议头）。
-    成功返回 True；任一环节失败按原设计只跳过该条、不阻断主流程（返回 False）。
     """
     logger.info(f"[编辑器/链接] 开始注入第 【{idx + 1}】 条 | 锚文本: 【{link_text}】 | URL: <{link_url}>")
     try:
@@ -813,7 +792,6 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
         page.keyboard.press("Space")
         page.wait_for_timeout(150)
 
-        # 唤醒"更多"菜单：多级后备选择器抵御图标 DOM 结构变动
         _interact_fallback_locators([
             editor_container.locator('#post-editor-more-icon').first,
             editor_container.locator("svg").filter(has=page.locator('path[d^="M12 16.5"]')).first,
@@ -829,7 +807,6 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
             page.locator('[role="menuitem"], [class*="menu-item"]').filter(has_text=RE_ADD_LINK).first,
         ], action="click", timeout=4000, desc="添加链接选项")
 
-        # 锁定弹窗作用域（无 dialog 角色时退化为整页）
         dialog = page
         try:
             dlg = page.get_by_role("dialog").last
@@ -838,7 +815,6 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
         except Exception:
             pass
 
-        # data-bn-type 为币安专有属性，优先嗅探
         name_input = _interact_fallback_locators([
             dialog.locator('input[name="name"][data-bn-type="input"]').first,
             dialog.locator('input[name="name"]').first,
@@ -866,7 +842,6 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
         confirm_btn.click(timeout=6000)
         expect(name_input).to_be_hidden(timeout=6000)
 
-        # 校验链接确已上屏
         expect(real_editor.locator("a").filter(
             has_text=re.compile(re.escape(link_text), re.IGNORECASE)).first).to_be_visible(timeout=5000)
 
@@ -889,9 +864,8 @@ def _inject_single_link(page, editor_container, real_editor, link_text, link_url
 
 def _type_body(page, real_editor, text):
     """
-    键入正文：键序与延迟与线上一致，仅按 TYPE_CHUNK_SIZE 切分调用避免超长文本撞总超时；
-    每块后校验是否真落字，未落字用 keyboard.insert_text 补录（不改变最终文本）。
-    NEWLINE_SAFE_MODE=True 时才把 \\n 改为 Shift+Enter。
+    键入正文：按 TYPE_CHUNK_SIZE 切分调用避免超长文本撞总超时；
+    每块后校验是否真落字，未落字用 keyboard.insert_text 补录。
     """
     if NEWLINE_SAFE_MODE and "\n" in text:
         lines = text.split("\n")
@@ -914,7 +888,7 @@ def _type_body(page, real_editor, text):
         try:
             real_editor.press_sequentially(seg, delay=TYPE_DELAY_MS, timeout=60000)
         except AttributeError:
-            real_editor.type(seg, delay=TYPE_DELAY_MS, timeout=60000)  # 兼容旧版 Playwright
+            real_editor.type(seg, delay=TYPE_DELAY_MS, timeout=60000)
         except Exception as e:
             logger.warning(f"[编辑器/正文] 第 【{start // TYPE_CHUNK_SIZE}】 块键入抛错，转入落字校验补录 "
                            f"| 详情: 【{str(e)[:120]}】")
@@ -939,7 +913,7 @@ def _type_body(page, real_editor, text):
 # ==============================================================================
 
 def _pick_trusted_send_button(cands):
-    """按原候选顺序挑选发送按钮，仅追加黑名单过滤（「立即回复」等跳转按钮误点会导致正文根本没提交）。"""
+    """按原候选顺序挑选发送按钮，仅追加黑名单过滤。"""
     for c in cands:
         try:
             if c.count() == 0:
@@ -958,10 +932,7 @@ def _pick_trusted_send_button(cands):
 
 
 class _ApiWatcher:
-    """
-    点击前挂 response 监听、点击后轮询取结果。相较 expect_response 的优势：
-    响应早于监听建立、同一动作多次请求、点击本身抛异常等场景都不会漏抓。判据与线上一致。
-    """
+    """点击前挂 response 监听、点击后轮询取结果。"""
 
     def __init__(self, page):
         self.page = page
@@ -1004,7 +975,7 @@ class _ApiWatcher:
 
 
 def _parse_api_json(resp):
-    """兼容 502/风控返回 HTML 而非 JSON 的场景，恒返回 dict（不可解析时为空 dict）。"""
+    """兼容 502/风控返回 HTML 而非 JSON 的场景，恒返回 dict。"""
     try:
         raw = resp.json()
         return raw if isinstance(raw, dict) else {"raw": str(raw)}
@@ -1013,11 +984,7 @@ def _parse_api_json(resp):
 
 
 def _read_api_verdict(page, watcher):
-    """
-    解读发送结果。主判据(与线上一致)：POST pgc/content/add 且 code=000000 或 success=True。
-    返回 (是否成功bool, 评论ID|None)；服务端明确业务拒绝时抛 BusinessErrorException。
-    辅助接口仅用于"主接口没抓到"时识别成功，绝不据此抛业务异常（避免误判扩大打击面）。
-    """
+    """解读发送结果。主判据：POST pgc/content/add 且 code=000000 或 success=True。"""
     resp = watcher.wait_primary(API_WAIT_TIMEOUT_MS)
     if resp is not None:
         body = _parse_api_json(resp)
@@ -1057,29 +1024,18 @@ def _read_api_verdict(page, watcher):
 #                              核心：提交一条评论
 # ==============================================================================
 
-
 def _submit_comment(page, editor_container, comment, image_path_list=None, url_info_list=None, chart_info=None,
                     sentiment=None):
-    """
-    在隔离作用域内跑完发帖全链路：唤醒 →[图片]→[超链接]→ 光标置顶 →[正文]→[强制光标置底]→[图表]→[情绪标签]→ 发送校验。
-    入参形貌: url_info_list = [{"text": str, "url": str}, ...]
-              image_path_list = [str, str, ...] 或单 str
-              chart_info = {"coin": "BTC", "bridge": "USDT", "type": "future"}
-              sentiment = "看多" | "看空" | None
-    返回评论ID(str) 或 None。
-    """
+    """在隔离作用域内跑完发帖全链路。"""
     comment = str(comment) if comment else ""
 
     _dismiss_overlays(page, aggressive=False, desc="pre-submit")
     report_guard_hits(page, "pre-submit")
 
-    # ---- 步骤 1：唤醒富文本编辑器 ----
     real_editor = _wake_editor(page, editor_container)
 
-    # ---- 步骤 2：注入图片（支持多图，严格遵循列表顺序）----
     valid_images = []
     if image_path_list:
-        # 兼容旧版调用传单字符串的情况
         if isinstance(image_path_list, str):
             image_path_list = [image_path_list]
         for p in image_path_list:
@@ -1091,33 +1047,29 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
     if valid_images:
         file_input = editor_container.locator('input[type="file"]').first
         try:
-            # 【策略 A】: 原生列表批量注入 (底层严格按照 List 顺序构建 DOM FileList)
             file_input.set_input_files(valid_images, timeout=15000)
             mounted = False
             try:
-                # 等待最后一张图片（缩略图）渲染出来，确保全部按序挂载完毕
                 expect(editor_container.locator(
                     "img[src^='blob'],img[src^='http'],img[src^='data:'],[class*='thumb'],[class*='preview'] img"
                 ).nth(len(valid_images) - 1)).to_be_visible(timeout=15000)
                 mounted = True
             except Exception:
-                page.wait_for_timeout(3500)  # 等不到缩略图则退回固定等待
+                page.wait_for_timeout(3500)
             logger.info(f"[编辑器/图片] 图片批量挂载完毕 | 数量: 【{len(valid_images)}】张 | "
                         f"缩略图全可见: 【{mounted}】 | 结果: [Success]")
         except Exception as e:
             logger.warning(f"[编辑器/图片] 批量注入失败，可能前端缺失 multiple 属性。进入逐张降级保序上传模式 | "
                            f"错误: 【{str(e)[:150]}】")
-            # 【策略 B】: 降级为逐张物理排队注入 (对抗不支持 multiple 的远古控件)
             try:
                 for idx, img_path in enumerate(valid_images):
                     file_input.set_input_files(img_path, timeout=5000)
-                    page.wait_for_timeout(1000)  # 强制给前端留出读取并追加 UI 的时间，保证顺序
+                    page.wait_for_timeout(1000)
                 logger.info(f"[编辑器/图片] 逐张降级上传完毕 | 数量: 【{len(valid_images)}】张 | 结果: [Success]")
             except Exception as sub_e:
                 logger.warning(f"[编辑器/图片] 逐张降级上传依然失败，本条自动降级为纯文本 | "
                                f"致命错误: 【{str(sub_e)[:150]}】")
 
-    # ---- 步骤 3：注入超链接（先注入，让超链接垫底）----
     links = [u for u in (url_info_list or []) if isinstance(u, dict)] if isinstance(url_info_list, list) else []
     if links:
         logger.info(f"[编辑器/链接] 检测到超链接任务 | 数量: 【{len(links)}】 | 结果: [启动注入流]")
@@ -1131,10 +1083,8 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
         _dismiss_overlays(page, aggressive=False, desc=f"pre-link-{idx}")
         _inject_single_link(page, editor_container, real_editor, link_text, link_url, idx)
 
-    # ---- 核心潜规则：强制光标置顶，防止正文写进超链接或历史残留物之后 ----
     _force_caret_to_head(page, real_editor, tag="before-body")
 
-    # ---- 步骤 4：注入正文 ----
     if comment.strip():
         logger.info(f"[编辑器/正文] 开始键入正文 | 字符数: 【{len(comment)}】 | 分块: 【{TYPE_CHUNK_SIZE}】")
         page.wait_for_timeout(800)
@@ -1159,7 +1109,6 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 
         logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
         try:
-            # 💡 核心修复点 1：状态同步前也强制锁死光标到底部，不留给前端跳焦点的机会
             _force_caret_to_tail(page, real_editor, tag="resync")
             real_editor.press("Space")
             page.wait_for_timeout(100)
@@ -1170,15 +1119,11 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 
         logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
 
-    # ---- 步骤 4.5：注入图表（移动到此处，确保追加在整个文档的绝对末尾）----
     if chart_info:
         logger.info("[编辑器/图表] 准备在正文末尾注入图表...")
         _dismiss_overlays(page, aggressive=False, desc="pre-chart")
-
-        # 💡 核心修复点 2：图表注入前，强制光标到整个文本的绝对末尾
         _force_caret_to_tail(page, real_editor, tag="before-chart")
 
-        # 安全换行，确保图表在正文下方另起一行（Shift+Enter 防止误触发发送）
         try:
             real_editor.press("Shift+Enter")
             page.wait_for_timeout(200)
@@ -1188,11 +1133,10 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 
         _inject_chart(page, editor_container, chart_info)
 
-    # ---- 步骤 4.6：注入情绪标签（看多/看空）----
     if sentiment:
         _inject_sentiment(page, editor_container, sentiment)
 
-    # ---- 步骤 5：定位并点击发送 ----
+    # 开始点击发送
     _dismiss_overlays(page, aggressive=False, desc="pre-send")
     send_btn_cands = [
         editor_container.locator("button").filter(has_text=RE_SEND_EXACT).first,
@@ -1292,7 +1236,6 @@ def _submit_comment(page, editor_container, comment, image_path_list=None, url_i
 def extract_binance_post_id(post_url):
     """
     从帖子 URL 提取纯数字 post_id（严格路径优先，失败退化为宽松匹配再退化为数字尾段）。
-    兼容 /square/post/123、/zh-CN/square/post/123、/square/post/history/123 及各 binance 镜像域。
     """
     raw = str(post_url or "").strip()
     if not raw:
@@ -1316,11 +1259,11 @@ def extract_binance_post_id(post_url):
 
 
 # ==============================================================================
-#                                  主控入口
+#                                  主控入口辅助
 # ==============================================================================
 
 def _alert_failure_scene(error_msg):
-    """失败终局提示：响铃 + 聚合打印失败原因。刻意不再 input() 挂起，保证全自动化不卡死。"""
+    """失败终局提示：响铃 + 聚合打印失败原因。"""
     sys.stdout.write("\a")
     sys.stdout.flush()
     logger.error(f"\n{'=' * 60}\n[中断/Halt] 🚨 任务异常终止（已保存故障现场，不阻塞等待人工）"
@@ -1329,8 +1272,7 @@ def _alert_failure_scene(error_msg):
 
 def _verify_page_ready(page, response, post_id):
     """
-    落地页四重体检，返回错误描述(str) 或 None(通过)。顺序即优先级：
-    HTTP 状态 → post_id 漂移(重定向/删帖) → 登录态 → 平台软拦截(拉黑/权限)。
+    落地页四重体检，返回错误描述(str) 或 None(通过)。
     """
     if response and response.status >= 400:
         return f"页面加载异常或帖子已被删除 (HTTP 状态码: {response.status})"
@@ -1338,7 +1280,7 @@ def _verify_page_ready(page, response, post_id):
     if post_id:
         landed = unquote(page.url)
         if post_id not in landed:
-            page.wait_for_timeout(2000)  # 给 SPA 的 replaceState 一点滞后余量
+            page.wait_for_timeout(2000)
             landed = unquote(page.url)
         if post_id not in landed:
             editor_alive = True
@@ -1367,14 +1309,10 @@ def _verify_page_ready(page, response, post_id):
     return None
 
 
-# ==============================================================================
-# 新增 1：主页发帖区定位器（基于你提供的 HTML 特征）
-# ==============================================================================
 def _locate_post_creator(page):
     """
-    精准锁定广场主页最顶部的发帖区容器（包含编辑器、工具栏和发文按钮的宏大容器）。
+    精准锁定广场主页最顶部的发帖区容器。
     """
-    # 策略 1：基于 HTML 提供的高度特定 class 定位 (最稳定)
     precise_locator = page.locator("div.short-editor-inner").first
     try:
         if precise_locator.is_visible(timeout=3000):
@@ -1383,7 +1321,6 @@ def _locate_post_creator(page):
     except Exception:
         pass
 
-    # 策略 2：基于占位符或发文按钮的向上溯源
     try:
         fallback_input = page.get_by_placeholder(re.compile(r"分享您的洞见|Share your insights", re.IGNORECASE)).first
         if fallback_input.is_visible(timeout=3000):
@@ -1395,13 +1332,84 @@ def _locate_post_creator(page):
     except Exception:
         pass
 
-    # 策略 3：兜底，在主页上发帖区永远是第一个富文本编辑器
     logger.warning("[定位/DOM] 精确定位与溯源均未命中，降级为锁定页面首个富文本容器")
     return page.locator('div:has(div[contenteditable="true"].ProseMirror), div:has(input[type="file"])').first
 
 
 # ==============================================================================
-# 新增 2：自动发帖主入口函数
+#                          会话管理 / 凭证提取 / 人工接管
+# ==============================================================================
+
+def login_and_save_session():
+    """打开可见浏览器供人工手动登录，回车后关闭并把会话固化到本地 User Data 目录。"""
+    logger.info(f"[登录/Auth] 准备手动登录 | 存储路径: <{USER_DATA_DIR}>")
+    clean_browser_cache(USER_DATA_DIR)
+
+    with sync_playwright() as p:
+        context = None
+        try:
+            context = _launch_persistent(
+                p, USER_DATA_DIR,
+                args=['--disable-blink-features=AutomationControlled', '--start-maximized'],
+                hide_automation=False,
+                debug=True,  # 🟢 修复：显式传参以启用有头模式
+            )
+            page = context.new_page()
+            page.goto(LOGIN_URL)
+            input("\n[登录/Auth] 等待操作 | 动作: 【登录成功后，请按 Enter 键关闭并保存会话】")
+            logger.info("[登录/Auth] 会话已固化到本地 | 结果: [Success]")
+        finally:
+            if context:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True, debug=True):
+    """
+    统一的持久化上下文启动口，已修复 DevTools 快捷键失效问题
+    🟢 修复：将 debug 默认值改为 True，并确保 headless 参数正确响应 debug
+    """
+    kwargs = {
+        "channel": "chrome",
+        "user_data_dir": user_data_dir,
+        "headless": not debug,  # 当 debug=True 时 headless=False（有头模式），debug=False 时 headless=True（无头模式）
+        "args": args
+    }
+
+    # 🚀 核心修复 1：彻底关闭 Playwright 的内部视口模拟机制
+    if viewport:
+        kwargs["viewport"] = viewport
+    else:
+        # 必须显式传入 no_viewport=True，否则 Playwright 会默认 800x600 模拟并劫持输入
+        kwargs["no_viewport"] = True
+
+    # 🚀 核心修复 2：剔除那些会破坏 Chrome 原生快捷键的默认参数
+    ignored_args = []
+    if hide_automation:
+        ignored_args.append("--enable-automation")
+
+    # 恢复 Chrome 底层负责路由部分快捷键的组件
+    ignored_args.extend([
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-component-extensions-with-background-pages"
+    ])
+    kwargs["ignore_default_args"] = ignored_args
+
+    context = p.chromium.launch_persistent_context(**kwargs)
+
+    # 🚀 核心修复 3：主动赋予环境剪贴板读写权限，防止 Ctrl+C / Ctrl+V 被沙箱静默拦截
+    try:
+        context.grant_permissions(['clipboard-read', 'clipboard-write'])
+    except Exception as e:
+        logger.warning(f"[环境] 剪贴板权限授予失败，可能影响 F12 粘贴: {e}")
+
+    return context
+
+
+# ==============================================================================
+#                                  主控入口 (发帖)
 # ==============================================================================
 def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_DIR,
                         url_info_list=None, chart_info=None, sentiment=None, debug=True):
@@ -1444,6 +1452,7 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
                     p, user_data_dir,
                     args=debug_args if debug else offscreen_args,
                     viewport=None if debug else {'width': 1920, 'height': 1080},
+                    debug=debug,  # 🟢 修复：将外层的 debug 透传进底层
                 )
                 context.set_default_timeout(60000)
                 context.set_default_navigation_timeout(60000)
@@ -1479,7 +1488,6 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
                 except Exception as e:
                     return f"无法定位发帖区: {e}", False, None
 
-                # 🚀 传入所有的附件参数，包括 chart_info 和 sentiment
                 post_id = _submit_comment(page, editor_container, content, image_path_list, url_info_list, chart_info,
                                           sentiment)
 
@@ -1515,6 +1523,9 @@ def create_binance_post(content, image_path_list=None, user_data_dir=USER_DATA_D
         return error_info, False, None
 
 
+# ==============================================================================
+#                                  主控入口 (评论)
+# ==============================================================================
 def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_dir=USER_DATA_DIR,
                             url_info_list=None, chart_info=None, sentiment=None, debug=False):
     """
@@ -1560,6 +1571,7 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
                     p, user_data_dir,
                     args=debug_args if debug else offscreen_args,
                     viewport=None if debug else {'width': 1920, 'height': 1080},
+                    debug=debug,  # 🟢 修复：将外层的 debug 透传进底层
                 )
                 context.set_default_timeout(60000)
                 context.set_default_navigation_timeout(60000)
@@ -1598,7 +1610,6 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
 
                 check_for_crash(page)
 
-                # 🚀 传入所有的附件参数，包括 chart_info 和 sentiment
                 comment_id = _submit_comment(page, editor_container, comment, image_path_list, url_info_list,
                                              chart_info, sentiment)
                 logger.info(
@@ -1652,79 +1663,38 @@ def comment_on_binance_post(post_url, comment, image_path_list=None, user_data_d
 
 
 # ==============================================================================
-#                          会话管理 / 凭证提取 / 人工接管
+#                                  人工接管函数
 # ==============================================================================
-
-def login_and_save_session():
-    """打开可见浏览器供人工手动登录，回车后关闭并把会话固化到本地 User Data 目录。"""
-    logger.info(f"[登录/Auth] 准备手动登录 | 存储路径: <{USER_DATA_DIR}>")
-    clean_browser_cache(USER_DATA_DIR)
-
+def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN"):
+    """启动可见浏览器交由人工自由操作（含 window-position 归零 + 置顶，防历史屏幕外坐标缓存）。"""
+    logger.info(f"\n{'=' * 60}\n[人工/Manual] 启动本地浏览器交接控制权 | 目录: <{user_data_dir}>\n{'=' * 60}")
     with sync_playwright() as p:
         context = None
         try:
             context = _launch_persistent(
-                p, USER_DATA_DIR,
-                args=['--disable-blink-features=AutomationControlled', '--start-maximized'],
-                hide_automation=False,
+                p, user_data_dir,
+                args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'],
+                debug=True,  # 🟢 修复：显式传参以启用有头模式
             )
-            page = context.new_page()
-            page.goto(LOGIN_URL)
-            input("\n[登录/Auth] 等待操作 | 动作: 【登录成功后，请按 Enter 键关闭并保存会话】")
-            logger.info("[登录/Auth] 会话已固化到本地 | 结果: [Success]")
+            page = context.pages[0] if context.pages else context.new_page()
+            page.bring_to_front()
+            page.goto(home_url)
+            logger.info("[人工/Manual] ✅ 浏览器已就绪，控制权已交接 | 🛑 退出方式: 【直接关闭浏览器窗口，程序自动结束】")
+            page.wait_for_event("close", timeout=0)
+        except Exception as e:
+            logger.warning(f"[人工/Manual] 浏览器运行异常 | 可能原因: 【环境损坏或窗口被手动强杀: {e}】")
         finally:
             if context:
                 try:
                     context.close()
                 except Exception:
                     pass
+            logger.info("[人工/Manual] 👋 窗口已关闭，控制权收回，系统资源已释放。\n")
 
-def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=True, debug=False):
-    """统一的持久化上下文启动口，已修复 DevTools 快捷键失效问题"""
-    kwargs = {
-        "channel": "chrome",
-        "user_data_dir": user_data_dir,
-        "headless": not debug,
-        "args": args
-    }
-
-    # 🚀 核心修复 1：彻底关闭 Playwright 的内部视口模拟机制
-    if viewport:
-        kwargs["viewport"] = viewport
-    else:
-        # 必须显式传入 no_viewport=True，否则 Playwright 会默认 800x600 模拟并劫持输入
-        kwargs["no_viewport"] = True
-
-        # 🚀 核心修复 2：剔除那些会破坏 Chrome 原生快捷键的默认参数
-    ignored_args = []
-    if hide_automation:
-        ignored_args.append("--enable-automation")
-
-    # 恢复 Chrome 底层负责路由部分快捷键的组件
-    ignored_args.extend([
-        "--disable-extensions",
-        "--disable-default-apps",
-        "--disable-component-extensions-with-background-pages"
-    ])
-    kwargs["ignore_default_args"] = ignored_args
-
-    context = p.chromium.launch_persistent_context(**kwargs)
-
-    # 🚀 核心修复 3：主动赋予环境剪贴板读写权限，防止 Ctrl+C / Ctrl+V 被沙箱静默拦截
-    try:
-        context.grant_permissions(['clipboard-read', 'clipboard-write'])
-    except Exception as e:
-        logger.warning(f"[环境] 剪贴板权限授予失败，可能影响 F12 粘贴: {e}")
-
-    return context
 
 def get_auth_tokens_robust(user_data_dir, debug=False):
     """
     以真实浏览器请求为样本提取脱机 API 凭证，同时顺带提取 User Data。
-    流程：Headed 打开广场作者页 → 拦截首个非 OPTIONS 的 `pgc/user/client` 请求 → 取其 csrftoken/cookie；
-    请求头无 Cookie 时，回退用 context.cookies("https://www.binance.com") 拼装。
-    顺带后台监听 `pgc/user?getFollowCount` 接口来获取用户基本信息。
-    返回: (cookie|None, csrf|None, user_data|None)
     """
     if not os.path.exists(user_data_dir):
         logger.warning(f"[凭证/Auth] 环境目录不存在，无法提取 | 目录: <{user_data_dir}>")
@@ -1732,7 +1702,7 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
 
     visit_url = "https://www.binance.com/zh-CN/square/profile/insights_anchor"
     api_keyword = "pgc/user/client"
-    user_api_keyword = "pgc/user?getFollowCount"  # 新增：目标用户接口的特征关键字
+    user_api_keyword = "pgc/user?getFollowCount"
 
     logger.info(
         f"[凭证/Auth] 启动浏览器提取凭证(Headed 必须可见) | 目录: <{user_data_dir}> | 主拦截: <{api_keyword}> | 辅拦截: <{user_api_keyword}>")
@@ -1749,27 +1719,21 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
             )
             page = context.pages[0] if context.pages else context.new_page()
 
-            # ================= 新增块：后台非阻塞监听目标用户接口的响应 =================
             user_api_responses = []
 
             def on_response(res):
-                # 过滤出符合条件的 GET 响应
                 if user_api_keyword in res.url and res.request.method != "OPTIONS":
                     user_api_responses.append(res)
 
-            # 挂载监听器（完全不会阻塞主线程）
             page.on("response", on_response)
-            # ========================================================================
 
             with page.expect_request(
                     lambda req: api_keyword in req.url and req.method != "OPTIONS", timeout=20000
             ) as req_info:
-                # wait_until="networkidle" 能大概率保证页面请求加载完毕，此时 user 接口也跑完了
                 page.goto(visit_url, wait_until="networkidle")
 
-            # --- 第1步：提取原有的核心凭证（最重要，不作任何干预） ---
             req = req_info.value
-            headers = req.headers  # Playwright 返回的 header key 恒为小写
+            headers = req.headers
             csrf = (headers.get("csrftoken") or "").strip() or None
             cookie = (headers.get("cookie") or "").strip()
             source = "request-header"
@@ -1791,25 +1755,20 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
                   f"| Cookie长度: 【{len(cookie)}】 | 含核心 p20t: 【{has_p20t}】"
                   f"{'' if (has_p20t and csrf) else ' | 提醒: 缺失 p20t 或 CSRF，后续 API 很可能 401/400'}")
 
-            # --- 第2步：提取用户 data 字段（放在最后，容错处理） ---
             user_data = None
             for res in user_api_responses:
                 try:
-                    # 确保状态码 200 才去解析
                     if res.ok:
                         json_body = res.json()
-                        # 检查 success 为 true，然后取出 data
                         if json_body and json_body.get("success"):
                             user_data = json_body.get("data")
                             logger.info(
                                 f"[凭证/Auth] 成功捕获用户信息 | 目录: <{user_data_dir}> | 昵称: 【{user_data.get('displayName')}】 | UID: 【{user_data.get('squareUid')}】")
                             break
                 except Exception as e:
-                    # 即使 JSON 解析崩溃也直接吞掉，绝不能影响凭证返回
                     logger.debug(
                         f"[凭证/Auth] 尝试解析用户信息响应时出现异常(已忽略) | 目录: <{user_data_dir}> | 详情: {e}")
 
-            # 返回 3 个元素
             return cookie, csrf, user_data
 
         except PlaywrightTimeoutError:
@@ -1827,41 +1786,9 @@ def get_auth_tokens_robust(user_data_dir, debug=False):
                     pass
 
 
-def open_browser_for_manual_use(user_data_dir, home_url="https://www.binance.com/zh-CN"):
-    """启动可见浏览器交由人工自由操作（含 window-position 归零 + 置顶，防历史屏幕外坐标缓存）。"""
-    logger.info(f"\n{'=' * 60}\n[人工/Manual] 启动本地浏览器交接控制权 | 目录: <{user_data_dir}>\n{'=' * 60}")
-    with sync_playwright() as p:
-        context = None
-        try:
-            context = _launch_persistent(
-                p, user_data_dir,
-                args=['--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'],
-            )
-            page = context.pages[0] if context.pages else context.new_page()
-            page.bring_to_front()
-            page.goto(home_url)
-            logger.info("[人工/Manual] ✅ 浏览器已就绪，控制权已交接 | 🛑 退出方式: 【直接关闭浏览器窗口，程序自动结束】")
-            page.wait_for_event("close", timeout=0)
-        except Exception as e:
-            logger.warning(f"[人工/Manual] 浏览器运行异常 | 可能原因: 【环境损坏或窗口被手动强杀: {e}】")
-        finally:
-            if context:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-            logger.info("[人工/Manual] 👋 窗口已关闭，控制权收回，系统资源已释放。\n")
-
-
 def _inject_chart(page, editor_container, chart_info):
     """
-    注入图表卡片逻辑：
-1.
-点击图表图标
-    2. 输入目标币种 (coin)
-    3. 拦截 /trade/widget/list 接口，解析返回的 JSON
-    4. 匹配 coin, bridge, type，找到目标对应的精确索引
-    5. 点击前端列表中对应索引的项
+    注入图表卡片逻辑。
     """
     if not chart_info or not isinstance(chart_info, dict):
         return False
@@ -1877,21 +1804,17 @@ def _inject_chart(page, editor_container, chart_info):
     logger.info(f"[编辑器/图表] 开始注入图表 | 目标: {coin}-{bridge} ({c_type})")
 
     try:
-        # 1. 点击图表图标 (依靠特定的 SVG path 识别)
         chart_icon = _interact_fallback_locators([
             editor_container.locator('svg path[d^="M17.123 1.803"]').locator(".."),
             editor_container.locator('.trade-widget-icon, [class*="widget-icon"]').first
         ], action="click", timeout=5000, desc="添加图表图标")
         page.wait_for_timeout(500)
 
-        # 2. 定位搜索框
         search_input = _interact_fallback_locators([
             page.locator('input[aria-label*="搜索币种"], input[placeholder*="搜索币种"]').first,
             page.locator('.bn-textField-input').first
         ], action="wait", timeout=5000, desc="图表搜索框")
 
-        # 3. 设置接口拦截器并填入内容
-        # 币安的前端可能会发多次请求，我们需要确保拿到 keyword 匹配的那一次
         def is_target_request(response):
             if "pgc/trade/widget/list" in response.url and response.request.method == "POST":
                 try:
@@ -1904,10 +1827,8 @@ def _inject_chart(page, editor_container, chart_info):
 
         with page.expect_response(is_target_request, timeout=10000) as response_info:
             search_input.fill(coin)
-            # 模拟真实输入停顿，触发前端防抖(debounce)发请求
             page.wait_for_timeout(800)
 
-        # 4. 解析接口响应，寻找目标索引
         resp = response_info.value
         body = resp.json()
         items = body.get("data", [])
@@ -1928,14 +1849,8 @@ def _inject_chart(page, editor_container, chart_info):
 
         logger.info(f"[编辑器/图表] 匹配成功 | 目标在列表中的索引为: 【{target_index}】")
 
-        # 5. 在 DOM 中点击对应索引的列表项
-        # 列表容器通常包含 cursor-pointer 和 hover 效果
         list_items = page.locator('div.overflow-y-auto > div.cursor-pointer')
-
-        # 等待元素渲染
         list_items.nth(target_index).wait_for(state="visible", timeout=5000)
-
-        # 点击指定索引的项
         list_items.nth(target_index).click(timeout=3000)
         page.wait_for_timeout(800)
 
@@ -1954,15 +1869,13 @@ def _inject_chart(page, editor_container, chart_info):
 
 def _inject_sentiment(page, editor_container, sentiment):
     """
-    注入情绪（看多/看空）图标逻辑：
-    识别特征：共用同一个 SVG path（M20.91 6.861...），"看空"的 SVG 多了 style="transform: rotateX(180deg);"。
+    注入情绪（看多/看空）图标逻辑。
     """
     if not sentiment or sentiment not in ["看多", "看空"]:
         return
 
     logger.info(f"[编辑器/情绪] 准备点击情绪标签 | 目标: 【{sentiment}】")
     try:
-        # 1. 根据核心 path 寻找对应的包含该情绪图标的 SVG 集合
         svg_locators = editor_container.locator('svg').filter(has=page.locator('path[d^="M20.91 6.861"]'))
         count = svg_locators.count()
         if count == 0:
@@ -1972,7 +1885,6 @@ def _inject_sentiment(page, editor_container, sentiment):
         target_svg = None
         for i in range(count):
             svg_node = svg_locators.nth(i)
-            # 通过获取 style 属性判断是否被 rotateX(180deg) 翻转
             style_str = svg_node.get_attribute("style") or ""
             is_bear = "rotateX(180deg)" in style_str
 
@@ -1984,7 +1896,6 @@ def _inject_sentiment(page, editor_container, sentiment):
                 break
 
         if target_svg:
-            # 情绪按钮通常存在于父级 div，点击其父级容器触发选中
             target_svg.locator("..").click(timeout=3000)
             page.wait_for_timeout(500)
             logger.info(f"[编辑器/情绪] 情绪标签点击成功 | 结果: [Success]")
@@ -2001,9 +1912,9 @@ def _inject_sentiment(page, editor_container, sentiment):
 # ==============================================================================
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
-    # login_and_save_session()                                  # 初次手动登录并固化 Session
-    open_browser_for_manual_use(USER_DATA_DIR)  # 人工接管调试
-    # cookies, csrf = get_auth_tokens_robust(USER_DATA_DIR)     # 提取脱机 API 凭证
+    # login_and_save_session()
+    # open_browser_for_manual_use(USER_DATA_DIR)
+    # cookies, csrf, udata = get_auth_tokens_robust(USER_DATA_DIR)
 
     test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
     test_msg = "少即是多，慢即是快。同频共振！🚀"
@@ -2028,23 +1939,19 @@ if __name__ == "__main__":
     else:
         logger.error(f"\n[结果/Final] ❌ ======== 任务失败 ======== | 最终追溯:\n{err}")
 
-    # 1. 拟定发帖文案
-    test_content = "交易所的估值天花板，正在被真实的线下消费捅破。\n\n何一确认：币安支付现已接入日本全国 PayPay 商户。这不是小圈子里的链上自嗨，而是把加密支付直接接进了主流线下商业网络。\n\n多数人看 BNB，眼光始终停留在手续费折扣和打新挖矿。但当它跳出交易所围墙、切入真实世界的支付场景时，流动性就不再只是投机筹码，而是有了实体刚需做托底。\n\n靠发预告撑不起长线，能在街头实体里跑通闭环的生态，基本盘只会越来越硬。"
+    test_content = "$BTC \n\n交易所的估值天花板，正在被真实的线下消费捅破。\n\n何一确认：币安支付现已接入日本全国 PayPay 商户。这不是小圈子里的链上自嗨，而是把加密支付直接接进了主流线下商业网络。\n\n多数人看 BNB，眼光始终停留在手续费折扣和打新挖矿。但当它跳出交易所围墙、切入真实世界的支付场景时，流动性就不再只是投机筹码，而是有了实体刚需做托底。\n\n靠发预告撑不起长线，能在街头实体里跑通闭环的生态，基本盘只会越来越硬。"
 
-    # 2. 配置目标图表 (支持 type="future" 合约 或 type="spot" 现货)
     target_chart = {
         "coin": "BTC",
         "bridge": "USDT",
         "type": "future"
     }
 
-    # 3. 可选：附带跳转链接 / 图片
     test_links = [
         {"text": "更多行情", "url": "https://www.binance.com"}
     ]
-    test_images = [r"E:\chrome\1759239193.png"]  # 如需测试图片可传: [r"E:\chrome\1759239193.png"]
+    test_images = [r"E:\chrome\1759239193.png"]
 
-    # 4. 调用发帖函数（建议保持 debug=True，方便直接观察搜索框输入和列表点击动作）
     err, success, p_id = create_binance_post(
         content=test_content,
         image_path_list=test_images,

@@ -148,7 +148,7 @@ def check_format_info(json_data, placeholders):
     # 更新字段集合：废弃 coins，改为 target_coin，新增 raw_hook
     evidence_keys = {
         "target_coin", "stance", "dimension", "core_fact",
-        "logic_link", "raw_hook", "impact_weight", "shelf_life", "images",
+        "logic_link", "raw_hook", "impact_weight", "shelf_life", "images", "impact_reason"
     }
     image_keys = {"image_id", "image_type", "context", "usable", "unusable_reason"}
     enums = {
