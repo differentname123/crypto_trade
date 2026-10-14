@@ -1370,7 +1370,6 @@ def delete_old_post():
         deleted_reverse = deleted_timeout = failed = account_errors = 0
         deleted_post_ids = set()
         now = time.time()
-        ACCOUNTS.reverse()  # 轮询账号交替顺序
 
         logger.info("[历史清理/开始] 启动帖子清理轮询 | 账号数: [%s]", len(ACCOUNTS))
 
