@@ -878,7 +878,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
         symbol = hot_coins[0]["symbol"].replace("USDT", "").replace("USDC", "")
         tags.extend([f"#{symbol}", f"${symbol} "])
     logger.debug("[文章/标签] 标签已准备 | 主题: [%s] | 标签: [%s]", topic, tags)
-    return text + "\n" + "\n".join(tags)
+    return text + "\n\n\n" + "\n".join(tags)
 
 
 COIN_TAG_PATTERN = re.compile(r"\$[A-Za-z0-9_]*[A-Za-z][A-Za-z0-9_]*")
@@ -941,6 +941,37 @@ def _publish_articles_once(article_manager):
     """调度并发布一轮；管理器返回含 topic/article_info/publish_attempts 的文章列表。
     article_info 含 text/score/image_placeholders/image_mapping；回写账号状态及发布字段，无返回。
     """
+    def _extract_article_images(article_doc):
+        """提取文章实际使用的图片地址集合（包含 original_url 与 local_path），并返回用于统计的主地址列表。"""
+        info_dict = article_doc.get("article_info")
+        if not isinstance(info_dict, dict):
+            return set(), []
+        image_mapping = info_dict.get("image_mapping")
+        if not isinstance(image_mapping, dict) or not image_mapping:
+            return set(), []
+
+        placeholders = info_dict.get("image_placeholders")
+        if isinstance(placeholders, list) and placeholders:
+            mappings = [image_mapping[p] for p in placeholders if p in image_mapping]
+        else:
+            mappings = list(image_mapping.values())
+
+        all_addrs = set()
+        primary_urls = []
+        for item in mappings:
+            if not isinstance(item, dict):
+                continue
+            orig_url = (item.get("original_url") or "").strip()
+            local_path = (item.get("local_path") or "").strip()
+            if orig_url:
+                all_addrs.add(orig_url)
+            if local_path:
+                all_addrs.add(local_path)
+            primary = orig_url or local_path
+            if primary:
+                primary_urls.append(primary)
+        return all_addrs, primary_urls
+
     now = time.time()
     state = (read_json(STATE_FILE) or {}) if os.path.exists(STATE_FILE) else {}
     for account in ACCOUNTS:
@@ -950,33 +981,90 @@ def _publish_articles_once(article_manager):
             "last_error_time": 0, "topic_publish_history": {},
         }.items():
             account_state.setdefault(key, value)
-    candidates = article_manager.find_articles(query={
-        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
-        "status": "ok", "publish_status": {"$ne": "success"},
+
+    # 1. 查询最近 6 小时内发布成功的帖子，汇总所有已使用的图片地址列表
+    recent_success_articles = article_manager.find_articles(query={
+        "status": "ok",
+        "publish_status": "success",
+        "publish_time": {"$gte": now - 6 * 3600},
     }) or []
-    # 并且要求 prompt_version 与当前一致，避免旧 prompt 生成的文章被发布。
-    candidates = [
-        article for article in candidates
-        if article.get("prompt_version") == prompt_version
-    ]
+
+    used_image_addrs = set()
+    used_image_list = []
+    for pub_article in recent_success_articles:
+        addrs, primary_list = _extract_article_images(pub_article)
+        used_image_addrs.update(addrs)
+        for url in primary_list:
+            if url not in used_image_list:
+                used_image_list.append(url)
+
+    # 2. 查询最近 6 小时内待发布的候选帖子
+    raw_candidates = article_manager.find_articles(query={
+        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
+        "status": "ok",
+        "publish_status": {"$ne": "success"},
+    }) or []
 
     hot_coins = {str(coin).lower() for coin in (get_hot_coin() or [])}
-    # : 原实现要求至少一张图，与旧注释“无图”相反；按实际筛选保留含图要求。
-    # : 次数限制只在本轮入口检查，失败文章可被后续账号继续尝试，单轮可能超过上限。
-    articles = [
-        article for article in candidates
-        if isinstance(article.get("article_info", {}), dict)
-           and len(article.get("article_info", {}).get("image_placeholders", [])) >= 0
-           and article.get("publish_attempts", 0) < PUBLISH_MAX_ATTEMPTS
-           and (article.get("topic") or "").lower() in hot_coins
-    ]
+
+    # 3. 逐层过滤并统计每个类别过滤掉的文章数量
+    filter_stats = {
+        "prompt_version_mismatch": 0,  # 提示词版本不符
+        "invalid_article_info": 0,     # article_info 结构异常或图片占位符非法
+        "exceed_max_attempts": 0,      # 发布尝试次数达到上限
+        "not_hot_coin": 0,             # 主题不在当前热门币种列表内
+        "duplicate_image": 0,          # 使用了最近 6 小时内已发布成功帖子的图片
+    }
+    articles = []
+
+    for article in raw_candidates:
+        if article.get("prompt_version") != prompt_version:
+            filter_stats["prompt_version_mismatch"] += 1
+            continue
+
+        info = article.get("article_info")
+        if not isinstance(info, dict) or not isinstance(info.get("image_placeholders", []), list):
+            filter_stats["invalid_article_info"] += 1
+            continue
+
+        if article.get("publish_attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
+            filter_stats["exceed_max_attempts"] += 1
+            continue
+
+        if (article.get("topic") or "").lower() not in hot_coins:
+            filter_stats["not_hot_coin"] += 1
+            continue
+
+        article_img_addrs, _ = _extract_article_images(article)
+        if article_img_addrs and (article_img_addrs & used_image_addrs):
+            filter_stats["duplicate_image"] += 1
+            continue
+
+        articles.append(article)
+
     articles.sort(key=lambda item: item.get("article_info", {}).get("score", 0), reverse=True)
+    total_filtered = sum(filter_stats.values())
+
+    logger.info(
+        "[发布/过滤统计] 近 6 小时文章筛选完成 | 原始查询: [%s] | 最终候选: [%s] | 过滤总数: [%s] "
+        "| 过滤明细 -> 版本不符: [%s], 结构异常: [%s], 尝试超限(>=%s): [%s], 非热门币种: [%s], 图片重复: [%s] "
+        "| 近 6 小时已发成功帖: [%s] | 已占用图片数: [%s]",
+        len(raw_candidates), len(articles), total_filtered,
+        filter_stats["prompt_version_mismatch"],
+        filter_stats["invalid_article_info"],
+        PUBLISH_MAX_ATTEMPTS, filter_stats["exceed_max_attempts"],
+        filter_stats["not_hot_coin"],
+        filter_stats["duplicate_image"],
+        len(recent_success_articles), len(used_image_list),
+    )
+
     logger.info(
         "[发布/计划] 近 6 小时含图文章已按评分排序 | 查询: [%s] | 候选: [%s] "
         "| 配置账号: [%s] | 账号冷却: [%s 秒] | 同账号同主题冷却: [%s 秒]",
-        len(candidates), len(articles), len(ACCOUNTS),
+        len(raw_candidates), len(articles), len(ACCOUNTS),
         ACCOUNT_COOLDOWN_SECONDS, ACCOUNT_TOPIC_COOLDOWN_SECONDS,
     )
+
     for account in ACCOUNTS:
         if not articles:
             break
@@ -985,32 +1073,46 @@ def _publish_articles_once(article_manager):
         if remaining > 0:
             logger.debug("[发布/账号] 仍在冷却 | 账号: [%s] | 剩余: [%s 秒]", account, int(remaining))
             continue
-        # : 同主题冷却按原始 topic 区分大小写；计时仍统一使用本轮开始时间。
-        selected_index = next((
-            index for index, article in enumerate(articles)
-            if now - account_state["topic_publish_history"].get(article.get("topic", ""), 0)
-               >= ACCOUNT_TOPIC_COOLDOWN_SECONDS
-        ), None)
+
+        # 挑选满足同账号同主题冷却、且未与本轮前序已发布文章发生图片冲突的候选文章
+        selected_index = None
+        for index, cand in enumerate(articles):
+            if now - account_state["topic_publish_history"].get(cand.get("topic", ""), 0) < ACCOUNT_TOPIC_COOLDOWN_SECONDS:
+                continue
+            cand_img_addrs, _ = _extract_article_images(cand)
+            if cand_img_addrs and (cand_img_addrs & used_image_addrs):
+                logger.info(
+                    "[发布/同轮去重] 候选文章与本轮刚发布的图片重复，跳过 | 账号: [%s] | 文章: [%s] | 主题: [%s]",
+                    account, cand.get("_id"), cand.get("topic"),
+                )
+                continue
+            selected_index = index
+            break
+
         if selected_index is None:
-            logger.debug("[发布/账号] 所有候选主题仍在冷却 | 账号: [%s]", account)
+            logger.debug("[发布/账号] 所有候选主题仍在冷却或图片冲突 | 账号: [%s]", account)
             continue
+
         article = articles[selected_index]
         info, topic = article.get("article_info", {}), article.get("topic", "")
         stance = article.get("stance", "")
         started = time.monotonic()
         stage, api_result = "准备正文、媒体及账号配置", "尚未调用"
         try:
-            text = info.get('text', '')
+            text = info.get("text", "")
             if topic:
-                text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda match: "$" + topic + " ",
-                              text, flags=re.IGNORECASE)
+                text = re.sub(
+                    rf"(?<!\$)\b{re.escape(topic)}\b",
+                    lambda match: "$" + topic + " ",
+                    text,
+                    flags=re.IGNORECASE,
+                )
             text = add_hot_topic_to_article(text, topic) + "\n\n\n\n\n\n👇"
-            # 如果 text 不是以 $ 开头，则在开头加上 $topic，且不重复添加。
-            if not text.startswith(f"${topic}"):
-                text = f"${topic} {info.get('text', '')}"
+            # 修复原逻辑覆盖问题：基于已追加标签的 text 补充开头 $topic，而非重置为 info.get('text', '')
+            if topic and not text.startswith(f"${topic}"):
+                text = f"${topic} {text}"
 
             text_list = _build_publish_text_list(text)
-            # : 沿用完整 image_mapping 的插入顺序，不按占位符再次筛选；缺失路径传 None。
             image_paths = [mapping.get("local_path") or None for mapping in info.get("image_mapping", {}).values()]
             user_data_dir = get_config(f"{account}_browser_session_dir")
             attempts = article.get("publish_attempts", 0) + 1
@@ -1018,7 +1120,7 @@ def _publish_articles_once(article_manager):
             err, success, post_id = create_binance_post(
                 content=text, image_path_list=image_paths, user_data_dir=user_data_dir,
                 chart_info={"coin": topic, "bridge": "USDT", "type": "future"}, sentiment=stance,
-                debug=True, text_list=text_list
+                debug=True, text_list=text_list,
             )
             post_id = str(post_id)
             api_result = "成功" if success else "失败"
@@ -1031,16 +1133,18 @@ def _publish_articles_once(article_manager):
                 changes = {
                     "publish_status": "success", "published_by": account, "publish_time": now,
                     "binance_post_id": post_id, "publish_attempts": attempts,
-                    "publish_price": latest_price
+                    "publish_price": latest_price,
                 }
+                # 实时将本篇新发布成功的图片加入已用集合，防止同轮后续账号重复使用
+                new_img_addrs, _ = _extract_article_images(article)
+                used_image_addrs.update(new_img_addrs)
             else:
                 error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
-                changes = {"publish_status": "failed", "last_error": error, "publish_attempts": attempts,
-                           "publish_price": latest_price
-
-                           }
-            # : 保留先文件后数据库的非事务写入；接口抛异常不累计次数，回写失败可能导致重复发布。
+                changes = {
+                    "publish_status": "failed", "last_error": error, "publish_attempts": attempts,
+                    "publish_price": latest_price,
+                }
             stage = "写入账号状态文件"
             save_json(STATE_FILE, state)
             stage = "回写数据库发布状态"
@@ -1064,7 +1168,7 @@ def _publish_articles_once(article_manager):
 
 
 def auto_publish_articles():
-    """发布后台任务：独立管理器，启动后等 60 秒，每轮结束后等 600 秒。"""
+    """发布后台任务：独立管理器，每轮结束后等 600 秒。"""
     article_manager = GeneratedArticleManager(gen_db_object())
     # time.sleep(60)
     while True:
@@ -1078,7 +1182,6 @@ def auto_publish_articles():
             )
         finally:
             time.sleep(PUBLISH_POLL_SECONDS)
-
 
 def build_search_text(post):
     """生成搜索文本；post.content 含 text_content/mentioned_coins。
