@@ -145,9 +145,10 @@ def check_format_info(json_data, placeholders):
     if not isinstance(json_data["evidences"], list):
         return False, "evidences 必须是列表"
 
+    # 更新字段集合：废弃 coins，改为 target_coin，新增 raw_hook
     evidence_keys = {
-        "core_fact", "logic_link", "dimension", "coins",
-        "stance", "impact_weight", "shelf_life", "images",
+        "target_coin", "stance", "dimension", "core_fact",
+        "logic_link", "raw_hook", "impact_weight", "shelf_life", "images",
     }
     image_keys = {"image_id", "image_type", "context", "usable", "unusable_reason"}
     enums = {
@@ -156,23 +157,37 @@ def check_format_info(json_data, placeholders):
         "shelf_life": ("hours", "days", "weeks", "long", "unknown"),
     }
     image_types = ("盘面截图", "数据图表", "新闻截图", "社交截图", "收益截图", "梗图表情", "实拍照片", "其他")
-    # : 保留原校验边界：顶层允许额外字段、evidences 可为空；
-    # core_fact/context/coins 元素不新增类型限制，图片允许遗漏或重复引用，不强制一一覆盖。
+
     for index, evidence in enumerate(json_data["evidences"], 1):
         label = f"evidences[{index}]"
         error = _key_error(evidence, evidence_keys, label)
         if error:
             return False, error
+
+        # 标的校验：单一主语、非空、必须大写 (宏观为 MARKET)
+        target_coin = evidence["target_coin"]
+        if not isinstance(target_coin, str) or not target_coin.strip():
+            return False, f"{label}.target_coin 必须是非空字符串"
+        if target_coin != target_coin.upper():
+            return False, f"{label}.target_coin 必须为大写英文字符串: {target_coin!r}"
+
+        # 文本事实与逻辑断言字段校验
+        if not isinstance(evidence["core_fact"], str) or not evidence["core_fact"].strip():
+            return False, f"{label}.core_fact 必须是非空字符串"
         if not isinstance(evidence["logic_link"], str):
-            return False, f"{label}.logic_link 必须是字符串"
+            return False, f"{label}.logic_link 必须是字符串（允许为空字符串）"
+        if not isinstance(evidence["raw_hook"], str):
+            return False, f"{label}.raw_hook 必须是字符串（允许为空字符串）"
+
+        # 普通人开仓冲动权重 (1~5 整数，防止 bool 穿透)
         weight = evidence["impact_weight"]
         if not isinstance(weight, int) or isinstance(weight, bool) or not 1 <= weight <= 5:
             return False, f"{label}.impact_weight 必须是 1—5 的整数，不能是布尔值"
+
         for field, allowed in enums.items():
             if evidence[field] not in allowed:
                 return False, f"{label}.{field} 取值不合法: {evidence[field]!r}"
-        if not isinstance(evidence["coins"], list) or not evidence["coins"]:
-            return False, f"{label}.coins 必须是非空列表"
+
         if not isinstance(evidence["images"], list):
             return False, f"{label}.images 必须是列表"
 
@@ -193,7 +208,6 @@ def check_format_info(json_data, placeholders):
             if not usable and not reason.strip():
                 return False, f"{image_label} 不可用时必须说明 unusable_reason"
     return True, ""
-
 
 def gen_media_format_info(post):
     """提取并校验论据；post 含 post_id/content.text_content/media.local_mapping。
@@ -238,9 +252,9 @@ def process_and_save_single_post(post, post_manager):
     post_id = post.get("post_id", "UNKNOWN_ID") if isinstance(post, dict) else "UNKNOWN_ID"
     try:
         format_info = gen_media_format_info(post)
-        format_info["prompt_version"] = prompt_version
         if not format_info:
             return
+        format_info["prompt_version"] = prompt_version
         post["logic_mul"] = format_info
         post_manager.upsert_posts([post])
         logger.info(
@@ -252,7 +266,6 @@ def process_and_save_single_post(post, post_manager):
             "❌ [帖子/处理] 当前帖子失败 | 帖子: [%s] | 后续: [结束本帖，继续其他任务] "
             "| 排查: [检查帖子字段、提示词和媒体路径、数据库连接]", post_id,
         )
-
 
 def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     """按币种/排序采集后统一回写；管理器接收 [帖子字典]，其余为币种序列和接口参数。
@@ -392,9 +405,9 @@ def build_source_image_mapping(post):
 
 def transform_mlus(mlu_list):
     """把论据转成创作素材，保持多图证据链完整及同帖同图去重。
-    输入项含 core_fact、logic_link、images[{image_id, usable, context}]、
+    输入项含 core_fact、logic_link、raw_hook、images[{image_id, usable, context}]、
     source_post_id、source_image_mapping；缺少映射时由 source_text_content 恢复。
-    返回 ([{id, fact, underlying_logic, visual_evidence}], {ASSET占位符: 来源字典})；
+    返回 ([{id, fact, underlying_logic, raw_hook, visual_evidence}], {ASSET占位符: 来源字典})；
     visual_evidence 为 None、单图字典或有序多图列表，图项含 placeholder/what_it_shows。
     """
     materials, image_mapping, asset_by_source = [], {}, {}
@@ -403,6 +416,7 @@ def transform_mlus(mlu_list):
             "id": f"M{index}",
             "fact": evidence.get("core_fact", ""),
             "underlying_logic": evidence.get("logic_link", ""),
+            "raw_hook": evidence.get("raw_hook", ""),  # 将提取到的高感染力金句透传给下游文章生成模型
             "visual_evidence": None,
         }
         materials.append(material)
@@ -448,7 +462,6 @@ def transform_mlus(mlu_list):
         material["visual_evidence"] = visual_items[0] if len(visual_items) == 1 else visual_items
     return materials, image_mapping
 
-
 def extract_and_group_valid_evidences():
     """按时效/币种/立场筛选并按权重排序，返回 {coin: {stance: [论据]}}。
     论据追加 source_post_id/publish_time/source_text_content/source_image_mapping。
@@ -483,17 +496,25 @@ def extract_and_group_valid_evidences():
             if len(images) < 1 or any(image.get("usable") is not True for image in images):
                 continue
             duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
-            coins, stance = evidence.get("coins", []), evidence.get("stance")
-            if age > duration or not isinstance(coins, list) or not coins or stance not in ("看多", "看空"):
+
+            # 适配 target_coin (兼容旧版 coins 列表兜底)
+            target_coin = str(evidence.get("target_coin") or "").strip().upper()
+            if not target_coin and isinstance(evidence.get("coins"), list):
+                candidate_coins = [str(c).strip().upper() for c in evidence["coins"] if str(c).strip()]
+            else:
+                candidate_coins = [target_coin] if target_coin else []
+
+            stance = evidence.get("stance")
+            if age > duration or not candidate_coins or stance not in ("看多", "看空"):
                 continue
+
             enriched = {
                 **evidence, "source_post_id": post.get("post_id", "UNKNOWN"),
                 "publish_time": publish_time,
                 "source_text_content": (post.get("content") or {}).get("text_content", ""),
                 "source_image_mapping": source_mapping,
             }
-            for coin in coins:
-                coin = str(coin).strip().upper()
+            for coin in candidate_coins:
                 if coin and coin in hot_coins and coin in active_symbols:
                     grouped[coin][stance].append(enriched)
     for stances in grouped.values():
@@ -509,7 +530,6 @@ def extract_and_group_valid_evidences():
         invalid_times, time.monotonic() - started,
     )
     return result
-
 
 def check_article_info(article_info, materials, image_mapping, max_chars):
     """校验文章与证据链；article_info 必须含下方七字段。
