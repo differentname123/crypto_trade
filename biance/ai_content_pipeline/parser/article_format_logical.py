@@ -1698,11 +1698,103 @@ def _run_task(task):
             "| 排查: [检查对应链路的数据、文件权限与外部服务]", task.__name__,
         )
         raise
+def get_need_check_pre_screen_info(
+    limit=100,
+    no_evidence_filter=None,
+    only_current_version=True,
+    random_sample=True,
+    save_path=None,
+):
+    """
+    查询已有初筛结果及模型原始输入数据（post_id、清洗后正文、图片占位符列表），用于人工复盘漏判与误判。
 
+    :param limit: 返回的最大样本数（设为 0 或 None 则返回全部匹配记录）
+    :param no_evidence_filter:
+        - None: 返回全部已初筛帖子
+        - True: 仅返回被判定为【大概率无论据（已淘汰）】的帖子（用于排查“误杀/漏提”）
+        - False: 仅返回被判定为【可能有论据（已保留）】的帖子（用于排查“放水/多花钱”）
+    :param only_current_version: 是否仅筛选当前 prompt_version 的初筛记录
+    :param random_sample: 是否随机打乱抽样（避免集中看到同一时段或单一币种的帖子）
+    :param save_path: 可选文件路径（如 "pre_screen_review.json"），传入后自动保存为 JSON 文件
+    :return: 包含原始输入与初筛结果的字典列表
+    """
+    post_manager = UniversalPostManager(gen_db_object())
+
+    # 1. 组装 MongoDB 查询条件
+    query = {
+        "source": BINANCE_SOURCE,
+        "pre_screen": {"$exists": True, "$ne": None},
+    }
+    if only_current_version:
+        query["pre_screen.prompt_version"] = prompt_version
+    if isinstance(no_evidence_filter, bool):
+        query["pre_screen.no_evidence"] = no_evidence_filter
+
+    # 2. 查询数据库（兼容 collection 直查、find_posts 方法与内存过滤兜底）
+    raw_posts = []
+    try:
+        if hasattr(post_manager, "collection"):
+            raw_posts = list(post_manager.collection.find(query))
+        elif hasattr(post_manager, "find_posts"):
+            raw_posts = post_manager.find_posts(query=query) or []
+        else:
+            all_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+            for p in all_posts:
+                ps = p.get("pre_screen")
+                if not isinstance(ps, dict) or not isinstance(ps.get("no_evidence"), bool):
+                    continue
+                if only_current_version and ps.get("prompt_version") != prompt_version:
+                    continue
+                if isinstance(no_evidence_filter, bool) and ps.get("no_evidence") != no_evidence_filter:
+                    continue
+                raw_posts.append(p)
+    except Exception as exc:
+        logger.error(f"❌ [初筛/审查] 查询已初筛帖子失败 | 异常: {exc}")
+        return []
+
+    # 3. 统计整体淘汰与保留分布
+    total_matched = len(raw_posts)
+    total_no_ev = sum(1 for p in raw_posts if (p.get("pre_screen") or {}).get("no_evidence") is True)
+    total_has_ev = total_matched - total_no_ev
+
+    # 4. 抽样与截取
+    if random_sample:
+        random.shuffle(raw_posts)
+    selected_posts = raw_posts[:limit] if (limit and limit > 0) else raw_posts
+
+    # 5. 组装审查数据结构（还原初筛输入 + 拼接初筛结论）
+    review_list = []
+    for post in selected_posts:
+        if not isinstance(post, dict):
+            continue
+        base_item = build_pre_screen_item(post)
+        pre_screen = post.get("pre_screen") or {}
+
+        review_item = {
+            "post_id": base_item["post_id"],
+            "text_content": base_item["text_content"],
+            "images": base_item["images"],
+            "no_evidence": pre_screen.get("no_evidence"),
+            "reason": pre_screen.get("reason", ""),
+        }
+        review_list.append(review_item)
+
+    if save_path:
+        save_json(save_path, review_list)
+
+    logger.info(
+        "[初筛/审查] 已导出初筛复盘数据 | 匹配总数: [%s (淘汰: %s / 保留: %s)] "
+        "| 本次抽取: [%s] | 过滤条件(no_evidence): [%s] | 导出文件: [%s]",
+        total_matched, total_no_ev, total_has_ev,
+        len(review_list), no_evidence_filter, save_path or "未落盘",
+    )
+    return review_list
 
 if __name__ == "__main__":
     # query_hot_posts_by_keyword(target_key="gtc")
     # get_need_check_article_info()
+    # data = get_need_check_pre_screen_info(limit=1000)
+
 
     tasks = [
         generate_analysis_articles,
