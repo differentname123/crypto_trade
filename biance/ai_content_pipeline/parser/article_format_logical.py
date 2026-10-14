@@ -1250,21 +1250,74 @@ def clean_article_records(raw_records):
 
 def get_need_check_article_info():
     """
-    组装待审查的文章信息
-    :return:
+    组装待审查的文章信息，并查询关联材料的原始帖子数据。
+
+    :return: (selected_data, cleaned_source_posts) 两个列表:
+             1. selected_data: 清洗后的待审查文章数据列表
+             2. cleaned_source_posts: 清洗后的原帖列表，元素包含 text_content 与 logic_mul
     """
     article_manager = GeneratedArticleManager(gen_db_object())
     candidates = article_manager.find_articles(query={
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
-        "status": "ok", "publish_status": {"$ne": "success"},
+        "status": "ok",
+        "publish_status": {"$ne": "success"},
     }) or []
 
-    cleaned_data = clean_article_records(candidates)
-    # 随机选择 50个
-    random.shuffle(cleaned_data)
-    selected_data = cleaned_data[:20]
+    # 1. 优先对原始候选记录打乱并抽取 20 篇，保留原始 material_post_mapping 字段
+    random.shuffle(candidates)
+    selected_candidates = candidates[:10]
 
-    logger.info("[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s]", len(candidates), len(selected_data))
+    # 2. 清洗待审查文章结构
+    selected_data = clean_article_records(selected_candidates)
+
+    # 3. 收集抽取文章中所有材料对应的原始帖子 post_id
+    raw_post_ids = set()
+    for article in selected_candidates:
+        mapping = article.get("material_post_mapping") or {}
+        if isinstance(mapping, dict):
+            for post_id in mapping.values():
+                if post_id:
+                    raw_post_ids.add(str(post_id).strip())
+
+    cleaned_source_posts = []
+    # 4. 根据 post_id 批量查询 post_manager 里的原帖并清洗
+    if raw_post_ids:
+        post_manager = UniversalPostManager(gen_db_object())
+        id_list = list(raw_post_ids)
+        # 兼容 post_id 字段在 MongoDB 中存储为字符串或整型数值的情况
+        query_ids = list(id_list) + [int(i) for i in id_list if i.isdigit()]
+        query = {"post_id": {"$in": query_ids}}
+
+        raw_posts = []
+        try:
+            if hasattr(post_manager, "collection"):
+                raw_posts = list(post_manager.collection.find(query))
+            elif hasattr(post_manager, "find_posts"):
+                raw_posts = post_manager.find_posts(query=query) or []
+            else:
+                posts_in_db = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+                target_id_set = set(query_ids)
+                raw_posts = [p for p in posts_in_db if p.get("post_id") in target_id_set]
+        except Exception as exc:
+            logger.error(f"❌ [文章/待审查] 查询原帖素材失败 | 异常: {exc}")
+
+        # 5. 清洗原帖字段，仅保留 text_content 和 logic_mul
+        for post in raw_posts:
+            if not isinstance(post, dict):
+                continue
+            content = post.get("content") or {}
+            cleaned_source_posts.append({
+                "origin_content": content.get("text_content", ""),
+                "logic_mul": post.get("logic_mul"),
+            })
+
+    logger.info(
+        "[文章/待审查] 已组装待审查文章信息 | 候选: [%s] | 随机抽取: [%s] | 关联原帖素材: [%s]",
+        len(candidates), len(selected_data), len(cleaned_source_posts)
+    )
+
+    return selected_data, cleaned_source_posts
+
 
 MAX_REPLAY_DAYS = 7
 DELETE_INTERVAL_SEC = 3600  # 调整为每小时检查一次，确保及时发现并清理逆向帖子
