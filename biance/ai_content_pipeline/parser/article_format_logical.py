@@ -1384,7 +1384,7 @@ def build_viral_article_task(post):
 
     comments = post.get("comments", [])
     comments = [comment_info["content"] for comment_info in comments]
-
+    comments = comments[:20]
 
     brief = {
         "current_year": datetime.now(BEIJING_TZ).year,
