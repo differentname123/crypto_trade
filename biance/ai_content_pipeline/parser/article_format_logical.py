@@ -640,10 +640,10 @@ def batch_screen_viral_posts(posts, post_manager):
 def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     started = time.monotonic()
     posts, token_count = [], 0
-    for token in token_list:
-        token_count += 1
-        for order in orders:
-            posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
+    # for token in token_list:
+    #     token_count += 1
+    #     for order in orders:
+    #         posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
     posts.extend(fetch_binance_feed(count=feed_count * 2))
     if posts:
         post_manager.upsert_posts(posts)
@@ -660,7 +660,7 @@ def fetch_post(post_manager):
 
 # 管理器、币种序列 → 热门/最新流及综合流入库。
 def fetch_hot_post(post_manager, token_list):
-    _fetch_and_save_posts(post_manager, token_list, (1, 2), 100)
+    _fetch_and_save_posts(post_manager, token_list, (1, 2), 1000)
 
 
 # top_k → {top_gainers/top_losers:[{symbol,percentage}]}；局部行情客户端在异常时也关闭。
@@ -708,7 +708,7 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            # fetch_hot_post(post_manager, get_hot_coin())
+            fetch_hot_post(post_manager, get_hot_coin())
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
             if not posts:
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
