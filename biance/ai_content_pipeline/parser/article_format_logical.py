@@ -45,7 +45,7 @@ from biance.biance_squre_api import (
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
-prompt_version = "1015-3"
+prompt_version = "1015-4"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -707,7 +707,7 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_hot_post(post_manager, get_hot_coin())
+            # fetch_hot_post(post_manager, get_hot_coin())
             posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
             if not posts:
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
@@ -1361,11 +1361,18 @@ def build_viral_article_task(post):
         }
         for img_id, meta in source_mapping.items()
     }
+
+
+    comments == post.get("comments", [])
+    comments = [comment_info["content"] for comment_info in comments ]
+
+
     brief = {
         "current_year": datetime.now(BEIJING_TZ).year,
         "original_post": {
             "post_id": post_id_str,
             "text_content": normalized_text.strip(),
+            "comments":comments,
             "available_images": list(placeholders.keys()),
         },
         "stage1_screen": {
@@ -2515,7 +2522,7 @@ if __name__ == "__main__":
 
     tasks = [
         # generate_analysis_articles,
-        generate_viral_articles,
+        # generate_viral_articles,
         format_image_article,
         # hudong,
         # auto_publish_articles,
