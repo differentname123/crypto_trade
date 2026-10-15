@@ -64,7 +64,7 @@ MEDIUM_MODEL_LIST = [
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
     {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
-    {"model_name": "gpt-6-codex-sol-max", "权重": 1, "备注": "来源codex 付费"},
+    {"model_name": "gpt-6-codex-sol-max", "权重": 5, "备注": "来源codex 付费"},
 
 ]
 LOW_MODEL_LIST = [
