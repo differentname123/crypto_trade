@@ -2317,7 +2317,7 @@ def _inject_sentiment(page, editor_container, sentiment):
 if __name__ == "__main__":
     # 其他可选入口（按需取消注释）：
     # login_and_save_session()
-    # open_browser_for_manual_use(USER_DATA_DIR)
+    open_browser_for_manual_use(USER_DATA_DIR)
     # cookies, csrf, udata = get_auth_tokens_robust(USER_DATA_DIR)
 
     # test_url = "https://www.binance.com/zh-CN/square/post/309692475255842"
