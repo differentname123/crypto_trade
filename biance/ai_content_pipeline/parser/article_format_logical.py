@@ -2792,6 +2792,9 @@ def _publish_viral_articles_for_platform(article_manager, platform):
         f"publish_records.{platform}.status": {"$ne": "success"},
     }) or []
 
+    # topic 必须是 "搞钱与盈亏"
+    raw_candidates = [article for article in raw_candidates if (article.get("topic") or "").strip() == "搞钱与盈亏"]
+
     stats = Counter()
     candidates = []
     for article in raw_candidates:
