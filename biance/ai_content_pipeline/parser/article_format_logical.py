@@ -45,7 +45,7 @@ from biance.biance_squre_api import (
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
-prompt_version = "1015-1"
+prompt_version = "1015-2"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
