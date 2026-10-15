@@ -1363,8 +1363,8 @@ def build_viral_article_task(post):
     }
 
 
-    comments == post.get("comments", [])
-    comments = [comment_info["content"] for comment_info in comments ]
+    comments = post.get("comments", [])
+    comments = [comment_info["content"] for comment_info in comments]
 
 
     brief = {
@@ -2522,7 +2522,7 @@ if __name__ == "__main__":
 
     tasks = [
         # generate_analysis_articles,
-        # generate_viral_articles,
+        generate_viral_articles,
         format_image_article,
         # hudong,
         # auto_publish_articles,
