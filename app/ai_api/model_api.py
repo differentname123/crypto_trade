@@ -68,7 +68,7 @@ MEDIUM_MODEL_LIST = [
 
 ]
 LOW_MODEL_LIST = [
-    {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
+    # {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
     # {"model_name": "gemma-api-key-4-31b-it", "权重": 0, "备注": "来源api key aistudio "},
 
