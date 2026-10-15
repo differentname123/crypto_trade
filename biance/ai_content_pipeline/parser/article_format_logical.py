@@ -2311,9 +2311,155 @@ def get_need_check_pre_screen_info(
     return review_list
 
 
+def get_need_check_viral_article_info(
+        limit=100,
+        hours=6,
+        only_current_version=True,
+        random_sample=True,
+        save_path=None,
+):
+    """
+    获取高流量重塑文章及其来源原帖的对照审查数据（精简人肉复盘格式）。
+
+    :param limit: 返回的最大抽样条数（传 0 或 None 则返回全部）
+    :param hours: 查询最近多少小时内生成的文章，默认 6 小时
+    :param only_current_version: 是否严格限制 prompt_version
+    :param random_sample: 是否随机抽样
+    :param save_path: 可选保存文件路径（如 "viral_review.json"）
+    :return: 精简对照字典列表 [ {"source_post": ..., "remodeled_article": ...}, ... ]
+    """
+    article_manager = GeneratedArticleManager(gen_db_object())
+
+    # 1. 查询待审核的流量文章 (type="viral", 成功生成且未发布)
+    query = {
+        "type": ARTICLE_TYPE_VIRAL,
+        "status": "ok",
+        "publish_status": {"$ne": "success"},
+    }
+    if hours and hours > 0:
+        query["created_at"] = {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}
+    if only_current_version:
+        query["prompt_version"] = prompt_version
+
+    candidates = article_manager.find_articles(query=query, sort=[("created_at", -1)]) or []
+    if not candidates:
+        logger.info("[高流量/审查] 未找到待审查文章 | 筛选时间: [近 %s 小时]", hours)
+        return []
+
+    # 2. 抽样
+    if random_sample:
+        random.shuffle(candidates)
+    selected_articles = candidates[:limit] if (limit and limit > 0) else candidates
+
+    # 3. 收集原帖 ID 准备批量反查
+    post_ids = set()
+    for art in selected_articles:
+        p_list = art.get("post_id_list") or []
+        for pid in p_list:
+            if pid is not None and str(pid).strip():
+                post_ids.add(str(pid).strip())
+                if str(pid).strip().isdigit():
+                    post_ids.add(int(pid))
+
+    # 4. 批量查询原帖
+    post_map = {}
+    if post_ids:
+        post_manager = UniversalPostManager(gen_db_object())
+        query_ids = list(post_ids)
+        p_query = {"post_id": {"$in": query_ids}}
+        raw_posts = []
+        try:
+            if hasattr(post_manager, "collection"):
+                raw_posts = list(post_manager.collection.find(p_query))
+            elif hasattr(post_manager, "find_posts"):
+                raw_posts = post_manager.find_posts(query=p_query) or []
+            else:
+                all_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+                raw_posts = [p for p in all_posts if
+                             p.get("post_id") in query_ids or str(p.get("post_id")) in query_ids]
+        except Exception:
+            logger.exception("❌ [高流量/审查] 关联原帖查询异常")
+
+        for p in raw_posts:
+            if isinstance(p, dict) and p.get("post_id") is not None:
+                post_map[str(p["post_id"]).strip()] = p
+
+    # 5. 组装极致精简的审查结构
+    review_list = []
+    for article in selected_articles:
+        # 定位关联合适的原帖
+        p_list = article.get("post_id_list") or []
+        target_post_id = str(p_list[0]).strip() if p_list else ""
+        if not target_post_id:
+            mapping = article.get("material_post_mapping") or {}
+            target_post_id = str(mapping.get("M1", "")).strip()
+
+        raw_p = post_map.get(target_post_id, {})
+        info = article.get("article_info") or {}
+        v_screen = raw_p.get("viral_screen") or {}
+        engagement = raw_p.get("engagement") or {}
+
+        # 5.1 原帖图文规范化（长 URL 替换为占位符 [IMAGE_1]...）
+        clean_text, _, mapping = normalize_post_media(raw_p) if raw_p else ("", [], {})
+        image_placeholders = list(mapping.keys())
+
+        # 5.2 原帖信息：图文分离，保留互动数据与完整的 viral_screen（含 valid_images）
+        source_post_data = {
+            "text": clean_text.strip(),
+            "images": image_placeholders,
+            "engagement": {
+                "view_count": engagement.get("view_count", 0),
+                "like_count": engagement.get("like_count", 0),
+                "comment_count": engagement.get("comment_count", 0),
+            },
+            "viral_screen": {
+                "viral_score": v_screen.get("viral_score"),
+                "topic_tag": v_screen.get("topic_tag"),
+                "perspective_strategy": v_screen.get("perspective_strategy"),
+                "viral_reason": v_screen.get("viral_reason") or v_screen.get("reject_reason", ""),
+                "core_soul": v_screen.get("core_soul", ""),
+                "rewrite_direction": v_screen.get("rewrite_direction", ""),
+                "valid_images": [
+                    {
+                        "image_id": img.get("image_id"),
+                        "image_content": img.get("image_content"),
+                    }
+                    for img in v_screen.get("valid_images", [])
+                    if isinstance(img, dict)
+                ],
+            },
+        }
+
+        # 5.3 洗稿重塑文章：去除非必要包装与重复的 stage1 字段
+        remodeled_article_data = {
+            "topic_tag": article.get("topic", ""),
+            "perspective_strategy": article.get("stance", ""),
+            "post_text": info.get("text") or info.get("post_text", ""),
+            "bait_comments": info.get("god_comments") or info.get("bait_comments", []),
+            "selected_images": info.get("image_placeholders") or info.get("selected_images", []),
+            "self_eval_score": info.get("score") if info.get("score") is not None else info.get("self_eval_score"),
+        }
+
+        review_list.append({
+            "source_post": source_post_data,
+            "remodeled_article": remodeled_article_data,
+        })
+
+    # 6. 保存与输出
+    if save_path:
+        save_json(save_path, review_list)
+
+    logger.info(
+        "[高流量/审查] 精简复盘数据组装完成 | 候选: [%s] | 抽样返回: [%s] | 导出文件: [%s]",
+        len(candidates), len(review_list), save_path or "未落盘",
+    )
+    return review_list
+
+
 if __name__ == "__main__":
     # query_hot_posts_by_keyword(target_key="gtc")
     # get_need_check_article_info()
+    get_need_check_viral_article_info()
     # data = get_need_check_pre_screen_info(limit=1000)
 
     tasks = [
