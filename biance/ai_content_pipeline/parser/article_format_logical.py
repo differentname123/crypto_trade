@@ -1454,22 +1454,24 @@ def execute_viral_article_task(task_data, article_manager):
             if not valid:
                 raise ValueError(error)
 
+            decision_reason = raw_info["decision_reason"].strip()
+
             # 二阶段看真图后判定不可用 -> 记为 skip 并落库，防止后续死循环重复拉取
             if not raw_info["usable"]:
-                reason = raw_info["reject_reason"].strip()
-                record["topic"] = raw_info.get("topic_tag") or "无效噪音"
+                record["topic"] = "无效噪音"
                 record["status"] = "skip"
                 record["error_message"] = None
                 record["article_info"] = {
                     "status": "skip",
                     "usable": False,
-                    "reject_reason": reason,
-                    "reason": reason,
-                    "text": "",
-                    "god_comments": [],
-                    "image_placeholders": [],
-                    "used_material_ids": [],
-                    "score": None,
+                    "decision_reason": decision_reason,
+                    "topic_tag": "无效噪音",
+                    "selected_images": [],
+                    "image_role": "",
+                    "viral_analysis": "",
+                    "post_text": "",
+                    "bait_comments": [],
+                    "viral_score": 0.0,
                     "image_mapping": {},
                 }
                 break
@@ -1477,24 +1479,23 @@ def execute_viral_article_task(task_data, article_manager):
             # 二阶段判定可用 -> 组装正式发布结构
             selected_images = raw_info["selected_images"]
             topic_tag = raw_info["topic_tag"]
+            viral_score = round(float(raw_info["viral_score"]), 1)
             record["topic"] = topic_tag
-            info = {
+            record["status"] = "ok"
+            record["error_message"] = None
+            record["article_info"] = {
                 "status": "ok",
                 "usable": True,
-                "text": raw_info["post_text"],
-                "god_comments": raw_info["bait_comments"],
-                "image_placeholders": selected_images,
-                "used_material_ids": ["M1"],
-                "score": 9.0,
-                "reason": None,
-                "image_mapping": {key: dict(image_mapping[key]) for key in selected_images},
+                "decision_reason": decision_reason,
                 "topic_tag": topic_tag,
-                "viral_analysis": raw_info["viral_analysis"],
-                "post_text": raw_info["post_text"],
-                "bait_comments": raw_info["bait_comments"],
                 "selected_images": selected_images,
+                "image_role": raw_info["image_role"].strip(),
+                "viral_analysis": raw_info["viral_analysis"].strip(),
+                "post_text": raw_info["post_text"].strip(),
+                "bait_comments": raw_info["bait_comments"],
+                "viral_score": viral_score,
+                "image_mapping": {key: dict(image_mapping[key]) for key in selected_images},
             }
-            record["article_info"], record["status"], record["error_message"] = info, "ok", None
             break
         except Exception as exc:
             error_message = f"{type(exc).__name__}: {exc}"
@@ -1520,16 +1521,17 @@ def execute_viral_article_task(task_data, article_manager):
     if saved_record["status"] == "skip":
         logger.info(
             "[高流量/二阶段淘汰] 看图验货未通过已记skip | 原帖: [%s] | 原因: [%s] | 耗时: [%.2f 秒]",
-            post_id, saved_record["article_info"]["reason"], time.monotonic() - started,
+            post_id, saved_record["article_info"]["decision_reason"], time.monotonic() - started,
         )
     else:
         logger.info(
-            "[高流量/完成] 已重塑并入库 | 原帖: [%s] | 赛道: [%s] | 选图: [%s张] | 尝试: [%s] | 耗时: [%.2f 秒]",
-            post_id, saved_record["topic"], len(saved_record["article_info"]["selected_images"]),
+            "[高流量/完成] 已重塑并入库 | 原帖: [%s] | 赛道: [%s] | 评分: [%s] | 选图: [%s张] | 原因: [%s] | 尝试: [%s] | 耗时: [%.2f 秒]",
+            post_id, saved_record["topic"], saved_record["article_info"]["viral_score"],
+            len(saved_record["article_info"]["selected_images"]),
+            saved_record["article_info"]["decision_reason"],
             record["attempt_count"], time.monotonic() - started,
         )
     return saved_record
-
 
 # 单轮高流量文章重塑：筛选粗筛通过单帖 → 1对1构建多模态重塑任务 → 并发生成并存入 GeneratedArticleManager。
 def generate_viral_articles_once():
@@ -2424,7 +2426,7 @@ def get_need_check_viral_article_info(
         save_path=None,
 ):
     """
-    获取高流量重塑文章及其来源原帖的对照审查数据（适配新两阶段架构：含 viral_analysis 与一阶段 event_key）。
+    获取高流量重塑文章及其来源原帖的对照审查数据（严格对齐最新两阶段 Schema）。
     """
     article_manager = GeneratedArticleManager(gen_db_object())
 
@@ -2482,9 +2484,6 @@ def get_need_check_viral_article_info(
     for article in selected_articles:
         p_list = article.get("post_id_list") or []
         target_post_id = str(p_list[0]).strip() if p_list else ""
-        if not target_post_id:
-            mapping = article.get("material_post_mapping") or {}
-            target_post_id = str(mapping.get("M1", "")).strip()
 
         raw_p = post_map.get(target_post_id, {})
         info = article.get("article_info") or {}
@@ -2495,7 +2494,7 @@ def get_need_check_viral_article_info(
         image_placeholders = list(mapping.keys())
 
         source_post_data = {
-            "post_id": str(raw_p.get("post_id") or "").strip(),
+            "post_id": str(raw_p.get("post_id") or target_post_id).strip(),
             "text": clean_text.strip(),
             "images": image_placeholders,
             "engagement": {
@@ -2510,11 +2509,15 @@ def get_need_check_viral_article_info(
         }
 
         remodeled_article_data = {
-            "topic_tag": info.get("topic_tag") or article.get("topic", ""),
+            "usable": info.get("usable", False),
+            "decision_reason": info.get("decision_reason", ""),
+            "topic_tag": info.get("topic_tag", ""),
+            "selected_images": info.get("selected_images", []),
+            "image_role": info.get("image_role", ""),
             "viral_analysis": info.get("viral_analysis", ""),
-            "post_text": info.get("text") or info.get("post_text", ""),
-            "bait_comments": info.get("god_comments") or info.get("bait_comments", []),
-            "selected_images": info.get("image_placeholders") or info.get("selected_images", []),
+            "post_text": info.get("post_text", ""),
+            "bait_comments": info.get("bait_comments", []),
+            "viral_score": info.get("viral_score", 0.0),
         }
 
         review_list.append({
