@@ -2312,7 +2312,7 @@ def get_need_check_pre_screen_info(
 
 
 def get_need_check_viral_article_info(
-        limit=100,
+        limit=40,
         hours=6,
         only_current_version=True,
         random_sample=True,
@@ -2405,6 +2405,7 @@ def get_need_check_viral_article_info(
 
         # 5.2 原帖信息：图文分离，保留互动数据与完整的 viral_screen（含 valid_images）
         source_post_data = {
+            "post_id": str(raw_p.get("post_id") or "").strip(),
             "text": clean_text.strip(),
             "images": image_placeholders,
             "engagement": {
