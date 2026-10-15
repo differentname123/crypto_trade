@@ -23,7 +23,8 @@ from datetime import datetime, timedelta, timezone
 import stat
 from functools import lru_cache
 from PIL import Image, UnidentifiedImageError
-
+VIRAL_PUBLISH_MAX_AGE_HOURS = 24
+STATE_FILE_LOCK = threading.Lock()
 # 大模型视觉接口支持的标准光栅图片格式
 ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
 import ccxt
@@ -76,7 +77,7 @@ ARTICLE_VARIANTS = 2
 ARTICLE_CONCURRENCY = 5
 ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 STATE_FILE = "account_publish_state.json"
-ACCOUNTS = ["myself", "mama", "ruru", "qiqi"]
+ACCOUNTS = ["qiqi", "ruru"]
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 ACCOUNT_COOLDOWN_SECONDS = 3600
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600
@@ -1613,59 +1614,23 @@ def _build_publish_text_list(text):
 
 
 # 管理器文章{topic,stance,publish_attempts,article_info{text,score,image_placeholders,image_mapping}}
-# → 按评分/图片去重/账号冷却发布；回写账号文件及文章发布字段，不返回业务数据。
-# : 原筛选允许无图文章；上传仍遍历整个image_mapping；追加标签后不再复核260字限制。
-# : 远端、账号文件、数据库没有事务；结果未知或数据库不可写时仍需人工核对，不能保证完全幂等。
-# : 发布接口抛异常仍不累计尝试；success为真时仍直接把post_id转成字符串，不追加业务校验。
-# 管理器文章{topic,stance,publish_attempts,article_info{text,score,image_placeholders,image_mapping}}
-# → 按评分/图片去重/账号冷却发布；回写账号文件及文章发布字段，不返回业务数据。
+# → 按评分/图片去重/账号冷却发布分析帖；回写账号文件及文章发布字段，不返回业务数据。
 def _publish_articles_once(article_manager):
-    # article_info → (全部URL/路径集合,统计用主地址列表)；优先original_url，其次local_path。
-    def image_addresses(article):
-        info = article.get("article_info")
-        if not isinstance(info, dict):
-            return set(), []
-        mapping = info.get("image_mapping")
-        if not isinstance(mapping, dict) or not mapping:
-            return set(), []
-        placeholders = info.get("image_placeholders")
-        selected = ([mapping[key] for key in placeholders if key in mapping]
-                    if isinstance(placeholders, list) and placeholders else mapping.values())
-        addresses, primary = set(), []
-        for item in selected:
-            if not isinstance(item, dict):
-                continue
-            url, path = (item.get("original_url") or "").strip(), (item.get("local_path") or "").strip()
-            addresses.update(value for value in (url, path) if value)
-            if url or path:
-                primary.append(url or path)
-        return addresses, primary
-
     now = time.time()
-    state = (read_json(STATE_FILE) or {}) if os.path.exists(STATE_FILE) else {}
-    if not isinstance(state, dict):
-        raise ValueError("账号状态文件必须为 {账号: 状态字典}")
-    for account in ACCOUNTS:
-        account_state = state.setdefault(account, {})
-        if not isinstance(account_state, dict):
-            raise ValueError(f"账号状态必须是字典: {account}")
-        for key, value in {
-            "total_success": 0, "last_publish_time": 0, "last_error_msg": "",
-            "last_error_time": 0, "topic_publish_history": {},
-        }.items():
-            account_state.setdefault(key, value)
-        if not isinstance(account_state["topic_publish_history"], dict):
-            raise ValueError(f"账号主题历史必须为 {{主题: 时间戳}}: {account}")
+    state = _load_and_init_publish_state()
 
     recent_success = article_manager.find_articles(query={
         "status": "ok", "publish_status": "success", "publish_time": {"$gte": now - 6 * 3600},
     }) or []
     used_addresses, used_primary = set(), set()
     for article in recent_success:
-        addresses, primary = image_addresses(article)
+        addresses, primary = _extract_article_image_addresses(article)
         used_addresses.update(addresses)
         used_primary.update(primary)
+
+    # 仅查询非 viral 类型的分析类文章，避免与流量帖队列串扰
     raw_candidates = article_manager.find_articles(query={
+        "type": {"$ne": ARTICLE_TYPE_VIRAL},
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
         "status": "ok", "publish_status": {"$ne": "success"},
     }) or []
@@ -1686,7 +1651,7 @@ def _publish_articles_once(article_manager):
         if (article.get("topic") or "").lower() not in hot_coins:
             stats["topic"] += 1
             continue
-        addresses, _ = image_addresses(article)
+        addresses, _ = _extract_article_image_addresses(article)
         if addresses & used_addresses:
             stats["image"] += 1
             continue
@@ -1746,16 +1711,18 @@ def _publish_articles_once(article_manager):
             try:
                 latest_price = get_latest_crypto_price(topic)
             except Exception as exc:
-                # 价格仅为辅助字段，获取失败记 Warning，不追加至 fatal problems 队列
                 logger.warning(
                     "[发布/行情] 获取发布时刻价格失败 | 主题: [%s] | 异常: [%s] | 后续: [价格记为 None 继续落库]",
                     topic, exc,
                 )
             if success:
-                account_state["total_success"] += 1
+                new_total = account_state["total_success"] + 1
+                account_state["total_success"] = new_total
                 account_state["last_publish_time"] = now
                 if topic:
                     account_state["topic_publish_history"][topic] = now
+                state_updates = {"total_success": new_total, "last_publish_time": now}
+                topic_update = (topic, now) if topic else None
                 changes = {
                     "publish_status": "success", "published_by": account, "publish_time": now,
                     "binance_post_id": post_id, "publish_attempts": attempts, "publish_price": latest_price,
@@ -1764,14 +1731,15 @@ def _publish_articles_once(article_manager):
             else:
                 error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
                 account_state["last_error_msg"], account_state["last_error_time"] = error, now
+                state_updates = {"last_error_msg": error, "last_error_time": now}
+                topic_update = None
                 changes = {
                     "publish_status": "failed", "last_error": error,
                     "publish_attempts": attempts, "publish_price": latest_price,
                 }
-            # 已确认远端结果后，两处状态独立尝试保存；仅持久化失败视为阻断性错误。
             stage = "保存已确认的发布结果"
             try:
-                save_json(STATE_FILE, state)
+                _update_account_publish_state(account, state_updates, topic_update=topic_update)
                 saved.append("账号状态")
             except Exception as exc:
                 problems.append(("写入账号状态", exc))
@@ -1827,7 +1795,7 @@ def _load_account_credentials(action, with_user_info=False):
     for account in ACCOUNTS:
         try:
             session_dir = get_config(f"{account}_browser_session_dir")
-            cookies, token, user_info = get_auth_tokens_robust(session_dir)
+            cookies, token, user_info = get_auth_tokens_robust(session_dir, debug=True)
             if not cookies or not token:
                 logger.warning(
                     "[%s/账号] 凭证不完整 | 账号: [%s] | 后续: [跳过当前账号] "
@@ -1857,6 +1825,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance):
             error, success, comment_id = comment_on_binance_post(
                 post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
                 comment=text, user_data_dir=session_dir, sentiment=stance,
+                debug=True
             )
             results[f"{text}"] = {
                 "account": account, "comment_id": str(comment_id) if comment_id else "",
@@ -1880,8 +1849,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance):
     return results
 
 
-# 近24小时已发文章 → 点赞收藏/其他账号评论 → 回写interacted/interaction_time/comment_interact_info。
-# : 原策略不检查点赞收藏返回值，评论失败仍标记完成；同批无帖子ID的记录也可能被标记。
+# 近24小时已发文章 → 点赞收藏/其他账号评论(兼容分析帖god_comments与流量帖bait_comments) → 回写互动状态。
 def _hudong_once(article_manager):
     started = time.monotonic()
     credentials, _ = _load_account_credentials("互动")
@@ -1909,9 +1877,13 @@ def _hudong_once(article_manager):
         return
     for article in pending:
         other_accounts = [account for account in ACCOUNTS if account != article.get("published_by")]
+        info = article.get("article_info") or {}
+        comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
+        raw_stance = article.get("stance")
+        sentiment = raw_stance if raw_stance in ("看多", "看空") else None
         article["comment_interact_info"] = interact_comment(
-            article.get("article_info", {}).get("god_comments", []), other_accounts,
-            article.get("binance_post_id"), article.get("stance"),
+            comments or [], other_accounts,
+            article.get("binance_post_id"), sentiment,
         )
         article["interacted"], article["interaction_time"] = True, now.timestamp()
     try:
@@ -1926,7 +1898,6 @@ def _hudong_once(article_manager):
         "[互动/完成] 接口返回且状态已保存 | 帖子: [%s] | 账号: [%s] | 标记记录: [%s] | 耗时: [%.2f 秒]",
         len(post_ids), len(credentials), len(pending), time.monotonic() - started,
     )
-
 
 # 独立文章管理器 → 互动轮询；每轮结束后等待1200秒。
 def hudong():
@@ -2534,7 +2505,270 @@ def get_need_check_viral_article_info(
         len(candidates), len(review_list), save_path or "未落盘",
     )
     return review_list
+# article → (全部URL/路径集合, 统计用主地址列表)；同时兼容分析帖(image_placeholders)与流量帖(selected_images)。
+def _extract_article_image_addresses(article):
+    info = article.get("article_info")
+    if not isinstance(info, dict):
+        return set(), []
+    mapping = info.get("image_mapping")
+    if not isinstance(mapping, dict) or not mapping:
+        return set(), []
+    placeholders = info.get("selected_images") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("image_placeholders")
+    selected = ([mapping[key] for key in placeholders if key in mapping]
+                if isinstance(placeholders, list) and placeholders else mapping.values())
+    addresses, primary = set(), []
+    for item in selected:
+        if not isinstance(item, dict):
+            continue
+        url, path = (item.get("original_url") or "").strip(), (item.get("local_path") or "").strip()
+        addresses.update(value for value in (url, path) if value)
+        if url or path:
+            primary.append(url or path)
+    return addresses, primary
 
+
+# 线程安全读取并初始化账号状态文件；确保分析帖与流量帖的冷却字段共存且互不干扰。
+def _load_and_init_publish_state():
+    with STATE_FILE_LOCK:
+        state = (read_json(STATE_FILE) or {}) if os.path.exists(STATE_FILE) else {}
+        if not isinstance(state, dict):
+            raise ValueError("账号状态文件必须为 {账号: 状态字典}")
+        for account in ACCOUNTS:
+            account_state = state.setdefault(account, {})
+            if not isinstance(account_state, dict):
+                raise ValueError(f"账号状态必须是字典: {account}")
+            for key, value in {
+                "total_success": 0, "last_publish_time": 0, "last_error_msg": "",
+                "last_error_time": 0, "topic_publish_history": {},
+                "viral_total_success": 0, "viral_last_publish_time": 0,
+                "viral_last_error_msg": "", "viral_last_error_time": 0,
+            }.items():
+                account_state.setdefault(key, value)
+            if not isinstance(account_state["topic_publish_history"], dict):
+                raise ValueError(f"账号主题历史必须为 {{主题: 时间戳}}: {account}")
+        return state
+
+
+# 线程安全局部更新指定账号的状态字段并落盘，防止分析帖与流量帖并发发布时互相覆盖。
+def _update_account_publish_state(account, field_updates, topic_update=None):
+    with STATE_FILE_LOCK:
+        state = (read_json(STATE_FILE) or {}) if os.path.exists(STATE_FILE) else {}
+        if not isinstance(state, dict):
+            state = {}
+        account_state = state.setdefault(account, {})
+        for key, value in {
+            "total_success": 0, "last_publish_time": 0, "last_error_msg": "",
+            "last_error_time": 0, "topic_publish_history": {},
+            "viral_total_success": 0, "viral_last_publish_time": 0,
+            "viral_last_error_msg": "", "viral_last_error_time": 0,
+        }.items():
+            account_state.setdefault(key, value)
+        account_state.update(field_updates)
+        if topic_update:
+            topic_key, topic_time = topic_update
+            if not isinstance(account_state.get("topic_publish_history"), dict):
+                account_state["topic_publish_history"] = {}
+            account_state["topic_publish_history"][topic_key] = topic_time
+        save_json(STATE_FILE, state)
+
+
+# 近24小时 ARTICLE_TYPE_VIRAL 文章 → 按 viral_score 从高到低排序 → 独立1h账号冷却发布 → 回写账号与数据库状态。
+def _publish_viral_articles_once(article_manager):
+    now = time.time()
+    state = _load_and_init_publish_state()
+
+    # 查询近24小时已成功发布的帖子，用于图片去重
+    recent_success = article_manager.find_articles(query={
+        "status": "ok",
+        "publish_status": "success",
+        "publish_time": {"$gte": now - VIRAL_PUBLISH_MAX_AGE_HOURS * 3600},
+    }) or []
+    used_addresses, used_primary = set(), set()
+    for article in recent_success:
+        addresses, primary = _extract_article_image_addresses(article)
+        used_addresses.update(addresses)
+        used_primary.update(primary)
+
+    # 仅查询 24 小时内生成的 ARTICLE_TYPE_VIRAL 待发布帖子
+    raw_candidates = article_manager.find_articles(query={
+        "type": ARTICLE_TYPE_VIRAL,
+        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=VIRAL_PUBLISH_MAX_AGE_HOURS)},
+        "status": "ok",
+        "publish_status": {"$ne": "success"},
+    }) or []
+
+    stats = Counter()
+    candidates = []
+    for article in raw_candidates:
+        info = article.get("article_info")
+        if article.get("prompt_version") != prompt_version:
+            stats["version"] += 1
+            continue
+        if (not isinstance(info, dict)
+                or info.get("status") != "ok"
+                or info.get("usable") is not True
+                or not isinstance(info.get("post_text"), str)
+                or not info.get("post_text").strip()
+                or not isinstance(info.get("selected_images", []), list)
+                or isinstance(info.get("viral_score"), bool)
+                or not isinstance(info.get("viral_score"), (int, float))):
+            stats["structure"] += 1
+            continue
+        if article.get("publish_attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
+            stats["attempts"] += 1
+            continue
+
+        # 校验选中的图片映射及本地文件完整性
+        mapping = info.get("image_mapping") or {}
+        selected_images = info.get("selected_images") or []
+        if any(not isinstance(mapping.get(img_id), dict)
+               or not _is_valid_image_file(mapping[img_id].get("local_path"))
+               for img_id in selected_images):
+            stats["invalid_image"] += 1
+            continue
+
+        addresses, _ = _extract_article_image_addresses(article)
+        if addresses and (addresses & used_addresses):
+            stats["image_dup"] += 1
+            continue
+        candidates.append((article, addresses))
+
+    # 按照 viral_score 从高到低排序
+    candidates.sort(key=lambda item: float(item[0]["article_info"].get("viral_score", 0.0)), reverse=True)
+    logger.info(
+        "[流量发布/计划] 近%s小时流量帖已按评分从高到低筛选 | 查询: [%s] | 候选: [%s] "
+        "| 过滤: [版本%s/结构%s/尝试超限%s/图片缺失%s/图片重复%s] | 尝试上限: [%s] "
+        "| 近%s小时已发: [%s] | 占用图片: [%s] | 账号: [%s] | 独立账号冷却: [%s秒]",
+        VIRAL_PUBLISH_MAX_AGE_HOURS, len(raw_candidates), len(candidates),
+        stats["version"], stats["structure"], stats["attempts"], stats["invalid_image"],
+        stats["image_dup"], PUBLISH_MAX_ATTEMPTS, VIRAL_PUBLISH_MAX_AGE_HOURS,
+        len(recent_success), len(used_primary), len(ACCOUNTS), ACCOUNT_COOLDOWN_SECONDS,
+    )
+
+    for account in ACCOUNTS:
+        if not candidates:
+            break
+        account_state = state[account]
+        # 单独按照流量帖计算 1h 冷却，不与其他类型帖子或主题冷却关联
+        remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("viral_last_publish_time", 0))
+        if remaining > 0:
+            logger.debug("[流量发布/账号] 仍在独立冷却中 | 账号: [%s] | 剩余: [%s 秒]", account, int(remaining))
+            continue
+
+        selected_index = None
+        for index, (article, addresses) in enumerate(candidates):
+            if addresses and (addresses & used_addresses):
+                continue
+            selected_index = index
+            break
+        if selected_index is None:
+            logger.debug("[流量发布/账号] 所有候选图片均与已发布冲突 | 账号: [%s]", account)
+            continue
+        logger.info("[流量发布/账号] 账号可用 | 账号: [%s] | 候选文章: [%s] | 评分: [%s]",
+                    account, candidates[selected_index][0].get("_id"), candidates[selected_index][0]["article_info"].get("viral_score"))
+        article, addresses = candidates[selected_index]
+        info = article["article_info"]
+        topic = article.get("topic") or info.get("topic_tag") or ""
+        score = info.get("viral_score")
+        started = time.monotonic()
+        stage, api_result = "准备正文、媒体及配置", "尚未调用"
+        try:
+            text = info.get("post_text", "").strip()
+            text_list = _build_publish_text_list(text)
+            mapping = info.get("image_mapping") or {}
+            selected_keys = info.get("selected_images") or []
+            image_paths = [
+                mapping[key].get("local_path")
+                for key in selected_keys
+                if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")
+            ]
+            session_dir = get_config(f"{account}_browser_session_dir")
+            attempts = article.get("publish_attempts", 0) + 1
+            stage, api_result = "调用发布接口", "未知"
+            err, success, post_id = create_binance_post(
+                content=text,
+                image_path_list=image_paths,
+                user_data_dir=session_dir,
+                chart_info=None,
+                sentiment=None,
+                debug=True,
+                text_list=text_list,
+            )
+            post_id, api_result = str(post_id), "成功" if success else "失败"
+            problems, saved = [], []
+            if success:
+                new_total = account_state.get("viral_total_success", 0) + 1
+                account_state["viral_total_success"] = new_total
+                account_state["viral_last_publish_time"] = now
+                state_updates = {
+                    "viral_total_success": new_total,
+                    "viral_last_publish_time": now,
+                }
+                changes = {
+                    "publish_status": "success",
+                    "published_by": account,
+                    "publish_time": now,
+                    "binance_post_id": post_id,
+                    "publish_attempts": attempts,
+                    "publish_price": None,
+                }
+                used_addresses.update(addresses)
+            else:
+                error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
+                account_state["viral_last_error_msg"] = error
+                account_state["viral_last_error_time"] = now
+                state_updates = {
+                    "viral_last_error_msg": error,
+                    "viral_last_error_time": now,
+                }
+                changes = {
+                    "publish_status": "failed",
+                    "last_error": error,
+                    "publish_attempts": attempts,
+                    "publish_price": None,
+                }
+
+            stage = "保存已确认的发布结果"
+            try:
+                _update_account_publish_state(account, state_updates)
+                saved.append("账号状态")
+            except Exception as exc:
+                problems.append(("写入账号状态", exc))
+            article.update(changes)
+            try:
+                article_manager.upsert_articles([article])
+                saved.append("数据库状态")
+            except Exception as exc:
+                problems.append(("回写数据库", exc))
+            if problems:
+                details = "; ".join(f"{label}: {type(exc).__name__}: {exc}" for label, exc in problems)
+                raise RuntimeError(f"{details} | 已保存: [{', '.join(saved) or '无'}]") from problems[0][1]
+        except Exception as exc:
+            raise RuntimeError(
+                f"流量发布阶段[{stage}]失败 | 账号: [{account}] | 文章: [{article.get('_id')}] "
+                f"| 赛道: [{topic}] | 接口结果: [{api_result}]；请核对远端结果与本地状态 | 原因: [{exc}]"
+            ) from exc
+
+        if success:
+            candidates.pop(selected_index)
+        log = logger.info if success else logger.error
+        log(
+            "%s[流量发布/文章] 本次处理结束 | 账号: [%s] | 赛道: [%s] | 文章: [%s] "
+            "| 评分: [%s] | 尝试: [%s/%s] | 耗时: [%.2f 秒] | 结果: [%s] | 说明: [%s]",
+            "" if success else "❌ ", account, topic, article.get("_id"), score,
+            attempts, PUBLISH_MAX_ATTEMPTS, time.monotonic() - started, api_result,
+            "远端发布与本地回写完成" if success else error,
+        )
+
+
+# 独立文章管理器 → 流量帖发布轮询；每轮结束后等待600秒。
+def auto_publish_viral_articles():
+    _poll_task(
+        _publish_viral_articles_once,
+        GeneratedArticleManager(gen_db_object()),
+        PUBLISH_POLL_SECONDS,
+        "流量发布",
+    )
 
 if __name__ == "__main__":
     # query_hot_posts_by_keyword(target_key="gtc")
@@ -2546,8 +2780,9 @@ if __name__ == "__main__":
         # generate_analysis_articles,
         generate_viral_articles,
         format_image_article,
-        # hudong,
+        hudong,
         # auto_publish_articles,
+        auto_publish_viral_articles,
         # delete_old_post
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
