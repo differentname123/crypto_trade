@@ -2405,7 +2405,7 @@ def get_need_check_viral_article_info(
 
     query = {
         "type": ARTICLE_TYPE_VIRAL,
-        "status": "ok",
+        # "status": "ok",
         "publish_status": {"$ne": "success"},
     }
     if hours and hours > 0:
@@ -2510,7 +2510,7 @@ def get_need_check_viral_article_info(
 if __name__ == "__main__":
     # query_hot_posts_by_keyword(target_key="gtc")
     # get_need_check_article_info()
-    # get_need_check_viral_article_info()
+    get_need_check_viral_article_info()
     # data = get_need_check_pre_screen_info(limit=1000)
 
     tasks = [
