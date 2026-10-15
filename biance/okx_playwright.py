@@ -42,6 +42,10 @@ NEWLINE_SAFE_MODE = False
 RE_SEND = re.compile(r"发文|发布|发送|Post|Publish|Send", re.IGNORECASE)
 RE_SEND_EXACT = re.compile(r"^(发文|发布|发送|Post|Publish|Send)$", re.IGNORECASE)
 
+# 评论按钮文案匹配
+RE_COMMENT_BTN = re.compile(r"评论|回复|发送|Comment|Reply|Send", re.IGNORECASE)
+RE_COMMENT_BTN_EXACT = re.compile(r"^(评论|回复|发送|Comment|Reply|Send)$", re.IGNORECASE)
+
 # 引导浮层"确认关闭"类按钮：刻意不含「取消/Cancel」，避免误取消业务弹窗
 RE_DISMISS = re.compile(
     r"^\s*(好的|好|知道了|我知道了|明白了|明白|了解|开始使用|立即体验|马上体验|下一步|"
@@ -70,6 +74,10 @@ EDITOR_GUARD_SELECTOR = '.ProseMirror,[contenteditable="true"],input[type="file"
 # OKX 星球发帖提交接口主判据与辅助判据
 RE_SUBMIT_API_PRIMARY = re.compile(r"priapi/v5/content/ugc/publish|content/ugc/publish", re.IGNORECASE)
 RE_SUBMIT_API_SECONDARY = re.compile(r"content/.*/publish|ugc/publish|orbit/.*/publish", re.IGNORECASE)
+
+# OKX 星球评论提交接口主判据与辅助判据
+RE_COMMENT_API_PRIMARY = re.compile(r"priapi/v5/content/user/comment|content/user/comment", re.IGNORECASE)
+RE_COMMENT_API_SECONDARY = re.compile(r"content/.*/comment|ugc/comment|orbit/.*/comment", re.IGNORECASE)
 
 logger = setup_logger(app_name="okx_playwright")
 
@@ -136,7 +144,8 @@ def _clean_stale_chromium_singleton(user_data_dir):
 class _ReentrantUserDataLock:
     """
     单目录锁管理器：
-    1. 进程内通过 RLock + 线程递归计数支持多线程排队与同线程重入；
+1.
+进程内通过 RLock + 线程递归计数支持多线程排队与同线程重入；
     2. 跨进程通过 OS 内核级文件描述符锁 (msvcrt.locking / fcntl.flock) + 禁止句柄继承 (O_NOINHERIT)，
        保证无论 Ctrl+C、IDE 强行 Stop、kill -9 还是进程崩溃，内核都会立即释放锁，绝不死锁。
     """
@@ -803,6 +812,45 @@ def _locate_post_creator(page):
     return fallback
 
 
+def _locate_comment_box(page):
+    """
+    精准锁定 OKX 星球帖子详情页的评论输入区容器（不绑定 cmIdleReplyBtn 等随焦点变化的动态类名）。
+    目标结构：<div class="cmInputRow-fObz9"> 内含 cmEditorWrap (tiptap ProseMirror)
+    """
+    candidates = [
+        page.locator('div[class*="cmEditorWrap-"]').first,
+        page.locator('div[class*="cmInputRow-"]').first,
+        page.locator('div:has(> div[class*="cmEditorWrap-"])').first,
+    ]
+
+    for idx, loc in enumerate(candidates):
+        try:
+            if loc.is_visible(timeout=4000):
+                logger.info(f"[定位/DOM] 已锁定 OKX 星球评论区容器 (策略 #{idx + 1})")
+                return loc
+        except Exception:
+            continue
+
+    try:
+        page.mouse.wheel(0, 350)
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+    for idx, loc in enumerate(candidates):
+        try:
+            if loc.is_visible(timeout=3000):
+                logger.info(f"[定位/DOM] 滚动后已锁定 OKX 星球评论区容器 (策略 #{idx + 1})")
+                return loc
+        except Exception:
+            continue
+
+    logger.warning("[定位/DOM] 精确评论容器策略未命中，降级锁定包含 ProseMirror 的容器")
+    fallback = page.locator('div:has(div.tiptap.ProseMirror[contenteditable="true"])').first
+    fallback.wait_for(state="visible", timeout=10000)
+    return fallback
+
+
 def _resolve_wake_target(editor_container):
     """解析点击唤醒 OKX Tiptap 编辑器的目标元素。"""
     cands = (
@@ -1170,6 +1218,96 @@ def _read_api_verdict(page, watcher):
     return False, None
 
 
+class _CommentApiWatcher:
+    """点击前挂 response 监听、点击后轮询取 OKX 评论接口结果。"""
+
+    def __init__(self, page):
+        self.page = page
+        self.primary = []
+        self.secondary = []
+        self._closed = False
+        page.on("response", self._on_response)
+
+    def _on_response(self, resp):
+        try:
+            if resp.request.method != "POST":
+                return
+            url = resp.url or ""
+            if RE_COMMENT_API_PRIMARY.search(url):
+                self.primary.append(resp)
+            elif RE_COMMENT_API_SECONDARY.search(url):
+                self.secondary.append(resp)
+        except Exception:
+            pass
+
+    def wait_primary(self, timeout_ms):
+        end = time.time() + timeout_ms / 1000.0
+        while time.time() < end:
+            if self.primary:
+                return self.primary[-1]
+            self.page.wait_for_timeout(200)
+        return None
+
+    def latest_secondary(self):
+        return self.secondary[-1] if self.secondary else None
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.page.remove_listener("response", self._on_response)
+        except Exception:
+            pass
+
+
+def _read_comment_api_verdict(page, watcher):
+    """
+    解读 OKX 星球评论结果。
+    主判据：POST /priapi/v5/content/user/comment 且 code == "0"，提取 data.commentId（兜底 id / contentId）。
+    """
+    resp = watcher.wait_primary(API_WAIT_TIMEOUT_MS)
+    if resp is not None:
+        body = _parse_api_json(resp)
+        code_str = str(body.get("code", ""))
+        if code_str in ("0", "000000") or body.get("success") is True:
+            data = body.get("data")
+            comment_id = (
+                (data.get("commentId") or data.get("id") or data.get("contentId"))
+                if isinstance(data, dict) else None
+            )
+            logger.info(
+                f"[评论/校验] OKX 主接口确认评论成功 | 响应码: 【{code_str}】 "
+                f"| 评论ID(commentId): 【{comment_id}】 | 结果: [Success]"
+            )
+            return True, comment_id
+        if body:
+            err = body.get("msg") or body.get("message") or body.get("error_message") or "未知业务拦截"
+            logger.error(f"[评论/校验] 服务端业务规则拒收本条评论 | HTTP: 【{resp.status}】 | code: 【{code_str}】 | 原因: 【{err}】")
+            _forensics(page, "comment_biz_reject", {"url": resp.url, "status": resp.status, "body": body})
+            raise BusinessErrorException(f"业务评论被服务器拦截 (code={code_str})，原因: {err}")
+        logger.warning(f"[评论/校验] 主接口响应非 JSON(HTTP 【{resp.status}】)，转入 DOM 兜底校验")
+        return False, None
+
+    sec = watcher.latest_secondary()
+    if sec is None:
+        logger.warning(f"[评论/校验] 【{API_WAIT_TIMEOUT_MS}ms】 内未捕获到评论提交接口，转入 DOM 兜底校验")
+        return False, None
+
+    body = _parse_api_json(sec)
+    code_str = str(body.get("code", ""))
+    logger.info(f"[评论/校验] 观测到疑似评论接口（辅助判据） | URL: <{sec.url}> | HTTP: 【{sec.status}】 | body: 【{str(body)[:200]}】")
+    if code_str in ("0", "000000") or body.get("success") is True:
+        data = body.get("data")
+        comment_id = (
+            (data.get("commentId") or data.get("id") or data.get("contentId"))
+            if isinstance(data, dict) else None
+        )
+        logger.info(f"[评论/校验] 辅助接口判定评论成功 | 评论ID: 【{comment_id}】 | 结果: [Success]")
+        return True, comment_id
+    return False, None
+
+
 # ==============================================================================
 #                              核心：提交一条 OKX 星球帖子
 # ==============================================================================
@@ -1333,6 +1471,137 @@ def _submit_post(page, editor_container, content="", image_path_list=None, text_
     })
     raise Exception(f"发文已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
                     f"媒体 {media_before}→{media_after}），疑似按钮失效、内容被前端校验拦下或网络堵塞。")
+
+
+# ==============================================================================
+#                              核心：提交一条 OKX 星球评论
+# ==============================================================================
+
+def _submit_comment(page, comment_container, content=""):
+    """执行：点击选中评论框 → 直接键入评论文本 → 定位激活态「评论」按钮点击并校验响应。"""
+    content = str(content) if content else ""
+    if not content.strip():
+        raise Exception("评论内容不能为空")
+
+    _dismiss_overlays(page, aggressive=False, desc="pre-comment-submit")
+    report_guard_hits(page, "pre-comment-submit")
+
+    # 直接定位评论框内的 ProseMirror 编辑器
+    real_editor = page.locator(
+        'div[class*="cmEditorWrap-"] div.tiptap.ProseMirror, '
+        'div[class*="editorContent-"] div.tiptap.ProseMirror, '
+        'div.tiptap.ProseMirror[contenteditable="true"]'
+    ).first
+
+    try:
+        real_editor.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    page.wait_for_timeout(200)
+
+    # 1. 点击选中评论输入框，立即直接打字
+    _robust_click(real_editor)
+    page.wait_for_timeout(300)
+
+    logger.info(f"[评论/正文] 已选中评论输入框，直接开始键入评论 | 字符数: 【{len(content)}】")
+    _type_body(page, real_editor, content)
+    page.wait_for_timeout(300)
+
+    try:
+        current_text = (real_editor.inner_text() or "").strip()
+    except Exception:
+        current_text = ""
+
+    if not current_text:
+        logger.warning("[评论/正文] 首次键入未检测到文本，直接使用 keyboard.insert_text 补录")
+        try:
+            _robust_click(real_editor)
+            page.wait_for_timeout(150)
+            page.keyboard.insert_text(content)
+            page.wait_for_timeout(300)
+        except Exception as ins_e:
+            logger.warning(f"[评论/正文] insert_text 补录异常: {str(ins_e)[:100]}")
+
+    logger.info("[评论/正文] 评论输入完成 | 结果: [Success]")
+
+    # 2. 定位激活态「评论」按钮：
+    # <button type="button" data-testid="okd-button" data-e2e-okd-button-loading="false"
+    #         class="okui-primarybutton-var okui-primarybutton okui-primarybutton-sm">评论</button>
+    # 注意：输入框激活后外层 cmInputRow- 与按钮 cmIdleReplyBtn- 均已移除，因此直接在 page 上定位
+    comment_btn_cands = [
+        page.locator('button[data-testid="okd-button"].okui-primarybutton').filter(has_text=RE_COMMENT_BTN_EXACT).first,
+        page.locator('button[data-testid="okd-button"]').filter(has_text=RE_COMMENT_BTN_EXACT).first,
+        page.get_by_role("button", name="评论", exact=True).first,
+        page.locator('button.okui-primarybutton').filter(has_text=RE_COMMENT_BTN_EXACT).first,
+        page.locator("button").filter(has_text=RE_COMMENT_BTN_EXACT).first,
+    ]
+
+    comment_button = None
+    try:
+        comment_button = _interact_fallback_locators(
+            comment_btn_cands, action="wait", timeout=5000, desc="评论按钮"
+        )
+        expect(comment_button).to_be_enabled(timeout=5000)
+    except PlaywrightTimeoutError:
+        logger.warning("[评论/按钮] 评论按钮在 5s 内未变为 enabled，尝试直接强制点击")
+    except Exception as e:
+        logger.warning(f"[评论/按钮] 发生意外的定位错误: {str(e)[:150]}")
+        comment_button = _pick_trusted_send_button(comment_btn_cands) or comment_btn_cands[0]
+
+    try:
+        text_before = len((real_editor.inner_text() or "").strip())
+    except Exception:
+        text_before = len(content)
+    api_success, comment_id = False, None
+
+    logger.info(f"[评论/提交] 触发「评论」并挂载接口监听 | 主判据: <priapi/v5/content/user/comment> "
+                f"| 发送前评论框: 【文本{text_before}字】")
+    watcher = _CommentApiWatcher(page)
+    try:
+        clicked = False
+        for attempt in range(3):
+            try:
+                if attempt == 0:
+                    _robust_click(comment_button)
+                elif attempt == 1:
+                    comment_button.click(timeout=3000, force=True)
+                else:
+                    comment_button.evaluate("el => el.click()")
+                clicked = True
+                break
+            except Exception as ce:
+                logger.warning(f"[评论/提交] 第【{attempt + 1}】次点击失败，升级点击方式重试 | 详情: 【{str(ce)[:150]}】")
+
+        if not clicked:
+            _forensics(page, "comment_click_fail", {"hit": _hit_test(page, comment_button)})
+            raise Exception("评论按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
+
+        api_success, comment_id = _read_comment_api_verdict(page, watcher)
+    except PlaywrightTimeoutError as e:
+        logger.warning(f"[评论/校验] 等待接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
+    finally:
+        watcher.close()
+
+    if api_success:
+        return comment_id
+
+    page.wait_for_timeout(3000)
+    try:
+        text_after = len((real_editor.inner_text() or "").strip())
+    except Exception:
+        text_after = 0
+    if text_before > 0 and text_after < text_before / 3:
+        logger.info(f"[评论/校验] DOM 兜底比对通过（评论框已被清空） | 文本: 【{text_before}→{text_after}】 | 结果: [Success]")
+        return comment_id
+
+    report_guard_hits(page, "comment-send-fail")
+    _forensics(page, "comment_send_no_effect", {
+        "text_before": text_before,
+        "text_after": text_after,
+        "comment_btn_hit_test": _hit_test(page, comment_button),
+    })
+    raise Exception(f"评论已点击但评论框未清空且接口无成功响应（文本 {text_before}→{text_after}），"
+                    f"疑似按钮失效、内容被前端校验拦下或网络堵塞。")
 
 
 # ==============================================================================
@@ -1526,6 +1795,125 @@ def create_okx_post(content="", image_path_list=None, user_data_dir=USER_DATA_DI
         return error_info, False, None
 
 
+def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR, debug=True):
+    """
+    主控入口 3：调度浏览器打开指定 OKX 星球帖子详情页并执行【纯文本评论】全流程。
+    返回 Tuple(错误信息(str|None), 是否成功(bool), 评论ID(str|None))，格式与 create_okx_post 保持一致。
+    """
+    target_post_url = str(target_post_url or "").strip()
+    if not target_post_url:
+        return "缺少目标帖子链接: target_post_url 不能为空", False, None
+
+    content = str(content or "")
+    if not content.strip():
+        return "评论内容不能为空", False, None
+
+    if not os.path.isdir(user_data_dir):
+        return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
+
+    logger.info(f"\n{'=' * 70}\n[任务/Comment] 启动 OKX 星球自动化评论 | 目标帖子: <{target_post_url}> "
+                f"| 评论字数: 【{len(content)}字】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
+                f"\n{'=' * 70}")
+
+    anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
+    offscreen_args = [
+        '--disable-blink-features=AutomationControlled', '--disable-gpu',
+        '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
+        '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
+        '--disable-breakpad', '--force-device-scale-factor=1', '--hide-scrollbars',
+    ] + anti_freeze_args
+
+    debug_args = [
+        '--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'
+    ] + anti_freeze_args
+
+    try:
+        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
+            with sync_playwright() as p:
+                context = None
+                try:
+                    context = _launch_persistent(
+                        p, user_data_dir,
+                        args=debug_args if debug else offscreen_args,
+                        viewport=None if debug else {'width': 1920, 'height': 1080},
+                        debug=debug,
+                    )
+                    context.set_default_timeout(60000)
+                    context.set_default_navigation_timeout(60000)
+
+                    page = context.new_page()
+                    for old_page in context.pages:
+                        if old_page != page:
+                            try:
+                                old_page.close()
+                            except Exception:
+                                pass
+                    page.bring_to_front()
+
+                    install_overlay_guard(page)
+
+                    response = page.goto(target_post_url, timeout=60000, wait_until="domcontentloaded")
+                    _dismiss_overlays(page, aggressive=False, desc="comment-nav")
+                    report_guard_hits(page, "comment-nav")
+
+                    if response and response.status >= 400:
+                        return f"OKX 帖子详情页加载异常 (HTTP {response.status})", False, None
+
+                    try:
+                        page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=3000)
+                        return "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。", False, None
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    check_for_crash(page)
+
+                    try:
+                        comment_container = _locate_comment_box(page)
+                    except Exception as e:
+                        return f"无法定位 OKX 星球评论区: {e}", False, None
+
+                    comment_id = _submit_comment(
+                        page, comment_container,
+                        content=content
+                    )
+
+                    logger.info(f"[任务/Comment] OKX 星球评论发布成功 | 评论ID(commentId): 【{comment_id}】 | 结果: [Success]")
+                    return None, True, comment_id
+
+                except BusinessErrorException as biz_e:
+                    error_info = f"[业务拦截] {biz_e}"
+                    logger.error(f"[任务/Comment] 评论被服务端业务规则阻断 | 原因: 【{error_info}】")
+                    return error_info, False, None
+
+                except Exception as e:
+                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                    if context and context.pages:
+                        try:
+                            _forensics(context.pages[0], "comment_error", {"url": target_post_url, "error": error_info[:2000]})
+                        except Exception:
+                            pass
+                    _alert_failure_scene(error_info)
+                    return error_info, False, None
+
+                finally:
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"[任务/Comment] {error_info}")
+        return error_info, False, None
+
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return error_info, False, None
+
+
 def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url=OKX_ORBIT_URL):
     """
     主控入口 2：启动可见浏览器交由人工自由操作（用于首次扫码/账号登录）。
@@ -1577,3 +1965,11 @@ if __name__ == "__main__":
         logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球发帖任务成功 ======== | 帖子ID: 【{p_id}】")
     else:
         logger.error(f"\n[结果/Final] ❌ ======== OKX 星球发帖任务失败 ======== | 错误原因:\n{err}")
+
+    # 评论调用示例：
+    c_err, c_success, c_id = comment_on_okx_post(
+        target_post_url="https://www.okx.com/zh-hans/orbit/post/90135509268160",
+        content="666",
+        user_data_dir=USER_DATA_DIR,
+        debug=True
+    )

@@ -24,7 +24,7 @@ import stat
 from functools import lru_cache
 from PIL import Image, UnidentifiedImageError
 
-from biance.okx_playwright import create_okx_post
+from biance.okx_playwright import create_okx_post, comment_on_okx_post
 
 VIRAL_PUBLISH_MAX_AGE_HOURS = 24
 STATE_FILE_LOCK = threading.Lock()
@@ -1647,7 +1647,6 @@ def _build_publish_text_list(text):
         last_end, after_coin = match.end(), True
     return result
 
-
 # 单平台分析帖发布：按评分/平台内图片去重/账号冷却发布分析帖；回写对应平台账号文件及 publish_records[platform]。
 def _publish_analysis_articles_for_platform(article_manager, platform):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
@@ -1784,10 +1783,9 @@ def _publish_analysis_articles_for_platform(article_manager, platform):
                     "last_attempt_time": now,
                     "publish_price": latest_price,
                 })
-                if platform == PLATFORM_BINANCE:
-                    plat_record.setdefault("interacted", False)
-                    plat_record.setdefault("interaction_time", None)
-                    plat_record.setdefault("comment_interact_info", {})
+                plat_record.setdefault("interacted", False)
+                plat_record.setdefault("interaction_time", None)
+                plat_record.setdefault("comment_interact_info", {})
                 used_addresses.update(addresses)
             else:
                 error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
@@ -1892,19 +1890,34 @@ def _load_account_credentials(action, with_user_info=False):
     return credentials, errors
 
 
-# 神评列表、其他账号列表、帖子ID/立场 → {评论文本:{account,comment_id,success,error_info}}。
-# : 原规则按评论文本作键，重复文本会覆盖；发送异常仍逐账号隔离且不产生结果条目。
-def interact_comment(god_comments, other_account_list, post_id, stance):
+# 神评列表、可用账号列表、帖子ID/立场/平台 → {评论文本:{account,comment_id,success,error_info}}。
+# 兼容 Binance 与 OKX 评论接口；按评论文本作键，发送异常逐账号隔离。
+def interact_comment(god_comments, other_account_list, post_id, stance, platform=PLATFORM_BINANCE):
     results, unconfirmed, raised = {}, 0, 0
     accounts = random.sample(other_account_list, len(other_account_list))
     for account, text in zip(accounts, god_comments):
-        session_dir = get_config(f"{account}_browser_session_dir")
+        session_dir = _get_account_session_dir(platform, account)
         try:
-            error, success, comment_id = comment_on_binance_post(
-                post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
-                comment=text, user_data_dir=session_dir, sentiment=stance,
-                debug=True
-            )
+            if platform == PLATFORM_BINANCE:
+                error, success, comment_id = comment_on_binance_post(
+                    post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
+                    comment=text, user_data_dir=session_dir, sentiment=stance,
+                    debug=True,
+                )
+            elif platform == PLATFORM_OKX:
+                target_post_url = (
+                    str(post_id) if str(post_id).startswith("http")
+                    else f"https://www.okx.com/zh-hans/orbit/post/{post_id}"
+                )
+                error, success, comment_id = comment_on_okx_post(
+                    target_post_url=target_post_url,
+                    content=text,
+                    user_data_dir=session_dir,
+                    debug=True,
+                )
+            else:
+                raise ValueError(f"不支持的评论互动平台: {platform}")
+
             results[f"{text}"] = {
                 "account": account, "comment_id": str(comment_id) if comment_id else "",
                 "success": success, "error_info": error,
@@ -1913,84 +1926,147 @@ def interact_comment(god_comments, other_account_list, post_id, stance):
         except Exception:
             raised += 1
             logger.exception(
-                "❌ [互动/评论] 发送异常，远端结果未知 | 帖子: [%s] | 账号: [%s] "
+                "❌ [互动/评论] 发送异常，远端结果未知 | 平台: [%s] | 帖子: [%s] | 账号: [%s] "
                 "| 后续: [沿用账号隔离，继续其他评论] | 排查: [检查登录、网络和接口响应]",
-                post_id, account,
+                platform, post_id, account,
             )
     if accounts and god_comments:
         log = logger.warning if unconfirmed or raised else logger.info
         log(
-            "[互动/评论汇总] 评论尝试结束 | 帖子: [%s] | 配对: [%s] | 未确认: [%s] "
+            "[互动/评论汇总] 评论尝试结束 | 平台: [%s] | 帖子: [%s] | 配对: [%s] | 未确认: [%s] "
             "| 调用异常: [%s] | 结果条目: [%s] | 未确认排查: [检查结果字典中的error_info及远端评论]",
-            post_id, min(len(accounts), len(god_comments)), unconfirmed, raised, len(results),
+            platform, post_id, min(len(accounts), len(god_comments)), unconfirmed, raised, len(results),
         )
     return results
 
 
-# 近24小时 Binance 已发文章 → 点赞收藏/其他账号评论(兼容分析帖god_comments与流量帖bait_comments) → 回写互动状态（OKX不互动）。
+# 近24小时已发文章互动：
+# 1. Binance：点赞收藏 + 排除发帖主人账号后评论互动；
+# 2. OKX：仅评论互动，且因单账号原因不排除发帖主人账号。
 def _hudong_once(article_manager):
-    started = time.monotonic()
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
+
+    # ==================== 1. Binance 互动（点赞收藏 + 排除主人账号评论） ====================
+    b_started = time.monotonic()
     credentials, _ = _load_account_credentials("互动")
     if not credentials:
-        logger.warning("[互动/跳过] 无可用凭证 | 账号数: [%s] | 排查: [先恢复登录与会话]", len(ACCOUNTS))
+        logger.warning("[互动/跳过] 平台[%s]无可用凭证 | 账号数: [%s] | 排查: [先恢复登录与会话]", PLATFORM_BINANCE, len(ACCOUNTS))
+    else:
+        b_articles = article_manager.find_articles(query={
+            "status": "ok",
+            f"publish_records.{PLATFORM_BINANCE}.status": "success",
+            f"publish_records.{PLATFORM_BINANCE}.publish_time": {"$gte": cutoff_ts},
+        }) or []
+        b_pending, b_post_ids = [], []
+        for article in b_articles:
+            b_rec = ((article.get("publish_records") or {}).get(PLATFORM_BINANCE)) or {}
+            post_id = b_rec.get("post_id")
+            if not b_rec.get("interacted") and post_id and str(post_id) != "None":
+                b_pending.append(article)
+                b_post_ids.append(str(post_id))
+
+        if not b_post_ids:
+            logger.info(
+                "[互动/完成] 平台[%s]没有可提交帖子 | 待处理: [%s] | 耗时: [%.2f 秒]",
+                PLATFORM_BINANCE, len(b_pending), time.monotonic() - b_started,
+            )
+        else:
+            try:
+                like_and_bookmark(b_post_ids, credentials)
+            except Exception:
+                logger.exception(
+                    "❌ [互动/执行] 平台[%s]点赞收藏接口异常 | 帖子: [%s] | 后续: [不标记，等待下轮] "
+                    "| 排查: [检查凭证、网络与限流；已完成的远端操作可能被重试]",
+                    PLATFORM_BINANCE, len(b_post_ids),
+                )
+            else:
+                interacted_ts = time.time()
+                for article in b_pending:
+                    b_rec = article["publish_records"][PLATFORM_BINANCE]
+                    other_accounts = [account for account in ACCOUNTS if account != b_rec.get("published_by")]
+                    info = article.get("article_info") or {}
+                    comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
+                    raw_stance = article.get("stance")
+                    sentiment = raw_stance if raw_stance in ("看多", "看空") else None
+                    b_rec["comment_interact_info"] = interact_comment(
+                        comments or [], other_accounts,
+                        b_rec.get("post_id"), sentiment,
+                        platform=PLATFORM_BINANCE,
+                    )
+                    b_rec["interacted"] = True
+                    b_rec["interaction_time"] = interacted_ts
+                try:
+                    article_manager.upsert_articles(b_pending)
+                    logger.info(
+                        "[互动/完成] 平台[%s]接口返回且状态已保存 | 帖子: [%s] | 账号: [%s] | 标记记录: [%s] | 耗时: [%.2f 秒]",
+                        PLATFORM_BINANCE, len(b_post_ids), len(credentials), len(b_pending), time.monotonic() - b_started,
+                    )
+                except Exception:
+                    logger.exception(
+                        "❌ [互动/回写] 平台[%s]接口已返回，状态保存失败 | 记录: [%s] | 后续: [继续其他平台] "
+                        "| 排查: [检查数据库；重试前核对已完成的远端互动]",
+                        PLATFORM_BINANCE, len(b_pending),
+                    )
+
+    # ==================== 2. OKX 互动（仅评论互动，不排除发帖主人账号） ====================
+    o_started = time.monotonic()
+    okx_accounts = list(PLATFORM_ACCOUNTS.get(PLATFORM_OKX) or [])
+    if not okx_accounts:
+        logger.warning("[互动/跳过] 平台[%s]未配置互动账号", PLATFORM_OKX)
         return
-    now = datetime.now(timezone.utc)
-    articles = article_manager.find_articles(query={
+
+    o_articles = article_manager.find_articles(query={
         "status": "ok",
-        f"publish_records.{PLATFORM_BINANCE}.status": "success",
-        f"publish_records.{PLATFORM_BINANCE}.publish_time": {"$gte": (now - timedelta(hours=24)).timestamp()},
+        f"publish_records.{PLATFORM_OKX}.status": "success",
+        f"publish_records.{PLATFORM_OKX}.publish_time": {"$gte": cutoff_ts},
     }) or []
-    pending = []
-    post_ids = []
-    for article in articles:
-        b_rec = ((article.get("publish_records") or {}).get(PLATFORM_BINANCE)) or {}
-        post_id = b_rec.get("post_id")
-        if not b_rec.get("interacted") and post_id:
-            pending.append(article)
-            post_ids.append(str(post_id))
-    if not post_ids:
-        logger.info("[互动/完成] 没有可提交帖子 | 待处理: [%s] | 耗时: [%.2f 秒]",
-                    len(pending), time.monotonic() - started)
-        return
-    try:
-        like_and_bookmark(post_ids, credentials)
-    except Exception:
-        logger.exception(
-            "❌ [互动/执行] 点赞收藏接口异常 | 帖子: [%s] | 后续: [不标记，等待下轮] "
-            "| 排查: [检查凭证、网络与限流；已完成的远端操作可能被重试]", len(post_ids),
+    o_pending = []
+    for article in o_articles:
+        o_rec = ((article.get("publish_records") or {}).get(PLATFORM_OKX)) or {}
+        post_id = o_rec.get("post_id")
+        if not o_rec.get("interacted") and post_id and str(post_id) != "None":
+            o_pending.append(article)
+
+    if not o_pending:
+        logger.info(
+            "[互动/完成] 平台[%s]没有可提交帖子 | 待处理: [0] | 耗时: [%.2f 秒]",
+            PLATFORM_OKX, time.monotonic() - o_started,
         )
         return
-    for article in pending:
-        b_rec = article["publish_records"][PLATFORM_BINANCE]
-        other_accounts = [account for account in ACCOUNTS if account != b_rec.get("published_by")]
+
+    interacted_ts = time.time()
+    for article in o_pending:
+        o_rec = article["publish_records"][PLATFORM_OKX]
         info = article.get("article_info") or {}
         comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
-        raw_stance = article.get("stance")
-        sentiment = raw_stance if raw_stance in ("看多", "看空") else None
-        b_rec["comment_interact_info"] = interact_comment(
-            comments or [], other_accounts,
-            b_rec.get("post_id"), sentiment,
+        # OKX 只有一个账号，不再过滤 published_by 主人账号，仅执行评论互动
+        o_rec["comment_interact_info"] = interact_comment(
+            comments or [], okx_accounts,
+            o_rec.get("post_id"), None,
+            platform=PLATFORM_OKX,
         )
-        b_rec["interacted"] = True
-        b_rec["interaction_time"] = now.timestamp()
+        o_rec["interacted"] = True
+        o_rec["interaction_time"] = interacted_ts
+
     try:
-        article_manager.upsert_articles(pending)
+        article_manager.upsert_articles(o_pending)
     except Exception:
         logger.exception(
-            "❌ [互动/回写] 接口已返回，状态保存失败 | 记录: [%s] | 后续: [结束本轮] "
-            "| 排查: [检查数据库；重试前核对已完成的远端互动]", len(pending),
+            "❌ [互动/回写] 平台[%s]评论已执行，状态保存失败 | 记录: [%s] | 后续: [结束本轮] "
+            "| 排查: [检查数据库；重试前核对已完成的远端互动]",
+            PLATFORM_OKX, len(o_pending),
         )
         return
+
     logger.info(
-        "[互动/完成] 接口返回且状态已保存 | 帖子: [%s] | 账号: [%s] | 标记记录: [%s] | 耗时: [%.2f 秒]",
-        len(post_ids), len(credentials), len(pending), time.monotonic() - started,
+        "[互动/完成] 平台[%s]评论互动完成且状态已保存 | 帖子: [%s] | 账号: [%s] | 标记记录: [%s] | 耗时: [%.2f 秒]",
+        PLATFORM_OKX, len(o_pending), len(okx_accounts), len(o_pending), time.monotonic() - o_started,
     )
 
 
 # 独立文章管理器 → 互动轮询；每轮结束后等待1200秒。
 def hudong():
     _poll_task(_hudong_once, GeneratedArticleManager(gen_db_object()), INTERACTION_INTERVAL_SECONDS, "互动")
-
 
 # 旧版post{content{text_content,mentioned_coins},logic_mul:[{visual_fact,semantic_core,narrative_role}]}
 # → 搜索字符串；保留公开导出入口，输入形貌由调用方负责。
@@ -2687,6 +2763,7 @@ def _update_account_publish_state(platform, account, field_updates, topic_update
 
 
 # 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/图片冲突 → 按 viral_score 降序 → 1h冷却发布 → 回写状态。
+# 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/图片冲突 → 按 viral_score 降序 → 1h冷却发布 → 回写状态。
 def _publish_viral_articles_for_platform(article_manager, platform):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
     if not accounts:
@@ -2851,10 +2928,9 @@ def _publish_viral_articles_for_platform(article_manager, platform):
                     "last_attempt_time": now,
                     "publish_price": None,
                 })
-                if platform == PLATFORM_BINANCE:
-                    plat_record.setdefault("interacted", False)
-                    plat_record.setdefault("interaction_time", None)
-                    plat_record.setdefault("comment_interact_info", {})
+                plat_record.setdefault("interacted", False)
+                plat_record.setdefault("interaction_time", None)
+                plat_record.setdefault("comment_interact_info", {})
                 used_addresses.update(addresses)
             else:
                 error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
@@ -2906,7 +2982,6 @@ def _publish_viral_articles_for_platform(article_manager, platform):
             "远端发布与本地回写完成" if success else error,
         )
 
-
 # 依次调度各平台（Binance / OKX）的流量帖发布，平台间异常隔离。
 def _publish_viral_articles_once(article_manager):
     for platform in (PLATFORM_BINANCE, PLATFORM_OKX):
@@ -2936,6 +3011,15 @@ def demo_okx():
     err, success, p_id = create_okx_post(
         content=test_content,
         image_path_list=test_images,
+        user_data_dir=user_data_dir,
+        debug=True
+    )
+
+    target_post_url = "https://www.okx.com/zh-hans/orbit/post/90104622119872"
+
+    err, success, p_id = comment_on_okx_post(
+        target_post_url=target_post_url,
+        content="测试评论内容",
         user_data_dir=user_data_dir,
         debug=True
     )
