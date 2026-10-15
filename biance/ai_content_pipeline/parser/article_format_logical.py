@@ -1492,6 +1492,7 @@ def execute_viral_article_task(task_data, article_manager):
                 "image_role": raw_info["image_role"].strip(),
                 "viral_analysis": raw_info["viral_analysis"].strip(),
                 "post_text": raw_info["post_text"].strip(),
+                "used_material_ids": ["M1"],
                 "bait_comments": raw_info["bait_comments"],
                 "viral_score": viral_score,
                 "image_mapping": {key: dict(image_mapping[key]) for key in selected_images},
