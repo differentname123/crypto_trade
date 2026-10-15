@@ -45,7 +45,7 @@ from biance.biance_squre_api import (
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
-prompt_version = "1015-4"
+prompt_version = "1016-1"
 BINANCE_SOURCE = "biance"
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -1289,49 +1289,35 @@ def extract_valid_viral_posts(article_manager):
 # 第二阶段模型返回 {usable,reject_reason,topic_tag,selected_images,viral_analysis,post_text,bait_comments} → (bool,错误文本)。
 def check_viral_article_info(raw_info, placeholders, max_chars):
     expected_keys = {
-        "usable", "reject_reason", "topic_tag", "selected_images",
-        "viral_analysis", "post_text", "bait_comments",
+        "usable", "decision_reason", "topic_tag", "selected_images",
+        "image_role", "viral_analysis", "post_text", "bait_comments",
+        "viral_score",
     }
     error = _key_error(raw_info, expected_keys, "高流量二阶段重塑")
     if error:
         return False, error
+
     usable = raw_info["usable"]
     if not isinstance(usable, bool):
         return False, "usable 必须是布尔值"
-    reject_reason = raw_info["reject_reason"]
-    if not isinstance(reject_reason, str):
-        return False, "reject_reason 必须是字符串"
 
-    # 分支1：二阶段看图验货后判定不可用（熔断淘汰）
+    # 无论 usable 为 true 还是 false，decision_reason 都必须是非空字符串
+    decision_reason = raw_info["decision_reason"]
+    if not isinstance(decision_reason, str) or not decision_reason.strip():
+        return False, "decision_reason 必须是非空字符串（放行或淘汰均需说明原因）"
+
+    # 分支1：二阶段看图验货后判定不可用（熔断淘汰，直接放行避免触发无意义重试）
     if not usable:
-        if not reject_reason.strip():
-            return False, "usable 为 false 时必须说明 reject_reason"
         return True, ""
 
     # 分支2：二阶段判定可用，严格校验成稿字段
-    if reject_reason.strip():
-        return False, "usable 为 true 时 reject_reason 必须为空字符串"
     allowed_tags = (
         "搞钱与盈亏", "情感与两性", "奇葩与吃瓜",
         "人性与潜规则", "职场与生存", "搞笑与整活",
     )
     if raw_info["topic_tag"] not in allowed_tags:
         return False, f"topic_tag 取值不合法: {raw_info['topic_tag']!r}"
-    if not isinstance(raw_info["viral_analysis"], str) or not raw_info["viral_analysis"].strip():
-        return False, "usable 为 true 时 viral_analysis 必须是非空字符串"
-    text = raw_info["post_text"]
-    if not isinstance(text, str) or not text.strip():
-        return False, "post_text 必须是非空字符串"
-    if len(re.sub(r"\s", "", text)) > max_chars:
-        return False, f"post_text 非空白字符数超过 {max_chars}"
-    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
-        return False, "post_text 不能包含图片或视频占位符"
-    comments = raw_info["bait_comments"]
-    if (not isinstance(comments, list) or not 2 <= len(comments) <= 3
-            or any(not isinstance(item, str) or not item.strip() for item in comments)):
-        return False, "bait_comments 必须是包含 2—3 条非空字符串的列表"
-    if any(len(re.sub(r"\s", "", item)) > 20 for item in comments):
-        return False, "bait_comments 单条评论字数过长（需控制在18字左右）"
+
     selected_images = raw_info["selected_images"]
     if not isinstance(selected_images, list) or any(not isinstance(item, str) or not item for item in selected_images):
         return False, "selected_images 必须是非空字符串组成的列表"
@@ -1341,8 +1327,40 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
         return False, "selected_images 最多保留 3 张图片"
     if any(item not in placeholders for item in selected_images):
         return False, f"selected_images 必须来自原帖真实图片占位符 {sorted(placeholders)}"
-    return True, ""
 
+    # 校验 image_role：有图时强制非空（防剧透锚点）；无图时仅校验类型，不因偶发填写"无"而浪费重试
+    image_role = raw_info["image_role"]
+    if not isinstance(image_role, str):
+        return False, "image_role 必须是字符串"
+    if selected_images and not image_role.strip():
+        return False, "保留配图时 image_role 必须是非空字符串"
+
+    if not isinstance(raw_info["viral_analysis"], str) or not raw_info["viral_analysis"].strip():
+        return False, "usable 为 true 时 viral_analysis 必须是非空字符串"
+
+    text = raw_info["post_text"]
+    if not isinstance(text, str) or not text.strip():
+        return False, "post_text 必须是非空字符串"
+    if len(re.sub(r"\s", "", text)) > max_chars:
+        return False, f"post_text 非空白字符数超过 {max_chars}"
+    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
+        return False, "post_text 不能包含图片或视频占位符"
+
+    comments = raw_info["bait_comments"]
+    if (not isinstance(comments, list) or not 2 <= len(comments) <= 3
+            or any(not isinstance(item, str) or not item.strip() for item in comments)):
+        return False, "bait_comments 必须是包含 2—3 条非空字符串的列表"
+    if any(len(re.sub(r"\s", "", item)) > 20 for item in comments):
+        return False, "bait_comments 单条评论字数过长（需控制在18字左右）"
+
+    # 校验 viral_score：排除 bool，兼容 int/float（如 8 或 8.5）
+    viral_score = raw_info["viral_score"]
+    if isinstance(viral_score, bool) or not isinstance(viral_score, (int, float)):
+        return False, "viral_score 必须是数字"
+    if not (0.0 < float(viral_score) <= 10.0):
+        return False, "usable 为 true 时 viral_score 必须在 (0, 10] 区间内"
+
+    return True, ""
 
 # 单篇粗筛放行原帖 → 构建第二阶段多模态（直传原图+原文）验货与洗稿重塑任务。
 def build_viral_article_task(post):

@@ -67,6 +67,8 @@
 
 提示词其它要求如下：
 
+
+
 # 提示词工程设计范式 (Prompt Engineering Paradigm)
 
 ### 核心心智模型
