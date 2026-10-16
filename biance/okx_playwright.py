@@ -1848,8 +1848,8 @@ def create_okx_post(
     user_data_dir=USER_DATA_DIR,
     debug=True,
     text_list=None,
-    add_hot_tag=True,
-    add_position=True,
+    add_hot_tag=False,
+    add_position=False,
 ):
     """
     主控入口 1：调度浏览器打开 OKX 星球主页并执行【纯文本 / 热门标签 / 仓位分享 / 带图片发帖】全流程。
