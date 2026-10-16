@@ -1249,18 +1249,23 @@ def extract_valid_viral_posts(article_manager):
     now = time.time()
 
     # 查询近48小时已生成(status=ok)的高流量文章的 event_key，用于跨轮次同源热点冷却
-    recent_viral_articles = article_manager.find_articles(
-        query={
-            "source": BINANCE_SOURCE,
-            "type": ARTICLE_TYPE_VIRAL,
-            "status": "ok",
-            "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
-        },
-        limit=0,
-    ) or []
+    recent_viral_articles = (
+        article_manager.find_articles(
+            query={
+                "source": BINANCE_SOURCE,
+                "type": ARTICLE_TYPE_VIRAL,
+                "status": "ok",
+                "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
+            },
+            limit=0,
+        )
+        or []
+    )
     used_event_keys = Counter()
     for art in recent_viral_articles:
-        ek = (((art.get("creation_brief") or {}).get("stage1_screen") or {}).get("event_key") or "").strip()
+        ek = (
+            ((art.get("creation_brief") or {}).get("stage1_screen") or {}).get("event_key") or ""
+        ).strip()
         if ek:
             used_event_keys[ek] += 1
 
@@ -1287,6 +1292,12 @@ def extract_valid_viral_posts(article_manager):
         text = (post.get("content") or {}).get("text_content") or ""
         if any(match.group(1) == "视频" for match in MEDIA_PATTERN.finditer(text)):
             continue
+
+        # ----------------【新增：必须有图片判断】----------------
+        if not (post.get("media") or {}).get("images"):
+            continue
+        # -----------------------------------------------------
+
         if not _is_valid_raw_post(post):
             continue
         hot_weight = view_count + like_count * 20 + comment_count * 50
@@ -1319,7 +1330,6 @@ def extract_valid_viral_posts(article_manager):
         event_skipped, len(result), time.monotonic() - started,
     )
     return result
-
 
 # 第二阶段模型返回 {usable,reject_reason,topic_tag,selected_images,viral_analysis,post_text,bait_comments} → (bool,错误文本)。
 def check_viral_article_info(raw_info, placeholders, max_chars):
