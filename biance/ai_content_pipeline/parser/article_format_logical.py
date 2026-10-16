@@ -1790,12 +1790,12 @@ def _publish_analysis_articles_for_platform(article_manager, platform):
                 err, success, post_id = create_binance_post(
                     content=text, image_path_list=image_paths, user_data_dir=session_dir,
                     chart_info={"coin": topic, "bridge": "USDT", "type": "future"}, sentiment=stance,
-                    debug=True, text_list=text_list,
+                    debug=False, text_list=text_list,
                 )
             elif platform == PLATFORM_OKX:
                 err, success, post_id = create_okx_post(
                     content=text, image_path_list=image_paths, user_data_dir=session_dir,
-                    debug=True,
+                    debug=False,
                 )
             else:
                 raise ValueError(f"不支持的发布平台: {platform}")
@@ -1915,7 +1915,7 @@ def _load_account_credentials(action, with_user_info=False):
     for account in ACCOUNTS:
         try:
             session_dir = get_config(f"{account}_browser_session_dir")
-            cookies, token, user_info = get_auth_tokens_robust(session_dir, debug=True)
+            cookies, token, user_info = get_auth_tokens_robust(session_dir, debug=False)
             if not cookies or not token:
                 logger.warning(
                     "[%s/账号] 凭证不完整 | 账号: [%s] | 后续: [跳过当前账号] "
@@ -1946,7 +1946,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance, platform
                 error, success, comment_id = comment_on_binance_post(
                     post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
                     comment=text, user_data_dir=session_dir, sentiment=stance,
-                    debug=True,
+                    debug=False,
                 )
             elif platform == PLATFORM_OKX:
                 target_post_url = (
@@ -1957,7 +1957,7 @@ def interact_comment(god_comments, other_account_list, post_id, stance, platform
                     target_post_url=target_post_url,
                     content=text,
                     user_data_dir=session_dir,
-                    debug=True,
+                    debug=False,
                 )
             else:
                 raise ValueError(f"不支持的评论互动平台: {platform}")
@@ -2962,7 +2962,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
                     user_data_dir=session_dir,
                     chart_info=None,
                     sentiment=None,
-                    debug=True,
+                    debug=False,
                     text_list=text_list,
                 )
             elif platform == PLATFORM_OKX:
@@ -2971,7 +2971,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
                     content=text,
                     image_path_list=image_paths,
                     user_data_dir=session_dir,
-                    debug=True,
+                    debug=False,
                 )
             else:
                 raise ValueError(f"不支持的发布平台: {platform}")
@@ -3079,7 +3079,7 @@ def demo_okx():
         content=test_content,
         image_path_list=test_images,
         user_data_dir=user_data_dir,
-        debug=True
+        debug=False
     )
 
     target_post_url = "https://www.okx.com/zh-hans/orbit/post/90104622119872"
@@ -3088,7 +3088,7 @@ def demo_okx():
         target_post_url=target_post_url,
         content="测试评论内容",
         user_data_dir=user_data_dir,
-        debug=True
+        debug=False
     )
 
 
