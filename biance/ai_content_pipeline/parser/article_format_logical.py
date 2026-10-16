@@ -85,6 +85,7 @@ ACCOUNTS = ["qiqi", "ruru"]
 OKX_ACCOUNTS = ["myself"]
 FEED_TOKENS = ["BTC", "ETH", "BNB", "SOL", "XRP", "DOGE"]
 ACCOUNT_COOLDOWN_SECONDS = 3600
+OKX_ACCOUNT_COOLDOWN_SECONDS = 600
 ACCOUNT_TOPIC_COOLDOWN_SECONDS = 2 * 3600
 PUBLISH_MAX_ATTEMPTS = 3
 PUBLISH_POLL_SECONDS = 600
@@ -712,7 +713,7 @@ def get_top_k_movers(top_k=5):
             if callable(close_fn):
                 close_fn()
         except Exception as close_err:
-            logger.debug("[行情/释放] CCXT 客户端释放异常（已忽略）: %s", close_err)
+            logger.info("[行情/释放] CCXT 客户端释放异常（已忽略）: %s", close_err)
 
 
 # 合约/现货热榜与涨跌榜各前2项 → 去重币种列表；沿用集合的无序返回。
@@ -1669,7 +1670,7 @@ def add_hot_topic_to_article(text, topic, tag_count=2):
     if hot_coins:
         symbol = hot_coins[0]["symbol"].replace("USDT", "").replace("USDC", "")
         tags.extend([f"#{symbol}", f"${symbol} "])
-    logger.debug("[文章/标签] 标签已准备 | 主题: [%s] | 标签: [%s]", topic, tags)
+    logger.info("[文章/标签] 标签已准备 | 主题: [%s] | 标签: [%s]", topic, tags)
     return text + "\n\n\n" + "\n".join(tags)
 
 
@@ -1755,7 +1756,7 @@ def _publish_analysis_articles_for_platform(article_manager, platform):
         account_state = platform_state[account]
         remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state["last_publish_time"])
         if remaining > 0:
-            logger.debug("[发布/账号] 仍在冷却 | 平台: [%s] | 账号: [%s] | 剩余: [%s 秒]", platform, account, int(remaining))
+            logger.info("[发布/账号] 仍在冷却 | 平台: [%s] | 账号: [%s] | 剩余: [%s 秒]", platform, account, int(remaining))
             continue
         selected_index = None
         for index, (article, addresses) in enumerate(candidates):
@@ -1765,7 +1766,7 @@ def _publish_analysis_articles_for_platform(article_manager, platform):
             selected_index = index
             break
         if selected_index is None:
-            logger.debug("[发布/账号] 所有候选仍在主题冷却或图片冲突 | 平台: [%s] | 账号: [%s]", platform, account)
+            logger.info("[发布/账号] 所有候选仍在主题冷却或图片冲突 | 平台: [%s] | 账号: [%s]", platform, account)
             continue
         article, addresses = candidates[selected_index]
         info, topic, stance = article["article_info"], article.get("topic", ""), article.get("stance", "")
@@ -2910,8 +2911,11 @@ def _publish_viral_articles_for_platform(article_manager, platform):
         account_state = platform_state[account]
         # 每个平台账号独立计算 1h 冷却
         remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("viral_last_publish_time", 0))
+        if platform == PLATFORM_OKX:
+            remaining = OKX_ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("viral_last_publish_time", 0))
+
         if remaining > 0:
-            logger.debug(
+            logger.info(
                 "[流量发布/账号] 仍在独立冷却中 | 平台: [%s] | 账号: [%s] | 剩余: [%s 秒]",
                 platform, account, int(remaining),
             )
@@ -2924,7 +2928,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
             selected_index = index
             break
         if selected_index is None:
-            logger.debug("[流量发布/账号] 所有候选图片均与当前平台已发布冲突 | 平台: [%s] | 账号: [%s]", platform, account)
+            logger.info("[流量发布/账号] 所有候选图片均与当前平台已发布冲突 | 平台: [%s] | 账号: [%s]", platform, account)
             continue
         logger.info(
             "[流量发布/账号] 账号可用 | 平台: [%s] | 账号: [%s] | 候选文章: [%s] | 评分: [%s]",

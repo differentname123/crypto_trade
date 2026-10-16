@@ -1312,166 +1312,6 @@ def _read_comment_api_verdict(page, watcher):
 #                              核心：提交一条 OKX 星球帖子
 # ==============================================================================
 
-def _submit_post(page, editor_container, content="", image_path_list=None, text_list=None):
-    """在发帖容器作用域内执行：唤醒编辑器 → 键入文本 → 上传图片 → 点击「发文」并校验响应。"""
-    content = str(content) if content else ""
-    valid_text_list = _normalize_text_list(text_list)
-
-    _dismiss_overlays(page, aggressive=False, desc="pre-submit")
-    report_guard_hits(page, "pre-submit")
-
-    real_editor = _wake_editor(page, editor_container)
-
-    # 1. 输入正文内容
-    if valid_text_list or content.strip():
-        _force_caret_to_tail(page, real_editor, tag="before-body")
-        if valid_text_list:
-            total_chars = sum(len(x.get("text", "")) for x in valid_text_list)
-            logger.info(
-                f"[编辑器/正文] 使用 text_list 键入正文 | 列表项数: 【{len(valid_text_list)}】 "
-                f"| 总字符数: 【{total_chars}】 | 分块: 【{TYPE_CHUNK_SIZE}】"
-            )
-            page.wait_for_timeout(500)
-            _type_text_list(page, real_editor, valid_text_list)
-            page.wait_for_timeout(400)
-        else:
-            logger.info(f"[编辑器/正文] 开始键入正文 | 字符数: 【{len(content)}】 | 分块: 【{TYPE_CHUNK_SIZE}】")
-            page.wait_for_timeout(500)
-            _type_body(page, real_editor, content)
-            page.wait_for_timeout(400)
-
-        try:
-            current_text = (real_editor.inner_text() or "").strip()
-        except Exception:
-            current_text = ""
-
-        expect_non_empty = (
-            any(x.get("text", "").strip() for x in valid_text_list)
-            if valid_text_list else bool(content.strip())
-        )
-        if not current_text and expect_non_empty:
-            logger.warning("[编辑器/正文] 正文被静默清空，触发一次全量补录")
-            _dismiss_overlays(page, aggressive=True, desc="text-retry")
-            try:
-                expect(real_editor).to_be_editable(timeout=4000)
-            except Exception:
-                real_editor = _wake_editor(page, editor_container, max_round=2)
-            _force_caret_to_tail(page, real_editor, tag="text-retry")
-            if valid_text_list:
-                _type_text_list(page, real_editor, valid_text_list)
-            else:
-                _type_body(page, real_editor, content)
-            page.wait_for_timeout(400)
-
-        logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
-        try:
-            _force_caret_to_tail(page, real_editor, tag="resync")
-            real_editor.press("Space")
-            page.wait_for_timeout(100)
-            real_editor.press("Backspace")
-            page.wait_for_timeout(300)
-        except Exception as sync_e:
-            logger.warning(f"[编辑器/同步] 状态唤醒动作异常，但继续主流程: {str(sync_e)[:100]}")
-
-        logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
-
-    # 2. 挂载图片（如果提供）
-    valid_images = []
-    if image_path_list:
-        if isinstance(image_path_list, str):
-            image_path_list = [image_path_list]
-        for p in image_path_list:
-            if os.path.exists(p):
-                valid_images.append(p)
-            else:
-                logger.warning(f"[编辑器/图片] 图片路径不存在，已跳过: <{p}>")
-
-    if valid_images:
-        _dismiss_overlays(page, aggressive=False, desc="pre-image")
-        _upload_images(page, editor_container, valid_images)
-
-    # 3. 定位并点击「发文」按钮 (<button type="button" class="publishBtn-qrlWy">)
-    _dismiss_overlays(page, aggressive=False, desc="pre-send")
-    send_btn_cands = [
-        editor_container.locator('button[class*="publishBtn"]').first,
-        editor_container.locator('button:has(span[class*="publishBtnText"])').first,
-        editor_container.locator("button").filter(has_text=RE_SEND_EXACT).first,
-        editor_container.get_by_role("button", name=RE_SEND).first,
-    ]
-
-    send_button = None
-    try:
-        send_button = _pick_trusted_send_button(send_btn_cands) or _interact_fallback_locators(
-            send_btn_cands, action="wait", timeout=5000, desc="发文按钮"
-        )
-        expect(send_button).to_be_enabled(timeout=10000)
-    except PlaywrightTimeoutError:
-        _forensics(page, "btn_disabled_fatal", {
-            "btn_html": send_button.evaluate("el => el.outerHTML") if send_button else "none",
-            "editor_text": real_editor.inner_text() if real_editor else "none"
-        })
-        raise Exception(
-            "「发文」按钮被找到，但持续处于禁用(Disabled)状态（可能正文为空、字数超500上限或图片仍在上传中）。"
-        )
-    except Exception as e:
-        logger.warning(f"[发送/按钮] 发生意外的定位错误: {str(e)[:150]}")
-        send_button = send_btn_cands[0]
-
-    text_before, media_before = _snapshot_editor(editor_container, real_editor)
-    api_success, content_id = False, None
-
-    logger.info(f"[发送/提交] 触发「发文」并挂载接口监听 | 主判据: <priapi/v5/content/ugc/publish> "
-                f"| 发送前编辑器: 【文本{text_before}字 / 媒体{media_before}个】")
-    watcher = _ApiWatcher(page)
-    try:
-        clicked = False
-        for attempt in range(3):
-            hit = _hit_test(page, send_button)
-            if not hit.get("ok"):
-                logger.warning(
-                    f"[发送/提交] 发文按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】")
-                _dismiss_overlays(page, aggressive=(attempt >= 1), desc=f"send-blocked-{attempt}")
-            try:
-                if attempt == 0:
-                    _robust_click(send_button)
-                elif attempt == 1:
-                    send_button.click(timeout=5000, force=True)
-                else:
-                    send_button.evaluate("el => el.click()")
-                clicked = True
-                break
-            except Exception as ce:
-                logger.warning(f"[发送/提交] 第【{attempt + 1}】次点击失败，升级点击方式重试 | 详情: 【{str(ce)[:150]}】")
-
-        if not clicked:
-            _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
-            raise Exception("发文按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
-
-        api_success, content_id = _read_api_verdict(page, watcher)
-    except PlaywrightTimeoutError as e:
-        logger.warning(f"[发送/校验] 等待接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
-    finally:
-        watcher.close()
-
-    if api_success:
-        return content_id
-
-    page.wait_for_timeout(3000)
-    text_after, media_after = _snapshot_editor(editor_container, real_editor)
-    if (text_before > 0 and text_after < text_before / 3) or (media_before > 0 and media_after < media_before):
-        logger.info(f"[发送/校验] DOM 兜底比对通过（输入框已被清空） | 文本: 【{text_before}→{text_after}】 "
-                    f"| 媒体: 【{media_before}→{media_after}】 | 结果: [Success]")
-        return content_id
-
-    report_guard_hits(page, "send-fail")
-    _forensics(page, "send_no_effect", {
-        "text_before": text_before, "text_after": text_after,
-        "media_before": media_before, "media_after": media_after,
-        "send_btn_hit_test": _hit_test(page, send_button),
-    })
-    raise Exception(f"发文已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
-                    f"媒体 {media_before}→{media_after}），疑似按钮失效、内容被前端校验拦下或网络堵塞。")
-
 
 # ==============================================================================
 #                              核心：提交一条 OKX 星球评论
@@ -1674,9 +1514,347 @@ def _launch_persistent(p, user_data_dir, args, viewport=None, hide_automation=Tr
     return context
 
 
-def create_okx_post(content="", image_path_list=None, user_data_dir=USER_DATA_DIR, debug=True, text_list=None):
+def _add_hot_topic_tag(page, editor_container, real_editor):
     """
-    主控入口 1：调度浏览器打开 OKX 星球主页并执行【纯文本 / 带图片发帖】全流程。
+    在正文输入完成后追加默认热门标签：
+    将光标锁定至编辑器末尾 → 输入 "\n\n#" 触发标签联想弹窗 → 等待 0.5 秒 → 按下 Enter 键选中首个热门标签。
+    """
+    logger.info("[编辑器/标签] 准备通过输入 '#' + Enter 添加热门话题标签...")
+    try:
+        _robust_click(real_editor)
+        _force_caret_to_tail(page, real_editor, tag="before-hot-tag")
+        try:
+            real_editor.press_sequentially("\n\n#", delay=TYPE_DELAY_MS, timeout=5000)
+        except AttributeError:
+            real_editor.type("\n\n#", delay=TYPE_DELAY_MS, timeout=5000)
+        except Exception:
+            page.keyboard.type("\n\n#", delay=TYPE_DELAY_MS)
+
+        # 等待 0.5 秒让热门标签联想列表弹出并默认选中第一项
+        page.wait_for_timeout(500)
+
+        # 按下 Enter 键确认选中第一个热门标签
+        try:
+            real_editor.press("Enter", timeout=3000)
+        except Exception:
+            page.keyboard.press("Enter")
+
+        page.wait_for_timeout(350)
+        logger.info("[编辑器/标签] 默认热门标签('# + Enter')添加完成 | 结果: [Success]")
+    except Exception as e:
+        logger.warning(f"[编辑器/标签] 添加热门标签失败，忽略并继续主流程 | 原因: 【{str(e)[:150]}】")
+
+
+def _is_futures_panel_open(page):
+    """检测仓位分享弹窗 (<section class="productPanel-..." aria-label="futures">) 是否已真正打开可见。"""
+    try:
+        return bool(
+            page.evaluate(
+                """() => {
+                    const el = document.querySelector('section[aria-label="futures"], section[class*="productPanel-"], div[class*="positionList-"]');
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    const st = window.getComputedStyle(el);
+                    return r.width > 10 && r.height > 10 &&
+                           st.display !== 'none' && st.visibility !== 'hidden' &&
+                           parseFloat(st.opacity || '1') > 0.1;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _add_position_share(page, editor_container):
+    """
+    点击仓位分享按钮 (<i class="icon iconfont okx-trading-line-chart">)，
+    连续点击确保弹窗 (<section class="productPanel-..." aria-label="futures">) 打开，
+    随后选择第一个仓位 (<button class="selectableRow-...">)，最后点击「确认」按钮 (<button class="... orbitConfirmBtn-...">)。
+    """
+    logger.info("[编辑器/仓位] 准备添加仓位分享...")
+    pos_btn_cands = [
+        editor_container.locator('button:has(i.okx-trading-line-chart)').first,
+        editor_container.locator('i.okx-trading-line-chart').first,
+        page.locator('button:has(i.okx-trading-line-chart)').first,
+        page.locator('i.okx-trading-line-chart').first,
+    ]
+
+    try:
+        pos_btn = _interact_fallback_locators(
+            pos_btn_cands, action="wait", timeout=5000, desc="仓位分享按钮(okx-trading-line-chart)"
+        )
+        try:
+            pos_btn.scroll_into_view_if_needed(timeout=2000)
+            page.wait_for_timeout(150)
+        except Exception:
+            pass
+
+        box = pos_btn.bounding_box()
+
+        # 第 1 次点击仓位分享按钮
+        if box and box["width"] > 0 and box["height"] > 0:
+            px = box["x"] + box["width"] / 2
+            py = box["y"] + box["height"] / 2
+            page.mouse.move(px, py)
+            page.mouse.click(px, py, delay=50)
+        else:
+            _robust_click(pos_btn)
+        logger.info("[编辑器/仓位] 已执行仓位分享按钮第 1 次点击")
+
+        page.wait_for_timeout(500)
+
+        # 第 2 次点击仓位分享按钮（若第 1 次未弹出面板，立即补点第 2 次）
+        if not _is_futures_panel_open(page):
+            logger.info("[编辑器/仓位] 仓位弹窗尚未打开，执行第 2 次连续点击...")
+            box2 = pos_btn.bounding_box() or box
+            if box2 and box2["width"] > 0 and box2["height"] > 0:
+                px2 = box2["x"] + box2["width"] / 2
+                py2 = box2["y"] + box2["height"] / 2
+                page.mouse.move(px2, py2)
+                page.mouse.click(px2, py2, delay=60)
+            else:
+                _robust_click(pos_btn)
+            page.wait_for_timeout(500)
+
+        # 若仍未打开，使用 JS 原生穿透点击兜底
+        if not _is_futures_panel_open(page):
+            logger.info("[编辑器/仓位] 触发 JS 原生穿透点击仓位按钮兜底...")
+            pos_btn.evaluate("el => (el.closest('button,[role=\"button\"]') || el).click()")
+            page.wait_for_timeout(500)
+
+        # 1. 定位并点击弹窗中的第一个可选仓位按钮 (<button type="button" class="selectableRow-QNxjW">)
+        first_position_cands = [
+            page.locator('section[aria-label="futures"] div[class*="positionList-"] button[class*="selectableRow-"]').first,
+            page.locator('section[class*="productPanel-"] div[class*="positionList-"] button[class*="selectableRow-"]').first,
+            page.locator('div[class*="positionList-"] button[class*="selectableRow-"]').first,
+            page.locator('section[aria-label="futures"] button[class*="selectableRow-"]').first,
+        ]
+
+        first_pos_btn = _interact_fallback_locators(
+            first_position_cands, action="wait", timeout=6000, desc="弹窗内第一个持仓项(selectableRow)"
+        )
+        _robust_click(first_pos_btn)
+        logger.info("[编辑器/仓位] 已选中第一个仓位项，准备点击「确认」按钮...")
+        page.wait_for_timeout(300)
+
+        # 2. 定位并点击弹窗底部的「确认」按钮 (<button data-testid="okd-button" ... class="... orbitConfirmBtn-qDfs2"><span class="btn-content">确认</span></button>)
+        re_confirm_text = re.compile(r"^\s*(确认|确定|Confirm|OK)\s*$", re.IGNORECASE)
+        confirm_btn_cands = [
+            page.locator('button[class*="orbitConfirmBtn-"]').first,
+            page.locator('button[data-testid="okd-button"][class*="orbitConfirmBtn"]').first,
+            page.locator('button[data-testid="okd-button"].btn-fill-primary').filter(has_text=re_confirm_text).first,
+            page.locator('button.okui-btn.btn-fill-primary').filter(has_text=re_confirm_text).first,
+            page.get_by_role("button", name=re_confirm_text).first,
+        ]
+
+        confirm_btn = _interact_fallback_locators(
+            confirm_btn_cands, action="wait", timeout=5000, desc="仓位分享「确认」按钮(orbitConfirmBtn)"
+        )
+        try:
+            expect(confirm_btn).to_be_enabled(timeout=3000)
+        except Exception:
+            pass
+
+        _robust_click(confirm_btn)
+        page.wait_for_timeout(500)
+        logger.info("[编辑器/仓位] 已点击「确认」按钮，仓位分享挂载完成 | 结果: [Success]")
+    except Exception as e:
+        logger.warning(f"[编辑器/仓位] 添加仓位分享失败（可能当前无持仓或弹窗超时），忽略并继续 | 原因: 【{str(e)[:150]}】")
+
+
+def _submit_post(
+    page,
+    editor_container,
+    content="",
+    image_path_list=None,
+    text_list=None,
+    add_hot_tag=True,
+    add_position=True,
+):
+    """
+    在发帖容器作用域内执行：
+    唤醒编辑器 → 键入文本 → (可选)增加热门标签 → (可选)增加仓位分享 → (可选)上传图片 → 点击「发文」并校验响应。
+    """
+    content = str(content) if content else ""
+    valid_text_list = _normalize_text_list(text_list)
+
+    _dismiss_overlays(page, aggressive=False, desc="pre-submit")
+    report_guard_hits(page, "pre-submit")
+
+    real_editor = _wake_editor(page, editor_container)
+
+    # 1. 输入正文内容
+    if valid_text_list or content.strip():
+        _force_caret_to_tail(page, real_editor, tag="before-body")
+        if valid_text_list:
+            total_chars = sum(len(x.get("text", "")) for x in valid_text_list)
+            logger.info(
+                f"[编辑器/正文] 使用 text_list 键入正文 | 列表项数: 【{len(valid_text_list)}】 "
+                f"| 总字符数: 【{total_chars}】 | 分块: 【{TYPE_CHUNK_SIZE}】"
+            )
+            page.wait_for_timeout(500)
+            _type_text_list(page, real_editor, valid_text_list)
+            page.wait_for_timeout(400)
+        else:
+            logger.info(f"[编辑器/正文] 开始键入正文 | 字符数: 【{len(content)}】 | 分块: 【{TYPE_CHUNK_SIZE}】")
+            page.wait_for_timeout(500)
+            _type_body(page, real_editor, content)
+            page.wait_for_timeout(400)
+
+        try:
+            current_text = (real_editor.inner_text() or "").strip()
+        except Exception:
+            current_text = ""
+
+        expect_non_empty = (
+            any(x.get("text", "").strip() for x in valid_text_list)
+            if valid_text_list else bool(content.strip())
+        )
+        if not current_text and expect_non_empty:
+            logger.warning("[编辑器/正文] 正文被静默清空，触发一次全量补录")
+            _dismiss_overlays(page, aggressive=True, desc="text-retry")
+            try:
+                expect(real_editor).to_be_editable(timeout=4000)
+            except Exception:
+                real_editor = _wake_editor(page, editor_container, max_round=2)
+            _force_caret_to_tail(page, real_editor, tag="text-retry")
+            if valid_text_list:
+                _type_text_list(page, real_editor, valid_text_list)
+            else:
+                _type_body(page, real_editor, content)
+            page.wait_for_timeout(400)
+
+        logger.info("[编辑器/同步] 执行强制状态唤醒 (State Resync)...")
+        try:
+            _force_caret_to_tail(page, real_editor, tag="resync")
+            real_editor.press("Space")
+            page.wait_for_timeout(100)
+            real_editor.press("Backspace")
+            page.wait_for_timeout(300)
+        except Exception as sync_e:
+            logger.warning(f"[编辑器/同步] 状态唤醒动作异常，但继续主流程: {str(sync_e)[:100]}")
+
+        logger.info("[编辑器/正文] 正文输入与状态同步完成 | 结果: [Success]")
+
+    # 2. 打完文字后，在末尾输入 "\n\n#" 并在 0.5s 后按 Enter 增加热门标签（若开启）
+    if add_hot_tag:
+        _add_hot_topic_tag(page, editor_container, real_editor)
+
+    # 3. 增加仓位分享，选择第一个仓位并点击确认（若开启）
+    if add_position:
+        _add_position_share(page, editor_container)
+
+    # 4. 挂载图片（如果提供）
+    valid_images = []
+    if image_path_list:
+        if isinstance(image_path_list, str):
+            image_path_list = [image_path_list]
+        for p in image_path_list:
+            if os.path.exists(p):
+                valid_images.append(p)
+            else:
+                logger.warning(f"[编辑器/图片] 图片路径不存在，已跳过: <{p}>")
+
+    if valid_images:
+        _dismiss_overlays(page, aggressive=False, desc="pre-image")
+        _upload_images(page, editor_container, valid_images)
+
+    # 5. 定位并点击「发文」按钮 (<button type="button" class="publishBtn-qrlWy">)
+    _dismiss_overlays(page, aggressive=False, desc="pre-send")
+    send_btn_cands = [
+        editor_container.locator('button[class*="publishBtn"]').first,
+        editor_container.locator('button:has(span[class*="publishBtnText"])').first,
+        editor_container.locator("button").filter(has_text=RE_SEND_EXACT).first,
+        editor_container.get_by_role("button", name=RE_SEND).first,
+    ]
+
+    send_button = None
+    try:
+        send_button = _pick_trusted_send_button(send_btn_cands) or _interact_fallback_locators(
+            send_btn_cands, action="wait", timeout=5000, desc="发文按钮"
+        )
+        expect(send_button).to_be_enabled(timeout=10000)
+    except PlaywrightTimeoutError:
+        _forensics(page, "btn_disabled_fatal", {
+            "btn_html": send_button.evaluate("el => el.outerHTML") if send_button else "none",
+            "editor_text": real_editor.inner_text() if real_editor else "none"
+        })
+        raise Exception(
+            "「发文」按钮被找到，但持续处于禁用(Disabled)状态（可能正文为空、字数超500上限或图片仍在上传中）。"
+        )
+    except Exception as e:
+        logger.warning(f"[发送/按钮] 发生意外的定位错误: {str(e)[:150]}")
+        send_button = send_btn_cands[0]
+
+    text_before, media_before = _snapshot_editor(editor_container, real_editor)
+    api_success, content_id = False, None
+
+    logger.info(f"[发送/提交] 触发「发文」并挂载接口监听 | 主判据: <priapi/v5/content/ugc/publish> "
+                f"| 发送前编辑器: 【文本{text_before}字 / 媒体{media_before}个】")
+    watcher = _ApiWatcher(page)
+    try:
+        clicked = False
+        for attempt in range(3):
+            hit = _hit_test(page, send_button)
+            if not hit.get("ok"):
+                logger.warning(
+                    f"[发送/提交] 发文按钮不可命中，先清障再重试 | 第【{attempt + 1}】次 | 详情: 【{_fmt_hit(hit)}】")
+                _dismiss_overlays(page, aggressive=(attempt >= 1), desc=f"send-blocked-{attempt}")
+            try:
+                if attempt == 0:
+                    _robust_click(send_button)
+                elif attempt == 1:
+                    send_button.click(timeout=5000, force=True)
+                else:
+                    send_button.evaluate("el => el.click()")
+                clicked = True
+                break
+            except Exception as ce:
+                logger.warning(f"[发送/提交] 第【{attempt + 1}】次点击失败，升级点击方式重试 | 详情: 【{str(ce)[:150]}】")
+
+        if not clicked:
+            _forensics(page, "send_click_fail", {"hit": _hit_test(page, send_button)})
+            raise Exception("发文按钮点击 3 级降级全部失败（疑似被浮层持续拦截或按钮已失效）。")
+
+        api_success, content_id = _read_api_verdict(page, watcher)
+    except PlaywrightTimeoutError as e:
+        logger.warning(f"[发送/校验] 等待接口响应超时，转入 DOM 兜底校验 | 详情: 【{str(e)[:120]}】")
+    finally:
+        watcher.close()
+
+    if api_success:
+        return content_id
+
+    page.wait_for_timeout(3000)
+    text_after, media_after = _snapshot_editor(editor_container, real_editor)
+    if (text_before > 0 and text_after < text_before / 3) or (media_before > 0 and media_after < media_before):
+        logger.info(f"[发送/校验] DOM 兜底比对通过（输入框已被清空） | 文本: 【{text_before}→{text_after}】 "
+                    f"| 媒体: 【{media_before}→{media_after}】 | 结果: [Success]")
+        return content_id
+
+    report_guard_hits(page, "send-fail")
+    _forensics(page, "send_no_effect", {
+        "text_before": text_before, "text_after": text_after,
+        "media_before": media_before, "media_after": media_after,
+        "send_btn_hit_test": _hit_test(page, send_button),
+    })
+    raise Exception(f"发文已点击但输入框未清空且接口无成功响应（文本 {text_before}→{text_after}，"
+                    f"媒体 {media_before}→{media_after}），疑似按钮失效、内容被前端校验拦下或网络堵塞。")
+
+
+def create_okx_post(
+    content="",
+    image_path_list=None,
+    user_data_dir=USER_DATA_DIR,
+    debug=True,
+    text_list=None,
+    add_hot_tag=True,
+    add_position=True,
+):
+    """
+    主控入口 1：调度浏览器打开 OKX 星球主页并执行【纯文本 / 热门标签 / 仓位分享 / 带图片发帖】全流程。
+    :param add_hot_tag: 是否在文字末尾增加默认热门标签，默认 True
+    :param add_position: 是否增加仓位分享（默认选第一个持仓），默认 True
     返回 Tuple(错误信息(str|None), 是否成功(bool), 帖子ID(str|None))。
     """
     if not os.path.isdir(user_data_dir):
@@ -1691,6 +1869,7 @@ def create_okx_post(content="", image_path_list=None, user_data_dir=USER_DATA_DI
 
     logger.info(f"\n{'=' * 70}\n[任务/Main] 启动 OKX 星球自动化发帖 | URL: <{OKX_ORBIT_URL}> "
                 f"| 正文: 【{text_summary}】 | 图片数量: 【{img_count}】张 "
+                f"| 热门标签: 【{add_hot_tag}】 | 仓位分享: 【{add_position}】 "
                 f"| 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
@@ -1756,7 +1935,9 @@ def create_okx_post(content="", image_path_list=None, user_data_dir=USER_DATA_DI
                         page, editor_container,
                         content=content,
                         image_path_list=image_path_list,
-                        text_list=text_list
+                        text_list=text_list,
+                        add_hot_tag=add_hot_tag,
+                        add_position=add_position,
                     )
 
                     logger.info(f"[任务/Main] OKX 星球帖子发布成功 | 帖子ID(contentId): 【{post_id}】 | 结果: [Success]")
@@ -1793,7 +1974,6 @@ def create_okx_post(content="", image_path_list=None, user_data_dir=USER_DATA_DI
         error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
         logger.error(error_info)
         return error_info, False, None
-
 
 def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR, debug=True):
     """
