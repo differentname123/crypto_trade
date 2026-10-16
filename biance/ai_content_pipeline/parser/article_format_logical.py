@@ -1399,7 +1399,7 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
         return False, "selected_images 必须是非空字符串组成的列表"
     if len(selected_images) != len(set(selected_images)):
         return False, "selected_images 不允许重复"
-    if len(selected_images) > 3:
+    if len(selected_images) > 5:
         return False, "selected_images 最多保留 3 张图片"
     if any(item not in placeholders for item in selected_images):
         return False, f"selected_images 必须来自原帖真实图片占位符 {sorted(placeholders)}"
