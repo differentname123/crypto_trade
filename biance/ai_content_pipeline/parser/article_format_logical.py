@@ -1324,28 +1324,59 @@ def extract_valid_viral_posts(article_manager):
 # 第二阶段模型返回 {usable,reject_reason,topic_tag,selected_images,viral_analysis,post_text,bait_comments} → (bool,错误文本)。
 def check_viral_article_info(raw_info, placeholders, max_chars):
     expected_keys = {
-        "usable", "decision_reason", "topic_tag", "selected_images",
-        "image_role", "viral_analysis", "post_text", "bait_comments",
-        "viral_score",
+        "image_semantics", "selected_images", "global_truth",
+        "feasibility_audit", "usable", "topic_tag",
+        "expression_strategy", "post_text", "bait_comments", "viral_score",
     }
     error = _key_error(raw_info, expected_keys, "高流量二阶段重塑")
     if error:
         return False, error
 
+    # ================= 第一关：防偷懒强校验（无论放行还是淘汰都必须通过） =================
+    # 1. 校验逐图语义解析：确保模型真正看完了 placeholders 里的每一张图，绝不漏看
+    image_semantics = raw_info["image_semantics"]
+    if not isinstance(image_semantics, list):
+        return False, "image_semantics 必须是列表"
+
+    parsed_ids = []
+    kept_ids_in_semantics = set()
+    for item in image_semantics:
+        if not isinstance(item, dict):
+            return False, "image_semantics 中的元素必须是字典对象"
+        img_id = item.get("id")
+        role = item.get("semantic_role")
+        keep = item.get("keep")
+        if not isinstance(img_id, str) or img_id not in placeholders:
+            return False, f"image_semantics.id ({img_id!r}) 不在原帖真实图片占位符 {sorted(placeholders)} 中"
+        if not isinstance(role, str) or not role.strip():
+            return False, f"图片 {img_id} 的 semantic_role 必须是非空字符串"
+        if not isinstance(keep, bool):
+            return False, f"图片 {img_id} 的 keep 必须是布尔值"
+        parsed_ids.append(img_id)
+        if keep:
+            kept_ids_in_semantics.add(img_id)
+
+    if len(parsed_ids) != len(set(parsed_ids)) or set(parsed_ids) != set(placeholders):
+        return False, f"image_semantics 必须不重不漏地覆盖全部原帖图片: 期望 {sorted(placeholders)}, 实际 {sorted(parsed_ids)}"
+
+    # 2. 校验全局真相与双生死线审讯（必须在下 usable 结论前写清楚）
+    global_truth = raw_info["global_truth"]
+    if not isinstance(global_truth, str) or not global_truth.strip():
+        return False, "global_truth 必须是非空字符串"
+
+    feasibility_audit = raw_info["feasibility_audit"]
+    if not isinstance(feasibility_audit, str) or not feasibility_audit.strip():
+        return False, "feasibility_audit 必须是非空字符串（放行或淘汰均需说明依据）"
+
     usable = raw_info["usable"]
     if not isinstance(usable, bool):
         return False, "usable 必须是布尔值"
 
-    # 无论 usable 为 true 还是 false，decision_reason 都必须是非空字符串
-    decision_reason = raw_info["decision_reason"]
-    if not isinstance(decision_reason, str) or not decision_reason.strip():
-        return False, "decision_reason 必须是非空字符串（放行或淘汰均需说明原因）"
-
-    # 分支1：二阶段看图验货后判定不可用（熔断淘汰，直接放行避免触发无意义重试）
+    # 分支1：看图验货并完成全套推理后判定不可用（熔断淘汰，直接放行避免无意义重试）
     if not usable:
         return True, ""
 
-    # 分支2：二阶段判定可用，严格校验成稿字段
+    # ================= 第二关：判定可用后的成稿严苛校验 =================
     allowed_tags = (
         "搞钱与盈亏", "情感与两性", "奇葩与吃瓜",
         "人性与潜规则", "职场与生存", "搞笑与整活",
@@ -1362,17 +1393,15 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
         return False, "selected_images 最多保留 3 张图片"
     if any(item not in placeholders for item in selected_images):
         return False, f"selected_images 必须来自原帖真实图片占位符 {sorted(placeholders)}"
+    if any(item not in kept_ids_in_semantics for item in selected_images):
+        return False, "selected_images 中包含了在 image_semantics 里被标记为 keep=false 的废图"
 
-    # 校验 image_role：有图时强制非空（防剧透锚点）；无图时仅校验类型，不因偶发填写"无"而浪费重试
-    image_role = raw_info["image_role"]
-    if not isinstance(image_role, str):
-        return False, "image_role 必须是字符串"
-    if selected_images and not image_role.strip():
-        return False, "保留配图时 image_role 必须是非空字符串"
+    # 校验改写与防剧透策略
+    expression_strategy = raw_info["expression_strategy"]
+    if not isinstance(expression_strategy, str) or not expression_strategy.strip():
+        return False, "usable 为 true 时 expression_strategy 必须是非空字符串"
 
-    if not isinstance(raw_info["viral_analysis"], str) or not raw_info["viral_analysis"].strip():
-        return False, "usable 为 true 时 viral_analysis 必须是非空字符串"
-
+    # 校验正文
     text = raw_info["post_text"]
     if not isinstance(text, str) or not text.strip():
         return False, "post_text 必须是非空字符串"
@@ -1381,14 +1410,15 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
     if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
         return False, "post_text 不能包含图片或视频占位符"
 
+    # 校验神评（放宽至 1~3 条、单条 24 字以内，既防长篇大论又避免误杀自然口语）
     comments = raw_info["bait_comments"]
-    if (not isinstance(comments, list) or not 2 <= len(comments) <= 3
+    if (not isinstance(comments, list) or not 1 <= len(comments) <= 3
             or any(not isinstance(item, str) or not item.strip() for item in comments)):
-        return False, "bait_comments 必须是包含 2—3 条非空字符串的列表"
-    if any(len(re.sub(r"\s", "", item)) > 20 for item in comments):
-        return False, "bait_comments 单条评论字数过长（需控制在18字左右）"
+        return False, "bait_comments 必须是包含 1—3 条非空字符串的列表"
+    if any(len(re.sub(r"\s", "", item)) > 24 for item in comments):
+        return False, "bait_comments 单条评论字数过长（需控制在 24 字以内）"
 
-    # 校验 viral_score：排除 bool，兼容 int/float（如 8 或 8.5）
+    # 校验 viral_score
     viral_score = raw_info["viral_score"]
     if isinstance(viral_score, bool) or not isinstance(viral_score, (int, float)):
         return False, "viral_score 必须是数字"
@@ -1396,7 +1426,6 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
         return False, "usable 为 true 时 viral_score 必须在 (0, 10] 区间内"
 
     return True, ""
-
 
 # 单篇粗筛放行原帖 → 构建第二阶段多模态（直传原图+原文）验货与洗稿重塑任务。
 def build_viral_article_task(post):
@@ -1489,9 +1518,12 @@ def execute_viral_article_task(task_data, article_manager):
             if not valid:
                 raise ValueError(error)
 
-            decision_reason = raw_info["decision_reason"].strip()
+            # 提取核心思维链产出，并兼容原有下游落库字段名
+            decision_reason = raw_info["feasibility_audit"].strip()
+            global_truth = raw_info["global_truth"].strip()
+            image_semantics = raw_info["image_semantics"]
 
-            # 二阶段看真图后判定不可用 -> 记为 skip 并落库，防止后续死循环重复拉取
+            # 二阶段看真图后判定不可用 -> 记为 skip 并落库（保留看图与审讯记录便于事后排查）
             if not raw_info["usable"]:
                 record["topic"] = "无效噪音"
                 record["status"] = "skip"
@@ -1499,11 +1531,12 @@ def execute_viral_article_task(task_data, article_manager):
                 record["article_info"] = {
                     "status": "skip",
                     "usable": False,
-                    "decision_reason": decision_reason,
+                    "decision_reason": decision_reason,      # 映射自 feasibility_audit
+                    "viral_analysis": global_truth,          # 映射自 global_truth
+                    "image_semantics": image_semantics,      # 新增：保存逐图验尸详情
                     "topic_tag": "无效噪音",
                     "selected_images": [],
                     "image_role": "",
-                    "viral_analysis": "",
                     "post_text": "",
                     "bait_comments": [],
                     "viral_score": 0.0,
@@ -1521,14 +1554,15 @@ def execute_viral_article_task(task_data, article_manager):
             record["article_info"] = {
                 "status": "ok",
                 "usable": True,
-                "decision_reason": decision_reason,
+                "decision_reason": decision_reason,                        # 兼容原字段：双生死线审讯结论
+                "viral_analysis": global_truth,                            # 兼容原字段：全局真相与唯一爽点
+                "image_role": raw_info["expression_strategy"].strip(),     # 兼容原字段：改写策略与防剧透底牌
+                "image_semantics": image_semantics,                        # 新增：逐图语义解析记录
                 "topic_tag": topic_tag,
                 "selected_images": selected_images,
-                "image_role": raw_info["image_role"].strip(),
-                "viral_analysis": raw_info["viral_analysis"].strip(),
                 "post_text": raw_info["post_text"].strip(),
                 "used_material_ids": ["M1"],
-                "bait_comments": raw_info["bait_comments"],
+                "bait_comments": [c.strip() for c in raw_info["bait_comments"]],
                 "viral_score": viral_score,
                 "image_mapping": {key: dict(image_mapping[key]) for key in selected_images},
             }
@@ -1568,7 +1602,6 @@ def execute_viral_article_task(task_data, article_manager):
             record["attempt_count"], time.monotonic() - started,
         )
     return saved_record
-
 
 # 单轮高流量文章重塑：筛选粗筛通过单帖 → 1对1构建多模态重塑任务 → 并发生成并存入 GeneratedArticleManager。
 def generate_viral_articles_once():
@@ -2564,8 +2597,8 @@ def get_need_check_pre_screen_info(
 
 
 def get_need_check_viral_article_info(
-        limit=40,
-        hours=6,
+        limit=100,
+        hours=12,
         only_current_version=True,
         random_sample=True,
         save_path=None,
@@ -2647,22 +2680,38 @@ def get_need_check_viral_article_info(
                 "like_count": engagement.get("like_count", 0),
                 "comment_count": engagement.get("comment_count", 0),
             },
-            "viral_screen": {
-                "keep": v_screen.get("keep"),
-                "event_key": v_screen.get("event_key", ""),
-            },
         }
 
+        usable = info.get("usable", False)
+
+        # 按“看图解码 -> 全局真相 -> 生死线审讯 -> 成稿输出”的思维链顺序组装复盘数据
+        if not usable:
+            # 淘汰帖：仅保留看图验尸、全局真相与淘汰依据，剔除 0.0 分和“无效噪音”等冗余字段
+            remodeled_article_data = {
+                "usable": False,
+                "image_semantics": info.get("image_semantics", []),
+                "viral_analysis": info.get("viral_analysis", ""),
+                "decision_reason": info.get("decision_reason", ""),
+            }
+        else:
+            # 放行帖：完整展示思维链与成稿结果
+            remodeled_article_data = {
+                "usable": True,
+                "topic_tag": info.get("topic_tag", ""),
+                "viral_score": info.get("viral_score", 0.0),
+                "image_semantics": info.get("image_semantics", []),
+                "selected_images": info.get("selected_images", []),
+                "viral_analysis": info.get("viral_analysis", ""),
+                "decision_reason": info.get("decision_reason", ""),
+                "image_role": info.get("image_role", ""),
+                "post_text": info.get("post_text", ""),
+                "bait_comments": info.get("bait_comments", []),
+            }
+
+        # 删除值为空的字段（注意保留 usable: False）
         remodeled_article_data = {
-            "usable": info.get("usable", False),
-            "decision_reason": info.get("decision_reason", ""),
-            "topic_tag": info.get("topic_tag", ""),
-            "selected_images": info.get("selected_images", []),
-            "image_role": info.get("image_role", ""),
-            "viral_analysis": info.get("viral_analysis", ""),
-            "post_text": info.get("post_text", ""),
-            "bait_comments": info.get("bait_comments", []),
-            "viral_score": info.get("viral_score", 0.0),
+            k: v for k, v in remodeled_article_data.items()
+            if k == "usable" or v not in (None, "", [], {})
         }
 
         review_list.append({
@@ -2678,6 +2727,7 @@ def get_need_check_viral_article_info(
         len(candidates), len(review_list), save_path or "未落盘",
     )
     return review_list
+
 
 
 # article → (全部URL/路径集合, 统计用主地址列表)；同时兼容分析帖(image_placeholders)与流量帖(selected_images)。
@@ -3037,10 +3087,10 @@ if __name__ == "__main__":
     tasks = [
         # generate_analysis_articles,
         generate_viral_articles,
-        format_image_article,
-        hudong,
+        # format_image_article,
+        # hudong,
         # auto_publish_articles,
-        auto_publish_viral_articles,
+        # auto_publish_viral_articles,
         # delete_old_post
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
