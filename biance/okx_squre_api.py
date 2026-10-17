@@ -152,15 +152,15 @@ def _safe_int(val, default=0):
 
 
 def _clean_text(raw):
-    """清理 HTML 转义、OKX 图片占位符（<!-- IMG#0 -->）、不可见字符与多余空行"""
+    """清理 HTML 转义、OKX 内嵌 HTML 注释占位符、不可见字符与多余空行"""
     if not raw:
         return ""
     text = html.unescape(str(raw))
-    text = _IMG_PLACEHOLDER_RE.sub('', text)
+    # 清理所有 HTML 注释形式的占位符（包含 IMG#0 及其他非图片组件注释占位符）
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
     text = _INVISIBLE_RE.sub('', text)
     text = _MULTI_NEWLINE_RE.sub('\n\n', text)
     return text.strip()
-
 
 def _clean_title(raw):
     """清理标题，空值返回 None"""
@@ -355,13 +355,8 @@ def clean_okx_posts(raw_data_list):
             else:
                 raw_text = content_data.get("content") or content_data.get("excerpt") or ""
 
+            # 仅做纯文本清洗，不再拼接 [实盘晒单: ...] 等非图片插件占位符
             text_content = _clean_text(raw_text)
-
-            # 若包含实盘晒单插件，将实盘摘要追加到正文末尾，方便下游直接提取交易信号
-            plugin_summaries = _extract_okx_plugin_summary(content_data)
-            if plugin_summaries:
-                plugin_text = "\n".join(plugin_summaries)
-                text_content = f"{text_content}\n\n{plugin_text}" if text_content else plugin_text
 
             data["content"].update({
                 "title": _clean_title(raw_title),
@@ -408,7 +403,6 @@ def clean_okx_posts(raw_data_list):
 
     logger.info(f"🗂️ [OKX清洗] 完成 | 成功={len(cleaned_list)}条 | 失败={failed}条")
     return cleaned_list
-
 
 # ============================================================
 # OKX 评论采集与清洗 (与 clean_binance_replies 100% 格式对齐)
@@ -572,7 +566,7 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
         return item, stats
 
     try:
-        # ---------- 1. 多模态标记融合到正文尾部 ----------
+        # ---------- 1. 仅将图片类占位符融合到正文尾部 ----------
         media_info = item.get('media', {})
         media_marks = []
 
@@ -586,10 +580,6 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
         for img_url in media_info.get('inline_images', []):
             if img_url:
                 media_marks.append(f"[插图: {img_url}]")
-
-        video_url = media_info.get('video_url')
-        if video_url:
-            media_marks.append(f"[视频: {video_url}]")
 
         if media_marks:
             original_text = item.get('content', {}).get('text_content', '').strip()
@@ -656,7 +646,6 @@ def _enrich_single_okx_post(item, session, cookies="", extra_headers=None, downl
         logger.error(f"[OKX_UPDATE] 就地富化失败 | post_id={post_id} | error={e}", exc_info=True)
 
     return item, stats
-
 
 def update_okx_posts_in_place(clean_list, cookies="", extra_headers=None, download_media=True):
     """

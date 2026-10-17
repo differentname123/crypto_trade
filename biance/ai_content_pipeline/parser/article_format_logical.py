@@ -25,6 +25,7 @@ from functools import lru_cache
 from PIL import Image, UnidentifiedImageError
 
 from biance.okx_playwright import create_okx_post, comment_on_okx_post
+from biance.okx_squre_api import fetch_okx_feed
 
 VIRAL_PUBLISH_MAX_AGE_HOURS = 24
 STATE_FILE_LOCK = threading.Lock()
@@ -51,6 +52,8 @@ from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPost
 
 prompt_version = "1016-1"
 BINANCE_SOURCE = "biance"
+OKX_SOURCE = "okx"
+POST_SOURCES = (BINANCE_SOURCE, OKX_SOURCE)
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
 MAX_MEDIA_COUNT = 10
@@ -120,6 +123,14 @@ def _get_account_session_dir(platform, account):
             pass
         return rf"W:\temp\okx_{account}"
     return get_config(f"{account}_browser_session_dir")
+
+
+# 统一按多个 source 查询原帖列表，兼容 biance 与 okx 双数据源。
+def _find_posts_by_sources(post_manager, sources=POST_SOURCES, limit=POST_QUERY_LIMIT):
+    posts = []
+    for source in sources:
+        posts.extend(post_manager.find_posts_by_source(source, limit=limit) or [])
+    return posts
 
 
 # 秒/毫秒数值 → 秒；拒绝无效与非有限值，避免错误时间进入业务比较。
@@ -672,6 +683,8 @@ def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     #     for order in orders:
     #         posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
     posts.extend(fetch_binance_feed(count=feed_count * 2))
+    posts.extend(fetch_okx_feed(count=feed_count * 2))
+
     if posts:
         post_manager.upsert_posts(posts)
     logger.info(
@@ -687,7 +700,7 @@ def fetch_post(post_manager):
 
 # 管理器、币种序列 → 热门/最新流及综合流入库。
 def fetch_hot_post(post_manager, token_list):
-    _fetch_and_save_posts(post_manager, token_list, (1, 2), 1000)
+    _fetch_and_save_posts(post_manager, token_list, (1, 2), 100)
 
 
 # top_k → {top_gainers/top_losers:[{symbol,percentage}]}；局部行情客户端在异常时也关闭。
@@ -736,7 +749,11 @@ def format_image_article():
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
             fetch_hot_post(post_manager, get_hot_coin())
-            posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+            source_batches = [
+                post_manager.find_posts_by_source(source, limit=POST_QUERY_LIMIT) or []
+                for source in POST_SOURCES
+            ]
+            posts = [post for batch in source_batches for post in batch]
             if not posts:
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
                 time.sleep(60)
@@ -754,7 +771,7 @@ def format_image_article():
                     for future in as_completed(futures):
                         future.result()
             batch_screen_viral_posts(posts, post_manager)
-            delay = 5 if len(posts) >= POST_QUERY_LIMIT else 3600
+            delay = 5 if any(len(batch) >= POST_QUERY_LIMIT for batch in source_batches) else 3600
             logger.info(
                 "[帖子/完成] 本轮线程结束 | 扫描: [%s] | 已提交: [%s] | 耗时: [%.2f 秒] "
                 "| 下次扫描: [%s 秒后] | 单帖结果: [见帖子回写/失败日志]",
@@ -772,7 +789,7 @@ def format_image_article():
 # 无入参 → 查询范围内非None的 logic_mul/pre_screen 置空并批量回写；保留手动清理入口。
 def clear_all_media_format_batch():
     manager = UniversalPostManager(gen_db_object())
-    posts = manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
     updates = [post for post in posts if post.get("logic_mul") is not None or post.get("pre_screen") is not None]
     for post in updates:
         post["logic_mul"] = post["pre_screen"] = None
@@ -821,18 +838,19 @@ def transform_mlus(mlu_list):
             )
             continue
         visual_items, seen_ids = [], set()
+        ev_source = evidence.get("source") or BINANCE_SOURCE
         for image in images:
             image_id = image["image_id"]
             if image_id in seen_ids:
                 continue
             seen_ids.add(image_id)
-            source_key = (evidence.get("source_post_id"), image_id)
+            source_key = (ev_source, evidence.get("source_post_id"), image_id)
             placeholder = asset_by_source.get(source_key)
             if placeholder is None:
                 placeholder = f"[ASSET_IMG_{len(asset_by_source) + 1}]"
                 asset_by_source[source_key] = placeholder
                 image_mapping[placeholder] = {
-                    "source": BINANCE_SOURCE, "source_post_id": evidence.get("source_post_id"),
+                    "source": ev_source, "source_post_id": evidence.get("source_post_id"),
                     "original_image_id": image_id, "original_image_id_list": [image_id], **source_mapping[image_id],
                 }
             visual_items.append({"placeholder": placeholder, "what_it_shows": image["context"]})
@@ -848,7 +866,7 @@ def extract_and_group_valid_evidences():
     active_symbols = str(read_json("active_usdt_symbols.json")).upper()
     started = time.monotonic()
     manager = UniversalPostManager(gen_db_object())
-    posts = manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
     grouped = defaultdict(lambda: defaultdict(list))
     now, invalid_times = time.time(), 0
     for post in posts:
@@ -865,6 +883,7 @@ def extract_and_group_valid_evidences():
         if age > 15 * 24 * 3600 or age < -3600:
             continue
         source_mapping = build_source_image_mapping(post)
+        post_source = post.get("source") or BINANCE_SOURCE
         for evidence in logic["evidences"]:
             if any(image.get("usable") is not True for image in evidence.get("images", [])):
                 continue
@@ -879,7 +898,8 @@ def extract_and_group_valid_evidences():
             if age > duration or not candidate_coins or stance not in ("看多", "看空"):
                 continue
             enriched = {
-                **evidence, "source_post_id": post.get("post_id", "UNKNOWN"), "publish_time": publish_time,
+                **evidence, "source": post_source, "source_post_id": post.get("post_id", "UNKNOWN"),
+                "publish_time": publish_time,
                 "source_text_content": (post.get("content") or {}).get("text_content", ""),
                 "source_image_mapping": source_mapping,
             }
@@ -965,9 +985,10 @@ def get_post_usage_counts(article_manager, source, post_ids):
     counts = dict.fromkeys(unique_ids, 0)
     if not unique_ids:
         return counts
+    source_query = {"$in": list(source)} if isinstance(source, (list, tuple, set)) else source
     articles = article_manager.find_articles(
         query={
-            "source": source,
+            "source": source_query,
             "status": "ok",
             "post_id_list": {"$in": unique_ids},
             "$or": [
@@ -1065,7 +1086,7 @@ def build_article_task(coin, stance, ev_list, article_manager):
                   and not isinstance(item.get("source_post_id"), bool) and item["source_post_id"] not in ("", "UNKNOWN")
                   and isinstance(item.get("core_fact"), str) and item["core_fact"].strip()]
     usage = get_post_usage_counts(
-        article_manager, BINANCE_SOURCE, list(dict.fromkeys(item["source_post_id"] for item in candidates)),
+        article_manager, POST_SOURCES, list(dict.fromkeys(item["source_post_id"] for item in candidates)),
     )
     groups = defaultdict(list)
     for item in candidates:
@@ -1225,9 +1246,10 @@ def get_remodeled_viral_post_ids(article_manager, source, post_ids):
     str_ids = [str(pid).strip() for pid in raw_ids if str(pid).strip()]
     int_ids = [int(pid) for pid in str_ids if pid.isdigit()]
     query_ids = list(dict.fromkeys([*raw_ids, *str_ids, *int_ids]))
+    source_query = {"$in": list(source)} if isinstance(source, (list, tuple, set)) else source
     articles = article_manager.find_articles(
         query={
-            "source": source,
+            "source": source_query,
             "type": ARTICLE_TYPE_VIRAL,
             "status": {"$in": ["ok", "skip"]},
             "post_id_list": {"$in": query_ids},
@@ -1246,14 +1268,14 @@ def get_remodeled_viral_post_ids(article_manager, source, post_ids):
 def extract_valid_viral_posts(article_manager):
     started = time.monotonic()
     post_manager = UniversalPostManager(gen_db_object())
-    posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
     now = time.time()
 
     # 查询近48小时已生成(status=ok)的高流量文章的 event_key，用于跨轮次同源热点冷却
     recent_viral_articles = (
         article_manager.find_articles(
             query={
-                "source": BINANCE_SOURCE,
+                "source": {"$in": list(POST_SOURCES)},
                 "type": ARTICLE_TYPE_VIRAL,
                 "status": "ok",
                 "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
@@ -1305,7 +1327,7 @@ def extract_valid_viral_posts(article_manager):
         candidates.append((post, hot_weight, publish_time))
 
     candidate_ids = [item[0].get("post_id") for item in candidates if item[0].get("post_id") is not None]
-    processed_ids = get_remodeled_viral_post_ids(article_manager, BINANCE_SOURCE, candidate_ids)
+    processed_ids = get_remodeled_viral_post_ids(article_manager, POST_SOURCES, candidate_ids)
     unprocessed = [
         item for item in candidates
         if str(item[0].get("post_id", "")).strip() not in processed_ids
@@ -1442,12 +1464,13 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
 def build_viral_article_task(post):
     post_id = post.get("post_id")
     post_id_str = str(post_id or "").strip()
+    post_source = post.get("source") or BINANCE_SOURCE
     screen = post.get("viral_screen") or {}
     normalized_text, file_paths, placeholders = normalize_post_media(post)
     source_mapping = build_source_image_mapping(post)
     image_mapping = {
         img_id: {
-            "source": BINANCE_SOURCE,
+            "source": post_source,
             "source_post_id": post_id,
             "original_image_id": img_id,
             "original_image_id_list": [img_id],
@@ -1474,7 +1497,7 @@ def build_viral_article_task(post):
     }
     model_name = "gemini-3.1-pro-preview"
     record = {
-        "source": BINANCE_SOURCE,
+        "source": post_source,
         "type": ARTICLE_TYPE_VIRAL,
         "topic": "奇葩与吃瓜",
         "stance": "无主语直抛",
@@ -2166,7 +2189,7 @@ def process_posts(post_list):
 # 无入参 → [{text_content,logic_mul}]；保留历史媒体结构判据，含图记录稳定优先。
 def get_all_non_empty_logic_mul_with_clean_text():
     manager = UniversalPostManager(gen_db_object())
-    posts = manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT)
+    posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
     results = [{"text_content": MEDIA_PATTERN.sub("", (post.get("content") or {}).get("text_content") or "").strip(),
                 "logic_mul": post["logic_mul"]} for post in posts if post.get("logic_mul")]
 
@@ -2236,7 +2259,7 @@ def get_need_check_article_info():
             elif hasattr(post_manager, "find_posts"):
                 raw_posts = post_manager.find_posts(query=query) or []
             else:
-                posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+                posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
                 target_ids = set(query_ids)
                 raw_posts = [post for post in posts if post.get("post_id") in target_ids]
         except Exception:
@@ -2463,7 +2486,7 @@ def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
     manager = UniversalPostManager(gen_db_object())
     start_time = time.time() - hours * 3600
     query = {
-        "source": BINANCE_SOURCE, "publish_time": {"$gte": start_time},
+        "source": {"$in": list(POST_SOURCES)}, "publish_time": {"$gte": start_time},
         "engagement.view_count": {"$gte": min_views},
         "content.text_content": {"$regex": target_key, "$options": "i"},
     }
@@ -2474,7 +2497,7 @@ def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
         elif hasattr(manager, "find_posts"):
             posts = manager.find_posts(query=query, sort=sort)
         else:
-            raw_posts = manager.find_posts_by_source(BINANCE_SOURCE, limit=5000)
+            raw_posts = _find_posts_by_sources(manager, limit=5000)
             posts = [post for post in raw_posts
                      if post.get("publish_time", 0) >= start_time
                      and post.get("engagement", {}).get("view_count", 0) >= min_views
@@ -2538,7 +2561,7 @@ def get_need_check_pre_screen_info(
 
     # 1. 组装 MongoDB 查询条件
     query = {
-        "source": BINANCE_SOURCE,
+        "source": {"$in": list(POST_SOURCES)},
         "pre_screen": {"$exists": True, "$ne": None},
     }
     if only_current_version:
@@ -2554,7 +2577,7 @@ def get_need_check_pre_screen_info(
         elif hasattr(post_manager, "find_posts"):
             raw_posts = post_manager.find_posts(query=query) or []
         else:
-            all_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+            all_posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
             for p in all_posts:
                 ps = p.get("pre_screen")
                 if not isinstance(ps, dict) or not isinstance(ps.get("no_evidence"), bool):
@@ -2659,7 +2682,7 @@ def get_need_check_viral_article_info(
             elif hasattr(post_manager, "find_posts"):
                 raw_posts = post_manager.find_posts(query=p_query) or []
             else:
-                all_posts = post_manager.find_posts_by_source(BINANCE_SOURCE, limit=POST_QUERY_LIMIT) or []
+                all_posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
                 raw_posts = [p for p in all_posts if
                              p.get("post_id") in query_ids or str(p.get("post_id")) in query_ids]
         except Exception:
