@@ -49,11 +49,16 @@ DEFAULT_OKX_DEVID = "2f579465-c748-4469-9ca9-9e13f0df47dc"
 DEFAULT_OKX_SITE_INFO = "=03M3ojI5RXa05WZiwiIMFkQPx0Rfh1SPJiOiUGZvNmIsIiULJiOi42bpdWZyJye"
 
 
-def _build_okx_headers(referer="https://www.okx.com/zh-hans/orbit", cookies="", extra_headers=None):
+def _build_okx_headers(
+        referer="https://www.okx.com/zh-hans/orbit",
+        cookies="",
+        extra_headers=None,
+        timestamp_ms=None
+):
     """
-    构造 OKX Orbit 接口通用请求头，自动生成毫秒级时间戳与请求追踪 ID
+    构造 OKX 接口通用请求头，支持外部传入 timestamp_ms 以保证 URL 参数 t 与请求头时间戳严格一致
     """
-    now_ms = str(int(time.time() * 1000))
+    now_ms = str(timestamp_ms) if timestamp_ms else str(int(time.time() * 1000))
     headers = {
         "accept": "application/json",
         "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -87,6 +92,186 @@ def _build_okx_headers(referer="https://www.okx.com/zh-hans/orbit", cookies="", 
     if extra_headers and isinstance(extra_headers, dict):
         headers.update(extra_headers)
     return headers
+
+
+# ============================================================
+# OKX 热门币榜单采集函数 (新增)
+# ============================================================
+def fetch_okx_hot_coins(
+        num=25,
+        quote_type="USDT",
+        country_filter=1,
+        rank=0,
+        cookies="",
+        extra_headers=None,
+        session=None
+):
+    """
+    查询 OKX 最新热门币榜单（仅拉取第一页），返回纯币种符号列表
+
+    :param num:            第一页拉取的数量，默认 25
+    :param quote_type:     计价币种类型，默认 "USDT"
+    :param country_filter: 国家/地区过滤参数，默认 1
+    :param rank:           榜单排序类型参数，默认 0
+    :param cookies:        可选 OKX Cookie 字符串
+    :param extra_headers:  可选额外请求头字典（如 {"x-fptoken": "...", "x-fptoken-signature": "..."}）
+    :param session:        可选外部传入的 requests.Session 对象
+    :return:               按热度排序且去重后的币种列表，例如 ["BTC", "ETH", "OKB", ...]
+    """
+    url = "https://www.okx.com/priapi/v5/rubik/web/public/hot-rank"
+    referer = "https://www.okx.com/zh-hans/markets/rankings/spot/hot-crypto"
+    label = "OKX热门币榜"
+
+    req_client = session if session else requests
+    retry_count = 0
+
+    while retry_count < MAX_RETRIES:
+        now_ms = str(int(time.time() * 1000))
+        params = {
+            "countryFilter": country_filter,
+            "rank": rank,
+            "type": quote_type,
+            "pageNum": 1,
+            "num": num,
+            "t": now_ms
+        }
+        headers = _build_okx_headers(
+            referer=referer,
+            cookies=cookies,
+            extra_headers=extra_headers,
+            timestamp_ms=now_ms
+        )
+        response = None
+
+        try:
+            response = req_client.get(
+                url,
+                headers=headers,
+                params=params,
+                proxies=PROXIES,
+                timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            json_resp = response.json()
+
+            if str(json_resp.get("code")) != "0":
+                logger.error(
+                    f"❌ [{label}] API 业务报错 | code={json_resp.get('code')} | msg={json_resp.get('msg')}"
+                )
+                return []
+
+            data_obj = json_resp.get("data") or {}
+            rank_list = data_obj.get("data") or []
+
+            if not rank_list:
+                logger.warning(f"⚠️ [{label}] 返回的榜单列表为空")
+                return []
+
+            hot_coins = []
+            seen_coins = set()
+
+            for item in rank_list:
+                if not isinstance(item, dict):
+                    continue
+                # 优先取 ccyV2 (如 "BTC")，兜底从 instId (如 "BTC-USDT") 拆分
+                coin = (item.get("ccyV2") or "").strip().upper()
+                if not coin:
+                    inst_id = (item.get("instId") or "").strip().upper()
+                    if "-" in inst_id:
+                        coin = inst_id.split("-")[0].strip()
+
+                if coin and coin not in seen_coins:
+                    seen_coins.add(coin)
+                    hot_coins.append(coin)
+
+            logger.info(f"🔥 [{label}] 拉取成功 | 共获取 {len(hot_coins)} 个热门币种: {hot_coins}")
+            return hot_coins
+
+        except Exception as e:
+            detail = ""
+            if response is not None and response.status_code >= 400:
+                detail = f" | HTTP {response.status_code} | 返回: {response.text[:300]}"
+            retry_count += 1
+            logger.warning(
+                f"🚨 [{label}] 请求失败 ({retry_count}/{MAX_RETRIES}){detail} | 异常: {e}"
+            )
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"❌ [{label}] 连续失败达到 {MAX_RETRIES} 次上限，放弃采集")
+                break
+            time.sleep(random.uniform(1.0, 2.5))
+
+    return []
+
+
+def fetch_okx_feed(
+        count=20,
+        existing_ids=None,
+        cookies="",
+        extra_headers=None,
+        download_media=True,
+        initial_cursor="1"
+):
+    """
+    统一的 OKX 广场推荐流数据拉取接口（修复了外部 existing_ids 引用无法原地同步更新的问题）
+    """
+    # 保留外部传入对象的引用，便于后续原地写回更新
+    caller_existing_ref = existing_ids
+    normalized_existing = set(str(i) for i in existing_ids) if existing_ids else set()
+
+    task_label = "OKX推荐流"
+    logger.info(f"🚀 开始探测: [{task_label}] | 目标净增条数: {count}")
+
+    # 1. 拉取推荐流原始数据（内部已结合 normalized_existing 进行去重）
+    raw_feed_list = fetch_okx_feed_recommend(
+        required_count=count,
+        initial_cursor=initial_cursor,
+        cookies=cookies,
+        extra_headers=extra_headers,
+        existing_ids=normalized_existing
+    )
+
+    # 2. 早期拦截护城河二次确认，并同步原地更新外部传入的 existing_ids
+    filtered_feed_list = []
+    intercepted_count = 0
+
+    for raw_item in raw_feed_list:
+        content_data = raw_item.get("contentData") or {}
+        item_id = str(content_data.get("contentId") or "")
+        if item_id and item_id not in normalized_existing:
+            filtered_feed_list.append(raw_item)
+            normalized_existing.add(item_id)
+            if isinstance(caller_existing_ref, set):
+                caller_existing_ref.add(item_id)
+            elif isinstance(caller_existing_ref, list):
+                caller_existing_ref.append(item_id)
+        else:
+            intercepted_count += 1
+
+    if not filtered_feed_list:
+        logger.info(
+            f"🛑 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
+            f"🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
+        )
+        return []
+
+    logger.info(
+        f"📥 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
+        f"🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
+    )
+
+    # 3. 标准化 Schema 清洗
+    clean_feed_list = clean_okx_posts(filtered_feed_list)
+
+    # 4. 多线程并发富化（拼接媒体标签、下载图片、按需拉取评论）
+    final_clean_feed_list = update_okx_posts_in_place(
+        clean_feed_list,
+        cookies=cookies,
+        extra_headers=extra_headers,
+        download_media=download_media
+    )
+
+    return final_clean_feed_list
+
 
 
 # ============================================================
@@ -809,87 +994,12 @@ def fetch_okx_feed_recommend(
     return all_items[:required_count]
 
 
-def fetch_okx_feed(
-        count=20,
-        existing_ids=None,
-        cookies="",
-        extra_headers=None,
-        download_media=True,
-        initial_cursor="1"
-):
-    """
-    统一的 OKX 广场推荐流数据拉取接口（与 fetch_binance_feed 签名及返回结构完全对齐）
-
-    :param count:          目标净增条数
-    :param existing_ids:   历史已处理的 post_id 集合或列表（早期拦截护城河）
-    :param cookies:        可选 OKX Cookie 字符串
-    :param extra_headers:  可选额外请求头字典（如 {"x-fptoken": "...", "x-fptoken-signature": "..."}）
-    :param download_media: 是否自动下载图片到本地并建立 local_mapping，默认 True
-    :param initial_cursor: 推荐流起始 cursor，默认 "1"
-    :return:               与 fetch_binance_feed 结构 100% 相同的标准字典列表
-    """
-    if existing_ids is None:
-        existing_ids = set()
-    elif isinstance(existing_ids, list):
-        existing_ids = set(str(i) for i in existing_ids)
-    else:
-        existing_ids = set(str(i) for i in existing_ids)
-
-    task_label = "OKX推荐流"
-    logger.info(f"🚀 开始探测: [{task_label}] | 目标净增条数: {count}")
-
-    # 1. 拉取推荐流原始数据（内部已结合 existing_ids 进行去重）
-    raw_feed_list = fetch_okx_feed_recommend(
-        required_count=count,
-        initial_cursor=initial_cursor,
-        cookies=cookies,
-        extra_headers=extra_headers,
-        existing_ids=existing_ids
-    )
-
-    # 2. 早期拦截护城河二次确认并同步更新外部传入的 existing_ids
-    filtered_feed_list = []
-    intercepted_count = 0
-
-    for raw_item in raw_feed_list:
-        content_data = raw_item.get("contentData") or {}
-        item_id = str(content_data.get("contentId") or "")
-        if item_id and item_id not in existing_ids:
-            filtered_feed_list.append(raw_item)
-            existing_ids.add(item_id)
-        else:
-            intercepted_count += 1
-
-    if not filtered_feed_list:
-        logger.info(
-            f"🛑 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-            f"🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
-        )
-        return []
-
-    logger.info(
-        f"📥 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-        f"🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
-    )
-
-    # 3. 标准化 Schema 清洗
-    clean_feed_list = clean_okx_posts(filtered_feed_list)
-
-    # 4. 多线程并发富化（拼接媒体标签、下载图片、按需拉取评论）
-    final_clean_feed_list = update_okx_posts_in_place(
-        clean_feed_list,
-        cookies=cookies,
-        extra_headers=extra_headers,
-        download_media=download_media
-    )
-
-    return final_clean_feed_list
-
-
 # ============================================================
 # 单元测试与调用示例
 # ============================================================
 if __name__ == "__main__":
+    # 1. 测试拉取 OKX 最新热门币榜单（第一页前 25 个）
+    hot_coins = fetch_okx_hot_coins(num=25)
 
     # 2. 测试拉取 OKX 推荐流（与 fetch_binance_feed 返回格式完全一致）
     history_ids = set()

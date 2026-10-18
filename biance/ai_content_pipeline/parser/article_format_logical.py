@@ -25,7 +25,7 @@ from functools import lru_cache
 from PIL import Image, UnidentifiedImageError
 
 from biance.okx_playwright import create_okx_post, comment_on_okx_post
-from biance.okx_squre_api import fetch_okx_feed
+from biance.okx_squre_api import fetch_okx_feed, fetch_okx_hot_coins
 
 VIRAL_PUBLISH_MAX_AGE_HOURS = 24
 STATE_FILE_LOCK = threading.Lock()
@@ -2846,15 +2846,30 @@ def _update_account_publish_state(platform, account, field_updates, topic_update
         save_json(STATE_FILE, state)
 
 
-# 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/图片冲突 → 按 viral_score 降序 → 1h冷却发布 → 回写状态。
-# 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/图片冲突 → 按 viral_score 降序 → 1h冷却发布 → 回写状态。
-def _publish_viral_articles_for_platform(article_manager, platform):
+# 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/热币匹配/图片冲突 → 按 viral_score 降序 → 冷却发布 → 回写状态。
+def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
+
     if not accounts:
         return
     now = time.time()
     state = _load_and_init_publish_state()
     platform_state = state[platform]
+
+    # 清洗并规范化热门币列表（保持原有顺序，用于提取匹配到的第一个币）
+    normalized_hot_coins = []
+    for coin in (hot_coins or []):
+        if isinstance(coin, dict):
+            coin_str = (
+                str(coin.get("symbol") or coin.get("coin") or "")
+                .replace("USDT", "")
+                .replace("USDC", "")
+                .strip()
+            )
+        else:
+            coin_str = str(coin or "").replace("USDT", "").replace("USDC", "").strip()
+        if coin_str:
+            normalized_hot_coins.append(coin_str)
 
     # 仅查询当前平台近24小时已成功发布的帖子，用于当前平台内部图片去重（不阻塞其他平台发同帖）
     recent_success = article_manager.find_articles(query={
@@ -2877,7 +2892,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
     }) or []
 
     # topic 必须是 "搞钱与盈亏"
-    raw_candidates = [article for article in raw_candidates if (article.get("topic") or "").strip() == "搞钱与盈亏"]
+    # raw_candidates = [article for article in raw_candidates if (article.get("topic") or "").strip() == "搞钱与盈亏"]
 
     stats = Counter()
     candidates = []
@@ -2901,6 +2916,16 @@ def _publish_viral_articles_for_platform(article_manager, platform):
             stats["attempts"] += 1
             continue
 
+        # 将单条数据库数据转换为 str，不分大小写判断哪个 hot_coin 出现过，必须包含热门币
+        article_str_lower = str(article).lower()
+        matched_coin = next(
+            (coin.upper() for coin in normalized_hot_coins if coin.lower() in article_str_lower),
+            None,
+        )
+        if not matched_coin:
+            stats["no_hot_coin"] += 1
+            continue
+
         # 校验选中的图片映射及本地文件完整性
         mapping = info.get("image_mapping") or {}
         selected_images = info.get("selected_images") or []
@@ -2914,25 +2939,26 @@ def _publish_viral_articles_for_platform(article_manager, platform):
         if addresses and (addresses & used_addresses):
             stats["image_dup"] += 1
             continue
-        candidates.append((article, addresses))
+        candidates.append((article, addresses, matched_coin))
 
     # 按照 viral_score 从高到低排序，优先发送未发过的最高分帖子
     candidates.sort(key=lambda item: float(item[0]["article_info"].get("viral_score", 0.0)), reverse=True)
     logger.info(
         "[流量发布/计划] 平台[%s]近%s小时流量帖已按评分从高到低筛选 | 查询: [%s] | 候选: [%s] "
-        "| 过滤: [版本%s/结构%s/尝试超限%s/图片缺失%s/图片重复%s] | 尝试上限: [%s] "
+        "| 过滤: [版本%s/结构%s/尝试超限%s/无热币%s/图片缺失%s/图片重复%s] | 尝试上限: [%s] "
         "| 近%s小时已发: [%s] | 占用图片: [%s] | 账号: [%s] | 独立账号冷却: [%s秒]",
         platform, VIRAL_PUBLISH_MAX_AGE_HOURS, len(raw_candidates), len(candidates),
-        stats["version"], stats["structure"], stats["attempts"], stats["invalid_image"],
-        stats["image_dup"], PUBLISH_MAX_ATTEMPTS, VIRAL_PUBLISH_MAX_AGE_HOURS,
-        len(recent_success), len(used_primary), len(accounts), ACCOUNT_COOLDOWN_SECONDS,
+        stats["version"], stats["structure"], stats["attempts"], stats["no_hot_coin"],
+        stats["invalid_image"], stats["image_dup"], PUBLISH_MAX_ATTEMPTS,
+        VIRAL_PUBLISH_MAX_AGE_HOURS, len(recent_success), len(used_primary),
+        len(accounts), ACCOUNT_COOLDOWN_SECONDS,
     )
 
     for account in accounts:
         if not candidates:
             break
         account_state = platform_state[account]
-        # 每个平台账号独立计算 1h 冷却
+        # 每个平台账号独立计算冷却
         remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("viral_last_publish_time", 0))
         if platform == PLATFORM_OKX:
             remaining = OKX_ACCOUNT_COOLDOWN_SECONDS - (now - account_state.get("viral_last_publish_time", 0))
@@ -2945,7 +2971,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
             continue
 
         selected_index = None
-        for index, (article, addresses) in enumerate(candidates):
+        for index, (article, addresses, _) in enumerate(candidates):
             if addresses and (addresses & used_addresses):
                 continue
             selected_index = index
@@ -2954,11 +2980,12 @@ def _publish_viral_articles_for_platform(article_manager, platform):
             logger.info("[流量发布/账号] 所有候选图片均与当前平台已发布冲突 | 平台: [%s] | 账号: [%s]", platform, account)
             continue
         logger.info(
-            "[流量发布/账号] 账号可用 | 平台: [%s] | 账号: [%s] | 候选文章: [%s] | 评分: [%s]",
+            "[流量发布/账号] 账号可用 | 平台: [%s] | 账号: [%s] | 候选文章: [%s] | 匹配热币: [%s] | 评分: [%s]",
             platform, account, candidates[selected_index][0].get("_id"),
+            candidates[selected_index][2],
             candidates[selected_index][0]["article_info"].get("viral_score"),
         )
-        article, addresses = candidates[selected_index]
+        article, addresses, matched_coin = candidates[selected_index]
         info = article["article_info"]
         topic = article.get("topic") or info.get("topic_tag") or ""
         score = info.get("viral_score")
@@ -2967,6 +2994,12 @@ def _publish_viral_articles_for_platform(article_manager, platform):
         stage, api_result = "准备正文、媒体及配置", "尚未调用"
         try:
             text = info.get("post_text", "").strip()
+            # 在最终发送的文本前面统一加上匹配到的第一个币 f"${coin}"
+            # 保留空格以防止正文首字符为字母/数字时与币种粘连导致 COIN_TAG_PATTERN 误判
+            coin_prefix = f"${matched_coin}"
+            if not text.upper().startswith(coin_prefix.upper()):
+                text = f"{coin_prefix} {text}" if text else coin_prefix
+
             mapping = info.get("image_mapping") or {}
             selected_keys = info.get("selected_images") or []
             image_paths = [
@@ -3013,6 +3046,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
                     "published_by": account,
                     "publish_time": now,
                     "post_id": post_id,
+                    "matched_coin": matched_coin,
                     "attempts": attempts,
                     "last_error": None,
                     "last_attempt_time": now,
@@ -3032,6 +3066,7 @@ def _publish_viral_articles_for_platform(article_manager, platform):
                 }
                 plat_record.update({
                     "status": "failed",
+                    "matched_coin": matched_coin,
                     "last_error": error,
                     "attempts": attempts,
                     "last_attempt_time": now,
@@ -3058,31 +3093,37 @@ def _publish_viral_articles_for_platform(article_manager, platform):
         except Exception as exc:
             raise RuntimeError(
                 f"流量发布阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] | 文章: [{article.get('_id')}] "
-                f"| 赛道: [{topic}] | 接口结果: [{api_result}]；请核对远端结果与本地状态 | 原因: [{exc}]"
+                f"| 赛道: [{topic}] | 热币: [{matched_coin}] | 接口结果: [{api_result}]；请核对远端结果与本地状态 | 原因: [{exc}]"
             ) from exc
 
         if success:
             candidates.pop(selected_index)
         log = logger.info if success else logger.error
         log(
-            "%s[流量发布/文章] 本次处理结束 | 平台: [%s] | 账号: [%s] | 赛道: [%s] | 文章: [%s] "
+            "%s[流量发布/文章] 本次处理结束 | 平台: [%s] | 账号: [%s] | 赛道: [%s] | 热币: [%s] | 文章: [%s] "
             "| 评分: [%s] | 尝试: [%s/%s] | 耗时: [%.2f 秒] | 结果: [%s] | 说明: [%s]",
-            "" if success else "❌ ", platform, account, topic, article.get("_id"), score,
+            "" if success else "❌ ", platform, account, topic, matched_coin, article.get("_id"), score,
             attempts, PUBLISH_MAX_ATTEMPTS, time.monotonic() - started, api_result,
             "远端发布与本地回写完成" if success else error,
         )
+
 
 # 依次调度各平台（Binance / OKX）的流量帖发布，平台间异常隔离。
 def _publish_viral_articles_once(article_manager):
     for platform in (PLATFORM_BINANCE, PLATFORM_OKX):
         try:
-            _publish_viral_articles_for_platform(article_manager, platform)
+            hot_coins = ["BTC", "ETH", "BNB", "SOL"]
+            if platform == PLATFORM_BINANCE:
+                hot_coins = get_hot_coin() or hot_coins
+            elif platform == PLATFORM_OKX:
+                hot_coins = fetch_okx_hot_coins(num=25) or hot_coins
+
+            _publish_viral_articles_for_platform(article_manager, platform, hot_coins)
         except Exception:
             logger.exception(
                 "❌ [流量发布/平台隔离] 平台单轮流量帖发布异常 | 平台: [%s] | 后续: [继续其他平台]",
                 platform,
             )
-
 
 # 独立文章管理器 → 流量帖发布轮询；每轮结束后等待600秒。
 def auto_publish_viral_articles():
