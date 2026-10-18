@@ -706,5 +706,5 @@ if __name__ == "__main__":
     # probe_models("model_probe_results.json")
     # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-api-key-3.8-flash")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="qwen/qwen3.8-27b")
 
