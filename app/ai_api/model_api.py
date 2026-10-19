@@ -54,9 +54,9 @@ MEDIUM_MODEL_LIST = [
 
 
 
-    {"model_name": "gemini-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-api-key-3.7-flash", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.7-flash", "权重": 0.5, "备注": "来源api key aistudio"},
+    {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
 
 
 
@@ -71,9 +71,8 @@ MEDIUM_MODEL_LIST = [
 LOW_MODEL_LIST = [
     {"model_name": "gpt-5.6-max", "权重": 1, "备注": "来源chatgpt_web "},
 
-
-    {"model_name": "gemma-api-key-4-31b-it", "权重": 1, "备注": "来源api key aistudio "},
-    {"model_name": "gemini-api-key-3.5-flash-lite", "权重": 1, "备注": "来源api key aistudio "},
+    {"model_name": "gemma-aistudio-api-key-4-31b-it", "权重": 0.1, "备注": "来源api key aistudio "},
+    {"model_name": "gemini-aistudio-api-key-3.5-flash", "权重": 0.1, "备注": "来源api key aistudio "},
 
 
     {"model_name": "gemini-aistudio-3.5-flash", "权重": 0, "备注": "来源aistudio_web"},
@@ -709,5 +708,5 @@ if __name__ == "__main__":
     # probe_models("model_probe_results.json")
     # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="qwen/qwen3.8-27b")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-aistudio-api-key-4-31b-it")
 
