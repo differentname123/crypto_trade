@@ -36,6 +36,7 @@
 
     6. 【额度池】aistudio api key
         - 可用模型：[3.8flash以及以下 并且还有大量的gemma]
-        - 转换工具：mew api 这个项目
+        - 转换工具：mew api 这个项目 在docker里面 WXN6WQTUJBL32P7XQ75R6DR3VSJ3HNUX
+        docker run -d --name new-api --restart always -p 3001:3000 --add-host=host.docker.internal:host-gateway -e HTTP_PROXY="http://host.docker.internal:7890" -e HTTPS_PROXY="http://host.docker.internal:7890" -e ALL_PROXY="socks5://host.docker.internal:7890" -v ${PWD}/data:/data calciumion/new-api:latest
         - 原始额度：每天 20 次 .gemma 1.4万次
         - 每周估算：http://localhost:3001/usage-logs/common

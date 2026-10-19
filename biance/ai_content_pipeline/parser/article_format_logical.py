@@ -2844,7 +2844,15 @@ def _update_account_publish_state(platform, account, field_updates, topic_update
                 account_state["topic_publish_history"] = {}
             account_state["topic_publish_history"][topic_key] = topic_time
         save_json(STATE_FILE, state)
-
+def _extract_all_values_str(obj) -> str:
+    """递归提取所有嵌套结构中的 value（彻底忽略所有 dict 的 key），拼接成字符串"""
+    if isinstance(obj, dict):
+        return " ".join(_extract_all_values_str(v) for v in obj.values())
+    if isinstance(obj, (list, tuple, set)):
+        return " ".join(_extract_all_values_str(item) for item in obj)
+    if obj is None or isinstance(obj, bool):
+        return ""
+    return str(obj)
 
 # 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/热币匹配/图片冲突 → 按 viral_score 降序 → 冷却发布 → 回写状态。
 def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
@@ -2916,8 +2924,8 @@ def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
             stats["attempts"] += 1
             continue
 
-        # 将单条数据库数据转换为 str，不分大小写判断哪个 hot_coin 出现过，必须包含热门币
-        article_str_lower = str(article).lower()
+        # 仅提取嵌套结构中的所有 value 转为 str（忽略所有 key），不分大小写判断热门币
+        article_str_lower = _extract_all_values_str(article).lower()
         matched_coin = next(
             (coin.upper() for coin in normalized_hot_coins if coin.lower() in article_str_lower),
             None,
