@@ -217,7 +217,7 @@ async def _do_gemini_request(cookie_str, prompt, model_name, files, output_img_d
     """
     修改点：支持保存响应中的图片，并返回 (text, image_paths)
     """
-    PROXY_URL = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+    PROXY_URL = "http://127.0.0.1:7890"
 
     def _get_val(k, t):
         m = re.search(f"{re.escape(k)}=([^;]+)", t)

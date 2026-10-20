@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 # 全局常量：集中管理代理、分页、重试策略与预编译正则
 # ============================================================
 PROXIES = {
-    "http": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443",
-    "https": "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
+    "http": "http://127.0.0.1:7890",
+    "https": "http://127.0.0.1:7890"
 }
 PAGE_SIZE = 20
 MAX_RETRIES = 5
