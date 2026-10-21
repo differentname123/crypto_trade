@@ -2855,6 +2855,7 @@ def _extract_all_values_str(obj) -> str:
     return str(obj)
 
 # 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/热币匹配/图片冲突 → 按 viral_score 降序 → 冷却发布 → 回写状态。
+# 单平台流量帖发布：近24小时 ARTICLE_TYPE_VIRAL 文章 → 过滤该平台已发/热币匹配/图片冲突 → 按 viral_score 降序 → 冷却发布 → 回写状态。
 def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
 
@@ -2878,6 +2879,15 @@ def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
             coin_str = str(coin or "").replace("USDT", "").replace("USDC", "").strip()
         if coin_str:
             normalized_hot_coins.append(coin_str)
+
+    # 预编译每个热门币的匹配正则：前后不能紧邻英文字母（兼容中文紧邻、$BTC、#BTC、BTCUSDT 等，防 ETF 误中 ET）
+    hot_coin_patterns = [
+        (
+            coin.upper(),
+            re.compile(rf"(?<![A-Za-z]){re.escape(coin)}(?:USDT|USDC)?(?![A-Za-z])", re.IGNORECASE),
+        )
+        for coin in normalized_hot_coins
+    ]
 
     # 仅查询当前平台近24小时已成功发布的帖子，用于当前平台内部图片去重（不阻塞其他平台发同帖）
     recent_success = article_manager.find_articles(query={
@@ -2924,10 +2934,17 @@ def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
             stats["attempts"] += 1
             continue
 
-        # 仅提取嵌套结构中的所有 value 转为 str（忽略所有 key），不分大小写判断热门币
-        article_str_lower = _extract_all_values_str(article).lower()
+        # 仅使用 creation_brief.original_post.text_content 作为热门币判断依据
+        original_post = ((article.get("creation_brief") or {}).get("original_post")) or {}
+        raw_original_text = original_post.get("text_content")
+        original_text = raw_original_text if isinstance(raw_original_text, str) else ""
+        # 剔除 [IMAGE_1]、[VIDEO_1] 等占位符及原始媒体标签，防止占位符字母触发误报
+        clean_original_text = MEDIA_PATTERN.sub(
+            " ",
+            re.sub(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", " ", original_text),
+        )
         matched_coin = next(
-            (coin.upper() for coin in normalized_hot_coins if coin.lower() in article_str_lower),
+            (coin_upper for coin_upper, pattern in hot_coin_patterns if pattern.search(clean_original_text)),
             None,
         )
         if not matched_coin:
@@ -3114,7 +3131,6 @@ def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
             attempts, PUBLISH_MAX_ATTEMPTS, time.monotonic() - started, api_result,
             "远端发布与本地回写完成" if success else error,
         )
-
 
 # 依次调度各平台（Binance / OKX）的流量帖发布，平台间异常隔离。
 def _publish_viral_articles_once(article_manager):

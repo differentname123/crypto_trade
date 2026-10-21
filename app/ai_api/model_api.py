@@ -60,7 +60,7 @@ MEDIUM_MODEL_LIST = [
 
 
 
-    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
+    # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
     # {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
@@ -81,7 +81,7 @@ LOW_MODEL_LIST = [
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 1, "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
 
-    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
+    # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 0, "备注": "来源antigravity"},
 ]
 # 默认固定在本模块同目录，不随调用程序的工作目录变化。
 # 若多个程序使用本模块的不同副本，请将环境变量设为同一个本地绝对路径。
