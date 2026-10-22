@@ -693,10 +693,6 @@ def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     )
 
 
-# 管理器 → 固定币种热门流和综合流入库；保留手动采集入口。
-def fetch_post(post_manager):
-    _fetch_and_save_posts(post_manager, FEED_TOKENS, (1,), 100)
-
 
 # 管理器、币种序列 → 热门/最新流及综合流入库。
 def fetch_hot_post(post_manager, token_list):
@@ -758,7 +754,7 @@ def format_image_article():
                 logger.info("[帖子/轮询] 暂无原帖 | 下次扫描: [60 秒后]")
                 time.sleep(60)
                 continue
-            # batch_pre_screen_posts(posts, post_manager)
+            batch_pre_screen_posts(posts, post_manager)
             valid_posts = [post for post in posts if is_need_formatting(post)]
             logger.info(
                 "[帖子/计划] 初筛后精提 | 扫描: [%s] | 待精提: [%s] | 跳过: [%s] | 并发上限: [%s]",
