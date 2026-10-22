@@ -2100,14 +2100,28 @@ def _hudong_once(article_manager):
     interacted_ts = time.time()
     for article in o_pending:
         o_rec = article["publish_records"][PLATFORM_OKX]
+        # 1. 过滤掉发帖主人账号，仅保留其他互动账号
+        published_by = o_rec.get("published_by")
+        other_accounts = [account for account in okx_accounts if account != published_by]
+
         info = article.get("article_info") or {}
         comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
-        # OKX 只有一个账号，不再过滤 published_by 主人账号，仅执行评论互动
-        o_rec["comment_interact_info"] = interact_comment(
-            comments or [], okx_accounts,
-            o_rec.get("post_id"), None,
-            platform=PLATFORM_OKX,
-        )
+
+        # 2. 如果过滤后还有其他可用账号，则执行评论互动
+        if other_accounts:
+            o_rec["comment_interact_info"] = interact_comment(
+                comments or [], other_accounts,  # <--- 传入排除主人账号后的 other_accounts
+                o_rec.get("post_id"), None,
+                platform=PLATFORM_OKX,
+            )
+        else:
+            logger.warning(
+                "[互动/跳过] 平台[%s] 帖子[%s] 排除发帖账号[%s]后无其他互动账号可用",
+                PLATFORM_OKX, o_rec.get("post_id"), published_by
+            )
+            o_rec["comment_interact_info"] = {}
+
+        # 3. 标记互动完成，避免死循环重试
         o_rec["interacted"] = True
         o_rec["interaction_time"] = interacted_ts
 
