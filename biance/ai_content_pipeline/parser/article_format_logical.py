@@ -23,7 +23,10 @@ from datetime import datetime, timedelta, timezone
 import stat
 from functools import lru_cache
 from PIL import Image, UnidentifiedImageError
-
+from common.common_utils import (
+    get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
+)
+logger = setup_logger(app_name="media_format")
 from biance.okx_playwright import create_okx_post, comment_on_okx_post
 from biance.okx_squre_api import fetch_okx_feed, fetch_okx_hot_coins
 
@@ -32,10 +35,7 @@ STATE_FILE_LOCK = threading.Lock()
 # 大模型视觉接口支持的标准光栅图片格式
 ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
 import ccxt
-from common.common_utils import (
-    get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
-)
-logger = setup_logger(app_name="media_format")
+
 from app.ai_api.model_api import generate_content
 from biance.biance_playwright import (
     create_binance_post, get_auth_tokens_robust, comment_on_binance_post,
@@ -3212,7 +3212,7 @@ if __name__ == "__main__":
     # data = get_need_check_pre_screen_info(limit=1000)
 
     tasks = [
-        # generate_analysis_articles,
+        generate_analysis_articles,
         generate_viral_articles,
         format_image_article,
         hudong,
