@@ -674,16 +674,17 @@ def batch_screen_viral_posts(posts, post_manager):
     )
 
 
-# 币种序列、排序参数 → 采集并 upsert_posts([post])；保留接口顺序和重复帖子。
-def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
+# 管理器、币种序列 → 热门/最新流及综合流入库。
+def fetch_biance_hot_post(post_manager, token_list):
+    orders = (1, 2)
+    feed_count = 100
     started = time.monotonic()
     posts, token_count = [], 0
-    # for token in token_list:
-    #     token_count += 1
-    #     for order in orders:
-    #         posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
+    for token in token_list:
+        token_count += 1
+        for order in orders:
+            posts.extend(fetch_binance_feed(token=token, count=feed_count, orderBy=order))
     posts.extend(fetch_binance_feed(count=feed_count * 2))
-    posts.extend(fetch_okx_feed(count=feed_count * 2))
 
     if posts:
         post_manager.upsert_posts(posts)
@@ -693,10 +694,23 @@ def _fetch_and_save_posts(post_manager, token_list, orders, feed_count):
     )
 
 
+def fetch_okx_hot_post(post_manager, token_list):
+    orders = (1, 2)
+    feed_count = 100
+    started = time.monotonic()
+    posts, token_count = [], 0
+    for token in token_list:
+        token_count += 1
+        for order in orders:
+            posts.extend(fetch_okx_feed(token=token, count=feed_count, orderBy=order))
+    posts.extend(fetch_okx_feed(count=feed_count * 2))
 
-# 管理器、币种序列 → 热门/最新流及综合流入库。
-def fetch_hot_post(post_manager, token_list):
-    _fetch_and_save_posts(post_manager, token_list, (1, 2), 100)
+    if posts:
+        post_manager.upsert_posts(posts)
+    logger.info(
+        "[采集/完成] 推荐流已入库 | 币种: [%s] | 帖子: [%s，含重复] | 耗时: [%.2f 秒]",
+        token_count, len(posts), time.monotonic() - started,
+    )
 
 
 # top_k → {top_gainers/top_losers:[{symbol,percentage}]}；局部行情客户端在异常时也关闭。
@@ -744,7 +758,8 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_hot_post(post_manager, get_hot_coin())
+            fetch_biance_hot_post(post_manager, get_hot_coin())
+            fetch_okx_hot_post(post_manager, fetch_okx_hot_coins())
             source_batches = [
                 post_manager.find_posts_by_source(source, limit=POST_QUERY_LIMIT) or []
                 for source in POST_SOURCES

@@ -204,6 +204,7 @@ def fetch_okx_hot_coins(
 def fetch_okx_coin_feed(
         coin_name,
         required_count=20,
+        orderBy=2,
         group="USDT",
         initial_cursor="",
         cookies="",
@@ -215,10 +216,11 @@ def fetch_okx_coin_feed(
 
     :param coin_name:       目标币种代码，例如 "BTW", "BTC"
     :param required_count:  期望获取的净增帖子条数
+    :param orderBy:         排序方式：2 表示推荐 (默认)，1 表示最新 (按时间倒序)
     :param group:           交易对计价币，默认为 "USDT"
     :param initial_cursor:  初始游标，默认从 "" (空字符串) 开始
     :param cookies:         可选 Cookie 字符串
-    :param extra_headers:   可选额外请求头（如 x-fptoken, x-fptoken-signature 等）
+    :param extra_headers:   可选额外请求头（如 x-fptoken 等）
     :param existing_ids:    可选历史已抓取 ID 集合，支持翻页时实时过滤
     :return:                去重后的原始帖子字典列表 (统一包装为 contentData 结构)
     """
@@ -226,13 +228,21 @@ def fetch_okx_coin_feed(
     url = "https://www.okx.com/priapi/v5/content/public/kline-feed/1"
     referer = f"https://www.okx.com/zh-hans/trade-swap/{clean_coin.lower()}-{group.lower()}-swap"
 
+    # 解析 orderBy: 1 表示最新 (按时间倒序)，2 表示推荐排序
+    if str(orderBy).lower() in ["1", "latest", "new", "time"]:
+        exp_method = 1
+        order_label = "最新"
+    else:
+        exp_method = 2
+        order_label = "推荐"
+
+    label = f"OKX币种流[{clean_coin}-{order_label}]"
     all_items = []
     seen_ids = set(existing_ids) if existing_ids else set()
     cursor = str(initial_cursor) if initial_cursor is not None else ""
     page_index = 1
     retry_count = 0
     max_pages = max(15, (required_count // 10) * 3)
-    label = f"OKX币种流[{clean_coin}]"
 
     with requests.Session() as session:
         while len(all_items) < required_count and page_index <= max_pages:
@@ -242,7 +252,7 @@ def fetch_okx_coin_feed(
                 "coinName": clean_coin,
                 "cursor": cursor,
                 "group": group,
-                "experimentMethod": 2,
+                "experimentMethod": exp_method,
                 "t": now_ms
             }
             headers = _build_okx_headers(
@@ -271,7 +281,6 @@ def fetch_okx_coin_feed(
                     break
 
                 data_obj = json_resp.get("data") or {}
-                # 关键修复点：kline-feed 接口返回 contentDataList，普通 feed 接口返回 dataList
                 raw_list = data_obj.get("contentDataList") or data_obj.get("dataList") or []
 
                 if not raw_list:
@@ -282,7 +291,6 @@ def fetch_okx_coin_feed(
                 for item in raw_list:
                     if not isinstance(item, dict):
                         continue
-                    # 兼容可能已经被 contentData 包装或直接扁平的字典
                     content_data = item.get("contentData") if "contentData" in item else item
                     item_id = str(content_data.get("contentId") or content_data.get("id") or "")
                     if not item_id:
@@ -290,7 +298,6 @@ def fetch_okx_coin_feed(
 
                     if item_id not in seen_ids:
                         seen_ids.add(item_id)
-                        # 标准化包装，使输出结构与全局推荐流保持 100% 一致
                         standard_wrapper = item if "contentData" in item else {"contentData": item}
                         all_items.append(standard_wrapper)
                         new_in_page += 1
@@ -301,7 +308,6 @@ def fetch_okx_coin_feed(
                     f"净增未见:{new_in_page}条 | 累计净增:{len(all_items)}/{required_count} | nextCursor={next_cursor}"
                 )
 
-                # 翻页结束条件检测
                 if not next_cursor or next_cursor == "0" or next_cursor == cursor:
                     break
 
@@ -327,7 +333,8 @@ def fetch_okx_coin_feed(
 
 def fetch_okx_feed(
         count=20,
-        coin_name=None,
+        token=None,
+        orderBy=2,
         existing_ids=None,
         cookies="",
         extra_headers=None,
@@ -335,32 +342,41 @@ def fetch_okx_feed(
         initial_cursor=None
 ):
     """
-    统一的 OKX 广场流数据拉取总入口 (支持全网推荐流与指定币种帖子流)
+    统一的 OKX 广场流数据拉取总入口 (支持全网推荐流、指定币种推荐/最新流)
 
     :param count:           目标净增抓取条数
-    :param coin_name:       可选指定代币符号 (如 "BTW", "BTC")。默认为 None，表示拉取全网推荐流；有值则抓取对应代币帖子
+    :param coin_name:       代币符号 (如 "BTW", "BTC")。默认为 None，表示抓取全网广场推荐流
+    :param orderBy:         排序方式 (仅在指定 coin_name 时生效)：
+                            - 2: 推荐排序 (默认)
+                            - 1: 最新排序 (按时间倒序)
     :param existing_ids:    历史去重 ID 集合/列表 (外部传入对象会被原地更新)
-    :param cookies:         OKX Cookie 字符串
-    :param extra_headers:   自定义 Header 字典
+    :param cookies:         OKX Cookie
+    :param extra_headers:   自定义 Header
     :param download_media:  是否下载多模态媒体文件到本地
-    :param initial_cursor:  起始游标。为 None 时，推荐流默认为 "1"，特定币种流默认为 ""
-    :return:                富化与清洗完成的标准化帖子列表 (符合统一 Schema)
+    :param initial_cursor:  起始游标
+    :return:                富化与清洗完成的标准化帖子列表
     """
+    coin_name = token
     caller_existing_ref = existing_ids
     normalized_existing = set(str(i) for i in existing_ids) if existing_ids else set()
 
     is_coin_mode = bool(coin_name and str(coin_name).strip())
     clean_coin_name = str(coin_name).strip().upper() if is_coin_mode else None
-    task_label = f"OKX币种流[{clean_coin_name}]" if is_coin_mode else "OKX广场推荐流"
+
+    # 判断展示标签
+    is_latest = str(orderBy).lower() in ["1", "latest", "new", "time"]
+    order_label = "最新" if is_latest else "推荐"
+    task_label = f"OKX币种流[{clean_coin_name}-{order_label}]" if is_coin_mode else "OKX广场推荐流"
 
     logger.info(f"🚀 开始探测: [{task_label}] | 目标净增条数: {count}")
 
-    # 1. 根据是否指定 coin_name 智能选择抓取流
+    # 1. 抓取原始数据
     if is_coin_mode:
         cur = initial_cursor if initial_cursor is not None else ""
         raw_feed_list = fetch_okx_coin_feed(
             coin_name=clean_coin_name,
             required_count=count,
+            orderBy=orderBy,
             initial_cursor=cur,
             cookies=cookies,
             extra_headers=extra_headers,
@@ -376,7 +392,7 @@ def fetch_okx_feed(
             existing_ids=normalized_existing
         )
 
-    # 2. 早期拦截护城河二次确认，并同步原地更新外部传入的 existing_ids
+    # 2. 早期拦截护城河二次确认
     filtered_feed_list = []
     intercepted_count = 0
 
@@ -407,10 +423,8 @@ def fetch_okx_feed(
         f"🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
     )
 
-    # 3. 标准化 Schema 清洗
+    # 3. 数据清洗与多模态富化
     clean_feed_list = clean_okx_posts(filtered_feed_list)
-
-    # 4. 多线程并发富化（拼接媒体标签、下载图片、按需拉取评论）
     final_clean_feed_list = update_okx_posts_in_place(
         clean_feed_list,
         cookies=cookies,
@@ -419,7 +433,6 @@ def fetch_okx_feed(
     )
 
     return final_clean_feed_list
-
 
 
 # ============================================================
@@ -1154,7 +1167,7 @@ if __name__ == "__main__":
     okx_recommend_posts = fetch_okx_feed(count=10)
 
     # 场景 2: 传入特定币种（例如 "BTW"），抓取该币种关联帖子
-    btw_posts = fetch_okx_feed(count=40, coin_name="BTW", download_media=False)
+    btw_posts = fetch_okx_feed(count=40, token="BTW", download_media=False)
     logger.info(f"BTW 代币帖子获取成功: {len(btw_posts)} 条")
     if btw_posts:
         logger.info(f"BTW 首条帖子文本: {btw_posts[0]['content']['text_content'][:100]}...")
