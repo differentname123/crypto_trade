@@ -1726,33 +1726,53 @@ def _build_publish_text_list(text):
     return result
 
 # 单平台分析帖发布：按评分/平台内图片去重/账号冷却发布分析帖；回写对应平台账号文件及 publish_records[platform]。
-def _publish_analysis_articles_for_platform(article_manager, platform):
-    accounts = PLATFORM_ACCOUNTS.get(platform) or []
-    if not accounts:
-        return
-    now = time.time()
-    state = _load_and_init_publish_state()
-    platform_state = state[platform]
+# ==================== 分析帖发布链路（高内聚低耦合重构版） ====================
 
+# 平台名称 → 该平台对应的账号发帖冷却秒数（对齐流量帖的平台差异化冷却配置）。
+def _get_platform_cooldown_seconds(platform):
+    if platform == PLATFORM_OKX:
+        return OKX_ACCOUNT_COOLDOWN_SECONDS
+    return ACCOUNT_COOLDOWN_SECONDS
+
+
+# 原始热门币列表（兼容 str 或 dict） → 小写币种集合；屏蔽不同平台热币接口返回格式差异。
+def _normalize_hot_coin_set(hot_coins):
+    normalized = set()
+    for item in (hot_coins or []):
+        if isinstance(item, dict):
+            coin_str = str(item.get("symbol") or item.get("coin") or "")
+        else:
+            coin_str = str(item or "")
+        coin_str = coin_str.replace("USDT", "").replace("USDC", "").strip().lower()
+        if coin_str:
+            normalized.add(coin_str)
+    return normalized
+
+
+# 管理器、平台 → (近6小时已用全部图片地址集合, 统计用主地址列表, 已成功发布文章数)。
+def _get_recent_published_image_usage(article_manager, platform, hours=6):
     recent_success = article_manager.find_articles(query={
         "status": "ok",
         f"publish_records.{platform}.status": "success",
-        f"publish_records.{platform}.publish_time": {"$gte": now - 6 * 3600},
+        f"publish_records.{platform}.publish_time": {"$gte": time.time() - hours * 3600},
     }) or []
-    used_addresses, used_primary = set(), set()
+    used_addresses, used_primary = set(), []
     for article in recent_success:
         addresses, primary = _extract_article_image_addresses(article)
         used_addresses.update(addresses)
-        used_primary.update(primary)
+        used_primary.extend(primary)
+    return used_addresses, used_primary, len(recent_success)
 
-    # 仅查询非 viral 类型的分析类文章，且当前平台尚未发布成功
+
+# 管理器、平台、热门币集合、已占用图片集合 → (按评分降序的 [(article, addresses)] 列表, 原始查询数, 过滤统计 Counter)。
+def _collect_analysis_candidates(article_manager, platform, hot_coin_set, used_addresses):
     raw_candidates = article_manager.find_articles(query={
         "type": {"$ne": ARTICLE_TYPE_VIRAL},
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=6)},
         "status": "ok",
         f"publish_records.{platform}.status": {"$ne": "success"},
     }) or []
-    hot_coins = {str(coin).lower() for coin in (get_hot_coin() or [])}
+
     stats = Counter()
     candidates = []
     for article in raw_candidates:
@@ -1760,165 +1780,338 @@ def _publish_analysis_articles_for_platform(article_manager, platform):
         if article.get("prompt_version") != prompt_version:
             stats["version"] += 1
             continue
-        if not isinstance(info, dict) or not isinstance(info.get("image_placeholders", []), list):
+        if (not isinstance(info, dict)
+                or info.get("status") != "ok"
+                or not isinstance(info.get("text"), str)
+                or not info.get("text").strip()
+                or not isinstance(info.get("image_placeholders", []), list)
+                or isinstance(info.get("score"), bool)
+                or not isinstance(info.get("score"), (int, float))):
             stats["structure"] += 1
             continue
+
         plat_record = (article.get("publish_records") or {}).get(platform) or {}
         if plat_record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
             stats["attempts"] += 1
             continue
-        if (article.get("topic") or "").lower() not in hot_coins:
+
+        topic = (article.get("topic") or "").strip()
+        if not topic or topic.lower() not in hot_coin_set:
             stats["topic"] += 1
             continue
-        addresses, _ = _extract_article_image_addresses(article)
-        if addresses & used_addresses:
-            stats["image"] += 1
+
+        # 严格校验选中的图片映射及本地文件完整性（向 auto_publish_viral_articles 看齐）
+        mapping = info.get("image_mapping") or {}
+        placeholders = info.get("image_placeholders") or []
+        if any(not isinstance(mapping.get(img_id), dict)
+               or not _is_valid_image_file(mapping[img_id].get("local_path"))
+               for img_id in placeholders):
+            stats["invalid_image"] += 1
             continue
+
+        addresses, _ = _extract_article_image_addresses(article)
+        if addresses and (addresses & used_addresses):
+            stats["image_dup"] += 1
+            continue
+
         candidates.append((article, addresses))
-    candidates.sort(key=lambda item: item[0]["article_info"].get("score", 0), reverse=True)
-    logger.info(
-        "[发布/计划] 平台[%s]近6小时分析帖已按评分筛选 | 查询: [%s] | 候选: [%s] "
-        "| 过滤: [版本%s/结构%s/尝试超限%s/非热币%s/图片重复%s] | 尝试上限: [%s] "
-        "| 近6小时已发: [%s] | 占用图片: [%s] | 账号: [%s] | 冷却: [账号%s秒/同主题%s秒]",
-        platform, len(raw_candidates), len(candidates), stats["version"], stats["structure"], stats["attempts"],
-        stats["topic"], stats["image"], PUBLISH_MAX_ATTEMPTS, len(recent_success), len(used_primary),
-        len(accounts), ACCOUNT_COOLDOWN_SECONDS, ACCOUNT_TOPIC_COOLDOWN_SECONDS,
+
+    candidates.sort(key=lambda item: float(item[0]["article_info"].get("score", 0.0)), reverse=True)
+    return candidates, len(raw_candidates), stats
+
+
+# 账号状态、候选列表、当前秒、已占用图片集合 → 命中的候选索引或 None。
+def _select_candidate_for_analysis_account(account_state, candidates, now, used_addresses):
+    topic_history = account_state.get("topic_publish_history") or {}
+    for index, (article, addresses) in enumerate(candidates):
+        topic = (article.get("topic") or "").strip()
+        last_topic_time = topic_history.get(topic, 0)
+        if now - last_topic_time < ACCOUNT_TOPIC_COOLDOWN_SECONDS:
+            continue
+        if addresses and (addresses & used_addresses):
+            continue
+        return index
+    return None
+
+
+# 文章字典 → (组装好币种标签与热门话题的最终正文, 严格按占位符顺序提取的有效图片路径列表)。
+def _format_analysis_post_content(article, platform=PLATFORM_BINANCE):
+    info = article["article_info"]
+    topic = (article.get("topic") or "").strip()
+    text = info.get("text", "").strip()
+
+    if topic:
+        text = re.sub(
+            rf"(?<!\$)\b{re.escape(topic)}\b",
+            lambda _: f"${topic} ",
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    # 仅在 Binance 平台调用币安热门标签，且增加安全异常兜底
+    if platform == PLATFORM_BINANCE:
+        try:
+            text = add_hot_topic_to_article(text, topic)
+        except Exception as exc:
+            logger.warning("[发布/标签] 获取热门标签失败，降级使用原生话题: %s", exc)
+            text = f"{text}\n\n#{topic}\n${topic} "
+    else:
+        # OKX 平台直接追加当前主题标签
+        text = f"{text}\n\n#{topic}\n${topic} "
+
+    text = text + "\n\n\n\n\n\n👇"
+    if topic and not text.upper().startswith(f"${topic}".upper()):
+        text = f"${topic} {text}"
+
+    mapping = info.get("image_mapping") or {}
+    placeholders = info.get("image_placeholders") or []
+    image_paths = [
+        mapping[key].get("local_path")
+        for key in placeholders
+        if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")
+    ]
+    return text, image_paths
+
+# 统一封装跨平台底层发帖调用，屏蔽 Binance 与 OKX 接口参数差异。
+def _execute_platform_post(platform, session_dir, text, image_paths, topic=None, stance=None):
+    if platform == PLATFORM_BINANCE:
+        text_list = _build_publish_text_list(text)
+        chart_info = {"coin": topic, "bridge": "USDT", "type": "future"} if topic else None
+        return create_binance_post(
+            content=text,
+            image_path_list=image_paths,
+            user_data_dir=session_dir,
+            chart_info=chart_info,
+            sentiment=stance,
+            debug=False,
+            text_list=text_list,
+        )
+    if platform == PLATFORM_OKX:
+        return create_okx_post(
+            content=text,
+            image_path_list=image_paths,
+            user_data_dir=session_dir,
+            debug=False,
+        )
+    raise ValueError(f"不支持的发布平台: {platform}")
+
+
+# 安全获取发布时刻币种价格，异常时降级返回 None，不阻断发布主流程。
+def _safe_get_latest_price(platform, topic):
+    if not topic:
+        return None
+    try:
+        return get_latest_crypto_price(topic)
+    except Exception as exc:
+        logger.warning(
+            "[发布/行情] 获取发布时刻价格失败 | 平台: [%s] | 主题: [%s] | 异常: [%s] | 后续: [价格记为 None 继续落库]",
+            platform, topic, exc,
+        )
+        return None
+
+
+# 组装发布结果并原子化落盘账号状态与数据库状态（合并最新 publish_records 防止覆盖互动线程状态）。
+def _persist_analysis_publish_result(
+    article_manager, platform, account, account_state, article, plat_record,
+    success, post_id, attempts, now, topic, latest_price, err_msg,
+):
+    if success:
+        new_total = account_state.get("total_success", 0) + 1
+        account_state["total_success"] = new_total
+        account_state["last_publish_time"] = now
+        if topic:
+            account_state.setdefault("topic_publish_history", {})[topic] = now
+        state_updates = {"total_success": new_total, "last_publish_time": now}
+        topic_update = (topic, now) if topic else None
+        plat_record.update({
+            "status": "success",
+            "published_by": account,
+            "publish_time": now,
+            "post_id": post_id,
+            "attempts": attempts,
+            "last_error": None,
+            "last_attempt_time": now,
+            "publish_price": latest_price,
+        })
+        plat_record.setdefault("interacted", False)
+        plat_record.setdefault("interaction_time", None)
+        plat_record.setdefault("comment_interact_info", {})
+        error_detail = ""
+    else:
+        error_detail = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err_msg}"
+        account_state["last_error_msg"] = error_detail
+        account_state["last_error_time"] = now
+        state_updates = {"last_error_msg": error_detail, "last_error_time": now}
+        topic_update = None
+        plat_record.update({
+            "status": "failed",
+            "last_error": error_detail,
+            "attempts": attempts,
+            "last_attempt_time": now,
+            "publish_price": latest_price,
+        })
+
+    problems, saved = [], []
+    try:
+        _update_account_publish_state(platform, account, state_updates, topic_update=topic_update)
+        saved.append("账号状态")
+    except Exception as exc:
+        problems.append(("写入账号状态", exc))
+
+    try:
+        # 落库前同步数据库最新的 publish_records，避免覆盖 hudong 线程在并发期间写入的互动标记
+        if article.get("_id") is not None:
+            latest_docs = article_manager.find_articles(query={"_id": article["_id"]}, limit=1) or []
+            if latest_docs and isinstance(latest_docs[0].get("publish_records"), dict):
+                article["publish_records"] = dict(latest_docs[0]["publish_records"])
+        if not isinstance(article.get("publish_records"), dict):
+            article["publish_records"] = {}
+        article["publish_records"][platform] = plat_record
+        article_manager.upsert_articles([article])
+        saved.append("数据库状态")
+    except Exception as exc:
+        problems.append(("回写数据库", exc))
+
+    if problems:
+        details = "; ".join(f"{label}: {type(exc).__name__}: {exc}" for label, exc in problems)
+        raise RuntimeError(f"{details} | 已保存: [{', '.join(saved) or '无'}]") from problems[0][1]
+
+    return error_detail
+
+
+# 单平台分析帖发布：近6小时分析帖 → 过滤已发/热币/图片完整性与冲突 → 按 score 降序 → 冷却发布 → 回写状态。
+def _publish_analysis_articles_for_platform(article_manager, platform, hot_coins):
+    accounts = PLATFORM_ACCOUNTS.get(platform) or []
+    if not accounts:
+        return
+
+    now = time.time()
+    state = _load_and_init_publish_state()
+    platform_state = state[platform]
+    cooldown_seconds = _get_platform_cooldown_seconds(platform)
+    hot_coin_set = _normalize_hot_coin_set(hot_coins)
+
+    used_addresses, used_primary, recent_success_count = _get_recent_published_image_usage(
+        article_manager, platform, hours=6,
     )
+    candidates, raw_count, stats = _collect_analysis_candidates(
+        article_manager, platform, hot_coin_set, used_addresses,
+    )
+
+    logger.info(
+        "[分析发布/计划] 平台[%s]近6小时分析帖已按评分从高到低筛选 | 查询: [%s] | 候选: [%s] "
+        "| 过滤: [版本%s/结构%s/尝试超限%s/非热币%s/图片缺失%s/图片重复%s] | 尝试上限: [%s] "
+        "| 近6小时已发: [%s] | 占用图片: [%s] | 账号: [%s] | 冷却: [账号%s秒/同主题%s秒]",
+        platform, raw_count, len(candidates),
+        stats["version"], stats["structure"], stats["attempts"], stats["topic"],
+        stats["invalid_image"], stats["image_dup"], PUBLISH_MAX_ATTEMPTS,
+        recent_success_count, len(used_primary), len(accounts),
+        cooldown_seconds, ACCOUNT_TOPIC_COOLDOWN_SECONDS,
+    )
+
     for account in accounts:
         if not candidates:
             break
         account_state = platform_state[account]
-        remaining = ACCOUNT_COOLDOWN_SECONDS - (now - account_state["last_publish_time"])
+        remaining = cooldown_seconds - (now - account_state.get("last_publish_time", 0))
         if remaining > 0:
-            logger.info("[发布/账号] 仍在冷却 | 平台: [%s] | 账号: [%s] | 剩余: [%s 秒]", platform, account, int(remaining))
+            logger.info(
+                "[分析发布/账号] 仍在独立冷却中 | 平台: [%s] | 账号: [%s] | 剩余: [%s 秒]",
+                platform, account, int(remaining),
+            )
             continue
-        selected_index = None
-        for index, (article, addresses) in enumerate(candidates):
-            last_topic_time = account_state["topic_publish_history"].get(article.get("topic", ""), 0)
-            if now - last_topic_time < ACCOUNT_TOPIC_COOLDOWN_SECONDS or addresses & used_addresses:
-                continue
-            selected_index = index
-            break
+
+        selected_index = _select_candidate_for_analysis_account(
+            account_state, candidates, now, used_addresses,
+        )
         if selected_index is None:
-            logger.info("[发布/账号] 所有候选仍在主题冷却或图片冲突 | 平台: [%s] | 账号: [%s]", platform, account)
+            logger.info(
+                "[分析发布/账号] 所有候选仍在主题冷却或与当前平台已发图片冲突 | 平台: [%s] | 账号: [%s]",
+                platform, account,
+            )
             continue
+
         article, addresses = candidates[selected_index]
-        info, topic, stance = article["article_info"], article.get("topic", ""), article.get("stance", "")
+        info = article["article_info"]
+        topic = (article.get("topic") or "").strip()
+        stance = article.get("stance", "")
+        score = info.get("score")
         plat_record = dict((article.get("publish_records") or {}).get(platform) or {})
+
+        logger.info(
+            "[分析发布/账号] 账号可用 | 平台: [%s] | 账号: [%s] | 候选文章: [%s] | 主题: [%s] | 立场: [%s] | 评分: [%s]",
+            platform, account, article.get("_id"), topic, stance, score,
+        )
+
         started = time.monotonic()
         stage, api_result = "准备正文、媒体及配置", "尚未调用"
         try:
-            text = info.get("text", "")
-            if topic:
-                text = re.sub(rf"(?<!\$)\b{re.escape(topic)}\b", lambda match: "$" + topic + " ",
-                              text, flags=re.IGNORECASE)
-            text = add_hot_topic_to_article(text, topic) + "\n\n\n\n\n\n👇"
-            if topic and not text.startswith(f"${topic}"):
-                text = f"${topic} {text}"
-            image_paths = [item.get("local_path") or None for item in info.get("image_mapping", {}).values()]
+            text, image_paths = _format_analysis_post_content(article)
             session_dir = _get_account_session_dir(platform, account)
             attempts = plat_record.get("attempts", 0) + 1
+
             stage, api_result = "调用发布接口", "未知"
-            if platform == PLATFORM_BINANCE:
-                text_list = _build_publish_text_list(text)
-                err, success, post_id = create_binance_post(
-                    content=text, image_path_list=image_paths, user_data_dir=session_dir,
-                    chart_info={"coin": topic, "bridge": "USDT", "type": "future"}, sentiment=stance,
-                    debug=False, text_list=text_list,
-                )
-            elif platform == PLATFORM_OKX:
-                err, success, post_id = create_okx_post(
-                    content=text, image_path_list=image_paths, user_data_dir=session_dir,
-                    debug=False,
-                )
-            else:
-                raise ValueError(f"不支持的发布平台: {platform}")
+            err, success, post_id = _execute_platform_post(
+                platform=platform,
+                session_dir=session_dir,
+                text=text,
+                image_paths=image_paths,
+                topic=topic,
+                stance=stance,
+            )
             post_id, api_result = str(post_id), "成功" if success else "失败"
-            problems, saved = [], []
-            latest_price = None
-            try:
-                latest_price = get_latest_crypto_price(topic)
-            except Exception as exc:
-                logger.warning(
-                    "[发布/行情] 获取发布时刻价格失败 | 平台: [%s] | 主题: [%s] | 异常: [%s] | 后续: [价格记为 None 继续落库]",
-                    platform, topic, exc,
-                )
-            if success:
-                new_total = account_state["total_success"] + 1
-                account_state["total_success"] = new_total
-                account_state["last_publish_time"] = now
-                if topic:
-                    account_state["topic_publish_history"][topic] = now
-                state_updates = {"total_success": new_total, "last_publish_time": now}
-                topic_update = (topic, now) if topic else None
-                plat_record.update({
-                    "status": "success",
-                    "published_by": account,
-                    "publish_time": now,
-                    "post_id": post_id,
-                    "attempts": attempts,
-                    "last_error": None,
-                    "last_attempt_time": now,
-                    "publish_price": latest_price,
-                })
-                plat_record.setdefault("interacted", False)
-                plat_record.setdefault("interaction_time", None)
-                plat_record.setdefault("comment_interact_info", {})
-                used_addresses.update(addresses)
-            else:
-                error = f"发布接口未确认成功；可能是会话失效、网络异常、限流或内容校验失败；详情: {err}"
-                account_state["last_error_msg"], account_state["last_error_time"] = error, now
-                state_updates = {"last_error_msg": error, "last_error_time": now}
-                topic_update = None
-                plat_record.update({
-                    "status": "failed",
-                    "last_error": error,
-                    "attempts": attempts,
-                    "last_attempt_time": now,
-                    "publish_price": latest_price,
-                })
+            latest_price = _safe_get_latest_price(platform, topic)
+
             stage = "保存已确认的发布结果"
-            try:
-                _update_account_publish_state(platform, account, state_updates, topic_update=topic_update)
-                saved.append("账号状态")
-            except Exception as exc:
-                problems.append(("写入账号状态", exc))
-            if not isinstance(article.get("publish_records"), dict):
-                article["publish_records"] = {}
-            article["publish_records"][platform] = plat_record
-            try:
-                article_manager.upsert_articles([article])
-                saved.append("数据库状态")
-            except Exception as exc:
-                problems.append(("回写数据库", exc))
-            if problems:
-                details = "; ".join(f"{label}: {type(exc).__name__}: {exc}" for label, exc in problems)
-                raise RuntimeError(f"{details} | 已保存: [{', '.join(saved) or '无'}]") from problems[0][1]
+            error_detail = _persist_analysis_publish_result(
+                article_manager=article_manager,
+                platform=platform,
+                account=account,
+                account_state=account_state,
+                article=article,
+                plat_record=plat_record,
+                success=success,
+                post_id=post_id,
+                attempts=attempts,
+                now=now,
+                topic=topic,
+                latest_price=latest_price,
+                err_msg=err,
+            )
+            if success:
+                used_addresses.update(addresses)
         except Exception as exc:
             raise RuntimeError(
-                f"发布阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] | 文章: [{article.get('_id')}] "
+                f"分析发布阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] | 文章: [{article.get('_id')}] "
                 f"| 主题: [{topic}] | 接口结果: [{api_result}]；请核对远端结果与本地状态 | 原因: [{exc}]"
             ) from exc
+
         if success:
             candidates.pop(selected_index)
         log = logger.info if success else logger.error
         log(
-            "%s[发布/文章] 本次处理结束 | 平台: [%s] | 账号: [%s] | 主题: [%s] | 文章: [%s] "
+            "%s[分析发布/文章] 本次处理结束 | 平台: [%s] | 账号: [%s] | 主题: [%s] | 立场: [%s] | 文章: [%s] "
             "| 评分: [%s] | 尝试: [%s/%s] | 耗时: [%.2f 秒] | 结果: [%s] | 说明: [%s]",
-            "" if success else "❌ ", platform, account, topic, article.get("_id"), info.get("score"),
+            "" if success else "❌ ", platform, account, topic, stance, article.get("_id"), score,
             attempts, PUBLISH_MAX_ATTEMPTS, time.monotonic() - started, api_result,
-            "远端发布与本地回写完成" if success else error,
+            "远端发布与本地回写完成" if success else error_detail,
         )
 
 
-# 依次调度各平台（Binance / OKX）的分析帖发布，平台间异常隔离。
+# 依次调度各平台（Binance / OKX）的分析帖发布，对齐 _publish_viral_articles_once 结构，平台间异常隔离。
 def _publish_articles_once(article_manager):
     for platform in (PLATFORM_BINANCE, PLATFORM_OKX):
         try:
-            _publish_analysis_articles_for_platform(article_manager, platform)
+            hot_coins = ["BTC", "ETH", "BNB", "SOL"]
+            if platform == PLATFORM_BINANCE:
+                hot_coins = get_hot_coin() or hot_coins
+            elif platform == PLATFORM_OKX:
+                hot_coins = fetch_okx_hot_coins(num=25) or hot_coins
+
+            _publish_analysis_articles_for_platform(article_manager, platform, hot_coins)
         except Exception:
             logger.exception(
-                "❌ [发布/平台隔离] 平台单轮分析帖发布异常 | 平台: [%s] | 后续: [继续其他平台]",
+                "❌ [分析发布/平台隔离] 平台单轮分析帖发布异常 | 平台: [%s] | 后续: [继续其他平台]",
                 platform,
             )
 
@@ -1938,10 +2131,14 @@ def _poll_task(task, manager, interval, action):
             time.sleep(interval)
 
 
-# 独立文章管理器 → 发布轮询；每轮结束后等待600秒。
+# 独立文章管理器 → 分析帖发布轮询；每轮结束后等待600秒。
 def auto_publish_articles():
-    _poll_task(_publish_articles_once, GeneratedArticleManager(gen_db_object()), PUBLISH_POLL_SECONDS, "发布")
-
+    _poll_task(
+        _publish_articles_once,
+        GeneratedArticleManager(gen_db_object()),
+        PUBLISH_POLL_SECONDS,
+        "分析发布",
+    )
 
 # action、是否保留用户信息 → ({account:{cookies,csrf_token,user_info?}},异常账号数)；逐账号隔离故障。
 def _load_account_credentials(action, with_user_info=False):
@@ -3216,7 +3413,7 @@ if __name__ == "__main__":
         generate_viral_articles,
         format_image_article,
         hudong,
-        # auto_publish_articles,
+        auto_publish_articles,
         auto_publish_viral_articles,
         # delete_old_post
     ]
