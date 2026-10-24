@@ -74,7 +74,9 @@ PRE_SCREEN_CONCURRENCY = 5
 VIRAL_STAGE1_BATCH_SIZE = 50
 VIRAL_POST_MAX_AGE_HOURS = 24
 VIRAL_PUBLISH_MAX_AGE_HOURS = 24
-VIRAL_MIN_VIEW_COUNT = 1000
+VIRAL_MIN_VIEW_COUNT_BINANCE = 1000
+VIRAL_MIN_VIEW_COUNT_OKX = 10000
+
 ARTICLE_TYPE_ANALYSIS = "analysis"
 ARTICLE_TYPE_VIRAL = "viral"
 ARTICLE_MATERIAL_LIMIT = 10
@@ -1207,6 +1209,14 @@ def extract_valid_viral_posts(article_manager):
         view_count = engagement.get("view_count", 0)
         like_count = engagement.get("like_count", 0) or 0
         comment_count = engagement.get("comment_count", 0) or 0
+
+        source = post.get("source")
+        VIRAL_MIN_VIEW_COUNT_OKX = 1000
+        if source == PLATFORM_OKX:
+            VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_OKX
+        if source == PLATFORM_BINANCE:
+            VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_BINANCE
+
         if not isinstance(view_count, (int, float)) or isinstance(view_count,
                                                                   bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
             continue
