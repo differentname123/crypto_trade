@@ -354,6 +354,12 @@ def is_need_viral_screening(post):
         return False
     engagement = post.get("engagement") or {}
     view_count = engagement.get("view_count", 0)
+    VIRAL_MIN_VIEW_COUNT = 1000
+    source = post.get("source")
+    if source == OKX_SOURCE:
+        VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_OKX
+    elif source == BINANCE_SOURCE:
+        VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_BINANCE
     if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
         return False
     try:
@@ -1211,11 +1217,13 @@ def extract_valid_viral_posts(article_manager):
         comment_count = engagement.get("comment_count", 0) or 0
 
         source = post.get("source")
-        VIRAL_MIN_VIEW_COUNT_OKX = 1000
-        if source == PLATFORM_OKX:
+        VIRAL_MIN_VIEW_COUNT = 1000
+        if source == OKX_SOURCE:
             VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_OKX
-        if source == PLATFORM_BINANCE:
+        elif source == BINANCE_SOURCE:
             VIRAL_MIN_VIEW_COUNT = VIRAL_MIN_VIEW_COUNT_BINANCE
+        else:
+            logger.info(f"{source} not in {POST_SOURCES}")
 
         if not isinstance(view_count, (int, float)) or isinstance(view_count,
                                                                   bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
