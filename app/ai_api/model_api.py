@@ -54,6 +54,10 @@ MEDIUM_MODEL_LIST = [
 
 
 
+    {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
+
+
+
     {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
     {"model_name": "gemini-aistudio-api-key-3.7-flash", "权重": 0.5, "备注": "来源api key aistudio"},
     {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
@@ -710,5 +714,5 @@ if __name__ == "__main__":
     # probe_models("model_probe_results.json")
     # generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemma-4-31b-it-max")
     for i in range(10):
-        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-antigravity-3.8-flash-high-high")
+        generate_content(prompt="最近特朗普有什么新闻,要标注相应的时间", model="gemini-3.8-flash-high")
 
