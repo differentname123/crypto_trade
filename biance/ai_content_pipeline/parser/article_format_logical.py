@@ -55,7 +55,7 @@ POST_SOURCES = (BINANCE_SOURCE, OKX_SOURCE)
 PLATFORM_BINANCE = "binance"
 PLATFORM_OKX = "okx"
 ACCOUNTS = ["qiqi", "ruru"]
-OKX_ACCOUNTS = ["myself", "mama"]
+OKX_ACCOUNTS = ["myself", "mama", "nana"]
 PLATFORM_ACCOUNTS = {PLATFORM_BINANCE: ACCOUNTS, PLATFORM_OKX: OKX_ACCOUNTS}
 
 PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
