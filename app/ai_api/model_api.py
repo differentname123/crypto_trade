@@ -54,7 +54,7 @@ MEDIUM_MODEL_LIST = [
 
 
 
-    {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
+    # {"model_name": "gemini-3.8-flash-high", "权重": 4, "备注": "来源antigravity tool"},
 
 
 
