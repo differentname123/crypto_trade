@@ -2133,9 +2133,16 @@ def _load_account_credentials(action, with_user_info=False):
 
 # 评论列表/账号列表/帖子/立场/平台 → {评论文本:{account,comment_id,success,error_info}}。
 # : 仍按评论文本作键，重复文本覆盖；会话读取仍在发送异常隔离之外。
-def interact_comment(god_comments, other_account_list, post_id, stance, platform=PLATFORM_BINANCE):
+def interact_comment(god_comments, other_account_list, post_id, stance, platform=PLATFORM_BINANCE, max_count=2):
+
+
     results, unconfirmed, raised = {}, 0, 0
     accounts = random.sample(other_account_list, len(other_account_list))
+    # 最多只保留 other_account_list 中的前 max_count 个账号，避免过多重复评论。
+    if max_count > 0:
+        accounts = accounts[:max_count]
+
+
     for account, text in zip(accounts, god_comments):
         session_dir = _get_account_session_dir(platform, account)
         try:
@@ -2201,6 +2208,9 @@ def _interact_for_platform(article_manager, platform, cutoff_ts):
     for article in pending:
         record = article["publish_records"][platform]
         other_accounts = [account for account in accounts if account != record.get("published_by")]
+
+
+
         info = article.get("article_info") or {}
         comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
         raw_stance = article.get("stance")
