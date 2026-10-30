@@ -23,7 +23,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\okx_mama"
+USER_DATA_DIR = r"W:\temp\okx_myself"
 OKX_ORBIT_URL = "https://www.okx.com/zh-hans/orbit"
 
 TYPE_CHUNK_SIZE = 80  # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变

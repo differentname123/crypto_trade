@@ -55,7 +55,7 @@ POST_SOURCES = (BINANCE_SOURCE, OKX_SOURCE)
 PLATFORM_BINANCE = "binance"
 PLATFORM_OKX = "okx"
 ACCOUNTS = ["qiqi", "ruru"]
-OKX_ACCOUNTS = ["myself", "mama", "nana"]
+OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
 PLATFORM_ACCOUNTS = {PLATFORM_BINANCE: ACCOUNTS, PLATFORM_OKX: OKX_ACCOUNTS}
 
 PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
@@ -1724,6 +1724,8 @@ def _get_recent_published_image_usage(article_manager, platform, hours=6, now=No
 
 # 按类型查询文章 → ([(article,图片地址集合,匹配币种)],原始查询数,过滤Counter)。
 # : 分析查询仍是type!=viral；评分仍仅检验数值类型，流量帖不启用原未使用的最低4分门槛。
+# 按类型查询文章 → ([(article,图片地址集合,匹配币种)],原始查询数,过滤Counter)。
+# : 分析查询仍是type!=viral；评分仍仅检验数值类型，流量帖不启用原未使用的最低4分门槛。
 def _collect_publish_candidates(article_manager, platform, hot_coins, used_addresses, article_type):
     rule = PUBLISH_RULES[article_type]
     viral = article_type == ARTICLE_TYPE_VIRAL
@@ -1756,6 +1758,14 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
         if record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
             stats["attempts"] += 1
             continue
+
+        # 流量类型帖子来源错开：向欧易发布时，文章来源不能为欧易自身
+        if viral and platform == PLATFORM_OKX:
+            article_source = str(article.get("source") or "").strip().lower()
+            if article_source == OKX_SOURCE.lower():
+                stats["source_conflict"] += 1
+                continue
+
         if viral:
             original_post = (article.get("creation_brief") or {}).get("original_post") or {}
             original_text = original_post.get("text_content")
@@ -1783,7 +1793,6 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
         candidates.append((article, addresses, matched_coin))
     candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
     return candidates, len(raw), stats
-
 
 # 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却仅适用于分析帖。
 def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
@@ -1953,6 +1962,8 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
 
 # 平台、热币列表、文章类型 → 筛选/排序/冷却/发布/回写；发布异常上抛，由平台调度隔离。
 # : 每轮用同一个now计算时间；失败候选仍可能被下一个账号重试，轮内不重查尝试上限。
+# 平台、热币列表、文章类型 → 筛选/排序/冷却/发布/回写；发布异常上抛，由平台调度隔离。
+# : 每轮用同一个now计算时间；失败候选仍可能被下一个账号重试，轮内不重查尝试上限。
 def _publish_articles_for_platform(article_manager, platform, hot_coins, article_type):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
     if not accounts:
@@ -1969,7 +1980,7 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
     )
     _log(f"{rule['action']}/计划", "候选已按评分降序排列", 平台=platform, 窗口=f"{rule['hours']}小时",
          查询=raw_count, 候选=len(candidates),
-         过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
+         过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/来源冲突{stats['source_conflict']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
          已发=recent_count, 占用图片=len(set(used_primary)) if viral else len(used_primary),
          账号数=len(accounts), 冷却=f"{cooldown}秒，按文章类型独立计算",
          主题冷却="无" if viral else f"{ACCOUNT_TOPIC_COOLDOWN_SECONDS}秒")
@@ -1997,7 +2008,6 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
                 text, paths = _format_viral_post_content(info, matched_coin)
             else:
                 # : 原调用遗漏platform，OKX分析帖也使用Binance标签；为功能保真保留默认值。
-
                 text, paths = _format_analysis_post_content(article, platform=platform)
 
             session_dir = _get_account_session_dir(platform, account)
@@ -2030,7 +2040,6 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
              评分=info.get(rule["score"]), 尝试=f"{attempts}/{PUBLISH_MAX_ATTEMPTS}",
              耗时=f"{time.monotonic() - started:.2f}秒", 结果=api_result,
              说明="远端发布与本地回写完成" if success else error)
-
 
 def _publish_analysis_articles_for_platform(article_manager, platform, hot_coins):
     _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_ANALYSIS)
