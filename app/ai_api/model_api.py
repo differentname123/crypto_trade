@@ -49,7 +49,6 @@ MEDIUM_MODEL_LIST = [
 
     {"model_name": "gemini-aistudio-3.1-pro-preview", "权重": 1, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.6-flash", "权重": 2, "备注": "来源aistudio_web"},
-    {"model_name": "gemini-aistudio-3.7-flash", "权重": 4, "备注": "来源aistudio_web"},
     {"model_name": "gemini-aistudio-3.8-flash", "权重": 4, "备注": "来源aistudio_web"},
 
 
@@ -59,7 +58,6 @@ MEDIUM_MODEL_LIST = [
 
 
     {"model_name": "gemini-aistudio-api-key-3.8-flash", "权重": 0.5, "备注": "来源api key aistudio"},
-    {"model_name": "gemini-aistudio-api-key-3.7-flash", "权重": 0.5, "备注": "来源api key aistudio"},
     {"model_name": "gemini-aistudio-api-key-3.6-flash", "权重": 0.5, "备注": "来源api key aistudio"},
 
     {"model_name": "gpt-5.6-max", "权重": 0, "备注": "来源chatgpt_web "},
