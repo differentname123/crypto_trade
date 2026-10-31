@@ -66,12 +66,12 @@ MEDIUM_MODEL_LIST = [
     {"model_name": "gemini-web-3.5-flash-lite-thinking", "权重": 0,
      "备注": "来源gemini_web 目前是免费 gemini用户能够用到的最强模型了"},
 
-    # {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 8, "备注": "来源antigravity"},
+    {"model_name": "gemini-antigravity-3.8-flash-high-high", "权重": 10, "备注": "来源antigravity"},
     # {"model_name": "claude-antigravity-opus-4-6-thinking", "权重": 0, "备注": "来源antigravity"},
 
     # {"model_name": "gpt-5.6-terra-max", "权重": 0, "备注": "来源codex 免费"},
     # {"model_name": "gpt-6-codex-sol-max", "权重": 5, "备注": "来源codex 付费"},
-    {"model_name": "gpt-6-codex-luna-max", "权重": 10, "备注": "来源codex 付费"},
+    # {"model_name": "gpt-6-codex-luna-max", "权重": 10, "备注": "来源codex 付费"},
 
 ]
 LOW_MODEL_LIST = [
