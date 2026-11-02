@@ -175,7 +175,68 @@ response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
 
 ---
 
-## 五、 常见故障排查 (避坑指南)
+## 五、 本地 MongoDB 数据库服务运维
+
+本服务已配置与本地 Windows 完全一致的环境，供本机的爬虫或后端服务直接以 `localhost` 免修改调用。
+
+### 1. 核心信息与配置路径
+
+| 模块 / 配置项 | 路径或对应值 | 说明 |
+| --- | --- | --- |
+| **系统服务名称** | `mongod.service` | 系统 Systemd 托管服务 |
+| **主配置文件** | `/etc/mongod.conf` | 管理端口、监听地址（仅 `127.0.0.1`）与鉴权开关 |
+| **数据持久化路径** | `/var/lib/mongodb` | 数据库实际文件存放目录 |
+| **日志文件路径** | `/var/log/mongodb/mongod.log` | 运行及报错排查日志 |
+| **监听端口** | `27017` | 绑定本地，不对公网开放 |
+| **授权用户** | `localUser` | 所属鉴权库 `admin`，拥有 `root` 权限 |
+| **用户密码** | `localPassword123` |  |
+| **业务数据库** | `crawler_data` | 爬虫等业务默认存放库 |
+
+### 2. 常用运维命令与连接方式
+
+* 🟢 **服务启停与状态检查:**
+```bash
+systemctl restart mongod
+systemctl stop mongod
+systemctl status mongod
+```
+
+* 🔍 **查看实时运行日志:**
+```bash
+tail -n 100 -f /var/log/mongodb/mongod.log
+# 或通过 systemd 查看
+journalctl -u mongod -n 50 -f
+```
+
+* 🚀 **终端直连命令 (Mongosh 交互式进入):**
+```bash
+mongosh "mongodb://localUser:localPassword123@localhost:27017/?authSource=admin"
+```
+
+* 🐍 **Python / 代码直连配置与 URI:**
+```python
+# 连接 URI 与本地完全一致，代码直接复用：
+MONGO_URI = "mongodb://localUser:localPassword123@localhost:27017/?authSource=admin"
+MONGO_DB_NAME = "crawler_data"
+
+# PyMongo 示例：
+# from pymongo import MongoClient
+# client = MongoClient(MONGO_URI)
+# db = client[MONGO_DB_NAME]
+```
+
+* 💾 **本地历史数据同步（如需导入/备份）:**
+```bash
+# 1. 导出指定业务库数据 (在存有旧数据的机器上执行)
+mongodump --uri="mongodb://localUser:localPassword123@localhost:27017/crawler_data?authSource=admin" --out=./mongo_backup
+
+# 2. 导入恢复数据至当前服务器 (在服务器上执行)
+mongorestore --uri="mongodb://localUser:localPassword123@localhost:27017/?authSource=admin" ./mongo_backup
+```
+
+---
+
+## 六、 常见故障排查 (避坑指南)
 
 ### 🚨 故障 1：前端更新后浏览器依旧白屏 / 无法显示新功能
 
