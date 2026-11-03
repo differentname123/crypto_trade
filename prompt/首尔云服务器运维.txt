@@ -5,14 +5,15 @@
 这里记录了项目相关的底层资源与控制台地址，方便快速登录管理。
 
 * 🌐 **域名管理 (Spaceship):**
-* 订单/域名控制台: [点击访问 Spaceship 订单详情]
-* 代理专用二级域名: `proxy.easyeverything.top`
+  * 订单/域名控制台: [点击访问 Spaceship 订单详情]
+  * 代理专用二级域名: `proxy.easyeverything.top`
+  * 惠选商城二级域名: `easy-shop.easyeverything.top`
 
 
 * ☁️ **服务器管理 (腾讯云轻量应用服务器):**
-* 公网 IPv4 地址: `43.131.225.155`
-* 硬件配置：**2GB 物理内存 + 2GB Swap 虚拟内存 (总容量 4GB)**
-* 服务器控制台: [点击访问 腾讯云 Lighthouse 实例详情]
+  * 公网 IPv4 地址: `43.131.225.155`
+  * 硬件配置：**2GB 物理内存 + 2GB Swap 虚拟内存 (总容量 4GB)**
+  * 服务器控制台: [点击访问 腾讯云 Lighthouse 实例详情]
 
 
 
@@ -20,15 +21,15 @@
 
 ## 二、 Web 网页端与 API 服务 (Nginx 统一接管)
 
-本模块包含 **Alpha 加密页面 (`crypto`)**、**带单检测页面 (`copy-sweep`)** 以及它们**共享的 Python 后端 API**。
+本模块包含 **Alpha 加密页面 (`crypto`)**、**带单检测页面 (`copy-sweep`)**，以及 **极简惠选商城 (`easy-shop`)** 与其后端服务。
 
 ### 1. 整体架构 (多子域名分发)
 
 * **链路走向:** 用户访问不同子域名 ➔ Cloudflare (仅 CDN/HTTPS) ➔ Nginx (服务器80端口) ➔ 对应前端目录或本地后端。
 * **Nginx 路由规则:**
-* **前端 `crypto`:** 匹配根目录，返回 `/var/www/alpha-web/`
-* **前端 `copy-sweep`:** 匹配根目录，返回 `/var/www/copy-sweep-web/`
-* **共享后端:** 带有 `/api/` 的请求，统一转发至本地 `8000` 端口处理。
+  * **前端 `crypto`:** 匹配根目录，返回 `/var/www/alpha-web/`，API 请求转发至本地 `8000` 端口。
+  * **前端 `copy-sweep`:** 匹配根目录，返回 `/var/www/copy-sweep-web/`，API 请求转发至本地 `8000` 端口。
+  * **全栈 `easy-shop`:** 匹配全站路由，全部反向代理至本地 **`8001` 端口**（FastAPI 统管前端静态文件与 `/api/` 接口；Nginx 独立配置并内置了核心高危接口限流防刷保护，防止官方拉黑 PID）。
 
 
 
@@ -38,9 +39,13 @@
 | --- | --- | --- |
 | **Alpha 前端代码** | `/var/www/alpha-web/` | `crypto` 域名的静态文件存放处 |
 | **Sweep 前端代码** | `/var/www/copy-sweep-web/` | `copy-sweep` 域名的静态文件存放处 |
-| **Python 共享后端** | `/root/alpha-api/alpha_api.py` | 修改 AI 提示词、业务逻辑、接口处理 |
-| **统一 Nginx 配置** | `/etc/nginx/sites-available/alpha-momentum` | 统一管理上述域名的前端路由及接口转发 |
-| **后端系统服务** | `/etc/systemd/system/alpha-api.service` | 修改后端运行端口或环境变量 |
+| **Python 共享后端** | `/root/alpha-api/alpha_api.py` | 修改 AI 提示词、业务逻辑、接口处理（运行于 `8000` 端口） |
+| **Alpha/Sweep Nginx 配置** | `/etc/nginx/sites-available/alpha-momentum` | 统一管理 `crypto` 与 `copy-sweep` 的前端路由及接口转发 |
+| **Alpha/Sweep 系统服务** | `/etc/systemd/system/alpha-api.service` | 修改后端运行端口或环境变量 |
+| **极简惠选商城代码** | `/root/easy_shop_web/mobile_web/` | 商城全栈源码目录（启动入口 `run.py`） |
+| **商城核心私有配置** | `/root/easy_shop_web/mobile_web/config.local.json` | **商城唯一真相源**：修改端口 (8001)、拼多多凭据、Mongo 认证与日志等级 |
+| **商城独立 Nginx 配置** | `/etc/nginx/sites-available/easy-shop` | 商城专属反向代理与核心接口限流防护规则（软链至 `sites-enabled`） |
+| **商城系统服务** | `/etc/systemd/system/easy-shop.service` | 商城后台常驻与开机自启服务（运行于 `8001` 端口） |
 
 ### 3. 标准运维与通用部署流程
 
@@ -55,25 +60,46 @@
 ```bash
 chown -R www-data:www-data /var/www/<对应目录>
 chmod -R 755 /var/www/<对应目录>
-
 ```
 
-🟢 **后端逻辑更新 (代码修改后必做)**
+🟢 **Alpha 后端逻辑更新 (代码修改后必做)**
 修改了 `alpha_api.py` 后，必须重启服务并检查日志：
 
 ```bash
 systemctl restart alpha-api.service
 journalctl -u alpha-api.service -n 50 -f
 # 按 Ctrl+C 退出
-
 ```
 
-🔵 **Nginx 配置重载 (改路由/域名后必做)**
+🟢 **极简惠选商城运维与更新 (`easy-shop`)**
+
+* **修改配置（一站式管理）：**
+  只需直接编辑私有配置文件即可，无需动任何代码：
+  ```bash
+  nano /root/easy_shop_web/mobile_web/config.local.json
+  ```
+* **服务重启 / 停止 / 查看状态:**
+  ```bash
+  systemctl restart easy-shop.service
+  systemctl stop easy-shop.service
+  systemctl status easy-shop.service
+  ```
+* **查看实时日志与访问流水:**
+  ```bash
+  journalctl -u easy-shop.service -n 50 -f
+  # 或查看持久化运行日志
+  tail -n 100 -f /root/easy_shop_web/mobile_web/runtime/logs/mobile_web.log
+  ```
+* **无损自检（测试数据库连通性，不发外部网络请求）:**
+  ```bash
+  /root/easy_shop_web/mobile_web/venv/bin/python /root/easy_shop_web/mobile_web/run.py --check-mongo
+  ```
+
+🔵 **Nginx 配置重载 (改路由/域名/防护规则后必做)**
 
 ```bash
 nginx -t
 systemctl reload nginx
-
 ```
 
 ---
@@ -87,18 +113,18 @@ systemctl reload nginx
 * **核心工作目录:** `/root/trader_bot`
 * **Python 虚拟环境路径:** `/root/trader_bot/venv/bin/python`
 * **Grid 策略 (网格):**
-* 执行入口: `/root/trader_bot/run_grid_bot.py`
-* 服务配置: `/etc/systemd/system/bot-grid.service`
+  * 执行入口: `/root/trader_bot/run_grid_bot.py`
+  * 服务配置: `/etc/systemd/system/bot-grid.service`
 
 
 * **Martin 策略 (马丁):**
-* 执行入口: `/root/trader_bot/run_martin_bot.py`
-* 服务配置: `/etc/systemd/system/bot-martin.service`
+  * 执行入口: `/root/trader_bot/run_martin_bot.py`
+  * 服务配置: `/etc/systemd/system/bot-martin.service`
 
 
 * **Signal 策略 (信号):**
-* 执行入口: `/root/trader_bot/run_signal_bot.py`
-* 服务配置: `/etc/systemd/system/bot-signal.service`
+  * 执行入口: `/root/trader_bot/run_signal_bot.py`
+  * 服务配置: `/etc/systemd/system/bot-signal.service`
 
 
 
@@ -106,9 +132,7 @@ systemctl reload nginx
 
 **🟢 Grid 策略 (网格机器人)**
 
-* **重启/停止/状态:** `systemctl restart bot-grid`
-| `systemctl stop bot-grid` |
-`systemctl status bot-grid`
+* **重启/停止/状态:** `systemctl restart bot-grid` | `systemctl stop bot-grid` | `systemctl status bot-grid`
 * **查看实时日志/报错:** `  journalctl -u bot-grid -n 100 -f    `
 
 **🔵 Martin 策略 (马丁机器人)**
@@ -125,22 +149,13 @@ systemctl reload nginx
 
 * **配置重载:** 每次修改了 `/etc/systemd/system/` 下的 service 文件后，必须先执行 `systemctl daemon-reload`，再执行 restart。
 * **内存分配策略 (已放宽限制):**
-* 依托于 `2GB 物理内存 + 2GB 虚拟内存` 的配置，为避免机器人运行中被误杀，当前 3 个服务均设置了 **`MemoryMax=1200M`**。
-* 三者合计理论峰值为 3600M，在 4GB 总容量的安全范围内。
-* 配合 `Restart=always` 与 `RestartSec=5` 参数，即使偶发 OOM 也能在 5 秒内迅速自启。
+  * 依托于 `2GB 物理内存 + 2GB 虚拟内存` 的配置，为避免机器人运行中被误杀，当前 3 个服务均设置了 **`MemoryMax=1200M`**。
+  * 三者合计理论峰值为 3600M，在 4GB 总容量的安全范围内。
+  * 配合 `Restart=always` 与 `RestartSec=5` 参数，即使偶发 OOM 也能在 5 秒内迅速自启。
 * **一键排查进程被杀记录 (OOM检查):**
 ```bash
-
-
 dmesg -T | grep -i -E "killed process|oom" -C 5
-
-
-
 ```
-
-
-
-
 
 ---
 
@@ -160,7 +175,6 @@ dmesg -T | grep -i -E "killed process|oom" -C 5
 ```bash
 systemctl daemon-reload
 systemctl restart gost
-
 ```
 
 * 🚀 **Python 代码直连调用模板:**
@@ -170,14 +184,13 @@ import requests
 PROXY_URL = "https://YOUR_USER:YOUR_PASS@proxy.easyeverything.top:443"
 proxies = {"http": PROXY_URL, "https": PROXY_URL}
 response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
-
 ```
 
 ---
 
 ## 五、 本地 MongoDB 数据库服务运维
 
-本服务已配置与本地 Windows 完全一致的环境，供本机的爬虫或后端服务直接以 `localhost` 免修改调用。
+本服务已配置与本地 Windows 完全一致的环境，供本机的爬虫、商城后端（`easy-shop`）等服务直接以 `localhost` 免修改调用。
 
 ### 1. 核心信息与配置路径
 
@@ -190,7 +203,7 @@ response = requests.get("https://api.ipify.org?format=json", proxies=proxies)
 | **监听端口** | `27017` | 绑定本地，不对公网开放 |
 | **授权用户** | `localUser` | 所属鉴权库 `admin`，拥有 `root` 权限 |
 | **用户密码** | `localPassword123` |  |
-| **业务数据库** | `crawler_data` | 爬虫等业务默认存放库 |
+| **业务数据库** | `crawler_data` | 爬虫与商城默认商品/订单数据存放库 |
 
 ### 2. 常用运维命令与连接方式
 
@@ -242,8 +255,8 @@ mongorestore --uri="mongodb://localUser:localPassword123@localhost:27017/?authSo
 
 * **根本原因：** Cloudflare 边缘节点或浏览器存在“死缓存”。
 * **解决方案：**
-1. 登录 Cloudflare 控制台 -> Caching (缓存) -> Configuration -> 点击 **`Purge Everything`**。
-2. 浏览器端按 `Ctrl + F5` 强制刷新，或在 F12 Network 中勾选 `Disable cache`。
+  1. 登录 Cloudflare 控制台 -> Caching (缓存) -> Configuration -> 点击 **`Purge Everything`**。
+  2. 浏览器端按 `Ctrl + F5` 强制刷新，或在 F12 Network 中勾选 `Disable cache`。
 
 
 
@@ -251,6 +264,22 @@ mongorestore --uri="mongodb://localUser:localPassword123@localhost:27017/?authSo
 
 * **根本原因：** 极大概率是内存溢出（OOM），导致系统强制杀死了 Python 进程。
 * **解决方案：**
-1. 执行 `dmesg -T | grep -i oom` 确认是否是因为内存不足。
-2. 检查是哪个策略吃内存：`systemd-cgtop`。
-3. 虽然内存限制已放宽至 1200M，但如果持续出现 OOM，建议排查 Python 代码中是否存在内存泄漏。
+  1. 执行 `dmesg -T | grep -i oom` 确认是否是因为内存不足。
+  2. 检查是哪个策略吃内存：`systemd-cgtop`。
+  3. 虽然内存限制已放宽至 1200M，但如果持续出现 OOM，建议排查 Python 代码中是否存在内存泄漏。
+
+
+
+### 🚨 故障 3：商城访问返回 429 Too Many Requests 或转链生成失败
+
+* **根本原因：**
+  1. 接口触发了 Nginx 的防刷防御机制（单个 IP 针对转链或登录接口请求频次超过了 2次/秒）。
+  2. 拼多多凭据配置错误、PID 格式异常，或本地 `config.local.json` 发生语法错误。
+* **解决方案：**
+  1. 如属于正常测试时的手速过快，等待 2~3 秒冷却后即可自动恢复正常；如需放宽限制，可调整 `/etc/nginx/sites-available/easy-shop` 中的 `rate` 与 `burst`。
+  2. 执行 `journalctl -u easy-shop.service -n 50 -f` 查看报错堆栈。
+  3. 执行自检命令验证配置有效性与 Mongo 连通性：
+     ```bash
+     /root/easy_shop_web/mobile_web/venv/bin/python /root/easy_shop_web/mobile_web/run.py --check-mongo
+     ```
+  4. 修改了 `config.local.json` 后，必须执行 `systemctl restart easy-shop.service` 使配置生效。
