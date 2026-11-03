@@ -72,6 +72,11 @@ journalctl -u alpha-api.service -n 50 -f
 ```
 
 🟢 **极简惠选商城运维与更新 (`easy-shop`)**
+cd /root/easy_shop_web
+git pull origin main
+
+systemctl restart easy-shop
+
 
 * **修改配置（一站式管理）：**
   只需直接编辑私有配置文件即可，无需动任何代码：
