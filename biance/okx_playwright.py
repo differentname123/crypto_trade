@@ -23,7 +23,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\okx_myself"
+USER_DATA_DIR = r"W:\temp\okx_ruru"
 OKX_ORBIT_URL = "https://www.okx.com/zh-hans/orbit"
 
 TYPE_CHUNK_SIZE = 80  # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -1975,9 +1975,14 @@ def create_okx_post(
         logger.error(error_info)
         return error_info, False, None
 
-def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR, debug=True):
+def comment_on_okx_post(target_post_url, content="", like=True, user_data_dir=USER_DATA_DIR, debug=True):
     """
-    主控入口 3：调度浏览器打开指定 OKX 星球帖子详情页并执行【纯文本评论】全流程。
+    主控入口 3：调度浏览器打开指定 OKX 星球帖子详情页并执行【点赞(可选) + 纯文本评论】全流程。
+    :param target_post_url: 目标帖子详情页 URL
+    :param content: 评论文本内容
+    :param like: 是否需要点赞，默认 True
+    :param user_data_dir: 浏览器用户数据目录
+    :param debug: 是否开启调试模式（True 显示界面，False 离屏后台）
     返回 Tuple(错误信息(str|None), 是否成功(bool), 评论ID(str|None))，格式与 create_okx_post 保持一致。
     """
     target_post_url = str(target_post_url or "").strip()
@@ -1992,7 +1997,7 @@ def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
     logger.info(f"\n{'=' * 70}\n[任务/Comment] 启动 OKX 星球自动化评论 | 目标帖子: <{target_post_url}> "
-                f"| 评论字数: 【{len(content)}字】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
+                f"| 评论字数: 【{len(content)}字】 | 是否点赞: 【{like}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
     anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
@@ -2048,6 +2053,47 @@ def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR
 
                     check_for_crash(page)
 
+                    # ---------- 点赞逻辑处理 ----------
+                    if like:
+                        try:
+                            # 1. 检测是否已点赞（已点赞图标具有 aria-label="取消点赞" 或包含 okx-trading-like-filled / liked 类）
+                            already_liked = page.locator(
+                                'i[aria-label="取消点赞"], i.okx-trading-like-filled, i[class*="liked-"]'
+                            ).first
+                            if already_liked.count() > 0 and already_liked.is_visible(timeout=1500):
+                                logger.info("[点赞/Like] 目标帖子已处于点赞状态(检测到「取消点赞」图标)，无需重复点击")
+                            else:
+                                # 2. 定位未点赞图标并执行点击
+                                like_icon_cands = [
+                                    page.locator('i[aria-label="点赞"]').first,
+                                    page.locator('i.okx-trading-like:not(.okx-trading-like-filled)').first,
+                                    page.locator('button:has(i[aria-label="点赞"])').first,
+                                    page.locator('button:has(i.okx-trading-like)').first,
+                                ]
+                                like_target = None
+                                for c in like_icon_cands:
+                                    try:
+                                        if c.count() > 0 and c.is_visible(timeout=1000):
+                                            like_target = c
+                                            break
+                                    except Exception:
+                                        continue
+
+                                if like_target:
+                                    try:
+                                        like_target.scroll_into_view_if_needed(timeout=2000)
+                                    except Exception:
+                                        pass
+                                    page.wait_for_timeout(200)
+                                    _robust_click(like_target)
+                                    page.wait_for_timeout(500)
+                                    logger.info("[点赞/Like] 帖子点赞操作执行完成 | 结果: [Success]")
+                                else:
+                                    logger.warning("[点赞/Like] 未能匹配到帖子点赞按钮，跳过点赞")
+                        except Exception as like_e:
+                            logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
+
+                    # ---------- 评论流程 ----------
                     try:
                         comment_container = _locate_comment_box(page)
                     except Exception as e:
@@ -2092,7 +2138,6 @@ def comment_on_okx_post(target_post_url, content="", user_data_dir=USER_DATA_DIR
         error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
         logger.error(error_info)
         return error_info, False, None
-
 
 def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url=OKX_ORBIT_URL):
     """

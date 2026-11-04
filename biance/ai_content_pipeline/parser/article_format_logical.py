@@ -1721,79 +1721,6 @@ def _get_recent_published_image_usage(article_manager, platform, hours=6, now=No
         primary.extend(first)
     return addresses, primary, len(recent)
 
-
-# 按类型查询文章 → ([(article,图片地址集合,匹配币种)],原始查询数,过滤Counter)。
-# : 分析查询仍是type!=viral；评分仍仅检验数值类型，流量帖不启用原未使用的最低4分门槛。
-# 按类型查询文章 → ([(article,图片地址集合,匹配币种)],原始查询数,过滤Counter)。
-# : 分析查询仍是type!=viral；评分仍仅检验数值类型，流量帖不启用原未使用的最低4分门槛。
-def _collect_publish_candidates(article_manager, platform, hot_coins, used_addresses, article_type):
-    rule = PUBLISH_RULES[article_type]
-    viral = article_type == ARTICLE_TYPE_VIRAL
-    raw = article_manager.find_articles(query={
-        "type": ARTICLE_TYPE_VIRAL if viral else {"$ne": ARTICLE_TYPE_VIRAL},
-        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=rule["hours"])},
-        "status": "ok", f"publish_records.{platform}.status": {"$ne": "success"},
-    }) or []
-    coins = _normalize_hot_coins(hot_coins)
-    hot_set = {coin.lower() for coin in coins}
-    patterns = [
-        (coin.upper(), re.compile(rf"(?<![A-Za-z]){re.escape(coin)}(?:USDT|USDC)?(?![A-Za-z])", re.IGNORECASE))
-        for coin in coins
-    ] if viral else []
-    candidates, stats = [], Counter()
-    for article in raw:
-        info = article.get("article_info")
-        if article.get("prompt_version") != prompt_version:
-            stats["version"] += 1
-            continue
-        if (not isinstance(info, dict) or info.get("status") != "ok"
-                or (viral and info.get("usable") is not True)
-                or not isinstance(info.get(rule["text"]), str) or not info[rule["text"]].strip()
-                or not isinstance(info.get(rule["images"], []), list)
-                or isinstance(info.get(rule["score"]), bool)
-                or not isinstance(info.get(rule["score"]), (int, float))):
-            stats["structure"] += 1
-            continue
-        record = (article.get("publish_records") or {}).get(platform) or {}
-        if record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
-            stats["attempts"] += 1
-            continue
-
-        # 流量类型帖子来源错开：向欧易发布时，文章来源不能为欧易自身
-        if viral and platform == PLATFORM_OKX:
-            article_source = str(article.get("source") or "").strip().lower()
-            if article_source == OKX_SOURCE.lower():
-                stats["source_conflict"] += 1
-                continue
-
-        if viral:
-            original_post = (article.get("creation_brief") or {}).get("original_post") or {}
-            original_text = original_post.get("text_content")
-            clean = MEDIA_PATTERN.sub(" ", re.sub(
-                r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", " ",
-                original_text if isinstance(original_text, str) else "",
-            ))
-            matched_coin = next((coin for coin, pattern in patterns if pattern.search(clean)), None)
-        else:
-            topic = (article.get("topic") or "").strip()
-            matched_coin = topic if topic and topic.lower() in hot_set else None
-        if not matched_coin:
-            stats["no_hot_coin"] += 1
-            continue
-        mapping = info.get("image_mapping") or {}
-        if any(not isinstance(mapping.get(key), dict)
-               or not _is_valid_image_file(mapping[key].get("local_path"))
-               for key in info.get(rule["images"]) or []):
-            stats["invalid_image"] += 1
-            continue
-        addresses, _ = _extract_article_image_addresses(article)
-        if addresses and addresses & used_addresses:
-            stats["image_dup"] += 1
-            continue
-        candidates.append((article, addresses, matched_coin))
-    candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
-    return candidates, len(raw), stats
-
 # 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却仅适用于分析帖。
 def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
     history = account_state.get("topic_publish_history") or {}
@@ -1960,10 +1887,93 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
     return error_detail
 
 
-# 平台、热币列表、文章类型 → 筛选/排序/冷却/发布/回写；发布异常上抛，由平台调度隔离。
-# : 每轮用同一个now计算时间；失败候选仍可能被下一个账号重试，轮内不重查尝试上限。
-# 平台、热币列表、文章类型 → 筛选/排序/冷却/发布/回写；发布异常上抛，由平台调度隔离。
-# : 每轮用同一个now计算时间；失败候选仍可能被下一个账号重试，轮内不重查尝试上限。
+def _collect_publish_candidates(article_manager, platform, hot_coins, used_addresses, article_type):
+    rule = PUBLISH_RULES[article_type]
+    viral = article_type == ARTICLE_TYPE_VIRAL
+    raw = article_manager.find_articles(query={
+        "type": ARTICLE_TYPE_VIRAL if viral else {"$ne": ARTICLE_TYPE_VIRAL},
+        "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=rule["hours"])},
+        "status": "ok", f"publish_records.{platform}.status": {"$ne": "success"},
+    }) or []
+    coins = _normalize_hot_coins(hot_coins)
+    hot_set = {coin.lower() for coin in coins}
+    patterns = [
+        (coin.upper(), re.compile(rf"(?<![A-Za-z]){re.escape(coin)}(?:USDT|USDC)?(?![A-Za-z])", re.IGNORECASE))
+        for coin in coins
+    ] if viral else []
+    candidates, stats = [], Counter()
+    for article in raw:
+        info = article.get("article_info")
+        if article.get("prompt_version") != prompt_version:
+            stats["version"] += 1
+            continue
+
+        # 先提取正文字段，用于后续结构校验及竞品词排斥校验
+        text_content = info.get(rule["text"]) if isinstance(info, dict) else None
+
+        if (not isinstance(info, dict) or info.get("status") != "ok"
+                or (viral and info.get("usable") is not True)
+                or not isinstance(text_content, str) or not text_content.strip()
+                or not isinstance(info.get(rule["images"], []), list)
+                or isinstance(info.get(rule["score"]), bool)
+                or not isinstance(info.get(rule["score"]), (int, float))):
+            stats["structure"] += 1
+            continue
+
+        # --- 新增：竞品词排斥校验（检查正文、神评/诱导评论） ---
+        comments_list = info.get("bait_comments", []) if viral else info.get("god_comments", [])
+        comments_text = " ".join([str(c) for c in comments_list if c])
+        full_check_text = (text_content + " " + comments_text).lower()
+
+        if platform == PLATFORM_BINANCE and ("okx" in full_check_text or "欧易" in full_check_text):
+            stats["rival_keyword"] += 1
+            continue
+        elif platform == PLATFORM_OKX and ("binance" in full_check_text or "币安" in full_check_text):
+            stats["rival_keyword"] += 1
+            continue
+        # --------------------------------------------------------
+
+        record = (article.get("publish_records") or {}).get(platform) or {}
+        if record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
+            stats["attempts"] += 1
+            continue
+
+        # 流量类型帖子来源错开：向欧易发布时，文章来源不能为欧易自身
+        if viral and platform == PLATFORM_OKX:
+            article_source = str(article.get("source") or "").strip().lower()
+            if article_source == OKX_SOURCE.lower():
+                stats["source_conflict"] += 1
+                continue
+
+        if viral:
+            original_post = (article.get("creation_brief") or {}).get("original_post") or {}
+            original_text = original_post.get("text_content")
+            clean = MEDIA_PATTERN.sub(" ", re.sub(
+                r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", " ",
+                original_text if isinstance(original_text, str) else "",
+            ))
+            matched_coin = next((coin for coin, pattern in patterns if pattern.search(clean)), None)
+        else:
+            topic = (article.get("topic") or "").strip()
+            matched_coin = topic if topic and topic.lower() in hot_set else None
+        if not matched_coin:
+            stats["no_hot_coin"] += 1
+            continue
+        mapping = info.get("image_mapping") or {}
+        if any(not isinstance(mapping.get(key), dict)
+               or not _is_valid_image_file(mapping[key].get("local_path"))
+               for key in info.get(rule["images"]) or []):
+            stats["invalid_image"] += 1
+            continue
+        addresses, _ = _extract_article_image_addresses(article)
+        if addresses and addresses & used_addresses:
+            stats["image_dup"] += 1
+            continue
+        candidates.append((article, addresses, matched_coin))
+    candidates.sort(key=lambda item: float(item[0]["article_info"].get(rule["score"], 0.0)), reverse=True)
+    return candidates, len(raw), stats
+
+
 def _publish_articles_for_platform(article_manager, platform, hot_coins, article_type):
     accounts = PLATFORM_ACCOUNTS.get(platform) or []
     if not accounts:
@@ -1978,12 +1988,15 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
     candidates, raw_count, stats = _collect_publish_candidates(
         article_manager, platform, hot_coins, used_addresses, article_type,
     )
+
+    # 过滤日志中补充了 竞品词{stats['rival_keyword']} 的统计打点
     _log(f"{rule['action']}/计划", "候选已按评分降序排列", 平台=platform, 窗口=f"{rule['hours']}小时",
          查询=raw_count, 候选=len(candidates),
-         过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/来源冲突{stats['source_conflict']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
+         过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/来源冲突{stats['source_conflict']}/竞品词{stats['rival_keyword']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
          已发=recent_count, 占用图片=len(set(used_primary)) if viral else len(used_primary),
          账号数=len(accounts), 冷却=f"{cooldown}秒，按文章类型独立计算",
          主题冷却="无" if viral else f"{ACCOUNT_TOPIC_COOLDOWN_SECONDS}秒")
+
     for account in accounts:
         if not candidates:
             break
