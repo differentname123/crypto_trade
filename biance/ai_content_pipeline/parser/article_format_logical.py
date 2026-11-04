@@ -61,6 +61,7 @@ PLATFORM_ACCOUNTS = {PLATFORM_BINANCE: ACCOUNTS, PLATFORM_OKX: OKX_ACCOUNTS}
 PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
+MULTI_ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_多币种分析文章生成.txt"
 VIRAL_STAGE1_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖可用性筛选.txt"
 VIRAL_STAGE2_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖洗稿和神评生成.txt"
 
@@ -78,6 +79,7 @@ VIRAL_MIN_VIEW_COUNT_BINANCE = 1000
 VIRAL_MIN_VIEW_COUNT_OKX = 10000
 
 ARTICLE_TYPE_ANALYSIS = "analysis"
+ARTICLE_TYPE_MULTI_ANALYSIS = "analysis_multi"
 ARTICLE_TYPE_VIRAL = "viral"
 ARTICLE_MATERIAL_LIMIT = 10
 ARTICLE_MIN_MATERIALS = 5
@@ -86,6 +88,26 @@ ARTICLE_MAX_CHARS = 260
 ARTICLE_VARIANTS = 2
 ARTICLE_CONCURRENCY = 5
 ARTICLE_GENERATION_INTERVAL_SECONDS = 600
+
+# 多币种聚合分析配置：最多20条论据池，每轮10次并发生成
+MULTI_ANALYSIS_MATERIAL_LIMIT = 20
+MULTI_ANALYSIS_MIN_MATERIALS = 4
+MULTI_ANALYSIS_ROUNDS = 10
+MULTI_ANALYSIS_CONCURRENCY = 5
+MULTI_ANALYSIS_MAX_CHARS = 360
+
+# 流水线各模块独立启停控制面板
+TASK_SWITCHES = {
+    "fetch_and_screen": True,         # 采集与初筛/提取
+    "single_analysis_gen": True,      # 单币分析生成
+    "single_analysis_pub": True,      # 单币分析发布
+    "multi_analysis_gen": True,       # 多币分析生成 (最多20论据/每轮10次)
+    "multi_analysis_pub": True,       # 多币分析发布 (独立控制开关)
+    "viral_gen": False,               # 娱乐帖生成
+    "viral_pub": False,               # 娱乐帖发布
+    "hudong": True,                   # 评论区互动
+    "delete_old_post": False,         # 历史清理 (手动开启)
+}
 
 STATE_FILE = "account_publish_state.json"
 STATE_FILE_LOCK = threading.Lock()
@@ -109,6 +131,10 @@ PUBLISH_RULES = {
     ARTICLE_TYPE_ANALYSIS: {
         "action": "分析发布", "hours": 6, "text": "text",
         "images": "image_placeholders", "score": "score", "state_prefix": "",
+    },
+    ARTICLE_TYPE_MULTI_ANALYSIS: {
+        "action": "多币分析发布", "hours": 6, "text": "text",
+        "images": "image_placeholders", "score": "score", "state_prefix": "multi_",
     },
     ARTICLE_TYPE_VIRAL: {
         "action": "流量发布", "hours": VIRAL_PUBLISH_MAX_AGE_HOURS, "text": "post_text",
@@ -833,8 +859,9 @@ def clear_all_media_format_batch():
 def transform_mlus(mlu_list):
     materials, image_mapping, asset_by_source = [], {}, {}
     for index, evidence in enumerate(mlu_list, 1):
+        coin = str(evidence.get("target_coin") or "").strip().upper()
         material = {
-            "id": f"M{index}", "fact": evidence.get("core_fact", ""),
+            "id": f"M{index}", "coin": coin, "target_coin": coin, "fact": evidence.get("core_fact", ""),
             "underlying_logic": evidence.get("logic_link", ""), "raw_hook": evidence.get("raw_hook", ""),
             "visual_evidence": None,
         }
@@ -1626,7 +1653,386 @@ def _poll_generation(task, action):
 
 
 def generate_analysis_articles():
-    _poll_generation(generate_analysis_articles_once, "文章")
+    _poll_generation(generate_analysis_articles_once, "单币文章")
+
+
+# ==============================================================================
+#                      多币种聚合分析生成流水线 (独立任务)
+# ==============================================================================
+
+def extract_all_valid_multi_coin_evidences(article_manager):
+    """提取全部有效、符合时效、未超频次的多币种候选论据池，并按币种分组返回。
+    为后续每轮 10 次独立随机采样提供充足的全局候选池。
+    """
+    started = time.monotonic()
+    biance_hot_coins = {coin.upper() for coin in get_hot_coin()}
+    okx_hot_coins = {coin.upper() for coin in PLATFORMS[PLATFORM_OKX].hot_coins()}
+    hot_coins = biance_hot_coins.union(okx_hot_coins)
+
+    post_manager = UniversalPostManager(gen_db_object())
+    posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
+    now = time.time()
+
+    raw_evidences = []
+    for post in posts:
+        logic, raw_time = post.get("logic_mul"), post.get("publish_time")
+        if (not isinstance(logic, dict) or logic.get("prompt_version") != prompt_version
+                or not logic.get("evidences") or not raw_time):
+            continue
+        try:
+            publish_time = _publish_time_seconds(raw_time)
+        except ValueError:
+            continue
+        age = now - publish_time
+        if age > 15 * 24 * 3600 or age < -3600:
+            continue
+
+        source_mapping = build_source_image_mapping(post)
+        post_source = post.get("source") or BINANCE_SOURCE
+        post_id = post.get("post_id", "UNKNOWN")
+
+        for evidence in logic["evidences"]:
+            if any(image.get("usable") is not True for image in evidence.get("images", [])):
+                continue
+            duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
+            if age > duration:
+                continue
+
+            target_coin = str(evidence.get("target_coin") or "").strip().upper()
+            if not target_coin or target_coin not in hot_coins or target_coin == "MARKET":
+                continue
+            if evidence.get("stance") not in ("看多", "看空", "震荡"):
+                continue
+            if not isinstance(evidence.get("core_fact"), str) or not evidence["core_fact"].strip():
+                continue
+
+            raw_evidences.append({
+                **evidence,
+                "target_coin": target_coin,
+                "source": post_source,
+                "source_post_id": post_id,
+                "publish_time": publish_time,
+                "source_text_content": (post.get("content") or {}).get("text_content", ""),
+                "source_image_mapping": source_mapping,
+            })
+
+    if not raw_evidences:
+        return [], {}
+
+    # 统计原帖使用次数，排除超限帖子
+    all_post_ids = list(dict.fromkeys(item["source_post_id"] for item in raw_evidences if item.get("source_post_id") not in ("", "UNKNOWN")))
+    usage = get_post_usage_counts(article_manager, POST_SOURCES, all_post_ids)
+
+    usable_evidences = [
+        item for item in raw_evidences
+        if usage.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
+    ]
+
+    coin_groups = defaultdict(list)
+    for item in usable_evidences:
+        coin_groups[item["target_coin"]].append(item)
+
+    if len(usable_evidences) < MULTI_ANALYSIS_MIN_MATERIALS or len(coin_groups) < 2:
+        _log("多币文章/选材", "候选论据不足或币种单一，跳过本轮生成",
+             论据数=len(usable_evidences), 涵盖币种=len(coin_groups))
+        return [], {}
+
+    _log("多币文章/选材", "多币全局候选池准备就绪", 总论据=len(usable_evidences),
+         覆盖币种=f"{len(coin_groups)}个: {sorted(coin_groups.keys())}", 耗时=f"{time.monotonic() - started:.2f}秒")
+    return usable_evidences, coin_groups
+
+
+def sample_multi_coin_evidences_for_task(usable_evidences, coin_groups, limit=MULTI_ANALYSIS_MATERIAL_LIMIT, task_index=1, used_signatures=None):
+    """为单次多币种生成任务独立动态采样材料子集。
+    
+    核心目标：
+    1. 确保每一轮的 10 次并发生成任务，各自拿到完全不同的币种组合或素材切片，绝非同一批材料生成 10 次；
+    2. 随机聚焦 2~4 个币种，从这些币种中各抽取 2~4 条核心论据，总条数控制在 limit (默认20) 内；
+    3. 采样组合通过签名防重机制保证多样性。
+    """
+    if len(usable_evidences) < MULTI_ANALYSIS_MIN_MATERIALS or len(coin_groups) < 2:
+        return []
+
+    available_coins = sorted(coin_groups.keys())
+    best_candidate = []
+
+    # 尝试生成与之前任务不完全重复的材料切片 (最多尝试 8 次随机采样)
+    for _ in range(8):
+        # 1. 动态决定本次任务关注的币种数 (2~4 个)
+        k = random.choice([2, 3, 4]) if len(available_coins) >= 3 else 2
+        k = min(k, len(available_coins))
+        chosen_coins = random.sample(available_coins, k)
+
+        # 2. 从每个选中的币种中随机抽取 2~4 条论据
+        selected = []
+        for coin in chosen_coins:
+            evs = list(coin_groups[coin])
+            random.shuffle(evs)
+            take_n = min(len(evs), random.randint(2, 4))
+            selected.extend(evs[:take_n])
+
+        # 3. 若所选币种论据总数不足 MULTI_ANALYSIS_MIN_MATERIALS，从其他币种补充
+        if len(selected) < MULTI_ANALYSIS_MIN_MATERIALS:
+            other_coins = [c for c in available_coins if c not in chosen_coins]
+            random.shuffle(other_coins)
+            for c in other_coins:
+                evs = list(coin_groups[c])
+                random.shuffle(evs)
+                selected.extend(evs[:2])
+                if len(selected) >= MULTI_ANALYSIS_MIN_MATERIALS:
+                    break
+
+        # 4. 限制最多 limit (20) 条
+        if len(selected) > limit:
+            random.shuffle(selected)
+            selected = selected[:limit]
+
+        # 5. 按照影响力权重与随机微扰排序
+        selected.sort(key=lambda x: (x.get("impact_weight", 0), random.random()), reverse=True)
+
+        # 6. 计算签名验证独立性
+        sig = frozenset(
+            (item.get("source_post_id", ""), item.get("target_coin", ""), item.get("core_fact", "")[:30])
+            for item in selected
+        )
+        if used_signatures is not None and sig in used_signatures:
+            best_candidate = selected
+            continue
+
+        if used_signatures is not None:
+            used_signatures.add(sig)
+        return selected
+
+    if best_candidate:
+        return best_candidate
+    return selected
+
+
+def check_multi_coin_article_info(article_info, materials, image_mapping, max_chars):
+    expected_keys = {
+        "status", "primary_coin", "related_coins", "narrative_pattern",
+        "text", "god_comments", "image_placeholders", "used_material_ids",
+        "score", "reason"
+    }
+    error = _key_error(article_info, expected_keys, "多币文章")
+    if error:
+        return False, error
+    if article_info["status"] not in ("ok", "skip"):
+        return False, "status 必须为 ok 或 skip"
+
+    if article_info["status"] == "skip":
+        if (article_info["text"] != "" or article_info["image_placeholders"] or article_info["used_material_ids"]
+                or article_info["god_comments"] or article_info["score"] is not None
+                or article_info["primary_coin"] is not None or article_info["related_coins"]):
+            return False, "skip 状态下正文、图片、神评、素材及币种字段必须清空"
+        if not isinstance(article_info["reason"], str) or not article_info["reason"].strip():
+            return False, "skip 必须说明 reason"
+        return True, ""
+
+    # ok 状态校验
+    primary = article_info["primary_coin"]
+    if not isinstance(primary, str) or not primary.strip() or primary != primary.upper():
+        return False, f"primary_coin 必须是非空大写英文字符串: {primary!r}"
+
+    related = article_info["related_coins"]
+    if not isinstance(related, list) or not related or any(not isinstance(c, str) or c != c.upper() for c in related):
+        return False, "related_coins 必须包含至少一个大写英文字符串"
+    if primary in related:
+        return False, f"primary_coin ({primary}) 不能出现在 related_coins 中"
+
+    text = article_info["text"]
+    if not isinstance(text, str) or not text.strip():
+        return False, "ok 正文不能为空"
+    if len(re.sub(r"\s", "", text)) > max_chars:
+        return False, f"正文非空白字符数超过 {max_chars}"
+    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
+        return False, "正文不能包含图片或视频占位符"
+
+    # 排版与换行硬约束：防止长篇大套无断句折磨读者
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    if len(paragraphs) < 2 or text.count("\n") < 2:
+        return False, "正文缺少必要分段与换行，必须包含至少 2 处换行（使用 \\n\\n 分段）以保证手机端阅读呼吸感"
+    if any(len(p) > 85 for p in paragraphs):
+        return False, "正文存在单段文字过长（超过 85 字未换行），必须拆分为短促自然断块"
+
+    comments = article_info["god_comments"]
+    if not isinstance(comments, list) or not (1 <= len(comments) <= 3) or any(not isinstance(c, str) or not c.strip() for c in comments):
+        return False, "god_comments 必须包含 1-3 条非空字符串"
+
+    score = article_info["score"]
+    if isinstance(score, bool) or not isinstance(score, (int, float)) or not (0 <= score <= 10):
+        return False, "score 必须是 0-10 的数值"
+
+    material_by_id = {item["id"]: item for item in materials}
+    used_ids = article_info["used_material_ids"]
+    if not isinstance(used_ids, list) or len(used_ids) < 2 or any(m_id not in material_by_id for m_id in used_ids):
+        return False, "多币文章 used_material_ids 必须引用至少 2 条真实存在的素材"
+
+    used_coins = {material_by_id[m_id]["target_coin"] for m_id in used_ids if m_id in material_by_id and material_by_id[m_id].get("target_coin")}
+    if len(used_coins) < 2:
+        return False, f"多币文章采用的素材必须涵盖至少 2 个币种，当前仅涉及: {used_coins}"
+
+    selected_images = article_info["image_placeholders"]
+    if not isinstance(selected_images, list) or len(selected_images) > 3 or len(selected_images) != len(set(selected_images)):
+        return False, "image_placeholders 必须是不超过 3 张且去重的列表"
+
+    allowed_images = set()
+    for material_id in used_ids:
+        visual = material_by_id[material_id].get("visual_evidence")
+        if not visual:
+            continue
+        chain = visual if isinstance(visual, list) else [visual]
+        chain_ids = [item["placeholder"] for item in chain]
+        allowed_images.update(chain_ids)
+        chosen = [item for item in selected_images if item in chain_ids]
+        if chosen and chosen != chain_ids:
+            return False, f"素材 {material_id} 的图片证据链必须整组使用并保留输入顺序"
+    if any(item not in allowed_images or item not in image_mapping for item in selected_images):
+        return False, "图片必须来自已采用素材，且存在真实来源映射"
+
+    return True, ""
+
+
+def build_multi_coin_article_task(selected_evidences, article_manager, round_index=1):
+    ev_copy = list(selected_evidences)
+    materials, image_mapping = transform_mlus(ev_copy)
+    brief = {
+        "task": {
+            "topic": "多币种聚合观察",
+            "max_chars": MULTI_ANALYSIS_MAX_CHARS,
+            "round_index": round_index,
+        },
+        "materials": materials,
+    }
+    model_name = "gemini-3.1-pro-preview"
+    record = {
+        "source": BINANCE_SOURCE,
+        "type": ARTICLE_TYPE_MULTI_ANALYSIS,
+        "topic": "MULTI",
+        "stance": "联动分析",
+        "status": "processing",
+        "creation_brief": brief,
+        "material_post_mapping": {
+            material["id"]: evidence["source_post_id"] for material, evidence in zip(materials, ev_copy)
+        },
+        "post_id_list": [],
+        "prompt_file_path": MULTI_ARTICLE_PROMPT_FILE_PATH,
+        "model_name": model_name,
+        "prompt_version": prompt_version,
+        "article_info": None,
+        "error_message": None,
+        "error_history": [],
+        "raw_response": None,
+        "attempt_count": 0,
+    }
+    prompt = read_file_to_str(MULTI_ARTICLE_PROMPT_FILE_PATH)
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError(f"多币文章提示词为空或读取失败: {MULTI_ARTICLE_PROMPT_FILE_PATH}")
+
+    return {
+        "is_skip": False,
+        "record": record,
+        "full_prompt": f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}",
+        "materials": materials,
+        "image_mapping": image_mapping,
+        "round_index": round_index,
+        "model_name": model_name,
+    }
+
+
+def execute_multi_coin_article_task(task_data, article_manager):
+    started = time.monotonic()
+    round_idx = task_data.get("round_index", 1)
+    mapping = task_data["image_mapping"]
+
+    def convert(info):
+        info["image_mapping"] = {key: dict(mapping[key]) for key in info["image_placeholders"]}
+        return info
+
+    record = _generate_article_record(
+        task_data,
+        lambda info: check_multi_coin_article_info(info, task_data["materials"], mapping, MULTI_ANALYSIS_MAX_CHARS),
+        convert,
+        "多币文章/生成",
+        f"第{round_idx}轮",
+        preset_model_group="medium",
+    )
+    if record["status"] != "ok":
+        if record["status"] == "skip":
+            _log("多币文章/跳过", "模型决定不生成多币文章", 轮次=round_idx,
+                 原因=(record.get("article_info") or {}).get("reason", "未说明"))
+        return record
+
+    info = record["article_info"]
+    primary = info["primary_coin"]
+    related = info["related_coins"]
+    coins = [primary] + [c for c in related if c != primary]
+
+    record["topic"] = primary
+    record["primary_coin"] = primary
+    record["related_coins"] = related
+    record["coins"] = coins
+    record["stance"] = info.get("narrative_pattern") or "联动分析"
+
+    saved = prepare_article_record_for_db(record)
+    article_manager.upsert_articles([saved])
+    _log("多币文章/完成", "已校验并入库", 主币=primary, 关联币=related,
+         模式=record["stance"], 评分=info["score"], 耗时=f"{time.monotonic() - started:.2f}秒")
+    return saved
+
+
+def generate_multi_analysis_articles_once():
+    started = time.monotonic()
+    manager = GeneratedArticleManager(gen_db_object())
+    usable_evidences, coin_groups = extract_all_valid_multi_coin_evidences(manager)
+    if not usable_evidences or len(coin_groups) < 2:
+        return []
+
+    # 10 次独立动态采样，为每个任务生成完全不同的材料切片与币种组合
+    tasks = []
+    used_signatures = set()
+    for i in range(1, MULTI_ANALYSIS_ROUNDS + 1):
+        task_evidences = sample_multi_coin_evidences_for_task(
+            usable_evidences,
+            coin_groups,
+            limit=MULTI_ANALYSIS_MATERIAL_LIMIT,
+            task_index=i,
+            used_signatures=used_signatures,
+        )
+        if not task_evidences:
+            continue
+        task = build_multi_coin_article_task(task_evidences, manager, round_index=i)
+        tasks.append(task)
+
+    if not tasks:
+        _log("多币文章/计划", "未能为本轮采样到有效的多币任务切片，跳过本轮")
+        return []
+
+    _log("多币文章/计划", "启动多币并发生成", 论据总池=len(usable_evidences),
+         覆盖币种=f"{len(coin_groups)}个: {sorted(coin_groups.keys())}",
+         独立采样任务=len(tasks), 并发=MULTI_ANALYSIS_CONCURRENCY)
+
+    results, raised, model_skips = [], 0, 0
+    with ThreadPoolExecutor(max_workers=MULTI_ANALYSIS_CONCURRENCY) as executor:
+        futures = {executor.submit(execute_multi_coin_article_task, task, manager): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                res = future.result()
+                results.append(res)
+                model_skips += res.get("status") == "skip"
+            except Exception:
+                raised += 1
+                _log("多币文章/执行", "单任务生成异常", level="exception", 轮次=task.get("round_index"))
+
+    counts = Counter(item.get("status") for item in results)
+    _log("多币文章/汇总", "本轮多币生成结束", 总任务=len(tasks), 成功=counts["ok"],
+         模型跳过=model_skips, 失败=counts["error"] + raised, 耗时=f"{time.monotonic() - started:.2f}秒")
+    return results
+
+
+def generate_multi_analysis_articles():
+    _poll_generation(generate_multi_analysis_articles_once, "多币文章")
 
 
 def generate_viral_articles():
@@ -1721,13 +2127,13 @@ def _get_recent_published_image_usage(article_manager, platform, hours=6, now=No
         primary.extend(first)
     return addresses, primary, len(recent)
 
-# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却仅适用于分析帖。
+# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却适用于单币和多币分析帖。
 def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
     history = account_state.get("topic_publish_history") or {}
     for index, (article, addresses, _) in enumerate(candidates):
-        if article_type == ARTICLE_TYPE_ANALYSIS:
-            topic = (article.get("topic") or "").strip()
-            if now - history.get(topic, 0) < ACCOUNT_TOPIC_COOLDOWN_SECONDS:
+        if article_type in (ARTICLE_TYPE_ANALYSIS, ARTICLE_TYPE_MULTI_ANALYSIS):
+            coins_to_check = article.get("coins") or ([article.get("topic")] if article.get("topic") else [])
+            if any(now - history.get(c, 0) < ACCOUNT_TOPIC_COOLDOWN_SECONDS for c in coins_to_check if c):
                 continue
         if addresses and addresses & used_addresses:
             continue
@@ -1746,6 +2152,55 @@ def _format_analysis_post_content(article, platform=PLATFORM_BINANCE):
     text = adapter.decorate_analysis(text, topic) + "\n\n\n\n\n\n👇"
     if topic and not text.upper().startswith(f"${topic}".upper()):
         text = f"${topic} {text}"
+    mapping = info.get("image_mapping") or {}
+    paths = [mapping[key].get("local_path") for key in info.get("image_placeholders") or []
+             if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")]
+    return text, paths
+
+
+def _format_multi_analysis_post_content(article, platform=PLATFORM_BINANCE):
+    """
+    多币种聚合帖正文格式化：
+    - 正文各代币保留 Cashtag 格式 ($SYMBOL)；
+    - 首行仅保留核心主币 Cashtag 前缀 ($PRIMARY)，避免顶部堆砌过多币种；
+    - 文末仅保留核心主币标签及热门话题，清爽利落，避免尾部标签泛滥。
+    """
+    info = article["article_info"]
+    text = info.get("text", "").strip()
+    coins = [c for c in (article.get("coins") or []) if c]
+    if not coins and article.get("topic"):
+        coins = [article.get("topic").strip()]
+
+    # 正文保留所有提及币种的 Cashtag 格式，不修改正文内的币种表达
+    for c in coins:
+        text = re.sub(rf"(?<!\$)\b{re.escape(c)}\b", lambda _: f"${c} ", text, flags=re.IGNORECASE)
+
+    # 首行前缀：只保留核心主币，不再罗列所有币种
+    primary = article.get("primary_coin") or article.get("topic") or (coins[0] if coins else "")
+    cashtag_prefix = f"${primary}" if primary else ""
+    if cashtag_prefix and not text.upper().startswith(cashtag_prefix.upper()):
+        text = f"{cashtag_prefix}\n\n{text}"
+
+    # 文末标签：只追加核心主币标签与热门话题，不再追加所有币种
+    if platform == PLATFORM_BINANCE:
+        try:
+            hashtags = [item["hashtag"] for item in fetch_binance_hot_hashtags()]
+            tags = hashtags[:1]
+        except Exception:
+            tags = []
+        if primary:
+            tags.extend([f"#{primary}", f"${primary} "])
+        if tags:
+            text = text + "\n\n\n" + "\n".join(tags)
+    else:
+        tags = []
+        if primary:
+            tags.extend([f"#{primary}", f"${primary} "])
+        if tags:
+            text = text + "\n\n" + "\n".join(tags)
+
+    text = text + "\n\n\n\n\n\n👇"
+
     mapping = info.get("image_mapping") or {}
     paths = [mapping[key].get("local_path") for key in info.get("image_placeholders") or []
              if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")]
@@ -1794,7 +2249,10 @@ def _ensure_account_state(state, platform, account, normalize_history=False):
         account_state = platform_state[account] = {}
     defaults = {
         "total_success": 0, "last_publish_time": 0, "last_error_msg": "", "last_error_time": 0,
-        "topic_publish_history": {}, "viral_total_success": 0, "viral_last_publish_time": 0,
+        "topic_publish_history": {},
+        "multi_total_success": 0, "multi_last_publish_time": 0,
+        "multi_last_error_msg": "", "multi_last_error_time": 0,
+        "viral_total_success": 0, "viral_last_publish_time": 0,
         "viral_last_error_msg": "", "viral_last_error_time": 0,
     }
     for key, value in defaults.items():
@@ -1833,8 +2291,7 @@ def _update_account_publish_state(platform, account, field_updates, topic_update
 
 # article/plat_record/账号快照、远端确认结果 → 回写账号文件与数据库；返回失败说明或空串。
 # : 两次写入不是事务；分别尝试并报告已保存位置，异常必须上抛供调度边界处理。
-# : 分析帖仍读取最新publish_records后覆盖当前平台记录，流量帖仍直接整篇upsert；
-# 同平台互动字段及跨线程整篇写入的丢更新风险保留，修复需要数据库原子字段更新契约。
+# : 优先使用原子 $set 回写当前平台记录，避免多平台并发发布或互动线程丢失更新。
 def _persist_publish_result(article_manager, platform, account, account_state, article, plat_record,
                             success, post_id, attempts, now, topic, latest_price, err_msg,
                             article_type, matched_coin=None):
@@ -1848,7 +2305,11 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
         }
         account_state.update(state_updates)
         if not viral and topic:
-            account_state.setdefault("topic_publish_history", {})[topic] = now
+            # 记录冷却：同时为所有关联代币刷新冷却时间
+            all_topics = article.get("coins") or ([topic] if topic else [])
+            for c in all_topics:
+                if c:
+                    account_state.setdefault("topic_publish_history", {})[c] = now
             topic_update = (topic, now)
         plat_record.update(status="success", published_by=account, publish_time=now, post_id=post_id,
                            attempts=attempts, last_error=None, last_attempt_time=now, publish_price=latest_price)
@@ -1877,7 +2338,17 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
         if not isinstance(article.get("publish_records"), dict):
             article["publish_records"] = {}
         article["publish_records"][platform] = plat_record
-        article_manager.upsert_articles([article])
+
+        # 优化：支持 MongoDB 原生 update_one 原子 $set，防止多平台/互动并发写入互相覆盖
+        article_id = article.get("article_id")
+        if article_id and hasattr(article_manager, "db") and hasattr(article_manager.db, "get_collection"):
+            col = article_manager.db.get_collection(article_manager.collection_name)
+            col.update_one(
+                {"article_id": article_id},
+                {"$set": {f"publish_records.{platform}": plat_record, "updated_at": datetime.now(timezone.utc)}}
+            )
+        else:
+            article_manager.upsert_articles([article])
         saved.append("数据库状态")
     except Exception as exc:
         problems.append(("回写数据库", exc))
@@ -1890,8 +2361,15 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
 def _collect_publish_candidates(article_manager, platform, hot_coins, used_addresses, article_type):
     rule = PUBLISH_RULES[article_type]
     viral = article_type == ARTICLE_TYPE_VIRAL
+    if viral:
+        type_query = ARTICLE_TYPE_VIRAL
+    elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
+        type_query = ARTICLE_TYPE_MULTI_ANALYSIS
+    else:
+        type_query = ARTICLE_TYPE_ANALYSIS
+
     raw = article_manager.find_articles(query={
-        "type": ARTICLE_TYPE_VIRAL if viral else {"$ne": ARTICLE_TYPE_VIRAL},
+        "type": type_query,
         "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=rule["hours"])},
         "status": "ok", f"publish_records.{platform}.status": {"$ne": "success"},
     }) or []
@@ -1953,6 +2431,13 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
                 original_text if isinstance(original_text, str) else "",
             ))
             matched_coin = next((coin for coin, pattern in patterns if pattern.search(clean)), None)
+        elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
+            art_coins = [c for c in (article.get("coins") or []) if c]
+            if not art_coins and article.get("topic"):
+                art_coins = [article.get("topic")]
+            matched_coin = next((c for c in art_coins if c.lower() in hot_set), None)
+            if not matched_coin and art_coins:
+                matched_coin = art_coins[0]
         else:
             topic = (article.get("topic") or "").strip()
             matched_coin = topic if topic and topic.lower() in hot_set else None
@@ -2019,6 +2504,8 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
         try:
             if viral:
                 text, paths = _format_viral_post_content(info, matched_coin)
+            elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
+                text, paths = _format_multi_analysis_post_content(article, platform=platform)
             else:
                 # : 原调用遗漏platform，OKX分析帖也使用Binance标签；为功能保真保留默认值。
                 text, paths = _format_analysis_post_content(article, platform=platform)
@@ -2026,11 +2513,13 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
             session_dir = _get_account_session_dir(platform, account)
             attempts = record.get("attempts", 0) + 1
             stage, api_result = "调用发布接口", "未知"
+            chart_coin = None if viral else (article.get("primary_coin") or topic)
+            sentiment_tag = None if (viral or article_type == ARTICLE_TYPE_MULTI_ANALYSIS) else stance
             err, success, post_id = _execute_platform_post(
-                platform, session_dir, text, paths, topic=None if viral else topic, stance=None if viral else stance,
+                platform, session_dir, text, paths, topic=chart_coin, stance=sentiment_tag,
             )
             post_id, api_result = str(post_id), "成功" if success else "失败"
-            latest_price = None if viral else _safe_get_latest_price(platform, topic)
+            latest_price = None if (viral or article_type == ARTICLE_TYPE_MULTI_ANALYSIS) else _safe_get_latest_price(platform, topic)
             if success and viral:
                 used_addresses.update(addresses)
             stage = "保存已确认的发布结果"
@@ -2058,6 +2547,10 @@ def _publish_analysis_articles_for_platform(article_manager, platform, hot_coins
     _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_ANALYSIS)
 
 
+def _publish_multi_analysis_articles_for_platform(article_manager, platform, hot_coins):
+    _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_MULTI_ANALYSIS)
+
+
 def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
     _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_VIRAL)
 
@@ -2074,7 +2567,11 @@ def _publish_on_platforms(article_manager, publish_one_platform, action):
 
 
 def _publish_articles_once(article_manager):
-    _publish_on_platforms(article_manager, _publish_analysis_articles_for_platform, "分析发布")
+    _publish_on_platforms(article_manager, _publish_analysis_articles_for_platform, "单币分析发布")
+
+
+def _publish_multi_analysis_articles_once(article_manager):
+    _publish_on_platforms(article_manager, _publish_multi_analysis_articles_for_platform, "多币分析发布")
 
 
 def _publish_viral_articles_once(article_manager):
@@ -2096,13 +2593,23 @@ def _poll_task(task, manager, interval, action):
             time.sleep(interval)
 
 
-# 独立文章管理器 → 分析帖发布轮询；每轮结束后等待600秒。
+# 独立文章管理器 → 单币分析帖发布轮询；每轮结束后等待600秒。
 def auto_publish_articles():
     _poll_task(
         _publish_articles_once,
         GeneratedArticleManager(gen_db_object()),
         PUBLISH_POLL_SECONDS,
-        "分析发布",
+        "单币分析发布",
+    )
+
+
+# 独立文章管理器 → 多币分析帖发布轮询 (独立控制)；每轮结束后等待600秒。
+def auto_publish_multi_analysis_articles():
+    _poll_task(
+        _publish_multi_analysis_articles_once,
+        GeneratedArticleManager(gen_db_object()),
+        PUBLISH_POLL_SECONDS,
+        "多币分析发布",
     )
 
 
@@ -2264,7 +2771,11 @@ def hudong():
 def _article_delete_reason(article, now, prices):
     b_rec = ((article.get("publish_records") or {}).get(PLATFORM_BINANCE)) or {}
     price_updated = prices is not None
-    if price_updated:
+    # 多币种与流量帖跳过逆向价格计算，仅依赖超时自动清理，避免单币波动误删多币种/对比分析帖
+    if article.get("type") in (ARTICLE_TYPE_MULTI_ANALYSIS, ARTICLE_TYPE_VIRAL):
+        prices = None
+        price_updated = False
+    elif price_updated:
         base_price, current_price = prices
         difference = (current_price - base_price) / base_price
         profit = difference if article.get("stance") == "看多" else -difference
@@ -2879,15 +3390,24 @@ def main():
     # get_need_check_viral_article_info()
     # data = get_need_check_pre_screen_info(limit=1000)
 
-    tasks = [
-        generate_analysis_articles,
-        generate_viral_articles,
-        format_image_article,
-        hudong,
-        auto_publish_articles,
-        # auto_publish_viral_articles,
-        # delete_old_post
-    ]
+    task_map = {
+        "fetch_and_screen": format_image_article,
+        "single_analysis_gen": generate_analysis_articles,
+        "single_analysis_pub": auto_publish_articles,
+        "multi_analysis_gen": generate_multi_analysis_articles,
+        "multi_analysis_pub": auto_publish_multi_analysis_articles,
+        "viral_gen": generate_viral_articles,
+        # "viral_pub": auto_publish_viral_articles,
+        "hudong": hudong,
+        # "delete_old_post": delete_old_post,
+    }
+
+    tasks = [task_func for key, task_func in task_map.items() if TASK_SWITCHES.get(key, False)]
+    logger.info(
+        "[主控/启动] 正在根据 TASK_SWITCHES 启动流水线线程 | 激活任务数: [%s] | 任务清单: %s",
+        len(tasks), [t.__name__ for t in tasks],
+    )
+
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
     for thread in threads:
         thread.start()
