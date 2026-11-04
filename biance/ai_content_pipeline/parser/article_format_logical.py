@@ -2881,11 +2881,11 @@ def main():
 
     tasks = [
         generate_analysis_articles,
-        generate_viral_articles,
+        # generate_viral_articles,
         format_image_article,
         hudong,
         auto_publish_articles,
-        auto_publish_viral_articles,
+        # auto_publish_viral_articles,
         # delete_old_post
     ]
     threads = [threading.Thread(target=_run_task, args=(task,), name=task.__name__) for task in tasks]
