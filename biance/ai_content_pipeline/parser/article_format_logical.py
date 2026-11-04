@@ -2881,7 +2881,7 @@ def main():
 
     tasks = [
         generate_analysis_articles,
-        # generate_viral_articles,
+        generate_viral_articles,
         format_image_article,
         hudong,
         auto_publish_articles,
