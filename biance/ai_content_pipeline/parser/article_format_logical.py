@@ -103,10 +103,10 @@ TASK_SWITCHES = {
     "single_analysis_pub": True,      # 单币分析发布
     "multi_analysis_gen": True,       # 多币分析生成 (最多20论据/每轮10次)
     "multi_analysis_pub": True,       # 多币分析发布 (独立控制开关)
-    "viral_gen": False,               # 娱乐帖生成
-    "viral_pub": False,               # 娱乐帖发布
+    "viral_gen": True,               # 娱乐帖生成
+    "viral_pub": True,               # 娱乐帖发布
     "hudong": True,                   # 评论区互动
-    "delete_old_post": False,         # 历史清理 (手动开启)
+    "delete_old_post": True,         # 历史清理 (手动开启)
 }
 
 STATE_FILE = "account_publish_state.json"
