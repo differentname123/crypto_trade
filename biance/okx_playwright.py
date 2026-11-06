@@ -2167,7 +2167,447 @@ def open_browser_for_manual_use(user_data_dir=USER_DATA_DIR, home_url=OKX_ORBIT_
                     except Exception:
                         pass
                 logger.info("[人工/Manual] 👋 窗口已关闭，控制权收回，系统资源已释放。\n")
+# ==============================================================================
+#                    核心：通过浏览器原生请求批量删除 OKX 星球帖子
+# ==============================================================================
 
+_DELETE_SIGN_HOOK_INIT_JS = r"""
+(() => {
+    if (window.__okxDeleteHookInstalled) return;
+    window.__okxDeleteHookInstalled = true;
+    window.__okx_sig_map = {};
+    window.__okx_matched_sample = null;
+
+    const extractCryptoKey = (val, depth = 0) => {
+        if (!val || depth > 4) return;
+        try {
+            if (typeof CryptoKey !== 'undefined' && val instanceof CryptoKey) {
+                if (val.type === 'private') {
+                    window.__okx_priv_key = val;
+                }
+                return;
+            }
+            if (typeof val === 'object') {
+                for (const k of Object.keys(val)) {
+                    extractCryptoKey(val[k], depth + 1);
+                }
+            }
+        } catch (e) {}
+    };
+
+    // 1. 监听 IndexedDB 读取，自动捕获持久化的不可导出私钥对象
+    try {
+        const origGet = IDBObjectStore.prototype.get;
+        IDBObjectStore.prototype.get = function(...args) {
+            const req = origGet.apply(this, args);
+            req.addEventListener('success', function() {
+                extractCryptoKey(this.result);
+            });
+            return req;
+        };
+        const origGetAll = IDBObjectStore.prototype.getAll;
+        if (origGetAll) {
+            IDBObjectStore.prototype.getAll = function(...args) {
+                const req = origGetAll.apply(this, args);
+                req.addEventListener('success', function() {
+                    extractCryptoKey(this.result);
+                });
+                return req;
+            };
+        }
+    } catch (e) {}
+
+    // 2. 劫持 WebCrypto sign，捕获内存私钥与签名原文
+    try {
+        const origSign = window.crypto.subtle.sign.bind(window.crypto.subtle);
+        window.crypto.subtle.sign = async function(algorithm, key, data) {
+            try {
+                if (key && key.type === 'private') {
+                    window.__okx_priv_key = key;
+                    window.__okx_sign_algo = algorithm;
+                }
+                let rawText = '';
+                try {
+                    const u8 = data instanceof ArrayBuffer
+                        ? new Uint8Array(data)
+                        : new Uint8Array(data.buffer || data);
+                    rawText = new TextDecoder().decode(u8);
+                } catch (e) {}
+
+                const sigBuf = await origSign(algorithm, key, data);
+                try {
+                    const b64 = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+                    const fullSig = `{P1363}${b64}`;
+                    window.__okx_last_sign_raw = rawText;
+                    window.__okx_sig_map[fullSig] = rawText;
+                } catch (e) {}
+                return sigBuf;
+            } catch (err) {
+                return origSign(algorithm, key, data);
+            }
+        };
+    } catch (e) {}
+
+    // 3. 关联 XHR / fetch 请求头中的 x-client-signature，自动学习 1.3 签名拼接模板
+    const recordSample = (method, url, headers, bodyStr) => {
+        try {
+            const sig = headers['x-client-signature'] || headers['X-Client-Signature'];
+            const ts = headers['x-request-timestamp'] || headers['X-Request-Timestamp'];
+            if (!sig || !window.__okx_sig_map[sig]) return;
+            const rawText = window.__okx_sig_map[sig];
+            const u = new URL(url, location.origin);
+            window.__okx_matched_sample = {
+                rawText,
+                method: (method || 'GET').toUpperCase(),
+                fullPath: u.pathname + u.search,
+                pathname: u.pathname,
+                ts: String(ts || ''),
+                body: typeof bodyStr === 'string' ? bodyStr : ''
+            };
+        } catch (e) {}
+    };
+
+    try {
+        const origOpen = XMLHttpRequest.prototype.open;
+        const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        const origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+            this.__okx_method = method;
+            this.__okx_url = url;
+            this.__okx_headers = {};
+            return origOpen.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.setRequestHeader = function(k, v) {
+            if (this.__okx_headers) this.__okx_headers[k.toLowerCase()] = v;
+            return origSetHeader.call(this, k, v);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+            recordSample(this.__okx_method, this.__okx_url, this.__okx_headers || {}, body);
+            return origSend.call(this, body);
+        };
+    } catch (e) {}
+
+    try {
+        const origFetch = window.fetch.bind(window);
+        window.fetch = async function(input, init = {}) {
+            try {
+                const url = typeof input === 'string' ? input : (input && input.url) || '';
+                const method = init.method || (input && input.method) || 'GET';
+                const hdrs = {};
+                if (init.headers) {
+                    if (init.headers instanceof Headers) {
+                        init.headers.forEach((v, k) => { hdrs[k.toLowerCase()] = v; });
+                    } else if (typeof init.headers === 'object') {
+                        for (const [k, v] of Object.entries(init.headers)) {
+                            hdrs[k.toLowerCase()] = v;
+                        }
+                    }
+                }
+                recordSample(method, url, hdrs, init.body);
+            } catch (e) {}
+            return origFetch(input, init);
+        };
+    } catch (e) {}
+})();
+"""
+
+_TRIGGER_DELETE_API_JS = r"""
+async ({ contentId, seq }) => {
+    const getCookie = (name) => {
+        const match = document.cookie.match(new RegExp('(^|;\\s*)' + name + '=([^;]*)'));
+        return match ? decodeURIComponent(match[2]) : '';
+    };
+
+    const ts = Date.now().toString();
+    const path = '/priapi/v5/content/ugc/delete';
+    const fullPath = `${path}?t=${ts}`;
+    const bodyStr = JSON.stringify({ contentId: String(contentId) });
+
+    const rawToken = getCookie('token');
+    const authHeader = rawToken
+        ? (rawToken.startsWith('Bearer ') ? rawToken : rawToken)
+        : '';
+    const devId = getCookie('devId') || getCookie('fingerprint_id') || '';
+    const siteInfo = getCookie('ok_site_info') || '';
+    const traceId = getCookie('traceId') || `${Date.now()}000000`;
+    const locale = getCookie('locale') || getCookie('preferLocale') || 'zh_CN';
+
+    let clientSignature = '';
+    let usedRawToSign = '';
+
+    // 如果已截获到内存私钥，则动态生成 {P1363} 签名
+    if (window.__okx_priv_key) {
+        try {
+            const sample = window.__okx_matched_sample;
+            if (sample && sample.rawText) {
+                let text = sample.rawText;
+                if (sample.fullPath && text.includes(sample.fullPath)) {
+                    text = text.replace(sample.fullPath, fullPath);
+                } else if (sample.pathname && text.includes(sample.pathname)) {
+                    text = text.replace(sample.pathname, path);
+                }
+                if (sample.ts && text.includes(sample.ts)) {
+                    text = text.split(sample.ts).join(ts);
+                }
+                if (sample.method && text.includes(sample.method)) {
+                    text = text.replace(sample.method, 'POST');
+                }
+                if (sample.body && text.includes(sample.body)) {
+                    text = text.replace(sample.body, bodyStr);
+                } else if (sample.method === 'GET' && !text.includes(bodyStr)) {
+                    text = text + bodyStr;
+                }
+                usedRawToSign = text;
+            } else {
+                usedRawToSign = `${ts}POST${fullPath}${bodyStr}`;
+            }
+
+            const sigBuf = await window.crypto.subtle.sign(
+                window.__okx_sign_algo || { name: 'ECDSA', hash: { name: 'SHA-256' } },
+                window.__okx_priv_key,
+                new TextEncoder().encode(usedRawToSign)
+            );
+            const b64Sig = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+            clientSignature = `{P1363}${b64Sig}`;
+        } catch (signErr) {
+            usedRawToSign = `sign_error:${signErr.message}`;
+        }
+    }
+
+    const headers = {
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'authorization': authHeader,
+        'devid': devId,
+        'platform': 'web',
+        'x-cdn': 'https://www.okx.com',
+        'x-id-group': `${traceId}-c-${seq}`,
+        'x-locale': locale,
+        'x-request-timestamp': ts,
+        'x-simulated-trading': 'undefined',
+        'x-site-info': siteInfo,
+        'x-utc': '8',
+        'x-zkdex-env': '0'
+    };
+
+    if (clientSignature) {
+        headers['x-client-signature'] = clientSignature;
+        headers['x-client-signature-version'] = '1.3';
+    }
+
+    try {
+        const resp = await fetch(`https://www.okx.com${fullPath}`, {
+            method: 'POST',
+            headers,
+            body: bodyStr,
+            credentials: 'include'
+        });
+        const text = await resp.text();
+        let json = {};
+        try {
+            json = JSON.parse(text);
+        } catch (e) {
+            json = { raw: text.slice(0, 300) };
+        }
+        return {
+            httpStatus: resp.status,
+            body: json,
+            signed: Boolean(clientSignature),
+            hasPrivKey: Boolean(window.__okx_priv_key),
+            sampleRaw: window.__okx_last_sign_raw || ''
+        };
+    } catch (fetchErr) {
+        return {
+            httpStatus: 0,
+            body: { msg: fetchErr.message || String(fetchErr) },
+            signed: Boolean(clientSignature),
+            hasPrivKey: Boolean(window.__okx_priv_key),
+            sampleRaw: window.__okx_last_sign_raw || ''
+        };
+    }
+}
+"""
+
+
+def _delete_single_post_by_api(page, content_id, seq=1):
+    """在已登录页面上下文内触发单条删帖 API 请求并校验返回结果。"""
+    cid_str = str(content_id or "").strip()
+    if not cid_str:
+        return False, "contentId 为空"
+
+    res = page.evaluate(_TRIGGER_DELETE_API_JS, {"contentId": cid_str, "seq": int(seq)})
+    http_status = res.get("httpStatus", 0)
+    body = res.get("body") if isinstance(res.get("body"), dict) else {}
+    code_str = str(body.get("code", ""))
+    signed = res.get("signed", False)
+
+    if http_status == 200 and (code_str in ("0", "000000") or body.get("success") is True):
+        logger.info(
+            f"[删除/校验] 帖子删除成功 | contentId: 【{cid_str}】 | 响应码: 【{code_str}】 "
+            f"| 携带签名: 【{signed}】 | 结果: [Success]"
+        )
+        return True, None
+
+    err_msg = (
+        body.get("msg")
+        or body.get("message")
+        or body.get("error_message")
+        or body.get("raw")
+        or f"HTTP_{http_status}"
+    )
+    logger.error(
+        f"[删除/校验] 帖子删除失败 | contentId: 【{cid_str}】 | HTTP: 【{http_status}】 "
+        f"| code: 【{code_str}】 | 携带签名: 【{signed}】 | 原因: 【{err_msg}】"
+    )
+    return False, f"HTTP={http_status}, code={code_str}, msg={err_msg}"
+
+
+def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=True, interval_sec=0.8):
+    """
+    主控入口 4：打开 OKX 星球页面后，通过浏览器上下文逐个触发 `/priapi/v5/content/ugc/delete` 接口批量删除帖子。
+    :param post_id_list: 待删除的帖子 ID 列表（支持 list/tuple/set 或单个 str/int）
+    :param user_data_dir: 浏览器用户数据目录
+    :param debug: 是否开启调试模式（True 显示界面，False 离屏后台）
+    :param interval_sec: 每次删除请求之间的间隔秒数，默认 0.8 秒
+    返回 Tuple(错误信息(str|None), 是否全部成功(bool), 结果明细(dict: {"success_ids": [...], "failed_ids": {...}}))
+    """
+    if isinstance(post_id_list, (str, int)):
+        clean_id_list = [str(post_id_list).strip()] if str(post_id_list).strip() else []
+    elif isinstance(post_id_list, (list, tuple, set)):
+        clean_id_list = [str(x).strip() for x in post_id_list if str(x or "").strip()]
+    else:
+        clean_id_list = []
+
+    if not clean_id_list:
+        return "待删除的 post_id_list 不能为空", False, {"success_ids": [], "failed_ids": {}}
+
+    if not os.path.isdir(user_data_dir):
+        return f"缺少用户环境: {user_data_dir}，请先执行登录", False, {"success_ids": [], "failed_ids": {}}
+
+    logger.info(
+        f"\n{'=' * 70}\n[任务/Delete] 启动 OKX 星球批量接口删帖 | URL: <{OKX_ORBIT_URL}> "
+        f"| 待删数量: 【{len(clean_id_list)}】条 | 间隔: 【{interval_sec}s】 "
+        f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+    )
+
+    anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
+    offscreen_args = [
+        '--disable-blink-features=AutomationControlled', '--disable-gpu',
+        '--window-position=-10000,-10000', '--no-sandbox', '--disable-dev-shm-usage',
+        '--disable-renderer-backgrounding', '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows', '--disable-features=CalculateNativeWinOcclusion',
+        '--disable-breakpad', '--force-device-scale-factor=1', '--hide-scrollbars',
+    ] + anti_freeze_args
+
+    debug_args = [
+        '--disable-blink-features=AutomationControlled', '--start-maximized', '--window-position=0,0'
+    ] + anti_freeze_args
+
+    success_ids = []
+    failed_ids = {}
+
+    try:
+        with _user_data_dir_lock(user_data_dir, timeout=USER_DATA_LOCK_TIMEOUT_SEC):
+            with sync_playwright() as p:
+                context = None
+                try:
+                    context = _launch_persistent(
+                        p, user_data_dir,
+                        args=debug_args if debug else offscreen_args,
+                        viewport=None if debug else {'width': 1920, 'height': 1080},
+                        debug=debug,
+                    )
+                    context.set_default_timeout(60000)
+                    context.set_default_navigation_timeout(60000)
+
+                    page = context.new_page()
+                    for old_page in context.pages:
+                        if old_page != page:
+                            try:
+                                old_page.close()
+                            except Exception:
+                                pass
+                    page.bring_to_front()
+
+                    # 注入浮层免疫与 WebCrypto 签名截获脚本
+                    install_overlay_guard(page)
+                    page.add_init_script(_DELETE_SIGN_HOOK_INIT_JS)
+
+                    response = page.goto(OKX_ORBIT_URL, timeout=60000, wait_until="domcontentloaded")
+                    _dismiss_overlays(page, aggressive=False, desc="delete-nav")
+                    report_guard_hits(page, "delete-nav")
+
+                    if response and response.status >= 400:
+                        err_msg = f"OKX 星球主页加载异常 (HTTP {response.status})"
+                        return err_msg, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+
+                    try:
+                        page.locator("a[href*='/account/login']").first.wait_for(state="visible", timeout=3000)
+                        err_msg = "页面探测到登录入口，本地 Cookie 可能已过期失效，请先重新登录。"
+                        return err_msg, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    check_for_crash(page)
+
+                    # 等待页面初始化请求完成，确保 Cookie 与 WebCrypto 签名器就绪
+                    page.wait_for_timeout(1500)
+
+                    total = len(clean_id_list)
+                    for idx, post_id in enumerate(clean_id_list, start=1):
+                        logger.info(f"[删除/Delete] 正在触发第 【{idx}/{total}】 条删帖请求 | contentId: 【{post_id}】")
+                        ok, err_detail = _delete_single_post_by_api(page, post_id, seq=30 + idx)
+                        if ok:
+                            success_ids.append(post_id)
+                        else:
+                            failed_ids[post_id] = err_detail
+
+                        if idx < total and interval_sec > 0:
+                            page.wait_for_timeout(int(interval_sec * 1000))
+
+                    all_success = (len(failed_ids) == 0)
+                    summary = {"success_ids": success_ids, "failed_ids": failed_ids}
+
+                    if all_success:
+                        logger.info(
+                            f"[任务/Delete] 批量删帖全部完成 | 成功: 【{len(success_ids)}/{total}】 | 结果: [Success]"
+                        )
+                        return None, True, summary
+                    else:
+                        err_summary = f"部分或全部帖子删除失败（成功 {len(success_ids)} 条，失败 {len(failed_ids)} 条）: {failed_ids}"
+                        logger.warning(f"[任务/Delete] {err_summary}")
+                        return err_summary, False, summary
+
+                except Exception as e:
+                    error_info = f"[{type(e).__name__}] {e}\n[Traceback]:\n{traceback.format_exc()}"
+                    if context and context.pages:
+                        try:
+                            _forensics(
+                                context.pages[0],
+                                "delete_error",
+                                {"url": OKX_ORBIT_URL, "error": error_info[:2000], "failed_ids": failed_ids}
+                            )
+                        except Exception:
+                            pass
+                    _alert_failure_scene(error_info)
+                    return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+
+                finally:
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+    except UserDataDirLockTimeoutError as lock_e:
+        error_info = f"[UserDataDirLockTimeout] {lock_e}"
+        logger.error(f"[任务/Delete] {error_info}")
+        return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
+
+    except Exception as core_e:
+        error_info = f"[CoreEngineCrash] Playwright底层崩溃:\n{core_e}"
+        logger.error(error_info)
+        return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
 
 # ==============================================================================
 #                                   启动入口
@@ -2176,25 +2616,51 @@ if __name__ == "__main__":
     # 如需人工登录，取消下方注释：
     open_browser_for_manual_use(USER_DATA_DIR)
 
-    test_content = "祝大家 心想事成"
-    test_images = [r"E:\chrome\1759239193.png"]  # 若仅发纯文本，传 None 或 [] 即可
+    # 批量删帖调用示例：
+    posts_to_delete = [
+        "92080623697312",
 
-    err, success, p_id = create_okx_post(
-        content=test_content,
-        image_path_list=test_images,
+        "92080256488928",
+
+        "92080623697312",
+
+        "91963688820608",
+
+        # "在这里继续添加其它需要删除的 contentId",
+    ]
+    d_err, d_success, d_result = delete_okx_posts(
+        post_id_list=posts_to_delete,
         user_data_dir=USER_DATA_DIR,
-        debug=True
+        debug=True,
+        interval_sec=0.8,
     )
-
-    if success:
-        logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球发帖任务成功 ======== | 帖子ID: 【{p_id}】")
+    if d_success:
+        logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球批量删帖成功 ======== | 已删ID: {d_result['success_ids']}")
     else:
-        logger.error(f"\n[结果/Final] ❌ ======== OKX 星球发帖任务失败 ======== | 错误原因:\n{err}")
+        logger.error(f"\n[结果/Final] ❌ ======== OKX 星球批量删帖存在失败 ======== | 详情: {d_err}")
 
-    # 评论调用示例：
-    c_err, c_success, c_id = comment_on_okx_post(
-        target_post_url="https://www.okx.com/zh-hans/orbit/post/90135509268160",
-        content="666",
-        user_data_dir=USER_DATA_DIR,
-        debug=True
-    )
+
+    #
+    #
+    # test_content = "祝大家 心想事成"
+    # test_images = [r"E:\chrome\1759239193.png"]  # 若仅发纯文本，传 None 或 [] 即可
+    #
+    # err, success, p_id = create_okx_post(
+    #     content=test_content,
+    #     image_path_list=test_images,
+    #     user_data_dir=USER_DATA_DIR,
+    #     debug=True
+    # )
+    #
+    # if success:
+    #     logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球发帖任务成功 ======== | 帖子ID: 【{p_id}】")
+    # else:
+    #     logger.error(f"\n[结果/Final] ❌ ======== OKX 星球发帖任务失败 ======== | 错误原因:\n{err}")
+    #
+    # # 评论调用示例：
+    # c_err, c_success, c_id = comment_on_okx_post(
+    #     target_post_url="https://www.okx.com/zh-hans/orbit/post/90135509268160",
+    #     content="666",
+    #     user_data_dir=USER_DATA_DIR,
+    #     debug=True
+    # )
