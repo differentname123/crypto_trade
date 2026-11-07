@@ -1975,12 +1975,12 @@ def create_okx_post(
         logger.error(error_info)
         return error_info, False, None
 
-def comment_on_okx_post(target_post_url, content="", like=True, user_data_dir=USER_DATA_DIR, debug=True):
+def comment_on_okx_post(target_post_url, content="", like=False, user_data_dir=USER_DATA_DIR, debug=True):
     """
-    主控入口 3：调度浏览器打开指定 OKX 星球帖子详情页并执行【点赞(可选) + 纯文本评论】全流程。
+    主控入口 3：调度浏览器打开指定 OKX 星球帖子详情页并执行【点赞(可选) + 纯文本评论(可选)】全流程。
     :param target_post_url: 目标帖子详情页 URL
-    :param content: 评论文本内容
-    :param like: 是否需要点赞，默认 True
+    :param content: 评论文本内容（若为空且 like=True，则仅执行点赞）
+    :param like: 是否需要点赞，默认 False
     :param user_data_dir: 浏览器用户数据目录
     :param debug: 是否开启调试模式（True 显示界面，False 离屏后台）
     返回 Tuple(错误信息(str|None), 是否成功(bool), 评论ID(str|None))，格式与 create_okx_post 保持一致。
@@ -1989,14 +1989,14 @@ def comment_on_okx_post(target_post_url, content="", like=True, user_data_dir=US
     if not target_post_url:
         return "缺少目标帖子链接: target_post_url 不能为空", False, None
 
-    content = str(content or "")
-    if not content.strip():
-        return "评论内容不能为空", False, None
+    content = str(content or "").strip()
+    if not content and not like:
+        return "评论内容为空且未开启点赞，无需执行互动", False, None
 
     if not os.path.isdir(user_data_dir):
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, None
 
-    logger.info(f"\n{'=' * 70}\n[任务/Comment] 启动 OKX 星球自动化评论 | 目标帖子: <{target_post_url}> "
+    logger.info(f"\n{'=' * 70}\n[任务/Comment] 启动 OKX 星球自动化互动 | 目标帖子: <{target_post_url}> "
                 f"| 评论字数: 【{len(content)}字】 | 是否点赞: 【{like}】 | 模式: 【{'debug可见' if debug else '离屏后台'}】"
                 f"\n{'=' * 70}")
 
@@ -2092,6 +2092,10 @@ def comment_on_okx_post(target_post_url, content="", like=True, user_data_dir=US
                                     logger.warning("[点赞/Like] 未能匹配到帖子点赞按钮，跳过点赞")
                         except Exception as like_e:
                             logger.warning(f"[点赞/Like] 点赞操作异常（不阻断评论主流程）: {str(like_e)[:120]}")
+
+                    if not content:
+                        logger.info("[任务/Comment] 仅点赞模式执行完毕 | 结果: [Success]")
+                        return None, True, "LIKE_ONLY"
 
                     # ---------- 评论流程 ----------
                     try:
@@ -2335,6 +2339,53 @@ async ({ contentId, seq }) => {
     let clientSignature = '';
     let usedRawToSign = '';
 
+    // 若尚未通过被动 Hook 捕获到私钥，主动遍历 IndexedDB 查找不可导出私钥对象
+    if (!window.__okx_priv_key && typeof indexedDB !== 'undefined' && indexedDB.databases) {
+        try {
+            const dbs = await indexedDB.databases();
+            for (const dbInfo of (dbs || [])) {
+                if (!dbInfo || !dbInfo.name || window.__okx_priv_key) continue;
+                await new Promise((resolve) => {
+                    try {
+                        const openReq = indexedDB.open(dbInfo.name);
+                        openReq.onsuccess = () => {
+                            const db = openReq.result;
+                            const storeNames = Array.from(db.objectStoreNames || []);
+                            if (!storeNames.length) { db.close(); return resolve(); }
+                            let pending = storeNames.length;
+                            for (const sName of storeNames) {
+                                try {
+                                    const tx = db.transaction(sName, 'readonly');
+                                    const store = tx.objectStore(sName);
+                                    const getAllReq = store.getAll();
+                                    getAllReq.onsuccess = () => {
+                                        const items = getAllReq.result || [];
+                                        const findKey = (v, d = 0) => {
+                                            if (!v || d > 4) return;
+                                            if (typeof CryptoKey !== 'undefined' && v instanceof CryptoKey && v.type === 'private') {
+                                                window.__okx_priv_key = v;
+                                                return;
+                                            }
+                                            if (typeof v === 'object') {
+                                                for (const k of Object.keys(v)) findKey(v[k], d + 1);
+                                            }
+                                        };
+                                        findKey(items);
+                                        if (--pending <= 0) { db.close(); resolve(); }
+                                    };
+                                    getAllReq.onerror = () => { if (--pending <= 0) { db.close(); resolve(); } };
+                                } catch (e) {
+                                    if (--pending <= 0) { db.close(); resolve(); }
+                                }
+                            }
+                        };
+                        openReq.onerror = () => resolve();
+                    } catch (e) { resolve(); }
+                });
+            }
+        } catch (e) {}
+    }
+
     // 如果已截获到内存私钥，则动态生成 {P1363} 签名
     if (window.__okx_priv_key) {
         try {
@@ -2462,21 +2513,23 @@ def _delete_single_post_by_api(page, content_id, seq=1):
     return False, f"HTTP={http_status}, code={code_str}, msg={err_msg}"
 
 
-def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=True, interval_sec=0.8):
+def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, interval_sec=0.8):
     """
     主控入口 4：打开 OKX 星球页面后，通过浏览器上下文逐个触发 `/priapi/v5/content/ugc/delete` 接口批量删除帖子。
-    :param post_id_list: 待删除的帖子 ID 列表（支持 list/tuple/set 或单个 str/int）
+    :param post_id_list: 待删除的帖子 ID 列表（支持 list/tuple/set 或单个 str/int，自动保序去重）
     :param user_data_dir: 浏览器用户数据目录
-    :param debug: 是否开启调试模式（True 显示界面，False 离屏后台）
+    :param debug: 是否开启调试模式（True 显示界面，False 离屏后台，默认 False）
     :param interval_sec: 每次删除请求之间的间隔秒数，默认 0.8 秒
     返回 Tuple(错误信息(str|None), 是否全部成功(bool), 结果明细(dict: {"success_ids": [...], "failed_ids": {...}}))
     """
     if isinstance(post_id_list, (str, int)):
-        clean_id_list = [str(post_id_list).strip()] if str(post_id_list).strip() else []
+        raw_ids = [str(post_id_list).strip()] if str(post_id_list).strip() else []
     elif isinstance(post_id_list, (list, tuple, set)):
-        clean_id_list = [str(x).strip() for x in post_id_list if str(x or "").strip()]
+        raw_ids = [str(x).strip() for x in post_id_list if str(x or "").strip()]
     else:
-        clean_id_list = []
+        raw_ids = []
+
+    clean_id_list = list(dict.fromkeys(raw_ids))
 
     if not clean_id_list:
         return "待删除的 post_id_list 不能为空", False, {"success_ids": [], "failed_ids": {}}
@@ -2486,7 +2539,7 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=True, inte
 
     logger.info(
         f"\n{'=' * 70}\n[任务/Delete] 启动 OKX 星球批量接口删帖 | URL: <{OKX_ORBIT_URL}> "
-        f"| 待删数量: 【{len(clean_id_list)}】条 | 间隔: 【{interval_sec}s】 "
+        f"| 去重后待删数量: 【{len(clean_id_list)}】条 | 间隔: 【{interval_sec}s】 "
         f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
     )
 
@@ -2550,8 +2603,17 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=True, inte
 
                     check_for_crash(page)
 
-                    # 等待页面初始化请求完成，确保 Cookie 与 WebCrypto 签名器就绪
-                    page.wait_for_timeout(1500)
+                    # 轮询等待页面初始化请求与 WebCrypto 签名私钥就绪（最多等待 6 秒）
+                    for wait_round in range(12):
+                        page.wait_for_timeout(500)
+                        try:
+                            ready = page.evaluate("() => Boolean(window.__okx_priv_key)")
+                            if ready:
+                                break
+                            if wait_round == 3:
+                                page.mouse.wheel(0, 300)
+                        except Exception:
+                            pass
 
                     total = len(clean_id_list)
                     for idx, post_id in enumerate(clean_id_list, start=1):
@@ -2609,58 +2671,10 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=True, inte
         logger.error(error_info)
         return error_info, False, {"success_ids": success_ids, "failed_ids": failed_ids}
 
+
 # ==============================================================================
 #                                   启动入口
 # ==============================================================================
 if __name__ == "__main__":
     # 如需人工登录，取消下方注释：
-    open_browser_for_manual_use(USER_DATA_DIR)
-
-    # 批量删帖调用示例：
-    posts_to_delete = [
-        "92080623697312",
-
-        "92080256488928",
-
-        "92080623697312",
-
-        "91963688820608",
-
-        # "在这里继续添加其它需要删除的 contentId",
-    ]
-    d_err, d_success, d_result = delete_okx_posts(
-        post_id_list=posts_to_delete,
-        user_data_dir=USER_DATA_DIR,
-        debug=True,
-        interval_sec=0.8,
-    )
-    if d_success:
-        logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球批量删帖成功 ======== | 已删ID: {d_result['success_ids']}")
-    else:
-        logger.error(f"\n[结果/Final] ❌ ======== OKX 星球批量删帖存在失败 ======== | 详情: {d_err}")
-
-
-    #
-    #
-    # test_content = "祝大家 心想事成"
-    # test_images = [r"E:\chrome\1759239193.png"]  # 若仅发纯文本，传 None 或 [] 即可
-    #
-    # err, success, p_id = create_okx_post(
-    #     content=test_content,
-    #     image_path_list=test_images,
-    #     user_data_dir=USER_DATA_DIR,
-    #     debug=True
-    # )
-    #
-    # if success:
-    #     logger.info(f"\n[结果/Final] 🎉 ======== OKX 星球发帖任务成功 ======== | 帖子ID: 【{p_id}】")
-    # else:
-    #     logger.error(f"\n[结果/Final] ❌ ======== OKX 星球发帖任务失败 ======== | 错误原因:\n{err}")
-    #
-    # # 评论调用示例：
-    # c_err, c_success, c_id = comment_on_okx_post(
-    #     target_post_url="https://www.okx.com/zh-hans/orbit/post/90135509268160",
-    #     content="666",
-    #     user_data_dir=USER_DATA_DIR,
-    #     debug=True
-    # )
+    open_browser_for_manual_use(USER_DATA_DIR)

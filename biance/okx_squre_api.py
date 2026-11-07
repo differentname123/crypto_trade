@@ -48,6 +48,47 @@ _MULTI_NEWLINE_RE = re.compile(r'\n{3,}')
 DEFAULT_OKX_DEVID = "2f579465-c748-4469-9ca9-9e13f0df47dc"
 DEFAULT_OKX_SITE_INFO = "=03M3ojI5RXa05WZiwiIMFkQPx0Rfh1SPJiOiUGZvNmIsIiULJiOi42bpdWZyJye"
 
+# 自营矩阵账号黑名单：严禁将本方矩阵发布的帖子作为外部素材抓取入库（彻底斩断自产自销死循环）
+SELF_OKX_AUTHOR_IDS = {
+    "872834593500823552",   # myself (稳定短线)
+    "872896855657885696",   # mama (马到功成6)
+    "1035697745975390208",  # nana (来去之间Zzz)
+    "950093749101883392",   # ruru (瑞见未来)
+}
+SELF_OKX_AUTHOR_NAMES = {
+    "稳定短线",
+    "马到功成6",
+    "来去之间Zzz",
+    "瑞见未来",
+}
+
+
+def _is_self_okx_post(content_data: dict) -> bool:
+    """判断 OKX 原始 contentData 或清洗后帖子是否属于本方自营矩阵账号"""
+    if not isinstance(content_data, dict):
+        return False
+    author_obj = content_data.get("author") or {}
+    author_id = str(
+        author_obj.get("authorId")
+        or author_obj.get("userId")
+        or author_obj.get("uid")
+        or author_obj.get("author_id")
+        or content_data.get("authorId")
+        or content_data.get("userId")
+        or content_data.get("uid")
+        or content_data.get("author_id")
+        or ""
+    ).strip()
+    nick_name = str(
+        author_obj.get("nickName")
+        or author_obj.get("name")
+        or content_data.get("nickName")
+        or content_data.get("author_name")
+        or ""
+    ).strip()
+    return (author_id in SELF_OKX_AUTHOR_IDS) or (nick_name in SELF_OKX_AUTHOR_NAMES)
+
+
 
 def _build_okx_headers(
         referer="https://www.okx.com/zh-hans/orbit",
@@ -292,6 +333,8 @@ def fetch_okx_coin_feed(
                     if not isinstance(item, dict):
                         continue
                     content_data = item.get("contentData") if "contentData" in item else item
+                    if _is_self_okx_post(content_data):
+                        continue
                     item_id = str(content_data.get("contentId") or content_data.get("id") or "")
                     if not item_id:
                         continue
@@ -331,6 +374,7 @@ def fetch_okx_coin_feed(
 
     return all_items[:required_count]
 
+
 def fetch_okx_feed(
         count=20,
         token=None,
@@ -345,8 +389,8 @@ def fetch_okx_feed(
     统一的 OKX 广场流数据拉取总入口 (支持全网推荐流、指定币种推荐/最新流)
 
     :param count:           目标净增抓取条数
-    :param coin_name:       代币符号 (如 "BTW", "BTC")。默认为 None，表示抓取全网广场推荐流
-    :param orderBy:         排序方式 (仅在指定 coin_name 时生效)：
+    :param token:           代币符号 (如 "BTW", "BTC")。默认为 None，表示抓取全网广场推荐流
+    :param orderBy:         排序方式 (仅在指定 token 时生效)：
                             - 2: 推荐排序 (默认)
                             - 1: 最新排序 (按时间倒序)
     :param existing_ids:    历史去重 ID 集合/列表 (外部传入对象会被原地更新)
@@ -392,13 +436,16 @@ def fetch_okx_feed(
             existing_ids=normalized_existing
         )
 
-    # 2. 早期拦截护城河二次确认
+    # 2. 早期拦截护城河二次确认（含本方自营账号二次拦截）
     filtered_feed_list = []
     intercepted_count = 0
 
     for raw_item in raw_feed_list:
         content_data = raw_item.get("contentData") if "contentData" in raw_item else raw_item
         if not isinstance(content_data, dict):
+            continue
+        if _is_self_okx_post(content_data):
+            intercepted_count += 1
             continue
         item_id = str(content_data.get("contentId") or content_data.get("id") or "")
         if item_id and item_id not in normalized_existing:
@@ -414,13 +461,13 @@ def fetch_okx_feed(
     if not filtered_feed_list:
         logger.info(
             f"🛑 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-            f"🛡️历史拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
+            f"🛡️历史/自营拦截:{intercepted_count}条 | 净增:0条 -> 跳过后续处理"
         )
         return []
 
     logger.info(
         f"📥 [{task_label}] 探测完毕 | 抓取:{len(raw_feed_list)}条 | "
-        f"🛡️历史拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
+        f"🛡️历史/自营拦截:{intercepted_count}条 | 净增:{len(filtered_feed_list)}条新帖"
     )
 
     # 3. 数据清洗与多模态富化
@@ -449,7 +496,7 @@ def get_standard_schema():
         "publish_time": 0,
         "author_id": None,
         "card_type": "UNKNOWN",
-        "source": "okx",  # 标识来源为 okx；若下游强校验 "biance"，可改为 "biance"
+        "source": "okx",
 
         # --- 内层结构化容器 ---
         "metadata": {
@@ -507,6 +554,7 @@ def _clean_text(raw):
     text = _INVISIBLE_RE.sub('', text)
     text = _MULTI_NEWLINE_RE.sub('\n\n', text)
     return text.strip()
+
 
 def _clean_title(raw):
     """清理标题，空值返回 None"""
@@ -580,47 +628,6 @@ def _extract_okx_hashtags(content_data):
     return list(set(tags))
 
 
-def _extract_okx_plugin_summary(content_data):
-    """
-    提取 OKX 独有的实盘合约持仓卡片信息，转化为可读文本标记，辅助下游分析
-    例如: [实盘晒单: ZEC-USDT-SWAP | 方向:short | 杠杆:30x | 收益:+176.85 USDT (190.38%) | 开仓均价:1227.69]
-    """
-    summaries = []
-    for plugin in (content_data.get("pluginInfo") or []):
-        if not isinstance(plugin, dict):
-            continue
-        meta_str = plugin.get("metaData")
-        if not meta_str or not isinstance(meta_str, str):
-            continue
-        try:
-            meta_json = json.loads(meta_str)
-            fut_info = meta_json.get("futuresCurrentInfo") or {}
-            if fut_info:
-                inst_id = fut_info.get("instId") or plugin.get("displayId", "UNKNOWN")
-                direction = fut_info.get("posDirection") or fut_info.get("shareType", "")
-                leverage = fut_info.get("leverage", "")
-                pnl = fut_info.get("pnl", "")
-                pnl_unit = fut_info.get("pnlUnit", "USDT")
-                pnl_rate = fut_info.get("pnlRate", "")
-                entry_price = fut_info.get("entryPrice", "")
-
-                rate_str = ""
-                if pnl_rate:
-                    try:
-                        rate_str = f" ({float(pnl_rate) * 100:.2f}%)"
-                    except ValueError:
-                        pass
-
-                summary = (
-                    f"[实盘晒单: {inst_id} | 方向:{direction} | 杠杆:{leverage} | "
-                    f"收益:{pnl} {pnl_unit}{rate_str} | 开仓价:{entry_price}]"
-                )
-                summaries.append(summary)
-        except Exception:
-            continue
-    return summaries
-
-
 def _infer_card_type(content_data):
     """
     将 OKX 的帖子形态映射为与币安一致的 card_type 枚举：
@@ -650,6 +657,8 @@ def clean_okx_posts(raw_data_list):
             # 兼容直接传入 contentData 或外层带有 contentData 包装的字典
             content_data = raw_wrapper.get("contentData") if "contentData" in raw_wrapper else raw_wrapper
             if not isinstance(content_data, dict):
+                continue
+            if _is_self_okx_post(content_data):
                 continue
 
             post_id = str(content_data.get("contentId") or content_data.get("id") or "")
@@ -1117,6 +1126,8 @@ def fetch_okx_feed_recommend(
                 new_in_page = 0
                 for raw_item in data_list:
                     content_data = raw_item.get("contentData") or {}
+                    if _is_self_okx_post(content_data):
+                        continue
                     item_id = str(content_data.get("contentId") or "")
                     if not item_id:
                         continue
@@ -1153,6 +1164,128 @@ def fetch_okx_feed_recommend(
                 time.sleep(random.uniform(1.0, 2.5))
 
     return all_items[:required_count]
+
+
+def fetch_okx_user_timeline(
+        author_id,
+        max_pages=100,
+        start_ts=None,
+        end_ts=None,
+        cookies="",
+        extra_headers=None,
+):
+    """
+    拉取 OKX 指定用户主页的动态时间线帖子列表 (/priapi/v5/content/public/timeline/1, type=3)。
+    可用于按账号与时间段删帖或全量清理时，直接从远端枚举该账号当前存活的所有帖子。
+
+    :param author_id:     OKX 星球 authorId（如 "872834593500823552"）
+    :param max_pages:     最大翻页数（每页 50 条，默认 100 页即最多 5000 条）
+    :param start_ts:      可选起始时间戳（秒），若条目时间早于 start_ts 则提前结束翻页
+    :param end_ts:        可选截止时间戳（秒）
+    :param cookies:       可选 Cookie
+    :param extra_headers: 可选额外 Header
+    :return:              [{"post_id": str, "publish_time": float, "title": str}] 列表
+    """
+    clean_uid = str(author_id or "").strip()
+    if not clean_uid:
+        return []
+
+    url = "https://www.okx.com/priapi/v5/content/public/timeline/1"
+    referer = f"https://www.okx.com/zh-hans/orbit/user/{clean_uid}"
+    results = []
+    seen_ids = set()
+    cursor = ""
+    page_index = 1
+    retry_count = 0
+
+    with requests.Session() as session:
+        while page_index <= max_pages:
+            now_ms = str(int(time.time() * 1000))
+            params = {
+                "size": 50,
+                "queryName": clean_uid,
+                "type": 3,
+                "cursor": cursor,
+                "t": now_ms,
+            }
+            headers = _build_okx_headers(
+                referer=referer,
+                cookies=cookies,
+                extra_headers=extra_headers,
+                timestamp_ms=now_ms,
+            )
+            try:
+                resp = session.get(
+                    url,
+                    headers=headers,
+                    params=params,
+                    proxies=PROXIES,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                json_resp = resp.json()
+                if str(json_resp.get("code")) != "0":
+                    logger.warning(
+                        f"⚠️ [OKX用户主页流:{clean_uid}] 接口返回非0 | code={json_resp.get('code')} | msg={json_resp.get('msg')}"
+                    )
+                    break
+
+                data_obj = json_resp.get("data") or {}
+                raw_list = data_obj.get("contentDataList") or data_obj.get("dataList") or []
+                if not raw_list:
+                    break
+
+                new_in_page = 0
+                reached_older_than_start = False
+                for item in raw_list:
+                    if not isinstance(item, dict):
+                        continue
+                    c_data = item.get("contentData") if "contentData" in item else item
+                    if not isinstance(c_data, dict):
+                        continue
+                    cid = str(c_data.get("contentId") or c_data.get("id") or "").strip()
+                    if not cid or cid in seen_ids:
+                        continue
+                    seen_ids.add(cid)
+                    new_in_page += 1
+
+                    raw_pt = _safe_int(c_data.get("publishTime"), 0)
+                    pub_ts = raw_pt / 1000.0 if raw_pt > 10_000_000_000 else float(raw_pt)
+                    if end_ts is not None and pub_ts > 0 and pub_ts > float(end_ts):
+                        continue
+                    if start_ts is not None and pub_ts > 0 and pub_ts < float(start_ts):
+                        reached_older_than_start = True
+                        continue
+
+                    results.append({
+                        "post_id": cid,
+                        "publish_time": pub_ts,
+                        "title": str(c_data.get("title") or "")[:80],
+                    })
+
+                next_cursor = str(data_obj.get("nextCursor") or "")
+                if (
+                    reached_older_than_start
+                    or not next_cursor
+                    or next_cursor == "0"
+                    or next_cursor == cursor
+                    or new_in_page == 0
+                ):
+                    break
+
+                cursor = next_cursor
+                page_index += 1
+                retry_count = 0
+                time.sleep(random.uniform(0.15, 0.35))
+
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"🚨 [OKX用户主页流:{clean_uid}] 第 {page_index} 页请求异常 ({retry_count}/{MAX_RETRIES}): {e}")
+                if retry_count >= MAX_RETRIES:
+                    break
+                time.sleep(random.uniform(0.8, 1.5))
+
+    return results
 
 
 # ============================================================

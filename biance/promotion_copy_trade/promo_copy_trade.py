@@ -34,7 +34,7 @@ from common.mongo_db.mongo_manager import UniversalPostManager
 
 logger = setup_logger(app_name="promo_copy")
 
-BINANCE_SOURCE = "biance"
+BINANCE_SOURCE = "binance"
 POST_QUERY_LIMIT = 50000
 SCHEDULE_INTERVAL_SEC = 3600
 COMMENT_SEND_INTERVAL_SEC = 60

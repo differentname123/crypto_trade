@@ -621,7 +621,7 @@ def consumer_auto_sync_main(accounts=None):
     while True:
         try:
             # 1. 获取基础野生线索 (发帖+裂变)
-            posts_list = post_manager.find_posts_by_source("biance", limit=50000)
+            posts_list = post_manager.find_posts_by_source("binance", limit=50000)
             target_time_str = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
             shared_post_uids = extract_mutual_follow_users(posts_list, target_time_str)
 
@@ -692,7 +692,7 @@ def producer_fetch_content_main():
     while True:
         try:
             time.sleep(PRODUCER_SWEEP_INTERVAL)
-            existing_posts = post_manager.find_posts_by_source("biance", limit=50000)
+            existing_posts = post_manager.find_posts_by_source("binance", limit=50000)
             existing_ids = {str(_extract_post_id(p)) for p in existing_posts if _extract_post_id(p)}
 
             total_new = 0

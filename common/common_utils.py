@@ -16,6 +16,7 @@ import os
 import re
 import socket
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 from filelock import FileLock, Timeout
@@ -248,43 +249,110 @@ def get_config(key):
     return config_data[key]
 
 
-async def _download_media_async(url: str, save_dir: str, proxy: str = None) -> str:
-    """异步核心：使用 MD5 作为安全文件名下载文件，返回绝对路径。"""
+def compute_image_content_id(image_input) -> Optional[str]:
+    """
+    根据图片视觉像素内容生成纯粹的唯一标识（128-bit 双向感知差分哈希，32位十六进制字符串）。
+    无论图片 URL 如何变化、或者经过平台 CDN 重压缩/重编码，只要画面内容一致，返回的标识完全相同。
+    :param image_input: 图片二进制 bytes，或本地图片路径 (str / Path)
+    :return: 32位十六进制内容标识；若非有效图片则返回 None
+    """
+    import io
+    from PIL import Image
 
-    # 【核心修复】：将重量级网络库移到函数内部局部导入，彻底杜绝全局 DLL 冲突
-    import aiohttp
+    try:
+        if isinstance(image_input, (bytes, bytearray)):
+            img_ctx = Image.open(io.BytesIO(image_input))
+        else:
+            img_ctx = Image.open(image_input)
+
+        with img_ctx as img:
+            gray_h = img.convert("L").resize((9, 8), Image.Resampling.LANCZOS)
+            px_h = list(gray_h.getdata())
+            bits_h = 0
+            for r in range(8):
+                row_offset = r * 9
+                for c in range(8):
+                    bits_h = (bits_h << 1) | (1 if px_h[row_offset + c] > px_h[row_offset + c + 1] else 0)
+
+            gray_v = img.convert("L").resize((8, 9), Image.Resampling.LANCZOS)
+            px_v = list(gray_v.getdata())
+            bits_v = 0
+            for r in range(8):
+                for c in range(8):
+                    bits_v = (bits_v << 1) | (1 if px_v[r * 8 + c] > px_v[(r + 1) * 8 + c] else 0)
+
+            if bits_h == 0 and bits_v == 0:
+                rgb_bytes = img.convert("RGB").resize((16, 16), Image.Resampling.LANCZOS).tobytes()
+                return hashlib.md5(rgb_bytes).hexdigest()
+
+            return f"{bits_h:016x}{bits_v:016x}"
+    except Exception:
+        return None
+
+
+def get_image_content_id(file_path: str) -> str:
+    """
+    获取本地图片文件的纯内容唯一标识：
+    若物理文件存在则优先计算其视觉内容标识，否则回退提取文件名主干。
+    """
+    if not file_path:
+        return ""
+    p = Path(str(file_path).strip())
+    if p.is_file():
+        cid = compute_image_content_id(p)
+        if cid:
+            return cid
+    return p.stem.lower()
+
+
+async def _download_media_async(url: str, save_dir: str, proxy: str = None) -> str:
+    """
+    异步核心：先下载媒体内容字节，再基于【图片视觉内容唯一标识（dHash）】或【文件二进制内容哈希】生成唯一文件名。
+    彻底摒弃基于 URL 的 MD5 命名，杜绝同图异链或平台二次上传换链导致的重复落地与自产自销复用。
+    """
     import aiofiles
     import httpx
 
-    # 提取后缀名 (例如 .jpg, .mp4)
-    suffix = Path(urlparse(url).path).suffix
-
-    # 直接对整个 URL 进行 MD5 哈希，绝对安全，不会有任何非法字符
-    safe_name = f"{hashlib.md5(url.encode('utf-8')).hexdigest()}{suffix}"
-
-    save_path = Path(save_dir) / safe_name
-    abs_path = str(save_path.resolve())
-
-    # 文件已存在则直接返回路径
-    if save_path.exists():
-        return abs_path
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm"):
+        suffix = ".jpg"
 
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
     try:
+        chunks = []
         async with httpx.AsyncClient(proxy=proxy, verify=False) as client:
-            async with client.stream('GET', url, headers=headers, timeout=30.0) as response:
+            async with client.stream("GET", url, headers=headers, timeout=30.0) as response:
                 response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        chunks.append(chunk)
 
-                save_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_bytes = b"".join(chunks)
+        if not raw_bytes:
+            return None
 
-                async with aiofiles.open(save_path, 'wb') as f:
-                    async for chunk in response.aiter_bytes():
-                        await f.write(chunk)
+        # 优先按图片视觉内容生成唯一标识；非图片媒体（如视频）按二进制内容生成 SHA256 标识
+        content_id = compute_image_content_id(raw_bytes)
+        if not content_id:
+            content_id = hashlib.sha256(raw_bytes).hexdigest()[:32]
 
-        return abs_path
+        save_dir_path = Path(save_dir)
+        save_dir_path.mkdir(parents=True, exist_ok=True)
+
+        # 若目标目录下已存在相同内容标识的图片（无论后缀是 .jpg/.png/.webp），直接复用已有文件
+        for ext in (suffix, ".jpg", ".jpeg", ".png", ".webp"):
+            candidate = save_dir_path / f"{content_id}{ext}"
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return str(candidate.resolve())
+
+        save_path = save_dir_path / f"{content_id}{suffix}"
+        async with aiofiles.open(save_path, "wb") as f:
+            await f.write(raw_bytes)
+
+        return str(save_path.resolve())
 
     except Exception as e:
         print(f"[ERROR] 下载失败 {url}: {e}")
@@ -292,5 +360,6 @@ async def _download_media_async(url: str, save_dir: str, proxy: str = None) -> s
 
 
 def download_web_media(url: str, save_dir: str, proxy: str = None) -> str:
-    """同步入口：下载网络文件并返回本地绝对路径。"""
+    """同步入口：下载网络媒体文件并按纯内容唯一标识命名，返回本地绝对路径。"""
     return asyncio.run(_download_media_async(url, save_dir, proxy=proxy))
+

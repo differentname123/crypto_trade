@@ -1,15 +1,13 @@
 """
-[功能摘要] 采集 Binance/OKX 原帖，生成分析文章或单帖重塑文章，再按平台发布、互动并提供历史清理。
+[功能摘要] 采集 Binance/OKX 原帖，生成单币分析文章或单帖重塑文章，再按平台发布、可配置互动并提供历史/指定时间段清理。
 [输入数据] MongoDB 原帖 {source,post_id,publish_time,content,media,pre_screen,logic_mul,viral_screen}；
 文章 {type,topic,stance,article_info,publish_records}；本地提示词、币种文件、浏览器配置及账号状态 JSON。
-[数据流转/交互] 热榜/CCXT 行情 → 双平台采集入库 → 每批 50 帖文本初筛 → 图片编号与多模态论据提取；
-论据按币种/立场/时效/引用次数选材 → 模型生成并校验 analysis；24h 且浏览>1000 的图文帖
+[数据流转/交互] 热榜/CCXT 行情 → 双平台采集入库（自动拦截自家矩阵账号防自产自销） → 每批 50 帖文本初筛 → 图片编号与多模态论据提取；
+论据按币种/立场/时效/引用次数选材 → 模型生成并校验 analysis；24h 且高浏览的图文帖
 → 文本粗筛 → 同事件限额/单帖去重 → 原图验货与重塑 → 保存 viral（淘汰也保存 skip）；
-分析帖近6h、流量帖近24h → 平台内图片去重/评分排序/独立账号冷却 → 浏览器发布
-→ 分别回写账号文件和 publish_records；近24h已发帖 → 平台互动 → 回写结果；
-手动启用历史清理后，仅 Binance 按逆向行情/7天边界删除，并扫描远端历史作兜底。
-[输出数据] 初筛与论据、文章及配图溯源、各平台发布/互动/删除状态、人工复盘数据与聚合日志。
-运行依赖原项目的 common/app/biance、Pillow、CCXT、提示词和已登录浏览器配置；入口仍启动原有6个线程。
+分析帖近6h、流量帖近24h → 平台内基于图片内容唯一标识(dhash)去重/评分排序/独立账号冷却 → 浏览器发布
+→ 分别回写账号文件和 publish_records；近24h已发帖 → 按平台 INTERACTION_CONFIG 执行可配置点赞/互评 → 回写结果；
+支持指定账号与时间段（默认最近3天）批量删帖，以及按逆向行情/时间边界清理历史帖。
 """
 
 import json
@@ -33,23 +31,28 @@ from biance.biance_playwright import (
     comment_on_binance_post, create_binance_post, get_auth_tokens_robust,
 )
 from biance.biance_squre_api import (
+    SELF_BINANCE_AUTHOR_NAMES, SELF_BINANCE_USERNAMES,
     delete_binance_square_content, fetch_binance_feed, fetch_binance_future_hot_coins,
     fetch_binance_hot_hashtags, fetch_binance_spot_hot_coins,
     fetch_binance_square_replies, get_latest_crypto_price, like_and_bookmark,
 )
-from biance.okx_playwright import comment_on_okx_post, create_okx_post
-from biance.okx_squre_api import fetch_okx_feed, fetch_okx_hot_coins
+from biance.okx_playwright import comment_on_okx_post, create_okx_post, delete_okx_posts
+from biance.okx_squre_api import (
+    SELF_OKX_AUTHOR_IDS, SELF_OKX_AUTHOR_NAMES, fetch_okx_feed, fetch_okx_hot_coins,
+    fetch_okx_user_timeline,
+)
 from common.common_utils import (
-    get_config, read_file_to_str, read_json, save_json, setup_logger, string_to_object,
+    get_config, get_image_content_id, read_file_to_str, read_json,
+    save_json, setup_logger, string_to_object,
 )
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
 
 logger = setup_logger(app_name="media_format")
 
-# 一、配置：数据库 source 的历史拼写 biance 必须与发布平台键 binance 区分。
+# 一、全局配置与常量
 prompt_version = "1016-1"
-BINANCE_SOURCE = "biance"
+BINANCE_SOURCE = "binance"
 OKX_SOURCE = "okx"
 POST_SOURCES = (BINANCE_SOURCE, OKX_SOURCE)
 PLATFORM_BINANCE = "binance"
@@ -58,10 +61,23 @@ ACCOUNTS = ["qiqi", "ruru"]
 OKX_ACCOUNTS = ["myself", "mama", "nana", "ruru"]
 PLATFORM_ACCOUNTS = {PLATFORM_BINANCE: ACCOUNTS, PLATFORM_OKX: OKX_ACCOUNTS}
 
+# OKX 矩阵账号与唯一 author_id 映射（用于防自产自销与按账号删帖）
+OKX_ACCOUNT_UID_MAP = {
+    "myself": "872834593500823552",
+    "mama": "872896855657885696",
+    "nana": "1035697745975390208",
+    "ruru": "950093749101883392",
+}
+BINANCE_ACCOUNT_USERNAME_MAP = {
+    "qiqi": "insights_anchor",
+    "ruru": "ruivision",
+}
+SELF_AUTHOR_IDS = {str(x).lower() for x in (set(SELF_OKX_AUTHOR_IDS) | set(SELF_BINANCE_USERNAMES))}
+SELF_AUTHOR_NAMES = set(SELF_OKX_AUTHOR_NAMES) | set(SELF_BINANCE_AUTHOR_NAMES)
+
 PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
 PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
 ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
-MULTI_ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_多币种分析文章生成.txt"
 VIRAL_STAGE1_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖可用性筛选.txt"
 VIRAL_STAGE2_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖洗稿和神评生成.txt"
 
@@ -79,7 +95,6 @@ VIRAL_MIN_VIEW_COUNT_BINANCE = 1000
 VIRAL_MIN_VIEW_COUNT_OKX = 10000
 
 ARTICLE_TYPE_ANALYSIS = "analysis"
-ARTICLE_TYPE_MULTI_ANALYSIS = "analysis_multi"
 ARTICLE_TYPE_VIRAL = "viral"
 ARTICLE_MATERIAL_LIMIT = 10
 ARTICLE_MIN_MATERIALS = 5
@@ -89,24 +104,30 @@ ARTICLE_VARIANTS = 2
 ARTICLE_CONCURRENCY = 5
 ARTICLE_GENERATION_INTERVAL_SECONDS = 600
 
-# 多币种聚合分析配置：最多20条论据池，每轮10次并发生成
-MULTI_ANALYSIS_MATERIAL_LIMIT = 20
-MULTI_ANALYSIS_MIN_MATERIALS = 4
-MULTI_ANALYSIS_ROUNDS = 10
-MULTI_ANALYSIS_CONCURRENCY = 5
-MULTI_ANALYSIS_MAX_CHARS = 360
-
 # 流水线各模块独立启停控制面板
 TASK_SWITCHES = {
     "fetch_and_screen": True,         # 采集与初筛/提取
     "single_analysis_gen": True,      # 单币分析生成
     "single_analysis_pub": True,      # 单币分析发布
-    "multi_analysis_gen": True,       # 多币分析生成 (最多20论据/每轮10次)
-    "multi_analysis_pub": True,       # 多币分析发布 (独立控制开关)
-    "viral_gen": True,               # 娱乐帖生成
-    "viral_pub": True,               # 娱乐帖发布
+    "viral_gen": True,                # 娱乐帖生成
+    "viral_pub": True,                # 娱乐帖发布
     "hudong": True,                   # 评论区互动
-    "delete_old_post": True,         # 历史清理 (手动开启)
+    "delete_old_post": True,          # 历史清理
+}
+
+# 各平台互动（点赞与互评）独立灵活配置
+# 当前默认取消 OKX 的互评和点赞，且默认互评账号数设为 1 个随机账号
+INTERACTION_CONFIG = {
+    PLATFORM_OKX: {
+        "enable_like": False,
+        "enable_comment": False,
+        "max_comment_accounts": 1,
+    },
+    PLATFORM_BINANCE: {
+        "enable_like": True,
+        "enable_comment": True,
+        "max_comment_accounts": 1,
+    },
 }
 
 STATE_FILE = "account_publish_state.json"
@@ -119,6 +140,7 @@ PUBLISH_POLL_SECONDS = 600
 INTERACTION_INTERVAL_SECONDS = 1200
 MAX_REPLAY_DAYS = 7
 DELETE_INTERVAL_SEC = 3600
+IMAGE_DEDUP_LOOKBACK_HOURS = 168  # 7天内基于图片视觉内容唯一ID严格去重
 BEIJING_TZ = timezone(timedelta(hours=8))
 ALLOWED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP", "GIF", "BMP", "MPO"}
 MEDIA_PATTERN = re.compile(r"\[(插图|长文封面|视频封面|视频):\s*(https?://[^\]]+)\]")
@@ -131,10 +153,6 @@ PUBLISH_RULES = {
     ARTICLE_TYPE_ANALYSIS: {
         "action": "分析发布", "hours": 6, "text": "text",
         "images": "image_placeholders", "score": "score", "state_prefix": "",
-    },
-    ARTICLE_TYPE_MULTI_ANALYSIS: {
-        "action": "多币分析发布", "hours": 6, "text": "text",
-        "images": "image_placeholders", "score": "score", "state_prefix": "multi_",
     },
     ARTICLE_TYPE_VIRAL: {
         "action": "流量发布", "hours": VIRAL_PUBLISH_MAX_AGE_HOURS, "text": "post_text",
@@ -172,7 +190,7 @@ class BinancePlatform:
             sentiment=stance, debug=False, text_list=_build_publish_text_list(text),
         )
 
-    def comment(self, session_dir, post_id, text, stance):
+    def comment(self, session_dir, post_id, text, stance, like=False):
         return comment_on_binance_post(
             post_url=f"https://www.binance.com/zh-CN/square/post/{post_id}",
             comment=text, user_data_dir=session_dir, sentiment=stance, debug=False,
@@ -207,10 +225,10 @@ class OkxPlatform:
             content=text, image_path_list=image_paths, user_data_dir=session_dir, debug=False,
         )
 
-    def comment(self, session_dir, post_id, text, stance):
+    def comment(self, session_dir, post_id, text, stance, like=False):
         url = str(post_id) if str(post_id).startswith("http") else f"https://www.okx.com/zh-hans/orbit/post/{post_id}"
         return comment_on_okx_post(
-            target_post_url=url, content=text, user_data_dir=session_dir, debug=False,
+            target_post_url=url, content=text, user_data_dir=session_dir, like=like, debug=False,
         )
 
     def decorate_analysis(self, text, topic):
@@ -234,7 +252,7 @@ def _execute_platform_post(platform, session_dir, text, image_paths, topic=None,
 # 三、原帖筛选与模型字段契约
 
 
-# 统一按多个 source 查询原帖列表，兼容 biance 与 okx 双数据源。
+# 统一按多个 source 查询原帖列表，覆盖 binance 与 okx 双数据源。
 def _find_posts_by_sources(post_manager, sources=POST_SOURCES, limit=POST_QUERY_LIMIT):
     posts = []
     for source in sources:
@@ -328,10 +346,41 @@ def _is_valid_image_file(path):
     return _verify_image_integrity(abs_path, stat_info.st_mtime_ns, stat_info.st_size)
 
 
+# 判断原帖是否来自自家矩阵账号（斩断“自产自销死循环”的第二道防线）
+def _is_self_post(post, self_post_ids=None):
+    if not isinstance(post, dict):
+        return False
+    post_id = str(post.get("post_id", "") or "").strip()
+    if self_post_ids and post_id in self_post_ids:
+        return True
+    author = post.get("author") or {}
+    author_id = str(
+        post.get("author_id")
+        or author.get("author_id")
+        or author.get("id")
+        or author.get("uid")
+        or author.get("username")
+        or ""
+    ).strip()
+    if author_id and author_id.lower() in SELF_AUTHOR_IDS:
+        return True
+    author_name = str(
+        post.get("author_name")
+        or author.get("name")
+        or author.get("nickName")
+        or author.get("displayName")
+        or ""
+    ).strip()
+    if author_name and author_name in SELF_AUTHOR_NAMES:
+        return True
+    return False
+
+
 # post{post_id,publish_time,content.text_content,media{local_mapping,video_duration}} → bool。
-# : 映射项数>=10即淘汰；视频只按正时长排除；分析路径仍允许未来时间。
-# 先做内存/时效校验再读取图片，纯文本帖仍可通过。
+# : 映射项数>=10即淘汰；视频只按正时长排除；自家矩阵帖一律拦截。
 def _is_valid_raw_post(post):
+    if _is_self_post(post):
+        return False
     post_id = post.get("post_id")
     if post_id is None or not str(post_id).strip():
         return False
@@ -786,7 +835,7 @@ def _fetch_hot_posts(post_manager, token_list, fetch_feed, platform):
          帖数=f"{len(posts)}，含重复", 耗时=f"{time.monotonic() - started:.2f}秒")
 
 
-def fetch_biance_hot_post(post_manager, token_list):
+def fetch_binance_hot_post(post_manager, token_list):
     _fetch_hot_posts(post_manager, token_list, fetch_binance_feed, PLATFORM_BINANCE)
 
 
@@ -800,7 +849,7 @@ def format_image_article():
         try:
             started = time.monotonic()
             post_manager = UniversalPostManager(gen_db_object())
-            fetch_biance_hot_post(post_manager, PLATFORMS[PLATFORM_BINANCE].hot_coins())
+            fetch_binance_hot_post(post_manager, PLATFORMS[PLATFORM_BINANCE].hot_coins())
             fetch_okx_hot_post(post_manager, PLATFORMS[PLATFORM_OKX].hot_coins())
             source_batches = [
                 post_manager.find_posts_by_source(source, limit=POST_QUERY_LIMIT) or []
@@ -854,6 +903,29 @@ def clear_all_media_format_batch():
 # 五、选材、生成与落库：共享重试机制，保留两类文章各自的业务契约
 
 
+# 查询数据库所有自家矩阵已成功发布的 post_id 集合，彻底防止自家帖子作为原帖回流被二次引用
+def _get_all_self_published_post_ids(article_manager=None):
+    if article_manager is None:
+        article_manager = GeneratedArticleManager(gen_db_object())
+    articles = article_manager.find_articles(
+        query={
+            "$or": [
+                {f"publish_records.{PLATFORM_BINANCE}.post_id": {"$exists": True, "$ne": None}},
+                {f"publish_records.{PLATFORM_OKX}.post_id": {"$exists": True, "$ne": None}},
+            ]
+        },
+        limit=0,
+    ) or []
+    self_ids = set()
+    for art in articles:
+        pub = art.get("publish_records") or {}
+        for plat in (PLATFORM_BINANCE, PLATFORM_OKX):
+            pid = (pub.get(plat) or {}).get("post_id")
+            if pid and str(pid).strip() and str(pid).strip() != "None":
+                self_ids.add(str(pid).strip())
+    return self_ids
+
+
 # 论据[{core_fact,logic_link,raw_hook,images[{image_id,usable,context}],source_post_id,source_image_mapping}]
 # → ([{id,fact,underlying_logic,raw_hook,visual_evidence}],{ASSET编号:来源})；visual为None/单图/有序图组。
 def transform_mlus(mlu_list):
@@ -890,14 +962,19 @@ def transform_mlus(mlu_list):
             if image_id in seen_ids:
                 continue
             seen_ids.add(image_id)
-            source_key = (ev_source, evidence.get("source_post_id"), image_id)
+            meta = source_mapping[image_id]
+            local_path = meta.get("local_path") or ""
+            content_id = get_image_content_id(local_path)
+            # 基于图片内容唯一标识(dhash)优先去重，同内容图片在同篇文章中共享同一个占位符
+            source_key = ("content_id", content_id) if content_id else (ev_source, evidence.get("source_post_id"), image_id)
             placeholder = asset_by_source.get(source_key)
             if placeholder is None:
                 placeholder = f"[ASSET_IMG_{len(asset_by_source) + 1}]"
                 asset_by_source[source_key] = placeholder
                 image_mapping[placeholder] = {
                     "source": ev_source, "source_post_id": evidence.get("source_post_id"),
-                    "original_image_id": image_id, "original_image_id_list": [image_id], **source_mapping[image_id],
+                    "original_image_id": image_id, "original_image_id_list": [image_id],
+                    "content_id": content_id, **meta,
                 }
             visual_items.append({"placeholder": placeholder, "what_it_shows": image["context"]})
         material["visual_evidence"] = visual_items[0] if len(visual_items) == 1 else visual_items
@@ -905,17 +982,21 @@ def transform_mlus(mlu_list):
 
 
 # 当前版本logic_mul.evidences → {coin:{stance:[富化论据]}}；补齐source/原帖/图片溯源。
-# : 活跃币种仍在文件字符串中做子串匹配；任一图片不可用淘汰整条论据，无图论据可用。
-def extract_and_group_valid_evidences():
-    biance_hot_coins = {coin.upper() for coin in get_hot_coin()}
+# : 任一图片不可用淘汰整条论据，无图论据可用；严格排除自家矩阵发布的帖子。
+def extract_and_group_valid_evidences(article_manager=None):
+    binance_hot_coins = {coin.upper() for coin in get_hot_coin()}
     okx_hot_coins = {coin.upper() for coin in PLATFORMS[PLATFORM_OKX].hot_coins()}
-    hot_coins = biance_hot_coins.union(okx_hot_coins)
+    hot_coins = binance_hot_coins.union(okx_hot_coins)
     started = time.monotonic()
     manager = UniversalPostManager(gen_db_object())
     posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
+    self_post_ids = _get_all_self_published_post_ids(article_manager)
     grouped = defaultdict(lambda: defaultdict(list))
-    now, invalid_times = time.time(), 0
+    now, invalid_times, self_skipped = time.time(), 0, 0
     for post in posts:
+        if _is_self_post(post, self_post_ids):
+            self_skipped += 1
+            continue
         logic, raw_time = post.get("logic_mul"), post.get("publish_time")
         if (not isinstance(logic, dict) or logic.get("prompt_version") != prompt_version
                 or not logic.get("evidences") or not raw_time):
@@ -959,15 +1040,14 @@ def extract_and_group_valid_evidences():
     log = logger.warning if invalid_times else logger.info
     log(
         "[论据/筛选] 已分组并按权重排序 | 扫描: [%s] | 币种: [%s] | 论据: [%s，含跨组重复] "
-        "| 无效时间跳过: [%s] | 耗时: [%.2f 秒] | 时间异常排查: [核对秒/毫秒时间戳]",
+        "| 自家帖拦截: [%s] | 无效时间跳过: [%s] | 耗时: [%.2f 秒]",
         len(posts), len(result), sum(len(items) for stances in result.values() for items in stances.values()),
-        invalid_times, time.monotonic() - started,
+        self_skipped, invalid_times, time.monotonic() - started,
     )
     return result
 
 
 # source与post_id序列 → {post_id:成功发布引用次数}；同文章同帖只计一次。
-# : 统计跨平台成功记录、按post_id计数，未隔离同ID的不同来源，也不预占并发引用次数。
 def get_post_usage_counts(article_manager, source, post_ids):
     unique_ids = list(dict.fromkeys(post_ids))
     counts = dict.fromkeys(unique_ids, 0)
@@ -1042,7 +1122,6 @@ def prepare_article_record_for_db(article_data):
             if post_id not in post_ids:
                 post_ids.append(post_id)
     elif status == "skip" and record.get("type") == ARTICLE_TYPE_VIRAL:
-
         post_ids = [
             pid for pid in (record.get("post_id_list") or [])
             if pid not in (None, "", "UNKNOWN")
@@ -1117,7 +1196,6 @@ def check_article_info(article_info, materials, image_mapping, max_chars):
 
 # coin/stance、论据[{source,source_post_id,core_fact,dimension,shelf_life,impact_weight}]
 # → {is_skip,record,coin,stance,reason?}；可执行任务另含full_prompt/materials/image_mapping/model_name。
-# : 汇总OKX素材后文章source仍写biance；model_name只作元数据，实际使用medium组。
 def build_article_task(coin, stance, ev_list, article_manager):
     brief = {"task": {"topic": coin, "stance": stance, "max_chars": ARTICLE_MAX_CHARS}, "materials": []}
     model_name = "gemini-3.1-pro-preview"
@@ -1203,36 +1281,37 @@ def get_remodeled_viral_post_ids(article_manager, source, post_ids):
 
 
 # 当前版本viral_screen.keep=True原帖 → 待重塑列表，按浏览+点赞*20+评论*50排序。
-# : 必须有media.images，即使local_mapping含图也不替代；48h事件配额跨来源共享。
-# : 已处理ID过滤跨来源且不区分提示词版本；本轮候选先占事件配额，后续生成失败不回补。
 def extract_valid_viral_posts(article_manager):
     started = time.monotonic()
     post_manager = UniversalPostManager(gen_db_object())
     posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
+    self_post_ids = _get_all_self_published_post_ids(article_manager)
     now = time.time()
 
     recent_viral_articles = (
-            article_manager.find_articles(
-                query={
-                    "source": {"$in": list(POST_SOURCES)},
-                    "type": ARTICLE_TYPE_VIRAL,
-                    "status": "ok",
-                    "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
-                },
-                limit=0,
-            )
-            or []
+        article_manager.find_articles(
+            query={
+                "source": {"$in": list(POST_SOURCES)},
+                "type": ARTICLE_TYPE_VIRAL,
+                "status": "ok",
+                "created_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=48)},
+            },
+            limit=0,
+        )
+        or []
     )
     used_event_keys = Counter()
     for art in recent_viral_articles:
         ek = (
-                ((art.get("creation_brief") or {}).get("stage1_screen") or {}).get("event_key") or ""
+            ((art.get("creation_brief") or {}).get("stage1_screen") or {}).get("event_key") or ""
         ).strip()
         if ek:
             used_event_keys[ek] += 1
 
     candidates = []
     for post in posts:
+        if _is_self_post(post, self_post_ids):
+            continue
         screen = post.get("viral_screen")
         if not isinstance(screen, dict) or screen.get("prompt_version") != prompt_version:
             continue
@@ -1252,8 +1331,7 @@ def extract_valid_viral_posts(article_manager):
         else:
             logger.info(f"{source} not in {POST_SOURCES}")
 
-        if not isinstance(view_count, (int, float)) or isinstance(view_count,
-                                                                  bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
+        if not isinstance(view_count, (int, float)) or isinstance(view_count, bool) or view_count <= VIRAL_MIN_VIEW_COUNT:
             continue
         try:
             publish_time = _publish_time_seconds(post.get("publish_time", 0))
@@ -1305,7 +1383,6 @@ def extract_valid_viral_posts(article_manager):
 
 # raw{image_semantics,selected_images,global_truth,feasibility_audit,usable,topic_tag,
 # expression_strategy,post_text,bait_comments,viral_score}、原图占位符集合 → (bool,错误文本)。
-# : usable=False仍在逐图/全局说明检查后直接放行；可用稿允许0—5图，保留原实际边界。
 def check_viral_article_info(raw_info, placeholders, max_chars):
     expected_keys = {
         "image_semantics", "selected_images", "global_truth",
@@ -1405,7 +1482,6 @@ def check_viral_article_info(raw_info, placeholders, max_chars):
 
 # post{source,post_id,content,media,comments:[{content}],viral_screen} → 第二阶段任务
 # {record,full_prompt,file_paths,placeholders,image_mapping,post_id,topic,model_name}。
-# 提示词仍只拼original_post，不补传brief中的年份或stage1_screen，以保留模型输入。
 def build_viral_article_task(post):
     post_id = post.get("post_id")
     post_id_str = str(post_id or "").strip()
@@ -1419,6 +1495,7 @@ def build_viral_article_task(post):
             "source_post_id": post_id,
             "original_image_id": img_id,
             "original_image_id_list": [img_id],
+            "content_id": get_image_content_id(meta.get("local_path") or ""),
             **meta,
         }
         for img_id, meta in source_mapping.items()
@@ -1475,7 +1552,6 @@ def build_viral_article_task(post):
 
 
 # task{record,full_prompt}、校验/转换回调 → record{status,article_info,raw_response,error_history}。
-# 原设计：模型重试耗尽返回error记录且不入库；数据库写入由调用者负责并向上抛异常。
 def _generate_article_record(task, validator, convert, action, context, **model_kwargs):
     record = task["record"]
     for attempt in range(1, LLM_MAX_RETRIES + 1):
@@ -1608,9 +1684,9 @@ def _execute_article_tasks(tasks, worker, manager, action):
 # 当前有效论据{coin:{stance:[论据]}} → 每组2个任务 → 并发生成，返回含ok/skip/error的记录列表。
 def generate_analysis_articles_once():
     started = time.monotonic()
-    grouped = extract_and_group_valid_evidences()
-    groups = [(coin, stance, items) for coin, stances in grouped.items() for stance, items in stances.items()]
     manager = GeneratedArticleManager(gen_db_object())
+    grouped = extract_and_group_valid_evidences(manager)
+    groups = [(coin, stance, items) for coin, stances in grouped.items() for stance, items in stances.items()]
     tasks = [build_article_task(coin, stance, items, manager) for coin, stance, items in groups
              for _ in range(ARTICLE_VARIANTS)]
     local_skips = sum(bool(task.get("is_skip")) for task in tasks)
@@ -1656,385 +1732,6 @@ def generate_analysis_articles():
     _poll_generation(generate_analysis_articles_once, "单币文章")
 
 
-# ==============================================================================
-#                      多币种聚合分析生成流水线 (独立任务)
-# ==============================================================================
-
-def extract_all_valid_multi_coin_evidences(article_manager):
-    """提取全部有效、符合时效、未超频次的多币种候选论据池，并按币种分组返回。
-    为后续每轮 10 次独立随机采样提供充足的全局候选池。
-    """
-    started = time.monotonic()
-    biance_hot_coins = {coin.upper() for coin in get_hot_coin()}
-    okx_hot_coins = {coin.upper() for coin in PLATFORMS[PLATFORM_OKX].hot_coins()}
-    hot_coins = biance_hot_coins.union(okx_hot_coins)
-
-    post_manager = UniversalPostManager(gen_db_object())
-    posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
-    now = time.time()
-
-    raw_evidences = []
-    for post in posts:
-        logic, raw_time = post.get("logic_mul"), post.get("publish_time")
-        if (not isinstance(logic, dict) or logic.get("prompt_version") != prompt_version
-                or not logic.get("evidences") or not raw_time):
-            continue
-        try:
-            publish_time = _publish_time_seconds(raw_time)
-        except ValueError:
-            continue
-        age = now - publish_time
-        if age > 15 * 24 * 3600 or age < -3600:
-            continue
-
-        source_mapping = build_source_image_mapping(post)
-        post_source = post.get("source") or BINANCE_SOURCE
-        post_id = post.get("post_id", "UNKNOWN")
-
-        for evidence in logic["evidences"]:
-            if any(image.get("usable") is not True for image in evidence.get("images", [])):
-                continue
-            duration = SHELF_LIFE_SECONDS.get(evidence.get("shelf_life", "unknown"), 24 * 3600)
-            if age > duration:
-                continue
-
-            target_coin = str(evidence.get("target_coin") or "").strip().upper()
-            if not target_coin or target_coin not in hot_coins or target_coin == "MARKET":
-                continue
-            if evidence.get("stance") not in ("看多", "看空", "震荡"):
-                continue
-            if not isinstance(evidence.get("core_fact"), str) or not evidence["core_fact"].strip():
-                continue
-
-            raw_evidences.append({
-                **evidence,
-                "target_coin": target_coin,
-                "source": post_source,
-                "source_post_id": post_id,
-                "publish_time": publish_time,
-                "source_text_content": (post.get("content") or {}).get("text_content", ""),
-                "source_image_mapping": source_mapping,
-            })
-
-    if not raw_evidences:
-        return [], {}
-
-    # 统计原帖使用次数，排除超限帖子
-    all_post_ids = list(dict.fromkeys(item["source_post_id"] for item in raw_evidences if item.get("source_post_id") not in ("", "UNKNOWN")))
-    usage = get_post_usage_counts(article_manager, POST_SOURCES, all_post_ids)
-
-    usable_evidences = [
-        item for item in raw_evidences
-        if usage.get(item["source_post_id"], 0) < ARTICLE_POST_USAGE_LIMIT
-    ]
-
-    coin_groups = defaultdict(list)
-    for item in usable_evidences:
-        coin_groups[item["target_coin"]].append(item)
-
-    if len(usable_evidences) < MULTI_ANALYSIS_MIN_MATERIALS or len(coin_groups) < 2:
-        _log("多币文章/选材", "候选论据不足或币种单一，跳过本轮生成",
-             论据数=len(usable_evidences), 涵盖币种=len(coin_groups))
-        return [], {}
-
-    _log("多币文章/选材", "多币全局候选池准备就绪", 总论据=len(usable_evidences),
-         覆盖币种=f"{len(coin_groups)}个: {sorted(coin_groups.keys())}", 耗时=f"{time.monotonic() - started:.2f}秒")
-    return usable_evidences, coin_groups
-
-
-def sample_multi_coin_evidences_for_task(usable_evidences, coin_groups, limit=MULTI_ANALYSIS_MATERIAL_LIMIT, task_index=1, used_signatures=None):
-    """为单次多币种生成任务独立动态采样材料子集。
-    
-    核心目标：
-    1. 确保每一轮的 10 次并发生成任务，各自拿到完全不同的币种组合或素材切片，绝非同一批材料生成 10 次；
-    2. 随机聚焦 2~4 个币种，从这些币种中各抽取 2~4 条核心论据，总条数控制在 limit (默认20) 内；
-    3. 采样组合通过签名防重机制保证多样性。
-    """
-    if len(usable_evidences) < MULTI_ANALYSIS_MIN_MATERIALS or len(coin_groups) < 2:
-        return []
-
-    available_coins = sorted(coin_groups.keys())
-    best_candidate = []
-
-    # 尝试生成与之前任务不完全重复的材料切片 (最多尝试 8 次随机采样)
-    for _ in range(8):
-        # 1. 动态决定本次任务关注的币种数 (2~4 个)
-        k = random.choice([2, 3, 4]) if len(available_coins) >= 3 else 2
-        k = min(k, len(available_coins))
-        chosen_coins = random.sample(available_coins, k)
-
-        # 2. 从每个选中的币种中随机抽取 2~4 条论据
-        selected = []
-        for coin in chosen_coins:
-            evs = list(coin_groups[coin])
-            random.shuffle(evs)
-            take_n = min(len(evs), random.randint(2, 4))
-            selected.extend(evs[:take_n])
-
-        # 3. 若所选币种论据总数不足 MULTI_ANALYSIS_MIN_MATERIALS，从其他币种补充
-        if len(selected) < MULTI_ANALYSIS_MIN_MATERIALS:
-            other_coins = [c for c in available_coins if c not in chosen_coins]
-            random.shuffle(other_coins)
-            for c in other_coins:
-                evs = list(coin_groups[c])
-                random.shuffle(evs)
-                selected.extend(evs[:2])
-                if len(selected) >= MULTI_ANALYSIS_MIN_MATERIALS:
-                    break
-
-        # 4. 限制最多 limit (20) 条
-        if len(selected) > limit:
-            random.shuffle(selected)
-            selected = selected[:limit]
-
-        # 5. 按照影响力权重与随机微扰排序
-        selected.sort(key=lambda x: (x.get("impact_weight", 0), random.random()), reverse=True)
-
-        # 6. 计算签名验证独立性
-        sig = frozenset(
-            (item.get("source_post_id", ""), item.get("target_coin", ""), item.get("core_fact", "")[:30])
-            for item in selected
-        )
-        if used_signatures is not None and sig in used_signatures:
-            best_candidate = selected
-            continue
-
-        if used_signatures is not None:
-            used_signatures.add(sig)
-        return selected
-
-    if best_candidate:
-        return best_candidate
-    return selected
-
-
-def check_multi_coin_article_info(article_info, materials, image_mapping, max_chars):
-    expected_keys = {
-        "status", "primary_coin", "related_coins", "narrative_pattern",
-        "text", "god_comments", "image_placeholders", "used_material_ids",
-        "score", "reason"
-    }
-    error = _key_error(article_info, expected_keys, "多币文章")
-    if error:
-        return False, error
-    if article_info["status"] not in ("ok", "skip"):
-        return False, "status 必须为 ok 或 skip"
-
-    if article_info["status"] == "skip":
-        if (article_info["text"] != "" or article_info["image_placeholders"] or article_info["used_material_ids"]
-                or article_info["god_comments"] or article_info["score"] is not None
-                or article_info["primary_coin"] is not None or article_info["related_coins"]):
-            return False, "skip 状态下正文、图片、神评、素材及币种字段必须清空"
-        if not isinstance(article_info["reason"], str) or not article_info["reason"].strip():
-            return False, "skip 必须说明 reason"
-        return True, ""
-
-    # ok 状态校验
-    primary = article_info["primary_coin"]
-    if not isinstance(primary, str) or not primary.strip() or primary != primary.upper():
-        return False, f"primary_coin 必须是非空大写英文字符串: {primary!r}"
-
-    related = article_info["related_coins"]
-    if not isinstance(related, list) or not related or any(not isinstance(c, str) or c != c.upper() for c in related):
-        return False, "related_coins 必须包含至少一个大写英文字符串"
-    if primary in related:
-        return False, f"primary_coin ({primary}) 不能出现在 related_coins 中"
-
-    text = article_info["text"]
-    if not isinstance(text, str) or not text.strip():
-        return False, "ok 正文不能为空"
-    if len(re.sub(r"\s", "", text)) > max_chars:
-        return False, f"正文非空白字符数超过 {max_chars}"
-    if re.search(r"\[(?:ASSET_IMG|IMAGE|VIDEO)_\d+\]", text):
-        return False, "正文不能包含图片或视频占位符"
-
-    # 排版与换行硬约束：防止长篇大套无断句折磨读者
-    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
-    if len(paragraphs) < 2 or text.count("\n") < 2:
-        return False, "正文缺少必要分段与换行，必须包含至少 2 处换行（使用 \\n\\n 分段）以保证手机端阅读呼吸感"
-    if any(len(p) > 85 for p in paragraphs):
-        return False, "正文存在单段文字过长（超过 85 字未换行），必须拆分为短促自然断块"
-
-    comments = article_info["god_comments"]
-    if not isinstance(comments, list) or not (1 <= len(comments) <= 3) or any(not isinstance(c, str) or not c.strip() for c in comments):
-        return False, "god_comments 必须包含 1-3 条非空字符串"
-
-    score = article_info["score"]
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not (0 <= score <= 10):
-        return False, "score 必须是 0-10 的数值"
-
-    material_by_id = {item["id"]: item for item in materials}
-    used_ids = article_info["used_material_ids"]
-    if not isinstance(used_ids, list) or len(used_ids) < 2 or any(m_id not in material_by_id for m_id in used_ids):
-        return False, "多币文章 used_material_ids 必须引用至少 2 条真实存在的素材"
-
-    used_coins = {material_by_id[m_id]["target_coin"] for m_id in used_ids if m_id in material_by_id and material_by_id[m_id].get("target_coin")}
-    if len(used_coins) < 2:
-        return False, f"多币文章采用的素材必须涵盖至少 2 个币种，当前仅涉及: {used_coins}"
-
-    selected_images = article_info["image_placeholders"]
-    if not isinstance(selected_images, list) or len(selected_images) > 3 or len(selected_images) != len(set(selected_images)):
-        return False, "image_placeholders 必须是不超过 3 张且去重的列表"
-
-    allowed_images = set()
-    for material_id in used_ids:
-        visual = material_by_id[material_id].get("visual_evidence")
-        if not visual:
-            continue
-        chain = visual if isinstance(visual, list) else [visual]
-        chain_ids = [item["placeholder"] for item in chain]
-        allowed_images.update(chain_ids)
-        chosen = [item for item in selected_images if item in chain_ids]
-        if chosen and chosen != chain_ids:
-            return False, f"素材 {material_id} 的图片证据链必须整组使用并保留输入顺序"
-    if any(item not in allowed_images or item not in image_mapping for item in selected_images):
-        return False, "图片必须来自已采用素材，且存在真实来源映射"
-
-    return True, ""
-
-
-def build_multi_coin_article_task(selected_evidences, article_manager, round_index=1):
-    ev_copy = list(selected_evidences)
-    materials, image_mapping = transform_mlus(ev_copy)
-    brief = {
-        "task": {
-            "topic": "多币种聚合观察",
-            "max_chars": MULTI_ANALYSIS_MAX_CHARS,
-            "round_index": round_index,
-        },
-        "materials": materials,
-    }
-    model_name = "gemini-3.1-pro-preview"
-    record = {
-        "source": BINANCE_SOURCE,
-        "type": ARTICLE_TYPE_MULTI_ANALYSIS,
-        "topic": "MULTI",
-        "stance": "联动分析",
-        "status": "processing",
-        "creation_brief": brief,
-        "material_post_mapping": {
-            material["id"]: evidence["source_post_id"] for material, evidence in zip(materials, ev_copy)
-        },
-        "post_id_list": [],
-        "prompt_file_path": MULTI_ARTICLE_PROMPT_FILE_PATH,
-        "model_name": model_name,
-        "prompt_version": prompt_version,
-        "article_info": None,
-        "error_message": None,
-        "error_history": [],
-        "raw_response": None,
-        "attempt_count": 0,
-    }
-    prompt = read_file_to_str(MULTI_ARTICLE_PROMPT_FILE_PATH)
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError(f"多币文章提示词为空或读取失败: {MULTI_ARTICLE_PROMPT_FILE_PATH}")
-
-    return {
-        "is_skip": False,
-        "record": record,
-        "full_prompt": f"{prompt}\n{json.dumps(brief, ensure_ascii=False)}",
-        "materials": materials,
-        "image_mapping": image_mapping,
-        "round_index": round_index,
-        "model_name": model_name,
-    }
-
-
-def execute_multi_coin_article_task(task_data, article_manager):
-    started = time.monotonic()
-    round_idx = task_data.get("round_index", 1)
-    mapping = task_data["image_mapping"]
-
-    def convert(info):
-        info["image_mapping"] = {key: dict(mapping[key]) for key in info["image_placeholders"]}
-        return info
-
-    record = _generate_article_record(
-        task_data,
-        lambda info: check_multi_coin_article_info(info, task_data["materials"], mapping, MULTI_ANALYSIS_MAX_CHARS),
-        convert,
-        "多币文章/生成",
-        f"第{round_idx}轮",
-        preset_model_group="medium",
-    )
-    if record["status"] != "ok":
-        if record["status"] == "skip":
-            _log("多币文章/跳过", "模型决定不生成多币文章", 轮次=round_idx,
-                 原因=(record.get("article_info") or {}).get("reason", "未说明"))
-        return record
-
-    info = record["article_info"]
-    primary = info["primary_coin"]
-    related = info["related_coins"]
-    coins = [primary] + [c for c in related if c != primary]
-
-    record["topic"] = primary
-    record["primary_coin"] = primary
-    record["related_coins"] = related
-    record["coins"] = coins
-    record["stance"] = info.get("narrative_pattern") or "联动分析"
-
-    saved = prepare_article_record_for_db(record)
-    article_manager.upsert_articles([saved])
-    _log("多币文章/完成", "已校验并入库", 主币=primary, 关联币=related,
-         模式=record["stance"], 评分=info["score"], 耗时=f"{time.monotonic() - started:.2f}秒")
-    return saved
-
-
-def generate_multi_analysis_articles_once():
-    started = time.monotonic()
-    manager = GeneratedArticleManager(gen_db_object())
-    usable_evidences, coin_groups = extract_all_valid_multi_coin_evidences(manager)
-    if not usable_evidences or len(coin_groups) < 2:
-        return []
-
-    # 10 次独立动态采样，为每个任务生成完全不同的材料切片与币种组合
-    tasks = []
-    used_signatures = set()
-    for i in range(1, MULTI_ANALYSIS_ROUNDS + 1):
-        task_evidences = sample_multi_coin_evidences_for_task(
-            usable_evidences,
-            coin_groups,
-            limit=MULTI_ANALYSIS_MATERIAL_LIMIT,
-            task_index=i,
-            used_signatures=used_signatures,
-        )
-        if not task_evidences:
-            continue
-        task = build_multi_coin_article_task(task_evidences, manager, round_index=i)
-        tasks.append(task)
-
-    if not tasks:
-        _log("多币文章/计划", "未能为本轮采样到有效的多币任务切片，跳过本轮")
-        return []
-
-    _log("多币文章/计划", "启动多币并发生成", 论据总池=len(usable_evidences),
-         覆盖币种=f"{len(coin_groups)}个: {sorted(coin_groups.keys())}",
-         独立采样任务=len(tasks), 并发=MULTI_ANALYSIS_CONCURRENCY)
-
-    results, raised, model_skips = [], 0, 0
-    with ThreadPoolExecutor(max_workers=MULTI_ANALYSIS_CONCURRENCY) as executor:
-        futures = {executor.submit(execute_multi_coin_article_task, task, manager): task for task in tasks}
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                res = future.result()
-                results.append(res)
-                model_skips += res.get("status") == "skip"
-            except Exception:
-                raised += 1
-                _log("多币文章/执行", "单任务生成异常", level="exception", 轮次=task.get("round_index"))
-
-    counts = Counter(item.get("status") for item in results)
-    _log("多币文章/汇总", "本轮多币生成结束", 总任务=len(tasks), 成功=counts["ok"],
-         模型跳过=model_skips, 失败=counts["error"] + raised, 耗时=f"{time.monotonic() - started:.2f}秒")
-    return results
-
-
-def generate_multi_analysis_articles():
-    _poll_generation(generate_multi_analysis_articles_once, "多币文章")
-
-
 def generate_viral_articles():
     _poll_generation(generate_viral_articles_once, "高流量")
 
@@ -2043,7 +1740,6 @@ def generate_viral_articles():
 
 
 # text/topic → 追加热门话题与币种标签后的正文；保留原标签顺序及重复标签。
-# : tag_count原本未参与逻辑；保留公开参数，但仍只取1个热门话题。
 def add_hot_topic_to_article(text, topic, tag_count=2):
     hashtags = [item["hashtag"] for item in fetch_binance_hot_hashtags()]
     tags = hashtags[:1] + [f"#{topic}", f"${topic} "]
@@ -2073,7 +1769,7 @@ def _build_publish_text_list(text):
     return result
 
 
-# 平台名称 → 该平台对应的账号发帖冷却秒数（对齐流量帖的平台差异化冷却配置）。
+# 平台名称 → 该平台对应的账号发帖冷却秒数。
 def _get_platform_cooldown_seconds(platform):
     if platform == PLATFORM_OKX:
         return OKX_ACCOUNT_COOLDOWN_SECONDS
@@ -2091,7 +1787,7 @@ def _normalize_hot_coins(hot_coins):
     return coins
 
 
-# article → (全部URL/路径集合, 统计用主地址列表)；同时兼容分析帖(image_placeholders)与流量帖(selected_images)。
+# article → (全部URL/路径/图片内容唯一ID集合, 统计用主标识列表)；同时兼容分析帖与流量帖。
 def _extract_article_image_addresses(article):
     info = article.get("article_info")
     if not isinstance(info, dict):
@@ -2107,15 +1803,18 @@ def _extract_article_image_addresses(article):
     for item in selected:
         if not isinstance(item, dict):
             continue
-        url, path = (item.get("original_url") or "").strip(), (item.get("local_path") or "").strip()
-        addresses.update(value for value in (url, path) if value)
-        if url or path:
-            primary.append(url or path)
+        url = (item.get("original_url") or "").strip()
+        path = (item.get("local_path") or "").strip()
+        content_id = (item.get("content_id") or "").strip() or get_image_content_id(path)
+        addresses.update(value for value in (url, path, content_id) if value)
+        primary_key = content_id or path or url
+        if primary_key:
+            primary.append(primary_key)
     return addresses, primary
 
 
-# 平台/小时窗口 → (全部URL与路径集合,统计用主地址列表,已发文章数)；跨文章类型去重。
-def _get_recent_published_image_usage(article_manager, platform, hours=6, now=None):
+# 平台/小时窗口 → (全部URL/路径/内容唯一ID集合, 统计用主标识列表, 已发文章数)；跨文章类型严格按视觉内容去重。
+def _get_recent_published_image_usage(article_manager, platform, hours=IMAGE_DEDUP_LOOKBACK_HOURS, now=None):
     recent = article_manager.find_articles(query={
         "status": "ok", f"publish_records.{platform}.status": "success",
         f"publish_records.{platform}.publish_time": {"$gte": (time.time() if now is None else now) - hours * 3600},
@@ -2127,11 +1826,12 @@ def _get_recent_published_image_usage(article_manager, platform, hours=6, now=No
         primary.extend(first)
     return addresses, primary, len(recent)
 
-# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却适用于单币和多币分析帖。
+
+# 账号状态、候选三元组列表 → 可发布索引或None；同主题冷却适用于单币分析帖。
 def _select_publish_candidate(account_state, candidates, now, used_addresses, article_type):
     history = account_state.get("topic_publish_history") or {}
     for index, (article, addresses, _) in enumerate(candidates):
-        if article_type in (ARTICLE_TYPE_ANALYSIS, ARTICLE_TYPE_MULTI_ANALYSIS):
+        if article_type == ARTICLE_TYPE_ANALYSIS:
             coins_to_check = article.get("coins") or ([article.get("topic")] if article.get("topic") else [])
             if any(now - history.get(c, 0) < ACCOUNT_TOPIC_COOLDOWN_SECONDS for c in coins_to_check if c):
                 continue
@@ -2142,7 +1842,6 @@ def _select_publish_candidate(account_state, candidates, now, used_addresses, ar
 
 
 # article{topic,article_info{text,image_placeholders,image_mapping}} → (最终正文,有序图片路径)。
-# : 字数限制仍只校验模型正文，后追加的标签/前缀/换行不重新计算。
 def _format_analysis_post_content(article, platform=PLATFORM_BINANCE):
     info = article["article_info"]
     topic, text = (article.get("topic") or "").strip(), info.get("text", "").strip()
@@ -2152,55 +1851,6 @@ def _format_analysis_post_content(article, platform=PLATFORM_BINANCE):
     text = adapter.decorate_analysis(text, topic) + "\n\n\n\n\n\n👇"
     if topic and not text.upper().startswith(f"${topic}".upper()):
         text = f"${topic} {text}"
-    mapping = info.get("image_mapping") or {}
-    paths = [mapping[key].get("local_path") for key in info.get("image_placeholders") or []
-             if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")]
-    return text, paths
-
-
-def _format_multi_analysis_post_content(article, platform=PLATFORM_BINANCE):
-    """
-    多币种聚合帖正文格式化：
-    - 正文各代币保留 Cashtag 格式 ($SYMBOL)；
-    - 首行仅保留核心主币 Cashtag 前缀 ($PRIMARY)，避免顶部堆砌过多币种；
-    - 文末仅保留核心主币标签及热门话题，清爽利落，避免尾部标签泛滥。
-    """
-    info = article["article_info"]
-    text = info.get("text", "").strip()
-    coins = [c for c in (article.get("coins") or []) if c]
-    if not coins and article.get("topic"):
-        coins = [article.get("topic").strip()]
-
-    # 正文保留所有提及币种的 Cashtag 格式，不修改正文内的币种表达
-    for c in coins:
-        text = re.sub(rf"(?<!\$)\b{re.escape(c)}\b", lambda _: f"${c} ", text, flags=re.IGNORECASE)
-
-    # 首行前缀：只保留核心主币，不再罗列所有币种
-    primary = article.get("primary_coin") or article.get("topic") or (coins[0] if coins else "")
-    cashtag_prefix = f"${primary}" if primary else ""
-    if cashtag_prefix and not text.upper().startswith(cashtag_prefix.upper()):
-        text = f"{cashtag_prefix}\n\n{text}"
-
-    # 文末标签：只追加核心主币标签与热门话题，不再追加所有币种
-    if platform == PLATFORM_BINANCE:
-        try:
-            hashtags = [item["hashtag"] for item in fetch_binance_hot_hashtags()]
-            tags = hashtags[:1]
-        except Exception:
-            tags = []
-        if primary:
-            tags.extend([f"#{primary}", f"${primary} "])
-        if tags:
-            text = text + "\n\n\n" + "\n".join(tags)
-    else:
-        tags = []
-        if primary:
-            tags.extend([f"#{primary}", f"${primary} "])
-        if tags:
-            text = text + "\n\n" + "\n".join(tags)
-
-    text = text + "\n\n\n\n\n\n👇"
-
     mapping = info.get("image_mapping") or {}
     paths = [mapping[key].get("local_path") for key in info.get("image_placeholders") or []
              if isinstance(mapping.get(key), dict) and mapping[key].get("local_path")]
@@ -2250,8 +1900,6 @@ def _ensure_account_state(state, platform, account, normalize_history=False):
     defaults = {
         "total_success": 0, "last_publish_time": 0, "last_error_msg": "", "last_error_time": 0,
         "topic_publish_history": {},
-        "multi_total_success": 0, "multi_last_publish_time": 0,
-        "multi_last_error_msg": "", "multi_last_error_time": 0,
         "viral_total_success": 0, "viral_last_publish_time": 0,
         "viral_last_error_msg": "", "viral_last_error_time": 0,
     }
@@ -2275,7 +1923,6 @@ def _load_and_init_publish_state():
 
 
 # field_updates:{状态字段:新值}、topic_update=(主题,时间)或None → 加锁局部更新并保存。
-# : 这是进程内文件锁；保留快照计算计数的方式，不宣称跨进程或文件/数据库原子事务。
 def _update_account_publish_state(platform, account, field_updates, topic_update=None):
     with STATE_FILE_LOCK:
         state = _read_publish_state()
@@ -2290,8 +1937,6 @@ def _update_account_publish_state(platform, account, field_updates, topic_update
 
 
 # article/plat_record/账号快照、远端确认结果 → 回写账号文件与数据库；返回失败说明或空串。
-# : 两次写入不是事务；分别尝试并报告已保存位置，异常必须上抛供调度边界处理。
-# : 优先使用原子 $set 回写当前平台记录，避免多平台并发发布或互动线程丢失更新。
 def _persist_publish_result(article_manager, platform, account, account_state, article, plat_record,
                             success, post_id, attempts, now, topic, latest_price, err_msg,
                             article_type, matched_coin=None):
@@ -2305,7 +1950,6 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
         }
         account_state.update(state_updates)
         if not viral and topic:
-            # 记录冷却：同时为所有关联代币刷新冷却时间
             all_topics = article.get("coins") or ([topic] if topic else [])
             for c in all_topics:
                 if c:
@@ -2339,7 +1983,6 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
             article["publish_records"] = {}
         article["publish_records"][platform] = plat_record
 
-        # 优化：支持 MongoDB 原生 update_one 原子 $set，防止多平台/互动并发写入互相覆盖
         article_id = article.get("article_id")
         if article_id and hasattr(article_manager, "db") and hasattr(article_manager.db, "get_collection"):
             col = article_manager.db.get_collection(article_manager.collection_name)
@@ -2361,12 +2004,7 @@ def _persist_publish_result(article_manager, platform, account, account_state, a
 def _collect_publish_candidates(article_manager, platform, hot_coins, used_addresses, article_type):
     rule = PUBLISH_RULES[article_type]
     viral = article_type == ARTICLE_TYPE_VIRAL
-    if viral:
-        type_query = ARTICLE_TYPE_VIRAL
-    elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
-        type_query = ARTICLE_TYPE_MULTI_ANALYSIS
-    else:
-        type_query = ARTICLE_TYPE_ANALYSIS
+    type_query = ARTICLE_TYPE_VIRAL if viral else ARTICLE_TYPE_ANALYSIS
 
     raw = article_manager.find_articles(query={
         "type": type_query,
@@ -2386,7 +2024,6 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
             stats["version"] += 1
             continue
 
-        # 先提取正文字段，用于后续结构校验及竞品词排斥校验
         text_content = info.get(rule["text"]) if isinstance(info, dict) else None
 
         if (not isinstance(info, dict) or info.get("status") != "ok"
@@ -2398,7 +2035,6 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
             stats["structure"] += 1
             continue
 
-        # --- 新增：竞品词排斥校验（检查正文、神评/诱导评论） ---
         comments_list = info.get("bait_comments", []) if viral else info.get("god_comments", [])
         comments_text = " ".join([str(c) for c in comments_list if c])
         full_check_text = (text_content + " " + comments_text).lower()
@@ -2409,14 +2045,12 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
         elif platform == PLATFORM_OKX and ("binance" in full_check_text or "币安" in full_check_text):
             stats["rival_keyword"] += 1
             continue
-        # --------------------------------------------------------
 
         record = (article.get("publish_records") or {}).get(platform) or {}
         if record.get("attempts", 0) >= PUBLISH_MAX_ATTEMPTS:
             stats["attempts"] += 1
             continue
 
-        # 流量类型帖子来源错开：向欧易发布时，文章来源不能为欧易自身
         if viral and platform == PLATFORM_OKX:
             article_source = str(article.get("source") or "").strip().lower()
             if article_source == OKX_SOURCE.lower():
@@ -2431,13 +2065,6 @@ def _collect_publish_candidates(article_manager, platform, hot_coins, used_addre
                 original_text if isinstance(original_text, str) else "",
             ))
             matched_coin = next((coin for coin, pattern in patterns if pattern.search(clean)), None)
-        elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
-            art_coins = [c for c in (article.get("coins") or []) if c]
-            if not art_coins and article.get("topic"):
-                art_coins = [article.get("topic")]
-            matched_coin = next((c for c in art_coins if c.lower() in hot_set), None)
-            if not matched_coin and art_coins:
-                matched_coin = art_coins[0]
         else:
             topic = (article.get("topic") or "").strip()
             matched_coin = topic if topic and topic.lower() in hot_set else None
@@ -2467,18 +2094,18 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
     viral = article_type == ARTICLE_TYPE_VIRAL
     platform_state = _load_and_init_publish_state()[platform]
     cooldown = _get_platform_cooldown_seconds(platform)
+    dedup_hours = max(rule["hours"], IMAGE_DEDUP_LOOKBACK_HOURS)
     used_addresses, used_primary, recent_count = _get_recent_published_image_usage(
-        article_manager, platform, hours=rule["hours"], now=now if viral else None,
+        article_manager, platform, hours=dedup_hours, now=now,
     )
     candidates, raw_count, stats = _collect_publish_candidates(
         article_manager, platform, hot_coins, used_addresses, article_type,
     )
 
-    # 过滤日志中补充了 竞品词{stats['rival_keyword']} 的统计打点
     _log(f"{rule['action']}/计划", "候选已按评分降序排列", 平台=platform, 窗口=f"{rule['hours']}小时",
-         查询=raw_count, 候选=len(candidates),
+         图片去重窗口=f"{dedup_hours}小时", 查询=raw_count, 候选=len(candidates),
          过滤=f"版本{stats['version']}/结构{stats['structure']}/尝试超限{stats['attempts']}/来源冲突{stats['source_conflict']}/竞品词{stats['rival_keyword']}/非热币{stats['no_hot_coin']}/图片缺失{stats['invalid_image']}/图片重复{stats['image_dup']}",
-         已发=recent_count, 占用图片=len(set(used_primary)) if viral else len(used_primary),
+         已发=recent_count, 占用图片=len(set(used_primary)),
          账号数=len(accounts), 冷却=f"{cooldown}秒，按文章类型独立计算",
          主题冷却="无" if viral else f"{ACCOUNT_TOPIC_COOLDOWN_SECONDS}秒")
 
@@ -2504,31 +2131,26 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
         try:
             if viral:
                 text, paths = _format_viral_post_content(info, matched_coin)
-            elif article_type == ARTICLE_TYPE_MULTI_ANALYSIS:
-                text, paths = _format_multi_analysis_post_content(article, platform=platform)
             else:
-                # : 原调用遗漏platform，OKX分析帖也使用Binance标签；为功能保真保留默认值。
                 text, paths = _format_analysis_post_content(article, platform=platform)
 
             session_dir = _get_account_session_dir(platform, account)
             attempts = record.get("attempts", 0) + 1
             stage, api_result = "调用发布接口", "未知"
             chart_coin = None if viral else (article.get("primary_coin") or topic)
-            sentiment_tag = None if (viral or article_type == ARTICLE_TYPE_MULTI_ANALYSIS) else stance
+            sentiment_tag = None if viral else stance
             err, success, post_id = _execute_platform_post(
                 platform, session_dir, text, paths, topic=chart_coin, stance=sentiment_tag,
             )
             post_id, api_result = str(post_id), "成功" if success else "失败"
-            latest_price = None if (viral or article_type == ARTICLE_TYPE_MULTI_ANALYSIS) else _safe_get_latest_price(platform, topic)
-            if success and viral:
+            latest_price = None if viral else _safe_get_latest_price(platform, topic)
+            if success:
                 used_addresses.update(addresses)
             stage = "保存已确认的发布结果"
             error = _persist_publish_result(
                 article_manager, platform, account, account_state, article, record,
                 success, post_id, attempts, now, topic, latest_price, err, article_type, matched_coin,
             )
-            if success and not viral:
-                used_addresses.update(addresses)
         except Exception as exc:
             raise RuntimeError(
                 f"{rule['action']}阶段[{stage}]失败 | 平台: [{platform}] | 账号: [{account}] "
@@ -2543,12 +2165,9 @@ def _publish_articles_for_platform(article_manager, platform, hot_coins, article
              耗时=f"{time.monotonic() - started:.2f}秒", 结果=api_result,
              说明="远端发布与本地回写完成" if success else error)
 
+
 def _publish_analysis_articles_for_platform(article_manager, platform, hot_coins):
     _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_ANALYSIS)
-
-
-def _publish_multi_analysis_articles_for_platform(article_manager, platform, hot_coins):
-    _publish_articles_for_platform(article_manager, platform, hot_coins, ARTICLE_TYPE_MULTI_ANALYSIS)
 
 
 def _publish_viral_articles_for_platform(article_manager, platform, hot_coins):
@@ -2568,10 +2187,6 @@ def _publish_on_platforms(article_manager, publish_one_platform, action):
 
 def _publish_articles_once(article_manager):
     _publish_on_platforms(article_manager, _publish_analysis_articles_for_platform, "单币分析发布")
-
-
-def _publish_multi_analysis_articles_once(article_manager):
-    _publish_on_platforms(article_manager, _publish_multi_analysis_articles_for_platform, "多币分析发布")
 
 
 def _publish_viral_articles_once(article_manager):
@@ -2603,16 +2218,6 @@ def auto_publish_articles():
     )
 
 
-# 独立文章管理器 → 多币分析帖发布轮询 (独立控制)；每轮结束后等待600秒。
-def auto_publish_multi_analysis_articles():
-    _poll_task(
-        _publish_multi_analysis_articles_once,
-        GeneratedArticleManager(gen_db_object()),
-        PUBLISH_POLL_SECONDS,
-        "多币分析发布",
-    )
-
-
 # 独立文章管理器 → 流量帖发布轮询；每轮结束后等待600秒。
 def auto_publish_viral_articles():
     _poll_task(
@@ -2623,7 +2228,7 @@ def auto_publish_viral_articles():
     )
 
 
-# 七、互动与历史清理：Binance专有能力保留在独立处理链路
+# 七、互动与历史/指定时间段清理
 
 
 # action、是否保留用户信息 → ({account:{cookies,csrf_token,user_info?}},异常账号数)；逐账号隔离故障。
@@ -2652,23 +2257,29 @@ def _load_account_credentials(action, with_user_info=False):
 
 
 # 评论列表/账号列表/帖子/立场/平台 → {评论文本:{account,comment_id,success,error_info}}。
-# : 仍按评论文本作键，重复文本覆盖；会话读取仍在发送异常隔离之外。
-def interact_comment(god_comments, other_account_list, post_id, stance, platform=PLATFORM_BINANCE, max_count=2):
-
-
+# 默认 max_count=1（每次随机抽 1 个非发布者账号评论），并支持透传 like 参数控制是否顺带点赞。
+def interact_comment(
+    god_comments,
+    other_account_list,
+    post_id,
+    stance,
+    platform=PLATFORM_BINANCE,
+    max_count=1,
+    like=False,
+):
     results, unconfirmed, raised = {}, 0, 0
-    accounts = random.sample(other_account_list, len(other_account_list))
-    # 最多只保留 other_account_list 中的前 max_count 个账号，避免过多重复评论。
-    if max_count > 0:
-        accounts = accounts[:max_count]
-
+    if not other_account_list or not god_comments or max_count <= 0:
+        return results
+    accounts = random.sample(other_account_list, len(other_account_list))[:max_count]
 
     for account, text in zip(accounts, god_comments):
         session_dir = _get_account_session_dir(platform, account)
         try:
             if platform not in PLATFORMS:
                 raise ValueError(f"不支持的评论互动平台: {platform}")
-            error, success, comment_id = PLATFORMS[platform].comment(session_dir, post_id, text, stance)
+            error, success, comment_id = PLATFORMS[platform].comment(
+                session_dir, post_id, text, stance, like=like,
+            )
             results[f"{text}"] = {
                 "account": account, "comment_id": str(comment_id) if comment_id else "",
                 "success": success, "error_info": error,
@@ -2686,21 +2297,29 @@ def interact_comment(god_comments, other_account_list, post_id, stance, platform
     return results
 
 
-# 近24小时已发布文章 → 平台互动与批量回写；Binance先点赞收藏，两个平台均排除发布者评论。
-# : 保留“尝试后标记完成”的业务规则，即使没有其他账号、无评论或全部发送失败。
+# 近24小时已发布文章 → 按 INTERACTION_CONFIG 执行可配置点赞与互评（默认取消 OKX 互评与点赞，互评账号数默认 1）。
 def _interact_for_platform(article_manager, platform, cutoff_ts):
     started = time.monotonic()
+    cfg = INTERACTION_CONFIG.get(platform) or {}
+    enable_like = bool(cfg.get("enable_like", False))
+    enable_comment = bool(cfg.get("enable_comment", False))
+    max_comment_accounts = int(cfg.get("max_comment_accounts", 1))
+
+    if not enable_like and not enable_comment:
+        _log("互动/跳过", "当前平台已在 INTERACTION_CONFIG 中关闭点赞与互评", 平台=platform)
+        return
+
     binance = platform == PLATFORM_BINANCE
     credentials = {}
     accounts = ACCOUNTS if binance else list(PLATFORM_ACCOUNTS.get(platform) or [])
-    if binance:
+    if binance and enable_like:
         credentials, _ = _load_account_credentials("互动")
         if not credentials:
             _log("互动/跳过", "无可用凭证，暂不处理该平台", level="warning",
                  平台=platform, 账号数=len(accounts), 排查="恢复账号登录与浏览器会话")
             return
-    if not binance and not accounts:
-        _log("互动/跳过", "未配置互动账号", level="warning", 平台=platform, 排查="检查OKX账号配置")
+    if not accounts:
+        _log("互动/跳过", "未配置互动账号", level="warning", 平台=platform)
         return
     articles = article_manager.find_articles(query={
         "status": "ok", f"publish_records.{platform}.status": "success",
@@ -2717,7 +2336,7 @@ def _interact_for_platform(article_manager, platform, cutoff_ts):
         _log("互动/完成", "没有可提交帖子", 平台=platform, 待处理=0,
              耗时=f"{time.monotonic() - started:.2f}秒")
         return
-    if binance:
+    if binance and enable_like:
         try:
             like_and_bookmark(post_ids, credentials)
         except Exception:
@@ -2728,22 +2347,38 @@ def _interact_for_platform(article_manager, platform, cutoff_ts):
     for article in pending:
         record = article["publish_records"][platform]
         other_accounts = [account for account in accounts if account != record.get("published_by")]
-
-
-
         info = article.get("article_info") or {}
         comments = info.get("bait_comments") if article.get("type") == ARTICLE_TYPE_VIRAL else info.get("god_comments")
         raw_stance = article.get("stance")
         sentiment = raw_stance if binance and raw_stance in ("看多", "看空") else None
-        if binance or other_accounts:
-            record["comment_interact_info"] = interact_comment(
-                comments or [], other_accounts, record.get("post_id"), sentiment, platform=platform,
-            )
+
+        if enable_comment and max_comment_accounts > 0:
+            if other_accounts:
+                record["comment_interact_info"] = interact_comment(
+                    comments or [],
+                    other_accounts,
+                    record.get("post_id"),
+                    sentiment,
+                    platform=platform,
+                    max_count=max_comment_accounts,
+                    like=(enable_like and not binance),
+                )
+            else:
+                _log("互动/跳过", "排除发帖账号后没有其他互动账号", level="warning",
+                     平台=platform, 帖子=record.get("post_id"), 发布者=record.get("published_by"))
+                record["comment_interact_info"] = {}
+        elif not binance and enable_like and other_accounts:
+            # OKX 仅开启点赞、未开启评论时，随机选 max(1, max_comment_accounts) 个其他账号执行纯点赞
+            like_accounts = random.sample(other_accounts, len(other_accounts))[:max(1, max_comment_accounts)]
+            like_results = {}
+            for acc in like_accounts:
+                session_dir = _get_account_session_dir(platform, acc)
+                err, ok, _ = PLATFORMS[platform].comment(session_dir, record.get("post_id"), "", sentiment, like=True)
+                like_results[f"like_by_{acc}"] = {"account": acc, "success": ok, "error_info": err}
+            record["comment_interact_info"] = like_results
         else:
-            _log("互动/跳过", "排除发帖账号后没有其他互动账号，仍按原规则标记完成", level="warning",
-                 平台=platform, 帖子=record.get("post_id"), 发布者=record.get("published_by"),
-                 排查="检查是否只配置了发布者一个账号")
             record["comment_interact_info"] = {}
+
         record["interacted"], record["interaction_time"] = True, interacted_at
     try:
         article_manager.upsert_articles(pending)
@@ -2752,10 +2387,10 @@ def _interact_for_platform(article_manager, platform, cutoff_ts):
              记录=len(pending), 排查="检查数据库；重试前核对已完成的远端互动")
         return
     _log("互动/完成", "接口已返回且状态已保存", 平台=platform, 帖数=len(pending),
-         账号数=len(credentials) if binance else len(accounts), 耗时=f"{time.monotonic() - started:.2f}秒")
+         点赞=enable_like, 互评=enable_comment, 互评账号上限=max_comment_accounts,
+         耗时=f"{time.monotonic() - started:.2f}秒")
 
 
-# 不增加新的顶层异常隔离：Binance未处理异常仍终止本轮，交给原有轮询边界。
 def _hudong_once(article_manager):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).timestamp()
     _interact_for_platform(article_manager, PLATFORM_BINANCE, cutoff)
@@ -2767,12 +2402,299 @@ def hudong():
     _poll_task(_hudong_once, GeneratedArticleManager(gen_db_object()), INTERACTION_INTERVAL_SECONDS, "互动")
 
 
+# 解析时间边界参数（支持 None、秒/毫秒时间戳、datetime、"YYYY-MM-DD" 或 "YYYY-MM-DD HH:MM:SS"）
+def _parse_time_bound(value, default_ts, is_end=False):
+    if value is None:
+        return default_ts
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return _publish_time_seconds(value)
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo is not None else value.replace(tzinfo=BEIJING_TZ)
+        return dt.timestamp()
+    if isinstance(value, str):
+        text = value.strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text, fmt).replace(tzinfo=BEIJING_TZ)
+                if fmt == "%Y-%m-%d" and is_end:
+                    dt = dt + timedelta(days=1) - timedelta(seconds=1)
+                return dt.timestamp()
+            except ValueError:
+                continue
+    raise ValueError(f"无法解析时间参数: {value!r}")
+
+
+def delete_posts_by_account_and_time(
+    platform=PLATFORM_OKX,
+    accounts=None,
+    start_time=None,
+    end_time=None,
+    days=3,
+    extra_post_ids=None,
+    sync_db=True,
+    debug=False,
+):
+    """删除指定平台、指定账号在指定时间段内的所有帖子（默认删除最近 3 天的所有帖子）。
+
+    参数:
+        platform (str): 目标平台，"okx" 或 "binance"，默认 "okx"。
+        accounts (list[str] | str | None): 指定账号列表（如 ["myself", "mama"] 或 "myself"），None 表示该平台全部账号。
+        start_time (str | float | datetime | None): 起始时间（支持 "YYYY-MM-DD"、"YYYY-MM-DD HH:MM:SS" 或时间戳），
+            为 None 时默认取 `end_time - days * 86400`（即最近 days 天）。
+        end_time (str | float | datetime | None): 结束时间，为 None 时默认取当前时间。
+        days (float): 当 start_time 为 None 时，默认向前追溯的天数（默认 3 天）。
+        extra_post_ids (list[str] | dict[str, list[str]] | None): 额外补充要强制删除的 post_id 列表或 {account: [post_ids]} 映射。
+        sync_db (bool): 删除成功后是否同步在 MongoDB generated_articles 中标记 delete_time 并清理 social_media_posts 中的自爬脏数据。
+        debug (bool): 是否开启浏览器可视化调试模式。
+
+    返回:
+        dict: 各账号的删除统计汇总 `{account: {"target_count": int, "deleted": list, "failed": list}}`。
+    """
+    started = time.monotonic()
+    now = time.time()
+    end_ts = _parse_time_bound(end_time, now, is_end=True)
+    start_ts = _parse_time_bound(start_time, end_ts - float(days) * 86400.0, is_end=False)
+    start_str = datetime.fromtimestamp(start_ts, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    end_str = datetime.fromtimestamp(end_ts, BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+    if isinstance(accounts, str):
+        target_accounts = [accounts.strip()] if accounts.strip() else []
+    elif isinstance(accounts, (list, tuple, set)):
+        target_accounts = [str(a).strip() for a in accounts if str(a).strip()]
+    else:
+        target_accounts = list(PLATFORM_ACCOUNTS.get(platform) or [])
+
+    if not target_accounts:
+        _log("按时间删帖/跳过", "未找到有效目标账号", level="warning", 平台=platform)
+        return {}
+
+    article_manager = GeneratedArticleManager(gen_db_object())
+    post_manager = UniversalPostManager(gen_db_object())
+
+    # 1. 从 generated_articles 收集各账号在 [start_ts, end_ts] 内发布的 post_id
+    account_post_ids = {acc: [] for acc in target_accounts}
+    articles_by_post_id = defaultdict(list)
+
+    all_published_articles = article_manager.find_articles(
+        query={
+            f"publish_records.{platform}.post_id": {"$exists": True, "$ne": None},
+        },
+        limit=0,
+    ) or []
+
+    for art in all_published_articles:
+        rec = ((art.get("publish_records") or {}).get(platform)) or {}
+        pid = str(rec.get("post_id") or "").strip()
+        if not pid or pid == "None":
+            continue
+        articles_by_post_id[pid].append(art)
+        if rec.get("delete_time"):
+            continue
+        pub_by = str(rec.get("published_by") or "").strip()
+        if pub_by not in account_post_ids:
+            continue
+        raw_pub_time = rec.get("publish_time")
+        if raw_pub_time is not None:
+            try:
+                pub_ts = _publish_time_seconds(raw_pub_time)
+            except ValueError:
+                pub_ts = None
+        else:
+            created_at = art.get("created_at")
+            pub_ts = created_at.timestamp() if isinstance(created_at, datetime) else None
+        if pub_ts is not None and start_ts <= pub_ts <= end_ts:
+            account_post_ids[pub_by].append(pid)
+
+    # 2. 从 social_media_posts 补充扫描自家账号在 [start_ts, end_ts] 内被抓回来的帖子（防止 publish_records 漏记或被覆盖）
+    uid_to_account = {}
+    if platform == PLATFORM_OKX:
+        uid_to_account = {uid: acc for acc, uid in OKX_ACCOUNT_UID_MAP.items() if acc in account_post_ids}
+    elif platform == PLATFORM_BINANCE:
+        uid_to_account = {uname: acc for acc, uname in BINANCE_ACCOUNT_USERNAME_MAP.items() if acc in account_post_ids}
+
+    if uid_to_account:
+        raw_posts = _find_posts_by_sources(post_manager, sources=(platform,), limit=POST_QUERY_LIMIT)
+        for p in raw_posts:
+            pid = str(p.get("post_id") or "").strip()
+            if not pid:
+                continue
+            author = p.get("author") or {}
+            aid = str(
+                p.get("author_id")
+                or author.get("author_id")
+                or author.get("id")
+                or author.get("uid")
+                or author.get("username")
+                or ""
+            ).strip()
+            acc = uid_to_account.get(aid)
+            if not acc:
+                continue
+            try:
+                p_ts = _publish_time_seconds(p.get("publish_time", 0))
+            except ValueError:
+                continue
+            if start_ts <= p_ts <= end_ts:
+                account_post_ids[acc].append(pid)
+
+    # 3. 合并 extra_post_ids
+    if isinstance(extra_post_ids, dict):
+        for acc, pids in extra_post_ids.items():
+            if acc in account_post_ids and pids:
+                account_post_ids[acc].extend(str(x).strip() for x in pids if str(x).strip())
+    elif isinstance(extra_post_ids, (list, tuple, set)) and target_accounts:
+        for pid in extra_post_ids:
+            if str(pid).strip():
+                account_post_ids[target_accounts[0]].append(str(pid).strip())
+
+    # 对每个账号的 post_id 保序去重
+    for acc in target_accounts:
+        account_post_ids[acc] = list(dict.fromkeys(account_post_ids[acc]))
+
+    _log(
+        "按时间删帖/计划",
+        "已汇总待删帖清单",
+        平台=platform,
+        时间段=f"{start_str} ~ {end_str}",
+        账号清单={acc: len(pids) for acc, pids in account_post_ids.items()},
+    )
+
+    summary = {}
+    credentials = {}
+    if platform == PLATFORM_BINANCE:
+        credentials, _ = _load_account_credentials("按时间删帖", with_user_info=True)
+
+    for acc in target_accounts:
+        pids = account_post_ids.get(acc) or []
+        deleted_list, failed_list = [], []
+
+        if platform == PLATFORM_OKX:
+            okx_uid = OKX_ACCOUNT_UID_MAP.get(acc)
+            if okx_uid:
+                try:
+                    remote_okx_items = fetch_okx_user_timeline(
+                        author_id=okx_uid,
+                        max_pages=60,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                    ) or []
+                    for item in remote_okx_items:
+                        rid = str(item.get("post_id") or "").strip()
+                        if rid and rid not in pids:
+                            pids.append(rid)
+                except Exception as exc:
+                    _log("按时间删帖/远端扫描", "拉取 OKX 远端主页帖子列表异常，继续按已知ID删除", level="warning", 账号=acc, 原因=exc)
+            if not pids:
+                summary[acc] = {"target_count": 0, "deleted": [], "failed": []}
+                continue
+            session_dir = _get_account_session_dir(PLATFORM_OKX, acc)
+            _, _, detail = delete_okx_posts(post_id_list=pids, user_data_dir=session_dir, debug=debug)
+            detail = detail or {}
+            deleted_list.extend(str(x) for x in (detail.get("success_ids") or []))
+            failed_list.extend(str(x) for x in ((detail.get("failed_ids") or {}).keys()))
+        elif platform == PLATFORM_BINANCE:
+            cred = credentials.get(acc)
+            if not cred:
+                _log("按时间删帖/跳过", "Binance 账号凭证不可用", level="warning", 账号=acc)
+                summary[acc] = {"target_count": len(pids), "deleted": [], "failed": pids}
+                continue
+            # 同时扫描远端历史列表在 [start_ts, end_ts] 内的帖子
+            square_uid = (cred.get("user_info") or {}).get("squareUid")
+            if square_uid:
+                try:
+                    remote_items = fetch_binance_square_replies(
+                        target_square_uid=square_uid,
+                        cookies=cred["cookies"],
+                        csrf_token=cred["csrf_token"],
+                        limit=1000,
+                        time_offset=int(end_ts * 1000),
+                    ) or []
+                    for item in remote_items:
+                        rid = str(item.get("reply_id") or "").strip()
+                        r_ts = item.get("create_time") or item.get("publish_time")
+                        if rid:
+                            if r_ts is not None:
+                                try:
+                                    if not (start_ts <= _publish_time_seconds(r_ts) <= end_ts):
+                                        continue
+                                except ValueError:
+                                    pass
+                            if rid not in pids:
+                                pids.append(rid)
+                except Exception as exc:
+                    _log("按时间删帖/远端扫描", "拉取 Binance 远端帖子列表异常，继续按已知ID删除", level="warning", 账号=acc, 原因=exc)
+
+            for pid in pids:
+                try:
+                    ok = delete_binance_square_content(
+                        content_id=pid, cookies=cred["cookies"], csrf_token=cred["csrf_token"],
+                    )
+                    if ok:
+                        deleted_list.append(pid)
+                    else:
+                        failed_list.append(pid)
+                except Exception:
+                    failed_list.append(pid)
+
+        summary[acc] = {
+            "target_count": len(pids),
+            "deleted": deleted_list,
+            "failed": failed_list,
+        }
+
+        if sync_db and deleted_list:
+            deleted_at = time.time()
+            checked_at = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+            reason_str = f"按时间段批量清理 ({start_str} ~ {end_str})"
+            updated_articles = []
+            for pid in deleted_list:
+                for art in articles_by_post_id.get(pid, []):
+                    p_rec = art.setdefault("publish_records", {}).setdefault(platform, {})
+                    p_rec.update(
+                        delete_time=deleted_at,
+                        delete_reason=reason_str,
+                        check_time=checked_at,
+                    )
+                    updated_articles.append(art)
+            if updated_articles:
+                try:
+                    article_manager.upsert_articles(updated_articles)
+                except Exception as exc:
+                    _log("按时间删帖/回写", "回写 generated_articles 删除状态异常", level="warning", 账号=acc, 原因=exc)
+            try:
+                if hasattr(post_manager, "collection"):
+                    q_ids = list(deleted_list) + [int(x) for x in deleted_list if x.isdigit()]
+                    post_manager.collection.delete_many({"post_id": {"$in": q_ids}})
+            except Exception as exc:
+                _log("按时间删帖/清理原帖", "清理 social_media_posts 自爬记录异常", level="warning", 账号=acc, 原因=exc)
+
+        _log(
+            "按时间删帖/账号完成",
+            "账号时间段帖子清理完毕",
+            平台=platform,
+            账号=acc,
+            目标数=len(pids),
+            成功删除=len(deleted_list),
+            失败数=len(failed_list),
+        )
+
+    _log(
+        "按时间删帖/汇总",
+        "全部指定账号删帖任务结束",
+        平台=platform,
+        时间段=f"{start_str} ~ {end_str}",
+        总成功=sum(len(v["deleted"]) for v in summary.values()),
+        总失败=sum(len(v["failed"]) for v in summary.values()),
+        耗时=f"{time.monotonic() - started:.2f}秒",
+    )
+    return summary
+
+
 # article{stance, publish_records.binance}、当前秒、prices=None或(发布价,现价) → (删除原因或None,是否更新涨跌幅)。
 def _article_delete_reason(article, now, prices):
     b_rec = ((article.get("publish_records") or {}).get(PLATFORM_BINANCE)) or {}
     price_updated = prices is not None
-    # 多币种与流量帖跳过逆向价格计算，仅依赖超时自动清理，避免单币波动误删多币种/对比分析帖
-    if article.get("type") in (ARTICLE_TYPE_MULTI_ANALYSIS, ARTICLE_TYPE_VIRAL):
+    if article.get("type") == ARTICLE_TYPE_VIRAL:
         prices = None
         price_updated = False
     elif price_updated:
@@ -2800,7 +2722,6 @@ def _article_delete_reason(article, now, prices):
 
 
 # 已发Binance文章/远端历史 → 按逆向行情或7天时效删除，回写publish_records.binance。
-# : 远端兜底仍只传time_offset，不追加本地时间判定；依赖历史API的既有筛选语义。
 def _delete_old_posts_once(article_manager):
     started, now = time.monotonic(), time.time()
     reverse_count = timeout_count = failed = 0
@@ -2976,83 +2897,7 @@ def delete_old_post():
     _poll_task(_delete_old_posts_once, GeneratedArticleManager(gen_db_object()), DELETE_INTERVAL_SEC, "历史清理")
 
 
-# 八、人工查询与复盘入口：保留公开函数及输入/输出形状
-
-
-# 手动搜索文本入口：post{content,logic_mul:[{visual_fact,semantic_core,narrative_role}]} → str。
-# : 此公开入口使用旧列表契约，不能传入当前evidences字典；保留调用行为而不猜测迁移规则。
-def build_search_text(post):
-    content = post.get("content") or {}
-    text = MEDIA_PATTERN.sub("", content.get("text_content") or "").strip()
-    coins = content.get("mentioned_coins") or []
-    parts = [f"【文章正文】\n{text}\n关联币种：{', '.join(coins) if coins else '无'}\n"]
-    for index, media in enumerate(post.get("logic_mul") or [], 1):
-        visual, semantic, narrative = (media.get("visual_fact", {}), media.get("semantic_core", {}),
-                                       media.get("narrative_role", {}))
-        concepts = ", ".join(semantic.get("concepts", []) + visual.get("entities", []))
-        logic = f"{semantic.get('message', '')} {narrative.get('logic_bridge', '')}".strip()
-        parts.append(
-            f"\n【配图{index}语义解析】\n核心概念：{concepts}\n画面描述：{visual.get('description', '')}\n"
-            f"图文逻辑：{logic}\n关键数据(OCR)：{visual.get('ocr_text', '')}\n"
-        )
-    return "".join(parts).strip()
-
-
-# 手动媒体分块入口：post列表{content,logic_mul.images} → [{doc_id,content:[文本/媒体块]}]。
-# : 此公开入口读取旧顶层images，不自动把当前evidences投射成旧结构。
-def process_posts(post_list):
-    results = []
-    for index, post in enumerate(post_list, 1):
-        doc_id = f"d_{index}"
-        text = (post.get("content") or {}).get("text_content") or ""
-        images = (post.get("logic_mul") or {}).get("images", [])
-        blocks, counters, last_end = [], {"IMAGE": 0, "VIDEO": 0}, 0
-        for match in MEDIA_PATTERN.finditer(text):
-            before = text[last_end:match.start()].strip()
-            if before:
-                blocks.append({"type": "text", "text": before})
-            kind = "VIDEO" if match.group(1) == "视频" else "IMAGE"
-            image = images[counters["IMAGE"]] if kind == "IMAGE" and counters["IMAGE"] < len(images) else {}
-            counters[kind] += 1
-            visual = image.get("visual_fact", {})
-            prefix = "VID" if kind == "VIDEO" else "IMG"
-            blocks.append({
-                "type": "video" if kind == "VIDEO" else "image", "desc": visual.get("fact", ""),
-                "ocr": visual.get("ocr_text", ""), "logic": image.get("semantic_core", {}).get("message", ""),
-                "placeholder": f"[{prefix}_{doc_id}_{kind}_{counters[kind]:02d}]",
-            })
-            last_end = match.end()
-        remaining = text[last_end:].strip()
-        if remaining:
-            blocks.append({"type": "text", "text": remaining})
-        results.append({"doc_id": doc_id, "content": blocks})
-    return results
-
-
-# 无入参 → [{text_content,logic_mul}]；保留历史媒体结构判据，含图记录稳定优先。
-def get_all_non_empty_logic_mul_with_clean_text():
-    manager = UniversalPostManager(gen_db_object())
-    posts = _find_posts_by_sources(manager, limit=POST_QUERY_LIMIT)
-    results = [{"text_content": MEDIA_PATTERN.sub("", (post.get("content") or {}).get("text_content") or "").strip(),
-                "logic_mul": post["logic_mul"]} for post in posts if post.get("logic_mul")]
-
-    def has_images(data):
-        if isinstance(data, list):
-            return bool(data)
-        if not isinstance(data, dict):
-            return False
-        images = data.get("images")
-        if isinstance(images, list) and images:
-            return True
-        evidences = data.get("evidences")
-        return isinstance(evidences, list) and any(
-            isinstance(item, dict) and isinstance(item.get("images"), list) and bool(item["images"])
-            for item in evidences
-        )
-
-    results.sort(key=lambda item: not has_images(item["logic_mul"]))
-    logger.info("[数据/导出] 正文已清洗，含图优先 | 扫描: [%s] | 导出: [%s]", len(posts), len(results))
-    return results
+# 八、人工查询与复盘入口
 
 
 # 文章列表{article_info,creation_brief} → 仅含正文/神评/配图/素材ID与创作brief的列表。
@@ -3093,22 +2938,7 @@ def get_need_check_article_info():
         post_manager = UniversalPostManager(gen_db_object())
         ids = list(raw_ids)
         query_ids = ids + [int(post_id) for post_id in ids if post_id.isdigit()]
-        query = {"post_id": {"$in": query_ids}}
-        raw_posts = []
-        try:
-            if hasattr(post_manager, "collection"):
-                raw_posts = list(post_manager.collection.find(query))
-            elif hasattr(post_manager, "find_posts"):
-                raw_posts = post_manager.find_posts(query=query) or []
-            else:
-                posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
-                target_ids = set(query_ids)
-                raw_posts = [post for post in posts if post.get("post_id") in target_ids]
-        except Exception:
-            logger.exception(
-                "❌ [文章/待审查] 关联原帖查询失败 | 原帖ID数: [%s] | 后续: [返回文章及空素材] "
-                "| 排查: [检查数据库连接与原帖查询接口]", len(query_ids),
-            )
+        raw_posts = post_manager.find_posts(query={"post_id": {"$in": query_ids}}, limit=0) or []
         source_posts = [{"origin_content": (post.get("content") or {}).get("text_content", ""),
                          "logic_mul": post.get("logic_mul")} for post in raw_posts if isinstance(post, dict)]
     logger.info(
@@ -3119,7 +2949,6 @@ def get_need_check_article_info():
 
 
 # 关键字、小时数、最低浏览量 → [{text_content,images,engagement{view_count,like_count,comment_count}}]。
-# : 数据库分支用正则、兜底分支用字面子串；查询时间仍按秒比较，未自动兼容毫秒存储。
 def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
     manager = UniversalPostManager(gen_db_object())
     start_time = time.time() - hours * 3600
@@ -3128,26 +2957,7 @@ def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
         "engagement.view_count": {"$gte": min_views},
         "content.text_content": {"$regex": target_key, "$options": "i"},
     }
-    sort = [("engagement.view_count", -1)]
-    try:
-        if hasattr(manager, "collection"):
-            posts = list(manager.collection.find(query).sort(sort))
-        elif hasattr(manager, "find_posts"):
-            posts = manager.find_posts(query=query, sort=sort)
-        else:
-            raw_posts = _find_posts_by_sources(manager, limit=5000)
-            posts = [post for post in raw_posts
-                     if post.get("publish_time", 0) >= start_time
-                     and post.get("engagement", {}).get("view_count", 0) >= min_views
-                     and target_key.lower() in (post.get("content", {}).get("text_content", "") or "").lower()]
-            posts.sort(key=lambda post: post.get("engagement", {}).get("view_count", 0), reverse=True)
-    except Exception:
-        logger.exception(
-            "❌ [数据/查询] 热门帖查询失败 | 关键字: [%s] | 时长: [%s 小时] | 最低浏览量: [%s] "
-            "| 后续: [沿用空列表返回] | 排查: [检查正则表达式、数据库连接与帖子字段]",
-            target_key, hours, min_views,
-        )
-        return []
+    posts = manager.find_posts(query=query, sort=[("engagement.view_count", -1)], limit=0) or []
     results = []
     for post in posts:
         engagement = post.get("engagement") or {}
@@ -3164,7 +2974,6 @@ def query_hot_posts_by_keyword(target_key, hours=24, min_views=1000):
 
 
 # 筛选条件/抽样上限/可选save_path → [{post_id,text_content,images,no_evidence,reason}]。
-# 还原模型初筛输入供人工复盘；查询异常仍按原设计返回[]，文件保存异常继续上抛。
 def get_need_check_pre_screen_info(
         limit=100,
         no_evidence_filter=None,
@@ -3173,7 +2982,6 @@ def get_need_check_pre_screen_info(
         save_path=None,
 ):
     post_manager = UniversalPostManager(gen_db_object())
-
     query = {
         "source": {"$in": list(POST_SOURCES)},
         "pre_screen": {"$exists": True, "$ne": None},
@@ -3183,27 +2991,7 @@ def get_need_check_pre_screen_info(
     if isinstance(no_evidence_filter, bool):
         query["pre_screen.no_evidence"] = no_evidence_filter
 
-    raw_posts = []
-    try:
-        if hasattr(post_manager, "collection"):
-            raw_posts = list(post_manager.collection.find(query))
-        elif hasattr(post_manager, "find_posts"):
-            raw_posts = post_manager.find_posts(query=query) or []
-        else:
-            all_posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
-            for p in all_posts:
-                ps = p.get("pre_screen")
-                if not isinstance(ps, dict) or not isinstance(ps.get("no_evidence"), bool):
-                    continue
-                if only_current_version and ps.get("prompt_version") != prompt_version:
-                    continue
-                if isinstance(no_evidence_filter, bool) and ps.get("no_evidence") != no_evidence_filter:
-                    continue
-                raw_posts.append(p)
-    except Exception as exc:
-        logger.error(f"❌ [初筛/审查] 查询已初筛帖子失败 | 异常: {exc}")
-        return []
-
+    raw_posts = post_manager.find_posts(query=query, limit=0) or []
     total_matched = len(raw_posts)
     total_no_ev = sum(1 for p in raw_posts if (p.get("pre_screen") or {}).get("no_evidence") is True)
     total_has_ev = total_matched - total_no_ev
@@ -3218,15 +3006,13 @@ def get_need_check_pre_screen_info(
             continue
         base_item = build_pre_screen_item(post)
         pre_screen = post.get("pre_screen") or {}
-
-        review_item = {
+        review_list.append({
             "post_id": base_item["post_id"],
             "text_content": base_item["text_content"],
             "images": base_item["images"],
             "no_evidence": pre_screen.get("no_evidence"),
             "reason": pre_screen.get("reason", ""),
-        }
-        review_list.append(review_item)
+        })
 
     if save_path:
         save_json(save_path, review_list)
@@ -3241,7 +3027,6 @@ def get_need_check_pre_screen_info(
 
 
 # 抽样条件 → [{source_post:{post_id,text,images,engagement},remodeled_article:{usable,...}}]。
-# 保留未在两平台发布的文章与原帖对照，usable=False仍保留False值。
 def get_need_check_viral_article_info(
         limit=100,
         hours=12,
@@ -3250,7 +3035,6 @@ def get_need_check_viral_article_info(
         save_path=None,
 ):
     article_manager = GeneratedArticleManager(gen_db_object())
-
     query = {
         "type": ARTICLE_TYPE_VIRAL,
         f"publish_records.{PLATFORM_BINANCE}.status": {"$ne": "success"},
@@ -3272,8 +3056,7 @@ def get_need_check_viral_article_info(
 
     post_ids = set()
     for art in selected_articles:
-        p_list = art.get("post_id_list") or []
-        for pid in p_list:
+        for pid in art.get("post_id_list") or []:
             if pid is not None and str(pid).strip():
                 post_ids.add(str(pid).strip())
                 if str(pid).strip().isdigit():
@@ -3282,21 +3065,7 @@ def get_need_check_viral_article_info(
     post_map = {}
     if post_ids:
         post_manager = UniversalPostManager(gen_db_object())
-        query_ids = list(post_ids)
-        p_query = {"post_id": {"$in": query_ids}}
-        raw_posts = []
-        try:
-            if hasattr(post_manager, "collection"):
-                raw_posts = list(post_manager.collection.find(p_query))
-            elif hasattr(post_manager, "find_posts"):
-                raw_posts = post_manager.find_posts(query=p_query) or []
-            else:
-                all_posts = _find_posts_by_sources(post_manager, limit=POST_QUERY_LIMIT)
-                raw_posts = [p for p in all_posts if
-                             p.get("post_id") in query_ids or str(p.get("post_id")) in query_ids]
-        except Exception:
-            logger.exception("❌ [高流量/审查] 关联原帖查询异常")
-
+        raw_posts = post_manager.find_posts(query={"post_id": {"$in": list(post_ids)}}, limit=0) or []
         for p in raw_posts:
             if isinstance(p, dict) and p.get("post_id") is not None:
                 post_map[str(p["post_id"]).strip()] = p
@@ -3308,7 +3077,6 @@ def get_need_check_viral_article_info(
 
         raw_p = post_map.get(target_post_id, {})
         info = article.get("article_info") or {}
-        v_screen = raw_p.get("viral_screen") or {}
         engagement = raw_p.get("engagement") or {}
 
         clean_text, _, mapping = normalize_post_media(raw_p) if raw_p else ("", [], {})
@@ -3326,9 +3094,7 @@ def get_need_check_viral_article_info(
         }
 
         usable = info.get("usable", False)
-
         if not usable:
-
             remodeled_article_data = {
                 "usable": False,
                 "image_semantics": info.get("image_semantics", []),
@@ -3336,7 +3102,6 @@ def get_need_check_viral_article_info(
                 "decision_reason": info.get("decision_reason", ""),
             }
         else:
-
             remodeled_article_data = {
                 "usable": True,
                 "topic_tag": info.get("topic_tag", ""),
@@ -3370,7 +3135,8 @@ def get_need_check_viral_article_info(
     return review_list
 
 
-# 九、进程入口：保持原有6个非daemon线程；历史清理仍需手动启用。
+# 九、进程入口：根据 TASK_SWITCHES 启动流水线任务
+
 
 # 无参任务 → 当前线程执行；未被业务边界处理的异常记录上下文后重抛，不自动重启线程。
 def _run_task(task):
@@ -3385,17 +3151,13 @@ def _run_task(task):
 
 
 def main():
-    # query_hot_posts_by_keyword(target_key="gtc")
-    # get_need_check_article_info()
-    # get_need_check_viral_article_info()
-    # data = get_need_check_pre_screen_info(limit=1000)
+    # 手动按账号与时间段删帖示例（默认删除最近 3 天的所有帖子）：
+    # delete_posts_by_account_and_time(platform=PLATFORM_OKX, days=3)
 
     task_map = {
         "fetch_and_screen": format_image_article,
         "single_analysis_gen": generate_analysis_articles,
         "single_analysis_pub": auto_publish_articles,
-        "multi_analysis_gen": generate_multi_analysis_articles,
-        "multi_analysis_pub": auto_publish_multi_analysis_articles,
         "viral_gen": generate_viral_articles,
         # "viral_pub": auto_publish_viral_articles,
         "hudong": hudong,
@@ -3417,3 +3179,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

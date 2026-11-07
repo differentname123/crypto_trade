@@ -26,7 +26,7 @@ from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import UniversalPostManager
 
 # ---------------- 全局配置常量（集中管理硬编码，便于维护）----------------
-BINANCE_SOURCE = "biance"
+BINANCE_SOURCE = "binance"
 POST_QUERY_LIMIT = 50000
 SCHEDULE_INTERVAL_SEC = 3600
 LLM_MAX_RETRIES = 3

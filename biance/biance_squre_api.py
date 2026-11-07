@@ -44,60 +44,47 @@ REQUEST_TIMEOUT = 15
 _INVISIBLE_RE = re.compile(r'[\u200b-\u200f\ufeff\u202a-\u202e]')  # 零宽字符、排版控制符等
 _MULTI_NEWLINE_RE = re.compile(r'\n{3,}')
 
+# 币安自营矩阵账号黑名单：严禁将本方矩阵发布的帖子作为外部素材抓取入库（防止自产自销死循环）
+SELF_BINANCE_USERNAMES = {
+    "sleepwell_zzz",
+    "square-creator-7174ab4dc04d4",
+    "square-creator-7ca94046afc63",
+    "ruivision",
+    "insights_anchor",
+    "square-creator-70197d46eb4f8",
+    "easyeverything",
+    "square-creator-9912ff4d73e93",
+    "square-creator-ff5e108f93e48",
+    "square-creator-c733fa800b1e1",
+}
+SELF_BINANCE_AUTHOR_NAMES = {
+    "稳定短线",
+    "马到功成6",
+    "来去之间Zzz",
+    "瑞见未来",
+}
 
-def pull_feed_demo():
-    # 拉取帖子数据
-    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
 
-    master_feed_list = read_json("master_feed_list.json")
-    save_json("master_feed_list.json", master_feed_list)
+def _is_self_binance_post(raw_item: dict) -> bool:
+    """判断币安原始帖子或清洗后帖子是否属于本方自营矩阵账号"""
+    if not isinstance(raw_item, dict):
+        return False
+    author_obj = raw_item.get("author") or {}
+    username = str(
+        raw_item.get("username")
+        or author_obj.get("username")
+        or author_obj.get("author_id")
+        or ""
+    ).strip().lower()
+    author_name = str(
+        raw_item.get("authorName")
+        or raw_item.get("displayName")
+        or author_obj.get("name")
+        or author_obj.get("displayName")
+        or ""
+    ).strip()
+    return (username in SELF_BINANCE_USERNAMES) or (author_name in SELF_BINANCE_AUTHOR_NAMES)
 
-    # 4. 全局终极去重（防止不同信息流之间的数据交叉重叠）
-    global_seen_ids = set()
-    final_clean_list = []
-
-    for item in master_feed_list:
-        item_id = item.get("id") or item.get("contentId")
-        if item_id and item_id not in global_seen_ids:
-            global_seen_ids.add(item_id)
-            final_clean_list.append(item)
-
-    logger.info(f"✨ 全局去重完成: 发现并移除跨流重复数据 {len(master_feed_list) - len(final_clean_list)} 条。")
-    logger.info(f"🎉 最终可用的纯净大列表总数据量: {len(final_clean_list)} 条记录！")
-
-    # 5. 按照 cardType 分组，每种类型最多保留 20 条数据
-    logger.info("\n--- 5. 开始按 cardType 分组提取 (每种最多20条) ---")
-    group_map = {}
-    filter_list = []
-    card_type_counts = {}  # 用字典来记录每种类型的数量
-
-    for item in final_clean_list:
-        # 获取 cardType，缺省为 "UNKNOWN" 防报错
-        card_type = item.get("cardType", "UNKNOWN")
-
-        # 获取当前类型已经存入 filter_list 的数量，默认为 0
-        current_count = card_type_counts.get(card_type, 0)
-
-        # 核心判断：如果该类型保存的数据还不到 20 条，就继续保留
-        if current_count < 20:
-            filter_list.append(item)
-            # 计数器加 1
-            card_type_counts[card_type] = current_count + 1
-            if card_type not in group_map:
-                group_map[card_type] = []
-            group_map[card_type].append(item)
-
-    # 打印最终的分组结果
-    logger.info(f"🗂️ 分组提取完成！共发现 {len(card_type_counts)} 种不同的 cardType。")
-    logger.info(f"🎉 最终的 filter_list 包含 {len(filter_list)} 条记录！")
-
-    # 直观地打印出每种类型具体保留了多少条，方便你核对数据分布
-    logger.info("📊 各类型保留数量统计:")
-    for c_type, count in card_type_counts.items():
-        logger.info(f"   - {c_type}: {count} 条")
-
-    temp_all_result_list = clean_universal_posts(filter_list)
-    final_temp_all_result_list = update_posts_in_place(temp_all_result_list)
 
 
 def publish_to_binance_square(api_key, text_content):
@@ -372,7 +359,7 @@ def get_standard_schema():
         "publish_time": 0,
         "author_id": None,
         "card_type": "UNKNOWN",
-        "source": "biance",
+        "source": "binance",
 
         # --- 降级后的内层容器 ---
         "metadata": {
@@ -786,8 +773,10 @@ def clean_universal_posts(final_clean_list):
     seen_post_ids = set()
     unique_count = 0
 
-    # ---------- 1. 去重 + 分组统计 ----------
+    # ---------- 1. 去重 + 自营拦截 + 分组统计 ----------
     for item in final_clean_list:
+        if _is_self_binance_post(item):
+            continue
         post_id = item.get("id")
         if post_id:
             if post_id in seen_post_ids:
@@ -1263,6 +1252,9 @@ def fetch_binance_feed(count=20, keyword=None, token=None, existing_ids=None, **
     intercepted_count = 0
 
     for item in feed_list:
+        if _is_self_binance_post(item):
+            intercepted_count += 1
+            continue
         # 兼容两种常见的 ID 字段名，并统一转为字符串处理
         item_id = str(item.get("id") or item.get("contentId"))
 
@@ -2371,87 +2363,11 @@ def fetch_binance_future_hot_coins(business_enum="USDT_FUTURES", session=None, m
     return []
 
 if __name__ == "__main__":
-    # 获取实时指定币价格
-    latest_price = get_latest_crypto_price("US")
-
-
-    # # 获取热门标签
-    # hot_topic = fetch_binance_hot_hashtags()
-
-    # 测试获取合约热搜榜
+    logger.info("========== 🚀 币安广场接口快速联通性测试 ==========")
     hot_future_coins = fetch_binance_future_hot_coins()
-
-    # 获取现货热榜
     hot_spot_coins = fetch_binance_spot_hot_coins()
+    recommend_data = fetch_binance_feed(count=10)
+    logger.info(f"========== 🏁 测试完成 | 推荐流获取: {len(recommend_data)} 条 ==========")
 
-
-    # 查询目标用户的回复列表 不需要cookie
-    target_square_uid = "qvJ0myxEpH6fADYJWzc6DQ"
-    cookies = ""
-    csrf_token = ""
-    replies = fetch_binance_square_replies(target_square_uid=target_square_uid, cookies=cookies, csrf_token=csrf_token,
-                                           limit=1000)
-    print()
-    #
-    #
-    # # 删除指定的回复内容 需要cookie
-    # cookies = """bnc-uuid=884e61f5-a044-4af1-b820-55dccc789ffb; se_gd=gAIVBTRsBEPVxVbZTVFQgZZUQXFsLBVW1RURfVURlRQWgVlNWWJc1; se_gsd=aDY1FSRVITI3MxEhNCY3BSIsCxMYBAUHVl1HWldVW1RWI1NT1; BNC_FV_KEY=33559d62a73ba3d08cfd60775684fbc93d6d0973; OptanonAlertBoxClosed=2026-07-31T10:30:28.727Z; r30t=1; BNC-Location=CN; userPreferredCurrency=USD_USD; _gcl_au=1.1.1056723489.1785494357; g_state={"i_l":0,"i_ll":1785513332133,"i_b":"G+EsG6LEcCn6TzW7nUlhRgHKa2qzIa755oH36z8FYBk","i_e":{"enable_itp_optimization":24},"i_et":1785513332133}; _ga_3WP50LGEEC=deleted; _ga_3WP50LGEEC=deleted; _gid=GA1.2.1585322047.1788931810; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%221236030903%22%2C%22first_id%22%3A%2219fb7b8e7f5136e-06c97fc11230be-26071951-921600-19fb7b8e7f62036%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E7%9B%B4%E6%8E%A5%E6%B5%81%E9%87%8F%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC_%E7%9B%B4%E6%8E%A5%E6%89%93%E5%BC%80%22%2C%22%24latest_referrer%22%3A%22%22%2C%22%24latest_utm_source%22%3A%22chat%22%2C%22%24latest_utm_campaign%22%3A%22app_square_share_link%22%2C%22%24latest_utm_content%22%3A%22OHu1R-tdGmvA5_c_Kk8h5w%22%2C%22%24latest_utm_medium%22%3A%22app_share%22%7D%2C%22identities%22%3A%22eyIkaWRlbnRpdHlfY29va2llX2lkIjoiMTlmYjdiOGU3ZjUxMzZlLTA2Yzk3ZmMxMTIzMGJlLTI2MDcxOTUxLTkyMTYwMC0xOWZiN2I4ZTdmNjIwMzYiLCIkaWRlbnRpdHlfbG9naW5faWQiOiIxMjM2MDMwOTAzIn0%3D%22%2C%22history_login_id%22%3A%7B%22name%22%3A%22%24identity_login_id%22%2C%22value%22%3A%221236030903%22%7D%7D; r20t=web.1236030903.E3BD0C3A0075DD599B036433E63F3B2D; cr00=99E4412C55E98143B3432191DC4DCBC3; d1og=web.1236030903.F521EC18290810ED91BAB9C31E4B9573; r2o1=web.1236030903.735A9645F4025481FD473A2AE3142F30; f30l=web.1236030903.6F2B701AAF0C7D93500855925639AB69; p20t=web.1236030903.FD7A639B63D02545DCB2FDA6A8D065C3; aws-waf-token=0ade320a-976b-4f2b-925e-48cd6052155a:AQoAsjBtSZgKAAAA:+VC85pCoSDMJoAl6ctI4F1eAZRJZW1ITmYuo/wY8EuAAgHftL0Mhr6eKZFh0OS8+8/UlVcCgPbzy0tf0tfXJf+aRql8SPLKHiIt0moipuyzrhsfa8ibAfAo4njVx74wRUGQ+X0LnnZaW2ZPJHs7dwiN4Y2dsVDlroeabmxxPpP4UozayvlEnoOU7I16bqx3njLwM6yR+TBcpjYxRXnzUf+3cBrIAm+czDj92z1s3o9XMb3jM+fIU8UljCKovea5AnoUB0737q280bf7UuC/oBXF8IEn74NSDCbCWT0CTBhsNaY6FecvU5RieWYGlfLxQy0Dnew==; _uetsid=962131f0aebf11f197d9ab0b84c69c63; _uetvid=1667c8208ccc11f1adbb577b422f31f8; BNC_FV_KEY_T=101-GPR%2B749u8njAdSkjB0o6EbT%2FGD1b0FqG0GrwEEBIFZBqdwt0iw9si5BHo3oFswpPuHip1AfTqoPSlhQ4ruxPbQ%3D%3D-7HKF5O5WhvJfQ0bFFFjlMQ%3D%3D-e4; BNC_FV_KEY_EXPIRE=1789326647726; theme=dark; OptanonConsent=isGpcEnabled=0&datestamp=Sun+Sep+13+2026+21%3A53%3A13+GMT%2B0800+(%E4%B8%AD%E5%9B%BD%E6%A0%87%E5%87%86%E6%97%B6%E9%97%B4)&version=202604.2.0&browserGpcFlag=0&isDntEnabled=0&isIABGlobal=false&hosts=&consentId=9bff5e0c-0326-46cd-bb7c-b42b0b736326&interactionCount=1&isAnonUser=1&prevHadToken=0&landingPath=NotLandingPage&groups=C0001%3A1%2CC0003%3A1%2CC0004%3A1%2CC0002%3A1&fclco=&lastConsentTs=1785493828&intType=1&crTime=1785493830721&geolocation=KR%3B11&AwaitingReconsent=false; _gat_UA-162512367-1=1; _ga_3WP50LGEEC=GS2.1.s1789305048$o9$g1$t1789307596$j34$l0$h0; _ga=GA1.1.1768809681.1785493830"""
-    # csrf_token = 'c4f79d48f01c536ad1107bf83620309d'
-    # for item in replies:
-    #     reply_id = item.get("reply_id")
-    #     if reply_id:
-    #         success = delete_binance_square_content(
-    #             content_id=reply_id, cookies=cookies, csrf_token=csrf_token
-    #         )
-    #         print(f"删除 reply_id={reply_id} 的结果: {'成功' if success else '失败'}")
-    #
-    master_feed_list = []
-
-    logger.info("========== 🚀 开始全量数据抓取测试 ==========")
-
-    # 0. 获取该帖子的评论数据 (例如拉取前 50 条热门评论，sort_by=1 表示热门)
-    target_post_id = "309692475255842"  # 替换为实际的帖子 ID
-    logger.info(f"⏳ 正在拉取帖子评论: {target_post_id} ...")
-    comments = fetch_binance_replies(
-        content_id=target_post_id,
-        sort_by=1,  # 1: 热门评论, 2: 最新评论
-        required_count=50  # 需要拉取的数量
-    )
-    logger.info(f"✅ 评论数据获取成功 | 实际拉取数量: {len(comments)} 条")
-
-    # 1. 抓取推荐流
-    logger.info("--- 1. 准备抓取: 推荐流 ---")
-    recommend_data = fetch_binance_feed(count=100)
-    master_feed_list.extend(recommend_data)
-
-    # 2. 抓取搜索流 (以 "ETH" 为例)
-    logger.info("--- 2. 准备抓取: 搜索流 (ETH) ---")
-    search_data = fetch_binance_feed(keyword="ETH", count=10)
-    master_feed_list.extend(search_data)
-
-    # 3. 抓取特定币种流 (以 "BTC" 为例，按热门排序)
-    logger.info("--- 3. 准备抓取: 币种流 (BTC) ---")
-    token_data = fetch_binance_feed(token="BTC", count=10, orderBy=1)
-    master_feed_list.extend(token_data)
-
-    logger.info(f"========== 🏁 全量抓取结束 | 汇总总计 {len(master_feed_list)} 条 ==========")
-
-    # 2. 准备你要发布的纯文本内容 (支持换行和带 HashTag)
-    post_content = "BTC带头反弹，SOL却在100美元关口前尽显疲态，根本看不到独立资金愿意进场接盘。\n\n更反常的是衍生品数据：价格这么弱，100美元附近的资金费率依然维持正值（+0.0057%）。散户还在扎堆开仓赌反弹，市场连最起码的恐慌出清都没完成。\n\n没增量资金拉盘，车上却挤满了等别人抬轿的多头。筹码洗不干净，现在买入大概率要替套牢盘当燃料。多头不死，见底还早。\n\n $BTC $SOL\n\n #BTC #行情分析 #加密货币"
-
-
-    # 3. 调用发帖函数
-    SQUARE_API_KEY = get_config('yang_square_api_key')
-    logger.info("准备执行自动发帖任务...")
-    is_success = publish_to_binance_square(
-        api_key=SQUARE_API_KEY,
-        text_content=post_content
-    )
-
-    # 4. 根据返回的布尔值处理后续逻辑
-    if is_success:
-        print("\n🎉 发帖成功！请前往币安广场个人主页查看。")
-    else:
-        print("\n❌ 发帖失败！请检查上方日志中的错误码（可能是网络不通、Key失效或达到每日上限）。")
 
 
