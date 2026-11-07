@@ -23,7 +23,7 @@ from common.common_utils import setup_logger
 # ==============================================================================
 #                                   运行配置
 # ==============================================================================
-USER_DATA_DIR = r"W:\temp\okx_ruru"
+USER_DATA_DIR = r"W:\temp\okx_myself"
 OKX_ORBIT_URL = "https://www.okx.com/zh-hans/orbit"
 
 TYPE_CHUNK_SIZE = 80  # 正文分块长度：仅切分 press_sequentially 调用，键序与延迟不变
@@ -2513,13 +2513,166 @@ def _delete_single_post_by_api(page, content_id, seq=1):
     return False, f"HTTP={http_status}, code={code_str}, msg={err_msg}"
 
 
-def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, interval_sec=0.8):
+_FETCH_SELF_TIMELINE_JS = r"""
+async ({ authorId, maxPages, startMs, endMs }) => {
+    const getCookie = (name) => {
+        const match = document.cookie.match(new RegExp('(^|;\\s*)' + name + '=([^;]*)'));
+        return match ? decodeURIComponent(match[2]) : '';
+    };
+    const rawToken = getCookie('token');
+    const authHeader = rawToken
+        ? (rawToken.startsWith('Bearer ') ? rawToken : rawToken)
+        : '';
+    const devId = getCookie('devId') || getCookie('fingerprint_id') || '';
+    const siteInfo = getCookie('ok_site_info') || '';
+    const locale = getCookie('locale') || getCookie('preferLocale') || 'zh_CN';
+
+    const commonHeaders = (ts) => ({
+        'accept': 'application/json',
+        'authorization': authHeader,
+        'devid': devId,
+        'platform': 'web',
+        'x-cdn': 'https://www.okx.com',
+        'x-locale': locale,
+        'x-request-timestamp': ts,
+        'x-simulated-trading': 'undefined',
+        'x-site-info': siteInfo,
+        'x-utc': '8',
+        'x-zkdex-env': '0'
+    });
+
+    // 若未显式传入 authorId，尝试通过当前登录态拉取本人 authorId
+    let targetAuthorId = String(authorId || '').trim();
+    if (!targetAuthorId) {
+        try {
+            const ts0 = Date.now().toString();
+            const r0 = await fetch(`https://www.okx.com/priapi/v5/content/public/user-info?t=${ts0}`, {
+                method: 'GET',
+                headers: commonHeaders(ts0),
+                credentials: 'include'
+            });
+            const j0 = await r0.json();
+            if (j0 && j0.data && j0.data.authorId) {
+                targetAuthorId = String(j0.data.authorId).trim();
+            }
+        } catch (e) {}
+    }
+
+    if (!targetAuthorId) {
+        return { error: 'missing_author_id', ids: [], hasToken: Boolean(authHeader) };
+    }
+
+    let cursor = '';
+    const allIds = [];
+    const seen = new Set();
+    const limitPages = Number(maxPages) > 0 ? Number(maxPages) : 120;
+
+    for (let page = 1; page <= limitPages; page++) {
+        const ts = Date.now().toString();
+        const url = `https://www.okx.com/priapi/v5/content/public/timeline/1?size=20&queryName=${encodeURIComponent(targetAuthorId)}&type=3&cursor=${encodeURIComponent(cursor)}&t=${ts}`;
+        try {
+            const resp = await fetch(url, {
+                method: 'GET',
+                headers: commonHeaders(ts),
+                credentials: 'include'
+            });
+            const json = await resp.json();
+            if (String(json.code) !== '0') break;
+            const data = json.data || {};
+            const list = data.contentDataList || data.dataList || [];
+            if (!list.length) break;
+
+            let newInPage = 0;
+            let reachedOlder = false;
+            for (const item of list) {
+                const c = (item && item.contentData) ? item.contentData : item;
+                if (!c) continue;
+                const cid = String(c.contentId || c.id || '').trim();
+                if (!cid || seen.has(cid)) continue;
+                seen.add(cid);
+                newInPage++;
+
+                let pubMs = Number(c.publishTime || 0);
+                if (pubMs > 0 && pubMs < 10000000000) pubMs = pubMs * 1000;
+
+                if (endMs !== null && endMs !== undefined && pubMs > 0 && pubMs > Number(endMs)) {
+                    continue;
+                }
+                if (startMs !== null && startMs !== undefined && pubMs > 0 && pubMs < Number(startMs)) {
+                    reachedOlder = true;
+                    continue;
+                }
+                allIds.push(cid);
+            }
+
+            const nextCur = String(data.nextCursor || '');
+            if (reachedOlder || !nextCur || nextCur === '0' || nextCur === cursor || newInPage === 0) {
+                break;
+            }
+            cursor = nextCur;
+            await new Promise((r) => setTimeout(r, 120));
+        } catch (e) {
+            break;
+        }
+    }
+
+    return { error: null, authorId: targetAuthorId, ids: allIds, hasToken: Boolean(authHeader) };
+}
+"""
+
+
+def _fetch_self_timeline_in_page(page, author_id=None, max_pages=120, start_ts=None, end_ts=None):
+    """
+    在本人已登录的浏览器页面上下文中拉取 timeline/1（携带本人 token 与 Cookie），
+    确保能够完整获取包括“仅本人可见/风控限流”在内的所有本人帖子 ID。
+    """
+    start_ms = int(float(start_ts) * 1000) if start_ts is not None else None
+    end_ms = int(float(end_ts) * 1000) if end_ts is not None else None
+    res = page.evaluate(
+        _FETCH_SELF_TIMELINE_JS,
+        {
+            "authorId": str(author_id or "").strip(),
+            "maxPages": int(max_pages),
+            "startMs": start_ms,
+            "endMs": end_ms,
+        },
+    )
+    if not isinstance(res, dict):
+        return []
+    ids = [str(x).strip() for x in (res.get("ids") or []) if str(x).strip()]
+    logger.info(
+        f"[主页扫描/SelfTimeline] 本人登录态拉取主页帖子完成 | authorId: 【{res.get('authorId')}】 "
+        f"| 携带Token: 【{res.get('hasToken')}】 | 命中帖子数: 【{len(ids)}】条"
+    )
+    return ids
+
+
+def delete_okx_posts(
+    post_id_list=None,
+    user_data_dir=USER_DATA_DIR,
+    debug=False,
+    interval_sec=0.8,
+    fetch_self_timeline=False,
+    author_id=None,
+    start_ts=None,
+    end_ts=None,
+    max_pages=120,
+    until_empty=False,
+):
     """
     主控入口 4：打开 OKX 星球页面后，通过浏览器上下文逐个触发 `/priapi/v5/content/ugc/delete` 接口批量删除帖子。
+    支持在本人已登录的浏览器上下文内直接拉取本人主页时间线（含“仅本人可见”帖子）并一并删除。
+
     :param post_id_list: 待删除的帖子 ID 列表（支持 list/tuple/set 或单个 str/int，自动保序去重）
     :param user_data_dir: 浏览器用户数据目录
     :param debug: 是否开启调试模式（True 显示界面，False 离屏后台，默认 False）
     :param interval_sec: 每次删除请求之间的间隔秒数，默认 0.8 秒
+    :param fetch_self_timeline: 是否在本人登录态浏览器内拉取主页帖子列表（可捕获“仅自己可见”帖子）
+    :param author_id: 本人 OKX 星球 authorId（配合 fetch_self_timeline 使用）
+    :param start_ts: 可选起始时间戳（秒），仅拉取该时间之后的本人帖子
+    :param end_ts: 可选截止时间戳（秒），仅拉取该时间之前的本人帖子
+    :param max_pages: 本人主页拉取最大翻页数，默认 120
+    :param until_empty: 当 fetch_self_timeline=True 时，是否多轮复核删除直至本人登录态主页帖子清零
     返回 Tuple(错误信息(str|None), 是否全部成功(bool), 结果明细(dict: {"success_ids": [...], "failed_ids": {...}}))
     """
     if isinstance(post_id_list, (str, int)):
@@ -2531,16 +2684,22 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
 
     clean_id_list = list(dict.fromkeys(raw_ids))
 
-    if not clean_id_list:
+    if not clean_id_list and not fetch_self_timeline:
         return "待删除的 post_id_list 不能为空", False, {"success_ids": [], "failed_ids": {}}
 
     if not os.path.isdir(user_data_dir):
         return f"缺少用户环境: {user_data_dir}，请先执行登录", False, {"success_ids": [], "failed_ids": {}}
 
+    nav_url = (
+        f"https://www.okx.com/zh-hans/orbit/user/{str(author_id).strip()}"
+        if author_id and str(author_id).strip()
+        else OKX_ORBIT_URL
+    )
+
     logger.info(
-        f"\n{'=' * 70}\n[任务/Delete] 启动 OKX 星球批量接口删帖 | URL: <{OKX_ORBIT_URL}> "
-        f"| 去重后待删数量: 【{len(clean_id_list)}】条 | 间隔: 【{interval_sec}s】 "
-        f"| 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
+        f"\n{'=' * 70}\n[任务/Delete] 启动 OKX 星球批量接口删帖 | URL: <{nav_url}> "
+        f"| 初始传入ID数: 【{len(clean_id_list)}】条 | 本人登录态拉取主页: 【{fetch_self_timeline}】 "
+        f"| 间隔: 【{interval_sec}s】 | 模式: 【{'debug可见' if debug else '离屏后台'}】\n{'=' * 70}"
     )
 
     anti_freeze_args = ['--disable-restore-session-state', '--no-default-browser-check']
@@ -2586,7 +2745,7 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
                     install_overlay_guard(page)
                     page.add_init_script(_DELETE_SIGN_HOOK_INIT_JS)
 
-                    response = page.goto(OKX_ORBIT_URL, timeout=60000, wait_until="domcontentloaded")
+                    response = page.goto(nav_url, timeout=60000, wait_until="domcontentloaded")
                     _dismiss_overlays(page, aggressive=False, desc="delete-nav")
                     report_guard_hits(page, "delete-nav")
 
@@ -2615,24 +2774,62 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
                         except Exception:
                             pass
 
-                    total = len(clean_id_list)
-                    for idx, post_id in enumerate(clean_id_list, start=1):
-                        logger.info(f"[删除/Delete] 正在触发第 【{idx}/{total}】 条删帖请求 | contentId: 【{post_id}】")
-                        ok, err_detail = _delete_single_post_by_api(page, post_id, seq=30 + idx)
-                        if ok:
-                            success_ids.append(post_id)
-                        else:
-                            failed_ids[post_id] = err_detail
+                    # 若开启本人登录态主页扫描，则在当前已登录浏览器上下文中拉取本人全部可见帖子（含“仅本人可见”帖子）
+                    if fetch_self_timeline:
+                        self_tl_ids = _fetch_self_timeline_in_page(
+                            page,
+                            author_id=author_id,
+                            max_pages=max_pages,
+                            start_ts=start_ts,
+                            end_ts=end_ts,
+                        )
+                        clean_id_list = list(dict.fromkeys(self_tl_ids + clean_id_list))
 
-                        if idx < total and interval_sec > 0:
-                            page.wait_for_timeout(int(interval_sec * 1000))
+                    if not clean_id_list:
+                        logger.info("[任务/Delete] 本人登录态主页与传入列表均无待删帖子，直接返回成功")
+                        return None, True, {"success_ids": [], "failed_ids": {}}
+
+                    max_rounds = 3 if (fetch_self_timeline and until_empty) else 1
+                    seq_counter = 30
+                    already_attempted = set()
+
+                    for round_no in range(1, max_rounds + 1):
+                        if round_no > 1:
+                            clean_id_list = _fetch_self_timeline_in_page(
+                                page,
+                                author_id=author_id,
+                                max_pages=max_pages,
+                                start_ts=start_ts,
+                                end_ts=end_ts,
+                            )
+                            clean_id_list = [x for x in clean_id_list if x not in already_attempted]
+                            if not clean_id_list:
+                                logger.info(f"[任务/Delete] 第 {round_no} 轮复核确认本人登录态主页已无剩余帖子")
+                                break
+
+                        total = len(clean_id_list)
+                        for idx, post_id in enumerate(clean_id_list, start=1):
+                            already_attempted.add(post_id)
+                            seq_counter += 1
+                            logger.info(
+                                f"[删除/Delete] (第{round_no}轮) 正在触发第 【{idx}/{total}】 条删帖请求 | contentId: 【{post_id}】"
+                            )
+                            ok, err_detail = _delete_single_post_by_api(page, post_id, seq=seq_counter)
+                            if ok:
+                                success_ids.append(post_id)
+                                failed_ids.pop(post_id, None)
+                            else:
+                                failed_ids[post_id] = err_detail
+
+                            if idx < total and interval_sec > 0:
+                                page.wait_for_timeout(int(interval_sec * 1000))
 
                     all_success = (len(failed_ids) == 0)
                     summary = {"success_ids": success_ids, "failed_ids": failed_ids}
 
                     if all_success:
                         logger.info(
-                            f"[任务/Delete] 批量删帖全部完成 | 成功: 【{len(success_ids)}/{total}】 | 结果: [Success]"
+                            f"[任务/Delete] 批量删帖全部完成 | 成功: 【{len(success_ids)}】条 | 结果: [Success]"
                         )
                         return None, True, summary
                     else:
@@ -2677,4 +2874,4 @@ def delete_okx_posts(post_id_list, user_data_dir=USER_DATA_DIR, debug=False, int
 # ==============================================================================
 if __name__ == "__main__":
     # 如需人工登录，取消下方注释：
-    open_browser_for_manual_use(USER_DATA_DIR)
+    open_browser_for_manual_use(USER_DATA_DIR)

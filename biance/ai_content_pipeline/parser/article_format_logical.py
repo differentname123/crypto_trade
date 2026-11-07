@@ -23,6 +23,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import ccxt
 from PIL import Image
 
@@ -42,8 +49,9 @@ from biance.okx_squre_api import (
     fetch_okx_user_timeline,
 )
 from common.common_utils import (
-    get_config, get_image_content_id, read_file_to_str, read_json,
-    save_json, setup_logger, string_to_object,
+    PROMPT_DIR, get_config, get_image_content_id, get_requests_proxies,
+    read_file_to_str, read_json, resolve_session_dir, save_json,
+    setup_logger, string_to_object,
 )
 from common.mongo_db.mongo_base import gen_db_object
 from common.mongo_db.mongo_manager import GeneratedArticleManager, UniversalPostManager
@@ -75,11 +83,11 @@ BINANCE_ACCOUNT_USERNAME_MAP = {
 SELF_AUTHOR_IDS = {str(x).lower() for x in (set(SELF_OKX_AUTHOR_IDS) | set(SELF_BINANCE_USERNAMES))}
 SELF_AUTHOR_NAMES = set(SELF_OKX_AUTHOR_NAMES) | set(SELF_BINANCE_AUTHOR_NAMES)
 
-PRE_SCREEN_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU初筛.txt"
-PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类MLU提取.txt"
-ARTICLE_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_分析类文章生成.txt"
-VIRAL_STAGE1_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖可用性筛选.txt"
-VIRAL_STAGE2_PROMPT_FILE_PATH = r"W:\project\python_project\crypto_trade\prompt\内容生成方案_娱乐类_单帖洗稿和神评生成.txt"
+PRE_SCREEN_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU初筛.txt")
+PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类MLU提取.txt")
+ARTICLE_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_分析类文章生成.txt")
+VIRAL_STAGE1_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖可用性筛选.txt")
+VIRAL_STAGE2_PROMPT_FILE_PATH = str(PROMPT_DIR / "内容生成方案_娱乐类_单帖洗稿和神评生成.txt")
 
 POST_QUERY_LIMIT = 50000
 POST_MAX_AGE_HOURS = 48
@@ -130,7 +138,7 @@ INTERACTION_CONFIG = {
     },
 }
 
-STATE_FILE = "account_publish_state.json"
+STATE_FILE = str(Path(__file__).resolve().with_name("account_publish_state.json"))
 STATE_FILE_LOCK = threading.Lock()
 ACCOUNT_COOLDOWN_SECONDS = 3600
 OKX_ACCOUNT_COOLDOWN_SECONDS = 1300
@@ -174,9 +182,9 @@ def _log(action, message, level="info", exc_info=False, **fields):
 
 
 class BinancePlatform:
-    # 账号名 → 原项目配置中的浏览器会话目录。
+    # 账号名 → 原项目配置中的浏览器会话目录（支持跨平台自动回退）。
     def session_dir(self, account):
-        return get_config(f"{account}_browser_session_dir")
+        return resolve_session_dir(f"{account}_browser_session_dir", f"biance_{account}")
 
     # 返回原热榜的币种字符串列表；保留统一调用参数，不额外改变Binance查询。
     def hot_coins(self, for_publish=False):
@@ -206,15 +214,9 @@ class BinancePlatform:
 
 
 class OkxPlatform:
-    # 配置缺失/读取异常仍回退原固定目录，保持既有容错边界。
+    # 配置缺失/读取异常自动回退跨平台会话目录，保持既有容错边界。
     def session_dir(self, account):
-        try:
-            configured = get_config(f"okx_{account}_browser_session_dir")
-            if configured:
-                return configured
-        except Exception:
-            pass
-        return rf"W:\temp\okx_{account}"
+        return resolve_session_dir(f"okx_{account}_browser_session_dir", f"okx_{account}")
 
     # 返回原接口的[str或{symbol/coin}]；采集不传num，发布仍传num=25。
     def hot_coins(self, for_publish=False):
@@ -781,10 +783,13 @@ def batch_screen_viral_posts(posts, post_manager):
 
 # top_k → {top_gainers/top_losers:[{symbol,percentage}]}；安全释放 CCXT 客户端，禁止释放异常阻断正常返回。
 def get_top_k_movers(top_k=5):
-    exchange = ccxt.binance({
+    ccxt_cfg = {
         "enableRateLimit": True, "options": {"defaultType": "future"},
-        "proxies": {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"},
-    })
+    }
+    proxies = get_requests_proxies()
+    if proxies:
+        ccxt_cfg["proxies"] = proxies
+    exchange = ccxt.binance(ccxt_cfg)
     try:
         tickers = exchange.fetch_tickers()
         ranked = sorted(
@@ -2570,25 +2575,17 @@ def delete_posts_by_account_and_time(
 
         if platform == PLATFORM_OKX:
             okx_uid = OKX_ACCOUNT_UID_MAP.get(acc)
-            if okx_uid:
-                try:
-                    remote_okx_items = fetch_okx_user_timeline(
-                        author_id=okx_uid,
-                        max_pages=60,
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                    ) or []
-                    for item in remote_okx_items:
-                        rid = str(item.get("post_id") or "").strip()
-                        if rid and rid not in pids:
-                            pids.append(rid)
-                except Exception as exc:
-                    _log("按时间删帖/远端扫描", "拉取 OKX 远端主页帖子列表异常，继续按已知ID删除", level="warning", 账号=acc, 原因=exc)
-            if not pids:
-                summary[acc] = {"target_count": 0, "deleted": [], "failed": []}
-                continue
             session_dir = _get_account_session_dir(PLATFORM_OKX, acc)
-            _, _, detail = delete_okx_posts(post_id_list=pids, user_data_dir=session_dir, debug=debug)
+            _, _, detail = delete_okx_posts(
+                post_id_list=pids,
+                user_data_dir=session_dir,
+                debug=debug,
+                fetch_self_timeline=True,
+                author_id=okx_uid,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                max_pages=60,
+            )
             detail = detail or {}
             deleted_list.extend(str(x) for x in (detail.get("success_ids") or []))
             failed_list.extend(str(x) for x in ((detail.get("failed_ids") or {}).keys()))
